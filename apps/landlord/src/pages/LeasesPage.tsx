@@ -1,8 +1,9 @@
 import { useState, useEffect, Fragment } from 'react'
+import type React from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
-import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, Pause, Play, ArrowRight } from 'lucide-react'
+import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, ArrowRight } from 'lucide-react'
 import { LEASE_TYPE_LABEL, LeaseStatus, humanize } from '@gam/shared'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
@@ -397,7 +398,13 @@ export function LeasesPage() {
                       )}
                     </td>
                     <td onClick={e => e.stopPropagation()}>
-                      <div style={{ display: 'flex', gap: 6 }}>
+                      {/* S652 (Nic): "this page just feels like it has too much
+                          information" — eight buttons ran off the right edge.
+                          Three now: Details, one Charge menu (fee, one-off
+                          amount, recurring add-on or rent change, carried
+                          balance), one Change menu (move spot, move out,
+                          hibernate / resume). A draft keeps its Discard. */}
+                      <div style={{ display: 'flex', gap: 6, position: 'relative' }}>
                         <button
                           className="btn btn-ghost btn-sm"
                           title="Lease details (terms, fees, addendum history)"
@@ -406,13 +413,6 @@ export function LeasesPage() {
                         >
                           <Eye size={12} /> Details
                         </button>
-                        {/* ── S640 (Nic): A DRAFT NEEDS A WAY OUT ───────────
-                            "There's no way to delete it either. So it's just
-                             useless filler."
-                            An unsigned draft nobody can execute or complete sat
-                            on the dashboard as a permanent action item with no
-                            button that did anything. This closes it. Unsigned
-                            only — a signed lease is never ended from a list. */}
                         {can('leases.terminate') && (l.status === 'pending' || l.status === 'draft') && (
                           <button
                             className="btn btn-ghost btn-sm"
@@ -423,89 +423,34 @@ export function LeasesPage() {
                             <X size={12} /> Discard
                           </button>
                         )}
-                        {can('leases.bill_fee') && l.status === 'active' && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title="Bill the tenant a one-off fee on this lease"
-                            onClick={() => setBillFeeLease(l)}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            <FileText size={12} /> Bill fee
-                          </button>
+                        {l.status === 'active' && (can('leases.bill_fee') || can('leases.create')) && (
+                          <RowMenu label={<><DollarSign size={12} /> Charge</>} items={[
+                            ...(can('leases.bill_fee') ? [
+                              { label: 'Bill a fee', hint: 'A one-off fee from this lease\'s fee schedule', onClick: () => setBillFeeLease(l) },
+                              { label: 'Charge an amount', hint: 'Anything not in the lease — damage, a violation', onClick: () => setChargeLease(l) },
+                            ] : []),
+                            ...(can('leases.create') ? [
+                              { label: 'Recurring add-on or rent change', hint: 'Parking, storage, a new rent — as an agreement or a notice', onClick: () => setAddonLease(l) },
+                            ] : []),
+                            ...(can('leases.bill_fee') ? [
+                              { label: 'Carried balance', hint: 'What they already owed before GAM', onClick: () => setCarriedLease(l) },
+                            ] : []),
+                          ]} />
                         )}
-                        {can('leases.bill_fee') && l.status === 'active' && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title="Charge this tenant a one-off amount — parking violation, damage, anything not in the lease"
-                            onClick={() => setChargeLease(l)}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            <FileText size={12} /> Charge
-                          </button>
-                        )}
-                        {/* S605 (Nic): arrears from the landlord's previous
-                            system. Sits beside Bill fee because it is the same
-                            act — a landlord adding a charge — but it is entered
-                            ONCE per lease at migration, not recurring. */}
-                        {can('leases.bill_fee') && l.status === 'active' && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title="Record a balance this tenant already owed before moving onto GAM"
-                            onClick={() => setCarriedLease(l)}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            <FileText size={12} /> Carried balance
-                          </button>
-                        )}
-                        {can('leases.create') && l.status === 'active' && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title="Add a recurring charge (parking, storage) or change the rent — as an agreement the tenant signs, or a notice you issue. Takes effect on the date you set."
-                            onClick={() => setAddonLease(l)}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            <DollarSign size={12} /> Add-on / rent change
-                          </button>
-                        )}
-                        {/* S641 (Nic): "I don't wanna have to terminate their
-                            lease, send them a new lease for the new spot. I
-                            want to just be able to move them in the system and
-                            say, as of this date, they moved from this spot to
-                            this spot." Sits beside Move-out because that is
-                            where somebody looks for it, and reads as the
-                            opposite: the tenancy continues. */}
-                        {can('leases.edit') && l.status === 'active' && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title="Move this resident to a different space — same lease, same rent, same terms"
-                            onClick={() => setMoveLease(l)}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            <ArrowRight size={12} /> Move spot
-                          </button>
-                        )}
-                        {can('leases.deposit_return') && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title="Process move-out / deposit return"
-                            onClick={() => navigate(`/leases/${l.id}/deposit-return`)}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            <DollarSign size={12} /> Move-out
-                          </button>
-                        )}
-                        {can('leases.edit') && l.status === 'active' && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title={l.isHibernating
-                              ? 'Resume this seasonal lease — restart billing'
-                              : 'Hibernate for the off-season — pause billing, hold the spot, deposit stays. Snowbirds.'}
-                            disabled={hibernateMut.isLoading}
-                            onClick={() => hibernateMut.mutate({ id: l.id, action: l.isHibernating ? 'resume' : 'hibernate' })}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            {l.isHibernating ? <><Play size={12} /> Resume</> : <><Pause size={12} /> Hibernate</>}
-                          </button>
+                        {(can('leases.edit') || can('leases.deposit_return')) && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
+                          <RowMenu label={<><ArrowRight size={12} /> Change</>} items={[
+                            ...(can('leases.edit') && l.status === 'active' ? [
+                              { label: 'Move to another space', hint: 'Same lease, same rent, same terms', onClick: () => setMoveLease(l) },
+                            ] : []),
+                            ...(can('leases.deposit_return') ? [
+                              { label: 'Move out', hint: 'Move-out and deposit return', onClick: () => navigate(`/leases/${l.id}/deposit-return`) },
+                            ] : []),
+                            ...(can('leases.edit') && l.status === 'active' ? [
+                              l.isHibernating
+                                ? { label: 'Resume from hibernation', hint: 'Restart billing', onClick: () => hibernateMut.mutate({ id: l.id, action: 'resume' }) }
+                                : { label: 'Hibernate for the season', hint: 'Pause billing, hold the spot, deposit stays', onClick: () => hibernateMut.mutate({ id: l.id, action: 'hibernate' }) },
+                            ] : []),
+                          ]} />
                         )}
                       </div>
                     </td>
@@ -1324,6 +1269,31 @@ function SendAddendumModal({ lease, onClose }: { lease: any; onClose: () => void
           </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+// A small menu button for the leases table: one button, a list of actions.
+function RowMenu({ label, items }: { label: React.ReactNode; items: Array<{ label: string; hint?: string; onClick: () => void }> }) {
+  const [open, setOpen] = useState(false)
+  if (!items.length) return null
+  return (
+    <div style={{ position: 'relative' }}>
+      <button className="btn btn-ghost btn-sm" style={{ padding: '3px 8px' }} onClick={() => setOpen(o => !o)}>{label} ▾</button>
+      {open && (
+        <>
+          <div style={{ position: 'fixed', inset: 0, zIndex: 40 }} onClick={() => setOpen(false)} />
+          <div style={{ position: 'absolute', right: 0, top: '100%', marginTop: 4, zIndex: 41, minWidth: 250, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 10, boxShadow: '0 8px 24px rgba(0,0,0,.25)', padding: 4 }}>
+            {items.map(it => (
+              <button key={it.label} type="button" onClick={() => { setOpen(false); it.onClick() }}
+                style={{ display: 'block', width: '100%', textAlign: 'left', background: 'transparent', border: 'none', borderRadius: 7, padding: '8px 10px', cursor: 'pointer', color: 'var(--text-0)' }}>
+                <div style={{ fontSize: '.82rem', fontWeight: 600 }}>{it.label}</div>
+                {it.hint && <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{it.hint}</div>}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   )
 }

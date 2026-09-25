@@ -871,3 +871,11 @@ Tests: `creditLedgerEmitters.test.ts` "onboarding month is never negative", `wor
 - Mountain View / Oak Park leases pre-date packets (packet = the signed lease only); adding state-required documents today = the same button per lease, "Notice only".
 
 Nic's baby was born 2026-09-24; he is away. POS: untouched by instruction.
+
+## Deploy 62 — addendum send fixed and sent for Blu; Leases row actions collapsed (2026-09-25)
+
+**Blu's "Draft and send" red error (Country Acres Addendum Troy — MH 22):** the addendum route built every signer at signing position 1, so the send step refused it: "The landlord must sign before all other signers — no signer may share the landlord's signing position." (Found straight from the 4xx reason now in the log — deploy 56 paid off.) Fix: landlord = position 1, tenants 2, 3… like every other drafting path. The draft he made at 1:15 pm was repaired by hand (primary → position 2) and sent through the real send route as him at 4:06 pm; "Please sign" went to hawshomes.llc@gmail.com; Troy is invited once Blu signs. Test extended: signer order + a successful send.
+
+**Leases page too wide (Nic):** eight row buttons ran off the right edge. Now three: Details, a **Charge** menu (Bill a fee · Charge an amount · Recurring add-on or rent change · Carried balance) and a **Change** menu (Move to another space · Move out · Hibernate/Resume). Discard stays on drafts. No modal changed; the same actions, fewer buttons. Nic's further thought — fold "bill a fee" and "charge an amount" into ONE form with a recurring toggle — not done; a design decision for him.
+
+MEMORY.md index trimmed under its size limit (entries ≤128 chars).

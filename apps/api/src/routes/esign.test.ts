@@ -3576,9 +3576,17 @@ describe('POST /documents/addendum-terms — S582 money add-on', () => {
     expect(res.status).toBe(201)
     const docId = res.body.data.id
 
-    const signers = await db.query<{ role: string }>(
-      `SELECT role FROM lease_document_signers WHERE document_id = $1`, [docId])
+    const signers = await db.query<{ role: string; order_index: number }>(
+      `SELECT role, order_index FROM lease_document_signers WHERE document_id = $1 ORDER BY order_index, role`, [docId])
     expect(signers.rows.map(r => r.role).sort()).toEqual(['co_tenant_1', 'landlord', 'primary'])
+    // S652 (Blu): every signer sat at position 1 and the send step refused the
+    // document. Landlord first, tenants after, like every other drafting path.
+    expect(signers.rows.map(r => `${r.role}:${r.order_index}`)).toEqual(['landlord:1', 'primary:2', 'co_tenant_1:3'])
+    const sent = await request(buildApp())
+      .post(`/api/esign/documents/${docId}/send`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({})
+    expect(sent.status).toBe(200)
 
     // document-first: base PDF generated (not null)
     const doc = await db.query<{ base_pdf_url: string }>(

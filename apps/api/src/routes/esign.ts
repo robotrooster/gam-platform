@@ -4036,8 +4036,12 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
            FROM landlords la JOIN users u ON u.id = la.user_id WHERE la.id = $1`,
         [lease.landlord_id])
       if (!ll) throw new AppError(500, 'Landlord account not found')
+      // S652 (Blu, "Country Acres Addendum Troy — MH 22"): every signer built
+      // here landed at signing position 1, so the send step refused it —
+      // "no signer may share the landlord's signing position." The landlord is
+      // position 1; each tenant follows, as every other drafting path does.
       const built: any[] = [{
-        userId: ll.user_id, role: 'landlord',
+        userId: ll.user_id, role: 'landlord', orderIndex: 1,
         name: `${ll.first_name ?? ''} ${ll.last_name ?? ''}`.trim() || ll.email, email: ll.email,
       }]
       if (mode === 'agreement') {
@@ -4046,7 +4050,7 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
         // "Invalid signer role" guard below, so a 2+-tenant agreement addendum
         // would 400. First tenant = primary, the rest = co_tenant_1, co_tenant_2, …
         rosterRows.forEach((r: any, i: number) => built.push({
-          userId: r.user_id, role: i === 0 ? 'primary' : `co_tenant_${i}`,
+          userId: r.user_id, role: i === 0 ? 'primary' : `co_tenant_${i}`, orderIndex: i + 2,
           name: `${r.first_name ?? ''} ${r.last_name ?? ''}`.trim() || r.email, email: r.email,
         }))
       }
