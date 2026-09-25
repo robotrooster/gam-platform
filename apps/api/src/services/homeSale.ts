@@ -166,8 +166,8 @@ export async function reconcileHomeSaleContract(contractId: string): Promise<voi
 
   const counts = await queryOne<{ billed: string; paid: string }>(
     `SELECT
-        COUNT(*) FILTER (WHERE i.payment_id IS NOT NULL) AS billed,
-        COUNT(*) FILTER (WHERE p.status IN ('settled','paid_via_deposit')) AS paid
+        COUNT(*) FILTER (WHERE i.payment_id IS NOT NULL OR i.settled_off_platform_at IS NOT NULL) AS billed,
+        COUNT(*) FILTER (WHERE p.status IN ('settled','paid_via_deposit') OR i.settled_off_platform_at IS NOT NULL) AS paid
        FROM home_sale_installments i
        LEFT JOIN payments p ON p.id = i.payment_id
       WHERE i.contract_id = $1`, [contractId])
@@ -212,6 +212,17 @@ export async function reconcileAllHomeSaleContracts(): Promise<void> {
  * Returns the number of installments billed.
  */
 export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<number> {
+  // S652 (Nic): the contract keeps its true terms — John Sheptock's started in
+  // January 2021 — but GAM bills only from the property's first billing cycle.
+  // Every installment before that was paid outside GAM and is stamped so, once;
+  // it never bills and it counts as paid when the balance is worked out.
+  await query(
+    `UPDATE home_sale_installments i SET settled_off_platform_at = NOW()
+       FROM home_sale_contracts c, units u, properties p
+      WHERE i.contract_id = c.id AND u.id = c.unit_id AND p.id = u.property_id
+        AND c.status = 'active' AND i.payment_id IS NULL AND i.settled_off_platform_at IS NULL
+        AND p.first_billing_cycle IS NOT NULL
+        AND i.billing_month < date_trunc('month', p.first_billing_cycle)::date`)
   const due = await query<any>(
     `SELECT i.id AS installment_id, i.installment_number, i.amount, i.billing_month::text AS billing_month,
             c.id AS contract_id, c.unit_id, c.lease_id, c.tenant_id, c.landlord_id, c.installments_total
@@ -219,6 +230,7 @@ export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<nu
        JOIN home_sale_contracts c ON c.id = i.contract_id
       WHERE c.status = 'active'
         AND i.payment_id IS NULL
+        AND i.settled_off_platform_at IS NULL
         AND i.billing_month <= $1::date
       ORDER BY c.id, i.installment_number ASC`,
     [asOfMonth])

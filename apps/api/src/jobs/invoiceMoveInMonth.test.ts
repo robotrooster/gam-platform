@@ -47,6 +47,26 @@ async function rentDueDates(leaseId: string): Promise<string[]> {
   return rows.rows.map(r => r.d)
 }
 
+// S652 (Nic): the property's first billing cycle is the hard floor on the DUE
+// month. Country Acres was set to October; the nightly job billed September on
+// the 23rd for eight households, and the late-fee job followed the next night.
+describe('the property\'s first billing cycle is the floor on every due month', () => {
+  it('bills nothing before the first cycle, everything from it', async () => {
+    const s = await seedStack({ startDate: '2026-05-01', rentDueDay: 1 })
+    await db.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [s.leaseId])
+    await db.query(`UPDATE properties SET first_billing_cycle = '2026-07-01' WHERE id = $1`, [s.propertyId])
+    await backfill({ from: '2026-05-01', to: '2026-08-31', leaseId: s.leaseId })
+    expect(await rentDueDates(s.leaseId)).toEqual(['2026-07-01', '2026-08-01'])
+  })
+
+  it('without a first cycle the job behaves as before', async () => {
+    const s = await seedStack({ startDate: '2026-05-01', rentDueDay: 1 })
+    await db.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [s.leaseId])
+    await backfill({ from: '2026-05-01', to: '2026-08-31', leaseId: s.leaseId })
+    expect(await rentDueDates(s.leaseId)).toEqual(['2026-06-01', '2026-07-01', '2026-08-01'])
+  })
+})
+
 describe('move-in month is never double-billed by daily generation', () => {
   // S648 (Nic): rent can be due on a day other than the 1st, and the move-in
   // invoice now covers the move-in day UP TO the next due date — not the whole

@@ -37,6 +37,7 @@ interface ActiveLease {
   // S639: already living there when the park came onto GAM — their first
   // invoice is late-fee exempt however long they took to sign.
   is_existing_tenancy?: boolean
+  first_billing_cycle?: string | null
   // S648: the landlord's answer for this property. Only TRUE waives.
   onboarding_late_fee_waiver?: boolean
   tenant_id: string | null
@@ -232,6 +233,10 @@ const ACTIVE_LEASE_SELECT = `
            -- took to sign — see lateStartExempt below.
            l.is_existing_tenancy,
            COALESCE(p.onboarding_late_fee_waiver, FALSE) AS onboarding_late_fee_waiver,
+           -- S652 (Nic): the property's first billing cycle is the hard floor on
+           -- the DUE month. Country Acres was set to October; this job billed
+           -- September on the 23rd and the late-fee job followed.
+           to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
            l.move_in_first_month_rent::text AS move_in_first_month_rent,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
@@ -300,7 +305,13 @@ async function runGeneration(
 
     if (windowEnd < windowStart) continue
 
+    // S652 (Nic): nothing is due before the property's first billing cycle.
+    // The floor is on the invoice's DUE month, not on what was consumed: the
+    // October 1 invoice still carries September's water and electric, because
+    // utilities bill in arrears and ride whichever invoice comes next.
+    const floor = lease.first_billing_cycle ? lease.first_billing_cycle.slice(0, 7) + '-01' : null
     const candidateDueDates = dueDatesInRange(windowStart, windowEnd, lease.rent_due_day)
+      .filter(d => !floor || d >= floor)
     if (candidateDueDates.length === 0) continue
 
     // The move-in invoice (moveInBundle, dated lease.start_date) prorates rent
@@ -1252,6 +1263,10 @@ export async function backfillInvoices(opts: BackfillOpts): Promise<InvoiceGenRe
            -- exactly as the daily run does.
            l.is_existing_tenancy,
            COALESCE(p.onboarding_late_fee_waiver, FALSE) AS onboarding_late_fee_waiver,
+           -- S652 (Nic): the property's first billing cycle is the hard floor on
+           -- the DUE month. Country Acres was set to October; this job billed
+           -- September on the 23rd and the late-fee job followed.
+           to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
            l.move_in_first_month_rent::text AS move_in_first_month_rent,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,

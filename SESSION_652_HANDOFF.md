@@ -879,3 +879,17 @@ Nic's baby was born 2026-09-24; he is away. POS: untouched by instruction.
 **Leases page too wide (Nic):** eight row buttons ran off the right edge. Now three: Details, a **Charge** menu (Bill a fee · Charge an amount · Recurring add-on or rent change · Carried balance) and a **Change** menu (Move to another space · Move out · Hibernate/Resume). Discard stays on drafts. No modal changed; the same actions, fewer buttons. Nic's further thought — fold "bill a fee" and "charge an amount" into ONE form with a recurring toggle — not done; a design decision for him.
 
 MEMORY.md index trimmed under its size limit (entries ≤128 chars).
+
+## Deploy 63 — the first billing cycle is the floor; Country Acres history erased; April off MH 05 (2026-09-25)
+
+**Cause of "Country Acres overdue":** (1) the nightly invoice job never read `properties.first_billing_cycle` (Oct 2026); on the 23rd it billed September for 8 households and the late-fee job added $50 each on the 6th-of-month rule. (2) John Sheptock's installment contract was typed with its true start (Jan 2021, 120 × $200); on his signature the sale engine billed 69 months, $13,800. Eight more contracts carry real historical starts and would have done the same.
+
+**Shipped:** the property's first billing cycle is the hard floor on every bill's DUE month — nightly invoices (`invoiceGeneration`, filter on candidate due dates), home payments (`billDueHomeSaleInstallments` stamps earlier installments `settled_off_platform_at`, never bills them, counts them paid in `reconcileHomeSaleContract`; migration 20260925180000). Nic: the floor is on the cycle, not on consumption — the Oct 1 invoice still carries September's utilities (arrears), untouched. New property: "First bill from GAM" is a required month on the add-property form and the onboarding property step (defaults to next month); the API defaults it when a caller omits it. Tests: invoiceMoveInMonth "first billing cycle is the floor".
+
+**Data (Nic: "completely erase them, they are not real — a void is for a mistake made ON platform"):** 8 September invoices + 16 charges (8 rent, 8 late fees) at Country Acres DELETED; John's 69 pre-October home payments DELETED and the 69 installments stamped settled outside GAM → contract reads 69 paid / 51 to go. Now open at Country Acres: MH 06 and MH 17 October rent only.
+
+**April Hendrickson (Mountain View MH 05):** never lived there. Her signer row and 17 fields removed from the lease document, her lease_tenants row voided, her invite cancelled; the document completed with `completed_at` = Ruben Negrete's signature (Sept 16, 3:08 pm), executed PDF re-stamped; lease `signed_by_tenant` set.
+
+**Mountain View tax:** both rows 6.35% → 6.60% (Santa Cruz County: 5.6% state + 1.0% county retail; transient lodging 6.60%). 6.35% was Yavapai's rate.
+
+**Not built, Nic's call pending:** returning-resident background-check bypass (options given); register decimals / clear-cart / stay-button price (he is thinking about site pricing); one-signature property notice; POS customer credit.

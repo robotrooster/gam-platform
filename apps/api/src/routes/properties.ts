@@ -85,6 +85,12 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       city: z.string(), state: z.string(), zip: z.string(),
       type: z.enum(['residential','rv_longterm','rv_weekly','rv_nightly','mixed']).default('residential').optional(),
       unitTypes: z.array(z.string()).optional(),
+      // S652 (Nic): "when a landlord onboards a property they need to choose
+      // when the first billing cycle starts through the platform." Required at
+      // creation; it is the hard floor every bill's due month sits on.
+      // The app requires it; the API defaults to next month so nothing that
+      // creates a property without asking (agents, older callers) breaks.
+      firstBillingCycle: z.string().regex(/^\d{4}-\d{2}(-\d{2})?$/, 'Pick the month GAM sends the first bill').optional(),
       // S568: FALSE = homes-only external park (investor operates without owning
       // the land; park owner not on GAM). Default TRUE (operator owns the park).
       operatorOwnsLand: z.boolean().optional(),
@@ -251,17 +257,18 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       INSERT INTO properties
         (landlord_id, name, street1, street2, city, state, zip, type, unit_types,
          requires_booking_acknowledgment, operator_owns_land,
-         owner_user_id, managed_by_user_id, timezone, timezone_source)
+         owner_user_id, managed_by_user_id, timezone, timezone_source, first_billing_cycle)
       VALUES
         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
          (SELECT user_id FROM landlords WHERE id=$1),
          (SELECT user_id FROM landlords WHERE id=$1),
-         $12,'derived')
+         $12,'derived',$13::date)
       RETURNING *`,
       [targetLandlordId, body.name, body.street1, body.street2 ?? null,
        body.city, body.state, body.zip, body.type || 'mixed', body.unitTypes || [],
        body.requiresBookingAcknowledgment ?? false, body.operatorOwnsLand ?? true,
-       timezone])
+       timezone,
+       (body.firstBillingCycle ?? nextMonthIso()).slice(0, 7) + '-01'])
     const prop = propRes.rows[0]
 
     // S579: open the property's onboarding window. While it's open the landlord
@@ -2584,3 +2591,9 @@ propertiesRouter.delete('/:id', async (req, res, next) => {
     res.json({ success: true, data: { deleted: true, name: prop.name } })
   } catch (e) { next(e) }
 })
+
+/** The first of next month, ISO — a property's default first billing cycle. */
+function nextMonthIso(): string {
+  const d = new Date(); d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() + 1)
+  return d.toISOString().slice(0, 10)
+}

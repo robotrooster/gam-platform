@@ -66,7 +66,7 @@ export function OnboardingPage() {
   // Profile form
   const [profile, setProfile] = useState({ businessName: '', ein: '', phone: '', street1: '', city: '', state: '', zip: '' })
   // Property form
-  const [property, setProperty] = useState({ name: '', street1: '', street2: '', city: '', state: '', zip: '', type: 'residential' })
+  const [property, setProperty] = useState({ name: '', street1: '', street2: '', city: '', state: '', zip: '', type: 'residential', firstBillingCycle: (() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` })() })
   const [errors, setErrors] = useState<Record<string, string>>({})
 
   // S637: the bank-account CATALOG no longer gates onboarding. It stays
@@ -222,6 +222,7 @@ export function OnboardingPage() {
     if (stepIdx === 1) {
       if (!property.name.trim()) errs.propName = 'Property name required'
       if (!property.street1.trim()) errs.street1 = 'Address required'
+      if (!/^\d{4}-\d{2}$/.test(property.firstBillingCycle || '')) errs.firstBillingCycle = 'Pick the month GAM sends the first bill'
       if (!property.city.trim()) errs.city = 'City required'
       if (!property.zip.trim()) errs.zip = 'ZIP required'
     }
@@ -416,6 +417,13 @@ export function OnboardingPage() {
                   <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Street Address *</label>
                   <input className="input" placeholder="4821 W Oak St" value={property.street1} onChange={e => setProperty(p => ({ ...p, street1: e.target.value }))} style={{ width: '100%' }} />
                   {errors.street1 && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.street1}</div>}
+                </div>
+
+                <div style={{ marginBottom: 14 }}>
+                  <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>First bill from GAM *</label>
+                  <input type="month" className="input" value={property.firstBillingCycle} onChange={e => setProperty(p => ({ ...p, firstBillingCycle: e.target.value }))} style={{ width: 180 }} />
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>GAM sends the first bill for this month and nothing earlier. Existing residents you add mid-month get their first bill here; what happened before stays outside GAM.</div>
+                  {errors.firstBillingCycle && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.firstBillingCycle}</div>}
                 </div>
 
                 <div style={{ marginBottom: 14 }}>

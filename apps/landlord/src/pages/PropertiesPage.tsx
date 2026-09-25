@@ -190,6 +190,8 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     // against the property record work correctly. Form-state keys
     // remain snake_case because the PATCH body expects them that way.
     requiresBookingAcknowledgment: property?.requiresBookingAcknowledgment ?? false,
+    // S652 (Nic): required when a property is created — the floor every bill's due month sits on.
+    firstBillingCycle: property?.firstBillingCycle ? String(property.firstBillingCycle).slice(0, 7) : nextMonthYm(),
     // S526: weekly-lease jurisdictions — auto-drafts a lease at 7+ day stays
     // instead of 30+ (see services/bookingLeaseDraft.ts).
     weeklyLeaseMode: property?.weeklyLeaseMode ?? false,
@@ -418,6 +420,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     const errs: Record<string, string> = {}
     if (!form.name.trim())    errs.name    = 'Required'
     if (!form.street1.trim()) errs.street1 = 'Required'
+    if (!property && !/^\d{4}-\d{2}$/.test(form.firstBillingCycle || '')) errs.firstBillingCycle = 'Pick the month GAM sends the first bill'
     if (!form.city.trim())    errs.city    = 'Required'
     if (!form.zip.trim())     errs.zip     = 'Required'
     setErrors(errs)
@@ -631,6 +634,14 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
             <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
               Reservation policy
             </div>
+            {!property && (
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>First bill from GAM *</label>
+                <input type="month" className="input" value={form.firstBillingCycle} onChange={e => setForm(f => ({ ...f, firstBillingCycle: e.target.value }))} style={{ width: 180 }} />
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>GAM sends the first bill for this month and nothing earlier. Existing residents you add mid-month get their first bill here; what happened before stays outside GAM.</div>
+                {errors.firstBillingCycle && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.firstBillingCycle}</div>}
+              </div>
+            )}
             <label style={{
               display:        'flex',
               alignItems:     'flex-start',
@@ -1294,4 +1305,10 @@ function ApplyQrModal({ property, onClose }: { property: any; onClose: () => voi
       </div>
     </div>
   )
+}
+
+/** The first of next month as YYYY-MM — the sensible default for a property's first bill. */
+function nextMonthYm(): string {
+  const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + 1)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
 }
