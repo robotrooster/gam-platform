@@ -26,6 +26,10 @@ interface Member {
   phone: string | null
   permissions: Record<string, any>
   scope: any
+  // S652: the roster spans every company the account owns; each member
+  // belongs to one, and the column shows only when there is more than one.
+  landlordId: string
+  companyName: string | null
   createdAt: string
   updatedAt: string
   // S168: property_manager-only — direct-deposit opt-in toggle and the
@@ -70,6 +74,7 @@ export function TeamPage() {
 
   const members = data?.members || []
   const invitations = data?.invitations || []
+  const multiCompany = new Set(members.map(m => m.landlordId)).size > 1
 
   return (
     <div>
@@ -102,13 +107,14 @@ export function TeamPage() {
                   <th>Name</th>
                   <th>Email</th>
                   <th>Role</th>
+                  {multiCompany && <th>Company</th>}
                   <th>Permissions</th>
                   <th></th>
                 </tr>
               </thead>
               <tbody>
                 {members.length === 0 ? (
-                  <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>No team members yet.</td></tr>
+                  <tr><td colSpan={multiCompany ? 6 : 5} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>No team members yet.</td></tr>
                 ) : members.map(m => {
                   const isBookkeeper = m.role === 'bookkeeper'
                   const perms = (m.permissions || {}) as Record<string, boolean>
@@ -122,6 +128,7 @@ export function TeamPage() {
                       <td style={{ fontWeight: 500 }}>{m.firstName} {m.lastName}</td>
                       <td style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>{m.email}</td>
                       <td><span className={`badge ${ROLE_BADGE[m.role]}`}>{LANDLORD_ASSIGNABLE_ROLE_LABEL[m.role]}</span></td>
+                      {multiCompany && <td style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>{m.companyName || '—'}</td>}
                       <td style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>
                         {isBookkeeper ? (
                           <select

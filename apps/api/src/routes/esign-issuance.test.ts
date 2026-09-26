@@ -100,7 +100,7 @@ async function unsignedDoc(f: Fixture): Promise<string> {
      VALUES ($1,$2,'primary','T T',$3,2,$4,'sent')`,
     [documentId, f.tenantUserId, f.tenantEmail, crypto.randomBytes(32).toString('hex')])
   for (const [col, val] of Object.entries({
-    start_date: '2025-01-01', end_date: '2025-12-31', rent_amount: '1200.00',
+    start_date: '2025-01-01', end_date: '2027-12-31', rent_amount: '1200.00',
     security_deposit: '1200.00', rent_due_day: '1', lease_type: 'fixed_term',
     auto_renew: 'false',
   })) {

@@ -169,6 +169,19 @@ export async function finalizeConnection(landlordId: string, sessionId: string):
       [landlordId, acct.id, sessionId, inst, acct.last4 ?? null,
        acct.subcategory ?? acct.category ?? null, `${inst}${acct.last4 ? ' ••' + acct.last4 : ''}`])
     out.push(conn)
+    // S652 (Nic, relinking PNC): "now it's showing my bank account twice."
+    // Stripe issues a fresh account id per link, so a relink of the SAME bank
+    // (same institution, same last four) lands as a second row. The new link is
+    // the one with today's consent; the older one is retired so the page, the
+    // debit and the sync all read the live link. Retired, not deleted — its
+    // imported history stays attached to it.
+    if (acct.last4) {
+      await query(
+        `UPDATE bank_connections SET status = 'disconnected', updated_at = now()
+          WHERE landlord_id = $1 AND id <> $2 AND status = 'active'
+            AND institution_name = $3 AND account_last4 = $4`,
+        [landlordId, conn.id, inst, acct.last4])
+    }
     try { await syncConnection(conn.id) } catch { /* initial sync best-effort */ }
     // S652 (Nic): "when they link a bank, they're authorizing debits and payouts."
     // Mint the debit method NOW, from this link, so the day GAM is owed there is

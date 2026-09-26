@@ -1065,83 +1065,37 @@ describe('POST /sign/:documentId — partial signing transitions', () => {
 
 // ─── POST /sign/:documentId/decline ────────────────────────────
 
+// S652 (Nic): nobody can decline any document. The route answers 410 and
+// touches nothing — signer row, document, landlord's inbox all untouched.
 describe('POST /sign/:documentId/decline', () => {
-  it('happy path: tenant declines → signer declined, document voided, landlord notified', async () => {
+  it('is refused for a signer (410), and the document and signer are untouched', async () => {
     const f = await seedFixture()
     const { documentId, tenantSignerId } = await seedDoc(f, { status: 'sent', tenantSignerStatus: 'viewed' })
     const res = await request(buildApp())
       .post(`/api/esign/sign/${documentId}/decline`)
       .set('Authorization', `Bearer ${f.tenantToken}`)
       .send({ reason: 'Rent too high' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.status).toBe('declined')
-    expect(res.body.data.documentVoided).toBe(true)
-    const sr = await db.query<{ status: string; decline_reason: string }>(
+    expect(res.status).toBe(410)
+    expect(res.body.error).toMatch(/cannot be declined/i)
+    const sr = await db.query<{ status: string; decline_reason: string | null }>(
       `SELECT status, decline_reason FROM lease_document_signers WHERE id = $1`, [tenantSignerId],
     )
-    expect(sr.rows[0].status).toBe('declined')
-    expect(sr.rows[0].decline_reason).toBe('Rent too high')
+    expect(sr.rows[0].status).toBe('viewed')
+    expect(sr.rows[0].decline_reason).toBeNull()
     const doc = await db.query<{ status: string }>(
       `SELECT status FROM lease_documents WHERE id = $1`, [documentId],
     )
-    expect(doc.rows[0].status).toBe('voided')
-  })
-
-  it('non-signer rejected (403)', async () => {
-    const f = await seedFixture()
-    const { documentId } = await seedDoc(f, { status: 'sent' })
-    const otherUserId = (await db.query<{ id: string }>(
-      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
-       VALUES ($1, 'x', 'tenant', 'O', 'T', TRUE) RETURNING id`,
-      [`o-${randomUUID()}@x`],
-    )).rows[0].id
-    const outsider = jwt.sign(
-      { userId: otherUserId, role: 'tenant', email: 'o@x', profileId: randomUUID(), permissions: {} },
-      process.env.JWT_SECRET!, { expiresIn: '1h' },
-    )
-    const res = await request(buildApp())
-      .post(`/api/esign/sign/${documentId}/decline`)
-      .set('Authorization', `Bearer ${outsider}`)
-    expect(res.status).toBe(403)
-  })
-
-  it('rejects already-signed signer', async () => {
-    const f = await seedFixture()
-    const { documentId } = await seedDoc(f, { status: 'in_progress', landlordSignerStatus: 'signed' })
-    const res = await request(buildApp())
-      .post(`/api/esign/sign/${documentId}/decline`)
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/already signed/i)
-  })
-
-  it('idempotent: re-decline returns alreadyDeclined=true without re-firing notifications', async () => {
-    const f = await seedFixture()
-    const { documentId } = await seedDoc(f, { status: 'voided', tenantSignerStatus: 'declined' })
-    // Stamp declined_at so the idempotent path's data echo has a value
-    await db.query(
-      `UPDATE lease_document_signers SET declined_at = NOW(), decline_reason = 'orig' WHERE document_id = $1 AND role = 'primary'`,
-      [documentId],
-    )
-    const res = await request(buildApp())
-      .post(`/api/esign/sign/${documentId}/decline`)
-      .set('Authorization', `Bearer ${f.tenantToken}`)
-      .send({ reason: 'another reason' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.alreadyDeclined).toBe(true)
-    expect(res.body.data.decline_reason).toBe('orig')
+    expect(doc.rows[0].status).toBe('sent')
     expect(emailDocumentDeclinedMock).not.toHaveBeenCalled()
   })
 
-  it('rejects when document is already voided (and signer is still pending)', async () => {
+  it('is refused for the landlord too (410)', async () => {
     const f = await seedFixture()
-    const { documentId } = await seedDoc(f, { status: 'voided' })
-    // Signer is still 'pending', not 'declined', but doc is voided.
+    const { documentId } = await seedDoc(f, { status: 'sent' })
     const res = await request(buildApp())
       .post(`/api/esign/sign/${documentId}/decline`)
-      .set('Authorization', `Bearer ${f.tenantToken}`)
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/already voided/)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(410)
   })
 })
 
@@ -1335,11 +1289,12 @@ async function seedDocFields(
 }
 
 /** Default lease data set — start in the past so the lease activates and
- *  the unit-status flip + activation branches are exercised. */
+ *  the unit-status flip + activation branches are exercised. The end date is
+ *  ahead of today on purpose: S652 refuses to issue a lease already over. */
 function defaultLeaseFields(overrides: Record<string, string> = {}): Record<string, string> {
   return {
     start_date:       '2025-01-01',
-    end_date:         '2025-12-31',
+    end_date:         '2027-12-31',
     rent_amount:      '1200.00',
     security_deposit: '1200.00',
     rent_due_day:     '1',

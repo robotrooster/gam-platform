@@ -268,7 +268,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
   )
 }
 
-type Stage = 'signing'|'review'|'done'|'declined'
+type Stage = 'signing'|'review'|'done'
 
 // S534: a 'date' field is auto-stampable only when it records WHEN the
 // signer signed. Term dates (lease start/end) are deliberate inputs.
@@ -454,26 +454,9 @@ export function SignPage() {
     },
   }), [])
 
-  // S234: decline path. The tenant can refuse a sent doc with a reason.
-  // Backend voids the document on success — no path back.
-  const [showDeclineModal, setShowDeclineModal] = useState(false)
-  const [declineErr, setDeclineErr] = useState<string | null>(null)
-  const declineMut = useMutation(
-    (reason: string) => authFetch('/esign/sign/'+documentId+'/decline', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ reason }),
-    }).then(r=>r.json()),
-    {
-      onSuccess: (res:any) => {
-        if (!res?.success) { setDeclineErr(res?.error || 'Could not record decline'); return }
-        clearDraft()
-        setShowDeclineModal(false)
-        setStage('declined')
-      },
-      onError: (e:any) => setDeclineErr(e?.message || 'Could not record decline'),
-    },
-  )
+  // S652 (Nic): "make it so that nobody can ever decline any document. They
+  // just don't complete the signature if they're choosing not to." No decline
+  // path on any sign page; an unsigned document simply stays unsigned.
 
   const renderPageImperative = useCallback(async (pdf:any, pageNum:number) => {
     if (!canvasRef.current || !containerRef.current) return
@@ -713,20 +696,6 @@ export function SignPage() {
     return <SignatureSetup name={signer.name} initials={initials} onComplete={(sig,init,font)=>{ setSavedSig({value:sig,font}); setSavedInit({value:init,font}); setSetupDone(true) }}/>
   }
 
-  if (stage==='declined') return (
-    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
-      <div style={{ width:80, height:80, borderRadius:'50%', background:'rgba(220,76,76,.1)', border:'2px solid var(--red, #dc4c4c)', display:'flex', alignItems:'center', justifyContent:'center' }}>
-        <AlertCircle size={36} style={{ color:'var(--red, #dc4c4c)' }}/>
-      </div>
-      <h2 style={{ color:'var(--text-0)', margin:0 }}>You declined this document</h2>
-      <p style={{ color:'var(--text-3)', maxWidth:420, lineHeight:1.6 }}>
-        The document has been voided. {data?.document?.landlordName ? `${data.document.landlordName} has been notified` : 'The landlord has been notified'}
-        {' '}with your reason. If you'd like to revisit, contact them directly so they can prepare a new document.
-      </p>
-      <div style={{ fontSize:'.75rem', color:'var(--text-3)' }}>Declined: {new Date().toLocaleString()}</div>
-      <button onClick={()=>navigate('/')} className="btn btn-ghost" style={{ marginTop:8 }}>Back to portal</button>
-    </div>
-  )
 
   if (stage==='done') return (
     <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
@@ -793,18 +762,6 @@ export function SignPage() {
           </>}
           {!allFilled && nextField && <button onClick={goToNextField} className="btn btn-primary btn-sm">Next Field <ArrowRight size={13}/></button>}
           {allFilled && <button onClick={()=>setStage('review')} className="btn btn-primary">Review & Sign <ArrowRight size={14}/></button>}
-          {/* S234: decline path. Always available pre-sign so a tenant
-              who can't proceed (wrong terms, wrong unit, etc.) doesn't
-              need to ghost the landlord — they can refuse with reason
-              and the landlord knows to follow up. */}
-          <button
-            onClick={() => { setDeclineErr(null); setShowDeclineModal(true) }}
-            className="btn btn-ghost btn-sm"
-            style={{ color:'var(--red, #dc4c4c)' }}
-            title="Refuse to sign — voids the document"
-          >
-            Decline
-          </button>
         </div>
       </div>
 
@@ -1052,68 +1009,6 @@ export function SignPage() {
         </div>
       )}
 
-      {showDeclineModal && (
-        <DeclineModal
-          documentTitle={doc.title}
-          isLoading={declineMut.isLoading}
-          error={declineErr}
-          onCancel={() => setShowDeclineModal(false)}
-          onConfirm={(reason) => declineMut.mutate(reason)}
-        />
-      )}
-    </div>
-  )
-}
-
-function DeclineModal({
-  documentTitle, isLoading, error, onCancel, onConfirm,
-}: {
-  documentTitle: string
-  isLoading: boolean
-  error: string | null
-  onCancel: () => void
-  onConfirm: (reason: string) => void
-}) {
-  const [reason, setReason] = useState('')
-
-  return (
-    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
-      <div style={{ background:'white', borderRadius:14, width:'100%', margin:'auto', maxWidth:460, padding:'22px 24px', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
-        <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8 }}>
-          <AlertCircle size={20} style={{ color:'#dc4c4c' }}/>
-          <div style={{ fontWeight:800, fontSize:'1.05rem', color:'#1a1a1a' }}>Decline this document?</div>
-        </div>
-        <p style={{ fontSize:'.82rem', color:'#666', lineHeight:1.5, margin:'0 0 14px' }}>
-          Declining voids "<strong>{documentTitle}</strong>" — it can't be signed by anyone. Your landlord is notified with the reason you provide. There's no path to undo this; if the issue is fixable, the landlord prepares a new document and re-sends it.
-        </p>
-        <label style={{ fontSize:'.72rem', fontWeight:700, color:'#666', textTransform:'uppercase', letterSpacing:'.05em', display:'block', marginBottom:5 }}>
-          Reason <span style={{ fontWeight:400, textTransform:'none', letterSpacing:0 }}>(optional, but strongly recommended)</span>
-        </label>
-        <textarea
-          value={reason}
-          onChange={e => setReason(e.target.value)}
-          rows={4}
-          maxLength={1000}
-          placeholder="What about this document doesn't work? E.g. wrong unit, wrong dates, terms changed since we discussed."
-          style={{ width:'100%', padding:'10px 12px', borderRadius:8, border:'1px solid #e5e7eb', fontSize:'.85rem', fontFamily:'inherit', resize:'vertical', boxSizing:'border-box', color:'#1a1a1a', background:'#fafafa' }}
-        />
-        <div style={{ fontSize:'.7rem', color:'#999', marginTop:4, textAlign:'right' }}>{reason.length}/1000</div>
-        {error && (
-          <div style={{ marginTop:10, padding:'8px 12px', borderRadius:6, background:'rgba(220,76,76,.08)', border:'1px solid rgba(220,76,76,.25)', color:'#dc4c4c', fontSize:'.78rem' }}>
-            {error}
-          </div>
-        )}
-        <div style={{ display:'flex', gap:9, marginTop:16 }}>
-          <button onClick={onCancel} disabled={isLoading}
-            style={{ flex:1, padding:'11px', borderRadius:10, border:'1px solid #e5e7eb', background:'white', cursor:'pointer', fontWeight:600, color:'#1a1a1a' }}>
-            Cancel
-          </button>
-          <button onClick={() => onConfirm(reason.trim())} disabled={isLoading}
-            style={{ flex:1, padding:'11px', borderRadius:10, border:'none', background:'#dc4c4c', color:'white', fontWeight:700, cursor: isLoading?'wait':'pointer' }}>
-            {isLoading ? 'Declining…' : 'Decline document'}
-          </button>
-        </div>
-      </div>
     </div>
   )
 }

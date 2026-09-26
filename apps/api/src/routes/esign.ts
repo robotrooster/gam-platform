@@ -1,7 +1,6 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { extractUploadFilename, resolveUploadPath } from '../lib/uploadPaths'
-import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import { packageSiblings } from '../services/signingPackages'
 import { advancePacket, announcePacketIfComplete } from '../services/packetRelay'
 import {
@@ -198,6 +197,32 @@ async function getDocumentTenantSigners(documentId: string): Promise<{
  *
  * Returns the created lease_documents row.
  */
+/**
+ * S652 — a lease cannot be issued already over.
+ *
+ * Blu signed Country Acres MH 06 with an end date of 8/1/2026 and MH 17 with
+ * 2/26/2026, on 9/22/2026. The landlord's signature issued both leases, that
+ * night's lease-end job found them past their end, expired them, removed
+ * Curtis Clabough and Cameron Valdez from their homes and marked both sites
+ * vacant. Nothing said a word until October's invoices went missing.
+ *
+ * An end date on or before today is refused where the dates are read — at
+ * send and at every signature — with the date in the sentence. '-' (month to
+ * month) and a blank end date pass.
+ */
+export function assertLeaseNotAlreadyOver(endVal: string | null | undefined, today: Date = new Date()): void {
+  const raw = (endVal ?? '').trim()
+  if (!raw || raw === '-') return
+  const end = new Date(raw)
+  if (Number.isNaN(end.getTime())) return
+  const t = new Date(today.getFullYear(), today.getMonth(), today.getDate())
+  const e = new Date(end.getFullYear(), end.getMonth(), end.getDate())
+  if (e <= t) {
+    throw new AppError(400,
+      `This lease ends ${raw}, which has already passed. A lease cannot be issued already over — enter the current term, or "-" for month to month.`)
+  }
+}
+
 export async function createDocumentRecord(client: any, opts: {
   landlordId: string,
   templateId: string | null,
@@ -1940,7 +1965,16 @@ async function executeAddendumTerms(client: any, doc: any): Promise<{ leaseId: s
   // Block terminal states in case lease transitioned between creation and signing.
   // S71: 'voided' branch dropped — leases_status_check only allows
   // pending/active/expired/terminated, so 'voided' was unreachable.
-  if (lease.status === 'expired' || lease.status === 'terminated') {
+  //
+  // S652: a state/federal DISCLOSURE amends nothing — it is a signed notice
+  // that rides in the packet — so the lease's status has no bearing on it.
+  // Five of Country Acres' signed disclosures sat in execution_failed because
+  // their lease had expired between issuance and the last signature.
+  const purpose = doc.template_id
+    ? await client.query(`SELECT purpose FROM lease_templates WHERE id=$1`, [doc.template_id]).then((r: any) => r.rows[0]?.purpose ?? null)
+    : null
+  const isDisclosure = purpose === 'state_disclosure' || purpose === 'federal_disclosure'
+  if (!isDisclosure && (lease.status === 'expired' || lease.status === 'terminated')) {
     throw new AppError(409, `Cannot amend terms: lease is ${lease.status}`)
   }
 
@@ -4469,6 +4503,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
         WHERE document_id=$1 AND lease_column IN ('start_date','end_date') AND value IS NOT NULL`, [doc.id])
       const startVal = (vals as any[]).find(v => v.lease_column === 'start_date')?.value
       const endVal   = (vals as any[]).find(v => v.lease_column === 'end_date')?.value
+      if (doc.document_type === 'original_lease') assertLeaseNotAlreadyOver(endVal)
       if (startVal) {
         const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
         // S535: '-' end date = month-to-month (no end date) — never cast it as a date.
@@ -5224,6 +5259,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       const vals = valsRes.rows
       const startVal = (vals as any[]).find(v => v.lease_column === 'start_date')?.value
       const endVal   = (vals as any[]).find(v => v.lease_column === 'end_date')?.value
+      if (doc.document_type === 'original_lease') assertLeaseNotAlreadyOver(endVal)
       if (startVal) {
         const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
         // S535: '-' end date = month-to-month (no end date) — never cast it as a date.
@@ -5805,125 +5841,16 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
   }
 })
 
-// S234: signer-side decline. The schema's signer status enum has
-// included 'declined' since the original migration but no path ever
-// flipped a row to that state. Here it is. Semantics:
-//   - Decline by ANY signer voids the entire document (one decline =
-//     no point continuing the chain — the doc is dead). Mirrors the
-//     existing auto-void on expiry.
-//   - Reason is captured if provided (optional, max 1000 chars).
-//   - Landlord gets an email with the reason + an in-app notification.
-//   - Idempotent: re-clicking decline on an already-declined signer
-//     row returns the existing decline state without firing another
-//     notification.
-esignRouter.post('/sign/:documentId/decline', authOrSignerToken, async (req, res, next) => {
-  const client = await getClient()
-  try {
-    const reason = req.body?.reason != null ? String(req.body.reason).trim().slice(0, 1000) : null
-
-    await client.query('BEGIN')
-
-    const signerRes = await client.query(
-      `SELECT * FROM lease_document_signers WHERE document_id=$1 AND user_id=$2 FOR UPDATE`,
-      [req.params.documentId, req.user!.userId])
-    const signer = signerRes.rows[0]
-    if (!signer) throw new AppError(403, 'You are not a signer on this document')
-    if (signer.status === 'signed') throw new AppError(400, 'You have already signed this document')
-
-    // Idempotent: already declined → return existing state.
-    if (signer.status === 'declined') {
-      await client.query('COMMIT')
-      return res.json({
-        success: true,
-        data: {
-          status: 'declined',
-          declined_at: signer.declined_at,
-          decline_reason: signer.decline_reason,
-          alreadyDeclined: true,
-        },
-      })
-    }
-
-    const docRes = await client.query(
-      `SELECT d.*, u.unit_number, p.name AS property_name,
-              lu.id AS landlord_user_id,
-              lu.first_name AS landlord_first, lu.last_name AS landlord_last,
-              lu.email AS landlord_email
-         FROM lease_documents d
-         LEFT JOIN units u ON u.id = d.unit_id
-         LEFT JOIN properties p ON p.id = u.property_id
-         JOIN landlords la ON la.id = d.landlord_id
-         JOIN users lu ON lu.id = la.user_id
-        WHERE d.id = $1`,
-      [signer.document_id])
-    const doc = docRes.rows[0]
-    if (!doc) throw new AppError(404, 'Document not found')
-    if (doc.status === 'voided' || doc.status === 'execution_failed') {
-      throw new AppError(400, `Document is already ${doc.status} — nothing to decline`)
-    }
-
-    await client.query(
-      `UPDATE lease_document_signers
-          SET status = 'declined',
-              declined_at = NOW(),
-              decline_reason = $1
-        WHERE id = $2`,
-      [reason, signer.id])
-
-    await client.query(
-      `UPDATE lease_documents SET status = 'voided', updated_at = NOW() WHERE id = $1`,
-      [doc.id])
-
-    // S29c-2-A: any pending lease/tenant rows tied to this document
-    // need to be cascade-voided so the limbo state doesn't strand
-    // tenants in /pending. Same helper the auto-void cron uses.
-    try {
-      await cascadeLeaseTenantsOnVoid(client.query.bind(client), { id: doc.id, document_type: doc.document_type })
-    } catch (e) {
-      logger.error({ err: e }, '[esign-decline] cascadeLeaseTenantsOnVoid failed:')
-    }
-
-    await client.query('COMMIT')
-
-    // Notify the landlord. Email + in-app notification, both fire-and-
-    // forget — webhook caller already got their 200 back at this point.
-    const unitLabel = [doc.property_name, doc.unit_number ? `Unit ${doc.unit_number}` : null]
-      .filter(Boolean).join(' · ') || 'Document'
-    const landlordName = `${doc.landlord_first || ''} ${doc.landlord_last || ''}`.trim() || 'there'
-    const signerName  = signer.name || (req.user!.email ?? 'A signer')
-
-    const { emailDocumentDeclined } = await import('../services/email')
-    emailDocumentDeclined(
-      doc.landlord_email, landlordName, signerName, signer.role,
-      doc.title || 'Lease document', unitLabel, reason,
-      { landlordId: doc.landlord_id, documentId: doc.id },
-    ).catch(e => logger.error({ err: e }, '[EMAIL] esign decline:'))
-
-    createNotification({
-      userId: doc.landlord_user_id,
-      landlordId: doc.landlord_id,
-      type: 'esign_document_declined',
-      title: `${signerName} declined to sign`,
-      body: `${signerName} (${signer.role}) declined "${doc.title || 'lease document'}". ` +
-            (reason ? `Reason: ${reason}` : 'No reason provided.'),
-      data: { documentId: doc.id, signerId: signer.id, decline_reason: reason },
-    }).catch(e => logger.error({ err: e }, '[NOTIFY] esign decline:'))
-
-    res.json({
-      success: true,
-      data: {
-        status: 'declined',
-        declined_at: new Date().toISOString(),
-        decline_reason: reason,
-        documentVoided: true,
-      },
-    })
-  } catch (e) {
-    try { await client.query('ROLLBACK') } catch {}
-    next(e)
-  } finally {
-    client.release()
-  }
+// S652 (Nic): "make it so that nobody can ever decline any document. They just
+// don't complete the signature if they're choosing not to."
+//
+// This used to be the S234 decline path: one signer's refusal voided the whole
+// document, which is how Jeff Bowman's "Decline" on MH 30's lead-paint sales
+// disclosure killed a document Blu and Kim had already signed. There is no
+// decline any more, on any sign page, for anyone. The route stays only so an
+// old client gets a sentence instead of a 404.
+esignRouter.post('/sign/:documentId/decline', authOrSignerToken, async (_req, _res, next) => {
+  next(new AppError(410, 'Documents cannot be declined. If you are not going to sign, leave it unsigned and tell your landlord.'))
 })
 
 // ─────────────────────────────────────────────────────────────

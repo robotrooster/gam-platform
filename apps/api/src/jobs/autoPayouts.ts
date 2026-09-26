@@ -296,7 +296,6 @@ export interface PayoutResult {
   triggersDeferred: number
   skippedAlreadyPaidThisWeek: number
   /** S652 (Nic): held because GAM cannot debit the landlord's bank — a link is two-way or it is nothing. */
-  skippedNoDebitLink: number
   payoutsFailed: number
   errors: { entity: string; entity_id: string; account: string; error: string }[]
 }
@@ -326,7 +325,6 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
     skippedBelowMinimum: 0,
     triggersDeferred: 0,
     skippedAlreadyPaidThisWeek: 0,
-    skippedNoDebitLink: 0,
     payoutsFailed: 0,
     errors: [],
   }
@@ -508,7 +506,6 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
       else if (fired === 'zero_balance')          result.skippedZeroBalance++
       else if (fired === 'below_minimum')         result.skippedBelowMinimum++
       else if (fired === 'already_paid_this_week')result.skippedAlreadyPaidThisWeek++
-      else if (fired === 'no_debit_link')         result.skippedNoDebitLink++
       else if (fired === 'failed')                result.payoutsFailed++
 
     } catch (e: any) {
@@ -526,7 +523,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
 }
 
 type OneCandidateOutcome =
-  'fired' | 'zero_balance' | 'already_paid_this_week' | 'below_minimum' | 'failed' | 'no_debit_link'
+  'fired' | 'zero_balance' | 'already_paid_this_week' | 'below_minimum' | 'failed'
 
 async function processOneCandidate(
   cand: Candidate, today: string, monthEndSweep = false, catchUpRun = false,
@@ -580,13 +577,11 @@ async function processOneCandidate(
   //     lands on their own Connect at allocation/charge time. (S648: business
   //     money is held on the platform now — reconciled just below.)
   if (cand.kind === 'user') {
-    // S652 (Nic, DIRECTIVE): "a person cannot opt in to get paid out to their
-    // bank and not be charged from their bank when they owe… we take money
-    // when we're owed, we pay out when they're owed." A payout goes to a bank
-    // GAM can also debit. No such bank → the payout waits and the landlord is
-    // told exactly what to fix.
-    const held = await holdUnlessDebitable(cand)
-    if (held) return 'no_debit_link'
+    // S652 (Nic): a payout is NEVER held for the bank link. "Payouts are going
+    // to always happen… we will just withdraw the money from that." The debit
+    // side is minted from the link itself (bankFeed.finalizeConnection) and what
+    // GAM is owed is netted from the balance before this runs; a link GAM cannot
+    // debit is a notice on the Bank page, not a reason to keep someone's money.
     await reconcilePlatformHeldPayments(cand.entity_id)
   }
   // S648: business money is held on the platform too (invoices, register
@@ -687,44 +682,3 @@ async function processOneCandidate(
   return 'fired'
 }
 
-/**
- * S652: the two-way rule. Every landlord behind this Connect account must have
- * a debit method GAM can pull from. One is minted from the bank-feed link on the
- * spot when missing; if that cannot be done, the payout is held and the landlord
- * is told why (the same reason the bank page shows beside the link).
- */
-async function holdUnlessDebitable(cand: UserCandidate): Promise<boolean> {
-  const lls = await query<{ id: string; gam_debit_payment_method_id: string | null; business_name: string | null }>(
-    `SELECT id, gam_debit_payment_method_id, business_name FROM landlords
-      WHERE user_id = $1 AND stripe_connect_account_id = $2 AND COALESCE(is_demo, FALSE) = FALSE`,
-    [cand.entity_id, cand.stripe_connect_account_id])
-  for (const ll of lls) {
-    if (ll.gam_debit_payment_method_id) continue
-    const { createDebitPaymentMethod, debitLinkProblem } = await import('../services/bankFeed')
-    const pm = await createDebitPaymentMethod(ll.id).catch(() => null)
-    if (pm) {
-      await query(
-        `UPDATE landlords SET gam_debit_payment_method_id = $2, gam_debit_bank_last4 = $3, gam_debit_bank_name = $4,
-                gam_debit_authorized_at = COALESCE(gam_debit_authorized_at, NOW()), updated_at = NOW() WHERE id = $1`,
-        [ll.id, pm.paymentMethodId, pm.last4, pm.bankName])
-      continue
-    }
-    const why = await debitLinkProblem(ll.id).catch(() => 'GAM cannot debit the linked bank.')
-    logger.warn({ landlordId: ll.id, why }, '[auto_payouts] payout held — bank link cannot be debited')
-    try {
-      const { createNotification } = await import('../services/notifications')
-      const owner = (await query<{ email: string }>(`SELECT email FROM users WHERE id = $1`, [cand.entity_id]))[0]
-      await createNotification({
-        userId: cand.entity_id, landlordId: ll.id, emailTo: owner?.email,
-        type: 'payout_held_no_debit_link',
-        title: 'Your payout is waiting on your bank link',
-        body: `${why} Payouts and debits use the same bank; once GAM can debit it, your payout goes out on the next run.`,
-        actionUrl: '/bank', sendEmail: true,
-        emailSubject: 'Action needed: your payout is waiting on your bank link',
-        emailHtml: `<p>${why}</p><p>Payouts and debits use the same bank. Relink it under <strong>Financials → Bank</strong> and your payout goes out on the next run.</p>`,
-      })
-    } catch (e) { logger.error({ err: e, landlordId: ll.id }, '[auto_payouts] could not notify about the held payout') }
-    return true
-  }
-  return false
-}

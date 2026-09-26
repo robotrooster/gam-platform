@@ -17,7 +17,7 @@ import {
 import { logger } from '../lib/logger'
 // S641: one resolver for portal URLs — never a localhost link in production.
 import { portalUrl, portalLink } from '../lib/portalUrls'
-import { resolveLandlordTarget, landlordIdForProperty } from '../lib/landlordScope'
+import { resolveLandlordTarget, landlordIdForProperty, landlordScopeIds } from '../lib/landlordScope'
 
 // ── Shared helpers ────────────────────────────────────────────────
 
@@ -107,6 +107,24 @@ async function getLandlordIdFromReq(req: any): Promise<string> {
   return resolveLandlordTarget(req.user, null, 'team member')
 }
 
+/**
+ * S652 — every company whose team this caller may see or edit.
+ *
+ * Nic: "I don't see anywhere that shows my existing team." His account owns
+ * Oak Park AND Mountain View; the roll-up resolved ONE company (the one the
+ * account founded) and Lisa, on Mountain View's front desk, was under the
+ * other. A team member belongs to a property, the property to a company, and
+ * the account to all of its companies — so the roster spans them all, and a
+ * member is looked up by user id across them rather than under a guess.
+ */
+function teamLandlordIds(req: any): Promise<string[]> {
+  if (req.user?.role === 'landlord') {
+    const owned = landlordScopeIds(req.user)
+    if (owned.length) return Promise.resolve(owned)
+  }
+  return getLandlordIdFromReq(req).then((id) => [id])
+}
+
 async function insertScopeRow(
   client: any,
   role: LandlordAssignableRole,
@@ -189,14 +207,14 @@ scopesRouter.use(requireAuth)
 // Registered BEFORE /:roleType so Express doesn't match 'team' as a roleType.
 scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'), async (req, res, next) => {
   try {
-    const landlordId = await getLandlordIdFromReq(req)
+    const landlordIds = await teamLandlordIds(req)
 
     // S168: surface direct_deposit_enabled (per-manager opt-in toggle) and
     // the cached Connect-readiness flags from users so TeamPage can render
     // both the toggle state and the manager's onboarding progress without
     // a second round-trip.
     const pmRows = await query<any>(
-      `SELECT 'property_manager' AS role, s.user_id, s.permissions,
+      `SELECT 'property_manager' AS role, s.user_id, s.landlord_id, la.business_name AS company_name, s.permissions,
               jsonb_build_object(
                 'propertyIds', s.property_ids,
                 'unitIds', s.unit_ids,
@@ -209,11 +227,11 @@ scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'),
               u.connect_details_submitted,
               s.created_at, s.updated_at,
               u.email, u.first_name, u.last_name, u.phone
-         FROM property_manager_scopes s JOIN users u ON u.id = s.user_id
-        WHERE s.landlord_id = $1`, [landlordId])
+         FROM property_manager_scopes s JOIN users u ON u.id = s.user_id JOIN landlords la ON la.id = s.landlord_id
+        WHERE s.landlord_id = ANY($1::uuid[])`, [landlordIds])
 
     const omRows = await query<any>(
-      `SELECT 'onsite_manager' AS role, s.user_id, s.permissions,
+      `SELECT 'onsite_manager' AS role, s.user_id, s.landlord_id, la.business_name AS company_name, s.permissions,
               jsonb_build_object(
                 'propertyIds', s.property_ids,
                 'unitIds', s.unit_ids,
@@ -221,11 +239,11 @@ scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'),
               ) AS scope,
               s.created_at, s.updated_at,
               u.email, u.first_name, u.last_name, u.phone
-         FROM onsite_manager_scopes s JOIN users u ON u.id = s.user_id
-        WHERE s.landlord_id = $1`, [landlordId])
+         FROM onsite_manager_scopes s JOIN users u ON u.id = s.user_id JOIN landlords la ON la.id = s.landlord_id
+        WHERE s.landlord_id = ANY($1::uuid[])`, [landlordIds])
 
     const mwRows = await query<any>(
-      `SELECT 'maintenance' AS role, s.user_id, s.permissions,
+      `SELECT 'maintenance' AS role, s.user_id, s.landlord_id, la.business_name AS company_name, s.permissions,
               jsonb_build_object(
                 'propertyIds', s.property_ids,
                 'unitIds', s.unit_ids,
@@ -234,17 +252,17 @@ scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'),
               ) AS scope,
               s.created_at, s.updated_at,
               u.email, u.first_name, u.last_name, u.phone
-         FROM maintenance_worker_scopes s JOIN users u ON u.id = s.user_id
-        WHERE s.landlord_id = $1`, [landlordId])
+         FROM maintenance_worker_scopes s JOIN users u ON u.id = s.user_id JOIN landlords la ON la.id = s.landlord_id
+        WHERE s.landlord_id = ANY($1::uuid[])`, [landlordIds])
 
     const bkRows = await query<any>(
-      `SELECT 'bookkeeper' AS role, s.user_id,
+      `SELECT 'bookkeeper' AS role, s.user_id, s.landlord_id, la.business_name AS company_name,
               jsonb_build_object('access_level', s.access_level) AS permissions,
               jsonb_build_object('accessLevel', s.access_level) AS scope,
               s.created_at, s.updated_at,
               u.email, u.first_name, u.last_name, u.phone
-         FROM bookkeeper_scopes s JOIN users u ON u.id = s.user_id
-        WHERE s.landlord_id = $1`, [landlordId])
+         FROM bookkeeper_scopes s JOIN users u ON u.id = s.user_id JOIN landlords la ON la.id = s.landlord_id
+        WHERE s.landlord_id = ANY($1::uuid[])`, [landlordIds])
 
     const members = [...pmRows, ...omRows, ...mwRows, ...bkRows]
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
@@ -252,8 +270,8 @@ scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'),
     const invitations = await query<any>(
       `SELECT id, email, role, status, expires_at, created_at, accepted_at, revoked_at
          FROM invitations
-        WHERE landlord_id = $1 AND status = 'pending'
-        ORDER BY created_at DESC`, [landlordId])
+        WHERE landlord_id = ANY($1::uuid[]) AND status = 'pending'
+        ORDER BY created_at DESC`, [landlordIds])
 
     res.json({ success: true, data: { members, invitations } })
   } catch (e) { next(e) }
@@ -273,7 +291,7 @@ scopesRouter.patch(
   requirePerm('team.manage_permissions'),
   async (req, res, next) => {
     try {
-      const landlordId = await getLandlordIdFromReq(req)
+      const landlordIds = await teamLandlordIds(req)
       const body = z.object({ enabled: z.boolean() }).parse(req.body)
 
       // S236: self-target guard. CLAUDE.md spec: manager Connect is
@@ -290,16 +308,17 @@ scopesRouter.patch(
       const before = await queryOne<{ direct_deposit_enabled: boolean }>(
         `SELECT direct_deposit_enabled
            FROM property_manager_scopes
-          WHERE user_id = $1 AND landlord_id = $2`,
-        [req.params.userId, landlordId])
+          WHERE user_id = $1 AND landlord_id = ANY($2::uuid[])`,
+        [req.params.userId, landlordIds])
       if (!before) throw new AppError(404, 'Scope row not found')
 
       const updated = await queryOne<any>(
         `UPDATE property_manager_scopes
             SET direct_deposit_enabled = $1, updated_at = NOW()
-          WHERE user_id = $2 AND landlord_id = $3
+          WHERE user_id = $2 AND landlord_id = ANY($3::uuid[])
           RETURNING *`,
-        [body.enabled, req.params.userId, landlordId])
+        [body.enabled, req.params.userId, landlordIds])
+      const landlordId: string = updated.landlord_id
 
       if (body.enabled && !before.direct_deposit_enabled) {
         const manager = await queryOne<{ email: string; first_name: string }>(
@@ -345,13 +364,13 @@ scopesRouter.get(
   requirePerm('team.manage_permissions'),
   async (req, res, next) => {
     try {
-      const landlordId = await getLandlordIdFromReq(req)
+      const landlordIds = await teamLandlordIds(req)
 
       // Authorize: caller must employ this manager.
       const scope = await queryOne<{ id: string }>(
         `SELECT id FROM property_manager_scopes
-          WHERE user_id = $1 AND landlord_id = $2`,
-        [req.params.userId, landlordId])
+          WHERE user_id = $1 AND landlord_id = ANY($2::uuid[])`,
+        [req.params.userId, landlordIds])
       if (!scope) throw new AppError(404, 'Manager not found in your team')
 
       const userRow = await queryOne<{ stripe_connect_account_id: string | null }>(
@@ -373,23 +392,23 @@ scopesRouter.get('/:roleType', requirePerm('team.invite', 'team.manage_permissio
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
-    const landlordId = await getLandlordIdFromReq(req)
+    const landlordIds = await teamLandlordIds(req)
     const table = SCOPE_TABLES[role]
 
     const users = await query<any>(
       `SELECT s.*, u.email, u.first_name, u.last_name, u.phone
        FROM ${table} s
        JOIN users u ON u.id = s.user_id
-       WHERE s.landlord_id = $1
+       WHERE s.landlord_id = ANY($1::uuid[])
        ORDER BY s.created_at DESC`,
-      [landlordId])
+      [landlordIds])
 
     const invitations = await query<any>(
       `SELECT * FROM invitations
-       WHERE landlord_id = $1 AND role = $2
+       WHERE landlord_id = ANY($1::uuid[]) AND role = $2
        ORDER BY created_at DESC
        LIMIT 100`,
-      [landlordId, role])
+      [landlordIds, role])
 
     res.json({ success: true, data: { users, invitations } })
   } catch (e) { next(e) }
@@ -486,7 +505,7 @@ scopesRouter.patch('/:roleType/:userId/permissions', requirePerm('team.manage_pe
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
     if (role === 'bookkeeper') throw new AppError(400, 'Bookkeeper uses accessLevel, not permissions toggles')
-    const landlordId = await getLandlordIdFromReq(req)
+    const landlordIds = await teamLandlordIds(req)
     const body = z.object({ permissions: z.record(z.boolean()) }).parse(req.body)
     const table = SCOPE_TABLES[role]
 
@@ -502,8 +521,8 @@ scopesRouter.patch('/:roleType/:userId/permissions', requirePerm('team.manage_pe
 
     const updated = await queryOne<any>(
       `UPDATE ${table} SET permissions = $1, updated_at = NOW()
-        WHERE user_id = $2 AND landlord_id = $3 RETURNING *`,
-      [JSON.stringify(body.permissions), req.params.userId, landlordId])
+        WHERE user_id = $2 AND landlord_id = ANY($3::uuid[]) RETURNING *`,
+      [JSON.stringify(body.permissions), req.params.userId, landlordIds])
     if (!updated) throw new AppError(404, 'Scope row not found')
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -514,7 +533,7 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
-    const landlordId = await getLandlordIdFromReq(req)
+    const landlordIds = await teamLandlordIds(req)
     const scope = validateScopePayload(role, req.body)
 
     // S236: self-edit guard. Same reasoning as the /permissions
@@ -532,9 +551,9 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
           `UPDATE property_manager_scopes SET
              property_ids = $1, unit_ids = $2, all_properties = $3,
              maint_approval_ceiling_cents = $4, updated_at = NOW()
-           WHERE user_id = $5 AND landlord_id = $6 RETURNING *`,
+           WHERE user_id = $5 AND landlord_id = ANY($6::uuid[]) RETURNING *`,
           [scope.propertyIds, scope.unitIds, scope.allProperties,
-           scope.maintApprovalCeilingCents, req.params.userId, landlordId])
+           scope.maintApprovalCeilingCents, req.params.userId, landlordIds])
         break
       case 'onsite_manager': {
         // W-10 (S529, Nic decision): the property binding is PERMANENT —
@@ -543,8 +562,8 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
         // rows with no property yet get one first-set.
         const existing = await queryOne<any>(
           `SELECT property_ids FROM onsite_manager_scopes
-            WHERE user_id = $1 AND landlord_id = $2`,
-          [req.params.userId, landlordId])
+            WHERE user_id = $1 AND landlord_id = ANY($2::uuid[])`,
+          [req.params.userId, landlordIds])
         if (!existing) throw new AppError(404, 'Scope row not found')
         const cur: string[] = existing.property_ids || []
         const changed = cur.length &&
@@ -555,8 +574,8 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
         updated = await queryOne<any>(
           `UPDATE onsite_manager_scopes SET
              property_ids = $1, unit_ids = $2, updated_at = NOW()
-           WHERE user_id = $3 AND landlord_id = $4 RETURNING *`,
-          [cur.length ? cur : scope.propertyIds, scope.unitIds, req.params.userId, landlordId])
+           WHERE user_id = $3 AND landlord_id = ANY($4::uuid[]) RETURNING *`,
+          [cur.length ? cur : scope.propertyIds, scope.unitIds, req.params.userId, landlordIds])
         break
       }
       case 'maintenance':
@@ -564,16 +583,16 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
           `UPDATE maintenance_worker_scopes SET
              property_ids = $1, unit_ids = $2, job_categories = $3,
              all_properties = $4, updated_at = NOW()
-           WHERE user_id = $5 AND landlord_id = $6 RETURNING *`,
+           WHERE user_id = $5 AND landlord_id = ANY($6::uuid[]) RETURNING *`,
           [scope.propertyIds, scope.unitIds, scope.jobCategories,
-           scope.allProperties, req.params.userId, landlordId])
+           scope.allProperties, req.params.userId, landlordIds])
         break
       case 'bookkeeper':
         updated = await queryOne<any>(
           `UPDATE bookkeeper_scopes SET
              access_level = $1, updated_at = NOW()
-           WHERE user_id = $2 AND landlord_id = $3 RETURNING *`,
-          [scope.accessLevel, req.params.userId, landlordId])
+           WHERE user_id = $2 AND landlord_id = ANY($3::uuid[]) RETURNING *`,
+          [scope.accessLevel, req.params.userId, landlordIds])
         break
     }
     if (!updated) throw new AppError(404, 'Scope row not found')
@@ -586,12 +605,12 @@ scopesRouter.delete('/:roleType/:userId', requirePerm('team.manage_permissions')
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
-    const landlordId = await getLandlordIdFromReq(req)
+    const landlordIds = await teamLandlordIds(req)
     const table = SCOPE_TABLES[role]
 
     const deleted = await queryOne<any>(
-      `DELETE FROM ${table} WHERE user_id = $1 AND landlord_id = $2 RETURNING *`,
-      [req.params.userId, landlordId])
+      `DELETE FROM ${table} WHERE user_id = $1 AND landlord_id = ANY($2::uuid[]) RETURNING *`,
+      [req.params.userId, landlordIds])
     if (!deleted) throw new AppError(404, 'Scope row not found')
     res.json({ success: true, data: deleted })
   } catch (e) { next(e) }
