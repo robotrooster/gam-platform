@@ -90,6 +90,8 @@ export interface DebitOutcome {
     /** no usable bank link — the debt stays owed and this alerts */
     | 'no_bank_link'
     | 'stripe_failed'
+  /** S652: WHY the link is unusable, in words a person can act on. */
+  detail?: string
   debitId?: string
   chargesAmount?: number
   bankCost?: number
@@ -147,11 +149,19 @@ export async function debitLandlordForCharges(landlordId: string): Promise<Debit
   let paymentMethodId = l.gam_debit_payment_method_id
   if (!paymentMethodId) {
     const { createDebitPaymentMethod } = await import('./bankFeed')
-    const pm = await createDebitPaymentMethod(landlordId).catch(() => null)
+    // S652 (Nic): "why the fuck are we having a problem with that?" The reason
+    // was swallowed here: Oak Park's PNC feed link was made without the
+    // payment_method permission, and this logged only "no usable bank link".
+    let why: string | null = null
+    const pm = await createDebitPaymentMethod(landlordId).catch((e: any) => { why = e?.message ?? String(e); return null })
     if (!pm) {
-      logger.error({ landlordId, owed, threshold },
+      if (!why) {
+        const { debitLinkProblem } = await import('./bankFeed')
+        why = await debitLinkProblem(landlordId)
+      }
+      logger.error({ landlordId, owed, threshold, why },
         '[gam-debit] OWES GAM AND CANNOT BE COLLECTED FROM — no usable bank link')
-      return { status: 'skipped', reason: 'no_bank_link' }
+      return { status: 'skipped', reason: 'no_bank_link', detail: why ?? undefined }
     }
     paymentMethodId = pm.paymentMethodId
     await query(

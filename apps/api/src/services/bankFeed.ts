@@ -808,6 +808,30 @@ export async function setBooksStartDate(
  * Returns null when the link predates the payment_method permission — the
  * caller turns that into "re-link your bank", not into a silent failure.
  */
+/**
+ * S652 (Nic): say WHY a linked bank cannot be debited. A feed link made before
+ * the session asked for the payment_method permission (Oak Park's PNC, August
+ * 17) can show balances and transactions and still not be pulled from — the
+ * bank has to be linked once more so the new permission is granted.
+ */
+export async function debitLinkProblem(landlordId: string): Promise<string> {
+  const conn = await queryOne<any>(
+    `SELECT * FROM bank_connections WHERE landlord_id = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1`, [landlordId])
+  if (!conn) return 'No bank is linked under Settings → Bank feed.'
+  if (!conn.stripe_fc_account_id) return `The ${conn.institution_name ?? 'bank'} link has no Stripe account behind it — link it again.`
+  try {
+    const acct: any = await getStripe().financialConnections.accounts.retrieve(conn.stripe_fc_account_id)
+    const perms: string[] = acct?.permissions ?? []
+    if (!perms.includes('payment_method')) {
+      return `The ${conn.institution_name ?? 'bank'} ****${conn.account_last4 ?? ''} link was made without permission to debit. Link the same account once more under Settings → Bank feed; the new link asks for it.`
+    }
+    if (acct?.status && acct.status !== 'active') return `The ${conn.institution_name ?? 'bank'} link is ${acct.status} at the bank — link it again.`
+    return 'Stripe refused to make a debit method from this link.'
+  } catch (e: any) {
+    return `Stripe could not read the ${conn.institution_name ?? 'bank'} link: ${e?.message ?? e}`
+  }
+}
+
 export async function createDebitPaymentMethod(
   landlordId: string,
   bankConnectionId?: string,
@@ -822,10 +846,18 @@ export async function createDebitPaymentMethod(
 
   const stripe = getStripe()
   const customer = await getOrCreateFcCustomer(landlordId)
+  // S652 (Nic): the Oak Park pull failed with "no usable bank link" while PNC
+  // was linked and active. Stripe refuses a bank payment method without a
+  // billing name — the error was swallowed as "no link". The company's name
+  // and its owner's email are the billing details.
+  const who = await queryOne<{ name: string | null; email: string | null }>(
+    `SELECT COALESCE(NULLIF(la.business_name, ''), u.first_name || ' ' || u.last_name) AS name, u.email
+       FROM landlords la JOIN users u ON u.id = la.user_id WHERE la.id = $1`, [landlordId])
   try {
     const pm = await stripe.paymentMethods.create({
       type: 'us_bank_account',
       us_bank_account: { financial_connections_account: conn.stripe_fc_account_id },
+      billing_details: { name: who?.name || 'GAM landlord', email: who?.email || undefined },
     } as any)
     await stripe.paymentMethods.attach(pm.id, { customer })
     return {

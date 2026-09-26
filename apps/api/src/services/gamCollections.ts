@@ -143,26 +143,30 @@ export async function noticeUncollectableLandlords(): Promise<{ notified: number
          FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [c.landlordId])
     const o = owner[0]
     if (!o) continue
+    // S652 (Nic): "it's already fucking linked" — say exactly what is wrong with
+    // the link instead of pretending there is none. Oak Park's PNC feed link was
+    // made before the link asked for permission to debit.
+    const { debitLinkProblem } = await import('./bankFeed')
+    const why = c.hasBankLink ? await debitLinkProblem(c.landlordId).catch(() => null) : null
     await createNotification({
       userId: o.user_id,
       landlordId: c.landlordId,
       type: 'gam_balance_uncollectable',
       title: `We can't collect your Gold Asset Management balance`,
-      body: `Your account has an outstanding balance of $${c.owed.toFixed(2)} and we have no bank `
-        + `account we can collect it from. Connecting one under Banking takes a minute and settles it `
-        + `automatically. If we cannot collect, access to the portal is eventually suspended — `
-        + `your tenants are never affected.`,
+      body: `Your account has an outstanding balance of $${c.owed.toFixed(2)}. `
+        + (why ? `${why} ` : `We have no bank account we can collect it from. Connecting one under Banking takes a minute and settles it automatically. `)
+        + `If we cannot collect, access to the portal is eventually suspended — your tenants are never affected.`,
       actionUrl: '/banking',
       sendEmail: true,
       emailTo: o.email,
       emailSubject: 'Action needed: we cannot collect your GAM balance',
       emailHtml: `<p>Hi ${o.first_name || 'there'},</p>`
         + `<p>Your Gold Asset Management account has an outstanding balance of `
-        + `<strong>$${c.owed.toFixed(2)}</strong>, and there is no bank account on file we can `
-        + `collect it from.</p>`
-        + `<p>Connecting one under <strong>Banking</strong> in your portal settles it automatically — `
-        + `we take it from the same account your rent already moves through, and you never have to `
-        + `think about it again.</p>`
+        + `<strong>$${c.owed.toFixed(2)}</strong>.</p>`
+        + (why
+            ? `<p>${why}</p>`
+            : `<p>There is no bank account on file we can collect it from. Connecting one under <strong>Banking</strong> in your portal settles it automatically — `
+              + `we take it from the same account your rent already moves through, and you never have to think about it again.</p>`)
         + `<p>If we cannot collect, portal access is eventually suspended. Your tenants are not `
         + `affected either way — rent keeps being collected as normal.</p>`,
     }).catch(() => {})
