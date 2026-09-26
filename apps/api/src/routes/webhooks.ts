@@ -99,6 +99,15 @@ webhooksRouter.post('/stripe', async (req, res) => {
 
       const charge = await resolveCharge(stripe, pi)
       const paymentMethod = extractPaymentMethod(charge)
+      // S652 (Nic): the book records the margin from Stripe's ACTUAL fee on this
+      // charge, not a rate-table guess. Best effort — a missing balance
+      // transaction falls back to the estimate, never blocks the settlement.
+      let actualStripeFeeTotal: number | null = null
+      try {
+        const btRef = (charge as any)?.balance_transaction
+        const bt = typeof btRef === 'string' ? await stripe.balanceTransactions.retrieve(btRef) : btRef
+        if (bt && typeof bt.fee === 'number') actualStripeFeeTotal = bt.fee / 100
+      } catch { actualStripeFeeTotal = null }
       // S113-Phase2.5: snapshot the underlying charge id so post-commit
       // Transfer firing can use it as `source_transaction` to pull funds
       // from the original charge instead of the platform balance.
@@ -185,7 +194,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
             if (row.reversal_id) {
               const { resolveReversalOnTenantPayment } = await import('../services/paymentReversal')
               const reDisburse = await resolveReversalOnTenantPayment(client, row.reversal_id)
-              if (reDisburse) await executeRentAllocation(client, row.id, paymentMethod)
+              if (reDisburse) await executeRentAllocation(client, row.id, paymentMethod, { actualStripeFeeTotal })
               continue
             }
 
@@ -209,11 +218,11 @@ webhooksRouter.post('/stripe', async (req, res) => {
             // landlord's share.
             const strict = row.type === 'rent' || row.type === 'utility'
             if (strict) {
-              await executeRentAllocation(client, row.id, paymentMethod)
+              await executeRentAllocation(client, row.id, paymentMethod, { actualStripeFeeTotal })
             } else {
               await client.query('SAVEPOINT fee_alloc')
               try {
-                await executeRentAllocation(client, row.id, paymentMethod)
+                await executeRentAllocation(client, row.id, paymentMethod, { actualStripeFeeTotal })
                 await client.query('RELEASE SAVEPOINT fee_alloc')
               } catch (allocErr) {
                 await client.query('ROLLBACK TO SAVEPOINT fee_alloc')

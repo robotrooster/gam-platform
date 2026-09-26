@@ -397,6 +397,7 @@ export function InviteTenantModal({ onClose }: Props) {
               const win = (windows as any[]).find((w: any) => w.propertyId === selectedUnit?.propertyId)
               const windowOpen = !!win?.open
               if (!windowOpen && screenMode === 'sitting') setScreenMode('screen')
+              if (win?.returningAllowanceLeft === 0 && screenMode === 'returning') setScreenMode('screen')
               const opt = (mode: 'screen' | 'returning' | 'sitting', title: string, body: string) => (
                 <label key={mode} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', padding: '10px 12px', background: screenMode === mode ? 'rgba(201,162,39,.06)' : 'var(--bg-2)', border: `1px solid ${screenMode === mode ? 'var(--gold)' : 'var(--border-0)'}`, borderRadius: 8 }}>
                   <input type="radio" checked={screenMode === mode} onChange={() => setScreenMode(mode)} style={{ marginTop: 2, flexShrink: 0 }} />
@@ -409,7 +410,11 @@ export function InviteTenantModal({ onClose }: Props) {
               return (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 14 }}>
                   {opt('screen', 'New applicant — background check first', 'They create an account and complete a background check before you assign the space.')}
-                  {opt('returning', 'Returning resident — lived here before', 'You are attesting this person has lived at this property before. No background check. GAM records the attestation.')}
+                  {win?.returningAllowanceLeft === 0
+                    ? <div style={{ padding: '10px 12px', border: '1px solid var(--border-0)', borderRadius: 8, opacity: .6, fontSize: '.78rem', color: 'var(--text-3)' }}>
+                        <b style={{ color: 'var(--text-1)' }}>Returning resident</b> — not available at this property right now. New residents complete a background check.
+                      </div>
+                    : opt('returning', 'Returning resident — lived here before', 'You are attesting this person has lived at this property before. No background check. GAM records the attestation.')}
                   {windowOpen && opt('sitting', 'Already lives here', 'A resident who was here when this property came onto GAM. Onboarding window is open.')}
                 </div>
               )

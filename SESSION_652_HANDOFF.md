@@ -917,3 +917,16 @@ MEMORY.md index trimmed under its size limit (entries ≤128 chars).
 - **Tenants list**: "Payment health" column between Property and Rent (`payment_health` on GET /units: charges due before today; paid = settled OR covered by work trade; NULL until there is a bill). Profile stats count work-trade-suspended charges as settled — Curtis-style residents read 100%, not 0.
 - **Maintenance kinds per property (Nic's "option 2")**: `properties.maintenance_categories` (NULL = all) + `maintenance_note`; Settings → "Maintenance requests" card per property (checkboxes + note); tenant form shows only allowed kinds and the note; POST /maintenance refuses a disallowed kind with the landlord's note. Migration 20260925200000.
 - **Returning residents (Nic chose option 2)**: invite form has three doors — New applicant (screen, default) · Returning resident (landlord attests, no check, recorded) · Already lives here (only while the onboarding window is open). The free "uncheck to skip screening" is gone from the UI (the API still accepts a plain unit invite for scripts/onboarding). `applyReturningResidentWaive`: tenant waived, intent stamped `waive_reason='returning_resident'`, rolling-365-day count vs allowance = ceil(25% of sites, min 1); over it → admin notification `returning_resident_over_allowance` (landlord never sees the count). Tests in screening-grandfather.test.ts.
+
+## Deploy 66 — the book stops guessing; paid dates; method on the P&L; returning residents denied over the allowance (2026-09-25 night)
+
+**Cash tie-out (Nic asked three times; this is the answer):** Stripe $198.50 = Sept money in $7,571.30 − paid out to landlords $7,206.00 − Stripe's Sept costs $174.72 + August net $7.92. The $365.30 kept on the platform is exactly $238.31 customer processing fees + $82 Mountain View's fee + $44.99 screening (GAM's card paid the provider, so the whole $44.99 is GAM's — it is cost recovery plus $5 margin, NOT pass-through; I was wrong once on this). The cost feed is complete (all 78 Stripe cost lines recorded). The gap between cash and the book was the book: per-payment margin from a RATE TABLE, corrected monthly against costs filed by Stripe's billing period (network costs bill a month behind).
+
+**Shipped:**
+- Allocation takes `actualStripeFeeTotal` from the charge's balance transaction at settlement (webhooks → `executeRentAllocation` opts) and books the real margin; the rate-table estimate is the fallback only. Network costs remain the monthly true-up line.
+- Payment history: "Paid" column = the settled day, due date beneath it (was showing the due date as if paid on it).
+- Month P&L: method now says Cash / Check / Money order / Prior arrangement, not "—".
+- Returning residents over the allowance: the API refuses (409 "used its returning-resident allowance for the year") BEFORE waiving, no flag; `/landlords/me/onboarding-windows` carries `returningAllowanceLeft` and the invite form greys the door at 0 ("not available… new residents complete a background check"). Nic: "they'll call us to complain, and that's when we have the talk."
+- $10 minimum: ALREADY as Nic wants since S631 — a landlord with no lease and no payment stays in grace forever (never billed); the phantom August rows predate that and are reversed. No code change.
+
+Card payments last settled Sept 17; cash/checks through Sept 22.

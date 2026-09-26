@@ -302,7 +302,7 @@ reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, r
 
     // Settled income recognized in-month by ACTUAL payment date.
     const payments = await query<any>(`
-      SELECT p.id, p.settled_at, p.amount, p.type,
+      SELECT p.id, p.settled_at, p.amount, p.type, p.manual_method,
              p.ach_trace_number, p.stripe_charge_id, p.stripe_payment_intent_id,
              u.unit_number, pr.name AS property_name,
              us.first_name AS tenant_first, us.last_name AS tenant_last
@@ -319,7 +319,10 @@ reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, r
     // from the single shared definition (computeLandlordPL) so this and the Books
     // app can't diverge — deposits-out, categorized income, all expenses.
     const paymentRows = payments.map((p: any) => {
-      const method = p.ach_trace_number ? 'ACH'
+      // S652 (Nic): "it doesn't tell me if they paid cash or not."
+      const MANUAL: Record<string, string> = { cash: 'Cash', check: 'Check', money_order: 'Money order', prior_arrangement: 'Prior arrangement' }
+      const method = p.manual_method ? (MANUAL[p.manual_method] || p.manual_method)
+        : p.ach_trace_number ? 'ACH'
         : (p.stripe_charge_id || p.stripe_payment_intent_id) ? 'Card'
         : '—'
       const tenantName = [p.tenant_first, p.tenant_last].filter(Boolean).join(' ') || null

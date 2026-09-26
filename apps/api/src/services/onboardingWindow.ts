@@ -17,6 +17,7 @@
  * `gam-screening-grandfather-onboarding-window`.
  */
 import { query, queryOne } from '../db'
+import { AppError } from '../middleware/errorHandler'
 import { MIGRATION_WINDOW_DAYS } from '@gam/shared'
 import type { PoolClient } from 'pg'
 
@@ -134,6 +135,8 @@ export async function listOnboardingWindowsForLandlord(landlordIds: string[]): P
        ORDER BY p.created_at DESC`,
     [landlordIds],
   )
+  const left = new Map<string, number>()
+  for (const r of rows) left.set(r.id, (await returningResidentAllowance(r.id)).left)
   return rows.map((r) => {
     const unitCount = r.unit_count || 0
     const windowDays = computeWindowDays(unitCount)
@@ -147,7 +150,7 @@ export async function listOnboardingWindowsForLandlord(landlordIds: string[]): P
       open = Date.now() < until.getTime()
       daysRemaining = open ? Math.ceil((until.getTime() - Date.now()) / DAY_MS) : 0
     }
-    return { propertyId: r.id, propertyName: r.name, open, startedAt, until, completedAt, windowDays, unitCount, daysRemaining, lateFeeWaiver: r.onboarding_late_fee_waiver }
+    return { returningAllowanceLeft: left.get(r.id) ?? 0, propertyId: r.id, propertyName: r.name, open, startedAt, until, completedAt, windowDays, unitCount, daysRemaining, lateFeeWaiver: r.onboarding_late_fee_waiver }
   })
 }
 
@@ -177,9 +180,27 @@ export type ScreeningWaiveResult = { waived: boolean; reason: 'ok' | 'window_clo
  * waving everyone through shows up on the admin desk.
  */
 export const RETURNING_RESIDENT_ALLOWANCE = 0.25
+/** How much of a property's rolling-year returning-resident allowance is left. */
+export async function returningResidentAllowance(propertyId: string): Promise<{ used: number; allowance: number; left: number }> {
+  const row = await queryOne<{ used: string; units: string }>(
+    `SELECT (SELECT COUNT(*) FROM pending_tenant_intents i
+              WHERE i.property_id = $1 AND i.waive_reason = 'returning_resident'
+                AND i.screening_waived_at > NOW() - INTERVAL '365 days') AS used,
+            (SELECT COUNT(*) FROM units u WHERE u.property_id = $1 AND u.retired_at IS NULL) AS units`,
+    [propertyId])
+  const used = Number(row?.used ?? 0)
+  const allowance = Math.max(1, Math.ceil(Number(row?.units ?? 0) * RETURNING_RESIDENT_ALLOWANCE))
+  return { used, allowance, left: Math.max(0, allowance - used) }
+}
+// S652 (Nic): over the allowance the option is simply DENIED — "they'll call us
+// to complain that they can't skip it, and that's when we have the talk."
+export const RETURNING_ALLOWANCE_USED_MESSAGE =
+  'This property has used its returning-resident allowance for the year. New residents complete a background check.'
 export async function applyReturningResidentWaive(opts: {
   tenantId: string; landlordId: string; propertyId: string; unitId: string; byUserId: string
-}): Promise<{ waived: true; used: number; allowance: number; overAllowance: boolean }> {
+}): Promise<{ waived: true; used: number; allowance: number }> {
+  const a = await returningResidentAllowance(opts.propertyId)
+  if (a.left <= 0) throw new AppError(409, RETURNING_ALLOWANCE_USED_MESSAGE)
   await query(`UPDATE tenants SET background_check_status = 'waived' WHERE id = $1`, [opts.tenantId])
   await query(
     `INSERT INTO pending_tenant_intents
@@ -193,28 +214,7 @@ export async function applyReturningResidentWaive(opts: {
        screening_waived_unit_id = EXCLUDED.screening_waived_unit_id,
        waive_reason = 'returning_resident', updated_at = NOW()`,
     [opts.landlordId, opts.tenantId, opts.propertyId, opts.byUserId, opts.unitId])
-  const row = await queryOne<{ used: string; units: string }>(
-    `SELECT (SELECT COUNT(*) FROM pending_tenant_intents i
-              WHERE i.property_id = $1 AND i.waive_reason = 'returning_resident'
-                AND i.screening_waived_at > NOW() - INTERVAL '365 days') AS used,
-            (SELECT COUNT(*) FROM units u WHERE u.property_id = $1 AND u.retired_at IS NULL) AS units`,
-    [opts.propertyId])
-  const used = Number(row?.used ?? 0)
-  const allowance = Math.max(1, Math.ceil(Number(row?.units ?? 0) * RETURNING_RESIDENT_ALLOWANCE))
-  const overAllowance = used > allowance
-  if (overAllowance) {
-    const { createAdminNotification } = await import('./adminNotifications')
-    const p = await queryOne<{ name: string; business_name: string }>(
-      `SELECT p.name, la.business_name FROM properties p JOIN landlords la ON la.id = p.landlord_id WHERE p.id = $1`, [opts.propertyId])
-    await createAdminNotification({
-      severity: 'warn',
-      category: 'returning_resident_over_allowance',
-      title:    `${p?.business_name ?? 'A landlord'} is over the returning-resident allowance at ${p?.name ?? 'a property'}`,
-      body:     `${used} residents marked "lived here before" in the last year against an allowance of ${allowance} (25% of ${row?.units} sites). Background checks were skipped for each. Worth a look.`,
-      context:  { property_id: opts.propertyId, landlord_id: opts.landlordId, used, allowance },
-    }).catch(() => undefined)
-  }
-  return { waived: true, used, allowance, overAllowance }
+  return { waived: true, used: a.used + 1, allowance: a.allowance }
 }
 
 export async function applyScreeningWaive(opts: {

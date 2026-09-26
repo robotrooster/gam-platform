@@ -1110,7 +1110,7 @@ export function PaymentsPage() {
           <table className="data-table" style={{ minWidth: 880 }}>
             <thead>
               <tr>
-                <th>Due</th>
+                <th>Paid</th>
                 <th>Unit</th>
                 <th>Tenant</th>
                 <th>Type</th>
@@ -1130,7 +1130,12 @@ export function PaymentsPage() {
                   onClick={() => setSelected(p)}
                   style={{ cursor: 'pointer' }}
                 >
-                  <td className="mono">{p.dueDate ? new Date(p.dueDate).toLocaleDateString() : '—'}</td>
+                  {/* S652 (Nic): "it doesn't show when they actually paid" — the
+                      history showed the due date. The settled day leads; due sits under it. */}
+                  <td className="mono">
+                    {p.settledAt ? new Date(p.settledAt).toLocaleDateString() : (p.dueDate ? new Date(p.dueDate).toLocaleDateString() : '—')}
+                    {p.settledAt && p.dueDate && <div style={{ fontSize: '.66rem', color: 'var(--text-3)' }}>due {new Date(p.dueDate).toLocaleDateString()}</div>}
+                  </td>
                   <td className="mono">{p.unitNumber || '—'}</td>
                   <td style={{ fontSize: '.8rem' }}>{(p.tenantFirst || p.tenantLast) ? `${p.tenantFirst ?? ''} ${p.tenantLast ?? ''}`.trim() : '—'}</td>
                   <td><span className="badge badge-muted">{humanize(p.type)}</span></td>

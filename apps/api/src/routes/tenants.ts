@@ -1905,7 +1905,7 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
     // path is deliberately left as-is (no intent) to avoid double-drafting a
     // lease alongside the e-sign onboarding flow. Upsert the tenant's single
     // LIVE intent (partial-unique on tenant_id WHERE cancelled_at IS NULL).
-    let returning: { used: number; allowance: number; overAllowance: boolean } | null = null
+    let returning: { used: number; allowance: number } | null = null
     if (returningResident && unitId && tenantId) {
       const { applyReturningResidentWaive } = await import('../services/onboardingWindow')
       returning = await applyReturningResidentWaive({

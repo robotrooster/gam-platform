@@ -216,6 +216,14 @@ export interface AllocationOptions {
    * change because the tenant paid it early.
    */
   feeAlreadyCollected?: boolean
+  /**
+   * S652 (Nic): "it's an estimate that should not exist." Stripe's actual fee
+   * on the charge, in dollars, read from its balance transaction at settlement.
+   * When present it replaces the rate-table estimate of Stripe's cost, so the
+   * banking spread the book records is the real margin on this payment.
+   * Network costs are billed by Stripe monthly and stay a monthly line.
+   */
+  actualStripeFeeTotal?: number | null
 }
 
 export async function executeRentAllocation(
@@ -285,7 +293,9 @@ export async function executeRentAllocation(
     ? charge.feeBase
     : round2(charge.feeBase + wholeCustomerFee)
 
-  const wholeStripeCost = round2(Math.min(scFlat + processedAmount * (scPercent / 100), scCap))
+  const wholeStripeCost = opts.actualStripeFeeTotal != null
+    ? round2(opts.actualStripeFeeTotal)
+    : round2(Math.min(scFlat + processedAmount * (scPercent / 100), scCap))
 
   // Apportion by this row's share of the charge. The LAST row (deterministic
   // id order) absorbs the rounding remainder so the per-row pieces sum to the

@@ -225,7 +225,7 @@ describe('S636 every adult in a household is grandfathered, not just the first',
 // against a rolling year's allowance of 25% of the property's sites. Over it,
 // the platform is flagged — the landlord never sees the count.
 describe('returning resident — attested, recorded, capped', () => {
-  it('waives the check, records why, and flags the platform once the allowance is exceeded', async () => {
+  it('waives the check, records why, and refuses once the allowance is used up', async () => {
     const f = await seedFixture()   // one unit → allowance = max(1, ceil(0.25)) = 1
     const app = buildApp()
     const invite = (email: string) => request(app).post('/api/tenants/invite')
@@ -243,10 +243,8 @@ describe('returning resident — attested, recorded, capped', () => {
     expect(Number((await db.query(`SELECT COUNT(*) FROM admin_notifications WHERE category = 'returning_resident_over_allowance'`)).rows[0].count)).toBe(0)
 
     const two = await invite('back2@test.dev')
-    expect(two.status).toBeLessThan(300)
-    const flags = await db.query<any>(`SELECT title, context FROM admin_notifications WHERE category = 'returning_resident_over_allowance'`)
-    expect(flags.rows).toHaveLength(1)
-    expect(flags.rows[0].context).toMatchObject({ property_id: f.propertyId, used: 2, allowance: 1 })
+    expect(two.status).toBe(409)
+    expect(two.body.error).toMatch(/returning-resident allowance/i)
   })
 
   it('a returning resident must be invited to a space', async () => {
