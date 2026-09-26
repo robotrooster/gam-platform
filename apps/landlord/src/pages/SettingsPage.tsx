@@ -841,6 +841,18 @@ function PropertyBillingCycleRow({ property, qc }: { property: any; qc: any }) {
     },
   )
   const changed = month !== current
+  // S652 (Nic): set when the property was added, locked once anyone is billed.
+  if (property.firstBillingCycleLocked) {
+    return (
+      <div style={{ borderTop: '1px solid var(--border-1, rgba(255,255,255,.06))', paddingTop: 12 }}>
+        <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>{property.name || 'Unnamed property'}</div>
+        <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginTop: 6 }}>
+          First bill from GAM: <b>{current ? new Date(current + '-01T12:00:00').toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 'not set'}</b>
+          <span style={{ fontSize: '.7rem', color: 'var(--text-3)', marginLeft: 8 }}>set when the property was added · locked now that tenants are on it</span>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div style={{ borderTop: '1px solid var(--border-1, rgba(255,255,255,.06))', paddingTop: 12 }}>

@@ -170,6 +170,18 @@ export async function finalizeConnection(landlordId: string, sessionId: string):
        acct.subcategory ?? acct.category ?? null, `${inst}${acct.last4 ? ' ••' + acct.last4 : ''}`])
     out.push(conn)
     try { await syncConnection(conn.id) } catch { /* initial sync best-effort */ }
+    // S652 (Nic): "when they link a bank, they're authorizing debits and payouts."
+    // Mint the debit method NOW, from this link, so the day GAM is owed there is
+    // nothing left to ask. A link that cannot be debited from says so on the page.
+    try {
+      const pm = await createDebitPaymentMethod(landlordId, conn.id)
+      if (pm) {
+        await query(
+          `UPDATE landlords SET gam_debit_payment_method_id = $2, gam_debit_bank_last4 = $3, gam_debit_bank_name = $4,
+                  gam_debit_authorized_at = COALESCE(gam_debit_authorized_at, NOW()), gam_debit_revoked_at = NULL, updated_at = NOW()
+            WHERE id = $1`, [landlordId, pm.paymentMethodId, pm.last4, pm.bankName])
+      }
+    } catch (e) { logger.warn({ err: e, landlordId, connectionId: conn.id }, '[bank-feed] link made, debit method not minted') }
   }
   return out
 }
@@ -665,13 +677,28 @@ export async function disconnectConnection(landlordId: string, connectionId: str
 
 // ── Reads ───────────────────────────────────────────────────────────────────
 export async function listConnections(landlordId: string) {
-  return query<any>(
+  const rows = await query<any>(
     `SELECT id, provider, institution_name, account_last4, account_type, display_name,
             status, last_synced_at, last_sync_error, created_at,
-            current_balance, balance_currency, balance_as_of
+            current_balance, balance_currency, balance_as_of, stripe_fc_account_id
        FROM bank_connections
       WHERE landlord_id = $1 AND status <> 'disconnected'
       ORDER BY created_at DESC`, [landlordId])
+  // S652 (Nic): every linked bank says whether GAM can debit from it, and why not.
+  const stripe = getStripe()
+  for (const r of rows) {
+    r.debit_ready = false; r.debit_problem = null
+    if (!r.stripe_fc_account_id) { r.debit_problem = 'This link has no Stripe account behind it — link it again.'; continue }
+    try {
+      const acct: any = await stripe.financialConnections.accounts.retrieve(r.stripe_fc_account_id)
+      const perms: string[] = acct?.permissions ?? []
+      if (acct?.status && acct.status !== 'active') r.debit_problem = `This link is ${acct.status} at the bank — link it again.`
+      else if (!perms.includes('payment_method')) r.debit_problem = 'Linked before GAM asked for permission to debit — link this account once more.'
+      else r.debit_ready = true
+    } catch (e: any) { r.debit_problem = `Stripe could not read this link: ${e?.message ?? e}` }
+    delete r.stripe_fc_account_id
+  }
+  return rows
 }
 
 /**

@@ -304,6 +304,14 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                       {c.lastSyncedAt ? `Last synced ${fmtDate(c.lastSyncedAt)}` : 'Not yet synced'}
                       {c.status === 'error' && c.lastSyncError ? ` · error: ${c.lastSyncError}` : ''}
                     </div>
+                    {/* S652 (Nic): linking a bank authorizes payouts AND debits. A link
+                        GAM cannot pull from says so here, with the fix beside it. */}
+                    {c.debitReady
+                      ? <div style={{ fontSize: '.7rem', color: 'var(--green)', marginTop: 2 }}>GAM can pay out to and debit this account.</div>
+                      : <div style={{ fontSize: '.7rem', color: 'var(--amber)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                          <span>GAM cannot debit this account: {c.debitProblem || 'unknown reason'}</span>
+                          <button className="btn btn-primary btn-sm" style={{ padding: '1px 8px', fontSize: '.68rem' }} onClick={link} disabled={linking}>{linking ? 'Linking…' : 'Relink'}</button>
+                        </div>}
                   </div>
                   {/* S605: the account balance, which is what a landlord looks
                       for first on a page about their bank. Absent for links made

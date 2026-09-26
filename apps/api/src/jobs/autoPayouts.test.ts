@@ -105,7 +105,8 @@ async function seedEntityAnchoredLandlord(account = 'acct_entity_ll'): Promise<s
     const { userId, landlordId } = await seedLandlord(c)
     await c.query(
       `UPDATE landlords
-          SET stripe_connect_account_id = $2,
+          SET gam_debit_payment_method_id = 'pm_test_bank',
+              stripe_connect_account_id = $2,
               connect_payouts_enabled   = true,
               connect_details_submitted = true
         WHERE id = $1`,
@@ -272,7 +273,8 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
       const { landlordId } = await seedLandlord(c)
       // Entity account present but readiness flags still false (KYC incomplete).
       await c.query(
-        `UPDATE landlords SET stripe_connect_account_id='acct_entity_pending' WHERE id=$1`,
+        // S652: a payout goes to a bank GAM can also debit — the fixture has one on file.
+        `UPDATE landlords SET stripe_connect_account_id='acct_entity_pending', gam_debit_payment_method_id='pm_test_bank' WHERE id=$1`,
         [landlordId])
       await c.query('COMMIT')
     } finally { c.release() }

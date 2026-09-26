@@ -59,6 +59,10 @@ propertiesRouter.get('/', async (req, res, next) => {
     // instead — the underlying PK that's referenced via the JOIN.
     const props = await query<any>(`
       SELECT p.*, COUNT(u.id)::int AS total_units,
+        -- S652 (Nic): "once that's set and the property's onboarded, that's not
+        -- changeable again." Locked the moment a lease or an invoice exists.
+        (EXISTS (SELECT 1 FROM leases lx JOIN units ux ON ux.id = lx.unit_id WHERE ux.property_id = p.id)
+         OR EXISTS (SELECT 1 FROM invoices ix JOIN units ux2 ON ux2.id = ix.unit_id WHERE ux2.property_id = p.id)) AS first_billing_cycle_locked,
         COUNT(u.id) FILTER (WHERE u.status='active')::int AS occupied_units,
         COUNT(u.id) FILTER (WHERE u.status='vacant')::int AS vacant_units,
         to_jsonb(r.*) AS allocation_rule,
@@ -1511,8 +1515,8 @@ propertiesRouter.patch('/:id/first-billing-cycle', requireLandlord, async (req, 
     }).parse(req.body)
     const month = body.firstBillingCycle ? body.firstBillingCycle.slice(0, 7) + '-01' : null
 
-    const prop = await queryOne<{ id: string; landlord_id: string; name: string }>(
-      `SELECT id, landlord_id, name FROM properties WHERE id = $1`, [req.params.id])
+    const prop = await queryOne<{ id: string; landlord_id: string; name: string; first_billing_cycle: string | null }>(
+      `SELECT id, landlord_id, name, to_char(first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle FROM properties WHERE id = $1`, [req.params.id])
     if (!prop) throw new AppError(404, 'Property not found')
     // Moves money for every existing tenancy at the property at once — the
     // landlord or an admin, never a team role.
@@ -1530,6 +1534,15 @@ propertiesRouter.patch('/:id/first-billing-cycle', requireLandlord, async (req, 
          JOIN units u ON u.id = l.unit_id
         WHERE u.property_id = $1 AND l.is_existing_tenancy = true`,
       [prop.id])
+    // S652 (Nic): "make that locked like it's set when you add the property and
+    // it's locked forever." Once a lease or an invoice exists, the floor stands.
+    const inUse = await queryOne<{ n: string }>(
+      `SELECT (COALESCE((SELECT COUNT(*) FROM leases l JOIN units u ON u.id = l.unit_id WHERE u.property_id = $1), 0)
+             + COALESCE((SELECT COUNT(*) FROM invoices i JOIN units u2 ON u2.id = i.unit_id WHERE u2.property_id = $1), 0))::text AS n`,
+      [prop.id])
+    if (Number(inUse?.n || 0) > 0 && prop.first_billing_cycle && (month ?? null) !== prop.first_billing_cycle) {
+      throw new AppError(409, 'The first billing cycle was set when this property was added and is locked now that tenants are on it.')
+    }
 
     await query(
       `UPDATE properties SET first_billing_cycle = $2::date, updated_at = NOW() WHERE id = $1`,
