@@ -81,6 +81,9 @@ const DELIBERATE = new Map(Object.entries({
   'signingPackages PUT /templates/:templateId/properties':
     'pins a document to the properties it applies to. Nic\'s worry is precisely the mis-pin — "assigned parking gets sent to a property that doesn\'t have that, and then it\'s just generating confusion" — and property names spoken aloud are exactly where that mistake happens.',
   // ── S633 ──────────────────────────────────────────────────────────────────
+  // ── S652 ──────────────────────────────────────────────────────────────────
+  'properties PATCH /:id/maintenance-config':
+    'which kinds of maintenance request a property accepts and the note tenants see — a policy the landlord sets once under Settings, with the consequence explained on screen; an agent should never narrow what a tenant is allowed to report.',
   'properties PATCH /:id/first-billing-cycle':
     'declares which month GAM starts invoicing a property\'s EXISTING tenants — it moves money for every onboarded tenancy at once, and only the landlord knows which months they already collected off-platform. Not derivable, not delegable, and answered once during onboarding on a screen that explains the consequence.',
   // ── Named while closing S633\'s parity failure; all five predate it. ───────
