@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict fZtiA5i68B4d7jUuxhlRtePdhtTLKPO6fE1owRcjGYS6xqxpYbXRrDDt2xAkDyG
+\restrict hLqIkypNQrE1ad1sqWHOKWG6vPbgeDW6VX37GfWM6Za7U1mDmz63yAWUhPYxUWi
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6646,6 +6646,7 @@ CREATE TABLE public.pending_tenant_intents (
     work_trade_tracks_hours boolean,
     home_sale_terms jsonb,
     package_template_ids uuid[],
+    waive_reason text,
     CONSTRAINT pending_intent_work_trade_covered_check CHECK (((work_trade_covered_charges IS NULL) OR ((array_length(work_trade_covered_charges, 1) > 0) AND (work_trade_covered_charges <@ ARRAY['rent'::text, 'fees'::text, 'water'::text, 'sewer'::text, 'electric'::text, 'gas'::text, 'trash'::text, 'propane'::text])))),
     CONSTRAINT pending_tenant_intents_parser_status_check CHECK ((parser_status = ANY (ARRAY['not_uploaded'::text, 'parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text, 'resolved'::text]))),
     CONSTRAINT pti_work_trade_hours_positive CHECK (((work_trade_hours_target IS NULL) OR (work_trade_hours_target > 0)))
@@ -7944,6 +7945,8 @@ CREATE TABLE public.properties (
     stripe_terminal_location_id text,
     register_card_fee_payer text DEFAULT 'customer'::text NOT NULL,
     booking_card_fee_payer text DEFAULT 'customer'::text NOT NULL,
+    maintenance_categories text[],
+    maintenance_note text,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
@@ -27997,5 +28000,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict fZtiA5i68B4d7jUuxhlRtePdhtTLKPO6fE1owRcjGYS6xqxpYbXRrDDt2xAkDyG
+\unrestrict hLqIkypNQrE1ad1sqWHOKWG6vPbgeDW6VX37GfWM6Za7U1mDmz63yAWUhPYxUWi
 

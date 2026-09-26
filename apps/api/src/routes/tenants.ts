@@ -1825,8 +1825,15 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
     // chosen later at lease); the legacy unit-bound invite still works and is
     // left behaviourally untouched (no intent, no auto-draft change).
     const { email, firstName, lastName, unitId, phone, propertyId } = req.body
+    // S652 (Nic, option 2): "This person has lived here before" — the landlord
+    // attests it, the check is skipped, the attestation is recorded and counted
+    // against the property's rolling allowance (see applyReturningResidentWaive).
+    const returningResident = req.body.returningResident === true
     if (!email || !firstName || (!unitId && !propertyId)) {
       return res.status(400).json({ success: false, error: 'Email, name and a unit or property are required' })
+    }
+    if (returningResident && !unitId) {
+      return res.status(400).json({ success: false, error: 'A returning resident is invited to their space.' })
     }
     // S417: block disposable email domains so invites can't be sent to
     // throwaway addresses. Defeats the verification gate downstream.
@@ -1898,6 +1905,14 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
     // path is deliberately left as-is (no intent) to avoid double-drafting a
     // lease alongside the e-sign onboarding flow. Upsert the tenant's single
     // LIVE intent (partial-unique on tenant_id WHERE cancelled_at IS NULL).
+    let returning: { used: number; allowance: number; overAllowance: boolean } | null = null
+    if (returningResident && unitId && tenantId) {
+      const { applyReturningResidentWaive } = await import('../services/onboardingWindow')
+      returning = await applyReturningResidentWaive({
+        tenantId, landlordId: inviteLandlordId, propertyId: inviterPropertyId!, unitId, byUserId: req.user!.userId,
+      })
+    }
+
     if (propertyId && !unitId && tenantId) {
       await query(
         `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id)
@@ -2120,10 +2135,11 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
                  AND ce.superseded_by IS NULL
                  AND ce.event_type IN ('payment_received_late_minor','payment_received_late_major','payment_received_late_severe'))` + ` AS n`,
       [req.params.id])
+    // S652 (Nic): a work-trade charge is paid in hours — it counts as paid.
     const paymentStats = await queryOne<any>(`
       SELECT
         COUNT(*) as total_payments,
-        COUNT(*) FILTER (WHERE status = 'settled') as settled,
+        COUNT(*) FILTER (WHERE status = 'settled' OR work_trade_suspended_at IS NOT NULL) as settled,
         COUNT(*) FILTER (WHERE status = 'failed') as failed,
         COALESCE(SUM(amount) FILTER (WHERE status = 'settled'), 0) as total_paid,
         COALESCE(AVG(amount) FILTER (WHERE status = 'settled'), 0) as avg_payment,

@@ -164,6 +164,30 @@ maintenanceRouter.get('/:id', async (req, res, next) => {
 })
 
 // POST /api/maintenance — create request (tenant or landlord)
+// S652: what kinds of request this unit's property accepts, and the note to
+// show. Everything, when the property has not limited it.
+maintenanceRouter.get('/config', async (req, res, next) => {
+  try {
+    const unitId = String(req.query.unitId || '')
+    if (!/^[0-9a-f-]{36}$/i.test(unitId)) throw new AppError(400, 'unitId required')
+    const row = await queryOne<any>(
+      `SELECT p.maintenance_categories, p.maintenance_note, u.landlord_id
+         FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [unitId])
+    if (!row) throw new AppError(404, 'Unit not found')
+    if (req.user!.role === 'tenant') {
+      const on = await queryOne<any>(
+        `SELECT 1 FROM leases l JOIN lease_tenants lt ON lt.lease_id = l.id
+          WHERE l.unit_id = $1 AND lt.tenant_id = $2 AND lt.status IN ('active','pending_add','pending_remove') LIMIT 1`,
+        [unitId, req.user!.profileId])
+      if (!on) throw new AppError(403, 'Forbidden')
+    } else if (!canManageLandlordResource(req.user, row.landlord_id)) throw new AppError(403, 'Forbidden')
+    res.json({ success: true, data: {
+      categories: row.maintenance_categories?.length ? row.maintenance_categories : [...MAINTENANCE_CATEGORIES],
+      note: row.maintenance_note ?? null,
+    } })
+  } catch (e) { next(e) }
+})
+
 maintenanceRouter.post('/', async (req, res, next) => {
   try {
     // S571: tenants pick a category (title is derived) and do NOT set priority —
@@ -181,6 +205,18 @@ maintenanceRouter.post('/', async (req, res, next) => {
     // A tenant may not self-assign priority — it's agent-recommended and
     // landlord-overridable. Strip any priority a tenant tries to send.
     const priority = req.user!.role === 'tenant' ? undefined : body.priority
+    
+    // S652 (Nic): a tenant-owned park does not take "my stove is broken". The
+    // property says which kinds it accepts; anything else is refused with the
+    // landlord's own words, so the record stays clean and the tenant knows why.
+    if (req.user!.role === 'tenant' && body.category) {
+      const cfg = await queryOne<{ maintenance_categories: string[] | null; maintenance_note: string | null }>(
+        `SELECT p.maintenance_categories, p.maintenance_note FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+        [body.unitId])
+      if (cfg?.maintenance_categories?.length && !cfg.maintenance_categories.includes(body.category)) {
+        throw new AppError(400, cfg.maintenance_note || 'This property does not take that kind of request.')
+      }
+    }
 
     // Ownership gate for NON-tenant callers. The tenant path is scoped inside
     // the service (must be on the unit's active lease); a landlord/staff caller

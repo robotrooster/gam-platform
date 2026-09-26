@@ -219,3 +219,41 @@ describe('S636 every adult in a household is grandfathered, not just the first',
     expect(res.status).toBe(403)
   })
 })
+
+// S652 (Nic, option 2): a RETURNING resident skips the check on the landlord's
+// attestation, outside any window; every attestation is recorded and counted
+// against a rolling year's allowance of 25% of the property's sites. Over it,
+// the platform is flagged — the landlord never sees the count.
+describe('returning resident — attested, recorded, capped', () => {
+  it('waives the check, records why, and flags the platform once the allowance is exceeded', async () => {
+    const f = await seedFixture()   // one unit → allowance = max(1, ceil(0.25)) = 1
+    const app = buildApp()
+    const invite = (email: string) => request(app).post('/api/tenants/invite')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ email, firstName: 'Back', lastName: 'Again', unitId: f.unitId, returningResident: true })
+
+    const one = await invite('back1@test.dev')
+    expect(one.status).toBeLessThan(300)
+    const t1 = (await db.query<any>(
+      `SELECT t.background_check_status, i.waive_reason FROM tenants t JOIN users u ON u.id = t.user_id
+         LEFT JOIN pending_tenant_intents i ON i.tenant_id = t.id AND i.waive_reason IS NOT NULL
+        WHERE u.email = 'back1@test.dev'`)).rows[0]
+    expect(t1.background_check_status).toBe('waived')
+    expect(t1.waive_reason).toBe('returning_resident')
+    expect(Number((await db.query(`SELECT COUNT(*) FROM admin_notifications WHERE category = 'returning_resident_over_allowance'`)).rows[0].count)).toBe(0)
+
+    const two = await invite('back2@test.dev')
+    expect(two.status).toBeLessThan(300)
+    const flags = await db.query<any>(`SELECT title, context FROM admin_notifications WHERE category = 'returning_resident_over_allowance'`)
+    expect(flags.rows).toHaveLength(1)
+    expect(flags.rows[0].context).toMatchObject({ property_id: f.propertyId, used: 2, allowance: 1 })
+  })
+
+  it('a returning resident must be invited to a space', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp()).post('/api/tenants/invite')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ email: 'back3@test.dev', firstName: 'Back', lastName: 'Again', propertyId: f.propertyId, returningResident: true })
+    expect(res.status).toBe(400)
+  })
+})

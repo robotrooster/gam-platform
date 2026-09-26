@@ -1433,7 +1433,7 @@ export function SchedulePage() {
           >
             <thead ref={theadRef} style={{position:'sticky',top:0,zIndex:3}}>
               <tr>
-                <th style={{background:'var(--bg-3)',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600,position:'sticky',left:0,zIndex:4,width:180,minWidth:180,borderBottom:'1px solid var(--border-1)'}}>Unit</th>
+                <th style={{background:'var(--bg-3)',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600,position:'sticky',left:0,zIndex:6,width:180,minWidth:180,borderBottom:'1px solid var(--border-1)'}}>Unit</th>
                 {days.map(d => (
                   <th key={d} style={{background:'var(--bg-3)',padding:'6px 2px',fontSize:'.6rem',color:d===today?'var(--gold)':'var(--text-3)',fontWeight:d===today?700:400,textAlign:'center',width:colW,minWidth:colW,maxWidth:colW,borderBottom:'1px solid var(--border-1)',borderLeft:'1px solid var(--border-1)'}}>
                     <div>{new Date(d+'T12:00:00').toLocaleDateString('en-US',{month:'numeric',day:'numeric'})}</div>
@@ -1450,16 +1450,19 @@ export function SchedulePage() {
                   overflow:hidden, so nothing can push the row taller and nothing is
                   truly hidden. */}
               {filteredUnits.map(unit => (
-                <tr key={unit.id} style={{height:88}}>
+                <tr key={unit.id} style={{height:56}}>
                   {/* zIndex 3: must beat the day-cell bars (zIndex 1–2). When the grid
                       is scrolled, past day-cells slide UNDER this sticky column — at
                       zIndex 1 the bars painted over the unit info (S526 glitch). */}
-                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:3,height:88,boxSizing:'border-box',overflow:'hidden'}}>
-                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,height:76,overflow:'hidden'}}>
+                  {/* S652 (Nic): the space number and nothing else — the property is
+                      chosen at the top of the page and the type is on the button
+                      colour. Three lines per row made the grid scroll for no reason.
+                      zIndex 5: the long-stay bars and the floating names (2) slid
+                      over this column during a fast scroll. */}
+                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:5,height:56,boxSizing:'border-box',overflow:'hidden'}}>
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,height:44,overflow:'hidden'}}>
                       <div style={{minWidth:0}}>
-                        <div style={{fontWeight:600,fontSize:'.82rem'}}>{unit.unitNumber}</div>
-                        <div style={{fontSize:'.68rem',color:TYPE_COLORS[unit.unitType]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)}</div>
-                        <div title={unit.propertyName} style={{fontSize:'.65rem',color:'var(--text-3)',display:'-webkit-box',WebkitLineClamp:2,WebkitBoxOrient:'vertical',overflow:'hidden',lineHeight:1.25}}>{unit.propertyName}</div>
+                        <div style={{fontWeight:700,fontSize:'.86rem',color:TYPE_COLORS[unit.unitType]||'var(--text-0)'}} title={`${UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)} · ${unit.propertyName}`}>{unit.unitNumber}</div>
                       </div>
                       <div style={{display:'flex',gap:4}}>
                         {unit.isBookable && can('schedule.create_reservation') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}

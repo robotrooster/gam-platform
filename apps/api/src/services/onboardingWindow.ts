@@ -167,6 +167,56 @@ export type ScreeningWaiveResult = { waived: boolean; reason: 'ok' | 'window_clo
  * (the endpoint 403/409s; onboarding just skips the waive → the tenant screens).
  * The CALLER is responsible for having verified the landlord owns the property.
  */
+/**
+ * S652 (Nic, option 2): a RETURNING resident — somebody the landlord attests
+ * has lived at this property before — skips the background check outside the
+ * onboarding window. Every attestation is recorded; a property gets a rolling
+ * year's allowance of 25% of its site count, and going over it flags the
+ * platform (never the landlord — "I want it to just be like, hey, you've been
+ * flagged as adding too many people"). Honest parks never notice it; a park
+ * waving everyone through shows up on the admin desk.
+ */
+export const RETURNING_RESIDENT_ALLOWANCE = 0.25
+export async function applyReturningResidentWaive(opts: {
+  tenantId: string; landlordId: string; propertyId: string; unitId: string; byUserId: string
+}): Promise<{ waived: true; used: number; allowance: number; overAllowance: boolean }> {
+  await query(`UPDATE tenants SET background_check_status = 'waived' WHERE id = $1`, [opts.tenantId])
+  await query(
+    `INSERT INTO pending_tenant_intents
+       (landlord_id, tenant_id, parser_status, property_id, unit_id,
+        screening_waived, screening_waived_by, screening_waived_at, screening_attested, screening_waived_unit_id, waive_reason)
+     VALUES ($1, $2, 'not_uploaded', $3, NULL, true, $4, NOW(), true, $5, 'returning_resident')
+     ON CONFLICT (tenant_id) WHERE cancelled_at IS NULL AND unit_id IS NULL DO UPDATE SET
+       property_id = COALESCE(public.pending_tenant_intents.property_id, EXCLUDED.property_id),
+       screening_waived = true, screening_waived_by = EXCLUDED.screening_waived_by,
+       screening_waived_at = NOW(), screening_attested = true,
+       screening_waived_unit_id = EXCLUDED.screening_waived_unit_id,
+       waive_reason = 'returning_resident', updated_at = NOW()`,
+    [opts.landlordId, opts.tenantId, opts.propertyId, opts.byUserId, opts.unitId])
+  const row = await queryOne<{ used: string; units: string }>(
+    `SELECT (SELECT COUNT(*) FROM pending_tenant_intents i
+              WHERE i.property_id = $1 AND i.waive_reason = 'returning_resident'
+                AND i.screening_waived_at > NOW() - INTERVAL '365 days') AS used,
+            (SELECT COUNT(*) FROM units u WHERE u.property_id = $1 AND u.retired_at IS NULL) AS units`,
+    [opts.propertyId])
+  const used = Number(row?.used ?? 0)
+  const allowance = Math.max(1, Math.ceil(Number(row?.units ?? 0) * RETURNING_RESIDENT_ALLOWANCE))
+  const overAllowance = used > allowance
+  if (overAllowance) {
+    const { createAdminNotification } = await import('./adminNotifications')
+    const p = await queryOne<{ name: string; business_name: string }>(
+      `SELECT p.name, la.business_name FROM properties p JOIN landlords la ON la.id = p.landlord_id WHERE p.id = $1`, [opts.propertyId])
+    await createAdminNotification({
+      severity: 'warn',
+      category: 'returning_resident_over_allowance',
+      title:    `${p?.business_name ?? 'A landlord'} is over the returning-resident allowance at ${p?.name ?? 'a property'}`,
+      body:     `${used} residents marked "lived here before" in the last year against an allowance of ${allowance} (25% of ${row?.units} sites). Background checks were skipped for each. Worth a look.`,
+      context:  { property_id: opts.propertyId, landlord_id: opts.landlordId, used, allowance },
+    }).catch(() => undefined)
+  }
+  return { waived: true, used, allowance, overAllowance }
+}
+
 export async function applyScreeningWaive(opts: {
   tenantId: string
   landlordId: string

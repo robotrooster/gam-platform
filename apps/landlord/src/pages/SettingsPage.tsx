@@ -1,3 +1,4 @@
+import { MAINTENANCE_CATEGORIES, MAINTENANCE_CATEGORY_LABEL } from '@gam/shared'
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { api, apiGet, apiPatch } from '../lib/api'
@@ -359,7 +360,7 @@ export function SettingsPage() {
           <SecurityCard />
 
           {/* S631: first billing cycle */}
-          {can('settings.billing_view') && <FirstBillingCycleCard />}
+          {can('settings.billing_view') && <><FirstBillingCycleCard /><MaintenanceRequestsCard /></>}
 
           {/* Billing */}
           {can('settings.billing_view') && (
@@ -745,6 +746,60 @@ function FeatureRequestCard() {
 // GET /properties already spans every entity the account owns, so this list
 // needs no entity picker and no switcher: a property is named, and its company
 // is printed beside it.
+// ── S652 (Nic): maintenance requests per property ─────────────────────────────
+// "We need to have a good system for limiting maintenance requests to common
+// areas." A park of tenant-owned homes repairs the park, not the stove.
+function MaintenanceRequestsCard() {
+  const qc = useQueryClient()
+  const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card-header"><span className="card-title">Maintenance requests</span></div>
+      <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
+        Which kinds of request tenants at each property may file. Leave every box checked to take
+        everything. At a park of tenant-owned homes, untick the kinds that are the tenant&apos;s own
+        repair and say so in the note — the form shows it, and those requests cannot be filed.
+      </div>
+      {(properties as any[]).map(p => <PropertyMaintenanceRow key={p.id} property={p} qc={qc} />)}
+    </div>
+  )
+}
+
+function PropertyMaintenanceRow({ property, qc }: { property: any; qc: any }) {
+  const all = [...MAINTENANCE_CATEGORIES] as string[]
+  const current: string[] = property.maintenanceCategories?.length ? property.maintenanceCategories : all
+  const [picked, setPicked] = useState<string[]>(current)
+  const [note, setNote] = useState<string>(property.maintenanceNote || '')
+  const [saved, setSaved] = useState(false)
+  const saveMut = useMutation(
+    () => apiPatch(`/properties/${property.id}/maintenance-config`,
+      { categories: picked.length === all.length ? null : picked, note: note.trim() || null }),
+    { onSuccess: () => { qc.invalidateQueries('properties'); setSaved(true); setTimeout(() => setSaved(false), 2500) } })
+  const changed = picked.slice().sort().join() !== current.slice().sort().join() || (note.trim() || '') !== (property.maintenanceNote || '')
+  return (
+    <div style={{ borderTop: '1px solid var(--border-1, rgba(255,255,255,.06))', paddingTop: 12, marginTop: 12 }}>
+      <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>{property.name || 'Unnamed property'}</div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 14px', marginTop: 8 }}>
+        {all.map(c => (
+          <label key={c} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '.78rem', cursor: 'pointer' }}>
+            <input type="checkbox" checked={picked.includes(c)}
+              onChange={e => setPicked(p => e.target.checked ? [...p, c] : p.filter(x => x !== c))} />
+            {(MAINTENANCE_CATEGORY_LABEL as any)[c] || c}
+          </label>
+        ))}
+      </div>
+      <input className="form-input" value={note} onChange={e => setNote(e.target.value)} maxLength={400}
+        placeholder="Shown on the tenant's form, e.g. Repairs inside your home are yours; this form is for the park."
+        style={{ width: '100%', marginTop: 8 }} />
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+        <button className="btn btn-primary btn-sm" disabled={!changed || saveMut.isLoading || picked.length === 0} onClick={() => saveMut.mutate()}>Save</button>
+        {saved && <span style={{ fontSize: '.74rem', color: 'var(--green)' }}>Saved</span>}
+        {picked.length === 0 && <span style={{ fontSize: '.74rem', color: 'var(--red)' }}>Pick at least one kind.</span>}
+      </div>
+    </div>
+  )
+}
+
 function FirstBillingCycleCard() {
   const qc = useQueryClient()
   const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))

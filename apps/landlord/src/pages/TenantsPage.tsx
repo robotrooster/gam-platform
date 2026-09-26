@@ -119,13 +119,18 @@ export function TenantsPage() {
       {isLoading ? <div style={{color:'var(--text-3)',padding:32}}>Loading…</div> : (
         <div className="card" style={{padding:0,overflowX:'auto'}}>
           <table className="data-table" style={{minWidth:880}}>
-            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>Rent</th><th>ACH</th><th>SSI/SSDI</th></tr></thead>
+            <thead><tr><th style={{width:'22%'}}>Tenant</th><th>Unit</th><th>Property</th><th title="Charges paid on time, work trade counted as paid">Payment health</th><th>Rent</th><th>ACH</th><th>SSI/SSDI</th></tr></thead>
             <tbody>
               {tenants.length ? tenants.map((u: any) => (
                 <tr key={u.id} onClick={() => u.tenantId && navigate(`/tenants/${u.tenantId}`)} style={{ cursor: u.tenantId ? 'pointer' : 'default' }}>
                   <td><div style={{fontWeight:600,color:'var(--text-0)'}}>{u.tenantFirst} {u.tenantLast}</div><div style={{fontSize:'.72rem',color:'var(--text-3)'}}>{u.tenantEmail}</div></td>
                   <td className="mono">{u.unitNumber}</td>
                   <td style={{fontSize:'.82rem'}}>{u.propertyName}</td>
+                  {/* S652 (Nic): the percentage on the first screen, between property
+                      and rent. Work trade reads 100% — hours paid it. */}
+                  <td className="mono">{u.paymentHealth == null
+                    ? <span style={{color:'var(--text-3)'}}>—</span>
+                    : <span style={{fontWeight:700,color:Number(u.paymentHealth)>=90?'var(--green)':Number(u.paymentHealth)>=70?'var(--amber)':'var(--red)'}}>{Number(u.paymentHealth)}%</span>}</td>
                   <td className="mono">{u.rentAmount ? `$${Number(u.rentAmount).toLocaleString()}` : '—'}
                     {u.workTradeRent && <div style={{fontSize:'.68rem',color:'var(--text-3)'}}>traded for work</div>}</td>
                   {/* S640 (Nic): a work-trade resident pays in hours and will
@@ -137,7 +142,7 @@ export function TenantsPage() {
                   <td>{u.ssiSsdi ? <span className="badge badge-gold">SSI/SSDI</span> : <span style={{color:'var(--text-3)'}}>—</span>}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>{allTenants.length ? 'No tenants match your filters.' : 'No tenants yet.'}</td></tr>
+                <tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>{allTenants.length ? 'No tenants match your filters.' : 'No tenants yet.'}</td></tr>
               )}
             </tbody>
           </table>

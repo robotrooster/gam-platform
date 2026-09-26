@@ -15,7 +15,7 @@ import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 import { loadSubtype, setSubtypeUnits } from '../services/unitSubtype'
 import { AppError } from '../middleware/errorHandler'
 import { landlordScopeIds, isEntityMember, resolveLandlordTarget, landlordIdForProperty, ownsLandlord } from '../lib/landlordScope'
-import {
+import { MAINTENANCE_CATEGORIES,
   FEE_PAYER_VALUES,
   PLACEMENT_FEE_TYPE_VALUES,
   PropertyReviewStatus,
@@ -1481,6 +1481,27 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
 // There is deliberately NO fallback to the entity's retired value. An
 // unanswered property bills the month each lease starts in, which is the reading
 // that never double-bills.
+// S652 (Nic): "we need to have a good system for limiting maintenance requests
+// to common areas" at a park of tenant-owned homes. Per property: which kinds
+// a tenant may file (null = all), and a note the form shows them.
+propertiesRouter.patch('/:id/maintenance-config', requireLandlord, async (req, res, next) => {
+  try {
+    const body = z.object({
+      categories: z.array(z.enum(MAINTENANCE_CATEGORIES)).nullable(),
+      note: z.string().trim().max(400).nullable().optional(),
+    }).parse(req.body)
+    const prop = await queryOne<{ id: string; landlord_id: string }>(
+      `SELECT id, landlord_id FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, [])) throw new AppError(403, 'That property is not yours to change.')
+    const cats = body.categories && body.categories.length ? [...new Set(body.categories)] : null
+    await query(
+      `UPDATE properties SET maintenance_categories = $2::text[], maintenance_note = $3, updated_at = NOW() WHERE id = $1`,
+      [prop.id, cats, body.note || null])
+    res.json({ success: true, data: { maintenanceCategories: cats, maintenanceNote: body.note || null } })
+  } catch (e) { next(e) }
+})
+
 propertiesRouter.patch('/:id/first-billing-cycle', requireLandlord, async (req, res, next) => {
   try {
     const body = z.object({

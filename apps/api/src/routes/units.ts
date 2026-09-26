@@ -74,6 +74,18 @@ unitsRouter.get('/', async (req, res, next) => {
         vuo.primary_last_name AS tenant_last,
         vuo.primary_email AS tenant_email,
         vuo.tenant_count,
+        -- S652 (Nic): payment health on the list, not two clicks deep. Charges
+        -- due before today; paid = settled, or covered by work trade (hours
+        -- paid it, "there was no payment to be made, so how could they be at
+        -- zero percent"). NULL until there is a bill to judge by.
+        (SELECT CASE WHEN COUNT(*) = 0 THEN NULL
+                     ELSE ROUND(100.0 * COUNT(*) FILTER (WHERE p.status IN ('settled','paid_via_deposit') OR p.work_trade_suspended_at IS NOT NULL) / COUNT(*))
+                END
+           FROM payments p
+          WHERE p.tenant_id = vuo.primary_tenant_id
+            AND p.type IN ('rent','utility','fee','home_payment')
+            AND p.due_date < CURRENT_DATE
+            AND p.status IN ('pending','failed','settled','paid_via_deposit','returned')) AS payment_health,
         -- S554 (button-sweep bug #10): the admin-ops Units panel reads
         -- achVerified for the primary tenant's ACH badge; without this the
         -- field was always undefined and the badge stuck on "Pending".

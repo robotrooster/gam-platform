@@ -1581,6 +1581,12 @@ adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) 
              COALESCE(SUM(amount) FILTER (WHERE created_at >= date_trunc('month', CURRENT_DATE)), 0)::float AS this_month,
              COALESCE(SUM(amount), 0)::float AS all_time
         FROM platform_revenue_ledger GROUP BY type ORDER BY all_time DESC`)
+    // S652 (Nic): "Why is it trying to guess an all-time figure instead of
+    // calculating what's actually settled?" The book is what GAM has EARNED;
+    // part of it is fees landlords have not paid yet. Say so on the card.
+    const [owedByLandlords] = await query<any>(`
+      SELECT COALESCE(SUM(amount - COALESCE(collected_amount, 0)), 0)::float AS amt
+        FROM landlord_gam_charges WHERE amount > COALESCE(collected_amount, 0)`)
     const onBalance = (available ?? 0) + (pending ?? 0)
     const others = Number(owed.amt) + Number(heldItems.amt) + Number(deposits.amt) + Number(reserved.amt)
     res.json({ success: true, data: {
@@ -1588,6 +1594,7 @@ adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) 
       owed_to_landlords: Number(owed.amt) + Number(heldItems.amt) + Number(reserved.amt),
       deposits_in_trust: Number(deposits.amt),
       gams_own: available == null ? null : Math.round((onBalance - others) * 100) / 100,
+      owed_by_landlords_uncollected: Number(owedByLandlords?.amt ?? 0),
       revenue_by_type: revenue,
       revenue_this_month: Math.round(revenue.reduce((a: number, r: any) => a + Number(r.this_month), 0) * 100) / 100,
       revenue_all_time: Math.round(revenue.reduce((a: number, r: any) => a + Number(r.all_time), 0) * 100) / 100,

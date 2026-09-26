@@ -1148,7 +1148,7 @@ function Overview(){
             One Stripe balance holds three people's money; this is the split. */}
         {isSuperAdmin&&bal&&<div className="kpi"><div className="kl">GAM's Own Money</div>
           <div className="kv g">{bal.gamsOwn==null?'—':formatCurrency(bal.gamsOwn)}</div>
-          <div className="ks">on the balance after everyone else is paid · earned {formatCurrency(bal.revenueThisMonth||0)} this month, {formatCurrency(bal.revenueAllTime||0)} all time</div></div>}
+          <div className="ks">cash on the balance after everyone else is paid · book: {formatCurrency(bal.revenueThisMonth||0)} earned this month, {formatCurrency(bal.revenueAllTime||0)} all time{(bal.owedByLandlordsUncollected||0)>0?` — ${formatCurrency(bal.owedByLandlordsUncollected)} of that still owed by landlords`:''}</div></div>}
         {isSuperAdmin&&bal&&<div className="kpi"><div className="kl">Not GAM's</div>
           <div className="kv gold">{formatCurrency((bal.owedToLandlords||0)+(bal.depositsInTrust||0))}</div>
           <div className="ks">{formatCurrency(bal.owedToLandlords||0)} owed to landlords{(bal.depositsInTrust||0)>0?` · ${formatCurrency(bal.depositsInTrust)} tenant deposits in trust`:''} · Stripe: {bal.stripeAvailable==null?'—':formatCurrency(bal.stripeAvailable)} available, {formatCurrency(bal.stripePending||0)} still clearing</div></div>}
