@@ -102,6 +102,7 @@ export function POSPage() {
   // when it is rung, by the same server path as every other sale.
   const [ticketsOpen, setTicketsOpen] = useState(false)
   const [openTicketId, setOpenTicketId] = useState<string | null>(null)
+  const [dismissedSessions, setDismissedSessions] = useState<Set<string>>(new Set())
   const [cashGiven, setCashGiven] = useState('')
   const [filterCat, setFilterCat] = useState('all')
   const [receipt, setReceipt] = useState<any>(null)
@@ -312,8 +313,9 @@ export function POSPage() {
   )
   useEffect(() => {
     if (clientSessionId) { setOpenTabBanner(null); return }
-    if (!openSessions || openSessions.length === 0) { setOpenTabBanner(null); return }
-    const first = openSessions[0]
+    const live = (openSessions || []).filter((s: any) => !dismissedSessions.has(s.id) && !dismissedSessions.has(s.clientSessionId))
+    if (live.length === 0) { setOpenTabBanner(null); return }
+    const first = live[0]
     setOpenTabBanner({
       id: first.id,
       total: Number(first.total ?? 0),
@@ -429,7 +431,9 @@ export function POSPage() {
       // S652 (Nic): a stay's price is the SITE's, not the catalog's, and no
       // site has been picked yet. Starts at zero and fills in when one is,
       // so nothing on screen ever shows a number the guest will not be charged.
-      return [...c, { id:item.id, name:item.name, price:item.stayUnit?0:Number(item.sellPrice), qty:1, tax:Number(item.taxRate), cat:item.category, icon:item.icon, chargeEligible:item.chargeEligible, stayUnit:item.stayUnit ?? null, _sessionItemId: clientItemId } as any]
+      // S652 (Nic): a stay starts at the property's base rate (the cheapest site
+      // of that length) and takes the chosen site's rate once one is picked.
+      return [...c, { id:item.id, name:item.name, price:item.stayUnit?Number(item.baseRate ?? 0):Number(item.sellPrice), qty:1, tax:Number(item.taxRate), cat:item.category, icon:item.icon, chargeEligible:item.chargeEligible, stayUnit:item.stayUnit ?? null, _sessionItemId: clientItemId } as any]
     })
   }
   // S536 (Nic): absolute-quantity setter — the register quantity is
@@ -446,7 +450,9 @@ export function POSPage() {
     if (!line) return
     const cap = stockCapFor(id)
     if (Number.isFinite(cap) && target > cap) showStockNotice(`Only ${cap} in stock`)
-    const newQty = Math.min(Math.max(0, Math.floor(target)), cap)
+    // S652 (Nic): "will not let you put in decimal points." Propane is sold by
+    // the gallon and a gallon has tenths. Two decimals, never floored.
+    const newQty = Math.min(Math.max(0, Math.round(target * 100) / 100), cap)
     const csid = clientSessionId
     const lineClientId = (line as any)._sessionItemId
     if (csid && lineClientId) {
@@ -897,7 +903,9 @@ export function POSPage() {
                       night and site 6 is $42 — so the button cannot show one.
                       The price appears when the site does. */}
                   <div style={{fontSize:'.88rem',color:'var(--gold)',fontWeight:700}}>
-                    {item.stayUnit ? <span style={{fontSize:'.72rem',color:'var(--text-3)',fontWeight:600}}>price by site</span> : fmt(item.sellPrice)}
+                    {item.stayUnit
+                      ? <>{fmt(Number(item.baseRate ?? 0))}<span style={{fontSize:'.62rem',color:'var(--text-3)',fontWeight:600,marginLeft:4}}>from</span></>
+                      : fmt(item.sellPrice)}
                   </div>
                   <div style={{display:'flex',gap:4,marginTop:4,flexWrap:'wrap'}}>
                     {item.chargeEligible&&<span style={{fontSize:'.65rem',background:'var(--gold-bg)',color:'var(--gold)',padding:'1px 4px',borderRadius:3}}>charge</span>}
@@ -916,8 +924,15 @@ export function POSPage() {
             )}
             <div className="card-header"><span className="card-title">Current Sale</span>
               {cart.length>0&&<button onClick={() => {
+                // S652 (Nic): "just clearing the cart should clear it, and if
+                // they have a name associated with it save it as a ticket."
+                if (tenantId || posCustomerId) { writeTicketMut.mutate(); return }
                 // S263/S264: clearing the cart enqueues a void on the
-                // live session. Offline-tolerant — drains on reconnect.
+                // live session. Offline-tolerant — drains on reconnect. The
+                // void lands after the open-tab list refreshes, so the tab
+                // used to come straight back as "resume or discard": remember
+                // what was cleared and never show it again on this terminal.
+                if (clientSessionId) setDismissedSessions(d => new Set(d).add(clientSessionId))
                 if (clientSessionId) {
                   void enqueueSync({
                     op: 'VOID_SESSION',
@@ -937,7 +952,7 @@ export function POSPage() {
                   </div>
                   <div style={{display:'flex',alignItems:'center',gap:4}}>
                     <button onClick={()=>updateQty(i.id,-1)} style={{background:'var(--bg-3)',border:'none',borderRadius:3,width:20,height:20,cursor:'pointer',fontWeight:700}}>-</button>
-                    <input type="number" min={0} value={i.qty} onFocus={e=>e.currentTarget.select()} onChange={e=>{const v=parseInt(e.target.value,10); if(!isNaN(v)) void setQty(i.id, v)}} style={{width:46,textAlign:'center',fontSize:'.82rem',fontWeight:600,background:'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:4,color:'var(--text-0)',padding:'2px 0'}} />
+                    <input type="number" min={0} step="any" value={i.qty} onFocus={e=>e.currentTarget.select()} onChange={e=>{const v=parseFloat(e.target.value); if(!isNaN(v)) void setQty(i.id, v)}} style={{width:46,textAlign:'center',fontSize:'.82rem',fontWeight:600,background:'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:4,color:'var(--text-0)',padding:'2px 0'}} />
                     <button onClick={()=>updateQty(i.id,1)} style={{background:'var(--bg-3)',border:'none',borderRadius:3,width:20,height:20,cursor:'pointer',fontWeight:700}}>+</button>
                   </div>
                   <div style={{fontSize:'.82rem',fontWeight:600,minWidth:44,textAlign:'right'}}>{fmt(i.price*i.qty)}</div>

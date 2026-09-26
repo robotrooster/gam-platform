@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 4xwZiZJTfRUaOVfVgfnifpO9oKq46Ht7JpJNEgn7tpBgbYeHXlxhWnjomvUcDMa
+\restrict fZtiA5i68B4d7jUuxhlRtePdhtTLKPO6fE1owRcjGYS6xqxpYbXRrDDt2xAkDyG
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4620,7 +4620,8 @@ CREATE TABLE public.home_sale_installments (
     interest_portion numeric(12,2) NOT NULL,
     remaining_balance numeric(12,2) NOT NULL,
     payment_id uuid,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    settled_off_platform_at timestamp with time zone
 );
 
 
@@ -27996,5 +27997,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 4xwZiZJTfRUaOVfVgfnifpO9oKq46Ht7JpJNEgn7tpBgbYeHXlxhWnjomvUcDMa
+\unrestrict fZtiA5i68B4d7jUuxhlRtePdhtTLKPO6fE1owRcjGYS6xqxpYbXRrDDt2xAkDyG
 

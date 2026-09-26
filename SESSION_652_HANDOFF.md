@@ -893,3 +893,19 @@ MEMORY.md index trimmed under its size limit (entries ≤128 chars).
 **Mountain View tax:** both rows 6.35% → 6.60% (Santa Cruz County: 5.6% state + 1.0% county retail; transient lodging 6.60%). 6.35% was Yavapai's rate.
 
 **Not built, Nic's call pending:** returning-resident background-check bypass (options given); register decimals / clear-cart / stay-button price (he is thinking about site pricing); one-signature property notice; POS customer credit.
+
+## Deploy 64 — first bill waits for the cycle; register base rate, decimals, clear-cart; debit test armed (2026-09-25 evening)
+
+**Deploy 63 (floor) shipped on its second run** — API restarted 4:58 pm with the floor; the landlord front end's Vercel alias lagged ("still serves index-CglFOWsJ.js"), redone here. First run failed 4 home-sale tests because gam_test is rebuilt from schema.sql and I had ALTERed it by hand — process fix in memory (migrate → dump-schema → tests).
+
+**Nic: "We are not in October. There shouldn't be open bills at all."** The move-in bundle made an existing resident's first invoice at signing (weeks early, no meter reads; Curtis got an empty October statement Sept 23). Now: an existing tenancy whose first cycle is in the future gets NO invoice at signing; the nightly job makes it when the cycle arrives, with the month's utilities. Country Acres' two premature October invoices (MH 06, MH 17) and their charges ERASED. Open charges at Country Acres: none. Test: invoiceMoveInMonth "signing an existing resident before the first cycle makes no invoice; the cycle does".
+
+**Register (Nic's go):** stay buttons show the property's base rate = cheapest site of that length ("$49 from"); the cart line starts there and takes the chosen site's rate when picked (`base_rate` on GET /pos/items). Quantities take two decimals (10.5 gallons). Clear: a named sale (tenant or POS customer) is held as a ticket; an anonymous one is dropped and the open-tab banner no longer resurrects it. Both registers byte-identical.
+
+**Fee debit test (Nic: "test that flow, PNC"):** both companies' bank-feed links are the same banks as their Connect payout banks (Oak Park PNC ****9677, Mountain View Wells Fargo ****8739); the debit payment method is minted from the feed link on first use, so ONE link already serves payouts and debits. Oak Park's threshold lowered $100 → $10 for the test; the sweep runs 8:30 am Phoenix and should pull $48 + $6 bank cost. Risk: if the feed link lacks the payment_method permission the sweep logs "no usable bank link" — check the 8:30 log. Restore the threshold after.
+
+**Stripe $198.50 vs ledger $218.87:** reconciles. Stripe = Sept net $190.58 + pre-Sept $7.92. The ledger books margins from ESTIMATED processor costs; Stripe's actual fees + network costs ran ~$19 higher this month (plus ~$1 pre-Sept). The month-end true-up (already ran a partial +$33.11) posts the difference on the 30th. Nothing left Stripe.
+
+**Returning-resident (Nic chose option 2):** not yet built — designed: invite modal gets "This person has lived here before" attestation (replaces the free "no screening" unit-invite path outside the onboarding window); recorded on the intent (screening_waived + attested); rolling-365-day count per property capped at 25% of unit count → over the cap = admin flag, landlord never sees the count. Next deploy.
+
+**Still awaiting Nic's go:** schedule row label + scroll layer; tenants page payment-health column + work-trade = 100%; maintenance categories per property (option 2).

@@ -59,6 +59,25 @@ describe('the property\'s first billing cycle is the floor on every due month', 
     expect(await rentDueDates(s.leaseId)).toEqual(['2026-07-01', '2026-08-01'])
   })
 
+  // S652 (Nic): "We are not in October. There shouldn't be open bills at all."
+  // An existing resident's first bill is made when the cycle arrives, not at
+  // signing — so the month's meter reads are on it.
+  it('signing an existing resident before the first cycle makes no invoice; the cycle does', async () => {
+    const s = await seedStack({ startDate: '2024-03-01', rentDueDay: 1 })
+    await db.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [s.leaseId])
+    const next = new Date(); next.setUTCDate(1); next.setUTCMonth(next.getUTCMonth() + 1)
+    const cycle = next.toISOString().slice(0, 10)
+    await db.query(`UPDATE properties SET first_billing_cycle = $2 WHERE id = $1`, [s.propertyId, cycle])
+    const r = await genMoveIn({
+      lease_id: s.leaseId, unit_id: s.unitId, tenant_id: s.tenantId,
+      landlord_id: s.landlordId, rent_amount: 1000, start_date: '2024-03-01',
+    } as any)
+    expect(r.invoiceCreated).toBe(false)
+    expect(await rentDueDates(s.leaseId)).toEqual([])
+    await backfill({ from: cycle, to: cycle, leaseId: s.leaseId })
+    expect(await rentDueDates(s.leaseId)).toEqual([cycle])
+  })
+
   it('without a first cycle the job behaves as before', async () => {
     const s = await seedStack({ startDate: '2026-05-01', rentDueDay: 1 })
     await db.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [s.leaseId])

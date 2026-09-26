@@ -135,10 +135,20 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
     // group by it.
     let items: any[]
     if (propertyFilter) {
+      // S652 (Nic): "there needs to be a price on the actual button." A stay's
+      // button shows the property's BASE rate — the cheapest site of that
+      // length — and the cart line updates to the chosen site's rate when the
+      // site is picked. Front-desk staff never see a blank price.
       items = await query<any>(
-        `SELECT pi.*, pc.name AS category
+        `SELECT pi.*, pc.name AS category,
+                CASE pi.stay_unit
+                  WHEN 'night' THEN COALESCE((SELECT MIN(u.nightly_rate) FROM units u WHERE u.property_id = pi.property_id AND u.retired_at IS NULL AND u.nightly_rate > 0), p.nightly_rate)
+                  WHEN 'week'  THEN COALESCE((SELECT MIN(u.weekly_rate)  FROM units u WHERE u.property_id = pi.property_id AND u.retired_at IS NULL AND u.weekly_rate  > 0), p.weekly_rate)
+                  WHEN 'month' THEN COALESCE((SELECT MIN(u.monthly_rate) FROM units u WHERE u.property_id = pi.property_id AND u.retired_at IS NULL AND u.monthly_rate > 0), p.monthly_rate)
+                  ELSE NULL END AS base_rate
           FROM pos_items pi
           LEFT JOIN pos_categories pc ON pc.id = pi.category_id
+          LEFT JOIN properties p ON p.id = pi.property_id
           WHERE pi.landlord_id = $1
             AND pi.is_active = TRUE
             AND pi.property_id = $2

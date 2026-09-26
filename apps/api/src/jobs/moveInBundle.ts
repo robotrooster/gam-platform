@@ -246,6 +246,22 @@ export async function generateMoveInInvoice(
     ? existingTenancyCycle(inputs.start_date, leaseMeta.first_billing_cycle)
     : inputs.start_date
 
+  // S652 (Nic): "We are not in October. There shouldn't be open bills at all."
+  // An existing resident's first bill belongs to the first billing cycle, and
+  // it is made by the nightly job WHEN that cycle arrives — with the month's
+  // meter reads on it. Making it at signing, weeks early, put an empty October
+  // statement in Curtis Clabough's inbox on September 23rd.
+  if (leaseMeta?.is_existing_tenancy) {
+    const tzRow = await client.query<{ tz: string }>(
+      `SELECT COALESCE(p.timezone, 'America/Phoenix') AS tz FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+      [inputs.unit_id])
+    const today = DateTime.now().setZone(tzRow.rows[0]?.tz || 'America/Phoenix').toISODate()!
+    if (invoiceDueDate > today) {
+      if (ownsTx) client.release()
+      return { invoiceCreated: false, invoiceId: null, invoiceNumber: null, rentAmount: inputs.rent_amount, moveInFeesInserted: 0, depositInserted: false }
+    }
+  }
+
   // S631 (Nic): a work-trade tenant must not be fined while they are working the
   // month off. The monthly cron has stamped late_fee_exempt for this since S623;
   // the MOVE-IN invoice never did, so the very first invoice of a work-trade
