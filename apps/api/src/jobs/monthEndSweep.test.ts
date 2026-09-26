@@ -120,7 +120,7 @@ describe('S641 the sweep pays where the weekly run would not', () => {
       await c.query('BEGIN')
       const { userId, landlordId } = await seedLandlord(c)
       await c.query(
-        `UPDATE landlords SET stripe_connect_account_id = $2,
+        `UPDATE landlords SET gam_debit_payment_method_id = 'pm_test_bank', stripe_connect_account_id = $2,
                 connect_payouts_enabled = TRUE, connect_details_submitted = TRUE
           WHERE id = $1`, [landlordId, 'acct_sweep_' + landlordId.slice(0, 8)])
       if (lastPayoutDaysAgo != null) {

@@ -66,7 +66,7 @@ async function seedPayable(opts: { lastPayoutDaysAgo?: number } = {}) {
     await c.query('BEGIN')
     const { userId, landlordId } = await seedLandlord(c)
     await c.query(
-      `UPDATE landlords SET stripe_connect_account_id = $2,
+      `UPDATE landlords SET gam_debit_payment_method_id = 'pm_test_bank', stripe_connect_account_id = $2,
               connect_payouts_enabled = TRUE, connect_details_submitted = TRUE
         WHERE id = $1`, [landlordId, 'acct_weekly_' + landlordId.slice(0, 8)])
     if (opts.lastPayoutDaysAgo != null) {

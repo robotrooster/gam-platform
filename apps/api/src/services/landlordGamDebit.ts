@@ -245,6 +245,11 @@ export async function debitLandlordForCharges(landlordId: string): Promise<Debit
       payment_method_types: ['us_bank_account'],
       confirm: true,
       off_session: true,
+      // S652 (Nic): linking the bank IS the authorization — "when they link a
+      // bank, they're authorizing debits and payouts." Stripe needs that said on
+      // the debit itself or it refuses ("requires a mandate"). Offline
+      // acceptance, dated when the link was made.
+      mandate_data: { customer_acceptance: { type: 'offline' } },
       // NACHA company-entry description — 8 chars, what prints on their
       // statement. A landlord reading "GAMFEES" knows what it is without
       // phoning anyone, which is the whole objective here.
