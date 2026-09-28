@@ -1506,6 +1506,25 @@ propertiesRouter.patch('/:id/maintenance-config', requireLandlord, async (req, r
   } catch (e) { next(e) }
 })
 
+/**
+ * S652 (Nic): "make the photo step optional… make it where the landlord
+ * toggles whether or not it's required per property. Setting it at the
+ * property level prevents discrimination." On: the reading walk will not take
+ * a number without a photo of the meter face. Off (default): the photo is
+ * offered, never demanded.
+ */
+propertiesRouter.patch('/:id/meter-photo-config', requireLandlord, async (req, res, next) => {
+  try {
+    const body = z.object({ required: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ id: string; landlord_id: string }>(
+      `SELECT id, landlord_id FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, [])) throw new AppError(403, 'That property is not yours to change.')
+    await query(`UPDATE properties SET meter_photo_required = $2, updated_at = NOW() WHERE id = $1`, [prop.id, body.required])
+    res.json({ success: true, data: { meterPhotoRequired: body.required } })
+  } catch (e) { next(e) }
+})
+
 propertiesRouter.patch('/:id/first-billing-cycle', requireLandlord, async (req, res, next) => {
   try {
     const body = z.object({

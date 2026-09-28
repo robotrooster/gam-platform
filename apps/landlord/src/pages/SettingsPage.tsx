@@ -360,7 +360,8 @@ export function SettingsPage() {
           <SecurityCard />
 
           {/* S631: first billing cycle */}
-          {can('settings.billing_view') && <><FirstBillingCycleCard /><MaintenanceRequestsCard /></>}
+          {can('settings.billing_view') && <><FirstBillingCycleCard />
+          <MeterPhotosCard /><MaintenanceRequestsCard /></>}
 
           {/* Billing */}
           {can('settings.billing_view') && (
@@ -796,6 +797,33 @@ function PropertyMaintenanceRow({ property, qc }: { property: any; qc: any }) {
         {saved && <span style={{ fontSize: '.74rem', color: 'var(--green)' }}>Saved</span>}
         {picked.length === 0 && <span style={{ fontSize: '.74rem', color: 'var(--red)' }}>Pick at least one kind.</span>}
       </div>
+    </div>
+  )
+}
+
+// S652 (Nic): "take a picture of each meter for historical accuracy… make the
+// photo step optional… set it at the property level, prevents discrimination."
+function MeterPhotosCard() {
+  const qc = useQueryClient()
+  const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
+  const toggle = useMutation(
+    (args: { id: string; required: boolean }) => apiPatch(`/properties/${args.id}/meter-photo-config`, { required: args.required }),
+    { onSuccess: () => qc.invalidateQueries('properties') })
+  return (
+    <div className="card">
+      <div className="card-header"><span className="card-title">Meter photos</span></div>
+      <p style={{ fontSize: '.8rem', color: 'var(--text-2)', margin: '0 0 6px' }}>
+        The reading walk always offers a photo of the meter face. Turn this on and the walk will not take a
+        number without one — for every meter at that property, every month.
+      </p>
+      {(properties as any[]).map(p => (
+        <label key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 0', borderTop: '1px solid var(--border-1, rgba(255,255,255,.06))', fontSize: '.82rem', cursor: 'pointer' }}>
+          <input type="checkbox" checked={!!p.meterPhotoRequired} disabled={toggle.isLoading}
+            onChange={e => toggle.mutate({ id: p.id, required: e.target.checked })} />
+          <span style={{ fontWeight: 600 }}>{p.name || 'Unnamed property'}</span>
+          <span style={{ color: 'var(--text-3)' }}>{p.meterPhotoRequired ? 'photo required with every reading' : 'photo optional'}</span>
+        </label>
+      ))}
     </div>
   )
 }

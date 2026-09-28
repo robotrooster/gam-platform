@@ -1,5 +1,10 @@
 import { Router } from 'express'
 import { z } from 'zod'
+import path from 'path'
+import fs from 'fs'
+import crypto from 'crypto'
+import multer from 'multer'
+import { streamStoredFile } from '../lib/fileServe'
 import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, METER_USAGE_ALERT_THRESHOLDS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
@@ -1224,6 +1229,54 @@ utilityRouter.get('/reading-runs/:id/meters', requireMeterReader, async (req, re
 // Enter one meter's reading inside a run. Cycle comes from the run —
 // the reader never picks dates. Auto-completes the run (generate +
 // finalize bills) when this was the last unread meter.
+// ── S652: THE METER FACE ────────────────────────────────────────────────────
+// Nic: "add the option for the maintenance person to take a picture of each
+// meter for historical accuracy." Anyone who may read the meter may photograph
+// it — no separate permission. The photo lands beside the reading it belongs
+// to (this cycle's monthly read, if it already exists) and is served only to
+// people who could see the reading.
+const meterPhotoDir = path.join(process.cwd(), 'uploads', 'meters')
+if (!fs.existsSync(meterPhotoDir)) fs.mkdirSync(meterPhotoDir, { recursive: true })
+const meterPhotoUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, meterPhotoDir),
+    filename: (_req, file, cb) => cb(null, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${(path.extname(file.originalname).toLowerCase() || '.jpg')}`),
+  }),
+  limits: { fileSize: 12 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (/^image\/(jpeg|png|webp|heic)$/.test(file.mimetype)) cb(null, true)
+    else cb(new AppError(400, 'A photo (JPEG, PNG, WebP or HEIC) is required'))
+  },
+})
+utilityRouter.post('/reading-runs/:id/meters/:meterId/photo', requireMeterReader, meterPhotoUpload.single('file'), async (req: any, res, next) => {
+  try {
+    if (!req.file) throw new AppError(400, 'No photo uploaded')
+    const run = await queryOne<any>(`SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
+    if (!run) throw new AppError(404, 'Reading run not found')
+    await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
+    const meter = await queryOne<{ id: string }>(`SELECT id FROM utility_meters WHERE id = $1 AND property_id = $2`, [req.params.meterId, run.property_id])
+    if (!meter) throw new AppError(404, 'Meter not found on this run')
+    const url = `/uploads/meters/${req.file.filename}`
+    // A reading already taken this cycle gets the photo now; otherwise the
+    // reading that follows carries it in.
+    const attached = await queryOne<{ id: string }>(
+      `UPDATE utility_meter_readings SET photo_url = $3
+        WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle' RETURNING id`,
+      [meter.id, run.billing_cycle_month, url])
+    res.status(201).json({ success: true, data: { url, attachedToReadingId: attached?.id ?? null } })
+  } catch (e) { next(e) }
+})
+utilityRouter.get('/readings/:id/photo', async (req: any, res, next) => {
+  try {
+    const r = await queryOne<any>(
+      `SELECT r.photo_url, m.property_id, p.landlord_id FROM utility_meter_readings r
+         JOIN utility_meters m ON m.id = r.meter_id JOIN properties p ON p.id = m.property_id WHERE r.id = $1`, [req.params.id])
+    if (!r?.photo_url) throw new AppError(404, 'No photo on this reading')
+    await assertMeterReadAccess(req.user, r.property_id, r.landlord_id)
+    streamStoredFile(res, r.photo_url)
+  } catch (e) { next(e) }
+})
+
 utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requireMeterReader, async (req, res, next) => {
   try {
     // Reads are odometer values; the digit width is per-meter (landlord
@@ -1239,12 +1292,25 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requireMeterRead
       // Replacing somebody else's read is a deliberate act, never a side effect
       // of a stray keystroke on the wrong row.
       replace: z.boolean().optional(),
+      // S652: the meter face, uploaded a moment earlier via .../photo.
+      photoUrl: z.string().regex(/^\/uploads\/meters\/[A-Za-z0-9._-]+$/).optional(),
     }).parse(req.body)
     const run = await queryOne<any>(
       `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
     await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
     if (run.status !== 'open') throw new AppError(409, 'Reading run is already completed')
+    // S652 (Nic): "set it at the property level" — a property that requires
+    // the photo will not take a number without one (a photo already on this
+    // cycle's reading counts, so a re-read after a photo is not asked twice).
+    const propPhoto = await queryOne<{ meter_photo_required: boolean }>(
+      `SELECT meter_photo_required FROM properties WHERE id = $1`, [run.property_id])
+    if (propPhoto?.meter_photo_required && !body.photoUrl) {
+      const already = await queryOne<{ id: string }>(
+        `SELECT id FROM utility_meter_readings WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle' AND photo_url IS NOT NULL`,
+        [req.params.meterId, run.billing_cycle_month])
+      if (!already) throw new AppError(400, 'This property requires a photo of the meter face with every reading — take the photo, then enter the number.')
+    }
     const meter = await queryOne<any>(
       `SELECT m.* FROM utility_meters m
         WHERE m.id = $1 AND m.property_id = $2`, [req.params.meterId, run.property_id])
@@ -1373,10 +1439,11 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requireMeterRead
     const reading = await queryOne<any>(
       `INSERT INTO utility_meter_readings
          (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id,
-          needs_review, review_note, is_rollover, reason, bill_amount)
-       VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, $6, $7, 'monthly_cycle', $8)
+          needs_review, review_note, is_rollover, reason, bill_amount, photo_url)
+       VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, $6, $7, 'monthly_cycle', $8, $9)
        ON CONFLICT (meter_id, billing_cycle_month) WHERE reason = 'monthly_cycle'
-       DO UPDATE SET reading_value = EXCLUDED.reading_value,
+       DO UPDATE SET photo_url = COALESCE(EXCLUDED.photo_url, utility_meter_readings.photo_url),
+                     reading_value = EXCLUDED.reading_value,
                      reading_date = EXCLUDED.reading_date,
                      created_by_user_id = EXCLUDED.created_by_user_id,
                      needs_review = EXCLUDED.needs_review,
@@ -1385,7 +1452,7 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requireMeterRead
                      bill_amount = EXCLUDED.bill_amount
        RETURNING id, meter_id, billing_cycle_month`,
       [meter.id, body.readingValue, run.billing_cycle_month, req.user!.userId,
-       needsReview, reviewNote, isRollover, isDollarMaster ? body.billAmount : null])
+       needsReview, reviewNote, isRollover, isDollarMaster ? body.billAmount : null, body.photoUrl ?? null])
 
     // When the last meter is read, the run moves to its VERIFICATION
     // phase (S533) — the system builds the blind double-check list and

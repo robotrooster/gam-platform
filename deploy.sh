@@ -131,11 +131,15 @@ if (cd apps/api && npm run build >/tmp/gam-deploy-api.log 2>&1); then
     # answer — and if anything but our job holds :4000, say so loudly.
     launchctl bootout "gui/$(id -u)/com.gam.api" >/dev/null 2>&1
     for i in $(seq 1 20); do lsof -nP -iTCP:4000 -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 1; done
-    for i in $(seq 1 10); do
+    # Deploy 72: launchd can take ~30 s after a bootout before it accepts the
+    # job again; the earlier 20 s window flagged a deploy that had in fact
+    # loaded a moment later. Wait up to two minutes, and re-check at the end.
+    for i in $(seq 1 60); do
       launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.gam.api.plist" >/dev/null 2>&1
       launchctl list 2>/dev/null | grep -q "com.gam.api$" && break
       sleep 2
     done
+    sleep 2
     if ! launchctl list 2>/dev/null | grep -q "com.gam.api$"; then bad "launchd did not load com.gam.api"; FAILED=1; fi
     # Give it a moment, then prove it is actually answering.
     for i in $(seq 1 60); do

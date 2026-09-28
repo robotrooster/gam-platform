@@ -1,13 +1,13 @@
 import { useState, useEffect, useMemo, useRef, CSSProperties } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { useSearchParams } from 'react-router-dom'
-import { apiGet, apiPost, apiPut, apiDelete, apiPatch } from '../lib/api'
+import { useSearchParams, useNavigate } from 'react-router-dom'
+import { apiGet, apiPost, apiPut, apiDelete, apiPatch, api } from '../lib/api'
 import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
 import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil, Check } from 'lucide-react'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
 import { ReadingWalkModal } from '../../../../packages/shared-ui/MeterWalk'
-const walkApi = { get: apiGet, post: apiPost }
+const walkApi = { get: apiGet, post: apiPost, upload: (url: string, form: FormData) => api.post(url, form).then(r => r.data) }
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -485,6 +485,7 @@ function BrokenMeterPolicyCard({ property }: { property: any }) {
 }
 
 function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () => void }) {
+  const navigate = useNavigate()
   const [value, setValue] = useState('')
   const [reason, setReason] = useState<'rollover' | 'swap' | null>(null)
   const digits = Number(reading.digits) || METER_READING_DEFAULT_DIGITS
@@ -513,6 +514,13 @@ function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () =>
           <div style={{ display:'flex', justifyContent:'space-between', marginTop:6 }}>
             <span style={{ color:'var(--text-3)' }}>Entered this cycle</span>
             <span className="mono" style={{ fontWeight:600, color:'var(--amber, #d97706)' }}>{fmtRead(reading.readingValue, digits)}</span>
+            {/* S652: the meter face the reader photographed, when there is one. */}
+            {reading.photoUrl && (
+              <button className="btn btn-ghost btn-sm" style={{ marginLeft:8 }}
+                onClick={() => navigate(`/view?src=${encodeURIComponent(`/utility/readings/${reading.id}/photo`)}&title=${encodeURIComponent('Meter photo')}`)}>
+                📷 View meter photo
+              </button>
+            )}
           </div>
           {reading.reviewNote && <div style={{ marginTop:8, fontSize:'.75rem', color:'var(--text-3)' }}>{reading.reviewNote}</div>}
         </div>

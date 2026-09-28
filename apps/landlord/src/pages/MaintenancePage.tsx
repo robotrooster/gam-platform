@@ -727,6 +727,11 @@ function ReceiptsSection({ requestId, canUpload }: { requestId: string; canUploa
   const qc = useQueryClient()
   const navigate = useNavigate()
   const [error, setError] = useState<string | null>(null)
+  // S652 (Nic): "nobody's gonna scan it into a system and then upload it from
+  // the computer… taking the photo of the receipt needs to be its own button."
+  // Add receipt opens the camera; the shot files under Receipts, apart from
+  // the fix photos. A file picker stays for the rare emailed PDF.
+  const [cameraOpen, setCameraOpen] = useState(false)
   const { data: receipts = [] } = useQuery<any[]>(['maint-receipts', requestId], () => apiGet(`/maintenance/${requestId}/receipts`))
   const upload = async (file: File) => {
     setError(null)
@@ -754,15 +759,22 @@ function ReceiptsSection({ requestId, canUpload }: { requestId: string; canUploa
           </button>
         ))}
         {canUpload && (
-          <label style={{ fontSize: '.68rem', color: 'var(--text-2)', border: '1px dashed var(--border-2)', borderRadius: 6, padding: '3px 8px', cursor: 'pointer' }}>
-            + Add receipt
-            <input type="file" accept=".pdf,.jpg,.jpeg,.png,.webp,.heic" style={{ display: 'none' }}
-              onChange={e => { const f = e.target.files?.[0]; if (f) upload(f); e.target.value = '' }} />
-          </label>
+          <>
+            <button type="button" onClick={() => setCameraOpen(true)}
+              style={{ fontSize: '.68rem', color: 'var(--text-2)', border: '1px dashed var(--border-2)', borderRadius: 6, padding: '3px 8px', cursor: 'pointer', background: 'none' }}>
+              📷 Add receipt
+            </button>
+            <label style={{ fontSize: '.64rem', color: 'var(--text-3)', cursor: 'pointer', textDecoration: 'underline' }}>
+              or a file
+              <input type="file" accept=".pdf,.jpg,.jpeg,.png,.webp,.heic" style={{ display: 'none' }}
+                onChange={e => { const f = e.target.files?.[0]; if (f) upload(f); e.target.value = '' }} />
+            </label>
+          </>
         )}
         {!receipts.length && !canUpload && <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>None</span>}
       </div>
       {error && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 3 }}>{error}</div>}
+      {cameraOpen && <CameraCapture mode="photo" onCapture={(f) => { upload(f); setCameraOpen(false) }} onClose={() => setCameraOpen(false)} />}
     </div>
   )
 }

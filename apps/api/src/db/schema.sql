@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict eZ60DrIo1DfLJXrp1DKUEo7LtSbnxpsVJnvFeMfsmgC0unoKpkuIroEitXhlLp5
+\restrict sCAFADTfDxZVRRPTSIQQS2fxFOjKoSU24tedNw4bTOW9Tc0aFnHVl0W8pLo7Ecu
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7950,6 +7950,7 @@ CREATE TABLE public.properties (
     booking_card_fee_payer text DEFAULT 'customer'::text NOT NULL,
     maintenance_categories text[],
     maintenance_note text,
+    meter_photo_required boolean DEFAULT false NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
@@ -11000,6 +11001,7 @@ CREATE TABLE public.utility_meter_readings (
     reason text DEFAULT 'monthly_cycle'::text NOT NULL,
     reason_note text,
     bill_amount numeric(12,2),
+    photo_url text,
     CONSTRAINT utility_meter_readings_reason_check CHECK ((reason = ANY (ARRAY['monthly_cycle'::text, 'stay_turnover'::text, 'move_out_final'::text, 'meter_replaced'::text, 'baseline'::text, 'billed_off_platform'::text, 'other'::text])))
 );
 
@@ -28011,5 +28013,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict eZ60DrIo1DfLJXrp1DKUEo7LtSbnxpsVJnvFeMfsmgC0unoKpkuIroEitXhlLp5
+\unrestrict sCAFADTfDxZVRRPTSIQQS2fxFOjKoSU24tedNw4bTOW9Tc0aFnHVl0W8pLo7Ecu
 

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Gauge, ChevronRight } from 'lucide-react'
-import { apiGet, apiPost } from '../lib/api'
+import { apiGet, apiPost, apiUpload } from '../lib/api'
 import { toast } from '../components/dialogs'
 import { ReadingWalkModal } from '../../../../packages/shared-ui/MeterWalk'
 
@@ -12,7 +12,7 @@ import { ReadingWalkModal } from '../../../../packages/shared-ui/MeterWalk'
 // requireMeterReader) — but the tenant portal had no screen for it. This is
 // that screen: the property's reading run, started here if none is open, and
 // the same blind walk the landlord's Utilities page uses.
-const walkApi = { get: apiGet, post: apiPost }
+const walkApi = { get: apiGet, post: apiPost, upload: (url: string, form: FormData) => apiUpload(url, form).then(d => ({ data: d })) }
 const monthLabel = (cycle: any) => new Date(String(cycle).slice(0, 10) + 'T00:00:00Z')
   .toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
 

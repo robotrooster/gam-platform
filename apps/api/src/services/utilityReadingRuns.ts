@@ -279,6 +279,10 @@ export async function getRunMeters(runId: string) {
                      WHERE mmu.meter_id = m.id) AS has_submetered_units,
             u.id AS unit_id, u.unit_number,
             (cur.id IS NOT NULL) AS is_read,
+            -- S652 (Nic): a photo of the meter face rides with the reading;
+            -- the property decides whether its walk insists on one.
+            (cur.photo_url IS NOT NULL) AS has_photo,
+            p.meter_photo_required AS photo_required,
             (t.tenant_id IS NOT NULL) AS will_bill,
             to_char(r.billing_cycle_month, 'YYYY-MM-DD') AS cycle_month,
             -- S648: the tenant's due day decides when their meter is read.
@@ -286,6 +290,7 @@ export async function getRunMeters(runId: string) {
               WHERE l2.unit_id = u.id AND l2.status = 'active'
               ORDER BY l2.start_date DESC LIMIT 1) AS due_day
        FROM utility_reading_runs r
+       JOIN properties p ON p.id = r.property_id
        JOIN utility_meters m ON m.property_id = r.property_id
                             AND m.billing_method IN ('submeter','rubs')
                             -- S631: the walk shows only what this run covers,

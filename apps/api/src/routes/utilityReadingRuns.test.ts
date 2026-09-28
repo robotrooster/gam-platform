@@ -1929,3 +1929,54 @@ describe('S652 — a work trader the landlord let read meters', () => {
     expect(r.status).toBe(403)
   })
 })
+
+// ── S652: a photo of the meter face rides with the reading ─────────────
+// Nic: "take a picture of each meter for historical accuracy… make the photo
+// step optional… set it at the property level." Optional by default; a
+// property that requires it will not take a number without one.
+describe('meter photos', () => {
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fe0d7a5f2c0000000049454e44ae426082', 'hex')
+  const snap = (app: express.Express, f: Fixture, runId: string, meterId: string) =>
+    request(app).post(`/api/utility/reading-runs/${runId}/meters/${meterId}/photo`)
+      .set('Authorization', `Bearer ${f.tokenA}`).attach('file', png, { filename: 'face.png', contentType: 'image/png' })
+
+  it('optional by default: a reading without a photo is fine, and a photo attaches to it', async () => {
+    const app = buildApp(); const f = await seed(); const run = await openRun(app, f)
+    const meters = await request(app).get(`/api/utility/reading-runs/${run.id}/meters`).set('Authorization', `Bearer ${f.tokenA}`)
+    expect(meters.body.data.every((m: any) => m.photo_required === false && m.has_photo === false)).toBe(true)
+    expect((await enterReading(app, f, run.id, f.meterLeased, 1100)).status).toBe(201)
+    const up = await snap(app, f, run.id, f.meterLeased)
+    expect(up.status).toBe(201)
+    expect(up.body.data.url).toMatch(/^\/uploads\/meters\//)
+    const row = await db.query<{ photo_url: string }>(`SELECT photo_url FROM utility_meter_readings WHERE meter_id=$1 AND billing_cycle_month=$2`, [f.meterLeased, CYCLE])
+    expect(row.rows[0].photo_url).toBe(up.body.data.url)
+    const served = await request(app).get(`/api/utility/readings/${up.body.data.attachedToReadingId}/photo`).set('Authorization', `Bearer ${f.tokenA}`)
+    expect(served.status).toBe(200)
+    const foreign = await request(app).get(`/api/utility/readings/${up.body.data.attachedToReadingId}/photo`).set('Authorization', `Bearer ${f.tokenB}`)
+    expect(foreign.status).toBe(403)
+  })
+
+  it('required at the property: no photo, no number; photo first, then the number lands with it', async () => {
+    const app = buildApp(); const f = await seed()
+    const cfg = await request(app).patch(`/api/properties/${f.propertyAId}/meter-photo-config`).set('Authorization', `Bearer ${f.tokenA}`).send({ required: true })
+    expect([200, 404]).toContain(cfg.status)  // the properties router is not mounted here; set it directly
+    await db.query(`UPDATE properties SET meter_photo_required = TRUE WHERE id=$1`, [f.propertyAId])
+    const run = await openRun(app, f)
+    const meters = await request(app).get(`/api/utility/reading-runs/${run.id}/meters`).set('Authorization', `Bearer ${f.tokenA}`)
+    expect(meters.body.data[0].photo_required).toBe(true)
+    const bare = await enterReading(app, f, run.id, f.meterLeased, 1100)
+    expect(bare.status).toBe(400)
+    expect(bare.body.error).toMatch(/photo/i)
+    const up = await snap(app, f, run.id, f.meterLeased)
+    const withPhoto = await request(app).post(`/api/utility/reading-runs/${run.id}/meters/${f.meterLeased}/reading`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ readingValue: 1100, photoUrl: up.body.data.url })
+    expect(withPhoto.status, JSON.stringify(withPhoto.body)).toBe(201)
+    const row = await db.query<{ photo_url: string; reading_value: string }>(`SELECT photo_url, reading_value FROM utility_meter_readings WHERE meter_id=$1 AND billing_cycle_month=$2 AND reason='monthly_cycle'`, [f.meterLeased, CYCLE])
+    expect(row.rows[0].photo_url).toBe(up.body.data.url)
+    expect(Number(row.rows[0].reading_value)).toBe(1100)
+    // a bogus path never becomes a photo
+    const forged = await request(app).post(`/api/utility/reading-runs/${run.id}/meters/${f.meterVacant}/reading`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ readingValue: 600, photoUrl: '/etc/passwd' })
+    expect(forged.status).toBe(400)
+  })
+})

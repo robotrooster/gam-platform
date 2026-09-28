@@ -14,7 +14,12 @@ import { useState, useEffect, useMemo, useRef, CSSProperties } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import { CheckCircle2, ChevronRight } from 'lucide-react'
 
-export type WalkApi = { get: (url: string) => Promise<any>; post: (url: string, body?: any) => Promise<any> }
+export type WalkApi = {
+  get: (url: string) => Promise<any>
+  post: (url: string, body?: any) => Promise<any>
+  // S652: the meter-face photo goes up as multipart before the number is posted.
+  upload?: (url: string, form: FormData) => Promise<any>
+}
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 const lbl: CSSProperties = { fontSize:'.75rem', color:'var(--text-3)', marginBottom:4, display:'block' }
@@ -335,6 +340,17 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
   const [rowErr, setRowErr] = useState<Record<string, string>>({})
   const [filter, setFilter] = useState<string>('all')
   const inputs = useRef<(HTMLInputElement | null)[]>([])
+  // S652 (Nic): "take a picture of each meter for historical accuracy… make
+  // the photo step optional… set it at the property level." One photo per
+  // meter, taken on the row, uploaded with the number. A property with the
+  // requirement on will not take the number without it.
+  const [photos, setPhotos] = useState<Record<string, File>>({})
+  const [previews, setPreviews] = useState<Record<string, string>>({})
+  const takePhoto = (meterId: string, f: File | null) => {
+    setPhotos(prev => { const n = { ...prev }; if (f) n[meterId] = f; else delete n[meterId]; return n })
+    setPreviews(prev => { if (prev[meterId]) URL.revokeObjectURL(prev[meterId]); const n = { ...prev }; if (f) n[meterId] = URL.createObjectURL(f); else delete n[meterId]; return n })
+  }
+  const photoMissing = (m: any) => !!m.photoRequired && !m.hasPhoto && !photos[m.meterId] && m.billingMethod === 'submeter'
 
   // One row per meter, units in natural order, masters last — a master is read
   // off a bill at a desk, not on the walk, so it does not belong mid-list.
@@ -392,11 +408,19 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
     if (savingIds.has(m.meterId)) return
     if (!readOk(m, v) || !billOk(m, b)) return
     if (v === '' && !usageOptional(m)) return
+    if (photoMissing(m)) { setRowErr(prev => ({ ...prev, [m.meterId]: 'This property requires a photo of the meter face — take it first.' })); return }
     setSavingIds(prev => new Set(prev).add(m.meterId))
     setRowErr(prev => ({ ...prev, [m.meterId]: '' }))
     try {
+      let photoUrl: string | undefined
+      if (photos[m.meterId] && api.upload) {
+        const fd = new FormData()
+        fd.append('file', photos[m.meterId])
+        const up: any = await api.upload(`/utility/reading-runs/${run.id}/meters/${m.meterId}/photo`, fd)
+        photoUrl = up?.data?.url ?? up?.url
+      }
       const r: any = await api.post(`/utility/reading-runs/${run.id}/meters/${m.meterId}/reading`,
-        { readingValue: Number(v || 0), ...(m.rubsBasis === 'bill_amount' ? { billAmount: Number(b) } : {}) })
+        { readingValue: Number(v || 0), ...(photoUrl ? { photoUrl } : {}), ...(m.rubsBasis === 'bill_amount' ? { billAmount: Number(b) } : {}) })
       setSavedIds(prev => new Set(prev).add(m.meterId))
       // S631: keep the count on the page behind honest as each line lands —
       // two people work this list at once, and a stale number reads as a lost save.
@@ -473,6 +497,20 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
                 )}
                 {rowErr[m.meterId] && (
                   <div style={{ fontSize:'.68rem', color:'var(--red)' }}>{rowErr[m.meterId]}</div>
+                )}
+                {/* S652: the meter face — offered on every submeter, demanded
+                    only where the property says so. Never on a master: that is
+                    read off the provider's bill. */}
+                {!m.isMaster && !isDone && !m.notYet && !!api.upload && (
+                  <div style={{ display:'flex', alignItems:'center', gap:8, marginTop:4 }}>
+                    <label style={{ fontSize:'.7rem', color: photoMissing(m) ? 'var(--gold)' : 'var(--text-2)', cursor:'pointer', border:'1px dashed var(--border-2, var(--border-1))', borderRadius:6, padding:'2px 8px' }}>
+                      📷 {photos[m.meterId] ? 'Retake' : (m.photoRequired ? 'Photo required' : 'Photo')}
+                      <input type="file" accept="image/*" capture="environment" style={{ display:'none' }}
+                        onChange={e => { takePhoto(m.meterId, e.target.files?.[0] ?? null); e.target.value = '' }} />
+                    </label>
+                    {previews[m.meterId] && <img src={previews[m.meterId]} alt="" style={{ height:34, width:34, objectFit:'cover', borderRadius:5, border:'1px solid var(--border-1)' }} />}
+                    {m.hasPhoto && !photos[m.meterId] && <span style={{ fontSize:'.66rem', color:'var(--text-3)' }}>photo on file</span>}
+                  </div>
                 )}
               </div>
               <div>

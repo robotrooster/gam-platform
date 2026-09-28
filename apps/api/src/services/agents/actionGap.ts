@@ -82,6 +82,8 @@ const DELIBERATE = new Map(Object.entries({
     'pins a document to the properties it applies to. Nic\'s worry is precisely the mis-pin — "assigned parking gets sent to a property that doesn\'t have that, and then it\'s just generating confusion" — and property names spoken aloud are exactly where that mistake happens.',
   // ── S633 ──────────────────────────────────────────────────────────────────
   // ── S652 ──────────────────────────────────────────────────────────────────
+  'properties PATCH /:id/meter-photo-config': 'a landlord setting about their own crew\'s walk — not an agent\'s call',
+  'utility POST /reading-runs/:id/meters/:meterId/photo': 'a camera on a phone at the meter — nothing an agent can do',
   'properties PATCH /:id/maintenance-config':
     'which kinds of maintenance request a property accepts and the note tenants see — a policy the landlord sets once under Settings, with the consequence explained on screen; an agent should never narrow what a tenant is allowed to report.',
   'properties PATCH /:id/first-billing-cycle':
