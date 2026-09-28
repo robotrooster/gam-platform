@@ -13,7 +13,7 @@ import {
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
   Landmark, ClipboardCheck, MessageSquare,
-  Sun, Moon, Globe, Headphones, Camera } from 'lucide-react'
+  Sun, Moon, Globe, Headphones, Camera, Gauge } from 'lucide-react'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
 // it) and an optional `perm` list (sub-permission keys; worker roles
@@ -49,6 +49,11 @@ const NAV_ITEMS: Array<{
   // and bookmarks still resolve.
   { to: '/properties',    icon: Building2,        label: 'Properties',       section: 'Portfolio',   category: 'properties' },
   { to: '/units',         icon: DoorOpen,         label: 'Unit Overview',    section: null,          category: 'units' },
+  // S652 (Nic): "build the meter readings top level nav entry for front
+  // counter staff." Straight to the reading walk for the properties they are
+  // assigned to; anyone holding "Enter meter readings" sees it. (S605 folded
+  // Utilities SETUP into the property page; this is the walk, not the setup.)
+  { to: '/utilities',     icon: Gauge,            label: 'Meter Readings',   section: null,          category: 'utilities' },
   { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          category: 'schedule' },
   { to: '/booking-sites', icon: Globe,            label: 'Booking Site',     section: null,          category: 'booking_sites' },
   { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          category: 'tenants' },

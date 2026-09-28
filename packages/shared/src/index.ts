@@ -1958,6 +1958,15 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     ]}],
   },
   {
+    // S652 (Nic): "I need that to be able to be done… for my front desk
+    // help." The key existed (ONSITE_MANAGER_SUB_PERMISSIONS) but was never in
+    // the catalog, so no landlord could grant it from the permissions page.
+    category: 'utilities', label: 'Meter readings',
+    sections: [{ label: 'Access', items: [
+      { key: 'utility.read_meters', label: 'Enter meter readings', hint: 'the monthly walk, a one-off read, and the meter photo' },
+    ]}],
+  },
+  {
     category: 'documents', label: 'Documents',
     sections: [{ label: 'Access', items: [
       { key: 'documents.view', label: 'View documents' },
