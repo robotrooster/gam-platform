@@ -134,13 +134,18 @@ if (cd apps/api && npm run build >/tmp/gam-deploy-api.log 2>&1); then
     # Deploy 72: launchd can take ~30 s after a bootout before it accepts the
     # job again; the earlier 20 s window flagged a deploy that had in fact
     # loaded a moment later. Wait up to two minutes, and re-check at the end.
+    # Deploy 73: the loop still reported "not loaded" on a deploy that WAS
+    # loaded seconds later, so each attempt now records launchctl's own words
+    # (/tmp/gam-deploy-launchd.log) — the next run tells us what launchd said.
+    : > /tmp/gam-deploy-launchd.log
     for i in $(seq 1 60); do
-      launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.gam.api.plist" >/dev/null 2>&1
-      launchctl list 2>/dev/null | grep -q "com.gam.api$" && break
+      out=$(launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.gam.api.plist" 2>&1); rc=$?
+      echo "$(date '+%T') attempt $i rc=$rc ${out}" >> /tmp/gam-deploy-launchd.log
+      launchctl list 2>/dev/null | grep -q "com.gam.api$" && { echo "$(date '+%T') listed after attempt $i" >> /tmp/gam-deploy-launchd.log; break; }
       sleep 2
     done
     sleep 2
-    if ! launchctl list 2>/dev/null | grep -q "com.gam.api$"; then bad "launchd did not load com.gam.api"; FAILED=1; fi
+    if ! launchctl list 2>/dev/null | grep -q "com.gam.api$"; then bad "launchd did not load com.gam.api (see /tmp/gam-deploy-launchd.log)"; FAILED=1; fi
     # Give it a moment, then prove it is actually answering.
     for i in $(seq 1 60); do
       code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:4000/api/sales/demo/slots 2>/dev/null)
