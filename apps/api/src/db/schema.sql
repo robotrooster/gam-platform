@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict hLqIkypNQrE1ad1sqWHOKWG6vPbgeDW6VX37GfWM6Za7U1mDmz63yAWUhPYxUWi
+\restrict HtD3W7N1gWdrjFa8TbqzjHuKvQk25IkBAdTQxhKpNMUsRRlUOZvkZsfXXt6sDLH
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7283,12 +7283,12 @@ CREATE TABLE public.pos_inventory_log (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     item_id uuid NOT NULL,
     landlord_id uuid NOT NULL,
-    change_qty integer NOT NULL,
+    change_qty numeric(12,3) NOT NULL,
     reason text NOT NULL,
     notes text,
     reference_id uuid,
-    stock_before integer NOT NULL,
-    stock_after integer NOT NULL,
+    stock_before numeric(12,3) NOT NULL,
+    stock_after numeric(12,3) NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT pos_inventory_log_reason_check CHECK ((reason = ANY (ARRAY['adjustment'::text, 'sale'::text, 'po_received'::text, 'return'::text, 'manual'::text, 'other'::text])))
 );
@@ -7304,13 +7304,13 @@ CREATE TABLE public.pos_item_variants (
     name text NOT NULL,
     cost_price numeric(10,2) DEFAULT 0 NOT NULL,
     sell_price numeric(10,2) NOT NULL,
-    stock_qty integer DEFAULT 0 NOT NULL,
+    stock_qty numeric(12,3) DEFAULT 0 NOT NULL,
     stock_min integer DEFAULT 5 NOT NULL,
     sort_order integer DEFAULT 0 NOT NULL,
     is_active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT pos_item_variants_stock_qty_nonneg CHECK ((stock_qty >= 0))
+    CONSTRAINT pos_item_variants_stock_qty_nonneg CHECK ((stock_qty >= (0)::numeric))
 );
 
 
@@ -7328,7 +7328,7 @@ CREATE TABLE public.pos_items (
     margin_pct numeric(6,2),
     tax_rate numeric(5,4) DEFAULT 0 NOT NULL,
     charge_eligible boolean DEFAULT true NOT NULL,
-    stock_qty integer DEFAULT 0 NOT NULL,
+    stock_qty numeric(12,3) DEFAULT 0 NOT NULL,
     stock_min integer DEFAULT 0 NOT NULL,
     stock_max integer DEFAULT 0 NOT NULL,
     vendor_id uuid,
@@ -7342,7 +7342,7 @@ CREATE TABLE public.pos_items (
     tax_category_id uuid,
     stay_unit text,
     CONSTRAINT pos_items_stay_unit_check CHECK (((stay_unit IS NULL) OR (stay_unit = ANY (ARRAY['night'::text, 'week'::text, 'month'::text])))),
-    CONSTRAINT pos_items_stock_qty_nonneg CHECK ((stock_qty >= 0))
+    CONSTRAINT pos_items_stock_qty_nonneg CHECK ((stock_qty >= (0)::numeric))
 );
 
 
@@ -17914,7 +17914,7 @@ CREATE INDEX idx_pos_items_landlord ON public.pos_items USING btree (landlord_id
 -- Name: idx_pos_items_low_stock; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_pos_items_low_stock ON public.pos_items USING btree (landlord_id, stock_qty) WHERE ((is_active = true) AND (stock_qty <= stock_min) AND (stock_max < 999));
+CREATE INDEX idx_pos_items_low_stock ON public.pos_items USING btree (landlord_id, stock_qty) WHERE ((is_active = true) AND (stock_qty <= (stock_min)::numeric) AND (stock_max < 999));
 
 
 --
@@ -28000,5 +28000,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict hLqIkypNQrE1ad1sqWHOKWG6vPbgeDW6VX37GfWM6Za7U1mDmz63yAWUhPYxUWi
+\unrestrict HtD3W7N1gWdrjFa8TbqzjHuKvQk25IkBAdTQxhKpNMUsRRlUOZvkZsfXXt6sDLH
 

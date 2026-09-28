@@ -283,13 +283,51 @@ describe('POST /api/pos/transactions — happy paths', () => {
     // Stock decremented + inventory log row
     const item = await db.query<{ stock_qty: number }>(
       `SELECT stock_qty FROM pos_items WHERE id = $1`, [itemId])
-    expect(item.rows[0].stock_qty).toBe(48)
+    expect(Number(item.rows[0].stock_qty)).toBe(48)
     const log = await db.query<{ change_qty: number; reason: string; reference_id: string }>(
       `SELECT change_qty, reason, reference_id FROM pos_inventory_log WHERE item_id = $1`, [itemId])
     expect(log.rows.length).toBe(1)
-    expect(log.rows[0].change_qty).toBe(-2)
+    expect(Number(log.rows[0].change_qty)).toBe(-2)
     expect(log.rows[0].reason).toBe('sale')
     expect(log.rows[0].reference_id).toBe(res.body.data.id)
+  })
+
+  // S652 (Nic): "charge a transaction on propane at Mountain View… it's not
+  // completing the sale." Propane sells by the gallon; 4.6 gallons hit
+  // integer stock columns, the database refused "-4.6", and the sale rolled
+  // back with the register none the wiser. Stock is numeric(12,3) now.
+  it('a fractional quantity (4.6 gallons of propane) completes and moves stock by 4.6', async () => {
+    const f = await seedPosFixture()
+    const itemId = await seedPosItem(f, { sellPrice: 3.30, stockQty: 767, stockMin: 5 })
+    calculateCartTaxMock.mockResolvedValueOnce({
+      subtotal: 15.18, taxAmount: 1.00,
+      lines: [{ itemId, lineSubtotal: 15.18, lineTax: 1.00 }],
+    })
+    const res = await request(buildApp())
+      .post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        propertyId: f.propertyId,
+        items: [{ id: itemId, name: 'Propane', qty: 4.6, price: 3.30, tax_rate: 0.066, category: 'Fuel' }],
+        paymentMethod: 'cash',
+        changeGiven: 0,
+      })
+    expect(res.status).toBe(201)
+    const lines = await db.query<{ qty: string }>(
+      `SELECT qty FROM pos_transaction_items WHERE transaction_id = $1`, [res.body.data.id])
+    expect(Number(lines.rows[0].qty)).toBeCloseTo(4.6, 3)
+    const item = await db.query<{ stock_qty: string }>(`SELECT stock_qty FROM pos_items WHERE id = $1`, [itemId])
+    expect(Number(item.rows[0].stock_qty)).toBeCloseTo(762.4, 3)
+    const log = await db.query<{ change_qty: string; stock_after: string }>(
+      `SELECT change_qty, stock_after FROM pos_inventory_log WHERE item_id = $1`, [itemId])
+    expect(Number(log.rows[0].change_qty)).toBeCloseTo(-4.6, 3)
+    expect(Number(log.rows[0].stock_after)).toBeCloseTo(762.4, 3)
+    // and the item list hands stock back as a number, not the driver's text
+    const list = await request(buildApp()).get(`/api/pos/items?propertyId=${f.propertyId}`).set('Authorization', `Bearer ${f.landlordToken}`)
+    const it = (list.body.data as any[]).find((x) => x.id === itemId)
+    // (buildApp() has no camelCase middleware — the live app camelizes on the way out)
+    expect(typeof it.stock_qty).toBe('number')
+    expect(it.stock_qty).toBeCloseTo(762.4, 3)
   })
 
   it('card sale with valid terminal stripePaymentIntentId persists with PI stamp', async () => {
@@ -549,7 +587,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
     expect(res.status).toBe(201)
     const item = await db.query<{ stock_qty: number }>(
       `SELECT stock_qty FROM pos_items WHERE id = $1`, [itemId])
-    expect(item.rows[0].stock_qty).toBe(999)  // unchanged
+    expect(Number(item.rows[0].stock_qty)).toBe(999)  // unchanged
     const log = await db.query(`SELECT id FROM pos_inventory_log WHERE item_id = $1`, [itemId])
     expect(log.rows.length).toBe(0)
   })
@@ -773,7 +811,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
     // Victim's stock NOT touched
     const victimItem = await db.query<{ stock_qty: number }>(
       `SELECT stock_qty FROM pos_items WHERE id = $1`, [victimItemId])
-    expect(victimItem.rows[0].stock_qty).toBe(50)
+    expect(Number(victimItem.rows[0].stock_qty)).toBe(50)
     // No inventory log on the victim item
     const log = await db.query(`SELECT id FROM pos_inventory_log WHERE item_id = $1`, [victimItemId])
     expect(log.rows.length).toBe(0)

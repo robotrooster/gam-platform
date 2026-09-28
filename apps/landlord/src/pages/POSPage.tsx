@@ -560,7 +560,12 @@ export function POSPage() {
       setOpenTicketId(null); qc.invalidateQueries('pos-tickets')
       qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
       qc.invalidateQueries(['pos-sessions-open', registerProperty])
-    }}
+    },
+    // S652 (Nic): a propane sale failed on the server and the register said
+    // nothing — the cart just sat there as an open tab. A failed sale says
+    // why, and keeps the cart so the cashier can charge it again.
+    onError: (e: any) => toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || e?.message || 'The sale did not go through — nothing was charged. Try again.'),
+    }
   )
 
   const toggleChargeMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { chargeEligible:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
@@ -771,6 +776,8 @@ export function POSPage() {
   // the per-user permissions page.
   const isOwner = !!user && ['landlord', 'admin', 'super_admin'].includes(user.role)
   const canSeeTab = (perm: string) => isOwner || (user?.permissions as any)?.[perm] === true
+  const canRefund = canSeeTab('pos.refund')
+  const canVoid = canSeeTab('pos.void')
   const TABS = [
     { key:'register',  label:'Register',   perm:'pos.tab.register' },
     { key:'history',   label:'History',    perm:'pos.tab.history' },
@@ -909,7 +916,7 @@ export function POSPage() {
                   </div>
                   <div style={{display:'flex',gap:4,marginTop:4,flexWrap:'wrap'}}>
                     {item.chargeEligible&&<span style={{fontSize:'.65rem',background:'var(--gold-bg)',color:'var(--gold)',padding:'1px 4px',borderRadius:3}}>charge</span>}
-                    {item.stockQty<999&&<span style={{fontSize:'.65rem',color:item.stockQty<=item.stockMin?'var(--amber)':'var(--text-3)'}}>{item.stockQty} left</span>}
+                    {item.stockQty<999&&<span style={{fontSize:'.65rem',color:item.stockQty<=item.stockMin?'var(--amber)':'var(--text-3)'}}>{Number(item.stockQty)} left</span>}
                   </div>
                 </button>
               ))}
@@ -1136,9 +1143,13 @@ export function POSPage() {
                   <td className="mono" style={{fontWeight:600}}>{fmt(t.total)}</td>
                   <td><span className={"badge "+(METHOD_MAP[t.paymentMethod]||'badge-muted')}>{humanize(t.paymentMethod)}</span></td>
                   <td><span className={"badge "+(STATUS_MAP[t.status]||'badge-muted')}>{t.status||'completed'}</span></td>
-                  <td>{t.status==='completed'&&(<div style={{display:'flex',gap:6}}>
-                    <button className="btn btn-ghost btn-sm" onClick={()=>setRefundModal({show:true,tx:t})}>Refund</button>
-                    <button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={()=>voidMut.mutate(t.id)}>Void</button>
+                  {/* S652 (Nic): refund and void are their own permissions
+                      (pos.refund / pos.void) — a cashier with Sales history
+                      sees the sales, not the buttons. The API refuses either
+                      without the permission; the page simply doesn't offer them. */}
+                  <td>{t.status==='completed'&&(canRefund||canVoid)&&(<div style={{display:'flex',gap:6}}>
+                    {canRefund&&<button className="btn btn-ghost btn-sm" onClick={()=>setRefundModal({show:true,tx:t})}>Refund</button>}
+                    {canVoid&&<button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={()=>voidMut.mutate(t.id)}>Void</button>}
                   </div>)}
                   {t.status==='refunded'&&<span style={{fontSize:'.75rem',color:'var(--text-3)'}}>-{fmt(t.refundAmount)}</span>}
                   </td>

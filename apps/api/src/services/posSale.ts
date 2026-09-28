@@ -91,12 +91,16 @@ export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promis
        item.price * item.qty])
 
     // Decrement stock if tracked (not 999)
-    if (dbItem && dbItem.stock_qty < 999) {
-      const newQty = Math.max(0, dbItem.stock_qty - item.qty)
+    // S652: stock is numeric(12,3) — propane sells by the gallon, so 4.6 is a
+    // real quantity. It was integer, the insert below refused "-4.6", and the
+    // whole sale rolled back with the register none the wiser.
+    const stockQty = dbItem ? Number(dbItem.stock_qty) : null
+    if (dbItem && stockQty != null && stockQty < 999) {
+      const newQty = Math.max(0, stockQty - item.qty)
       await client.query('UPDATE pos_items SET stock_qty=$1, updated_at=NOW() WHERE id=$2', [newQty, dbItem.id])
       await client.query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,reference_id,stock_before,stock_after)
         VALUES ($1,$2,$3,'sale',$4,$5,$6)`,
-        [dbItem.id, s.landlordId, -item.qty, tx.id, dbItem.stock_qty, newQty])
+        [dbItem.id, s.landlordId, -item.qty, tx.id, stockQty, newQty])
       // Pre-decrement snapshot, matching the original semantics
       // (reorderQty = stock_max - stock_qty).
       if (newQty <= dbItem.stock_min && dbItem.vendor_id) needsPO.push(dbItem)

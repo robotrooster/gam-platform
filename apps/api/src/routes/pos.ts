@@ -209,7 +209,9 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
     // resolution the sale uses — and the names behind it, so the register's
     // cart estimate is what the server charges.
     const eff = await effectiveItemTaxes(posLandlordId(req), items.map((i: any) => i.id))
-    items = items.map((i: any) => ({ ...i,
+    // S652: stock is numeric(12,3) now (propane by the gallon) and the driver
+    // hands numerics back as text — the client gets a number.
+    items = items.map((i: any) => ({ ...i, stock_qty: i.stock_qty == null ? i.stock_qty : Number(i.stock_qty),
       tax_rate: eff.get(i.id)?.rate ?? 0,
       taxes: eff.get(i.id)?.taxes ?? [] }))
 
@@ -460,13 +462,13 @@ posRouter.post('/items/:id/adjust-stock', requirePerm('pos.manage_inventory'), a
     const item = await queryOne<any>('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!item) throw new AppError(404, 'Item not found')
 
-    const newQty = Math.max(0, item.stock_qty + changeQty)
+    const newQty = Math.max(0, Number(item.stock_qty) + changeQty)
     await query('UPDATE pos_items SET stock_qty=$1, updated_at=NOW() WHERE id=$2', [newQty, item.id])
     await query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,notes,stock_before,stock_after)
       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [item.id, posLandlordId(req), changeQty, reason||'adjustment', notes||null, item.stock_qty, newQty])
 
-    res.json({ success: true, data: { stockBefore: item.stock_qty, stockAfter: newQty } })
+    res.json({ success: true, data: { stockBefore: Number(item.stock_qty), stockAfter: newQty } })
   } catch (e) { next(e) }
 })
 
@@ -1434,7 +1436,7 @@ posRouter.patch('/purchase-orders/:id', requirePerm('pos.manage_inventory'), asy
         const dbItem = await queryOne<any>('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [item.item_id, po.landlord_id])
         if (!dbItem) continue
         const qty = Number(item.qty_ordered)
-        const newQty = dbItem.stock_qty + qty
+        const newQty = Number(dbItem.stock_qty) + qty
         await query('UPDATE pos_items SET stock_qty=$1, updated_at=NOW() WHERE id=$2', [newQty, item.item_id])
         await query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,reference_id,stock_before,stock_after)
           VALUES ($1,$2,$3,'po_received',$4,$5,$6)`,
@@ -1592,8 +1594,8 @@ posRouter.get('/items/:id/variants', requirePerm('pos.ring_sale', 'pos.manage_in
       res.status(404).json({ success: false, error: 'Not found' })
       return
     }
-    const variants = await query('SELECT * FROM pos_item_variants WHERE item_id=$1 AND is_active=TRUE ORDER BY sort_order, sell_price', [req.params.id])
-    res.json({ success: true, data: variants })
+    const variants = await query<any>('SELECT * FROM pos_item_variants WHERE item_id=$1 AND is_active=TRUE ORDER BY sort_order, sell_price', [req.params.id])
+    res.json({ success: true, data: variants.map((v: any) => ({ ...v, stock_qty: v.stock_qty == null ? v.stock_qty : Number(v.stock_qty) })) })
   } catch (e) { next(e) }
 })
 

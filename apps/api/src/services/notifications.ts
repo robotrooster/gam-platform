@@ -420,8 +420,8 @@ export async function notifyLeaseExpiring(o: { landlordUserId:string; landlordId
 }
 
 export async function notifyLowStock(o: { landlordUserId:string; landlordId:string; landlordEmail:string; items:Array<{name:string;stock_qty:number;stock_min:number;vendor_name?:string}> }) {
-  const itemList = o.items.map(i=>`${i.name} (${i.stock_qty} left)`).join(', ')
-  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'pos_low_stock', title:`Low Stock — ${o.items.length} item${o.items.length>1?'s':''}`, body:`Below minimum: ${itemList}`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`📦 POS Low Stock Alert`, emailHtml:emailTemplate('Low Stock Alert', `Items below minimum:<br><br>${o.items.map(i=>`• <b>${i.name}</b> — ${i.stock_qty} left (min ${i.stock_min})${i.vendor_name?` · Vendor: ${i.vendor_name}`:''}`).join('<br>')}`) })
+  const itemList = o.items.map(i=>`${i.name} (${Number(i.stock_qty)} left)`).join(', ')
+  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'pos_low_stock', title:`Low Stock — ${o.items.length} item${o.items.length>1?'s':''}`, body:`Below minimum: ${itemList}`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`📦 POS Low Stock Alert`, emailHtml:emailTemplate('Low Stock Alert', `Items below minimum:<br><br>${o.items.map(i=>`• <b>${i.name}</b> — ${Number(i.stock_qty)} left (min ${i.stock_min})${i.vendor_name?` · Vendor: ${i.vendor_name}`:''}`).join('<br>')}`) })
 }
 
 // W-46: business-use supplies (parts_inventory), distinct from POS resale

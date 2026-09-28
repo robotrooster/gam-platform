@@ -221,7 +221,7 @@ describe('PATCH /api/pos/purchase-orders/:id — status=received', () => {
     // Stock restocked: 10 + 15 = 25
     const stockRow = await db.query<{ stock_qty: number }>(
       `SELECT stock_qty FROM pos_items WHERE id = $1`, [itemId])
-    expect(stockRow.rows[0].stock_qty).toBe(25)
+    expect(Number(stockRow.rows[0].stock_qty)).toBe(25)
 
     // Inventory log row with reason='po_received' and reference_id=poId
     const logRow = await db.query<{ change_qty: number; reason: string; reference_id: string; stock_before: number; stock_after: number }>(
@@ -229,10 +229,10 @@ describe('PATCH /api/pos/purchase-orders/:id — status=received', () => {
          FROM pos_inventory_log WHERE item_id = $1 AND reason = 'po_received'`,
       [itemId])
     expect(logRow.rows.length).toBe(1)
-    expect(logRow.rows[0].change_qty).toBe(15)
+    expect(Number(logRow.rows[0].change_qty)).toBe(15)
     expect(logRow.rows[0].reference_id).toBe(poId)
-    expect(logRow.rows[0].stock_before).toBe(10)
-    expect(logRow.rows[0].stock_after).toBe(25)
+    expect(Number(logRow.rows[0].stock_before)).toBe(10)
+    expect(Number(logRow.rows[0].stock_after)).toBe(25)
   })
 })
 
@@ -282,7 +282,7 @@ describe('GET /api/pos/inventory-log', () => {
     expect(res.body.data.length).toBe(1)
     const row = res.body.data[0]
     expect(row.item_id).toBe(itemId)
-    expect(row.change_qty).toBe(5)
+    expect(Number(row.change_qty)).toBe(5)
     expect(row.reason).toBe('adjustment')
     expect(row.item_name).toMatch(/^Item-/)
     // category column comes from the JOIN, not i.category (the S347 fix).
