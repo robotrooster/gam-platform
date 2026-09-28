@@ -89,6 +89,7 @@ import { BankPage } from './pages/BankPage'
 import { BankingPage }      from './pages/BankingPage'
 import { MaintenancePage } from './pages/MaintenancePage'
 import { DocumentsPage }   from './pages/DocumentsPage'
+import { TenantPhotosPage } from './pages/TenantPhotosPage'
 import { OnboardingPage }  from './pages/OnboardingPage'
 import { TenantOnboardingPage } from './pages/TenantOnboardingPage'
 import { PropertyOnboardingPage } from './pages/PropertyOnboardingPage'
@@ -280,6 +281,7 @@ function App() {
               <Route path="front-desk" element={<FrontDeskPage />} />
               <Route path="tenant-onboarding/pending" element={<PendingTenantsPage />} />
               <Route path="documents"      element={<DocumentsPage />} />
+              <Route path="tenant-photos"  element={<TenantPhotosPage />} />
               <Route path="leases"         element={<LeasesPage />} />
               <Route path="view"           element={<PdfViewerPage />} />
               <Route path="subleases"       element={LAUNCH_HIDDEN.has('/subleases') ? <Navigate to="/dashboard" replace /> : <SubleasesPage />} />

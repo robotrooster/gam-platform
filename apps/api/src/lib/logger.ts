@@ -36,6 +36,8 @@
 import pino, { type LoggerOptions } from 'pino'
 import pinoHttp, { type HttpLogger } from 'pino-http'
 import { randomUUID } from 'crypto'
+import os from 'os'
+import path from 'path'
 
 const isProd = process.env.NODE_ENV === 'production'
 const isTest = process.env.NODE_ENV === 'test' || !!process.env.VITEST_POOL_ID
@@ -54,7 +56,30 @@ const baseOptions: LoggerOptions = {
   timestamp: pino.stdTimeFunctions.isoTime,
 }
 
-const transport = !isProd && !isTest
+/**
+ * S652 (Nic): "it needs to have a full history of exactly what happened."
+ *
+ * Production used to log to stdout, which launchd appended to /tmp/gam-api.log:
+ * one file, never rotated, and /tmp is wiped by macOS on reboot and pruned by
+ * its periodic cleanup — the whole history could vanish with no one touching
+ * it. Production now writes its own file, one per day, under
+ * ~/Library/Logs/gam (LOG_DIR to override), named after APP_NAME so the demo
+ * API keeps a separate history. Nothing is ever deleted (no `limit`). launchd
+ * still captures stdout/stderr separately, for crash output only.
+ */
+export const LOG_DIR = process.env.LOG_DIR || path.join(os.homedir(), 'Library', 'Logs', 'gam')
+const transport = isProd
+  ? {
+      target: 'pino-roll',
+      options: {
+        file: path.join(LOG_DIR, process.env.APP_NAME || 'gam-api'),
+        frequency: 'daily',
+        dateFormat: 'yyyy-MM-dd',
+        extension: '.log',
+        mkdir: true,
+      },
+    }
+  : !isTest
   ? {
       // pino-pretty for dev. Lazy-loaded by pino, only required when
       // it's actually needed. Disable in test to keep vitest output

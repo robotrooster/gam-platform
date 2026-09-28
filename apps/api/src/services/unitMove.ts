@@ -44,7 +44,7 @@ export interface MoveResult {
  * Broken meters are excluded: they bill from a comparable and there is nothing
  * to read.
  */
-async function metersFor(unitId: string) {
+export async function metersFor(unitId: string) {
   return query<{ meter_id: string; label: string; utility_type: string }>(`
     SELECT m.id AS meter_id, m.label, m.utility_type
       FROM utility_meter_units mu
@@ -61,6 +61,9 @@ export async function moveLeaseToUnit(params: {
   movedOn: string          // YYYY-MM-DD
   reason?: string | null
   actorUserId?: string | null
+  // S652 (Nic): "it needs to happen at the time of move." One reading per
+  // submeter on the space they leave and the space they take, or no move.
+  reads?: Array<{ meterId: string; value: number }>
 }): Promise<MoveResult> {
   const lease = await queryOne<any>(
     `SELECT l.id, l.unit_id, l.landlord_id, l.status,
@@ -106,6 +109,22 @@ export async function moveLeaseToUnit(params: {
   const fromUnitId = lease.unit_id
   const closing = await metersFor(fromUnitId)
   const opening = await metersFor(params.toUnitId)
+
+  // S652 (Nic): the readings are part of the move, not a chase afterwards.
+  // Every submeter on either space needs its number before anything changes.
+  const needed = [...closing.map(m => ({ ...m, kind: 'closing' as const })), ...opening.map(m => ({ ...m, kind: 'opening' as const }))]
+  const given = new Map((params.reads ?? []).map(r => [r.meterId, r.value]))
+  const missing = needed.filter(m => !given.has(m.meter_id))
+  if (missing.length) {
+    throw new AppError(409, `Enter the meter reading for ${missing.map(m => m.label).join(', ')} — a move records both spaces' meters as of the move date.`)
+  }
+  for (const m of needed) {
+    const v = given.get(m.meter_id)!
+    const digits = await queryOne<{ digits: number }>(`SELECT digits FROM utility_meters WHERE id = $1`, [m.meter_id])
+    if (!Number.isInteger(v) || v < 0 || v >= 10 ** Number(digits?.digits ?? 6)) {
+      throw new AppError(400, `${m.label}: reading exceeds this meter's ${digits?.digits ?? 6}-digit capacity`)
+    }
+  }
 
   // One statement so the trigger sees the move date and the unit change
   // together — a separate UPDATE would stamp today and silently misdate the
@@ -216,9 +235,22 @@ export async function moveLeaseToUnit(params: {
     })()
   }
 
+  // The readings, dated the move: the closing number seams the old space's
+  // month, the opening number is the baseline the new space's next cycle
+  // subtracts from.
+  for (const m of needed) {
+    await query(
+      `INSERT INTO utility_meter_readings
+         (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason, reason_note)
+       VALUES ($1, $2, $3, date_trunc('month', $2::date)::date, $4, $5, $6)`,
+      [m.meter_id, params.movedOn, given.get(m.meter_id), params.actorUserId ?? null,
+       m.kind === 'opening' ? 'baseline' : 'other',
+       m.kind === 'opening' ? `Opening read — resident moved in on ${params.movedOn}` : `Closing read — resident moved out on ${params.movedOn}`])
+  }
+
   logger.info({
     leaseId: params.leaseId, fromUnitId, toUnitId: params.toUnitId,
-    movedOn: params.movedOn, closing: closing.length, opening: opening.length,
+    movedOn: params.movedOn, closing: closing.length, opening: opening.length, readsRecorded: needed.length,
   }, '[unit-move] resident moved spaces')
 
   return {

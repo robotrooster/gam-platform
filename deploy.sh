@@ -120,14 +120,35 @@ echo; echo "── API (launchd com.gam.api) ──"
 if (cd apps/api && npm run build >/tmp/gam-deploy-api.log 2>&1); then
   ok "built"
   if ! $CHECK_ONLY; then
-    launchctl kickstart -k "gui/$(id -u)/com.gam.api" >/dev/null 2>&1
+    # S652: bootout + bootstrap, not kickstart — a kickstart restarts the
+    # process but never re-reads the plist, so a changed log path or env var
+    # would sit unapplied until the next reboot.
+    # Deploy 71 lesson: the first bootstrap right after a bootout can fail with
+    # "Input/output error" while launchd is still tearing the old job down, and
+    # in that gap the watchdog (com.gam.watchdog) sees :4000 empty and starts
+    # the DEV api (ts-node) on the production port. So: bootout, wait for the
+    # port to be free, bootstrap until launchd lists the job, then insist on an
+    # answer — and if anything but our job holds :4000, say so loudly.
+    launchctl bootout "gui/$(id -u)/com.gam.api" >/dev/null 2>&1
+    for i in $(seq 1 20); do lsof -nP -iTCP:4000 -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 1; done
+    for i in $(seq 1 10); do
+      launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.gam.api.plist" >/dev/null 2>&1
+      launchctl list 2>/dev/null | grep -q "com.gam.api$" && break
+      sleep 2
+    done
+    if ! launchctl list 2>/dev/null | grep -q "com.gam.api$"; then bad "launchd did not load com.gam.api"; FAILED=1; fi
     # Give it a moment, then prove it is actually answering.
-    for i in $(seq 1 15); do
+    for i in $(seq 1 60); do
       code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:4000/api/sales/demo/slots 2>/dev/null)
       [ "$code" = "200" ] && break
       sleep 1
     done
     if [ "${code:-}" = "200" ]; then ok "restarted and answering"; else bad "restarted but NOT answering (last code: ${code:-none})"; FAILED=1; fi
+    # The thing answering must be OUR job — a ts-node dev process on :4000 is
+    # the watchdog's doing and serves source, not the build.
+    if lsof -nP -iTCP:4000 -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u | xargs -I{} ps -o command= -p {} 2>/dev/null | grep -q "ts-node"; then
+      bad "a DEV api (ts-node) holds :4000 — kill it and let launchd's com.gam.api take the port"; FAILED=1
+    fi
   fi
 else
   bad "BUILD FAILED — see /tmp/gam-deploy-api.log"; FAILED=1

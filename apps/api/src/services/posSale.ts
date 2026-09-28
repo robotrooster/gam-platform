@@ -8,6 +8,7 @@
  */
 import type { PoolClient } from 'pg'
 import { recordHeldItem } from './heldPayouts'
+import { logger } from '../lib/logger'
 
 export interface PosSaleInput {
   landlordId: string
@@ -106,5 +107,9 @@ export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promis
       if (newQty <= dbItem.stock_min && dbItem.vendor_id) needsPO.push(dbItem)
     }
   }
+  // S652 (Nic): "a full history of exactly what happened" — every recorded
+  // sale leaves one line of its own, independent of the HTTP summary.
+  logger.info({ transactionId: tx.id, propertyId: s.propertyId ?? null, landlordId: s.landlordId, cashierId: s.cashierId ?? null,
+                method: s.paymentMethod, total: tx.total, items: s.items.length }, '[pos] sale recorded')
   return { tx, needsPO }
 }

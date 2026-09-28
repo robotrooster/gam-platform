@@ -96,11 +96,39 @@ describe('moving a resident to another space', () => {
     expect(july[0].unit_number).toBe('RV 23')
   })
 
-  it('names the meters that need closing and opening reads', async () => {
+  // S652 (Nic): "moving somebody in the system should initiate two meter
+  // reads… it needs to happen at the time of move." No numbers, no move.
+  it('refuses to move until both spaces\' meters have a reading', async () => {
     const w = await world({ withMeters: true })
-    const r = await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15' })
+    await expect(moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15' }))
+      .rejects.toThrow(/RV 12 electric, RV 23 electric/)
+    const { rows } = await db.query(`SELECT unit_id FROM leases WHERE id=$1`, [w.leaseId])
+    expect(rows[0].unit_id).toBe(w.shady)   // nothing moved
+  })
+
+  it('records the closing read on the old space and the opening read on the new one, dated the move', async () => {
+    const w = await world({ withMeters: true })
+    const meters = await db.query<{ id: string; label: string }>(`SELECT id, label FROM utility_meters ORDER BY label`)
+    const [m12, m23] = meters.rows
+    const r = await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15', actorUserId: w.userId,
+      reads: [{ meterId: m12.id, value: 4210 }, { meterId: m23.id, value: 118 }] })
     expect(r.closingReadsNeeded.map(m => m.label)).toEqual(['RV 12 electric'])
     expect(r.openingReadsNeeded.map(m => m.label)).toEqual(['RV 23 electric'])
+    const reads = await db.query<{ meter_id: string; reading_value: string; reading_date: string; reason: string; reason_note: string }>(
+      `SELECT meter_id, reading_value, to_char(reading_date,'YYYY-MM-DD') AS reading_date, reason, reason_note
+         FROM utility_meter_readings ORDER BY reason`)
+    expect(reads.rows).toHaveLength(2)
+    const cl = reads.rows.find(x => x.meter_id === m12.id)!, op = reads.rows.find(x => x.meter_id === m23.id)!
+    expect(Number(cl.reading_value)).toBe(4210); expect(cl.reason).toBe('other'); expect(cl.reading_date).toBe('2026-06-15'); expect(cl.reason_note).toMatch(/moved out/i)
+    expect(Number(op.reading_value)).toBe(118); expect(op.reason).toBe('baseline'); expect(op.reading_date).toBe('2026-06-15')
+  })
+
+  it('refuses a reading past the meter face', async () => {
+    const w = await world({ withMeters: true })
+    const meters = await db.query<{ id: string }>(`SELECT id FROM utility_meters ORDER BY label`)
+    await expect(moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15',
+      reads: [{ meterId: meters.rows[0].id, value: 1_000_000 }, { meterId: meters.rows[1].id, value: 5 }] }))
+      .rejects.toThrow(/capacity/)
   })
 
   it('frees the old space and occupies the new one', async () => {
@@ -187,5 +215,33 @@ describe('billing a month with a move in it', () => {
          AND h.effective_from <= '2026-07-01'::date
          AND (h.effective_to IS NULL OR h.effective_to > '2026-07-01'::date)`, [w.shady])
     expect(rows).toHaveLength(0)
+  })
+})
+
+// The route: the move screen sends the readings with the move itself, and
+// asks beforehand which meters it will need.
+import express from 'express'
+import request from 'supertest'
+import jwt from 'jsonwebtoken'
+import { leasesRouter } from '../routes/leases'
+import { errorHandler } from '../middleware/errorHandler'
+
+describe('POST /api/leases/:id/move with readings', () => {
+  const app = () => { const a = express(); a.use(express.json()); a.use('/api/leases', leasesRouter); a.use(errorHandler); return a }
+  const tokenFor = (w: any) => jwt.sign({ userId: w.userId, role: 'landlord', email: 'll@test.dev', profileId: w.landlordId, landlordIds: [w.landlordId], permissions: {} },
+    process.env.JWT_SECRET!, { expiresIn: '1h' })
+  it('says which meters the move will need, refuses without them, moves with them', async () => {
+    const w = await world({ withMeters: true })
+    const need = await request(app()).get(`/api/leases/${w.leaseId}/move-reads?toUnitId=${w.sunny}`).set('Authorization', `Bearer ${tokenFor(w)}`)
+    expect(need.status).toBe(200)
+    expect(need.body.data.map((m: any) => `${m.label}:${m.kind}`)).toEqual(['RV 12 electric:closing', 'RV 23 electric:opening'])
+    const bare = await request(app()).post(`/api/leases/${w.leaseId}/move`).set('Authorization', `Bearer ${tokenFor(w)}`)
+      .send({ toUnitId: w.sunny, movedOn: '2026-06-15' })
+    expect(bare.status).toBe(409)
+    const res = await request(app()).post(`/api/leases/${w.leaseId}/move`).set('Authorization', `Bearer ${tokenFor(w)}`)
+      .send({ toUnitId: w.sunny, movedOn: '2026-06-15', reads: need.body.data.map((m: any, i: number) => ({ meterId: m.meterId, value: 100 + i })) })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const reads = await db.query(`SELECT count(*)::int AS n FROM utility_meter_readings`)
+    expect(reads.rows[0].n).toBe(2)
   })
 })

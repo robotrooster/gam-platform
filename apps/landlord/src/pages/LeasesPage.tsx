@@ -11,7 +11,6 @@ import { LeaseFormModal } from './LeaseFormModal'
 import { LeaseOverviewModal } from './LeaseOverviewModal'
 import { RenewalDecisionModal } from './RenewalDecisionModal'
 import { usePerms } from '../lib/permissions'
-import { PropertySelect } from '../components/ListControls'
 
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -59,7 +58,12 @@ export function LeasesPage() {
   // W-7 (S531): renewal decision form — deep-linked from the dashboard
   // to-do's expiring-lease items via ?renew=<leaseId>.
   const [renewalLeaseId, setRenewalLeaseId] = useState<string | null>(null)
-  const [propertyId, setPropertyId] = useState('')
+  // S652 (Nic): "the leases page should be broken down like the sign page
+  // where each property is a menu and when you click on it it drops down
+  // everything for that." One folder per property, closed until opened; the
+  // property dropdown is gone because the folders ARE the filter.
+  const [openProps, setOpenProps] = useState<Set<string>>(() => new Set())
+  const toggleProp = (id: string) => setOpenProps(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
   const leasesQc = useQueryClient()
@@ -192,9 +196,18 @@ export function LeasesPage() {
   // it — one control, and it answers the question the landlord actually asks
   // of this page ("show me this park"). Options derive from the full lease set
   // so the History toggle never changes what the dropdown offers.
-  const propertyOptions = (leases as any[]).map(l => ({ id: l.propertyId, name: l.propertyName }))
-  const displayLeases = visibleLeases.filter((l: any) =>
-    propertyId === '' || l.propertyId === propertyId)
+  const displayLeases = visibleLeases
+  // Folders in property-name order; leases inside keep the page's own order.
+  const groups: Array<{ id: string; name: string; leases: any[] }> = []
+  for (const l of displayLeases as any[]) {
+    const id = l.propertyId || 'none'
+    let g = groups.find(x => x.id === id)
+    if (!g) { g = { id, name: l.propertyName || 'No property', leases: [] }; groups.push(g) }
+    g.leases.push(l)
+  }
+  groups.sort((a, b) => a.name.localeCompare(b.name))
+  // A single-property account has nothing to fold — its one folder starts open.
+  const singleFolder = groups.length === 1
 
   return (
     <div>
@@ -252,10 +265,6 @@ export function LeasesPage() {
         </div>
       )}
 
-      <div className="filter-bar">
-        <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
-      </div>
-
       <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
         {isLoading ? (
           <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
@@ -274,7 +283,25 @@ export function LeasesPage() {
               </tr>
             </thead>
             <tbody>
-              {displayLeases.length ? displayLeases.map((l: any) => {
+              {displayLeases.length ? groups.flatMap(g => {
+                const isOpen = singleFolder || openProps.has(g.id)
+                const active = g.leases.filter((l: any) => l.status === 'active').length
+                const folder = (
+                  <tr key={`folder-${g.id}`} onClick={() => toggleProp(g.id)} className="row-clickable"
+                      style={{ cursor: 'pointer', background: 'var(--bg-2)' }}>
+                    <td colSpan={8} style={{ fontWeight: 700, padding: '12px 16px' }}>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        {isOpen ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                        {g.name}
+                        <span style={{ fontWeight: 400, fontSize: '.78rem', color: 'var(--text-3)' }}>
+                          {g.leases.length} lease{g.leases.length === 1 ? '' : 's'}{active !== g.leases.length ? ` · ${active} active` : ''}
+                        </span>
+                      </span>
+                    </td>
+                  </tr>
+                )
+                if (!isOpen) return [folder]
+                return [folder, ...g.leases.map((l: any) => {
                 // S527 fix: the API returns a tenants[] array (multi-tenant
                 // lease model); the old flat tenantFirst/tenantLast fields
                 // were never sent, so this column rendered "—" for every
@@ -464,6 +491,7 @@ export function LeasesPage() {
                   )}
                   </Fragment>
                 )
+              })]
               }) : (
                 <tr>
                   <td colSpan={8} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>
@@ -1022,6 +1050,10 @@ function MoveSpotModal({ lease, onClose }: { lease: any; onClose: () => void }) 
   const [reason, setReason] = useState('')
   const [err, setErr] = useState<string | null>(null)
   const [done, setDone] = useState<any>(null)
+  // S652 (Nic): "moving somebody in the system should initiate two meter
+  // reads… it needs to happen at the time of move." The numbers are asked for
+  // here, before the Move button lights, and travel with the move.
+  const [readValues, setReadValues] = useState<Record<string, string>>({})
 
   // Only spaces at the SAME property — a resident moving parks is a new
   // tenancy, not a move.
@@ -1029,26 +1061,33 @@ function MoveSpotModal({ lease, onClose }: { lease: any; onClose: () => void }) 
     ['units-for-move', lease.propertyId],
     () => apiGet(`/units?propertyId=${lease.propertyId}`),
     { enabled: !!lease.propertyId })
+  const { data: needed = [], isFetching: loadingReads } = useQuery<any[]>(
+    ['move-reads', lease.id, toUnitId],
+    () => apiGet(`/leases/${lease.id}/move-reads?toUnitId=${toUnitId}`),
+    { enabled: !!toUnitId })
 
   const open = (units as any[]).filter(u =>
     u.id !== lease.unitId && ['vacant', 'available'].includes(String(u.status)))
+  const allRead = (needed as any[]).every(m => (readValues[m.meterId] ?? '') !== '')
 
   const move = useMutation(
     () => apiPost(`/leases/${lease.id}/move`, {
       toUnitId, movedOn, reason: reason.trim() || null,
+      reads: (needed as any[]).map(m => ({ meterId: m.meterId, value: Number(readValues[m.meterId]) })),
     }),
     {
       onSuccess: (r: any) => {
         setDone(r?.data ?? r)
         qc.invalidateQueries('leases')
         qc.invalidateQueries('units')
+        qc.invalidateQueries('utility-meters')
       },
       onError: (e: any) =>
         setErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not move them.'),
     })
 
   if (done) {
-    const reads = [...(done.closingReadsNeeded ?? []), ...(done.openingReadsNeeded ?? [])]
+    const n = (done.closingReadsNeeded?.length ?? 0) + (done.openingReadsNeeded?.length ?? 0)
     return (
       <div className="modal-overlay" onClick={onClose}>
         <div className="modal" style={{ maxWidth: 470 }} onClick={e => e.stopPropagation()}>
@@ -1058,26 +1097,8 @@ function MoveSpotModal({ lease, onClose }: { lease: any; onClose: () => void }) 
           </div>
           <p style={{ fontSize: '.86rem', color: 'var(--text-1)' }}>
             Their tenancy continues unchanged — same lease, same rent, same terms.
+            {n > 0 ? ` ${n} meter reading${n === 1 ? '' : 's'} recorded for ${done.movedOn}.` : ' No submeters on either space, so there was nothing to read.'}
           </p>
-          {reads.length > 0 ? (
-            <div className="alert" style={{ borderColor: 'var(--gold)', fontSize: '.82rem' }}>
-              <strong>Read these meters on {done.movedOn}.</strong> Without a closing number on the
-              old space and an opening number on the new one, the month blends into one charge
-              instead of a line for each.
-              <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>
-                {done.closingReadsNeeded?.map((m: any) => (
-                  <li key={m.meterId} style={{ fontSize: '.8rem' }}>{m.label} — closing</li>
-                ))}
-                {done.openingReadsNeeded?.map((m: any) => (
-                  <li key={m.meterId} style={{ fontSize: '.8rem' }}>{m.label} — opening</li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-            <div style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>
-              No submeters on either space, so there is nothing to read.
-            </div>
-          )}
           <div className="modal-footer">
             <button className="btn btn-primary" onClick={onClose}>Done</button>
           </div>
@@ -1102,7 +1123,7 @@ function MoveSpotModal({ lease, onClose }: { lease: any; onClose: () => void }) 
           <label>
             <div className="form-label">MOVE TO</div>
             <select className="input" style={{ width: '100%' }} value={toUnitId}
-              onChange={e => setToUnitId(e.target.value)}>
+              onChange={e => { setToUnitId(e.target.value); setReadValues({}) }}>
               <option value="">Choose a space…</option>
               {open.map(u => <option key={u.id} value={u.id}>{u.unitNumber}</option>)}
             </select>
@@ -1123,15 +1144,35 @@ function MoveSpotModal({ lease, onClose }: { lease: any; onClose: () => void }) 
           <label>
             <div className="form-label">WHY (OPTIONAL)</div>
             <input className="input" style={{ width: '100%' }} value={reason}
-              placeholder="Pedestal failed / wanted the shade" 
+              placeholder="Pedestal failed / wanted the shade"
               onChange={e => setReason(e.target.value)} />
           </label>
+          {toUnitId && (needed as any[]).length > 0 && (
+            <div className="alert" style={{ borderColor: 'var(--gold)', fontSize: '.82rem' }}>
+              <strong>Meter readings as of {movedOn}</strong> — closing on the space they leave, opening on
+              the space they take. Both are required: without them the month bills as one blended charge.
+              <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+                {(needed as any[]).map((m: any) => (
+                  <label key={m.meterId} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: '.8rem' }}>
+                    <span style={{ flex: 1 }}>{m.label} <span style={{ color: 'var(--text-3)' }}>— {m.kind}</span></span>
+                    <input className="input mono" type="text" inputMode="numeric" autoComplete="off"
+                      value={readValues[m.meterId] ?? ''} placeholder="meter face"
+                      onChange={e => setReadValues(v => ({ ...v, [m.meterId]: e.target.value.replace(/\D/g, '').slice(0, 9) }))}
+                      style={{ width: 150, letterSpacing: '.08em' }} />
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+          {toUnitId && !loadingReads && (needed as any[]).length === 0 && (
+            <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>No submeters on either space — nothing to read.</div>
+          )}
         </div>
 
         {err && <div style={{ fontSize: '.78rem', color: 'var(--red)', marginTop: 10 }}>{err}</div>}
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" disabled={!toUnitId || move.isLoading}
+          <button className="btn btn-primary" disabled={!toUnitId || loadingReads || !allRead || move.isLoading}
             onClick={() => { setErr(null); move.mutate() }}>
             {move.isLoading ? 'Moving…' : 'Move'}
           </button>

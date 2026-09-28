@@ -13,7 +13,7 @@ import {
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
   Landmark, ClipboardCheck, MessageSquare,
-  Sun, Moon, Globe, Headphones } from 'lucide-react'
+  Sun, Moon, Globe, Headphones, Camera } from 'lucide-react'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
 // it) and an optional `perm` list (sub-permission keys; worker roles
@@ -102,6 +102,10 @@ const NAV_ITEMS: Array<{
   { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  category: 'maintenance' },
   { to: '/inspections',   icon: ClipboardCheck,   label: 'Inspections',      section: null,          category: 'inspections' },
   { to: '/documents',     icon: FileText,         label: 'Documents',        section: null,          category: 'documents' },
+  // S652 (Nic): a maintenance worker's way to put a posted notice or a record
+  // photo onto a resident's file, from the phone. Same category as Documents:
+  // holding "Add photos & posted notices" is enough to see it.
+  { to: '/tenant-photos', icon: Camera,           label: 'Photos & Notices', section: null,          category: 'documents' },
   { to: '/inventory',     icon: Package,          label: 'Inventory',        section: null,          category: 'inventory' },
   // W-36 (S531): sub-meter management — meters CRUD is gated on
   // properties.edit / units.* server-side; 'units' is the closest catalog

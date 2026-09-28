@@ -1943,6 +1943,8 @@ leasesRouter.post('/:id/move', requirePerm('leases.edit'), async (req: any, res,
       toUnitId: z.string().uuid(),
       movedOn:  z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
       reason:   z.string().max(500).nullable().optional(),
+      // S652: one reading per submeter on both spaces, taken at the time of the move.
+      reads:    z.array(z.object({ meterId: z.string().uuid(), value: z.number().int().min(0) })).max(40).optional(),
     }).parse(req.body)
 
     const lease = await queryOne<{ landlord_id: string }>(
@@ -1957,8 +1959,27 @@ leasesRouter.post('/:id/move', requirePerm('leases.edit'), async (req: any, res,
       movedOn: body.movedOn,
       reason: body.reason ?? null,
       actorUserId: req.user?.userId ?? null,
+      reads: body.reads,
     })
     res.json({ success: true, data: result })
+  } catch (e) { next(e) }
+})
+
+/**
+ * GET /api/leases/:id/move-reads?toUnitId= — the meters a move to that space
+ * will need read, so the move screen can ask for the numbers BEFORE moving.
+ */
+leasesRouter.get('/:id/move-reads', requirePerm('leases.edit'), async (req: any, res, next) => {
+  try {
+    const toUnitId = z.string().uuid().parse(req.query.toUnitId)
+    const lease = await queryOne<{ landlord_id: string; unit_id: string }>(
+      'SELECT landlord_id, unit_id FROM leases WHERE id = $1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    const { metersFor } = await import('../services/unitMove')
+    const [closing, opening] = await Promise.all([metersFor(lease.unit_id), metersFor(toUnitId)])
+    const shape = (rows: any[], kind: string) => rows.map(m => ({ meterId: m.meter_id, label: m.label, utilityType: m.utility_type, kind }))
+    res.json({ success: true, data: [...shape(closing, 'closing'), ...shape(opening, 'opening')] })
   } catch (e) { next(e) }
 })
 

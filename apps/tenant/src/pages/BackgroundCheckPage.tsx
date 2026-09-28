@@ -142,14 +142,14 @@ export function BackgroundCheckPage() {
   const providerCollectsPii = !!(price as any)?.providerCollectsPii
   // The name the check needs comes from the account, never a form field.
   useEffect(() => {
-    if (providerCollectsPii && me) {
+    if (me) {
       setForm(f => ({
         ...f,
         firstName: f.firstName || (me as any).firstName || '',
         lastName:  f.lastName  || (me as any).lastName  || '',
       }))
     }
-  }, [providerCollectsPii, me])
+  }, [me])
   // Account creation is moved to the step-5 effect below so the
   // /background/payment-intent call (which requires auth) can run before
   // submit. By the time submitMut fires, a token already exists.
@@ -534,7 +534,13 @@ export function BackgroundCheckPage() {
           {/* S642: Checkr's Tenant order will not open without a name, so it is
               asked for once, here, as the order's seed. The account is NOT named
               by it — the matched legal name off the finished report replaces it. */}
-          {needsAccountStep&&<div style={{marginBottom:18,padding:'14px 16px',background:'#141a22',border:'1px solid #1e2530',borderRadius:10}}>
+          {/* S652 (Nic): a prospect "wasn't letting them continue… to make their
+              payment." The name is REQUIRED to continue (canNext), but these
+              inputs only rendered on the first visit (needsAccountStep). Anyone
+              who came back with a session — or whose account carried no name —
+              had no field to type into and a button that never lit. The fields
+              show whenever the account has no name to fall back on. */}
+          {(needsAccountStep || !((me as any)?.firstName && (me as any)?.lastName))&&<div style={{marginBottom:18,padding:'14px 16px',background:'#141a22',border:'1px solid #1e2530',borderRadius:10}}>
             <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>Your legal name</div>
             <div style={{fontSize:'.75rem',color:'#7a8aaa',lineHeight:1.55,marginBottom:10}}>
               As it appears on your government ID — the screener matches against it.

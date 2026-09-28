@@ -1962,6 +1962,10 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     sections: [{ label: 'Access', items: [
       { key: 'documents.view', label: 'View documents' },
       { key: 'documents.upload', label: 'Upload documents' },
+      // S652 (Nic): "maintenance people need to be able to add a picture…
+      // a picture of said notice to that tenant's profile." A photo from the
+      // phone straight onto the resident's record — nothing else in Documents.
+      { key: 'documents.post_photo', label: 'Add photos & posted notices to a resident', hint: 'camera upload onto the resident\'s record' },
     ]}],
   },
   {

@@ -54,6 +54,7 @@ import { MaintenancePage } from './pages/MaintenancePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { PayoutsPage } from './pages/PayoutsPage'
 import { WorkTradePage } from './pages/WorkTradePage'
+import { MeterReadingsPage } from './pages/MeterReadingsPage'
 import { TenantSurveysPage } from './pages/TenantSurveysPage'
 import { PosCustomerOnboardingPage } from './pages/PosCustomerOnboardingPage'
 // S651: the renter pool's only screen — places near the address on their ID.
@@ -68,8 +69,7 @@ import {
   ShieldCheck, Home, Star, CreditCard, Wrench, ClipboardCheck,
   Video, DoorOpen, CalendarClock, HeartHandshake, BarChart3, Scale, ScrollText,
   Bell, Landmark, User, Dumbbell, MessagesSquare, FileText, ClipboardList, Sun, Moon,
-  UserSearch,
-} from 'lucide-react'
+  UserSearch, Gauge } from 'lucide-react'
 
 // S550: first-party product telemetry — one page_view per route change.
 // Fire-and-forget; failures are silently ignored (never affects UX).
@@ -691,6 +691,9 @@ function Layout() {
             <NavLink to="/communication" className={({isActive})=>`ni${isActive?' active':''}`}><MessagesSquare size={16}/>Communication</NavLink>
             {hasAmenities && <NavLink to="/amenities" className={({isActive})=>`ni${isActive?' active':''}`}><CalendarClock size={16}/>Amenities</NavLink>}
             {hasWorkTrade && <NavLink to="/work-trade" className={({isActive})=>`ni${isActive?' active':''}`}><HeartHandshake size={16}/>Work Trade</NavLink>}
+            {/* S652: a work trader whose agreement carries "Read meters" takes the property's reading walk from here. */}
+            {hasWorkTrade && Array.isArray((workTradeNav as any)?.fieldPermissions) && (workTradeNav as any).fieldPermissions.includes('read_meters') &&
+              <NavLink to="/meter-readings" className={({isActive})=>`ni${isActive?' active':''}`}><Gauge size={16}/>Meter Readings</NavLink>}
             {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}><BarChart3 size={16}/>My Record</NavLink>}
             {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>My Disputes</NavLink>}
             <LeaseNavLink/>
@@ -4852,6 +4855,7 @@ function App() {
           <Route path="entry-requests"      element={<TenantEntryRequestsPage />} />
           <Route path="amenities"           element={<TenantAmenitiesPage />} />
           <Route path="work-trade"          element={<WorkTradePage />} />
+          <Route path="meter-readings"      element={<MeterReadingsPage />} />
           <Route path="entry-requests/:id"  element={<TenantEntryRequestDetailPage />} />
           <Route path="credit"              element={LAUNCH_HIDDEN.has('/credit') ? <Navigate to="/home" replace /> : <CreditPage />} />
           <Route path="my-disputes"         element={LAUNCH_HIDDEN.has('/my-disputes') ? <Navigate to="/home" replace /> : <MyDisputesPage />} />

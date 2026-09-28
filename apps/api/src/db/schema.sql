@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict HtD3W7N1gWdrjFa8TbqzjHuKvQk25IkBAdTQxhKpNMUsRRlUOZvkZsfXXt6sDLH
+\restrict eZ60DrIo1DfLJXrp1DKUEo7LtSbnxpsVJnvFeMfsmgC0unoKpkuIroEitXhlLp5
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3773,6 +3773,9 @@ CREATE TABLE public.documents (
     maintenance_request_id uuid,
     property_id uuid,
     is_reference boolean DEFAULT false NOT NULL,
+    note text,
+    uploaded_by_user_id uuid,
+    posted_at date,
     CONSTRAINT documents_type_check CHECK ((type = ANY (ARRAY['lease'::text, 'addendum'::text, 'move_in_checklist'::text, 'move_out_checklist'::text, 'notice'::text, 'receipt'::text, 'park_rules'::text, 'disclosure'::text, 'reference'::text, 'other'::text])))
 );
 
@@ -23109,6 +23112,14 @@ ALTER TABLE ONLY public.documents
 
 
 --
+-- Name: documents documents_uploaded_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.documents
+    ADD CONSTRAINT documents_uploaded_by_user_id_fkey FOREIGN KEY (uploaded_by_user_id) REFERENCES public.users(id);
+
+
+--
 -- Name: dump_locations dump_locations_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -28000,5 +28011,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict HtD3W7N1gWdrjFa8TbqzjHuKvQk25IkBAdTQxhKpNMUsRRlUOZvkZsfXXt6sDLH
+\unrestrict eZ60DrIo1DfLJXrp1DKUEo7LtSbnxpsVJnvFeMfsmgC0unoKpkuIroEitXhlLp5
 

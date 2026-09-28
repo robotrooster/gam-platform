@@ -134,6 +134,8 @@ export function TenantDetailPage() {
             </div>
           </div>
 
+          <PhotosAndNoticesCard tenantId={id!} />
+
           <PostPaymentCard tenantId={id!} hasUnit={!!currentUnit} paidAhead={Number(data.paidAhead ?? 0)} />
           <OneOffChargesCard tenantId={id!} hasUnit={!!currentUnit} />
 
@@ -521,6 +523,45 @@ function PostPaymentCard({ tenantId, hasUnit, paidAhead }: { tenantId: string; h
               <button className="btn btn-ghost" onClick={() => setOpen(false)}>Cancel</button>
             </div>
           </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+// S652 (Nic): the posted notices and record photos on this resident's file —
+// what a maintenance worker (or anyone with the permission) added from the
+// Photos & Notices screen. Read here; taken there.
+function PhotosAndNoticesCard({ tenantId }: { tenantId: string }) {
+  const navigate = useNavigate()
+  const { data: docs = [] } = useQuery<any[]>(['documents', 'tenant', tenantId], () => apiGet(`/documents?tenantId=${tenantId}`))
+  const items = (docs as any[]).filter(d => ['notice', 'other'].includes(d.type) && String(d.mimeType || '').startsWith('image/'))
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+        <span>Photos & Notices</span>
+        <button className="btn btn-ghost btn-sm" onClick={() => navigate('/tenant-photos')}>Add a photo</button>
+      </div>
+      {items.length === 0 ? (
+        <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>Nothing posted or photographed yet.</div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {items.map((d: any) => (
+            <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 10, background: 'var(--bg-2)', border: '1px solid var(--border-0)' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span className={`badge ${d.type === 'notice' ? 'badge-amber' : 'badge-muted'}`}>{d.type === 'notice' ? 'Notice posted' : 'Photo'}</span>
+                  <span style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.name}</span>
+                </div>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
+                  {d.postedAt ? new Date(String(d.postedAt).slice(0, 10) + 'T12:00:00').toLocaleDateString() : new Date(d.createdAt).toLocaleDateString()}
+                  {d.note ? ` · ${d.note}` : ''}
+                </div>
+              </div>
+              <button className="btn btn-ghost btn-sm" onClick={() => navigate(`/view?src=${encodeURIComponent(`/documents/${d.id}/file`)}&title=${encodeURIComponent(d.name || 'Photo')}`)}>View</button>
+            </div>
+          ))}
         </div>
       )}
     </div>

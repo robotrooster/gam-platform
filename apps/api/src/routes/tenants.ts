@@ -2553,7 +2553,7 @@ tenantsRouter.get('/work-trade', requireAuth, async (req, res, next) => {
     const tenant = await queryOne<any>('SELECT t.id FROM tenants t WHERE t.user_id=$1', [req.user!.userId])
     if (!tenant) throw new AppError(404, 'Tenant not found')
     const agreement = await queryOne<any>(`
-      SELECT wta.*, u.unit_number, p.name as property_name
+      SELECT wta.*, u.unit_number, p.name as property_name, p.id AS property_id
       FROM work_trade_agreements wta
       JOIN units u ON u.id = wta.unit_id
       JOIN properties p ON p.id = u.property_id
