@@ -3995,6 +3995,33 @@ adminRouter.post('/landlords/:id/unlock', requireSuperAdmin, async (req: any, re
  * stats." Distinct from /earnings, which books a fee when it is EARNED and is
  * silent on whether it was ever received.
  */
+/**
+ * S652 — GAM's reader desk. A landlord asked for a card reader from the
+ * register; here it is ordered in Stripe's shop (pre-registered to the
+ * property's Terminal location shown on the row), and the Stripe order,
+ * serial and tracking are recorded. Marking it shipped raises the first
+ * payment; Stripe registering the device flips it to "registered" on its own.
+ */
+adminRouter.get('/reader-orders', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { adminListReaderOrders } = await import('../services/readerOrders')
+    res.json({ success: true, data: await adminListReaderOrders() })
+  } catch (e) { next(e) }
+})
+adminRouter.patch('/reader-orders/:id', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const body = z.object({
+      status: z.enum(['requested', 'ordered', 'shipped', 'delivered', 'registered', 'cancelled']).optional(),
+      stripeHardwareOrderId: z.string().trim().max(80).nullable().optional(),
+      serial: z.string().trim().max(80).nullable().optional(),
+      trackingUrl: z.string().trim().max(400).nullable().optional(),
+      note: z.string().trim().max(500).nullable().optional(),
+    }).parse(req.body)
+    const { adminUpdateReaderOrder } = await import('../services/readerOrders')
+    res.json({ success: true, data: await adminUpdateReaderOrder(req.params.id, body) })
+  } catch (e) { next(e) }
+})
+
 adminRouter.get('/collections', requireSuperAdmin, async (_req, res, next) => {
   try {
     const { collectionsBook } = await import('../services/gamCollections')

@@ -1894,6 +1894,9 @@ export function schedulerInit() {
       // capped-state shortfalls) into platform revenue in the same run.
       const sweep = await processScreeningFeeSweep()
       logger.info(sweep, '[screening-fee-sweep]')
+      // S652: the month's piece of any card reader on a plan.
+      const { raiseDueInstallments } = await import('../services/readerOrders')
+      logger.info({ raised: await raiseDueInstallments() }, '[reader-installments]')
     } catch (e) {
       logger.error({ err: e }, '[platform-fee-accrual] fatal')
     }

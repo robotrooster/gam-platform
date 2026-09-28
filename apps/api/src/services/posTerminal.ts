@@ -71,7 +71,8 @@ export async function getOrCreatePropertyLocation(propertyId: string): Promise<s
   }
   const loc = await getStripe().terminal.locations.create({
     display_name: p.name,
-    address: { line1: p.street1, line2: p.street2 ?? undefined, city: p.city, state: p.state, postal_code: p.zip, country: 'US' },
+    // Stripe refuses an EMPTY line2 ("cannot be unset") — send it only when there is one.
+    address: { line1: p.street1, ...(p.street2 && String(p.street2).trim() ? { line2: String(p.street2).trim() } : {}), city: p.city, state: p.state, postal_code: p.zip, country: 'US' },
     metadata: { gam_property_id: propertyId },
   })
   await query(`UPDATE properties SET stripe_terminal_location_id = $1 WHERE id = $2`, [loc.id, propertyId])

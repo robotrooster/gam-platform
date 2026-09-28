@@ -43,7 +43,7 @@ export interface GamCharge {
    *                      the landlord sees two numbers they can each check
    *                      rather than one lump they can only dispute
    */
-  kind: 'subscription' | 'manual_payment_fee' | 'bank_debit_cost'
+  kind: 'subscription' | 'manual_payment_fee' | 'bank_debit_cost' | 'device_installment'
   amount: number
   /** what produced this, so a retry cannot bill twice */
   sourceType: string

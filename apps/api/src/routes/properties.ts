@@ -282,6 +282,16 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     // (within the 30-day cap). See services/onboardingWindow.ts.
     await openOnboardingWindow(prop.id, client)
 
+    // S652 (Nic): "by default, we should have every property available to
+    // pick from that menu" — the Stripe Terminal location a card reader is
+    // registered to (and pre-registered to, straight from Stripe's shop). Made
+    // the moment the property exists so it is there the day someone orders a
+    // reader. Best-effort: a Stripe hiccup must never stop a property from
+    // being created; the location is made on first use if this misses.
+    void import('../services/posTerminal').then(({ getOrCreatePropertyLocation }) =>
+      getOrCreatePropertyLocation(prop.id).catch((e: any) =>
+        logger.warn({ err: e, propertyId: prop.id }, '[terminal] location not made at property creation')))
+
     // S574 (Nic): every property gets a live public website the moment it's
     // created — auto-assign a booking slug and publish it so the landlord has a
     // shareable site immediately, with no separate "enable" step to hunt for.

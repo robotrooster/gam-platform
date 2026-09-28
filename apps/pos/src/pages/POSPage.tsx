@@ -10,7 +10,7 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDel } from '../lib/api'
-import { humanize, processingFeeFor, rvSiteFactsLabel } from '@gam/shared'
+import { humanize, processingFeeFor, rvSiteFactsLabel, SUPPORTED_CARD_READER, READER_ORDER_STATUS_LABEL } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { SendPayLinkModal, PayLinksTab } from './POSPayLinks'
@@ -1598,6 +1598,11 @@ export function POSPage() {
           via the JS SDK at charge time. */}
       {tab==='readers' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
+          {/* S652 (Nic): "they get their card reader, they plug it in, they're
+              good to go." One supported model, the price, the plan, the address
+              — GAM orders it from Stripe pre-registered to this property and
+              ships it straight here. It shows in Active Readers on its own. */}
+          <GetReaderCard propertyId={registerProperty} property={(properties as any[]).find((p:any)=>p.id===registerProperty)} />
           <div className="card">
             <div className="card-header"><span className="card-title">Pair New Smart Reader</span></div>
             <div style={{fontSize:'.78rem',color:'var(--text-3)',marginTop:8,marginBottom:12}}>
@@ -1996,5 +2001,85 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
         })}>Use this site</button>
       </div>
     </>
+  )
+}
+
+
+// S652: ask GAM for the supported card reader, shipped straight from Stripe.
+function GetReaderCard({ propertyId, property }: { propertyId: string; property: any }) {
+  const qc = useQueryClient()
+  const { data: orders = [] } = useQuery<any[]>(['pos-reader-orders', propertyId], () => apiGet(`/pos/reader-orders?propertyId=${propertyId}`))
+  const open = (orders as any[]).find(o => !['registered','cancelled'].includes(o.status))
+  const [form, setForm] = useState(() => ({
+    name: '', company: property?.name || '', line1: property?.street1 || '', line2: property?.street2 || '',
+    city: property?.city || '', state: property?.state || '', zip: property?.zip || '', phone: '', email: '', note: '',
+  }))
+  const [showForm, setShowForm] = useState(false)
+  const set = (k: string, v: string) => setForm(f => ({ ...f, [k]: v }))
+  const request = useMutation(
+    () => apiPost('/pos/reader-orders', { propertyId, shipTo: {
+      name: form.name, company: form.company || null, line1: form.line1, line2: form.line2 || null,
+      city: form.city, state: form.state.toUpperCase(), zip: form.zip, phone: form.phone || null, email: form.email || null,
+    }, note: form.note || null }),
+    { onSuccess: () => { qc.invalidateQueries(['pos-reader-orders', propertyId]); setShowForm(false); toast('Request sent — we order it and ship it to you') },
+      onError: (e: any) => toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not send the request') })
+  const cancel = useMutation((id: string) => apiPost(`/pos/reader-orders/${id}/cancel`, {}),
+    { onSuccess: () => qc.invalidateQueries(['pos-reader-orders', propertyId]) })
+  const pieces = SUPPORTED_CARD_READER.installments
+  const piece = (SUPPORTED_CARD_READER.price / pieces).toFixed(2)
+  return (
+    <div className="card">
+      <div className="card-header" style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline' }}>
+        <span className="card-title">Get a card reader</span>
+        <span style={{ fontSize:'.75rem', color:'var(--text-3)' }}>{SUPPORTED_CARD_READER.label}</span>
+      </div>
+      {open ? (
+        <div style={{ fontSize:'.82rem', color:'var(--text-2)', marginTop: 8 }}>
+          <div><strong>{READER_ORDER_STATUS_LABEL[open.status as keyof typeof READER_ORDER_STATUS_LABEL]}</strong> — requested {new Date(open.createdAt).toLocaleDateString()}, shipping to {open.shipLine1}, {open.shipCity}.</div>
+          {open.trackingUrl && <div style={{ marginTop: 4 }}><a href={open.trackingUrl} target="_blank" rel="noopener noreferrer" style={{ color:'var(--gold)' }}>Track the package</a></div>}
+          <div style={{ fontSize:'.74rem', color:'var(--text-3)', marginTop: 6 }}>
+            When it arrives: plug in power, connect it to your Wi-Fi (or the Ethernet dock). It appears under Active Readers on its own — nothing to type.
+          </div>
+          {open.status === 'requested' && (
+            <button className="btn btn-ghost btn-sm" style={{ marginTop: 8 }} disabled={cancel.isLoading} onClick={() => cancel.mutate(open.id)}>Cancel request</button>
+          )}
+        </div>
+      ) : !showForm ? (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ fontSize:'.82rem', color:'var(--text-2)', lineHeight: 1.55 }}>
+            {SUPPORTED_CARD_READER.blurb} We order it from Stripe already set up for this property and ship it straight to you.
+          </div>
+          <div style={{ fontSize:'.86rem', fontWeight: 700, marginTop: 8 }}>
+            ${SUPPORTED_CARD_READER.price.toFixed(2)} — {pieces} monthly payments of ${piece}, taken from your payouts, each shown as its own line.
+          </div>
+          <button className="btn btn-primary" style={{ marginTop: 10 }} onClick={() => setShowForm(true)}>Request a reader</button>
+        </div>
+      ) : (
+        <div style={{ display:'grid', gap: 10, marginTop: 8 }}>
+          <div style={{ fontSize:'.78rem', color:'var(--text-3)' }}>Where should it ship? A street address — no PO boxes.</div>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap: 10 }}>
+            <div><div className="form-label">YOUR NAME</div><input className="form-input" style={{ width:'100%' }} value={form.name} onChange={e => set('name', e.target.value)} /></div>
+            <div><div className="form-label">COMPANY (ON THE BOX)</div><input className="form-input" style={{ width:'100%' }} value={form.company} onChange={e => set('company', e.target.value)} /></div>
+            <div style={{ gridColumn:'1/-1' }}><div className="form-label">STREET</div><input className="form-input" style={{ width:'100%' }} value={form.line1} onChange={e => set('line1', e.target.value)} /></div>
+            <div style={{ gridColumn:'1/-1' }}><div className="form-label">STREET LINE 2</div><input className="form-input" style={{ width:'100%' }} value={form.line2} onChange={e => set('line2', e.target.value)} /></div>
+            <div><div className="form-label">CITY</div><input className="form-input" style={{ width:'100%' }} value={form.city} onChange={e => set('city', e.target.value)} /></div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap: 10 }}>
+              <div><div className="form-label">STATE</div><input className="form-input" style={{ width:'100%' }} maxLength={2} value={form.state} onChange={e => set('state', e.target.value.toUpperCase())} /></div>
+              <div><div className="form-label">ZIP</div><input className="form-input" style={{ width:'100%' }} value={form.zip} onChange={e => set('zip', e.target.value)} /></div>
+            </div>
+            <div><div className="form-label">PHONE (FOR THE COURIER)</div><input className="form-input" style={{ width:'100%' }} value={form.phone} onChange={e => set('phone', e.target.value)} /></div>
+            <div><div className="form-label">EMAIL FOR SHIPPING UPDATES</div><input className="form-input" style={{ width:'100%' }} value={form.email} onChange={e => set('email', e.target.value)} /></div>
+          </div>
+          <div style={{ fontSize:'.8rem', color:'var(--text-2)' }}>
+            You are asking for one {SUPPORTED_CARD_READER.label} at ${SUPPORTED_CARD_READER.price.toFixed(2)}, paid as {pieces} monthly payments of ${piece} from your payouts, the first when it ships.
+          </div>
+          <div style={{ display:'flex', gap: 8 }}>
+            <button className="btn btn-ghost" onClick={() => setShowForm(false)}>Back</button>
+            <button className="btn btn-primary" disabled={!form.name || !form.line1 || !form.city || form.state.length !== 2 || !/^\d{5}(-\d{4})?$/.test(form.zip) || request.isLoading}
+              onClick={() => request.mutate()}>{request.isLoading ? 'Sending…' : 'Send the request'}</button>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }

@@ -314,6 +314,7 @@ function Layout(){
           <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={15}/> Payments</NavLink>
           <NavLink to="/disbursements" className={({isActive})=>`ni${isActive?' active':''}`}><ArrowDownToLine size={15}/> Disbursements</NavLink>
           <NavLink to="/connect-accounts" className={({isActive})=>`ni${isActive?' active':''}`}><Plug size={15}/> Connect Accounts</NavLink>
+          {isSuperAdmin&&<NavLink to="/reader-orders" className={({isActive})=>`ni${isActive?' active':''}`}><Plug size={15}/> Reader Orders</NavLink>}
           {isSuperAdmin&&<NavLink to="/deposit-interest" className={({isActive})=>`ni${isActive?' active':''}`}><Landmark size={15}/> Deposit Interest</NavLink>}
           <NavLink to="/outreach" className={({isActive})=>`ni${isActive?' active':''}`}><Mail size={15}/> Signup Outreach</NavLink>
           <NavLink to="/send-email" className={({isActive})=>`ni${isActive?' active':''}`}><Send size={15}/> Send Email</NavLink>
@@ -1991,6 +1992,73 @@ function Disbursements(){
 // bearing user / pm_company with cached readiness flags. Admin uses this
 // for support — when a landlord calls saying "tenants can't pay," admin
 // can verify if it's a Connect issue at a glance.
+// S652 (Nic): GAM's reader desk. A landlord asks for a card reader from the
+// register; here it gets ordered in Stripe's shop — pre-registered to the
+// property's Terminal location on the row — and the Stripe order, serial and
+// tracking are written down. "Shipped" raises the first payment; Stripe
+// registering the device flips the row to "registered" by itself.
+function ReaderOrders() {
+  const qc = useQueryClient()
+  const { data: orders = [], isLoading } = useQuery<any[]>('admin-reader-orders', () => get<any[]>('/admin/reader-orders'))
+  const [draft, setDraft] = React.useState<Record<string, any>>({})
+  const [busy, setBusy] = React.useState<string | null>(null)
+  const [msg, setMsg] = React.useState<string | null>(null)
+  const STATUSES = ['requested', 'ordered', 'shipped', 'delivered', 'registered', 'cancelled']
+  const LABEL: Record<string, string> = { requested: 'Requested', ordered: 'Ordered from Stripe', shipped: 'Shipped', delivered: 'Delivered', registered: 'Registered — ready', cancelled: 'Cancelled' }
+  const save = async (o: any) => {
+    const d = draft[o.id] || {}
+    setBusy(o.id); setMsg(null)
+    try {
+      await api.patch(`/admin/reader-orders/${o.id}`, {
+        status: d.status ?? o.status, stripeHardwareOrderId: d.stripeHardwareOrderId ?? o.stripeHardwareOrderId ?? null,
+        serial: d.serial ?? o.serial ?? null, trackingUrl: d.trackingUrl ?? o.trackingUrl ?? null,
+      })
+      setDraft(prev => { const n = { ...prev }; delete n[o.id]; return n })
+      qc.invalidateQueries('admin-reader-orders'); setMsg('Saved')
+    } catch (e: any) { setMsg(e?.response?.data?.error || 'Could not save') } finally { setBusy(null) }
+  }
+  const field = (o: any, k: string, placeholder: string) => (
+    <input className="inp" style={{ width: '100%', fontSize: '.78rem' }} placeholder={placeholder}
+      value={draft[o.id]?.[k] ?? o[k] ?? ''} onChange={e => setDraft(prev => ({ ...prev, [o.id]: { ...(prev[o.id] || {}), [k]: e.target.value } }))} />
+  )
+  return (
+    <div>
+      <div className="ph"><div><h1 className="pt">Reader Orders</h1><p className="ps">Card readers landlords asked for — order in Stripe's shop, pre-registered to the location shown, shipped to the address shown</p></div></div>
+      {msg && <div style={{ fontSize: '.8rem', color: 'var(--t2)', marginBottom: 8 }}>{msg}</div>}
+      {isLoading ? <div style={{ color: 'var(--t3)' }}>Loading…</div> : (orders as any[]).length === 0 ? (
+        <div className="card" style={{ padding: 24, color: 'var(--t3)' }}>No reader requests yet.</div>
+      ) : (
+        <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+          <table className="tbl" style={{ minWidth: 1100 }}>
+            <thead><tr><th>Requested</th><th>Landlord · property</th><th>Ship to</th><th>Stripe location</th><th>Plan</th><th>Status</th><th>Stripe order</th><th>Serial</th><th>Tracking</th><th></th></tr></thead>
+            <tbody>
+              {(orders as any[]).map(o => (
+                <tr key={o.id}>
+                  <td style={{ fontSize: '.78rem', whiteSpace: 'nowrap' }}>{new Date(o.createdAt).toLocaleDateString()}</td>
+                  <td style={{ fontSize: '.82rem' }}><div style={{ fontWeight: 600 }}>{o.businessName || o.landlordEmail}</div><div style={{ color: 'var(--t3)', fontSize: '.74rem' }}>{o.propertyName}</div></td>
+                  <td style={{ fontSize: '.74rem', color: 'var(--t2)' }}>{o.shipName}{o.shipCompany ? ` · ${o.shipCompany}` : ''}<br />{o.shipLine1}{o.shipLine2 ? `, ${o.shipLine2}` : ''}<br />{o.shipCity}, {o.shipState} {o.shipZip}{o.shipPhone ? <><br />{o.shipPhone}</> : null}</td>
+                  <td className="mono" style={{ fontSize: '.72rem', color: o.stripeTerminalLocationId ? 'var(--t2)' : 'var(--red)' }}>{o.stripeTerminalLocationId || 'no location — open the property'}</td>
+                  <td style={{ fontSize: '.78rem', whiteSpace: 'nowrap' }}>${Number(o.price).toFixed(2)} · {o.installments} × ${Number(o.installmentAmount).toFixed(2)}<br /><span style={{ color: 'var(--t3)' }}>{o.installmentsRaised} of {o.installments} raised</span></td>
+                  <td>
+                    <select className="inp" style={{ fontSize: '.78rem' }} value={draft[o.id]?.status ?? o.status}
+                      onChange={e => setDraft(prev => ({ ...prev, [o.id]: { ...(prev[o.id] || {}), status: e.target.value } }))}>
+                      {STATUSES.map(st => <option key={st} value={st}>{LABEL[st]}</option>)}
+                    </select>
+                  </td>
+                  <td style={{ minWidth: 150 }}>{field(o, 'stripeHardwareOrderId', 'thor_…')}</td>
+                  <td style={{ minWidth: 140 }}>{field(o, 'serial', 'serial number')}</td>
+                  <td style={{ minWidth: 160 }}>{field(o, 'trackingUrl', 'tracking link')}</td>
+                  <td><button className="btn btn-primary btn-sm" disabled={busy === o.id} onClick={() => save(o)}>{busy === o.id ? '…' : 'Save'}</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ConnectAccounts() {
   const { user } = useAuth()
   const qc = useQueryClient()
@@ -3974,6 +4042,7 @@ function App(){
           <Route path="payments"      element={<Payments/>}/>
           <Route path="disbursements" element={<Disbursements/>}/>
           <Route path="connect-accounts" element={<ConnectAccounts/>}/>
+          <Route path="reader-orders" element={<SuperAdminGuard><ReaderOrders/></SuperAdminGuard>}/>
           <Route path="reserve"       element={<SuperAdminGuard><Reserve/></SuperAdminGuard>}/>
           <Route path="nacha"         element={<SuperAdminGuard><NachaMonitor/></SuperAdminGuard>}/>
           <Route path="nexus"         element={<SuperAdminGuard><NexusMonitor/></SuperAdminGuard>}/>

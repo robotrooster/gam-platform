@@ -46,6 +46,8 @@ export async function cleanupAllSchema(): Promise<void> {
   }
   // S553: call slots FK sales_leads — clear child first. Availability has
   // no FKs but tests seed their own windows.
+  // S652: card-reader orders FK to properties/landlords; clear first.
+  await db.query(`DELETE FROM pos_reader_orders`)
   await db.query(`DELETE FROM sales_call_slots`)
   await db.query(`DELETE FROM sales_leads`)
   await db.query(`DELETE FROM sales_call_availability`)

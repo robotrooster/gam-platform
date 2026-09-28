@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict sCAFADTfDxZVRRPTSIQQS2fxFOjKoSU24tedNw4bTOW9Tc0aFnHVl0W8pLo7Ecu
+\restrict GUTcAWgsUJWegquatO0NCrOSlIcQFdDfWjBHfpFe3hohb67v9eGSp5p6vnHbfAp
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4902,7 +4902,7 @@ CREATE TABLE public.landlord_gam_charges (
     CONSTRAINT collected_never_exceeds_amount CHECK ((collected_amount <= amount)),
     CONSTRAINT landlord_gam_charges_amount_check CHECK ((amount > (0)::numeric)),
     CONSTRAINT landlord_gam_charges_collected_amount_check CHECK ((collected_amount >= (0)::numeric)),
-    CONSTRAINT landlord_gam_charges_kind_check CHECK ((kind = ANY (ARRAY['subscription'::text, 'manual_payment_fee'::text, 'bank_debit_cost'::text])))
+    CONSTRAINT landlord_gam_charges_kind_check CHECK ((kind = ANY (ARRAY['subscription'::text, 'manual_payment_fee'::text, 'bank_debit_cost'::text, 'device_installment'::text])))
 );
 
 
@@ -7497,6 +7497,47 @@ CREATE TABLE public.pos_purchase_orders (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     property_id uuid,
     CONSTRAINT pos_purchase_orders_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'approved'::text, 'sent'::text, 'received'::text, 'cancelled'::text])))
+);
+
+
+--
+-- Name: pos_reader_orders; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_reader_orders (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    status text DEFAULT 'requested'::text NOT NULL,
+    model text NOT NULL,
+    price numeric(10,2) NOT NULL,
+    installments integer DEFAULT 1 NOT NULL,
+    installment_amount numeric(10,2) NOT NULL,
+    installments_raised integer DEFAULT 0 NOT NULL,
+    ship_name text NOT NULL,
+    ship_company text,
+    ship_line1 text NOT NULL,
+    ship_line2 text,
+    ship_city text NOT NULL,
+    ship_state text NOT NULL,
+    ship_zip text NOT NULL,
+    ship_phone text,
+    ship_email text,
+    note text,
+    stripe_hardware_order_id text,
+    serial text,
+    tracking_url text,
+    stripe_reader_id text,
+    requested_by_user_id uuid,
+    ordered_at timestamp with time zone,
+    shipped_at timestamp with time zone,
+    delivered_at timestamp with time zone,
+    registered_at timestamp with time zone,
+    cancelled_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_reader_orders_installments_check CHECK ((installments >= 1)),
+    CONSTRAINT pos_reader_orders_status_check CHECK ((status = ANY (ARRAY['requested'::text, 'ordered'::text, 'shipped'::text, 'delivered'::text, 'registered'::text, 'cancelled'::text])))
 );
 
 
@@ -13811,6 +13852,14 @@ ALTER TABLE ONLY public.pos_purchase_orders
 
 
 --
+-- Name: pos_reader_orders pos_reader_orders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_reader_orders
+    ADD CONSTRAINT pos_reader_orders_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: pos_refunds pos_refunds_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -19600,6 +19649,13 @@ CREATE INDEX pos_open_tickets_booking_idx ON public.pos_open_tickets USING btree
 --
 
 CREATE INDEX pos_open_tickets_open_idx ON public.pos_open_tickets USING btree (property_id, created_at) WHERE (status = 'open'::text);
+
+
+--
+-- Name: pos_reader_orders_landlord_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_reader_orders_landlord_idx ON public.pos_reader_orders USING btree (landlord_id, status);
 
 
 --
@@ -25730,6 +25786,30 @@ ALTER TABLE ONLY public.pos_purchase_orders
 
 
 --
+-- Name: pos_reader_orders pos_reader_orders_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_reader_orders
+    ADD CONSTRAINT pos_reader_orders_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: pos_reader_orders pos_reader_orders_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_reader_orders
+    ADD CONSTRAINT pos_reader_orders_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id);
+
+
+--
+-- Name: pos_reader_orders pos_reader_orders_requested_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_reader_orders
+    ADD CONSTRAINT pos_reader_orders_requested_by_user_id_fkey FOREIGN KEY (requested_by_user_id) REFERENCES public.users(id);
+
+
+--
 -- Name: pos_refunds pos_refunds_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -28013,5 +28093,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict sCAFADTfDxZVRRPTSIQQS2fxFOjKoSU24tedNw4bTOW9Tc0aFnHVl0W8pLo7Ecu
+\unrestrict GUTcAWgsUJWegquatO0NCrOSlIcQFdDfWjBHfpFe3hohb67v9eGSp5p6vnHbfAp
 

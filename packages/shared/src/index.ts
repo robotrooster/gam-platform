@@ -7146,3 +7146,36 @@ export function matchesUnitQuery(query: string | null | undefined, unitNumber: s
   if (!u) return false
   return u.startsWith(q) || u === q
 }
+
+
+// ── S652: the one card reader GAM supports ───────────────────────────────
+// Nic: "make it where they can only get one specific reader… I want to just
+// make sure they are scoped to the right one that we support." The S710 is the
+// S700 with 4G cellular — it stays online when the office Wi-Fi does not. (No
+// reader takes payments offline for a browser register; that needs the native
+// app.) Priced as a plan: $350 in four monthly pieces, netted from disbursements.
+export const SUPPORTED_CARD_READER = {
+  model: 'stripe_reader_s710',
+  label: 'Stripe Reader S710',
+  blurb: 'Countertop or handheld. Wi-Fi, Ethernet dock, and 4G cellular so it stays online when the office Wi-Fi drops.',
+  price: 350,
+  installments: 4,
+} as const
+export const READER_ORDER_STATUSES = ['requested', 'ordered', 'shipped', 'delivered', 'registered', 'cancelled'] as const
+export type ReaderOrderStatus = typeof READER_ORDER_STATUSES[number]
+export const READER_ORDER_STATUS_LABEL: Record<ReaderOrderStatus, string> = {
+  requested:  'Requested',
+  ordered:    'Ordered from Stripe',
+  shipped:    'Shipped',
+  delivered:  'Delivered',
+  registered: 'Registered — ready to use',
+  cancelled:  'Cancelled',
+}
+/** The monthly pieces of a plan, to the cent, with the rounding on the last one. */
+export function installmentSplit(total: number, n: number): number[] {
+  const cents = Math.round(total * 100)
+  const base = Math.floor(cents / n)
+  const out = Array.from({ length: n }, () => base)
+  out[n - 1] += cents - base * n
+  return out.map(c => c / 100)
+}

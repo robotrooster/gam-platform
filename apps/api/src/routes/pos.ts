@@ -2230,6 +2230,12 @@ posRouter.post('/terminal/readers', requirePerm('pos.manage_inventory'), async (
 posRouter.get('/terminal/readers', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
   try {
     const propertyId = req.query.propertyId ? String(req.query.propertyId) : undefined
+    // S652: a reader Stripe registered from a pre-registered shop order shows
+    // up here on its own — no pairing code. Best-effort; see the service.
+    if (propertyId) {
+      const { syncReadersFromStripe } = await import('../services/readerOrders')
+      await syncReadersFromStripe(posLandlordId(req), propertyId).catch(() => 0)
+    }
     const rows = await listReaders(posLandlordId(req), propertyId)
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
@@ -2239,6 +2245,44 @@ posRouter.get('/terminal/readers', requirePerm('pos.ring_sale', 'pos.manage_inve
 // Soft-archive a reader (sets status='archived'). The Stripe-side record
 // remains; landlord can delete via Stripe dashboard if desired. Historical
 // transactions referencing this row still resolve.
+// ── S652: get a card reader ────────────────────────────────────────────────
+// One model (SUPPORTED_CARD_READER), the price and the plan, shipped straight
+// from Stripe to the property. GAM's desk does the ordering; the landlord only
+// asks and confirms where it goes.
+posRouter.post('/reader-orders', requirePerm('pos.manage_inventory'), async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      propertyId: z.string().uuid(),
+      shipTo: z.object({
+        name: z.string().trim().min(1).max(120), company: z.string().trim().max(120).nullable().optional(),
+        line1: z.string().trim().min(1).max(200), line2: z.string().trim().max(200).nullable().optional(),
+        city: z.string().trim().min(1).max(100), state: z.string().trim().length(2), zip: z.string().trim().regex(/^\d{5}(-\d{4})?$/),
+        phone: z.string().trim().max(30).nullable().optional(), email: z.string().trim().email().nullable().optional(),
+      }),
+      note: z.string().trim().max(500).nullable().optional(),
+    }).parse(req.body)
+    const landlordId = posLandlordId(req)
+    await assertPropertyIsLandlords(landlordId, body.propertyId)
+    await assertLandlordCanBePaid(landlordId)
+    const { requestReader } = await import('../services/readerOrders')
+    const row = await requestReader({ landlordId, propertyId: body.propertyId, shipTo: body.shipTo, note: body.note ?? null, requestedByUserId: req.user?.userId ?? null })
+    res.status(201).json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+posRouter.get('/reader-orders', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
+  try {
+    const propertyId = req.query.propertyId ? String(req.query.propertyId) : undefined
+    const { listReaderOrders } = await import('../services/readerOrders')
+    res.json({ success: true, data: await listReaderOrders(posLandlordId(req), propertyId) })
+  } catch (e) { next(e) }
+})
+posRouter.post('/reader-orders/:id/cancel', requirePerm('pos.manage_inventory'), async (req, res, next) => {
+  try {
+    const { cancelReaderRequest } = await import('../services/readerOrders')
+    res.json({ success: true, data: await cancelReaderRequest(posLandlordId(req), req.params.id) })
+  } catch (e) { next(e) }
+})
+
 posRouter.delete('/terminal/readers/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const row = await archiveReader(posLandlordId(req), req.params.id)
