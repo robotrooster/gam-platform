@@ -141,11 +141,16 @@ if (cd apps/api && npm run build >/tmp/gam-deploy-api.log 2>&1); then
     for i in $(seq 1 60); do
       out=$(launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.gam.api.plist" 2>&1); rc=$?
       echo "$(date '+%T') attempt $i rc=$rc ${out}" >> /tmp/gam-deploy-launchd.log
-      launchctl list 2>/dev/null | grep -q "com.gam.api$" && { echo "$(date '+%T') listed after attempt $i" >> /tmp/gam-deploy-launchd.log; break; }
+      launchctl print "gui/$(id -u)/com.gam.api" >/dev/null 2>&1 && { echo "$(date '+%T') listed after attempt $i" >> /tmp/gam-deploy-launchd.log; break; }
       sleep 2
     done
     sleep 2
-    if ! launchctl list 2>/dev/null | grep -q "com.gam.api$"; then bad "launchd did not load com.gam.api (see /tmp/gam-deploy-launchd.log)"; FAILED=1; fi
+    # Deploy 74 found the real cause of three false alarms: this script runs
+    # with pipefail, and `launchctl list | grep -q` lets grep exit on the first
+    # match, so launchctl dies of SIGPIPE and the PIPELINE reports failure —
+    # for a job that had loaded on attempt 1. `launchctl print` asks launchd
+    # directly and pipes nothing.
+    if ! launchctl print "gui/$(id -u)/com.gam.api" >/dev/null 2>&1; then bad "launchd did not load com.gam.api (see /tmp/gam-deploy-launchd.log)"; FAILED=1; fi
     # Give it a moment, then prove it is actually answering.
     for i in $(seq 1 60); do
       code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:4000/api/sales/demo/slots 2>/dev/null)
@@ -155,7 +160,7 @@ if (cd apps/api && npm run build >/tmp/gam-deploy-api.log 2>&1); then
     if [ "${code:-}" = "200" ]; then ok "restarted and answering"; else bad "restarted but NOT answering (last code: ${code:-none})"; FAILED=1; fi
     # The thing answering must be OUR job — a ts-node dev process on :4000 is
     # the watchdog's doing and serves source, not the build.
-    if lsof -nP -iTCP:4000 -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u | xargs -I{} ps -o command= -p {} 2>/dev/null | grep -q "ts-node"; then
+    if lsof -nP -iTCP:4000 -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u | xargs -I{} ps -o command= -p {} 2>/dev/null | grep "ts-node" >/dev/null; then
       bad "a DEV api (ts-node) holds :4000 — kill it and let launchd's com.gam.api take the port"; FAILED=1
     fi
   fi

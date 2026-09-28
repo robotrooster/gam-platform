@@ -48,7 +48,10 @@ export function TenantPhotosPage() {
       fd.append('tenantId', tenantId)
       if (resident?.unitId) fd.append('unitId', resident.unitId)
       fd.append('postedAt', postedAt)
-      const label = kind === 'notice' ? `Notice posted ${postedAt}` : `Photo ${postedAt}`
+      // The name is what the resident and the landlord read in their lists —
+      // a date the way people write it, not the wire format.
+      const when = new Date(postedAt + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+      const label = kind === 'notice' ? `Notice posted ${when}` : `Photo ${when}`
       fd.append('name', resident ? `${label} — ${resident.unitNumber}` : label)
       if (note.trim()) fd.append('note', note.trim())
       return api.post('/documents', fd).then(r => r.data)
