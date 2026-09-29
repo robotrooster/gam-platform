@@ -7,9 +7,11 @@ import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { installmentSplit, SUPPORTED_CARD_READER } from '@gam/shared'
 
 vi.mock('./posTerminal', () => ({ getOrCreatePropertyLocation: vi.fn(async () => 'tml_test') }))
-import { requestReader, cancelReaderRequest, adminUpdateReaderOrder, raiseDueInstallments, listReaderOrders } from './readerOrders'
+const adminNote = vi.fn(async (_o: any) => {})
+vi.mock('./adminNotifications', () => ({ createAdminNotification: (o: any) => adminNote(o) }))
+import { requestReader, cancelReaderRequest, adminUpdateReaderOrder, raiseDueInstallments, listReaderOrders, chaseReaderOrders } from './readerOrders'
 
-beforeEach(async () => { await cleanupAllSchema() })
+beforeEach(async () => { await cleanupAllSchema(); adminNote.mockClear() })
 
 async function world() {
   const c = await db.connect()
@@ -69,5 +71,42 @@ describe('a landlord asks for the one reader we support', () => {
     charges = await db.query(`SELECT amount FROM landlord_gam_charges WHERE landlord_id=$1`, [w.landlordId])
     expect(charges.rows).toHaveLength(4)
     expect(charges.rows.reduce((a: number, r: any) => a + Number(r.amount), 0)).toBe(350)
+  })
+})
+
+// S652 (Nic): "I don't want to have to manually look somewhere and say, oh, I
+// missed this notification." The request reaches GAM the moment it is made,
+// and the morning chase keeps coming until the row is handled.
+describe('a request cannot sit unseen', () => {
+  it('alerts GAM at once with what the Stripe shop needs', async () => {
+    const w = await world()
+    await requestReader({ landlordId: w.landlordId, propertyId: w.propertyId, shipTo, requestedByUserId: w.userId })
+    expect(adminNote).toHaveBeenCalledTimes(1)
+    const n = adminNote.mock.calls[0][0]
+    expect(n.category).toBe('reader_order_requested')
+    expect(n.emailSuperAdmins).toBe(true)
+    expect(n.body).toMatch(/Stripe Reader S710/)
+    expect(n.body).toMatch(/2843 East Frontage Road/)
+    expect(n.body).toMatch(/standard shipping/i)
+  })
+
+  it('chases every morning while it waits — one digest — and goes quiet once handled', async () => {
+    const w = await world()
+    const o = await requestReader({ landlordId: w.landlordId, propertyId: w.propertyId, shipTo, requestedByUserId: w.userId })
+    adminNote.mockClear()
+    const day2 = new Date(Date.now() + 2 * 86400000)
+    expect(await chaseReaderOrders(day2)).toEqual({ waiting: 1, sent: true })
+    expect(adminNote).toHaveBeenCalledTimes(1)
+    expect(adminNote.mock.calls[0][0].body).toMatch(/NOT ORDERED/)
+    await adminUpdateReaderOrder(o.id, { status: 'ordered', stripeHardwareOrderId: 'thor_1' })
+    adminNote.mockClear()
+    expect(await chaseReaderOrders(day2)).toEqual({ waiting: 0, sent: false })   // ordered, within 3 days
+    const day6 = new Date(Date.now() + 6 * 86400000)
+    const r = await chaseReaderOrders(day6)
+    expect(r.sent).toBe(true)
+    expect(adminNote.mock.calls[0][0].body).toMatch(/CHECK STRIPE/)
+    await adminUpdateReaderOrder(o.id, { status: 'registered', serial: 'WSC1' })
+    adminNote.mockClear()
+    expect(await chaseReaderOrders(day6)).toEqual({ waiting: 0, sent: false })
   })
 })

@@ -314,7 +314,7 @@ function Layout(){
           <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={15}/> Payments</NavLink>
           <NavLink to="/disbursements" className={({isActive})=>`ni${isActive?' active':''}`}><ArrowDownToLine size={15}/> Disbursements</NavLink>
           <NavLink to="/connect-accounts" className={({isActive})=>`ni${isActive?' active':''}`}><Plug size={15}/> Connect Accounts</NavLink>
-          {isSuperAdmin&&<NavLink to="/reader-orders" className={({isActive})=>`ni${isActive?' active':''}`}><Plug size={15}/> Reader Orders</NavLink>}
+          {isSuperAdmin&&<NavLink to="/reader-orders" className={({isActive})=>`ni${isActive?' active':''}`}><Plug size={15}/> Reader Orders<ReaderOrdersBadge/></NavLink>}
           {isSuperAdmin&&<NavLink to="/deposit-interest" className={({isActive})=>`ni${isActive?' active':''}`}><Landmark size={15}/> Deposit Interest</NavLink>}
           <NavLink to="/outreach" className={({isActive})=>`ni${isActive?' active':''}`}><Mail size={15}/> Signup Outreach</NavLink>
           <NavLink to="/send-email" className={({isActive})=>`ni${isActive?' active':''}`}><Send size={15}/> Send Email</NavLink>
@@ -1997,6 +1997,15 @@ function Disbursements(){
 // property's Terminal location on the row — and the Stripe order, serial and
 // tracking are written down. "Shipped" raises the first payment; Stripe
 // registering the device flips the row to "registered" by itself.
+// S652 (Nic): "I don't want to… say, oh, I missed this." The count of requests
+// nobody has ordered yet sits on the sidebar, on every admin page.
+function ReaderOrdersBadge() {
+  const { data: orders = [] } = useQuery<any[]>('admin-reader-orders', () => get<any[]>('/admin/reader-orders'), { refetchInterval: 5 * 60 * 1000 })
+  const n = (orders as any[]).filter(o => o.status === 'requested').length
+  if (!n) return null
+  return <span style={{ marginLeft: 'auto', background: '#c9a227', color: '#060809', borderRadius: 10, padding: '0 7px', fontSize: '.68rem', fontWeight: 800 }}>{n}</span>
+}
+
 function ReaderOrders() {
   const qc = useQueryClient()
   const { data: orders = [], isLoading } = useQuery<any[]>('admin-reader-orders', () => get<any[]>('/admin/reader-orders'))

@@ -25,6 +25,8 @@ import { logger } from '../lib/logger'
 import { getStripe } from '../lib/stripe'
 import { chargeLandlord } from './landlordGamAccount'
 import { getOrCreatePropertyLocation } from './posTerminal'
+import { createAdminNotification } from './adminNotifications'
+import { portalUrl } from '../lib/portalUrls'
 import { SUPPORTED_CARD_READER, installmentSplit } from '@gam/shared'
 
 export interface ShipTo {
@@ -55,7 +57,71 @@ export async function requestReader(opts: {
      opts.shipTo.city, opts.shipTo.state, opts.shipTo.zip, opts.shipTo.phone ?? null, opts.shipTo.email ?? null,
      opts.note ?? null, opts.requestedByUserId])
   logger.info({ orderId: row.id, landlordId: opts.landlordId, propertyId: opts.propertyId }, '[reader-order] requested')
+
+  // S652 (Nic): "I don't want to have to manually look somewhere and say, oh,
+  // I missed this… this person wanted a reader two weeks ago and I forgot."
+  // Stripe will not let software place the order (its ordering interface is a
+  // private preview our account is refused), so a person still presses buy —
+  // but the request comes to them, the moment it is made, with everything the
+  // shop asks for; and chaseReaderOrders() keeps coming back every morning
+  // until the row says Ordered.
+  const who = await queryOne<{ business_name: string | null; property_name: string; loc: string | null }>(
+    `SELECT l.business_name, p.name AS property_name, p.stripe_terminal_location_id AS loc
+       FROM properties p JOIN landlords l ON l.id = p.landlord_id WHERE p.id = $1`, [opts.propertyId])
+  await createAdminNotification({
+    severity: 'warn', category: 'reader_order_requested', emailSuperAdmins: true,
+    title: `Card reader requested — ${who?.business_name ?? 'a landlord'} · ${who?.property_name ?? ''}`.trim(),
+    body: [
+      `Order ONE ${SUPPORTED_CARD_READER.label}, standard shipping, in the Stripe shop.`,
+      `Pre-register it to the location "${who?.property_name ?? ''}"${who?.loc ? ` (${who.loc})` : ''}.`,
+      `Ship to: ${opts.shipTo.name}${opts.shipTo.company ? `, ${opts.shipTo.company}` : ''}, ${opts.shipTo.line1}${opts.shipTo.line2 ? `, ${opts.shipTo.line2}` : ''}, ${opts.shipTo.city}, ${opts.shipTo.state} ${opts.shipTo.zip}${opts.shipTo.phone ? ` · ${opts.shipTo.phone}` : ''}.`,
+      `Shop: https://dashboard.stripe.com/terminal/shop`,
+      `Then mark the row Ordered (with Stripe's order id) on the Reader Orders desk.`,
+    ].join('\n'),
+    context: { order_id: row.id, property_id: opts.propertyId },
+    action: { label: 'Open Reader Orders', url: `${portalUrl('admin')}/reader-orders` },
+  })
   return row
+}
+
+/**
+ * The morning chase: ONE email while anything is waiting on GAM.
+ *
+ *   requested            → nobody has ordered it yet (every day until they do)
+ *   ordered, no serial   → after 3 days: has Stripe shipped? paste the serial
+ *   shipped, unregistered→ after 10 days: did it arrive, is it plugged in?
+ *
+ * One digest, not one email per order (S652: one email per thing). Silent when
+ * nothing waits.
+ */
+export async function chaseReaderOrders(now: Date = new Date()): Promise<{ waiting: number; sent: boolean }> {
+  const rows = await query<any>(
+    `SELECT o.id, o.status, o.created_at, o.ordered_at, o.shipped_at, o.serial,
+            p.name AS property_name, l.business_name
+       FROM pos_reader_orders o JOIN properties p ON p.id = o.property_id JOIN landlords l ON l.id = o.landlord_id
+      WHERE o.status IN ('requested','ordered','shipped','delivered')
+      ORDER BY o.created_at`)
+  const days = (d: any) => Math.floor((now.getTime() - new Date(d).getTime()) / 86400000)
+  const lines: string[] = []
+  for (const o of rows) {
+    const name = `${o.business_name ?? 'Landlord'} · ${o.property_name}`
+    if (o.status === 'requested') {
+      lines.push(`NOT ORDERED — ${name}: asked ${days(o.created_at)} day(s) ago`)
+    } else if (o.status === 'ordered' && !o.serial && days(o.ordered_at ?? o.created_at) >= 3) {
+      lines.push(`CHECK STRIPE — ${name}: ordered ${days(o.ordered_at ?? o.created_at)} day(s) ago, no serial yet — has it shipped?`)
+    } else if ((o.status === 'shipped' || o.status === 'delivered') && days(o.shipped_at ?? o.created_at) >= 10) {
+      lines.push(`NOT IN USE — ${name}: shipped ${days(o.shipped_at ?? o.created_at)} day(s) ago and not registered — did it arrive, is it plugged in?`)
+    }
+  }
+  if (!lines.length) return { waiting: 0, sent: false }
+  await createAdminNotification({
+    severity: 'warn', category: 'reader_orders_waiting', emailSuperAdmins: true,
+    title: `${lines.length} card reader order${lines.length === 1 ? '' : 's'} waiting on GAM`,
+    body: lines.join('\n'),
+    context: { count: lines.length },
+    action: { label: 'Open Reader Orders', url: `${portalUrl('admin')}/reader-orders` },
+  })
+  return { waiting: lines.length, sent: true }
 }
 
 export function listReaderOrders(landlordId: string, propertyId?: string) {

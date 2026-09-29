@@ -1237,6 +1237,16 @@ export function schedulerInit() {
   // Daily at 8am — notify landlord when lease approaches end_date
   cron.schedule('0 8 * * *', checkLeaseExpiryNotices)
 
+  // S652 (Nic): a card-reader request must never sit unseen. Every morning,
+  // one email while anything is waiting on GAM; silent otherwise.
+  cron.schedule('5 8 * * *', async () => {
+    try {
+      const { chaseReaderOrders } = await import('../services/readerOrders')
+      const r = await chaseReaderOrders()
+      if (r.sent) logger.info(r, '[reader-orders] morning chase')
+    } catch (e) { logger.error({ err: e }, '[reader-orders] chase failed') }
+  }, { timezone: 'America/Phoenix' })
+
   // Utility reading runs — daily 7am Phoenix; self-gates to the last
   // business day of the month (weekends + US federal holidays walked
   // backward). Opens a run per property with readable meters and
