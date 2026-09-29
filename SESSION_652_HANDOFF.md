@@ -1052,3 +1052,9 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 - **Stuck-meter estimate:** already the low end of the CLUSTER (S647): drops near-zero spots (< 10% of the median), then the 25th percentile of occupied neighbors, nearest rank. No change.
 - **American spelling (Nic, DIRECTIVE):** 790 replacements in 267 files (code, comments, UI, tests) by word-family rules with explicit stems (script: scratchpad/american.py). Never touched: db/migrations, the generated schema, `cancelled` as a stored status/column. User-visible ones included "neighbours", "Mould", "Cancelling…", "totalling", "labelled".
 - Dakota Lane's RV 44 opening read (22646) CONFIRMED correct by Nic. Donald Hamp's lease: Nic signed his side.
+
+### After deploy 80 — utility bills follow their payment (DB rule, live without a deploy) (2026-09-29)
+
+- Nic: "tenants do not still owe $744.45… I have one guy that hasn't paid." CAUSE: a utility bill was marked paid ONLY by the Stripe webhook; cash, check, bank-deposit confirm, applied credit and released prepayments settled the PAYMENT and left the bill "billed". Mountain View had 5 ($532.14), Oak Park 33.
+- FIX: migration 20260929120000 — trigger `trg_utility_bills_follow_payment` on payments: status → settled marks the payment's utility bills paid (paid_at = settled_at); settled → anything else puts them back to billed. Backfilled 38 bills. Test in utilityRecovery.test.ts.
+- Mountain View now: billed $1,538.25 · paid $1,325.94 · still owed $212.31 = RV 45 Matthew Conklin $187.11 (September utility invoice pending, alongside his $589 rent, also pending) + RV 23 Jared Coyle $25.20 (August estimate "used before the lease was signed", billed 9/10, on NO invoice; RV 07 and RV 41's identical August estimates were voided in S642 as pre-onboarding). Waiting on Nic: void RV 23's? and is Matthew's $187.11 right (Nic remembers ~$90)?

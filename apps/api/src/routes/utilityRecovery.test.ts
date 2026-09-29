@@ -172,4 +172,40 @@ describe('GET /api/utility/recovery (S613)', () => {
       .set('Authorization', `Bearer ${a.token}`)
     expect(res.status).toBe(403)
   })
+
+  // S652 (Nic): "tenants do not still owe $744.45." A bill paid by cash or
+  // check stayed "billed" because only the online path marked it paid. The
+  // rule is on the table now: a utility bill follows its payment.
+  it('a utility bill is paid when its payment settles — by any route — and owed again if that payment is reversed', async () => {
+    const f = await seed()
+    const { rows: [meter] } = await db.query<any>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, rubs_allocation_method)
+       VALUES ($1,'electric','E','rubs',0,'occupant_count') RETURNING id`, [f.propertyId])
+    const { rows: [pay] } = await db.query<any>(
+      `INSERT INTO payments (landlord_id, tenant_id, unit_id, lease_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'utility',264.39,'pending','2026-09-01','UTILITY') RETURNING id`,
+      [f.landlordId, f.tenantId, f.unitId, f.leaseId])
+    const { rows: [bill] } = await db.query<any>(
+      `INSERT INTO utility_bills (meter_id, unit_id, tenant_id, lease_id, landlord_id,
+                                  billing_cycle_month, allocation_method, rate_per_unit,
+                                  base_fee_share, charge_amount, tax_rate_pct, tax_amount, utility_type, status, payment_id)
+       VALUES ($1,$2,$3,$4,$5,'2026-08-01','equal',0,0,264.39,0,0,'electric','billed',$6) RETURNING id`,
+      [meter.id, f.unitId, f.tenantId, f.leaseId, f.landlordId, pay.id])
+    const status = async () => (await db.query<any>(`SELECT status, paid_at FROM utility_bills WHERE id=$1`, [bill.id])).rows[0]
+
+    // a check taken at the counter: nothing but the payment row changes
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW(), manual_method='check' WHERE id=$1`, [pay.id])
+    expect((await status()).status).toBe('paid')
+    expect((await status()).paid_at).not.toBeNull()
+    const res = await request(buildApp())
+      .get(`/api/utility/recovery?propertyId=${f.propertyId}&from=2026-01-01&to=2026-12-31`)
+      .set('Authorization', `Bearer ${f.token}`)
+    expect(res.body.data.totals).toMatchObject({ recovered: 264.39, collected: 264.39, stillOwed: 0 })
+
+    // the check bounces
+    await db.query(`UPDATE payments SET status='returned' WHERE id=$1`, [pay.id])
+    expect((await status()).status).toBe('billed')
+    expect((await status()).paid_at).toBeNull()
+  })
 })
+

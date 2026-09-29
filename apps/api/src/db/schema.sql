@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict GUTcAWgsUJWegquatO0NCrOSlIcQFdDfWjBHfpFe3hohb67v9eGSp5p6vnHbfAp
+\restrict twy0FLLWP1uamEMOk9nXkgOH0C71Eg8hIYMajTa5jhkdqqdHKkjAhrvOhSSXUGM
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -1062,6 +1062,29 @@ CREATE FUNCTION public.update_updated_at() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
+$$;
+
+
+--
+-- Name: utility_bills_follow_payment(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.utility_bills_follow_payment() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.status = 'settled' AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM 'settled') THEN
+    UPDATE utility_bills
+       SET status = 'paid', paid_at = COALESCE(NEW.settled_at, now()), updated_at = now()
+     WHERE payment_id = NEW.id AND status IN ('billed', 'unbilled');
+  ELSIF TG_OP = 'UPDATE' AND OLD.status = 'settled' AND NEW.status <> 'settled' THEN
+    -- a returned check or a reversed payment: the bill is owed again
+    UPDATE utility_bills
+       SET status = 'billed', paid_at = NULL, updated_at = now()
+     WHERE payment_id = NEW.id AND status = 'paid';
+  END IF;
+  RETURN NEW;
+END;
 $$;
 
 
@@ -21500,6 +21523,13 @@ CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON public.users FOR EACH ROW E
 
 
 --
+-- Name: payments trg_utility_bills_follow_payment; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_utility_bills_follow_payment AFTER INSERT OR UPDATE OF status ON public.payments FOR EACH ROW EXECUTE FUNCTION public.utility_bills_follow_payment();
+
+
+--
 -- Name: vehicles trg_vehicles_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -28093,5 +28123,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict GUTcAWgsUJWegquatO0NCrOSlIcQFdDfWjBHfpFe3hohb67v9eGSp5p6vnHbfAp
+\unrestrict twy0FLLWP1uamEMOk9nXkgOH0C71Eg8hIYMajTa5jhkdqqdHKkjAhrvOhSSXUGM
 
