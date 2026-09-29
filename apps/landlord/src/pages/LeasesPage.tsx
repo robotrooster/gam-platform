@@ -206,6 +206,12 @@ export function LeasesPage() {
     g.leases.push(l)
   }
   groups.sort((a, b) => a.name.localeCompare(b.name))
+  // S652 (Nic): "it needs to be sorted in space number order, not just signing
+  // order." RV 2 before RV 10 — numbers read as numbers.
+  for (const g of groups) {
+    g.leases.sort((a: any, b: any) =>
+      String(a.unitNumber ?? '').localeCompare(String(b.unitNumber ?? ''), undefined, { numeric: true, sensitivity: 'base' }))
+  }
   // A single-property account has nothing to fold — its one folder starts open.
   const singleFolder = groups.length === 1
 
@@ -1068,6 +1074,7 @@ function MoveSpotModal({ lease, onClose }: { lease: any; onClose: () => void }) 
 
   const open = (units as any[]).filter(u =>
     u.id !== lease.unitId && ['vacant', 'available'].includes(String(u.status)))
+    .sort((a, b) => String(a.unitNumber ?? '').localeCompare(String(b.unitNumber ?? ''), undefined, { numeric: true, sensitivity: 'base' }))
   const allRead = (needed as any[]).every(m => (readValues[m.meterId] ?? '') !== '')
 
   const move = useMutation(
@@ -1153,13 +1160,30 @@ function MoveSpotModal({ lease, onClose }: { lease: any; onClose: () => void }) 
               the space they take. Both are required: without them the month bills as one blended charge.
               <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
                 {(needed as any[]).map((m: any) => (
-                  <label key={m.meterId} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: '.8rem' }}>
-                    <span style={{ flex: 1 }}>{m.label} <span style={{ color: 'var(--text-3)' }}>— {m.kind}</span></span>
-                    <input className="input mono" type="text" inputMode="numeric" autoComplete="off"
-                      value={readValues[m.meterId] ?? ''} placeholder="meter face"
-                      onChange={e => setReadValues(v => ({ ...v, [m.meterId]: e.target.value.replace(/\D/g, '').slice(0, 9) }))}
-                      style={{ width: 150, letterSpacing: '.08em' }} />
-                  </label>
+                  <div key={m.meterId} style={{ fontSize: '.8rem' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <span style={{ flex: 1 }}>{m.label} <span style={{ color: 'var(--text-3)' }}>— {m.kind}</span></span>
+                      <input className="input mono" type="text" inputMode="numeric" autoComplete="off"
+                        value={readValues[m.meterId] ?? ''} placeholder="meter face"
+                        onChange={e => setReadValues(v => ({ ...v, [m.meterId]: e.target.value.replace(/\D/g, '').slice(0, Number(m.digits) || 9) }))}
+                        style={{ width: 150, letterSpacing: '.08em' }} />
+                    </label>
+                    {/* S652 (Nic): the last reading on file, so an empty space
+                        doesn't need a walk. Offered as a one-tap only on the
+                        space they are moving INTO — the one they leave has
+                        been in use and has to be read. */}
+                    <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
+                      {m.lastValue != null
+                        ? <>Last on file: <span className="mono" style={{ color: 'var(--text-1)' }}>{String(m.lastValue).padStart(Number(m.digits) || 5, '0')}</span> on {new Date(m.lastDate + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</>
+                        : <>No reading on file for this meter yet.</>}
+                      {m.kind === 'opening' && m.lastValue != null && (
+                        <button type="button" className="btn btn-ghost btn-sm" style={{ padding: '0 8px', fontSize: '.7rem' }}
+                          onClick={() => setReadValues(v => ({ ...v, [m.meterId]: String(m.lastValue) }))}>
+                          Nobody's been there — use it
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 ))}
               </div>
             </div>

@@ -45,10 +45,21 @@ export interface MoveResult {
  * to read.
  */
 export async function metersFor(unitId: string) {
-  return query<{ meter_id: string; label: string; utility_type: string }>(`
-    SELECT m.id AS meter_id, m.label, m.utility_type
+  // S652 (Nic): "there's no table anywhere to view a full history of the
+  // reads… it'd be nice to have that pop up as a quick reference for both of
+  // these spots. That way, if nobody was actually in the spot, I don't have to
+  // walk out there." The newest reading on file rides along with each meter.
+  return query<{ meter_id: string; label: string; utility_type: string; digits: number;
+                 last_value: string | null; last_date: string | null; last_reason: string | null }>(`
+    SELECT m.id AS meter_id, m.label, m.utility_type, m.digits,
+           lr.reading_value::text AS last_value,
+           to_char(lr.reading_date, 'YYYY-MM-DD') AS last_date,
+           lr.reason AS last_reason
       FROM utility_meter_units mu
       JOIN utility_meters m ON m.id = mu.meter_id
+      LEFT JOIN LATERAL (
+        SELECT r.reading_value, r.reading_date, r.reason FROM utility_meter_readings r
+         WHERE r.meter_id = m.id ORDER BY r.reading_date DESC, r.created_at DESC LIMIT 1) lr ON TRUE
      WHERE mu.unit_id = $1
        AND m.billing_method = 'submeter'
        AND COALESCE(m.out_of_service, FALSE) = FALSE

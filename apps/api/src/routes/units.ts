@@ -2258,11 +2258,31 @@ unitsRouter.get('/schedule/master', requirePerm(
       ORDER BY b.check_in`, [callerLandlordIds, fromDate, toDate, scopedIds, oneProperty])
 
     // Get active leases in range
+    //
+    // S652 (Nic, DIRECTIVE): "make sure the master schedule splits that stay…
+    // when we move somebody's sites, it only moves the stay going forward at
+    // that day. We have an exact log of the day they change spots."
+    //
+    // This drew one bar per lease on the lease's CURRENT space, from the day
+    // the lease began. Move Dakota Lane from RV 18 to RV 44 and the schedule
+    // would have said he had been on 44 all along — over the top of whoever
+    // really was — and that 18 had been empty for a year. The move history
+    // (lease_unit_history) is the log of who was where: one bar per stretch,
+    // on the space it happened in, ending the day they left it.
     const leases = await query<any>(`
       SELECT l.*, u.unit_number, u.unit_type, p.name as property_name,
-        vlat.first_name, vlat.last_name, vlat.email, vlat.phone
+        vlat.first_name, vlat.last_name, vlat.email, vlat.phone,
+        h.unit_id AS unit_id,
+        GREATEST(l.start_date, h.effective_from) AS start_date,
+        -- the stretch on a space they LEFT ends the day before the move, so
+        -- the move day shows once, on the space they moved into
+        COALESCE((h.effective_to - 1), l.end_date) AS end_date,
+        h.id AS segment_id,
+        (h.effective_to IS NOT NULL) AS moved_out,
+        (SELECT u2.unit_number FROM units u2 WHERE u2.id = l.unit_id) AS current_unit_number
       FROM leases l
-      JOIN units u ON u.id = l.unit_id
+      JOIN lease_unit_history h ON h.lease_id = l.id
+      JOIN units u ON u.id = h.unit_id
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN LATERAL (
         -- S527 W-55: email/phone too — the schedule detail popup shows the
@@ -2277,10 +2297,11 @@ unitsRouter.get('/schedule/master', requirePerm(
         -- old "end_date >= $2" dropped those rows, so occupied units looked
         -- EMPTY on the schedule (while the booking guard rightly blocked
         -- them — "conflict on an empty spot" reports).
-        AND (l.end_date IS NULL OR l.end_date >= $2) AND l.start_date <= $3
+        AND (COALESCE(h.effective_to, l.end_date) IS NULL OR COALESCE(h.effective_to, l.end_date) >= $2)
+        AND GREATEST(l.start_date, h.effective_from) <= $3
         AND ($4::uuid[] IS NULL OR u.property_id = ANY($4::uuid[]))
         AND ($5::uuid IS NULL OR u.property_id = $5)
-      ORDER BY l.start_date`, [callerLandlordIds, fromDate, toDate, scopedIds, oneProperty])
+      ORDER BY GREATEST(l.start_date, h.effective_from)`, [callerLandlordIds, fromDate, toDate, scopedIds, oneProperty])
 
     // S649: out-of-order windows, drawn on the schedule as blocked time.
     const outOfOrder = await query<any>(`

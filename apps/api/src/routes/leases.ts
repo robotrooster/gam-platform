@@ -1978,7 +1978,10 @@ leasesRouter.get('/:id/move-reads', requirePerm('leases.edit'), async (req: any,
     if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
     const { metersFor } = await import('../services/unitMove')
     const [closing, opening] = await Promise.all([metersFor(lease.unit_id), metersFor(toUnitId)])
-    const shape = (rows: any[], kind: string) => rows.map(m => ({ meterId: m.meter_id, label: m.label, utilityType: m.utility_type, kind }))
+    const shape = (rows: any[], kind: string) => rows.map(m => ({
+      meterId: m.meter_id, label: m.label, utilityType: m.utility_type, kind, digits: Number(m.digits) || 6,
+      lastValue: m.last_value != null ? Math.trunc(Number(m.last_value)) : null, lastDate: m.last_date, lastReason: m.last_reason,
+    }))
     res.json({ success: true, data: [...shape(closing, 'closing'), ...shape(opening, 'opening')] })
   } catch (e) { next(e) }
 })

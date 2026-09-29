@@ -245,3 +245,27 @@ describe('POST /api/leases/:id/move with readings', () => {
     expect(reads.rows[0].n).toBe(2)
   })
 })
+
+// S652 (Nic, DIRECTIVE): "make sure the master schedule splits that stay… it
+// only moves the stay going forward at that day."
+import { unitsRouter } from '../routes/units'
+describe('the master schedule after a move', () => {
+  it('shows one bar per stretch: the old space until the day before, the new space from the move day', async () => {
+    const w = await world()
+    await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15' })
+    const a = express(); a.use(express.json()); a.use('/api/units', unitsRouter); a.use(errorHandler)
+    const token = jwt.sign({ userId: w.userId, role: 'landlord', email: 'll@test.dev', profileId: w.landlordId, landlordIds: [w.landlordId], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(a).get(`/api/units/schedule/master?from=2026-01-01&to=2026-12-31&propertyId=${w.propertyId}`)
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const mine = (res.body.data.leases as any[]).filter(l => l.id === w.leaseId)
+      .map(l => ({ unit: l.unit_id, from: String(l.start_date).slice(0, 10), to: l.end_date ? String(l.end_date).slice(0, 10) : null }))
+      .sort((x, y) => x.from.localeCompare(y.from))
+    expect(mine).toHaveLength(2)
+    expect(mine[0].unit).toBe(w.shady); expect(mine[0].to).toBe('2026-06-14')
+    expect(mine[1].unit).toBe(w.sunny); expect(mine[1].from).toBe('2026-06-15'); expect(mine[1].to).toBeNull()
+    // the other household on RV 40 is untouched: one bar
+    expect((res.body.data.leases as any[]).filter(l => l.id === w.otherLease)).toHaveLength(1)
+  })
+})
