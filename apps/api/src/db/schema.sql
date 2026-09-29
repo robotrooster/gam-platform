@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict twy0FLLWP1uamEMOk9nXkgOH0C71Eg8hIYMajTa5jhkdqqdHKkjAhrvOhSSXUGM
+\restrict OWAQi4AjxC82J3zL79Dn4Zt6sNTYcuHcTxvMKq9WpdUeDkzUyFpmduIdFg0V9ht
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6673,8 +6673,10 @@ CREATE TABLE public.pending_tenant_intents (
     home_sale_terms jsonb,
     package_template_ids uuid[],
     waive_reason text,
+    rent_due_day integer,
     CONSTRAINT pending_intent_work_trade_covered_check CHECK (((work_trade_covered_charges IS NULL) OR ((array_length(work_trade_covered_charges, 1) > 0) AND (work_trade_covered_charges <@ ARRAY['rent'::text, 'fees'::text, 'water'::text, 'sewer'::text, 'electric'::text, 'gas'::text, 'trash'::text, 'propane'::text])))),
     CONSTRAINT pending_tenant_intents_parser_status_check CHECK ((parser_status = ANY (ARRAY['not_uploaded'::text, 'parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text, 'resolved'::text]))),
+    CONSTRAINT pending_tenant_intents_rent_due_day_range CHECK (((rent_due_day IS NULL) OR ((rent_due_day >= 1) AND (rent_due_day <= 28)))),
     CONSTRAINT pti_work_trade_hours_positive CHECK (((work_trade_hours_target IS NULL) OR (work_trade_hours_target > 0)))
 );
 
@@ -6705,6 +6707,13 @@ COMMENT ON COLUMN public.pending_tenant_intents.is_work_trade IS 'S631: this res
 --
 
 COMMENT ON COLUMN public.pending_tenant_intents.work_trade_tracks_hours IS 'S637: false = create the agreement as a trusted trade (no hours logged). NULL = not stated, tracked.';
+
+
+--
+-- Name: COLUMN pending_tenant_intents.rent_due_day; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pending_tenant_intents.rent_due_day IS 'S652: the day of the month this household''s rent is due, stated on the invite. NULL = follow the property''s rule. Same 1-28 range as leases.rent_due_day.';
 
 
 --
@@ -28123,5 +28132,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict twy0FLLWP1uamEMOk9nXkgOH0C71Eg8hIYMajTa5jhkdqqdHKkjAhrvOhSSXUGM
+\unrestrict OWAQi4AjxC82J3zL79Dn4Zt6sNTYcuHcTxvMKq9WpdUeDkzUyFpmduIdFg0V9ht
 

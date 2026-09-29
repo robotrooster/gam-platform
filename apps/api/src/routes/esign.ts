@@ -403,15 +403,22 @@ export async function createDocumentRecord(client: any, opts: {
     // fixed day, or each tenant's move-in day — and the landlord may change it
     // for one tenant on the lease. An onboarding resident keeps the property's
     // fixed day: their GAM start date is not when they moved in.
+    //
+    // S652 (Nic): unless the landlord said on the INVITE which day this
+    // household is due — a park that bills each tenant on their own date
+    // onboards with residents who are already on those dates. That day wins
+    // over both rules.
     if (pv.rent_due_day == null || pv.rent_due_day === '') {
       const rule = await client.query(
         `SELECT p.rent_due_mode, p.rent_due_day,
                 EXISTS (SELECT 1 FROM pending_tenant_intents i WHERE i.unit_id = u.id
                           AND i.cancelled_at IS NULL AND i.resolved_at IS NULL
-                          AND COALESCE(i.is_existing_tenancy, false)) AS existing
+                          AND COALESCE(i.is_existing_tenancy, false)) AS existing,
+                (SELECT MAX(i.rent_due_day) FROM pending_tenant_intents i WHERE i.unit_id = u.id
+                    AND i.cancelled_at IS NULL AND i.resolved_at IS NULL) AS invite_day
            FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
         [opts.unitId]).then((r: any) => r.rows[0])
-      pv.rent_due_day = dueDayLabel(leaseDueDay({
+      pv.rent_due_day = dueDayLabel(rule?.invite_day != null ? Number(rule.invite_day) : leaseDueDay({
         mode: rule?.existing ? 'fixed_day' : (rule?.rent_due_mode ?? 'fixed_day'),
         propertyDay: rule?.rent_due_day ?? 1,
         startIso: pv.start_date ?? null,
@@ -1145,12 +1152,15 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     const rule = await client.query(
       `SELECT p.rent_due_mode, p.rent_due_day FROM units u JOIN properties p ON p.id = u.property_id
         WHERE u.id = $1`, [doc.unit_id]).then((r: any) => r.rows[0])
-    const existingRule = await client.query(
-      `SELECT bool_or(COALESCE(is_existing_tenancy, false)) AS e FROM pending_tenant_intents
-        WHERE unit_id = $1 AND cancelled_at IS NULL`, [doc.unit_id]).then((r: any) => r.rows[0]?.e === true)
+    const intentRule = await client.query(
+      `SELECT bool_or(COALESCE(is_existing_tenancy, false)) AS e, MAX(rent_due_day) AS invite_day
+         FROM pending_tenant_intents
+        WHERE unit_id = $1 AND cancelled_at IS NULL`, [doc.unit_id]).then((r: any) => r.rows[0])
+    const existingRule = intentRule?.e === true
     writableCols.push('rent_due_day')
     writablePlaceholders.push('$' + paramIdx)
-    writableValues.push(leaseDueDay({
+    // S652: the day stated on the invite, when there is one.
+    writableValues.push(intentRule?.invite_day != null ? Number(intentRule.invite_day) : leaseDueDay({
       mode: existingRule ? 'fixed_day' : (rule?.rent_due_mode ?? 'fixed_day'),
       propertyDay: rule?.rent_due_day ?? 1,
       startIso: vals.start_date ? String(vals.start_date).slice(0, 10) : null,

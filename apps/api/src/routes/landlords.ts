@@ -2396,6 +2396,19 @@ landlordsRouter.get('/me/onboarding-windows', requireLandlord, async (req, res, 
   } catch (e) { next(e) }
 })
 
+// S652 (Nic): "they let their due date be whenever they come in." The day this
+// household's rent is due, stated on the invite. Absent or blank = follow the
+// property's rule; anything else must be a real day a lease can carry (1–28).
+function inviteRentDueDay(body: any): number | null {
+  const v = body?.rentDueDay
+  if (v == null || v === '') return null
+  const n = Number(v)
+  if (!Number.isInteger(n) || n < 1 || n > 28) {
+    throw new AppError(400, 'The rent due day has to be between the 1st and the 28th.')
+  }
+  return n
+}
+
 // POST /api/landlords/me/onboard-new-lease-tenant (S558, Flow B — new lease)
 // Invite a person to a UNIT for a lease they will SIGN (vs onboard-tenant, which
 // migrates an already-signed paper lease). Unit-linked invite: the unit rides on
@@ -2431,6 +2444,7 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     // who had every address he needed from inviting a single tenant.
     if (!firstName || !lastName || !email) throw new AppError(400, 'firstName, lastName and email are required')
     if (!unitId) throw new AppError(400, 'unitId required')
+    const rentDueDay = inviteRentDueDay(req.body)
     const emailNorm = String(email).trim().toLowerCase()
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) throw new AppError(400, 'Invalid email format')
 
@@ -2574,13 +2588,14 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     // that an invite had been lost. Re-inviting to the SAME unit still reopens
     // that invite, which is the behavior this clause was written for.
     await client.query(
-      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, home_sale_terms, package_template_ids)
-       VALUES ($1, $2, 'not_uploaded', $3, $4, $5)
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, home_sale_terms, package_template_ids, rent_due_day)
+       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6)
        ON CONFLICT (tenant_id, unit_id) WHERE cancelled_at IS NULL AND unit_id IS NOT NULL
        DO UPDATE SET resolved_at=NULL, accepted_at=NULL, draft_document_id=NULL,
-                     home_sale_terms=EXCLUDED.home_sale_terms, package_template_ids=EXCLUDED.package_template_ids, updated_at=NOW()`,
-      // S652: the home sale and the ticked packet are decided on the invite and ride on the intent.
-      [landlordId, tenantId, unitId, homeSaleTerms ? JSON.stringify(homeSaleTerms) : null, packageTemplateIds])
+                     home_sale_terms=EXCLUDED.home_sale_terms, package_template_ids=EXCLUDED.package_template_ids,
+                     rent_due_day=COALESCE(EXCLUDED.rent_due_day, public.pending_tenant_intents.rent_due_day), updated_at=NOW()`,
+      // S652: the home sale, the ticked packet and the due day are decided on the invite and ride on the intent.
+      [landlordId, tenantId, unitId, homeSaleTerms ? JSON.stringify(homeSaleTerms) : null, packageTemplateIds, rentDueDay])
 
     await client.query('COMMIT')
 
@@ -2774,6 +2789,8 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       throw new AppError(400, 'Invalid email format')
     }
 
+    const rentDueDay = inviteRentDueDay(req.body)
+
     // S633: THIS IS THE ROUTE THAT BLOCKED THE MOUNTAIN VIEW INVITES.
     //
     // It read `req.user.profileId` — the one company the session sat on — and
@@ -2892,8 +2909,8 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       `INSERT INTO pending_tenant_intents
          (landlord_id, tenant_id, parser_status, unit_id,
           is_work_trade, work_trade_hours_target, work_trade_duties,
-          work_trade_tracks_hours, home_sale_terms, package_template_ids)
-       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7, $8, $9)
+          work_trade_tracks_hours, home_sale_terms, package_template_ids, rent_due_day)
+       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id, parser_status, created_at, is_work_trade`,
       [landlordId, tenantId, unitId || null,
        isWorkTrade === true,
@@ -2904,7 +2921,9 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
        // "not stated", which the signing path treats as tracked.
        isWorkTrade === true ? workTradeTracksHours !== false : null,
        // S652: selling them the home on installments — decided on the invite.
-       homeSaleTerms, packageTemplateIds]
+       homeSaleTerms, packageTemplateIds,
+       // S652: their own due day, when the landlord stated one.
+       unitId ? rentDueDay : null]
     )
 
     await client.query('COMMIT')

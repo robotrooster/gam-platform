@@ -699,6 +699,122 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
   return { prompted }
 }
 
+// ── S652: reads that fall on a tenant's own date (Nic) ───────────────
+//
+// "No reminder on the read day... let's fix that gap too."
+//
+// A round opens at month end and says so once. A tenant due on the 15th is read
+// on the 14th, a tenant due on the 23rd on the 22nd — and nothing said so on
+// those days. Miss one and that tenant's whole invoice, rent included, sits
+// held until somebody notices.
+//
+// Every morning: the meters whose read day is TODAY, and the ones whose day has
+// passed and are still unread. One notice per property per day, to whoever can
+// take the read — the landlord, staff with the permission, and work traders
+// whose agreement includes meter reading. Tenants due on the 1st are not
+// listed: they are the month-end round, which has its own notice.
+export async function promptTenantDateMeterReads(
+  today: string = todayInPhoenix(),
+): Promise<{ prompted: number; meters: number }> {
+  const runs = await query<{ id: string; property_id: string; landlord_id: string; property_name: string }>(
+    `SELECT r.id, r.property_id, r.landlord_id, p.name AS property_name
+       FROM utility_reading_runs r JOIN properties p ON p.id = r.property_id
+      WHERE r.status = 'open'
+      ORDER BY r.billing_cycle_month`)
+  type Due = { unit: string; readBy: string }
+  const byProperty = new Map<string, { landlordId: string; name: string; due: Due[] }>()
+  for (const run of runs) {
+    const rows = await getRunMeters(run.id)
+    for (const m of rows as any[]) {
+      if (!m.read_by || m.is_read || !m.will_bill || m.read_by > today) continue
+      const entry = byProperty.get(run.property_id)
+        ?? { landlordId: run.landlord_id, name: run.property_name, due: [] as Due[] }
+      entry.due.push({ unit: m.unit_number || m.label, readBy: m.read_by })
+      byProperty.set(run.property_id, entry)
+    }
+  }
+
+  let prompted = 0, meters = 0
+  const short = (iso: string) => new Date(iso + 'T00:00:00Z')
+    .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+  for (const [propertyId, p] of byProperty) {
+    const already = await queryOne<{ id: string }>(
+      `SELECT id FROM notifications
+        WHERE type = 'tenant_date_meter_reads_due'
+          AND data ->> 'propertyId' = $1 AND data ->> 'day' = $2
+        LIMIT 1`, [propertyId, today])
+    if (already) continue
+
+    const dueToday = p.due.filter(d => d.readBy === today)
+    const overdue = p.due.filter(d => d.readBy < today)
+    const parts: string[] = []
+    if (dueToday.length) {
+      parts.push(`${dueToday.length} meter${dueToday.length === 1 ? '' : 's'} to read today: ` +
+        `${dueToday.map(d => d.unit).join(', ')}. Their rent is due next, and the reading goes on that bill.`)
+    }
+    if (overdue.length) {
+      parts.push(`${overdue.length} overdue: ` +
+        `${overdue.map(d => `${d.unit} (was due ${short(d.readBy)})`).join(', ')}. ` +
+        `${overdue.length === 1 ? "That tenant's bill is" : "Those tenants' bills are"} on hold, rent included, until the meter is read.`)
+    }
+    const body = parts.join(' ')
+    const title = overdue.length && !dueToday.length
+      ? `Overdue meter reads — ${p.name}`
+      : `Meter reads due today — ${p.name}`
+
+    const landlord = await queryOne<{ user_id: string; email: string }>(
+      `SELECT l.user_id, u.email FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
+      [p.landlordId])
+    const staff = await query<{ user_id: string; email: string }>(
+      `SELECT DISTINCT u.id AS user_id, u.email FROM (
+          SELECT user_id FROM property_manager_scopes
+           WHERE landlord_id = $1
+             AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
+             AND ((permissions ->> 'properties.edit')::boolean IS TRUE
+                  OR (permissions ->> 'utility.read_meters')::boolean IS TRUE)
+          UNION
+          SELECT user_id FROM onsite_manager_scopes
+           WHERE landlord_id = $1
+             AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
+             AND ((permissions ->> 'properties.edit')::boolean IS TRUE
+                  OR (permissions ->> 'utility.read_meters')::boolean IS TRUE)
+        ) s JOIN users u ON u.id = s.user_id`,
+      [p.landlordId, propertyId])
+    // Work traders whose agreement includes reading meters read them from the
+    // tenant portal, so their notice opens there.
+    const traders = await query<{ user_id: string; email: string }>(
+      `SELECT DISTINCT u.id AS user_id, u.email
+         FROM work_trade_agreements a
+         JOIN tenants t ON t.id = a.tenant_id
+         JOIN users u ON u.id = t.user_id
+         JOIN units un ON un.id = a.unit_id
+        WHERE un.property_id = $1 AND a.status = 'active'
+          AND 'read_meters' = ANY(a.field_permissions)`, [propertyId])
+
+    const seen = new Set<string>()
+    const recipients = [
+      ...(landlord ? [{ ...landlord, url: `/utilities?propertyId=${propertyId}` }] : []),
+      ...staff.map(x => ({ ...x, url: `/utilities?propertyId=${propertyId}` })),
+      ...traders.map(x => ({ ...x, url: '/meter-readings' })),
+    ].filter(r => (seen.has(r.user_id) ? false : (seen.add(r.user_id), true)))
+    for (const r of recipients) {
+      await createNotification({
+        userId: r.user_id, landlordId: p.landlordId,
+        type: 'tenant_date_meter_reads_due',
+        title, body,
+        data: { propertyId, day: today, dueToday: dueToday.map(d => d.unit), overdue: overdue.map(d => d.unit) },
+        actionUrl: r.url,
+        sendEmail: true, emailTo: r.email,
+        emailSubject: title,
+        emailHtml: body,
+      })
+    }
+    prompted++
+    meters += p.due.length
+  }
+  return { prompted, meters }
+}
+
 // S559: LIVE front-desk "reads due" list — derived from the CURRENT calendar
 // every call, never a stored snapshot, so guest extensions / early checkouts
 // / cancellations self-correct with zero special handling. A spot is "due"

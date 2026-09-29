@@ -17,6 +17,7 @@ import { createAdminNotification } from '../services/adminNotifications'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 import { activeLinkForUnit } from '../services/crossPropertyLink'
+import { existingTenancyFirstDue } from './moveInBundle'
 
 // ============================================================
 // S26a: Invoice generator (replaces S25 rentGeneration)
@@ -329,7 +330,17 @@ async function runGeneration(
     const startMonth = lease.start_date.slice(0, 7)   // 'YYYY-MM'
     const dueDay = Number(lease.rent_due_day) || 1
     let dueDates: string[]
-    if (lease.is_existing_tenancy || dueDay === 1) {
+    if (lease.is_existing_tenancy && dueDay !== 1) {
+      // S652 (Nic): an onboarding resident on their own due day. Their first
+      // bill is that day of their first cycle month. Signed after it, the
+      // move-in invoice made it (and it sits before the lease start, outside
+      // this window). Signed BEFORE it, nothing was made at signing — this run
+      // makes it when the day arrives. Skipping the start month, as the 1st
+      // does, skipped that bill entirely: a month of rent never invoiced.
+      // Anything already invoiced is left alone by the (lease, due date) check.
+      const firstDue = existingTenancyFirstDue(lease.start_date, lease.first_billing_cycle ?? null, dueDay)
+      dueDates = candidateDueDates.filter(d => d >= firstDue)
+    } else if (lease.is_existing_tenancy || dueDay === 1) {
       dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
     } else {
       // S648 (Nic): rent due on another day (a fixed 15th, or the tenant's
@@ -391,7 +402,11 @@ async function runGeneration(
             AND lur.utility_type = m.utility_type
             AND lur.tenant_responsible
           WHERE r.status <> 'completed'
-            AND r.billing_cycle_month <= date_trunc('month', $3::date)::date
+            -- S652: BEFORE the invoice's own month. An invoice due in March
+            -- carries February's round; March's round is read for April. With
+            -- "<=" a round that opened on the 26th held every invoice due the
+            -- 27th and 28th of that month until the following month's read.
+            AND r.billing_cycle_month < date_trunc('month', $3::date)::date
             AND (
               -- this meter (submeter or RUBS master) unread for the cycle
               NOT EXISTS (
@@ -431,7 +446,7 @@ async function runGeneration(
               EXISTS (
                 SELECT 1 FROM utility_meter_readings rd
                  WHERE rd.meter_id = m.id AND rd.needs_review
-                   AND rd.billing_cycle_month <= date_trunc('month', $3::date)::date)
+                   AND rd.billing_cycle_month < date_trunc('month', $3::date)::date)
               -- a flagged reading on a submeter on one of the master's units
               OR (m.billing_method = 'rubs' AND EXISTS (
                 SELECT 1 FROM utility_meter_units master_mu
@@ -441,7 +456,7 @@ async function runGeneration(
                                         AND sm.utility_type = m.utility_type
                   JOIN utility_meter_readings rd ON rd.meter_id = sm.id
                  WHERE master_mu.meter_id = m.id AND rd.needs_review
-                   AND rd.billing_cycle_month <= date_trunc('month', $3::date)::date))
+                   AND rd.billing_cycle_month < date_trunc('month', $3::date)::date))
             )
           LIMIT 1`,
         [lease.id, lease.unit_id, dueDate]
@@ -462,7 +477,7 @@ async function runGeneration(
            JOIN lease_utility_responsibilities lur
              ON lur.lease_id = $1 AND lur.utility_type = m.utility_type AND lur.tenant_responsible
           WHERE r.status <> 'completed' AND r.approved_at IS NULL
-            AND r.billing_cycle_month <= date_trunc('month', $3::date)::date
+            AND r.billing_cycle_month < date_trunc('month', $3::date)::date
           LIMIT 1`,
         [lease.id, lease.unit_id, dueDate])
       if (readHold || flagHold || reviewHold) continue

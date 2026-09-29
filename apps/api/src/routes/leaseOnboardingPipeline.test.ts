@@ -128,6 +128,20 @@ describe('onboard-new-lease-tenant (Flow B)', () => {
     expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
   })
 
+  // S652 (Nic): "they let their due date be whenever they come in."
+  it('carries the household\'s own due day on the invite, and refuses a day no lease can hold', async () => {
+    const f = await seedBase()
+    const send = (rentDueDay: any) => request(buildApp())
+      .post('/api/landlords/me/onboard-new-lease-tenant')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ firstName: 'A', lastName: 'Tester', email: `t-${randomUUID().slice(0, 6)}@x.dev`, unitId: f.unitId, rentDueDay })
+    expect((await send(31)).status).toBe(400)
+    expect((await send('soon')).status).toBe(400)
+    expect((await send(23)).status).toBe(200)
+    const intent = await db.query(`SELECT rent_due_day FROM pending_tenant_intents WHERE unit_id=$1`, [f.unitId])
+    expect(intent.rows.map(r => r.rent_due_day)).toEqual([23])
+  })
+
   it('refuses to invite before the unit has rent set', async () => {
     const f = await seedBase()
     await db.query(`UPDATE units SET rent_amount=0 WHERE id=$1`, [f.unitId])

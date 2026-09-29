@@ -158,6 +158,29 @@ export function existingTenancyCycle(
 }
 
 
+/**
+ * S652 (Nic): "they let their due date be whenever they come in." The DATE of an
+ * existing tenancy's first invoice: the resident's own due day, in the cycle
+ * month existingTenancyCycle() names.
+ *
+ * The cycle was always a month; the date was always assumed to be its 1st. For
+ * a resident due on the 15th that put their first bill two weeks early — late
+ * fees counting from a day their rent was never due — and, when they signed
+ * before the 15th, the nightly run skipped the month altogether because it
+ * belonged to "the move-in invoice" that was never made.
+ *
+ * Due on the 1st, this is exactly existingTenancyCycle().
+ */
+export function existingTenancyFirstDue(
+  startDate: string,
+  firstBillingCycle: string | null,
+  dueDay: number | null | undefined,
+): string {
+  const cycle = existingTenancyCycle(startDate, firstBillingCycle)
+  const day = Math.min(Math.max(Math.trunc(Number(dueDay)) || 1, 1), 28)
+  return cycle.slice(0, 8) + String(day).padStart(2, '0')
+}
+
 export async function generateMoveInInvoice(
   inputs: MoveInInputs,
   externalClient?: PoolClient
@@ -242,8 +265,10 @@ export async function generateMoveInInvoice(
   // already be past, because an existing tenant knows when rent is due. Nic:
   // "For existing tenants, the anticipation of due date and bill pay and all
   // that stuff is known. It's an existing tenancy. Late fees are there."
+  // S652: on the resident's OWN due day of that cycle — the 1st only when that
+  // is their day.
   const invoiceDueDate = leaseMeta?.is_existing_tenancy
-    ? existingTenancyCycle(inputs.start_date, leaseMeta.first_billing_cycle)
+    ? existingTenancyFirstDue(inputs.start_date, leaseMeta.first_billing_cycle, leaseMeta.rent_due_day)
     : inputs.start_date
 
   // S652 (Nic): "We are not in October. There shouldn't be open bills at all."
@@ -623,7 +648,9 @@ export async function generateMoveInInvoice(
         // nothing to release them.
         // S648: a tenant due on another day works from move-in to the day
         // before their first due date; the 1st keeps the calendar month.
-        const wtDueDay = leaseMeta?.is_existing_tenancy ? 1 : (leaseMeta?.rent_due_day ?? 1)
+        // S652: an onboarding resident's first invoice is dated their own due
+        // day now, so their work period runs from it like anyone else's.
+        const wtDueDay = leaseMeta?.rent_due_day ?? 1
         const periodStart = wtDueDay === 1 ? monthStart : invoiceDueDate
         const periodEnd = wtDueDay === 1
           ? DateTime.fromISO(monthStart).endOf('month').toISODate()!

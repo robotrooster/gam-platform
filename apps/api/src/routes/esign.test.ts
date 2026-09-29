@@ -502,6 +502,30 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
     expect(vals.rent_due_day).toBe('1st') // landlord never chooses it — forced onto the doc
   })
 
+  // S652 (Nic): "they let their due date be whenever they come in." A park
+  // onboarding residents who are ALREADY on their own dates says the day on
+  // the invite, and the drafted lease states it.
+  it('S652: the due day stated on the invite is the one the lease states', async () => {
+    const f = await seedFixture()
+    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'rent_due_day'])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, is_existing_tenancy, rent_due_day)
+       SELECT $1, t.id, 'not_uploaded', $2, true, 23 FROM tenants t WHERE t.user_id = $3`,
+      [f.landlordId, f.unitId, f.tenantUserId])
+    const res = await request(buildApp())
+      .post('/api/esign/documents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        title: 'Auto Lease', templateId: tid, unitId: f.unitId,
+        signers: [
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
+        ],
+      })
+    expect(res.status).toBe(201)
+    expect((await docFieldValues(res.body.data.id)).rent_due_day).toBe('23rd')
+  })
+
   // S648 (Nic) lifted the S582 lock: the lease's due day is what bills; a
   // missing or unreadable one falls back to the property's rule at build.
   it('S648: rent_due_day bills the day the lease states', () => {

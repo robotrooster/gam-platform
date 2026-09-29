@@ -6,7 +6,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, ArrowUp, X, Inbox } from 'lucide-react'
 import { api, apiPost, apiGet, apiPut, apiPatch } from '../lib/api'
-import { AUTO_RENEW_MODES, AUTO_RENEW_MODE_LABEL, UNIT_TYPE_LABEL, humanize } from '@gam/shared'
+import { AUTO_RENEW_MODES, AUTO_RENEW_MODE_LABEL, UNIT_TYPE_LABEL, humanize, dueDayLabel } from '@gam/shared'
 
 // Backend response shape from POST /onboard-tenants-csv/validate.
 type CsvIssue = { severity: 'block' | 'warn'; field?: string; message: string }
@@ -442,6 +442,8 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
   const [sale, setSale] = useState<Record<string, HomeSaleForm | null>>({})
   // S652: the packet as the landlord left it ticked, per unit.
   const [packet, setPacket] = useState<Record<string, Record<string, boolean> | null>>({})
+  // S652: each household's own due day, when it has one.
+  const [dueDay, setDueDay] = useState<Record<string, string>>({})
   const [open, setOpen] = useState<Record<string, boolean>>(
     initialUnitId ? { [initialUnitId]: true } : {})
   const [sent, setSent] = useState<Record<string, string[]>>({})
@@ -494,6 +496,7 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
         try {
           await apiPost<any>('/landlords/me/onboard-new-lease-tenant',
             { ...p, unitId: u.id, existingResident: attest[u.id] !== false,
+              rentDueDay: attest[u.id] !== false && dueDay[u.id] ? Number(dueDay[u.id]) : undefined,
               homeSale: sale[u.id] ? homeSalePayload(sale[u.id]!) : undefined,
               packageTemplateIds: tickedIds(packet[u.id] ?? null) })
           okNames.push(`${p.firstName} ${p.lastName}`.trim() || p.email)
@@ -608,6 +611,8 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
                   setSale={v => setSale(prev => ({ ...prev, [u.id]: v }))}
                   packet={packet[u.id] ?? null}
                   setPacket={v => setPacket(prev => ({ ...prev, [u.id]: v }))}
+                  dueDay={dueDay[u.id] ?? ''}
+                  setDueDay={v => setDueDay(prev => ({ ...prev, [u.id]: v }))}
                   error={errors[u.id] ?? null} />
               ))}
             </div>
@@ -638,10 +643,33 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
   )
 }
 
+/**
+ * S652 (Nic): "they let their due date be whenever they come in." Someone who
+ * already lives there is already due on SOME day, and the lease can't work it
+ * out — their start date on GAM is not the day they moved in. Asked on the
+ * invite, for existing residents only; left alone it follows the property.
+ */
+export function DueDayPicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <label style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: '.76rem', color: 'var(--text-2)', marginBottom: 10 }}>
+      Their rent is due on
+      <select className="input" value={value} onChange={e => onChange(e.target.value)}
+        style={{ width: 'auto', minWidth: 170, fontSize: '.78rem', padding: '4px 8px' }}>
+        <option value="">the property&apos;s usual day</option>
+        {Array.from({ length: 28 }, (_, i) => i + 1).map(d => <option key={d} value={d}>the {dueDayLabel(d)}</option>)}
+      </select>
+      <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+        Their meter is read the business day before, and late fees count from this day.
+      </span>
+    </label>
+  )
+}
+
 /** S629: one unit's roster. Presentational — the page owns the data so a
  *  single send can see every unit at once. */
-function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest, setAttest, sale, setSale, packet, setPacket, error }: {
+function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest, setAttest, sale, setSale, packet, setPacket, dueDay, setDueDay, error }: {
   unit: any; open: boolean; onOpen: () => void; onClose: () => void
+  dueDay: string; setDueDay: (v: string) => void
   people: Person[]; setPeople: (next: Person[]) => void
   attest: boolean; setAttest: (v: boolean) => void
   sale: HomeSaleForm | null; setSale: (v: HomeSaleForm | null) => void
@@ -694,6 +722,7 @@ function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest
           Onboarding window closed — everyone invited here completes a background check before portal access.
         </div>
       ))}
+      {windowOpen && attest && <DueDayPicker value={dueDay} onChange={setDueDay} />}
 
       {/* S652 (Nic): asked only for a park-owned home — a tenant-owned home,
           an RV site or a bare lot never asks. */}
@@ -809,6 +838,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
     { enabled: !!propertyIdForWindow, staleTime: 60_000 })
   const windowOpen = !!obWindow?.open
   const [attestExisting, setAttestExisting] = useState(true)
+  const [ownDueDay, setOwnDueDay] = useState('')   // S652
   // S631 (Nic, DIRECTIVE): "Let's flag on invite so that no matter when they
   // accept it, the work-trade agreement has inserted it slightly before the
   // invoice is created." Declared here because a work_trade_agreement needs an
@@ -826,6 +856,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
       ...form,
       unitId: unitId || undefined,
       existingResident: !!unitId && windowOpen && attestExisting,
+      rentDueDay: unitId && windowOpen && attestExisting && ownDueDay ? Number(ownDueDay) : undefined,
       // Work trade is per unit — it trades labor for THAT tenancy's rent.
       isWorkTrade: !!unitId && isWorkTrade,
       workTradeTracksHours: isWorkTrade ? wtTracksHours : undefined,
@@ -979,6 +1010,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
                   {!attestExisting && <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Unchecked — this tenant will complete a background check.</div>}
                 </div>
               </label>
+              {attestExisting && <div style={{ marginTop: 10 }}><DueDayPicker value={ownDueDay} onChange={setOwnDueDay} /></div>}
             </div>
           ) : (
             <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>

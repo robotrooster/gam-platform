@@ -1259,6 +1259,16 @@ export function schedulerInit() {
     } catch (e) {
       logger.error({ err: e }, '[reading-runs] fatal')
     }
+    // S652 (Nic): tenants billed on their own date are read the business day
+    // before it. Say so on that day — and keep saying it while one is overdue,
+    // because a missed read holds that tenant's whole invoice.
+    try {
+      const { promptTenantDateMeterReads } = await import('../services/utilityReadingRuns')
+      const r = await promptTenantDateMeterReads()
+      if (r.prompted > 0) logger.info(r, '[tenant-date-reads]')
+    } catch (e) {
+      logger.error({ err: e }, '[tenant-date-reads] fatal')
+    }
     // S548 (Nic): every morning — not just month-end — prompt for meter
     // reads on submetered sites whose guests pull out TODAY. The at-checkout
     // read closes the departing guest's bill same-day and baselines the
