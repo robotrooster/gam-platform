@@ -562,9 +562,30 @@ export async function createDocumentRecord(client: any, opts: {
             WHERE unit_id = $1 AND cancelled_at IS NULL AND resolved_at IS NULL`,
           [opts.unitId]).then((r: any) => r.rows[0]?.existing === true)
 
+        // S652 (Nic, DIRECTIVE): "we're not doing a security deposit for
+        // returning customers. People that are using a returning slot get an
+        // exemption on security deposit. New people have the security deposit."
+        //
+        // The returning-resident invite (the landlord's attestation that
+        // skipped the background check) is recorded on the resident's intent
+        // at this property — not on the unit — so it is looked up through the
+        // residents on THIS document. Donald Hamp's lease for Mountain View
+        // RV 47 drafted with the park's $200 for a guest who comes every year.
+        // Still only a default: the landlord can type a deposit in.
+        const residentIds = (opts.signers ?? []).filter((sg: any) => sg.role !== 'landlord' && sg.role !== 'witness').map((sg: any) => sg.userId).filter(Boolean)
+        const returningResident = residentIds.length ? await client.query(
+          `SELECT EXISTS (
+             SELECT 1 FROM pending_tenant_intents i
+               JOIN tenants t ON t.id = i.tenant_id
+               JOIN units un ON un.id = $2
+              WHERE t.user_id = ANY($1::uuid[]) AND i.cancelled_at IS NULL
+                AND i.waive_reason = 'returning_resident'
+                AND (i.property_id = un.property_id OR i.unit_id = un.id)) AS r`,
+          [residentIds, opts.unitId]).then((r: any) => r.rows[0]?.r === true) : false
+
         for (const [col, val] of Object.entries({
           rent_amount:      ctx.rent_amount,
-          security_deposit: existingTenancy ? null : ctx.security_deposit,
+          security_deposit: (existingTenancy || returningResident) ? null : ctx.security_deposit,
         })) {
           if (val != null && Number(val) > 0 && prefillValues[col] == null) {
             prefillValues[col] = Number(val).toFixed(2)

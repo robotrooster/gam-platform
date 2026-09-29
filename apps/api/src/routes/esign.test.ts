@@ -3810,6 +3810,22 @@ describe('S637 deposit prefill skips an existing tenancy', () => {
   // tenancy, so the landlord has to be aged past that window for this branch to
   // exist at all — which is exactly the shape Nic described: nothing during
   // onboarding, deposits on new people once the park is running.
+  // S652 (Nic): "people that are using a returning slot get an exemption on
+  // security deposit. New people have the security deposit."
+  it('leaves the deposit blank for a returning resident (the landlord\'s attested invite)', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE landlords SET created_at = now() - INTERVAL '200 days' WHERE id = $1`, [f.landlordId])
+    await db.query(`UPDATE units SET security_deposit = 200 WHERE id = $1`, [f.unitId])
+    const prop = await db.query<{ property_id: string }>(`SELECT property_id FROM units WHERE id = $1`, [f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id, waive_reason, is_existing_tenancy)
+       VALUES ($1,$2,'not_uploaded',$3,NULL,'returning_resident',FALSE)`, [f.landlordId, f.tenantId, prop.rows[0].property_id])
+
+    const vals = await draftOffUnit(f, ['rent_amount', 'security_deposit'])
+    expect(vals.security_deposit ?? '').toBe('')     // exempt
+    expect(vals.rent_amount).toBe('1000.00')         // rent still seeds
+  })
+
   it('still seeds the deposit for a genuinely new tenancy', async () => {
     const f = await seedFixture()
     await db.query(`UPDATE landlords SET created_at = now() - INTERVAL '200 days' WHERE id = $1`, [f.landlordId])
