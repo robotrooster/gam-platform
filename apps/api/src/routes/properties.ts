@@ -1140,7 +1140,7 @@ propertiesRouter.patch('/:id/processing-fee-payers', requirePerm('properties.edi
 
 // PATCH /api/properties/:id/broken-meter-estimate — S648 (Nic). Whether a
 // broken or stuck submeter on an occupied space bills the low end of what
-// occupied neighbours used, or nothing until it is repaired. The landlord's
+// occupied neighbors used, or nothing until it is repaired. The landlord's
 // call ("up to them whether their area law allows it").
 propertiesRouter.patch('/:id/broken-meter-estimate', requirePerm('properties.edit'), async (req, res, next) => {
   try {
@@ -1428,7 +1428,7 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     }
 
     // S481: state-law mismatches against the property state's
-    // catalogued figures. Mirrors the S476 lease PATCH posture —
+    // cataloged figures. Mirrors the S476 lease PATCH posture —
     // only checks fields TOUCHED in this PATCH so the warning fires
     // when the landlord acts, not on unrelated edits. The default
     // late-fee config here flows into NEW leases at this property

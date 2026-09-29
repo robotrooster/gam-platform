@@ -182,7 +182,7 @@ function DeleteConfirmModal({ name, onCancel, onConfirm, busy }: {
     <div className="modal-overlay" onClick={onCancel}>
       <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
         <div className="modal-title">Cancel this invite?</div>
-        {/* S636: this said cancelling "deletes the pending intent and any
+        {/* S636: this said canceling "deletes the pending intent and any
             uploaded lease document". It does not, and has not since the
             hard-delete path was removed on purpose — the person, their document
             and this record all stay. What actually changes is the link, which is
@@ -206,7 +206,7 @@ function DeleteConfirmModal({ name, onCancel, onConfirm, busy }: {
             className="btn"
             style={{ background: COLOR_DANGER, color: '#fff', borderColor: COLOR_DANGER }}
           >
-            {busy ? 'Cancelling...' : 'Cancel invite'}
+            {busy ? 'Canceling...' : 'Cancel invite'}
           </button>
         </div>
       </div>
@@ -223,7 +223,7 @@ function DeleteConfirmModal({ name, onCancel, onConfirm, busy }: {
 // S639 (Nic): "I accidentally put Gerald Logue as a lower case, and I have no
 // way to change that invite." The route has always accepted a name; this modal
 // only ever offered the address, so a mistyped name had no fix at all short of
-// cancelling the invite and losing the held space. Names are normalised on save
+// canceling the invite and losing the held space. Names are normalized on save
 // (gerald → Gerald), so most of the time there is nothing to retype.
 function FixEmailModal({
   name, current, value, onChange,
@@ -720,7 +720,7 @@ function IntentCard({
 
               Two endpoints existed for exactly this and NEITHER had a control.
               Correcting the address is the better of the two — it keeps the same
-              person on the same space and re-sends, where cancelling means
+              person on the same space and re-sends, where canceling means
               re-inviting from scratch — so it goes first and says so. */}
           {!isBusy && (
             <button onClick={onFixEmail} className="btn btn-ghost btn-sm"

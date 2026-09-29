@@ -128,7 +128,7 @@ export interface DisplacementOutcome {
  * been moved or told, or neither happened.
  *
  * A LOCKED hold is still moved rather than dropped. The lock says "this exact
- * site", which we can no longer honour either way — and between losing the site
+ * site", which we can no longer honor either way — and between losing the site
  * you wanted and losing the reservation entirely, the first is the smaller
  * injury. It is reported so somebody can ring them.
  */

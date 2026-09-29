@@ -427,7 +427,7 @@ describe('S609 POST /propane/deliveries', () => {
     expect(res.status).toBe(404)
   })
   // S609 (Nic): the settle-time PROPANE REDISTRIBUTION tests are gone with the
-  // behaviour they covered. That path applied a tenant's rent money to
+  // behavior they covered. That path applied a tenant's rent money to
   // accelerated propane FIRST — the exact rent-supersession Nic ruled out:
   // "it's gonna apply the payment to the oldest charge, which would supersede
   // the rent, which would still end up letting the tenant acquire late fees."
@@ -725,7 +725,7 @@ describe('S632 true cost + property markup', () => {
   it('the markup does not vary with the payment plan — 1 or 4 bills the same', async () => {
     const f = await seed()
     const app = buildApp()
-    // Instalments are OFF per property by default — a 4-way split is refused
+    // Installments are OFF per property by default — a 4-way split is refused
     // until the landlord turns them on. That is the gate, not the markup.
     await request(app).post('/api/propane/settings')
       .set('Authorization', `Bearer ${f.tokenA}`)

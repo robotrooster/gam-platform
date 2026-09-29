@@ -167,7 +167,7 @@ export function PropertyDetailPage() {
       {tab === 'utilities' && <UtilityMetersPage embeddedPropertyId={id!} />}
       {tab === 'amenities' && <AmenitiesPage embeddedPropertyId={id!} />}
       {/* S605 (Nic): "Property inventory is equipment. It's small tractors, weed
-          whackers, tools" — labelled Equipment here so it can't be confused with
+          whackers, tools" — labeled Equipment here so it can't be confused with
           POS resale stock, which is a different table entirely. */}
       {tab === 'inventory' && <InventoryPage embeddedPropertyId={id!} />}
       {tab === 'maintenance' && <MaintenancePage embeddedPropertyId={id!} />}

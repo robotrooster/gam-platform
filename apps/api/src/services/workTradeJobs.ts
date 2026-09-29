@@ -18,7 +18,7 @@
  * (a water leak is plumbing), which is what makes the skill routing automatic.
  *
  * WHAT THEY SEE. The job, the unit and the notes about it — never the other
- * tenant's name, phone or email (audience isolation: a neighbour is not staff).
+ * tenant's name, phone or email (audience isolation: a neighbor is not staff).
  *
  * DONE. A job is done when its taker says so, except a skilled job finished by
  * a MONITORED work trader: that waits for the landlord or a TRUSTED work trader

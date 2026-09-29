@@ -455,7 +455,7 @@ export function UnitDetailPage() {
                       Still shown for every other unit type, where the list is about
                       what is actually inside a home. An RV spot with no ticks falls
                       back to the preset list for its type, which was always the
-                      behaviour for an unconfigured unit — and any ticks already saved
+                      behavior for an unconfigured unit — and any ticks already saved
                       are preserved, since the form still round-trips `features`. */}
                   {!isRv && featuresForType(editForm.unitType).length > 0 && (() => {
                     const offered = featuresForType(editForm.unitType)
@@ -1262,7 +1262,7 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
           One section, one question per utility: what does this space have? The
           answer happens to be a submeter for electric, a flat charge for trash
           and a tank for propane, but that is the mechanism, not the question. It
-          used to be three separate blocks organised by mechanism, so "does this
+          used to be three separate blocks organized by mechanism, so "does this
           unit have propane" had no home at all. */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
         {embedded
@@ -1603,7 +1603,7 @@ function PropaneTankRow({ unitId, propertyId, hasTank }: {
             onClick={() => appConfirm(
               owed > 0
                 ? `This space still owes ${money(owed)} on propane already delivered. Taking the tank off ` +
-                  `does not cancel that — the scheduled instalments keep billing. It only stops this space ` +
+                  `does not cancel that — the scheduled installments keep billing. It only stops this space ` +
                   `being offered on Record Delivery. Remove it?`
                 : `Take the propane tank off this space? It stops appearing on Record Delivery, so a ` +
                   `future delivery here couldn't be recorded until it's added back. Fills already ` +

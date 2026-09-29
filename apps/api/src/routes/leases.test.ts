@@ -705,20 +705,20 @@ describe('PATCH /leases/:id — auth + validation', () => {
     expect(res.body.data.state_law_warnings).toEqual([])
   })
 
-  it('S476: uncatalogued state → state_law_warnings empty', async () => {
+  it('S476: uncataloged state → state_law_warnings empty', async () => {
     const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
     await db.query(`UPDATE properties SET state = 'XX' WHERE id = $1`, [f.propertyId])
     const res = await request(buildApp())
       .patch(`/api/leases/${f.leaseId}`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ securityDeposit: 5000 })  // would flag in catalogued state
+      .send({ securityDeposit: 5000 })  // would flag in cataloged state
     expect(res.status).toBe(200)
     expect(res.body.data.state_law_warnings).toEqual([])
   })
 
   it('S476: lateFeeInitial percent of 10% > AZ catalog (no late_fee_max_pct on AZ residential) → empty', async () => {
     // AZ does NOT have a late_fee_max_pct provision; checkAgainstStatute
-    // returns null when the topic is uncatalogued. Confirms no false
+    // returns null when the topic is uncataloged. Confirms no false
     // alarm on a topic that doesn't have a state figure.
     const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
     const res = await request(buildApp())

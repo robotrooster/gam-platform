@@ -239,7 +239,7 @@ describe('GET + PATCH /api/utility/service-agreements (S615)', () => {
 
 // S616 (Nic): "maybe that tenant portal profile that only has the utilities
 // gets a big button that says 'hey, I need my final bill because I'm moving
-// out'." Nobody is watching the neighbour's front door — the one person who
+// out'." Nobody is watching the neighbor's front door — the one person who
 // reliably knows is the person leaving.
 describe('the payer gives notice (S616)', () => {
   async function payerToken(f: any, tenantId: string) {

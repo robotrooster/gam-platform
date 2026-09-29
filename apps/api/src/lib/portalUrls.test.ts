@@ -60,7 +60,7 @@ describe('S641 portal URLs', () => {
   // A localhost default is FINE when the variable beside it is one production
   // actually sets — it is a dev convenience that never fires. The bug is an
   // INVENTED name: LANDLORD_PORTAL_URL had no value anywhere, so the fallback
-  // was not a fallback, it was the behaviour. This flags that shape only, so
+  // was not a fallback, it was the behavior. This flags that shape only, so
   // the check stays worth keeping instead of being switched off.
   it('no link is built from an env var nothing sets', () => {
     // Set in apps/api/.env and verified present in production.

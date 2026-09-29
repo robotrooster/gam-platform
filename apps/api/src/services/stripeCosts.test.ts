@@ -7,17 +7,17 @@
  * things that made the first cut of it wrong.
  */
 import { describe, it, expect } from 'vitest'
-import { categorise, parsePeriod, COST_LABELS, COST_CATEGORIES } from './stripeCosts'
+import { categorize, parsePeriod, COST_LABELS, COST_CATEGORIES } from './stripeCosts'
 
-describe('S642 categorising what Stripe charged us', () => {
+describe('S642 categorizing what Stripe charged us', () => {
   it('reads Stripe’s own prose into our categories', () => {
-    expect(categorise('Card payments (2026-09-06): Transaction network costs')).toBe('card_interchange')
-    expect(categorise('Card payments (2026-09-06): Stripe volume fee')).toBe('stripe_volume_fee')
-    expect(categorise('Card payments (2026-09-12): Stripe per-authorization fee')).toBe('per_authorization')
-    expect(categorise('Authorization Boost (2026-09-06)')).toBe('authorization_boost')
-    expect(categorise('Radar (2026-09-04): Standard')).toBe('radar')
-    expect(categorise('Connections Balance Refresh (2026-08-01 - 2026-08-31)')).toBe('bank_linking')
-    expect(categorise('Something Stripe has not invented yet')).toBe('other')
+    expect(categorize('Card payments (2026-09-06): Transaction network costs')).toBe('card_interchange')
+    expect(categorize('Card payments (2026-09-06): Stripe volume fee')).toBe('stripe_volume_fee')
+    expect(categorize('Card payments (2026-09-12): Stripe per-authorization fee')).toBe('per_authorization')
+    expect(categorize('Authorization Boost (2026-09-06)')).toBe('authorization_boost')
+    expect(categorize('Radar (2026-09-04): Standard')).toBe('radar')
+    expect(categorize('Connections Balance Refresh (2026-08-01 - 2026-08-31)')).toBe('bank_linking')
+    expect(categorize('Something Stripe has not invented yet')).toBe('other')
   })
 
   it('every category has a label a human would read', () => {

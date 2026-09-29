@@ -918,11 +918,22 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
            AND e.expense_date BETWEEN $2::date AND $3::date
          GROUP BY 1
       ),
+      -- S652 (Nic): "spent zero, billed back $1,588.65, and not recovered
+      -- $1,588.65. Those are an exact match and I don't know why it's saying
+      -- it's not recovered. Most people at Mountain View have paid." Three
+      -- things were wrong at once: VOIDED bills were counted as billed back;
+      -- the total subtracted from a spend nobody had entered; and nothing said
+      -- how much of what was billed had actually been PAID. Billed excludes
+      -- void; collected is what tenants paid; the gap only exists where the
+      -- property recorded what the utility charged it.
       recovered AS (
-        SELECT ub.utility_type, SUM(ub.charge_amount)::numeric AS amount
+        SELECT ub.utility_type,
+               SUM(ub.charge_amount + COALESCE(ub.tax_amount, 0))::numeric AS amount,
+               SUM(ub.charge_amount + COALESCE(ub.tax_amount, 0)) FILTER (WHERE ub.status = 'paid')::numeric AS collected
           FROM utility_bills ub
           JOIN units u ON u.id = ub.unit_id
          WHERE u.property_id = $1
+           AND ub.status <> 'void'
            AND ub.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
                                           AND date_trunc('month', $3::date)::date
          GROUP BY 1
@@ -939,6 +950,7 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       SELECT t.utility_type,
              COALESCE(s.amount, 0)::float  AS spent,
              COALESCE(r.amount, 0)::float  AS recovered,
+             COALESCE(r.collected, 0)::float AS collected,
              COALESCE(o.amount, 0)::float  AS owner_occupied
         FROM (SELECT utility_type FROM spent
               UNION SELECT utility_type FROM recovered
@@ -953,6 +965,8 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       utilityType: r.utility_type,
       spent: Number(r.spent),
       recovered: Number(r.recovered),
+      collected: Number(r.collected),
+      stillOwed: Math.round((Number(r.recovered) - Number(r.collected)) * 100) / 100,
       ownerOccupied: Number(r.owner_occupied),
       // Only meaningful where the landlord recorded what he SPENT. Without the
       // bill on the expense side there is nothing to subtract from, so this
@@ -961,15 +975,82 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
         ? Math.round((Number(r.spent) - Number(r.recovered)) * 100) / 100
         : null,
     }))
-    const sum = (k: 'spent' | 'recovered' | 'ownerOccupied') =>
+    const sum = (k: 'spent' | 'recovered' | 'collected' | 'stillOwed' | 'ownerOccupied') =>
       Math.round(lines.reduce((n: number, l: any) => n + l[k], 0) * 100) / 100
+    // The gap is only a number where a spend was recorded — summed over those
+    // utilities alone, so a utility with no bill entered cannot make the
+    // total claim a shortfall (or a surplus) that nobody measured.
+    const measured = lines.filter((l: any) => l.notRecovered != null)
     res.json({ success: true, data: {
       from, to, lines,
       totals: {
-        spent: sum('spent'), recovered: sum('recovered'), ownerOccupied: sum('ownerOccupied'),
-        notRecovered: Math.round((sum('spent') - sum('recovered')) * 100) / 100,
+        spent: sum('spent'), recovered: sum('recovered'), collected: sum('collected'), stillOwed: sum('stillOwed'),
+        ownerOccupied: sum('ownerOccupied'),
+        notRecovered: measured.length
+          ? Math.round(measured.reduce((n: number, l: any) => n + l.notRecovered, 0) * 100) / 100
+          : null,
       },
     } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/utility/reading-history?propertyId=&months= — S652 (Nic): "I don't
+// want to download readings… I want stuff to stay in the system, visible
+// without downloading external reports… a spot to view the history as some
+// sort of spreadsheet, but make it look good." Every submeter at the property
+// with its readings, newest first, and the usage each one closed. LANDLORD-ONLY
+// for the same reason as /meters/:id/readings: a blind reader never sees values.
+utilityRouter.get('/reading-history', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const propertyId = z.string().uuid().parse(req.query.propertyId)
+    const months = Math.min(36, Math.max(1, Number(req.query.months) || 12))
+    const property = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
+    if (!property) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    const rows = await query<any>(`
+      SELECT m.id AS meter_id, m.label, m.utility_type, m.billing_method, m.digits, m.reading_multiplier,
+             COALESCE(m.out_of_service, FALSE) AS out_of_service,
+             (SELECT string_agg(u.unit_number, ', ' ORDER BY u.unit_number)
+                FROM utility_meter_units mu JOIN units u ON u.id = mu.unit_id WHERE mu.meter_id = m.id) AS unit_numbers,
+             r.id AS reading_id, to_char(r.reading_date, 'YYYY-MM-DD') AS reading_date,
+             to_char(r.billing_cycle_month, 'YYYY-MM-DD') AS cycle_month,
+             r.reading_value, r.reason, r.reason_note, r.needs_review, r.is_rollover,
+             (r.photo_url IS NOT NULL) AS has_photo,
+             (SELECT pr.reading_value FROM utility_meter_readings pr
+               WHERE pr.meter_id = m.id AND (pr.reading_date, pr.created_at) < (r.reading_date, r.created_at)
+               ORDER BY pr.reading_date DESC, pr.created_at DESC LIMIT 1) AS prior_value
+        FROM utility_meters m
+        LEFT JOIN utility_meter_readings r
+               ON r.meter_id = m.id AND r.reading_date >= (CURRENT_DATE - ($2::int * INTERVAL '1 month'))
+       WHERE m.property_id = $1 AND m.billing_method IN ('submeter', 'rubs')
+       ORDER BY m.utility_type, m.label, r.reading_date DESC NULLS LAST, r.created_at DESC NULLS LAST`,
+      [propertyId, months])
+    const byMeter = new Map<string, any>()
+    for (const r of rows) {
+      if (!byMeter.has(r.meter_id)) {
+        byMeter.set(r.meter_id, {
+          meterId: r.meter_id, label: r.label, utilityType: r.utility_type, billingMethod: r.billing_method,
+          digits: Number(r.digits) || 6, outOfService: r.out_of_service, unitNumbers: r.unit_numbers, readings: [],
+        })
+      }
+      if (!r.reading_id) continue
+      const value = Number(r.reading_value)
+      const prior = r.prior_value != null ? Number(r.prior_value) : null
+      // A master's number IS the cycle's usage; a submeter's usage is the turn
+      // since the read before it (a rollover or a swap shows no figure rather
+      // than a negative one).
+      const usage = r.billing_method === 'rubs' ? value
+        : prior == null || value < prior ? null
+        : Math.round((value - prior) * Number(r.reading_multiplier) * 1000) / 1000
+      byMeter.get(r.meter_id).readings.push({
+        id: r.reading_id, date: r.reading_date, cycleMonth: r.cycle_month, value, usage,
+        reason: r.reason, note: r.reason_note, needsReview: r.needs_review, isRollover: r.is_rollover, hasPhoto: r.has_photo,
+      })
+    }
+    const meters = [...byMeter.values()].sort((a, b) =>
+      String(a.unitNumbers ?? a.label).localeCompare(String(b.unitNumbers ?? b.label), undefined, { numeric: true, sensitivity: 'base' })
+      || String(a.utilityType).localeCompare(String(b.utilityType)))
+    res.json({ success: true, data: { months, meters } })
   } catch (e) { next(e) }
 })
 
@@ -1193,7 +1274,7 @@ utilityRouter.post('/reading-runs', requireMeterReader, async (req, res, next) =
       propertyId: z.string().uuid(),
       cycleMonth: z.string().regex(/^\d{4}-\d{2}-01$/, 'cycleMonth must be YYYY-MM-01').optional(),
       // S631: open a run for ONE utility so it bills as soon as its own reads
-      // are in. Omitted = every readable meter, the original behaviour.
+      // are in. Omitted = every readable meter, the original behavior.
       utilityType: z.string().min(1).max(40).optional(),
     }).parse(req.body)
     const property = await queryOne<any>(
@@ -1951,7 +2032,7 @@ utilityRouter.post('/bills/:id/pay', async (req: any, _res, next) => {
 //
 // Pricing is policy, decided once per property per utility, not per tenant. The
 // billing engine reads these and they override the meter columns — so two
-// neighbours on the same water main cannot be charged different rates because
+// neighbors on the same water main cannot be charged different rates because
 // of who entered their unit. Same posture as the S535 property-level late fees.
 utilityRouter.get('/property-rates', requirePerm('units.edit', 'units.view_status', 'properties.edit'), async (req, res, next) => {
   try {

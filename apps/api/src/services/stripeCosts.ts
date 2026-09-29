@@ -51,7 +51,7 @@ export const COST_LABELS: Record<CostCategory, string> = {
  * mapping lives in ONE place and the stored row carries our category — a read
  * should never be re-parsing English.
  */
-export function categorise(description: string): CostCategory {
+export function categorize(description: string): CostCategory {
   const d = (description || '').toLowerCase()
   if (d.includes('connections'))          return 'bank_linking'
   if (d.includes('radar'))                return 'radar'
@@ -137,7 +137,7 @@ export async function syncStripeCosts(opts: { lookbackDays?: number } = {}): Pro
            VALUES ($1,$2,$3,$4,$5, to_timestamp($6), $7, $8)
            ON CONFLICT (stripe_txn_id) DO NOTHING
            RETURNING id`,
-          [t.id, type, categorise(desc), desc, Math.abs(t.amount) / 100, t.created,
+          [t.id, type, categorize(desc), desc, Math.abs(t.amount) / 100, t.created,
            period.start, period.end])
         if (res.length) out.stored++; else out.skipped++
       }

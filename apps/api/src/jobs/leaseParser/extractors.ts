@@ -422,7 +422,7 @@ export function detectLateFees(pages: Page[]): {
  * THE PERSON PROBLEM. Grace is also a name, and a lease is full of names. A
  * tenant called Grace Whitfield must not donate her name to the billing engine.
  * Two guards, because either alone is wrong:
- *   · a capitalised "Grace" followed by another capitalised word, or preceded
+ *   · a capitalized "Grace" followed by another capitalized word, or preceded
  *     by one, is a person — "Grace Whitfield", "Mary Grace".
  *   · no digit anywhere near it means there is no period to read regardless.
  * A name adjacent to an unrelated number is still refused, because the number
@@ -450,12 +450,12 @@ function readCount(raw: string): number | null {
 export function graceLooksLikeAName(text: string, index: number): boolean {
   const before = text.slice(Math.max(0, index - 40), index)
   const after = text.slice(index + 5, index + 45)
-  // "Grace Whitfield" — capitalised Grace followed by another capitalised word
+  // "Grace Whitfield" — capitalized Grace followed by another capitalized word
   // that is not a word leases use for periods.
   if (/^\s+[A-Z][a-z]{1,20}/.test(after)
       && !/^\s+(Period|Days?|Day)\b/i.test(after)
       && text[index] === 'G') return true
-  // "Mary Grace", "to Grace," — preceded by a capitalised name or an address
+  // "Mary Grace", "to Grace," — preceded by a capitalized name or an address
   // of a person.
   if (/[A-Z][a-z]{1,20}\s+$/.test(before) && text[index] === 'G'
       && !/(a|the|day|days|of|no|any)\s+$/i.test(before)) return true

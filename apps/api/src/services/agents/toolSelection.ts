@@ -133,7 +133,7 @@ export function selectToolsForTurn(
      * miss was finalize_utility_bill on "send that one out" — which names
      * nothing, and after "run the water bills for March" plainly means the
      * bill. Nic: "it should know from context of what was said." Scored at half
-     * weight, so it colours an ambiguous turn without letting the previous
+     * weight, so it colors an ambiguous turn without letting the previous
      * subject override a clear change of topic.
      */
     previousMessage?: string
@@ -175,7 +175,7 @@ export function selectToolsForTurn(
     const nameWords = new Set(tokens(t.name.replace(/_/g, ' ')).map(stem))
     for (const w of want) if (nameWords.has(w)) score += 2
     // The same holds for the carried turn, at half weight: after "run the
-    // water bills", a "send that one out" should favour the tool NAMED for
+    // water bills", a "send that one out" should favor the tool NAMED for
     // bills over one that mentions them in passing.
     for (const w of carried) if (nameWords.has(w)) score += 1
     return { t, score }

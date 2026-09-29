@@ -8,7 +8,7 @@
  * within days of its lease starting.
  *
  * The test was the unit's status at the INSTANT of billing, and a lease
- * finalising bills its utilities BEFORE marking the unit occupied. So a space
+ * finalizing bills its utilities BEFORE marking the unit occupied. So a space
  * lived in all cycle read 'vacant' while its own bill was written.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -20,7 +20,7 @@ beforeEach(async () => { await cleanupAllSchema() })
 
 const CYCLE = '2026-08-01'
 
-/** A space whose meter has not moved, plus a neighbour that used 120 kWh. */
+/** A space whose meter has not moved, plus a neighbor that used 120 kWh. */
 // S648: estimating is a landlord's per-property choice. These fixtures turn it
 // on unless a test says otherwise.
 async function parkWithAStuckMeter(opts: {
@@ -55,13 +55,13 @@ async function parkWithAStuckMeter(opts: {
     await read(stuckMeter, '2026-08-01', 28999, 'baseline')
     await read(stuckMeter, '2026-09-02', 28999, 'monthly_cycle')
 
-    // a comparable neighbour that really used 120
-    const neighbour = await seedUnit(c, { propertyId, landlordId: ll.landlordId })
-    await c.query(`UPDATE units SET unit_number='RV 28', unit_type='rv_spot', status='active' WHERE id=$1`, [neighbour])
-    const nMeter = await mkMeter(neighbour, 'RV 28 electric', 0.21)
+    // a comparable neighbor that really used 120
+    const neighbor = await seedUnit(c, { propertyId, landlordId: ll.landlordId })
+    await c.query(`UPDATE units SET unit_number='RV 28', unit_type='rv_spot', status='active' WHERE id=$1`, [neighbor])
+    const nMeter = await mkMeter(neighbor, 'RV 28 electric', 0.21)
     await read(nMeter, '2026-08-01', 51999, 'baseline')
     await read(nMeter, '2026-09-02', 52119, 'monthly_cycle')
-    const nLease = await seedLease(c, { unitId: neighbour, landlordId: ll.landlordId, startDate: '2026-01-01' })
+    const nLease = await seedLease(c, { unitId: neighbor, landlordId: ll.landlordId, startDate: '2026-01-01' })
     await seedLeaseTenant(c, { leaseId: nLease, tenantId: await seedTenant(c) })
 
     if (opts.withLease) {
@@ -94,7 +94,7 @@ describe('a stuck meter on a space somebody lives in', () => {
     expect(Number(b.usage_amount)).toBe(120)
   })
 
-  // THE BUG: a lease finalising bills before the unit is marked occupied, so
+  // THE BUG: a lease finalizing bills before the unit is marked occupied, so
   // the space still read 'vacant' while its own bill was written.
   it('bills the comparable even when the status still says vacant', async () => {
     const w = await parkWithAStuckMeter({ unitStatus: 'vacant', withLease: true })

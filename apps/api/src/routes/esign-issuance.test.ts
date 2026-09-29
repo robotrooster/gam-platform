@@ -11,7 +11,7 @@
  * that state.
  *
  * These tests exist because the change moves WHEN money is created, and the two
- * failure modes are both expensive: billing nobody (the old behaviour) and
+ * failure modes are both expensive: billing nobody (the old behavior) and
  * billing twice (the obvious way to get the new one wrong).
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
@@ -532,7 +532,7 @@ describe('a stuck meter when the lease is signed', () => {
     }
     // The resident's own meter: read the same number twice.
     await meter(f.unitId, 61808, 61808)
-    // A lived-in neighbour of the same type with real usage to estimate from.
+    // A lived-in neighbor of the same type with real usage to estimate from.
     const c = await db.connect()
     try {
       const { seedUnit: su, seedLease: sl } = await import('../test/dbHelpers')
@@ -542,7 +542,7 @@ describe('a stuck meter when the lease is signed', () => {
     } finally { c.release() }
   }
 
-  it('bills an existing resident at the low end of what the neighbours used', async () => {
+  it('bills an existing resident at the low end of what the neighbors used', async () => {
     const f = await fixture()
     await stuckMeter(f, { existing: true })
     const documentId = await unsignedDoc(f)

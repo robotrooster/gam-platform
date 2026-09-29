@@ -390,7 +390,7 @@ export async function notifyMaintenanceUpdated(o: { tenantUserId:string; tenantE
  * their list; a complaint is not an emergency and does not belong in an inbox.
  *
  * Deliberately quotes the tenant rather than paraphrasing: the landlord should
- * read what was actually said, and no summary of "my neighbour plays music
+ * read what was actually said, and no summary of "my neighbor plays music
  * until 2am" is better than the sentence itself.
  */
 export async function notifyTenantComplaint(o: {

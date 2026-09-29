@@ -116,7 +116,7 @@ describe('S640 onboarding waiver survives an unstamped invoice', () => {
     expect((await feesOn(invoiceId)).total).toBeGreaterThan(0)
   })
 
-  it('still honours an explicit exemption stamp on anyone', async () => {
+  it('still honors an explicit exemption stamp on anyone', async () => {
     const { invoiceId } = await seedOverdue({ existingTenancy: false, stamped: true })
     await generateLateFeesForTimezone(TZ)
     expect(await feesOn(invoiceId)).toEqual({ count: 0, total: 0 })

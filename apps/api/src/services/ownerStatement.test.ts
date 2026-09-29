@@ -330,7 +330,7 @@ describe('the relationship opens itself', () => {
         `SELECT portal_access FROM pm_owner_relationships
           WHERE pm_company_id=$1 AND landlord_id=$2`, [pmId, landlordId])
       expect(after.rows).toHaveLength(1)
-      // The default is exactly today's behaviour: no portal until someone asks.
+      // The default is exactly today's behavior: no portal until someone asks.
       expect(after.rows[0].portal_access).toBe('none')
     } finally { client.release() }
   })

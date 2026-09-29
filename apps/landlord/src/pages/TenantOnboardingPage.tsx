@@ -305,7 +305,7 @@ export function PacketChecklist({ unitId, sale, ticked, setTicked }: {
 }) {
   const { data: pkg, isLoading } = useQuery<any>(['signing-package-for-unit', unitId, sale],
     () => apiGet(`/signing-packages/for-unit/${unitId}${sale ? '?sale=1' : ''}`), { enabled: !!unitId })
-  // Pre-tick from the package's own judgement whenever the packet is (re)loaded.
+  // Pre-tick from the package's own judgment whenever the packet is (re)loaded.
   useEffect(() => {
     if (!pkg?.items) return
     const next: Record<string, boolean> = {}
@@ -826,7 +826,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
       ...form,
       unitId: unitId || undefined,
       existingResident: !!unitId && windowOpen && attestExisting,
-      // Work trade is per unit — it trades labour for THAT tenancy's rent.
+      // Work trade is per unit — it trades labor for THAT tenancy's rent.
       isWorkTrade: !!unitId && isWorkTrade,
       workTradeTracksHours: isWorkTrade ? wtTracksHours : undefined,
       workTradeHoursTarget: isWorkTrade && wtHours ? Number(wtHours) : undefined,

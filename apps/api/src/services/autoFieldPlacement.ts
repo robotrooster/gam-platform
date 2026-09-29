@@ -97,7 +97,7 @@ export interface LateFeeTerms {
 
 export interface DetectionReport {
   /** Conventions this document actually matched. */
-  recognised: string[]
+  recognized: string[]
   /** Elections laid out, with how many options each. */
   elections: Array<{ label: string; options: number; page: number }>
   /** Reads like a choice, could not be structured. Needs a human. */
@@ -146,7 +146,7 @@ export interface AutoPlaceResult {
    */
   lateFeeTerms: LateFeeTerms | null
   /**
-   * S622: what the placer RECOGNISED, and what looked like a choice it could
+   * S622: what the placer RECOGNIZED, and what looked like a choice it could
    * not lay out. Without this an unfamiliar lease fails silently — boxes appear
    * on the blanks it understood and nothing says a whole election was missed.
    * Same principle as naming the screening fees we exclude on purpose: a gap
@@ -366,7 +366,7 @@ function detectTargets(pages: ReturnType<() => any>): { targets: RawTarget[]; pa
     // Signature labels mark the LEFT EDGE of their column ("TENANT(S)
     // SIGNATURE:" at x=43, "LANDLORD SIGNATURE:" at x=295, each block ~182
     // wide). So the question is containment — the last label at or left of the
-    // box — not which label centre happens to be nearest. Nearest-by-distance
+    // box — not which label center happens to be nearest. Nearest-by-distance
     // put a date at x=132, plainly inside the tenant column, on the landlord:
     // 132 is 89 from the tenant label but the lookup ran at the SLASH GLYPH's x
     // (192, since a "/ /" box is drawn 60pt to the left of the slashes), and
@@ -555,7 +555,7 @@ function nonSigRole(col: string | null, label: string | null, ctx: string, split
   // they are the landlord's to state correctly.
   //
   // Genuinely tenant-supplied facts — date of birth, emergency contact, driver's
-  // licence, phone — carry NO lease column (the landlord does not hold them), so
+  // license, phone — carry NO lease column (the landlord does not hold them), so
   // they fall through to the personal-info path below and stay with the tenant.
   // S635 (Nic, DIRECTIVE) EXTENDS THE RULE ABOVE ONE STEP. S622's reasoning was
   // that a value GAM already holds is "wrong by construction" as a tenant-entry
@@ -1304,7 +1304,7 @@ export function detectLateFeeTerms(pages: any[]): LateFeeTerms | null {
  *
  * Nic: "somebody could literally just have a word document drafted up with no
  * numbers, no indentations... every landlord's gonna have different lease
- * types." The recognisers here cover the conventions this engine understands.
+ * types." The recognizers here cover the conventions this engine understands.
  * Anything that reads like an either/or and did not become an election is
  * reported rather than dropped, so an unfamiliar format is a flagged gap
  * instead of a silent one.
@@ -1324,7 +1324,7 @@ const CHOICE_LANGUAGE = [
 function buildDetectionReport(
   pages: any[], radios: ProposedField[], consumed: Array<{ page: number; x: number; y: number }>,
 ): DetectionReport {
-  const recognised: string[] = []
+  const recognized: string[] = []
   const elections = radios
     .filter((r) => r.fieldType === 'radio_group' && r.leaseColumn)
     .map((r) => ({
@@ -1332,9 +1332,9 @@ function buildDetectionReport(
       options: String(r.options ?? '').split(',').filter(Boolean).length,
       page: r.page,
     }))
-  if (elections.length > 0) recognised.push('"(check one)" elections with underscore blanks')
-  if (radios.some((r) => r.parentKey)) recognised.push('nesting by indentation')
-  if (consumed.length > 0) recognised.push('option blanks')
+  if (elections.length > 0) recognized.push('"(check one)" elections with underscore blanks')
+  if (radios.some((r) => r.parentKey)) recognized.push('nesting by indentation')
+  if (consumed.length > 0) recognized.push('option blanks')
 
   // Lines already consumed as options are structured; everything else is fair
   // game for the sweep.
@@ -1365,7 +1365,7 @@ function buildDetectionReport(
       }
     }
   }
-  return { recognised, elections, unstructured }
+  return { recognized, elections, unstructured }
 }
 
 function detectCheckOneRadios(pages: any[]): {

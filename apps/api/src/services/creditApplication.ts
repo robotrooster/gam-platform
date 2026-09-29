@@ -38,7 +38,7 @@ export interface CreditApplicationResult {
  * oldest first.
  *
  * `scope` limits which charges are eligible:
- *   'invoice' — only rows on the given invoice (invoice-generation behaviour)
+ *   'invoice' — only rows on the given invoice (invoice-generation behavior)
  *   'lease'   — every open row on the lease, whatever invoice it belongs to
  *               (what a landlord means by "forgive that late fee")
  *
@@ -86,7 +86,7 @@ export async function applyCreditsToOpenCharges(
   if (available <= 0.005) return { applied: 0, rowsTouched: 0 }
 
   // Open charges, oldest first. 'invoice' scope keeps the long-standing
-  // invoice-generation behaviour; 'lease' scope reaches charges from earlier
+  // invoice-generation behavior; 'lease' scope reaches charges from earlier
   // cycles, which is the whole point when a landlord forgives a late fee that
   // has been sitting on last month's invoice.
   const charges = await client.query<{ id: string; amount: string }>(

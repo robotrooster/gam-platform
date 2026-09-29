@@ -428,7 +428,7 @@ export async function createDocumentRecord(client: any, opts: {
     // Pruning unused role slots is correct and deliberate: a one-tenant lease
     // should not carry co_tenant_3's signature box. But the same silence hid a
     // real defect for thirteen Country Acres leases. draftHouseholdLease
-    // labelled every resident 'tenant' while templates bind to 'primary' and
+    // labeled every resident 'tenant' while templates bind to 'primary' and
     // 'co_tenant_N', so NOT ONE tenant field matched — no name, no initials, no
     // signature date — and the documents went out looking finished. 70 of 125
     // fields vanished without a word.
@@ -1596,7 +1596,7 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   //
   // Implemented by pre-creating the custody row as already funded and marking it
   // 'carried_forward', which is the same signal the S516 double-charge guard in
-  // generateMoveInInvoice already honours for a deposit carried between GAM
+  // generateMoveInInvoice already honors for a deposit carried between GAM
   // leases. Reusing that guard rather than adding a second suppression path
   // keeps one code path responsible for "never bill a deposit twice".
   if (doc.deposit_already_held) {
@@ -2166,7 +2166,7 @@ esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (
  *
  * So this returns the whole list with what they hold against each, and says
  * NOTHING about which ones they need. No state, no requirement, no warning
- * colour — a landlord looking at an empty slot is looking at a document they
+ * color — a landlord looking at an empty slot is looking at a document they
  * have not uploaded, not a compliance failure. What they do about it is theirs.
  */
 esignRouter.get('/disclosures', requireAuth, requirePerm('leases.create'), async (req: any, res, next) => {
@@ -2214,7 +2214,7 @@ esignRouter.get('/disclosures', requireAuth, requirePerm('leases.create'), async
  * locking them too. Nic: "When I say they can't edit it on the documents, I mean
  * they can't edit the text of the document because it's a government published
  * form. They can add the necessary initial boxes or potentially an
- * acknowledgement checkbox... just including it with the signature in the packet
+ * acknowledgment checkbox... just including it with the signature in the packet
  * with no actual initial on the page itself is going to be argued that it was
  * never received from somebody down the line." Placing an initial on the page is
  * how a landlord proves delivery, so taking that away defeated the point. GAM
@@ -2550,7 +2550,7 @@ esignRouter.patch('/templates/:id', requireAuth, requirePerm('esign.template_man
 })
 
 // S558: designate this template as the DEFAULT for its unit type (the "primary
-// <unit type> lease"). Radio behaviour: clears any other default for the same
+// <unit type> lease"). Radio behavior: clears any other default for the same
 // (landlord, unit_type, property_id) first, then sets this one — atomic. Pass
 // { isDefault: false } to un-designate. A default requires a specific unit_type
 // (a universal/null-unit_type template can't be a unit-type default).
@@ -2750,7 +2750,7 @@ esignRouter.get('/templates/:id/auto-fields/:jobId', requireAuth, requirePerm('e
     const job = await getAutoFieldJob(req.params.jobId, landlordScopeIds(req.user!))
     if (!job || job.template_id !== req.params.id) throw new AppError(404, 'Job not found')
     // S622: pagesTotal/pagesDone let the editor show real progress instead of an
-    // unlabelled spinner. pagesTotal is null until the PDF has been parsed.
+    // unlabeled spinner. pagesTotal is null until the PDF has been parsed.
     res.json({ success: true, data: {
       status: job.status, result: job.result, error: job.error,
       pagesTotal: job.pages_total ?? null, pagesDone: job.pages_done ?? 0,
@@ -2989,7 +2989,7 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
     const resolvedUnitId = await resolveUnitFromPrefill(landlordScopeIds(req.user!), prefillValues || {})
     const finalUnitId = resolvedUnitId || unitId || null
     // S633: the document belongs to the company that owns the unit it is being
-    // sent for — derived, and authorised by the same check. With no unit (a
+    // sent for — derived, and authorized by the same check. With no unit (a
     // standalone form), the account names the company.
     const docLandlordId = finalUnitId
       ? await landlordIdForUnit(req.user!, finalUnitId, query)
@@ -3438,7 +3438,7 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
       // who the landlord is. True of the landlord as a PARTY — and irrelevant
       // to this box, which sits under a signature line and must name whoever
       // actually put ink on it. Once a property routes signing to an on-site
-      // manager, the old behaviour printed the owner's name over somebody
+      // manager, the old behavior printed the owner's name over somebody
       // else's signature. `name` already resolves to the property's signer when
       // one is named, and to the owner otherwise.
       landlord_name:    landlordUser.name,
@@ -4275,7 +4275,7 @@ esignRouter.post('/documents/work-trade-addendum', requireAuth, requirePerm('lea
     if (!agr) throw new AppError(404, 'Work-trade agreement not found')
     if (!canManageLandlordResource(req.user, agr.landlord_id)) throw new AppError(403, 'Not your agreement')
     // S633: the company is the agreement's own — derived, not taken from session
-    // state, and already authorised by the line above.
+    // state, and already authorized by the line above.
     const landlordId: string = agr.landlord_id
     if (agr.status !== 'active') throw new AppError(409, `Agreement is ${agr.status} — resume or renew the lease before sending an addendum`)
 
@@ -5531,7 +5531,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         }
       } catch (e: any) {
         // The landlord's signature is durable and stays. What failed is the
-        // lease materialising, which is the same condition the execution path
+        // lease materializing, which is the same condition the execution path
         // already treats as critical — surfaced, not swallowed.
         logger.error({ err: e, documentId: doc.id, reason: e.message },
           '[ESIGN] issuance build failed')
@@ -5654,11 +5654,11 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       // soon as acceptance happens."
       //
       // While they were invited but unsigned, their utility share was counted
-      // into the RUBS split — so their neighbours were charged correctly — and
+      // into the RUBS split — so their neighbors were charged correctly — and
       // held with no invoice behind it. Signing is what gives it somewhere to
       // go, so it lands on their first invoice now.
       //
-      // Post-commit and best-effort, like the neighbours here: the signature is
+      // Post-commit and best-effort, like the neighbors here: the signature is
       // recorded and must never be rolled back over a utility charge. A row
       // that fails stays HELD rather than vanishing, so nothing is silently
       // written off.
@@ -5686,7 +5686,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       // its terms and no schedule; this writes the installments and makes it
       // active, so what gets billed is what was signed.
       //
-      // Best-effort and post-commit like the neighbours here: the signature is
+      // Best-effort and post-commit like the neighbors here: the signature is
       // already recorded and must not be rolled back if scheduling fails.
       // activateHomeSaleContract is idempotent, and a failure leaves the
       // contract pending — visible, and retryable — rather than half-billed.
@@ -6004,7 +6004,7 @@ esignRouter.post('/upload', requireAuth, requirePerm('leases.create'), upload.si
  * S629: the same signer-token identity, for a file request.
  *
  * The signing page fetches the PDF it is asking somebody to sign, and that
- * route authorises per row — the caller must be the landlord OR a signer on a
+ * route authorizes per row — the caller must be the landlord OR a signer on a
  * document referencing the file. A signer arriving from an emailed link has no
  * session, so the token comes on the query string instead and stands in for
  * one. The per-row check below is untouched and still does the deciding: the
@@ -6053,7 +6053,7 @@ esignRouter.get('/files/:filename', authOrSignerTokenQuery, async (req: any, res
     const role = req.user!.role
     const filename = req.params.filename
     const urlSuffix = '/api/esign/files/' + filename
-    // S633: the account's companies, not one. Still authorised PER ROW below —
+    // S633: the account's companies, not one. Still authorized PER ROW below —
     // the document must belong to a company this caller owns, or they must be a
     // signer on it. Widening the scope does not widen who may read a file.
     const scopeLandlordIds = landlordScopeIds(req.user!)

@@ -133,6 +133,35 @@ describe('GET /api/utility/recovery (S613)', () => {
     const water = res.body.data.lines.find((l: any) => l.utilityType === 'water')
     expect(water.recovered).toBe(700)
     expect(water.notRecovered).toBeNull()
+    // S652 (Nic): with nothing recorded as spent, the TOTAL gap is a dash too —
+    // it used to subtract from zero and print the whole billing as a shortfall.
+    expect(res.body.data.totals.notRecovered).toBeNull()
+  })
+
+  // S652 (Nic): "spent zero, billed back $1,588.65, and not recovered
+  // $1,588.65… most people at Mountain View have paid their bill."
+  it('a voided bill is not billed back, and paid is told apart from still owed', async () => {
+    const f = await seed()
+    const { rows: [meter] } = await db.query<any>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, rubs_allocation_method)
+       VALUES ($1,'electric','E','rubs',0,'occupant_count') RETURNING id`, [f.propertyId])
+    const bill = (month: string, amount: number, status: string) => db.query(
+      `INSERT INTO utility_bills (meter_id, unit_id, tenant_id, lease_id, landlord_id,
+                                  billing_cycle_month, allocation_method, rate_per_unit,
+                                  base_fee_share, charge_amount, tax_rate_pct, tax_amount, utility_type, status)
+       VALUES ($1,$2,$3,$4,$5,$6,'equal',0,0,$7,0,0,'electric',$8)`,
+      [meter.id, f.unitId, f.tenantId, f.leaseId, f.landlordId, month, amount, status])
+    await bill('2026-03-01', 100, 'paid')
+    await bill('2026-04-01', 60, 'billed')
+    await bill('2026-05-01', 50.40, 'void')
+    const res = await request(buildApp())
+      .get(`/api/utility/recovery?propertyId=${f.propertyId}&from=2026-01-01&to=2026-12-31`)
+      .set('Authorization', `Bearer ${f.token}`)
+    const e = res.body.data.lines.find((l: any) => l.utilityType === 'electric')
+    expect(e.recovered).toBe(160)      // the void 50.40 is not counted
+    expect(e.collected).toBe(100)
+    expect(e.stillOwed).toBe(60)
+    expect(res.body.data.totals).toMatchObject({ recovered: 160, collected: 100, stillOwed: 60, notRecovered: null })
   })
 
   it('cross-landlord property → 403', async () => {

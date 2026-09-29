@@ -113,8 +113,8 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
   //
   // An identity box is the SYSTEM'S — it is filled from the invite and nobody
   // types it. Clearing the signer role alone left it falling through to the
-  // unassigned grey, which reads as a field somebody forgot to assign rather
-  // than one that is deliberately nobody's. It gets its own colour and says so
+  // unassigned gray, which reads as a field somebody forgot to assign rather
+  // than one that is deliberately nobody's. It gets its own color and says so
   // on the canvas, so the difference is visible without selecting it.
   const systemFilled = isAutoFilledLeaseColumn(field.leaseColumn)
   const color = systemFilled ? '#64748b' : (ROLE_COLORS[field.signerRole] || '#888')
@@ -216,7 +216,7 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
         }}>↳</div>
       ))}
       {/* S636: a system-filled box announces itself on the canvas. Without this
-          the only signal was a colour nobody has a key for. */}
+          the only signal was a color nobody has a key for. */}
       {systemFilled && (
         <div style={{
           position:'absolute', bottom:'100%', right:0, marginBottom:1,
@@ -229,7 +229,7 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
         position:'relative', width: field.width * scale, height: field.height * scale,
         border: `2px ${isConditional ? 'dashed' : 'solid'} ${selected ? color : color + '99'}`,
         // Depth ring — drawn outside the box so it never eats the field's own
-        // colour, which still says WHO fills it.
+        // color, which still says WHO fills it.
         boxShadow: depth > 0 ? `0 0 0 ${Math.max(1, Math.round(2 * scale))}px ${DEPTH_RING[Math.min(depth, 3)]}` : undefined,
         borderRadius: field.fieldType === 'checkbox' ? 4 : 6,
         background: `${color}18`,
@@ -421,7 +421,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   const [screeningFees, setScreeningFees] = useState<any[]>([])
   // S622: the late-fee terms the lease states in words, read from the prose.
   const [lateFeeTerms, setLateFeeTerms] = useState<any>(template.lateFeeTerms ?? null)
-  // S622: what the placer recognised, and what read like a choice it could not
+  // S622: what the placer recognized, and what read like a choice it could not
   // lay out. Advisory — not saved.
   const [detection, setDetection] = useState<any>(null)
   const [scale, setScale] = useState(0.9)
@@ -1226,7 +1226,7 @@ function SendDocumentModal({ onClose }) {
   )
   useEffect(() => {
     if (!pkg?.items) { setPackageTicked({}); return }
-    // Pre-ticked from the package's own judgement; the landlord adjusts.
+    // Pre-ticked from the package's own judgment; the landlord adjusts.
     const next: Record<string, boolean> = {}
     for (const i of pkg.items) next[i.templateId] = !!i.suggested
     setPackageTicked(next)
@@ -1800,7 +1800,7 @@ export function ESignPage() {
   // and the search did nothing. The park name is never the thing being searched
   // for — the accordion below already says which park you are in.
   //
-  // matchesUnitQuery normalises both sides, so "mobile home 5", "mh5" and "MH 05"
+  // matchesUnitQuery normalizes both sides, so "mobile home 5", "mh5" and "MH 05"
   // are one query. Signer and tenant names still match: a name cannot collide
   // with a park the way a unit type can, and looking somebody up by name is the
   // other reason to use this box.
@@ -1850,7 +1850,7 @@ export function ESignPage() {
 
   // S558: designate a template as its unit type's default (the "primary
   // <unit type> lease"). Server clears any prior default for the same
-  // (unit type, property) — radio behaviour.
+  // (unit type, property) — radio behavior.
   const setDefaultTemplateMut = useMutation(
     (id: string) => apiPost(`/esign/templates/${id}/set-default`, { isDefault: true }),
     { onSuccess: () => { qc.invalidateQueries('esign-templates'); qc.invalidateQueries('esign-sleeves') },

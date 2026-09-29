@@ -46,7 +46,7 @@ import { dateDigitSettles } from '@gam/shared'
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December']
 
-/** Days in a month, honouring leap years — so 31 February can't be accepted. */
+/** Days in a month, honoring leap years — so 31 February can't be accepted. */
 function daysInMonth(month: number, year: number): number {
   if (month < 1 || month > 12) return 31
   return new Date(Date.UTC(year || 2000, month, 0)).getUTCDate()

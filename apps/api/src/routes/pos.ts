@@ -552,7 +552,7 @@ async function assertCashierPricing(req: any, lines: { itemId?: string | null; p
   // and the server sets it. Holding a cashier to the item's sell_price here
   // would refuse every stay, since the two are not the same number and are not
   // meant to be. Nothing is loosened: the price the browser sent for a stay is
-  // discarded and replaced before anything is totalled.
+  // discarded and replaced before anything is totaled.
   const stayItems = new Set(rows.filter((r) => r.stay_unit).map((r) => r.id))
   for (const l of lines) {
     if (!l.itemId || !allowed.has(l.itemId)) continue

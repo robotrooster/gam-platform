@@ -8,7 +8,7 @@
  * their money went was handled entirely by a bot.
  *
  * The nudge is a request, and requests get refused — tool_choice 'required' is
- * documented in this same file as honoured "most of the time, not every time".
+ * documented in this same file as honored "most of the time, not every time".
  * So the second time of asking is the last.
  *
  * This is tested directly because in the run that prompted it the model complied

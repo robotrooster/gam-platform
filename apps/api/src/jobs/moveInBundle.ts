@@ -612,7 +612,7 @@ export async function generateMoveInInvoice(
           [wtAgreement.id])
         const fullTarget = Number(wtRow.rows[0]?.monthly_hours_target ?? 0)
         // Prorate the hours by how much of the month the rent covers: a half
-        // month of rent cannot ask for a full month of labour.
+        // month of rent cannot ask for a full month of labor.
         const fullMonthRent = Number(inputs.rent_amount) || rentForMoveIn
         const target = fullTarget > 0 && fullMonthRent > 0 && rentForMoveIn > 0
           ? Math.round((fullTarget * (rentForMoveIn / fullMonthRent)) * 100) / 100

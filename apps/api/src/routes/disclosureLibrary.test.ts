@@ -154,7 +154,7 @@ describe('GET /api/esign/library — what is on the shelf', () => {
 
   it('never says anybody is required to send anything', async () => {
     // Same rule the /disclosures endpoint is held to. GAM stocks a shelf; it
-    // does not practise law. Nic: "We don't police what's required where."
+    // does not practice law. Nic: "We don't police what's required where."
     await shelve({ jurisdiction: 'IL' })
     const body = JSON.stringify((await get(il).expect(200)).body)
     for (const word of ['required', 'must ', 'mandatory', 'violation', 'complian']) {

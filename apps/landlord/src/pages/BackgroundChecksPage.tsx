@@ -272,7 +272,7 @@ function ReviewModal({ check, onClose, onDecided }: {
                     })}
                     {verdict === 'consider' && (
                       <div style={{marginTop:10,fontSize:'.78rem',color:'var(--text-2)',lineHeight:1.5}}>
-                        A “consider” is not a decline, and not a judgement that a number is
+                        A “consider” is not a decline, and not a judgment that a number is
                         bad — it means the result did not automatically clear the criteria set
                         on the Checkr account, so Checkr is handing you the decision. Read the
                         figures beside each line before deciding. If you do decline on one, the

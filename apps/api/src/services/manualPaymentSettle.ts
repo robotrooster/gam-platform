@@ -52,7 +52,7 @@ export interface ManualSettleInput {
    * `false` (the default) for BANK DEPOSIT MATCHING, which is the opposite
    * problem: a deposit is matched to the specific charges it proves, and a late
    * fee genuinely earned before that payment must stay owed. Defaulting to the
-   * narrow behaviour keeps every existing caller as it was.
+   * narrow behavior keeps every existing caller as it was.
    */
   settleWholeBalance?: boolean
   /** S652 (Nic): one person, several leases, ONE balance — settle every open charge of theirs with this company. */
@@ -69,7 +69,7 @@ export interface ManualSettleInput {
    * The desk already computed change on screen and threw the number away, so a
    * cash overpayment could never become a credit the way a card one does.
    *
-   * Omitted keeps the old behaviour exactly — the bank-deposit match path never
+   * Omitted keeps the old behavior exactly — the bank-deposit match path never
    * knows a tendered amount, and check/money order are written for the amount.
    */
   amountTendered?: number | null
@@ -92,7 +92,7 @@ export interface ManualSettleResult {
   feeAmount: number
   feeBilledTo: 'none' | 'landlord' | 'tenant'
   feePaymentId: string | null
-  /** S637: the rows this settled — what the receipt itemises. */
+  /** S637: the rows this settled — what the receipt itemizes. */
   settledPaymentIds: string[]
   /** S637: what this settled, and what became of any surplus. */
   amountSettled: number
@@ -276,7 +276,7 @@ export async function settleManualRentPayment(
     //
     // Work-trade suspended rows are excluded: they are not owed now. They settle
     // at month close against hours worked, and sweeping them into a cash payment
-    // would collect rent somebody's labour already covered.
+    // would collect rent somebody's labor already covered.
     `UPDATE payments
         SET status = 'settled',
             settled_at = COALESCE($4::timestamptz, NOW()),

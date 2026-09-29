@@ -97,7 +97,7 @@ export async function billReview(runId: string) {
  * A read changed before anything was issued: drop the property's unissued bills
  * for that cycle onward, so the engine prices them again from the fixed number.
  * The whole property, not just the meter — a submeter's usage comes off its RUBS
- * master's pool, so fixing one read can move a neighbour's share.
+ * master's pool, so fixing one read can move a neighbor's share.
  * Returns false (and drops nothing) if anything from that span was issued.
  */
 export async function dropUnissuedBillsFrom(meterId: string, cycleMonth: any): Promise<boolean> {

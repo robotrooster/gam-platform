@@ -7,7 +7,7 @@
  *
  * The load-bearing test is the last one: the figure QUOTED to the tenant and the
  * figure the platform CHARGES must come from the same formula. A tenant choosing
- * a method on a number we then do not honour is the failure this guards.
+ * a method on a number we then do not honor is the failure this guards.
  */
 import { describe, it, expect } from 'vitest'
 import { paymentMethodCosts, processingFeeFor, PROCESSING_FEES } from '@gam/shared'

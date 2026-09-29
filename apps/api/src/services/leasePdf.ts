@@ -120,7 +120,7 @@ export async function generateLeasePdfBytes(leaseId: string): Promise<Uint8Array
   const fontBold = await pdf.embedFont(StandardFonts.HelveticaBold)
 
   const black = rgb(0, 0, 0)
-  const grey  = rgb(0.4, 0.4, 0.4)
+  const gray  = rgb(0.4, 0.4, 0.4)
   const gold  = rgb(0.788, 0.635, 0.153)
   const margin = 54
 
@@ -154,7 +154,7 @@ export async function generateLeasePdfBytes(leaseId: string): Promise<Uint8Array
       y -= size + 4
     }
   }
-  const heading = (t: string) => { ensure(28); y -= 6; page.drawText(t, { x: margin, y, size: 11, font: fontBold, color: grey }); y -= 16 }
+  const heading = (t: string) => { ensure(28); y -= 6; page.drawText(t, { x: margin, y, size: 11, font: fontBold, color: gray }); y -= 16 }
   const kv = (k: string, v: string) => {
     ensure(16)
     page.drawText(k, { x: margin, y, size: 10, font: fontBold, color: black })
@@ -241,13 +241,13 @@ export async function generateLeasePdfBytes(leaseId: string): Promise<Uint8Array
   ensure(40)
   page.drawText('Landlord:', { x: margin, y, size: 10, font: fontBold, color: black })
   page.drawText(ctx.landlord_name, { x: margin + 90, y, size: 10, font, color: black })
-  page.drawText(sigStatus(ctx.signed_by_landlord), { x: width - margin - 150, y, size: 9, font, color: ctx.signed_by_landlord ? rgb(0.16, 0.64, 0.35) : grey })
+  page.drawText(sigStatus(ctx.signed_by_landlord), { x: width - margin - 150, y, size: 9, font, color: ctx.signed_by_landlord ? rgb(0.16, 0.64, 0.35) : gray })
   y -= 18
   for (const tn of (ctx.tenant_names.length ? ctx.tenant_names : ['—'])) {
     ensure(20)
     page.drawText('Tenant:', { x: margin, y, size: 10, font: fontBold, color: black })
     page.drawText(tn, { x: margin + 90, y, size: 10, font, color: black })
-    page.drawText(sigStatus(ctx.signed_by_tenant), { x: width - margin - 150, y, size: 9, font, color: ctx.signed_by_tenant ? rgb(0.16, 0.64, 0.35) : grey })
+    page.drawText(sigStatus(ctx.signed_by_tenant), { x: width - margin - 150, y, size: 9, font, color: ctx.signed_by_tenant ? rgb(0.16, 0.64, 0.35) : gray })
     y -= 18
   }
 
@@ -259,7 +259,7 @@ export async function generateLeasePdfBytes(leaseId: string): Promise<Uint8Array
     executed
       ? 'This document reflects the executed lease terms of record on the GAM platform.'
       : 'This document reflects the current lease terms of record on the GAM platform and is not yet fully executed.',
-    8, font, grey)
+    8, font, gray)
 
   return await pdf.save()
 }

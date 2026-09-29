@@ -66,13 +66,13 @@ export function InviteTenantModal({ onClose }: Props) {
   //   · an OWNER-OCCUPIED unit, which has no lease at all, so it read as free.
   //   · a unit already holding a signed-but-not-active lease.
   //
-  // Hidden rather than greyed, per the rule Nic set for the meter pickers ("I
+  // Hidden rather than grayed, per the rule Nic set for the meter pickers ("I
   // don't want them grayed out because then I still have to scroll around
   // looking for just the odd one or two"), with a count of what was hidden
   // underneath so nothing vanishes unexplained.
   const { data: allUnits = [] } = useQuery<any[]>('vacant-units', () => apiGet('/units'))
   // S629: the predicate moved to lib/inviteEligibility so the Tenant Onboarding
-  // roster form applies exactly the same rule. Behaviour here is unchanged.
+  // roster form applies exactly the same rule. Behavior here is unchanged.
   const hiddenReasons = hiddenUnitReasons(allUnits as any[])
   const units = (allUnits as any[]).filter(canInviteToUnit)
 

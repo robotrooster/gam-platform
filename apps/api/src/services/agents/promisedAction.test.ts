@@ -56,7 +56,7 @@ describe('what must NOT be flagged', () => {
  * no name or email, could not call book_sales_call, and had been told only not
  * to promise.
  *
- * Asserted on the prompt text rather than on model behaviour: the branch either
+ * Asserted on the prompt text rather than on model behavior: the branch either
  * is offered to the model or it is not, and that is the part we control.
  */
 import { readFileSync } from 'node:fs'

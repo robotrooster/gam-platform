@@ -91,7 +91,7 @@ const staffActor = (keys: string[]) => ({
   auth: {
     // S633: 'maintenance_worker' IS NOT A ROLE. The canonical one is
     // 'maintenance' (packages/shared USER_ROLES). The fixture only ever worked
-    // because the old scope helper fell back to profileId for any unrecognised
+    // because the old scope helper fell back to profileId for any unrecognized
     // role — the same fallback that let a tenant's profileId read as a company.
     // With that gone, an invented role resolves to no scope, which is correct
     // and is what surfaced this. Now it exercises a real team role.

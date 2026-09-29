@@ -22,7 +22,7 @@ describe('normalizePersonName', () => {
     expect(normalizePersonName('ANASTACIO ERREGUIN')).toBe('Anastacio Erreguin')
   })
 
-  it('capitalises after an apostrophe or hyphen', () => {
+  it('capitalizes after an apostrophe or hyphen', () => {
     expect(normalizePersonName("o'brien")).toBe("O'Brien")
     expect(normalizePersonName('mary-jane')).toBe('Mary-Jane')
   })

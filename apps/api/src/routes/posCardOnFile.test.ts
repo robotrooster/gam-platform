@@ -21,7 +21,7 @@ import { camelCaseKeys } from '../lib/caseConversion'
 
 const created: any[] = []
 let cardOnCustomer: any = { id: 'pm_saved', type: 'card', card: { brand: 'visa', last4: '4242' } }
-let chargeBehaviour: 'ok' | 'auth_required' | 'declined' = 'ok'
+let chargeBehavior: 'ok' | 'auth_required' | 'declined' = 'ok'
 
 vi.mock('../lib/stripe', () => ({
   getStripe: () => ({
@@ -33,10 +33,10 @@ vi.mock('../lib/stripe', () => ({
     paymentIntents: {
       create: async (args: any) => {
         created.push(args)
-        if (chargeBehaviour === 'auth_required') {
+        if (chargeBehavior === 'auth_required') {
           const e: any = new Error('auth needed'); e.code = 'authentication_required'; throw e
         }
-        if (chargeBehaviour === 'declined') {
+        if (chargeBehavior === 'declined') {
           const e: any = new Error('Your card was declined'); e.code = 'card_declined'; throw e
         }
         return { id: 'pi_on_file', status: 'succeeded' }
@@ -61,7 +61,7 @@ beforeEach(async () => {
   await cleanupAllSchema()
   created.length = 0
   cardOnCustomer = { id: 'pm_saved', type: 'card', card: { brand: 'visa', last4: '4242' } }
-  chargeBehaviour = 'ok'
+  chargeBehavior = 'ok'
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_cof'
   ;({ posRouter } = await import('./pos'))
   ;({ errorHandler } = await import('../middleware/errorHandler'))
@@ -147,7 +147,7 @@ describe('charging the card already on file', () => {
 
   it('records no sale when the bank wants the cardholder present', async () => {
     const f = await seed()
-    chargeBehaviour = 'auth_required'
+    chargeBehavior = 'auth_required'
     const res = await sell(f)
     expect(res.status).toBe(402)
     expect(res.body.error).toMatch(/cardholder present|reader/i)
@@ -157,7 +157,7 @@ describe('charging the card already on file', () => {
   it('records no sale on a decline', async () => {
     // A sale row for money that never arrived is worse than no row.
     const f = await seed()
-    chargeBehaviour = 'declined'
+    chargeBehavior = 'declined'
     const res = await sell(f)
     expect(res.status).toBe(402)
     expect(await query('SELECT 1 FROM pos_transactions')).toHaveLength(0)

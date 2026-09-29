@@ -1,7 +1,7 @@
 /**
  * S628 — the queue behaves like a queue.
  *
- * The behaviour being pinned is the one that was missing when the model server
+ * The behavior being pinned is the one that was missing when the model server
  * aborted four times in an hour: too many people at once should make everybody
  * wait, not take the machine down and lose every conversation in flight.
  */

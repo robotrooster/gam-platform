@@ -56,7 +56,7 @@ export function RentRollPage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Rent Roll</h1>
-          <p className="page-subtitle">Contracted monthly rent across every occupied unit — including non-paying and evicting units, which still owe under their lease. Work-trade spaces are listed but totalled apart: their rent is settled in hours.</p>
+          <p className="page-subtitle">Contracted monthly rent across every occupied unit — including non-paying and evicting units, which still owe under their lease. Work-trade spaces are listed but totaled apart: their rent is settled in hours.</p>
         </div>
       </div>
 

@@ -305,7 +305,7 @@ async function notifyBothSides(o: {
       userId: landlordUser,
       landlordId: head.landlord_id,
       // Reuses the existing landlord type so this lands in the same place as
-      // every other "your rent arrived" notice, and honours the same preference.
+      // every other "your rent arrived" notice, and honors the same preference.
       type: 'rent_collected',
       title: 'A bank deposit was applied to rent',
       body: `A $${o.amount.toFixed(2)} deposit was matched to rent and recorded as paid ${o.effectivePaidDate}.${lateLine}`,

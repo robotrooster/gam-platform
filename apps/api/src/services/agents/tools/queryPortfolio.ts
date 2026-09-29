@@ -25,22 +25,22 @@
  * toolRouting.ts).
  *
  * COMPLAINTS ARE NOW CAPTURED. When this was first written nothing on the
- * platform recorded a complaint, so "who complains about their neighbour most"
+ * platform recorded a complaint, so "who complains about their neighbor most"
  * had no answer. Nic: "the table is gonna be created in the agent chat — that's
  * the point of contact where tenants are gonna complain about the neighbor."
  * So tenant_complaints exists and log_complaint (tenant side) writes to it, and
  * the two rankings that matter are here:
  *
  *   tenants.complaints_filed  -> who is always unhappy
- *   units.complaints_about    -> the neighbour who is the actual problem
+ *   units.complaints_about    -> the neighbor who is the actual problem
  *
  * Counts start from the day that shipped; a quiet older tenancy means "not
  * recorded", not "never complained", and the result says so.
  *
- * Still NOT categorisable: lease_notices is free text with no type column, so
+ * Still NOT categorizable: lease_notices is free text with no type column, so
  * notices can be counted per tenant and not broken down by reason. Never infer
  * a complaint from a maintenance category — those are hvac/plumbing/electrical/
- * appliance and say nothing about neighbours.
+ * appliance and say nothing about neighbors.
  */
 
 import { query } from '../../../db'
@@ -143,7 +143,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     notices_received: {
-      means: 'how many notices the landlord has served them (free text — not categorised)',
+      means: 'how many notices the landlord has served them (free text — not categorized)',
       unit: 'notices',
       sql: `SELECT u.first_name || ' ' || u.last_name AS label,
                    COUNT(n.id)::int AS value, NULL::text AS detail
@@ -179,7 +179,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
              GROUP BY un.id, un.unit_number`,
     },
     complaints_about: {
-      means: 'how many complaints have been raised ABOUT this unit — the neighbour who is the actual problem',
+      means: 'how many complaints have been raised ABOUT this unit — the neighbor who is the actual problem',
       unit: 'complaints',
       sql: `SELECT un.unit_number AS label, COUNT(c.id)::int AS value,
                    MAX(p.name) AS detail
@@ -365,7 +365,7 @@ export const queryPortfolio: AgentTool = {
       })),
       whatThisDoesNotContain:
         'Only the rows above, in this order, for this one measure. No trend, no cause, no comparison ' +
-        'to other landlords, and no judgement about whether a tenant is reasonable — report the ' +
+        'to other landlords, and no judgment about whether a tenant is reasonable — report the ' +
         'numbers and let the landlord draw the conclusion.',
     }
   },

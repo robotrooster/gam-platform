@@ -14,7 +14,7 @@
  * Why this rather than fixing the webhook: the webhook should be fixed too, and
  * only Nic can see whether one is registered in the Checkr dashboard. But a
  * $44.99 report that gates somebody's tenancy must not depend on a single HTTP
- * request arriving. A webhook is an optimisation — it makes the answer arrive
+ * request arriving. A webhook is an optimization — it makes the answer arrive
  * in seconds instead of minutes. This is what makes the answer arrive at all.
  *
  * Deliberately narrow: it advances a check the provider says has moved, using

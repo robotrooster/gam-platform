@@ -632,7 +632,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
 
   // ── S605: deep links ────────────────────────────────────────────────────
   //   #demo                  → the sales demo modal (as the buttons open it)
-  //   #onboarding            → same engine, relabelled as an onboarding call
+  //   #onboarding            → same engine, relabeled as an onboarding call
   //   #onboarding/<token>    → onboarding call, identity prefilled from the token
   //
   // Outreach to a landlord who signed up but stalled needs ONE clickable URL;
@@ -670,7 +670,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
     // Bare #onboarding deliberately falls through to demo: booking an onboarding
     // call REQUIRES a token (the server takes identity only from the token row),
     // so onboarding labels without one would promise a booking we can't make.
-    // The tokenised email link is the only real onboarding entry point.
+    // The tokenized email link is the only real onboarding entry point.
     if(lower === 'demo' || lower === 'onboarding'){
       mode='demo'; prefill=null; bookingToken=null; applyMode(); openModal(); return;
     }

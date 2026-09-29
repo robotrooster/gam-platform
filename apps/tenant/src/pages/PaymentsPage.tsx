@@ -81,7 +81,7 @@ const STATUS_BADGE: Record<string, string> = {
 // full price struck through with the saving named, rather than quietly showing a
 // smaller number. Nic: the tenant "needs to know that the landlord is actively
 // covering that and that they may choose to stop covering that at any time" — so
-// if a $10 ever does appear later, they recognise it as the landlord stopping
+// if a $10 ever does appear later, they recognize it as the landlord stopping
 // rather than a new charge nobody warned them about.
 function WaysToPay({ lease, reports = [], onReportDeposit, onWithdrawn }: {
   lease: any
@@ -476,7 +476,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                 {formatCurrency(b.outstanding)}
               </div>
               <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 2 }}>Due {b.dueDate}</div>
-              {/* Every utility itemised, so the total is never a number they
+              {/* Every utility itemized, so the total is never a number they
                   have to phone up about. */}
               <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
                 {b.rows.map((l: any) => (

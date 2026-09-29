@@ -215,7 +215,7 @@ export function CashPositionPanel({ entityId = '' }: { entityId?: string }) {
       {data.unattributedDeposits > 0 && (
         <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 10, lineHeight: 1.5 }}>
           There {data.unattributedDeposits === 1 ? 'is' : 'are'} also {data.unattributedDeposits}{' '}
-          {data.unattributedDeposits === 1 ? 'deposit' : 'deposits'} totalling{' '}
+          {data.unattributedDeposits === 1 ? 'deposit' : 'deposits'} totaling{' '}
           {formatCurrency(data.unattributedTotal)} that nothing has been matched to yet.
         </div>
       )}

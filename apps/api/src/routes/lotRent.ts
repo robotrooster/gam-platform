@@ -25,7 +25,7 @@ function landlordScope(req: any): string {
  * Expenses tab could not; the WRITE resolver was scoping a list.
  *
  * S633's rule has two halves and this route only had one: READS span every
- * entity the account owns, WRITES take an explicit authorised target. A read
+ * entity the account owns, WRITES take an explicit authorized target. A read
  * narrows only when ?entityId= names one, and that path still goes through the
  * same resolver, so an entity the account does not own is still a 403.
  */

@@ -324,7 +324,7 @@ export function computePlatformCut(opts: {
   // S607: delegates to the shared formula so the fee a tenant is QUOTED on the
   // invoice and the fee they are CHARGED come from one definition. Two copies
   // of this arithmetic is how a repricing lands in one place and not the other,
-  // and the tenant picks a method on a number we then do not honour.
+  // and the tenant picks a method on a number we then do not honor.
   return processingFeeFor(opts)
 }
 

@@ -42,7 +42,7 @@ function endOf(row: { starts_at: string | Date; duration_minutes: number }): Dat
 }
 
 // booked/completed → CONFIRMED; cancelled/no_show → CANCELLED (so a subscriber's
-// calendar greys/removes the event).
+// calendar grays/removes the event).
 function icalStatus(s: DemoSlotRow['status']): 'CONFIRMED' | 'CANCELLED' {
   return s === 'cancelled' || s === 'no_show' ? 'CANCELLED' : 'CONFIRMED'
 }

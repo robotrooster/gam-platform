@@ -83,7 +83,7 @@ export interface OwnerStatement {
 /** ISO first-of-month for the month containing `month` (accepts 'YYYY-MM' too). */
 export function monthStart(month: string): string {
   const m = /^(\d{4})-(\d{2})/.exec(month)
-  if (!m) throw new Error(`ownerStatement: unrecognised month "${month}"`)
+  if (!m) throw new Error(`ownerStatement: unrecognized month "${month}"`)
   return `${m[1]}-${m[2]}-01`
 }
 

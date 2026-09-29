@@ -54,7 +54,7 @@ export const checkPropertyAvailability: AgentTool = {
     // tool result every time: the result is the most recent and most specific
     // thing in the context, and it said "in the past" in plain English. So the
     // agent told someone trying to hand over money that their dates had already
-    // happened, and apologised for "using the current date".
+    // happened, and apologized for "using the current date".
     //
     // The error now carries the instruction instead of the phrase, and offers
     // the month they most likely meant so the question can be a confirmation
@@ -92,7 +92,7 @@ export const checkPropertyAvailability: AgentTool = {
           `Use those strings verbatim; do not compose a date yourself and never state a year other ` +
           `than ${likely.year}.\n` +
           `Say nothing about the calendar, nothing about which dates are or are not still available ` +
-          `in time, and do not apologise or mention any date you assumed. Just ask the month.`,
+          `in time, and do not apologize or mention any date you assumed. Just ask the month.`,
       }
     }
 

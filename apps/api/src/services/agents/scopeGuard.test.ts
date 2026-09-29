@@ -95,7 +95,7 @@ describe('stripChatMarkdown (S617)', () => {
     expect(stripChatMarkdown(ok)).toBe(ok)
   })
 
-  it('does not eat an asterisk used as a footnote or maths', () => {
+  it('does not eat an asterisk used as a footnote or math', () => {
     expect(stripChatMarkdown('2 * 3 = 6')).toBe('2 * 3 = 6')
   })
 
@@ -324,7 +324,7 @@ describe('stripChatMarkdown — run-on bullet lists', () => {
     expect(stripChatMarkdown(p)).toBe(p)
   })
 
-  it('still normalises a properly formatted list', () => {
+  it('still normalizes a properly formatted list', () => {
     expect(stripChatMarkdown('Vacant:\n- House 02\n- House 03'))
       .toBe('Vacant:\n• House 02\n• House 03')
   })

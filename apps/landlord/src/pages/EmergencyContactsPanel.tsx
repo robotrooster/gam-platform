@@ -173,7 +173,7 @@ export function EmergencyContactsPanel() {
                         onChange={e => setDraft(r.tenantId, { phone: e.target.value })} />
                       {/* S640: somebody already in the system with this name and
                           a number on file. Offered, never applied — a wrong
-                          number here gets dialled on the worst day of
+                          number here gets dialed on the worst day of
                           somebody's life. */}
                       {!d.phone && r.suggestion && (
                         <button type="button" className="btn btn-ghost btn-sm"

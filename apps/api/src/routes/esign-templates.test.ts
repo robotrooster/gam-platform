@@ -469,7 +469,7 @@ describe('S652: a disclosure can be written for one state', () => {
       .get('/api/esign/disclosures').set('Authorization', `Bearer ${f.tokenA}`)
     const asb = res.body.data.find((d: any) => d.type === 'asbestos')
     expect(asb.documents).toHaveLength(2)
-    expect(asb.states.sort()).toEqual(['IL', 'WA'])   // lowercase input normalised
+    expect(asb.states.sort()).toEqual(['IL', 'WA'])   // lowercase input normalized
 
     const lbp = res.body.data.find((d: any) => d.type === 'lead_based_paint')
     expect(lbp.documents[0].stateCode).toBeNull()     // federal: it travels

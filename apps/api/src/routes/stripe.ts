@@ -711,7 +711,7 @@ stripeRouter.post('/tenant/microdeposits/verify', async (req, res, next) => {
       // the descriptor code uppercase (SM + 4 characters) and a bank statement
       // may render it either way; a tenant retyping what they see in lowercase
       // must not fail a verification that Stripe counts as a wrong guess and
-      // locks after a few. Normalising here covers every client, including any
+      // locks after a few. Normalizing here covers every client, including any
       // future one that forgets to.
       descriptorCode: z.string().trim().toUpperCase().min(4).max(12).optional(),
     }).parse(req.body ?? {})

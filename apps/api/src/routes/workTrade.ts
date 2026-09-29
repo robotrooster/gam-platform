@@ -131,7 +131,7 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
     }).parse(req.body)
 
     // S633: the agreement belongs to the company that owns the unit it is
-    // written against — derived and authorised in one step, rather than assumed
+    // written against — derived and authorized in one step, rather than assumed
     // from whichever company the session sat on.
     const landlordId = await landlordIdForUnit(req.user!, body.unitId, query)
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [body.unitId])

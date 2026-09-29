@@ -400,7 +400,7 @@ export function SchedulePage() {
   // S639 (Nic, DIRECTIVE): "Master schedule needs to be scoped to a property,
   // not having all the different properties on one schedule." Spot numbers
   // repeat across parks, so a merged timeline stacks several identically
-  // labelled rows — unreadable, and a way to book the wrong space. The park is
+  // labeled rows — unreadable, and a way to book the wrong space. The park is
   // picked once and remembered (shared with the Units page), and the fetch
   // itself is scoped so a big account never pulls the whole portfolio.
   const { data: allProperties = [] } = useQuery<any[]>(
@@ -1456,7 +1456,7 @@ export function SchedulePage() {
                       zIndex 1 the bars painted over the unit info (S526 glitch). */}
                   {/* S652 (Nic): the space number and nothing else — the property is
                       chosen at the top of the page and the type is on the button
-                      colour. Three lines per row made the grid scroll for no reason.
+                      color. Three lines per row made the grid scroll for no reason.
                       zIndex 5: the long-stay bars and the floating names (2) slid
                       over this column during a fast scroll. */}
                   <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:5,height:56,boxSizing:'border-box',overflow:'hidden'}}>
@@ -2390,7 +2390,7 @@ export function SchedulePage() {
                     <button className="btn btn-sm" style={{marginLeft:'auto',color:'var(--red,#ff6b81)',borderColor:'var(--red,#ff6b81)'}}
                       disabled={cancelBookingMut.isLoading || d.status==='cancelled'}
                       onClick={()=>{ appConfirm('Cancel this reservation?', { danger: true, confirmLabel: 'Cancel reservation' }).then(ok => { if (ok) cancelBookingMut.mutate(d) }) }}>
-                      {cancelBookingMut.isLoading?'Cancelling…':'Cancel reservation'}
+                      {cancelBookingMut.isLoading?'Canceling…':'Cancel reservation'}
                     </button>
                   )}
                 </div>

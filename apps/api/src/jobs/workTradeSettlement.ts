@@ -36,7 +36,7 @@ const ROW_PRIORITY = `CASE p.type WHEN 'rent' THEN 0 WHEN 'utility' THEN 1
 
 // S648: a period's identity is its START date. With the 1st as the due day
 // that is the month label itself, so nothing changes for calendar tenants; a
-// tenant due on the 15th can have two periods labelled with one month (the
+// tenant due on the 15th can have two periods labeled with one month (the
 // move-in stub and the first full period), and the start tells them apart.
 async function loadOpenPeriods(
   client: PoolClient, agreementId: string, throughMonth: string,
@@ -75,7 +75,7 @@ async function loadOpenPeriods(
  * Apply `credit` dollars to an invoice's still-open rows, rent first.
  *
  * A row the credit fully covers is marked settled and noted as covered by
- * labour rather than cash — the same record the old generation-time credit
+ * labor rather than cash — the same record the old generation-time credit
  * wrote, just produced a month later. A row it partly covers is reduced.
  */
 async function creditInvoice(
@@ -179,7 +179,7 @@ async function creditInvoice(
  * work trade agreement ends."
  *
  * `late_fee_exempt` on the invoice already covers it, and per Nic's S624 answer
- * this remainder is never fined — someone short on hours is short on labour, not
+ * this remainder is never fined — someone short on hours is short on labor, not
  * refusing to pay. It joins the carried-balance track, which is outside FIFO and
  * payable in part (S622).
  */

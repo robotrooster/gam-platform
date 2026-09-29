@@ -60,7 +60,7 @@ const HEADING: Partial<Record<string, RegExp>> = {
   recycling_garbage:        /recycl/i,
   home_sale_on_lot:         /sale of (?:the |a )?(?:mobile |manufactured )?home|assignment and sale/i,
   park_statement_of_policy: /statement of policy|prospectus/i,
-  statutory_acknowledgement:/acknowledg/i,
+  statutory_acknowledgment:/acknowledg/i,
   zoning_designation:       /zoning/i,
   septic_system:            /septic/i,
   well_water:               /well water|private well/i,
@@ -79,7 +79,7 @@ const BODY: Partial<Record<string, RegExp>> = {
   owner_agent_identity: /\b(?:landlord|owner|lessor|manager|management|agent)\s*(?:\(s\))?\s*:\s*[^:]{3,160}?\b(?:p\.?\s?o\.?\s+box|\d{2,6}\s+[A-Za-z0-9 .]{2,40}\b(?:street|st\.?|road|rd\.?|avenue|ave\.?|highway|hwy\.?|drive|dr\.?|lane|ln\.?|blvd\.?|way|u\.s\.))/i,
   utility_billing_method: /(?:charged|billed)\s+(?:to\s+(?:the\s+)?tenant\s+)?separately|submeter|sub-meter|ratio utility billing/i,
   shared_utilities: /master[- ]meter|not separately metered/i,
-  statutory_acknowledgement: /acknowledg\w*\s+(?:the\s+)?receipt\s+of/i,
+  statutory_acknowledgment: /acknowledg\w*\s+(?:the\s+)?receipt\s+of/i,
 }
 
 // A hazard the document keeps coming back to IS a section on it, even when the

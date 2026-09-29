@@ -1701,7 +1701,7 @@ booksRouter.get('/rent-roll', requireBooksRead, blockBusinessOwner, async (req, 
     // in the occupancy rate and NOT in expected rent — including it would show
     // a permanent phantom variance the landlord can never collect.
     // S616: a UTILITY_SERVICE space is not a rental and never earns rent — it
-    // is a neighbour's building this landlord happens to supply power or trash
+    // is a neighbor's building this landlord happens to supply power or trash
     // to. Left in, it sat in the rent roll as a $0 unit and counted toward
     // occupancy, which is the same shape as the S604 owner_use fix: occupied,
     // but not by anyone paying this landlord rent.

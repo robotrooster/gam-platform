@@ -13,7 +13,7 @@
  * address, and Checkr collects the rest on its hosted flow.
  *
  * /price decided which form to show and defaulted to 'mock' whenever a
- * landlordId was absent or unrecognised — which is the renter-pool path by
+ * landlordId was absent or unrecognized — which is the renter-pool path by
  * definition, and anyone opening the page with a bad id. It also disagreed
  * with /submit, which resolves the pool shell's provider. So an applicant
  * could be asked for an SSN that the placed order would never carry.
@@ -83,7 +83,7 @@ describe('screening provider resolution', () => {
     expect(res.body.data.providerCollectsPii).toBe(true)
   })
 
-  it('does the same for an unrecognised landlordId rather than showing the SSN form', async () => {
+  it('does the same for an unrecognized landlordId rather than showing the SSN form', async () => {
     shellMock.mockResolvedValue({ landlordId: randomUUID(), backgroundProvider: 'checkr' })
     const res = await price(`landlordId=${randomUUID()}`)
     expect(res.status).toBe(200)

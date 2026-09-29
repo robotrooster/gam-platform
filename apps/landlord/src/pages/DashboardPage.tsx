@@ -21,7 +21,7 @@ interface DashStats {
   /** S642: of collectedMtd, how much is ACH still clearing. */
   collectedInFlight?: number
   outstanding: number
-  // S640: rent that trades for labour — contracted, real, and never arriving as
+  // S640: rent that trades for labor — contracted, real, and never arriving as
   // money. Reported apart from monthlyRentVolume/outstanding, not inside them.
   workTradeRent?: number
   workTradeUnits?: number
@@ -342,7 +342,7 @@ export function DashboardPage() {
           )}
         </div>
         {/* Row 4: what you pay GAM.
-            S642 (Nic): the landlord referral programme is withdrawn — "not
+            S642 (Nic): the landlord referral program is withdrawn — "not
             having something there is better than offering it to landlords and
             then taking it away", and it cannot survive landlords onboarding
             free. The Referral Earnings and Net Platform Cost cards went with

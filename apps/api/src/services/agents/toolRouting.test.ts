@@ -207,7 +207,7 @@ describe('reading the lease itself', () => {
 })
 
 describe('landlord phrasings', () => {
-  // The exact wording that flaked in the battery, plus its neighbours.
+  // The exact wording that flaked in the battery, plus its neighbors.
   it('routes ONE named tenant or unit to the single-tenant lookup', () => {
     for (const m of [
       "what's bob chen's balance",
@@ -330,8 +330,8 @@ describe('portfolio analytics', () => {
 })
 
 describe('the safety properties', () => {
-  it('returns nothing when the table does not recognise the wording', () => {
-    // Falls back to the runner's previous behaviour; must not guess.
+  it('returns nothing when the table does not recognize the wording', () => {
+    // Falls back to the runner's previous behavior; must not guess.
     expect(tenant('what is FlexVault?')).toBeUndefined()
     expect(landlord('what is my property worth?')).toBeUndefined()
     expect(tenant('')).toBeUndefined()

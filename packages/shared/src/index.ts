@@ -440,7 +440,7 @@ export const EXPENSE_CATEGORY_LABEL: Record<ExpenseCategory, string> = {
   lot_rent: 'Lot rent', bank_fees: 'Bank fees / charges', other: 'Other',
 }
 
-// S605 (Nic): microdeposit verification comes in TWO flavours and STRIPE picks,
+// S605 (Nic): microdeposit verification comes in TWO flavors and STRIPE picks,
 // not us. Nic hit the mismatch live — the app promised "two small deposits" and
 // the verify screen then asked for a six-digit code:
 //
@@ -574,7 +574,7 @@ export const US_STATE_NAME: Record<string, string> = {
 /**
  * S652 — where a form comes from, the way a landlord says it. 'US' (and a
  * missing code) read as Federal; a state code reads as the state's name. Used
- * everywhere a library form is labelled, so the Templates list, the package
+ * everywhere a library form is labeled, so the Templates list, the package
  * picker and the send screen can never disagree about whether a form is
  * federal or Illinois-only.
  */
@@ -2876,13 +2876,13 @@ export const DISCLOSURE_TYPES = [
   'fire_damage',               // 2
   // S652 — NOT A DISCLOSURE, WHICH IS WHY IT NEEDED ITS OWN SLOT.
   //
-  // Nic, reading the acknowledgement block on Blu's lease: "is that
-  // acknowledgement a legal requirement? And is that also in your disclosure
+  // Nic, reading the acknowledgment block on Blu's lease: "is that
+  // acknowledgment a legal requirement? And is that also in your disclosure
   // list... because that didn't seem to fit into a category on your table."
   //
   // It did not, and he was right to notice. Every other entry here says
   // something about the PROPERTY — lead in the paint, water in the basement. An
-  // acknowledgement says something about the LANDLORD: that he did the things
+  // acknowledgment says something about the LANDLORD: that he did the things
   // the statute told him to do, evidenced by the tenant's initials beside each.
   //
   // Blu's four are real Illinois law, and specific: the tenant was offered the
@@ -2890,10 +2890,10 @@ export const DISCLOSURE_TYPES = [
   // (765 ILCS 745/14-1), was shown a copy of the lease before signing, and was
   // offered a written lease of not less than 24 months on a date BEFORE signing
   // (745/6 and 6(a), almost word for word), and received the park rules.
-  'statutory_acknowledgement',
+  'statutory_acknowledgment',
   // S652 — a state agency's own guide to tenant and landlord rights, handed to
   // the resident. Found stocking the government library: IDPH's "Living in a
-  // Manufactured Home Community" fit no slot. Not an acknowledgement (that is
+  // Manufactured Home Community" fit no slot. Not an acknowledgment (that is
   // the landlord's evidence he did something) and not a property fact — it is
   // the government explaining the law to the tenant in plain words. Many states
   // publish one, so this slot fills up as the library does.
@@ -2935,7 +2935,7 @@ export const DISCLOSURE_TYPE_LABEL: Record<DisclosureType, string> = {
   well_water:               'Well water / water quality',
   flood_zone:               'Flood zone or flood history',
   radon:                    'Radon',
-  mold:                     'Mould',
+  mold:                     'Mold',
   sex_offender_registry:    'Sex offender registry',
   asbestos:                 'Asbestos',
   meth_contamination:       'Methamphetamine contamination',
@@ -2971,7 +2971,7 @@ export const DISCLOSURE_TYPE_LABEL: Record<DisclosureType, string> = {
   screening_criteria:       'Screening criteria and fees',
   smoking_policy:           'Smoking policy',
   move_in_condition:        'Move-in condition checklist',
-  statutory_acknowledgement: 'Statutory acknowledgements (pamphlet, lease offer, rules)',
+  statutory_acknowledgment: 'Statutory acknowledgments (pamphlet, lease offer, rules)',
   tenant_rights_guide:      'Tenant rights guide from a government agency',
   landlord_tenant_act:      'Landlord-tenant act (the law itself)',
   renovation_notice:        'Renovation notice (lead-safe work)',
@@ -3145,7 +3145,7 @@ export const LEASE_COLUMNS = [
   'sale_price', 'sale_down_payment', 'sale_financed_amount',
   'sale_monthly_payment', 'sale_term_months', 'sale_interest_rate',
   'sale_first_payment_month',
-  // S652: derived from what the landlord typed — the last instalment and its month
+  // S652: derived from what the landlord typed — the last installment and its month
   'sale_final_payment_amount', 'sale_final_payment_month',
   // signature — PDF display only
   'tenant_signature', 'landlord_signature',
@@ -3559,7 +3559,7 @@ export interface WritableLeaseColumnSpec {
 /**
  * S622: a radio's options are the words the LEASE prints, not machine values.
  * These map whatever a landlord's form says onto the values the columns accept.
- * Unrecognised input resolves to the safe default rather than reaching the
+ * Unrecognized input resolves to the safe default rather than reaching the
  * database — a signed document must never fail to become a lease over wording.
  */
 export function normaliseLeaseType(raw: string | null | undefined): string {
@@ -3646,7 +3646,7 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
     // date is incoherent, and the dash convention exists precisely so
     // blank-end leases resolve predictably.
     //
-    // S622: NORMALISE. This value arrives from a radio whose options are the
+    // S622: NORMALIZE. This value arrives from a radio whose options are the
     // words the LEASE prints — "FIXED TERM", "MONTH-TO-MONTH TERM", whatever a
     // landlord's own form says — and it was written into a CHECK-constrained
     // column verbatim. A real signing run died here: everyone had signed, the
@@ -3673,7 +3673,7 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
     },
   },
   auto_renew_mode: {
-    // S622: same normalisation, same reason — the radio carries the lease's own
+    // S622: same normalization, same reason — the radio carries the lease's own
     // wording ("May continue to rent the Premises…", "Must vacate the Premises")
     // and the column takes two fixed values.
     parse: (v) => {
@@ -4024,8 +4024,8 @@ export const UTILITY_TYPES: readonly UtilityType[] = ['water', 'gas', 'electric'
 // propane line printed "therms".
 //
 // The risk of two similar names is a landlord picking the wrong one, and that is
-// a LABEL problem, not a modelling one. Hence these, which also retire the raw
-// enum being capitalised straight into the UI.
+// a LABEL problem, not a modeling one. Hence these, which also retire the raw
+// enum being capitalized straight into the UI.
 export const UTILITY_TYPE_LABEL: Record<UtilityType, string> = {
   water:    'Water',
   sewer:    'Sewer',
@@ -4654,7 +4654,7 @@ export function achFeeLabel(): string {
  * Nic asked the invoice to show what each payment method would cost. A display
  * formula written separately from the charging formula is a quote that goes
  * stale the next time either is repriced — and the tenant would have chosen a
- * method based on a number we then did not honour. Same reasoning as S604's
+ * method based on a number we then did not honor. Same reasoning as S604's
  * derived labels, one level deeper: derive the FIGURES too, not just the words.
  */
 export function processingFeeFor(opts: {
@@ -5120,7 +5120,7 @@ export type PaymentType = typeof PAYMENT_TYPES[number]
 // outright. See CARD_DECLINE_FEE below.
 // S605: 'BALANCE' — arrears carried in from the landlord's previous system.
 // Its own descriptor rather than 'RENT': this is what the tenant sees on their
-// bank statement, and a debt they recognise as an old balance should not appear
+// bank statement, and a debt they recognize as an old balance should not appear
 // as a rent charge they might read as a duplicate.
 export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'MANUALPAY', 'HOMEPMT', 'FCPAYDOWN', 'DECLINEFEE', 'BALANCE'] as const
 export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
@@ -5144,7 +5144,7 @@ export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> =
   // the fee is for a payment handled and recorded BY HAND, not for the paper it
   // arrived on, so splitting instruments would create work with no difference in
   // outcome and simply move the argument to the next one (certified check, bank
-  // draft, traveller's cheque).
+  // draft, traveler's check).
   //
   // S646 (Nic) — THE LABEL LOST THE PARENTHETICAL. It used to read "Check (incl.
   // cashier's or certified)" to head off the argument. Nic: "we should remove
@@ -6805,7 +6805,7 @@ export const CONNECT_REQUIREMENT_LABEL: Record<string, string> = {
   'individual.email':                  'Your email address',
   'individual.ssn_last_4':             'The last 4 digits of your SSN',
   'individual.id_number':              'Your full SSN (or tax ID)',
-  'individual.verification.document':  'A photo of your driver’s licence or passport',
+  'individual.verification.document':  'A photo of your driver’s license or passport',
   'individual.verification.additional_document': 'A second ID document',
   'external_account':                  'The bank account rent should be deposited into',
   'tos_acceptance.date':               'Accepting Stripe’s terms',
@@ -6931,7 +6931,7 @@ export const listingMinPhotos = (unitType: string): number =>
  * a question about money, not about whether somebody is staying there. For
  * occupancy a booked spot is occupied whatever type it is.
  *
- * Service points are excluded, as everywhere else: a neighbour's building is
+ * Service points are excluded, as everywhere else: a neighbor's building is
  * not this landlord's occupancy either way.
  */
 export const SHORT_STAY_NIGHTS_PER_UNIT_MONTH = 30
@@ -6960,7 +6960,7 @@ export function occupancyRateFrom(
 // real problem next door.
 //
 // Deliberately NOT maintenance: maintenance_requests.category is a closed list
-// of hvac/plumbing/electrical/appliance/... with nothing that fits a neighbour,
+// of hvac/plumbing/electrical/appliance/... with nothing that fits a neighbor,
 // and forcing one in would corrupt repair reporting.
 export const COMPLAINT_CATEGORY_VALUES = [
   'noise', 'neighbor', 'parking', 'pets', 'smell', 'trash',
@@ -6993,7 +6993,7 @@ export const COMPLAINT_STATUS_LABEL: Record<ComplaintStatus, string> = {
 
 // S631: minimum password length, platform-wide. It lived as a local const in
 // routes/auth.ts, so the admin-invitation accept path (a second place that mints
-// a login) had no way to honour it without re-declaring the number — the exact
+// a login) had no way to honor it without re-declaring the number — the exact
 // drift the single-source rule exists to prevent.
 export const PASSWORD_MIN_LEN = 12
 
@@ -7079,11 +7079,11 @@ export function normalizePersonName(input: string | null | undefined): string {
   // Mixed case is a deliberate spelling — McDonald, O'Brien, JJ. Leave it.
   if (hasLower && hasUpper) return raw
   // Word by word, because initials are their own case. "JJ" and "TJ" are how
-  // people write their names, not shouting — a blanket lower-then-capitalise
+  // people write their names, not shouting — a blanket lower-then-capitalize
   // turns them into "Jj".
   return raw.split(' ').map(word => {
     if (/^[A-Z]{1,3}$/.test(word)) return word
-    // Capitalise the first letter of the word and after an internal hyphen or
+    // Capitalize the first letter of the word and after an internal hyphen or
     // apostrophe: mary-jane o'neill → Mary-Jane O'Neill.
     return word.toLowerCase().replace(/(^|[\-'’])([a-z])/g,
       (_m, sep: string, ch: string) => sep + ch.toUpperCase())
@@ -7103,7 +7103,7 @@ export function normalizePersonName(input: string | null | undefined): string {
 // at Mountain View RV Ranch returned every mobile home there too. The park name
 // is never what you are searching for — you already know which park you are in.
 //
-// This matches the UNIT NUMBER only, and normalises both sides so the spoken
+// This matches the UNIT NUMBER only, and normalizes both sides so the spoken
 // form and the written form land in the same place:
 //   "mobile home five", "mobile home 5", "MH5", "mh 05"  → all find MH 05
 //   "rv 9", "RV9", "space 9"                             → all find RV 09
@@ -7135,7 +7135,7 @@ export function normalizeUnitKey(input: string | null | undefined): string {
 /**
  * Does this unit match what the user typed? Prefix-based, so "mh" lists every
  * mobile home and "mh5" narrows to MH 5 (and MH 50-59, which is the useful
- * behaviour while still typing).
+ * behavior while still typing).
  *
  * Deliberately ignores the property name — that is the whole bug being fixed.
  */

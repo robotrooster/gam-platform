@@ -693,7 +693,7 @@ describe('POST /api/stripe/tenant/confirm-setup', () => {
     // lowercase? Should we lock the field to capital letters?" Stripe issues the
     // code upper case and a statement may render it either way. A wrong guess is
     // not free — Stripe counts them and locks the SetupIntent — so the code is
-    // normalised on the SERVER, covering every client rather than only the one
+    // normalized on the SERVER, covering every client rather than only the one
     // field that was fixed alongside it.
     it('upper-cases a lower-case descriptor code before it reaches Stripe', async () => {
       const { tenantId, userId } = await seedTenantWithStripe()

@@ -628,8 +628,8 @@ describe('S558 RUBS invoice gate', () => {
   // left unread anywhere on the master's line HELD the RUBS tenant's invoice,
   // because the pool could not be computed without it. The pool no longer
   // depends on any submeter — the RUBS units divide the whole bill — so one
-  // neighbour's unread meter must not sit on somebody else's invoice.
-  it('a neighbour\'s unread submeter no longer holds the RUBS unit invoice', async () => {
+  // neighbor's unread meter must not sit on somebody else's invoice.
+  it('a neighbor\'s unread submeter no longer holds the RUBS unit invoice', async () => {
     const app = buildApp()
     const f = await seed()
     const masterId = await addRubsMaster(f)
@@ -1403,7 +1403,7 @@ describe('S607: widened allocation bases', () => {
     const m = await seedSplit(f, 'hybrid', { primary: 'sqft', secondary: 'occupant_count', primaryPct: 50 })
     const c = await charges(app, f, m)
     // sqft shares 300/1200 = .25 and 900/1200 = .75; occupancy shares 1/4 = .25
-    // and 3/4 = .75. Blended 50/50 → .25 / .75. Normalising each side FIRST is
+    // and 3/4 = .75. Blended 50/50 → .25 / .75. Normalizing each side FIRST is
     // what stops square footage (hundreds) swamping headcount (ones).
     expect(c.a).toBeCloseTo(225, 2)
     expect(c.b).toBeCloseTo(675, 2)
@@ -1978,5 +1978,24 @@ describe('meter photos', () => {
     const forged = await request(app).post(`/api/utility/reading-runs/${run.id}/meters/${f.meterVacant}/reading`)
       .set('Authorization', `Bearer ${f.tokenA}`).send({ readingValue: 600, photoUrl: '/etc/passwd' })
     expect(forged.status).toBe(400)
+  })
+})
+
+// S652 (Nic): "I don't want to download readings… a spot to view the history
+// as some sort of spreadsheet." Landlord-only, like every other value history.
+describe('GET /api/utility/reading-history', () => {
+  it('lists each meter with its readings and what each one used', async () => {
+    const app = buildApp(); const f = await seed(); const run = await openRun(app, f)
+    expect((await enterReading(app, f, run.id, f.meterLeased, 1100)).status).toBe(201)
+    const res = await request(app).get(`/api/utility/reading-history?propertyId=${f.propertyAId}&months=36`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const m = res.body.data.meters.find((x: any) => x.meterId === f.meterLeased)
+    expect(m.readings.map((r: any) => r.value)).toEqual([1100, 1000])     // newest first
+    expect(m.readings[0].usage).toBe(100)                                  // 1100 − 1000
+    expect(m.readings[1].usage).toBeNull()                                 // nothing before the first
+    const other = await request(app).get(`/api/utility/reading-history?propertyId=${f.propertyAId}`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+    expect(other.status).toBe(403)
   })
 })

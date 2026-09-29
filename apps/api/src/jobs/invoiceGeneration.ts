@@ -712,10 +712,10 @@ async function runGeneration(
         //
         // The credit is a PERCENTAGE OF A BASIS, so an excluded charge has to
         // leave the basis as well as the distribution. Leave propane in the
-        // basis and the tenant's labour buys dollars off a bill they are meant
+        // basis and the tenant's labor buys dollars off a bill they are meant
         // to pay whole — the excluded charge silently discounts everything else,
-        // which is invisible on the invoice and wrong in the landlord's favour
-        // nowhere and the tenant's favour everywhere.
+        // which is invisible on the invoice and wrong in the landlord's favor
+        // nowhere and the tenant's favor everywhere.
         //
         // No agreement at all → everything is covered, which is what the credit
         // did before this existed.
@@ -726,8 +726,8 @@ async function runGeneration(
         // and THIS landlord — the tenant's hours buy dollars off what this
         // landlord is owed. A converged row is owed to the landlord next door,
         // who is not party to that bargain and never agreed to fund it. Leaving
-        // it in would quietly take money out of one landlord's pocket to honour
-        // another landlord's labour deal.
+        // it in would quietly take money out of one landlord's pocket to honor
+        // another landlord's labor deal.
         //
         // It leaves the BASIS as well as the distribution, for the S613 reason:
         // a charge that cannot be discounted must not inflate the pot that
@@ -882,7 +882,7 @@ async function runGeneration(
         // of the rent, so it asks 11/31 of the hours — otherwise every work-trade
         // tenancy would open ~69 hours in deficit for a month that charged eleven
         // days. `hourRate` is frozen here and never recomputed: a later rent
-        // change must not reprice labour owed for THIS month.
+        // change must not reprice labor owed for THIS month.
         if (wt && creditBasis > 0) {
           const monthStart = DateTime.fromISO(dueDate).startOf('month').toISODate()!
           const fullMonthBasis = round2(
@@ -963,7 +963,7 @@ async function runGeneration(
               invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
               Number(oc.amount).toFixed(2), dueDate,
               // The tenant reads the reason and the day it happened, so the
-              // line is recognisable instead of a bare amount they have to
+              // line is recognizable instead of a bare amount they have to
               // phone up about.
               `${oc.reason} (${new Date(oc.incident_date + 'T00:00:00Z')
                 .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })})`,
@@ -1002,7 +1002,7 @@ async function runGeneration(
           // S533: the invoice line carries begin/end reads + usage — the
           // tenant sees exactly what produced the charge (the blind rule
           // only ever applied to the READER's entry flow).
-          // S613: propane is sold and read in GALLONS. A propane line labelled
+          // S613: propane is sold and read in GALLONS. A propane line labeled
           // "therms" on a billable document is a wrong unit in front of a tenant.
           const UNIT_LABEL: Record<string, string> = { electric: 'kWh', water: 'gal', sewer: 'gal', gas: 'therms', propane: 'gal' }
           const pad = (v: any) => v == null ? null : String(Math.trunc(Number(v))).padStart(Number((ub as any).digits) || 6, '0')
@@ -1036,7 +1036,7 @@ async function runGeneration(
           // S616 — THE DIVERSION. This row's landlord is the bill's own, not the
           // lease's. For every ordinary utility they are the same value and
           // nothing changes; on a converged invoice this is the line that sends
-          // the neighbour's electricity money to the landlord whose meter
+          // the neighbor's electricity money to the landlord whose meter
           // turned, while the rent on the same document goes to the landlord who
           // owns the bricks. The payout sweep scopes by payments.landlord_id and
           // not by invoice, so no other code has to know this happened.

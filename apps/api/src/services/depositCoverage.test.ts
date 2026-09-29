@@ -12,7 +12,7 @@
  * that has nothing to do with the code. (Worth knowing generally: any
  * migration-seeded reference table is invisible to this harness.)
  *
- * So this guards the thing that IS behaviour: how a rate is MATCHED to a
+ * So this guards the thing that IS behavior: how a rate is MATCHED to a
  * deposit. That matching is what makes a 50-state table usable — and it is
  * where the subtle failure lives, because a state with a blanket rule and a
  * state with no rule at all look identical until you ask which one matched.
@@ -234,7 +234,7 @@ describe('S642 a blocked state says WHY', () => {
   })
 
   it('a reason never promotes a state to supported', async () => {
-    // Labelling must never be mistaken for clearance: flipping a state to
+    // Labeling must never be mistaken for clearance: flipping a state to
     // 'supported' sends real tenant money into GAM custody on a legal reading.
     await seed('ZA', 'blocked', 'vehicle_unconfirmed')
     const { rows } = await db.query<any>(

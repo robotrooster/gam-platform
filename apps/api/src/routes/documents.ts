@@ -267,7 +267,7 @@ documentsRouter.post('/', requirePerm('documents.upload', 'documents.post_photo'
       photoLandlordId = home.landlord_id
     }
     // S633: a document tagged to a unit belongs to the company that owns THAT
-    // unit — derived, and authorised by the same lookup that used to be a
+    // unit — derived, and authorized by the same lookup that used to be a
     // separate ownership check below. Untagged, the account names the company.
     // Previously this read the session's entity and then required the unit to
     // match it, so a document about the other company's unit was refused.

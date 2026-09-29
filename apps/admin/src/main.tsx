@@ -1048,7 +1048,7 @@ function Overview(){
   // FlexPay history yet. It buys DECISION TIME, which is what Nic actually
   // described wanting: "we should know about the last week of the month how
   // many more people we can approve for the next month." At 3% a single bad
-  // month empties it and enrolment stops that day; at 10%, against a ~3% real
+  // month empties it and enrollment stops that day; at 10%, against a ~3% real
   // loss rate, there is roughly a quarter's cushion — enough to see a trend,
   // tighten underwriting and taper deliberately rather than telling people who
   // were just approved no. Revisit once real loss data exists.
@@ -1063,7 +1063,7 @@ function Overview(){
   const reservePct=reserveTarget>0?Math.min(((stats?.reserveBalance||0)/reserveTarget)*100,100):0
 
   // S609: this WAS a hardcoded array — five invented months plus one real value
-  // labelled with a month it wasn't, drawing a tidy rising line whatever the
+  // labeled with a month it wasn't, drawing a tidy rising line whatever the
   // platform actually did. Now the real thing, from the settled ledger.
   const [trendMonths, setTrendMonths] = useState(6)
   const { data: trendData = [] } = useQuery<any[]>(
@@ -1861,7 +1861,7 @@ function Payments(){
   // The row IS still `pending` in the database, and correctly so: if the tenant
   // falls short on hours they get billed the difference at month close, so the
   // charge has to survive until reconciliation decides. What is wrong is
-  // showing that intermediate state to a human as an unpaid bill — it is labour
+  // showing that intermediate state to a human as an unpaid bill — it is labor
   // already being done, not money owed.
   //
   // workTradeSettlement (1st of the month, 02:15) zeroes what the hours covered
@@ -2276,7 +2276,7 @@ function Bool({ v }: { v: boolean }) {
   )
 }
 
-// ── S642 (Nic): THE COMMISSION PROGRAMME IS SCRAPPED ─────────────────────
+// ── S642 (Nic): THE COMMISSION PROGRAM IS SCRAPPED ─────────────────────
 //
 // "Scrap commissions completely. The $10 a month does not even begin to cover
 // the book that somebody would have had under their belt with us doing a
@@ -2289,7 +2289,7 @@ function Bool({ v }: { v: boolean }) {
 // Connect account — which barely covers Connect fees, bank linking and the
 // other per-account costs — there is nothing left to split, and a residual
 // nobody can live on is worse than no offer at all. Same reasoning that
-// retired the landlord referral programme earlier this session.
+// retired the landlord referral program earlier this session.
 //
 // The page, its nav item and its route are gone. NOT removed: commission_accruals
 // and the engine behind it (the table is EMPTY — nothing was ever earned or
@@ -3425,7 +3425,7 @@ function LoginPage(){
 // only credential, so the page shows the invited address read-only: it cannot be
 // pointed at a different one, and the role was fixed when the invitation was
 // sent. On success it hands off to the normal login, which runs straight into
-// the mandatory 2FA enrolment every admin must pass.
+// the mandatory 2FA enrollment every admin must pass.
 function AcceptInvite(){
   const token=window.location.pathname.split('/').pop()||''
   const navigate=useNavigate()

@@ -98,7 +98,7 @@ describe('S607: late fees never compound on late fees', () => {
     expect(first).toBeGreaterThan(0)
 
     // Those late fees are now sitting unpaid on the invoice. Re-running must not
-    // treat them as part of the amount being penalised.
+    // treat them as part of the amount being penalized.
     await generateLateFeesForTimezone(TZ)
     const second = (await lateFeeRows(invoiceId)).reduce((s, r) => s + Number(r.amount), 0)
 

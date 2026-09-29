@@ -37,7 +37,7 @@ export const getWorkTradeStanding: AgentTool = {
     'Where the tenant stands on their work-trade agreement: hours their current month asks for, ' +
     'hours carried over from earlier months, the total that would get them completely straight, ' +
     'and hours they have banked by working ahead. ' +
-    'Answer in hours — never quote a dollar value or a per-hour rate for work-trade labour. ' +
+    'Answer in hours — never quote a dollar value or a per-hour rate for work-trade labor. ' +
     'Use for "how many hours do I still owe?", "what happens if I only work 60 of my 80 hours?", ' +
     '"am I behind on my work trade?". Read-only.',
   parameters: { type: 'object', properties: {} },

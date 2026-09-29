@@ -708,7 +708,7 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
 // stamped without the reader choosing it: a departing lease whose tenant is
 // responsible for that utility → move_out_final (bills); everything else
 // (short-term / utilities-included) → stay_turnover (reference). Taking the
-// read, extending the stay, or cancelling all drop the row on the next fetch.
+// read, extending the stay, or canceling all drop the row on the next fetch.
 export async function getReadsDue(propertyId: string) {
   return query<any>(`
     WITH departures AS (

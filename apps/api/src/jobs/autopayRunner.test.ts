@@ -160,7 +160,7 @@ describe('S609 autopay runner', () => {
   // payable in part, usually large and on a catch-up footing — sweeping it into
   // an automatic pull would debit $1,800 from a tenant who set autopay up for
   // $800 of rent. That does not merely misapply money, it takes money that was
-  // never authorised.
+  // never authorized.
   it('S622: autopay never sweeps the carried-forward balance', async () => {
     await armForToday(f)
     await seedCharge(f, 800)

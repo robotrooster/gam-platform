@@ -1,7 +1,7 @@
 /**
  * S628 — tenant-first renewal. The 60-day question and the 32-day report.
  *
- * The behaviour worth pinning is the one that is easy to get backwards: the
+ * The behavior worth pinning is the one that is easy to get backwards: the
  * landlord alert fires whether or not the tenant answered, because "they have
  * not answered" is the case that needs a human. An alert conditional on an
  * answer would be silent in exactly the situation it exists for.

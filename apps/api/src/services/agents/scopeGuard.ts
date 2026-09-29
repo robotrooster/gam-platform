@@ -1,5 +1,5 @@
 /**
- * Last line of defence on the two ways an agent gives itself away.
+ * Last line of defense on the two ways an agent gives itself away.
  *
  * S617 (Nic): asked about something on another side of the platform, an agent
  * must answer as someone who has simply never heard of it — not as a machine
@@ -15,7 +15,7 @@
  * The first sentence is exactly right. The next one gives away both things at
  * once — it reaches for being an AI as the excuse, and it names whose feature
  * it is. Two prompt revisions did not shift it, so this is deterministic
- * instead. Prompts shape behaviour; they do not guarantee it, and this is the
+ * instead. Prompts shape behavior; they do not guarantee it, and this is the
  * kind of leak that is worth a guarantee.
  *
  * DELIBERATELY NARROW. It removes specific constructions, not topics — a
@@ -65,7 +65,7 @@ const LEAK_PATTERNS: { name: string; re: RegExp }[] = [
  * anyway. Asterisks around a name are not emphasis to the reader, they are
  * asterisks — so they are removed here rather than argued about.
  *
- * Bullets are normalised rather than deleted: a real list stays a list, it just
+ * Bullets are normalized rather than deleted: a real list stays a list, it just
  * stops carrying a markdown marker.
  */
 export function stripChatMarkdown(text: string): string {

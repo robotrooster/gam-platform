@@ -22,7 +22,7 @@ export interface SupportTemplate {
   label: string
   /** One line under the label — when to reach for this one. */
   when: string
-  /** Who it makes sense for; the picker greys out the rest. */
+  /** Who it makes sense for; the picker grays out the rest. */
   audience: 'landlord' | 'tenant' | 'any'
   subject: string
   /** `{{firstName}}` is filled from the chosen recipient before it is shown. */

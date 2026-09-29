@@ -30,7 +30,7 @@ describe('landlordScopeIds', () => {
   })
 
   it('S633: a landlord session with no landlordIds scopes to NOTHING, not to profileId', () => {
-    // The old behaviour fell back to profileId so a pre-S553 token kept its own
+    // The old behavior fell back to profileId so a pre-S553 token kept its own
     // book. S633 removes that on purpose: profileId no longer names an entity
     // for a landlord (routes/auth.ts mints it null), so falling back to it would
     // scope queries to a value that is either null or, worse, some other role's

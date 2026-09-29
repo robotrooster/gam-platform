@@ -292,7 +292,7 @@ describe('saysItWillCheck — the agent said it would go and check', () => {
   // A promised handoff is a real commitment that synthesizeHandoff turns into a
   // real escalation. Rewriting it here would break that.
   it('does not touch a REAL promised handoff', () => {
-    // promisesHandoff recognises these, synthesizeHandoff turns them into an
+    // promisesHandoff recognizes these, synthesizeHandoff turns them into an
     // actual escalation, and rewriting them here would break that.
     for (const reply of [
       "I'll connect you with a human support agent.",
@@ -303,7 +303,7 @@ describe('saysItWillCheck — the agent said it would go and check', () => {
 
   it('DOES catch a vague promise of follow-up that escalates nothing', () => {
     // "I'll check with the team and someone will get back to you" is not a
-    // handoff — promisesHandoff does not recognise it, so nothing is escalated
+    // handoff — promisesHandoff does not recognize it, so nothing is escalated
     // and nothing was looked up. The customer is left waiting on a promise no
     // part of the system has recorded. That is the "someone will email you
     // within 24 hours" dead end, and it should fail safe like any other.

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, CSSProperties } from 'react'
+import { useState, useEffect, useMemo, useRef, CSSProperties, Fragment } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPut, apiDelete, apiPatch, api } from '../lib/api'
@@ -138,6 +138,9 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
       URL.revokeObjectURL(a.href)
     } catch { toast.error('Could not download the readings') }
   }
+  // S652 (Nic): "I don't want to download readings… I want stuff to stay in the
+  // system, visible without downloading external reports."
+  const [historyOpen, setHistoryOpen] = useState(false)
   const [reviewReading, setReviewReading] = useState<any | null>(null)
   const [specialRead, setSpecialRead] = useState<{ meterId?: string; unitNumber?: string; reason?: string; label?: string } | null>(null)
 
@@ -239,7 +242,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
           {/* ── S652: the readings spreadsheet ── */}
           {canReview && propertyId && (
             <div style={{ display:'flex', justifyContent:'flex-end', marginBottom:12 }}>
-              <button className="btn btn-primary btn-sm" onClick={downloadReads}>Download readings</button>
+              <button className="btn btn-primary btn-sm" onClick={() => setHistoryOpen(true)}><Gauge size={13}/> Reading history</button>
             </div>
           )}
 
@@ -438,6 +441,9 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
       {walkRun && (
         <ReadingWalkModal run={walkRun} mode={walkRun.status === 'double_check' ? 'verify' : 'read'} api={walkApi} onClose={()=>{ setWalkRun(null); invalidate() }} />
       )}
+      {historyOpen && propertyId && (
+        <ReadingHistoryModal propertyId={propertyId} propertyName={thisProperty?.name || ''} onDownload={downloadReads} onClose={() => setHistoryOpen(false)} />
+      )}
       {specialRead && (
         <SpecialReadModal preset={specialRead} meters={(meters as any[]).filter(m=>m.billingMethod==='submeter')}
           onClose={()=>{ setSpecialRead(null); invalidate() }} />
@@ -478,7 +484,7 @@ function BrokenMeterPolicyCard({ property }: { property: any }) {
         <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={set.isLoading}
           onClick={() => on && set.mutate(false)}>Bill nothing until repaired</button>
         <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={set.isLoading}
-          onClick={() => !on && set.mutate(true)}>Bill the low end of what neighbours used</button>
+          onClick={() => !on && set.mutate(true)}>Bill the low end of what neighbors used</button>
       </div>
     </div>
   )
@@ -851,11 +857,16 @@ function PropaneSection({ propertyId, property, units, onChanged }: { propertyId
   const [fourDraft, setFourDraft] = useState(String(splitFourMin))
   useEffect(() => { setMinDraft(String(splitMin)); setFourDraft(String(splitFourMin)) }, [propertyId, splitMin, splitFourMin])
 
+  // S652 (Nic): "there's nowhere to click save anywhere. I don't know if it's
+  // actually recording anything." These saved the moment you clicked away —
+  // and said nothing. They still save on their own; now they say so.
+  const [savedAt, setSavedAt] = useState<number | null>(null)
   const settingsMut = useMutation(
     (p: any) => apiPost('/propane/settings', { propertyId, ...p }),
-    { onSuccess: () => { qc.invalidateQueries('properties'); onChanged() },
+    { onSuccess: () => { qc.invalidateQueries('properties'); onChanged(); setSavedAt(Date.now()); setTimeout(() => setSavedAt(null), 3000) },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save setting') }
   )
+  const thresholdsChanged = (minDraft !== '' && Number(minDraft) !== splitMin) || (fourDraft !== '' && Number(fourDraft) !== splitFourMin)
   const saveThreshold = (key: 'splitMinGallons' | 'splitFourMinGallons', draft: string, current: number) => {
     const v = Math.trunc(Number(draft))
     if (!draft || !Number.isFinite(v) || v < 1 || v === current) {
@@ -875,8 +886,10 @@ function PropaneSection({ propertyId, property, units, onChanged }: { propertyId
       <div className="card" style={{ padding:0 }}>
         <div style={{ display:'flex', gap:24, padding:'10px 16px', borderBottom:'1px solid var(--border-1)', flexWrap:'wrap' }}>
           <label style={{ display:'flex', alignItems:'center', gap:8, fontSize:'.8rem', cursor:'pointer' }}>
-            <input type="checkbox" checked={allowSplits} disabled={settingsMut.isLoading}
-              onChange={e=>settingsMut.mutate({ allowInstallments: e.target.checked })}/>
+            {/* S652: not disabled while it saves — that is what flashed the
+                "not allowed" cursor on every click. */}
+            <input type="checkbox" checked={allowSplits}
+              onChange={e=>{ if (!settingsMut.isLoading) settingsMut.mutate({ allowInstallments: e.target.checked }) }}/>
             Allow tenants to split fills into payments (2 or 4)
           </label>
           {allowSplits && (
@@ -899,6 +912,14 @@ function PropaneSection({ propertyId, property, units, onChanged }: { propertyId
               </label>
             </>
           )}
+          {allowSplits && thresholdsChanged && (
+            <button className="btn btn-primary btn-sm" disabled={settingsMut.isLoading}
+              onClick={() => settingsMut.mutate({
+                ...(Number(minDraft) !== splitMin ? { splitMinGallons: Math.trunc(Number(minDraft)) } : {}),
+                ...(Number(fourDraft) !== splitFourMin ? { splitFourMinGallons: Math.trunc(Number(fourDraft)) } : {}),
+              })}>Save</button>
+          )}
+          {savedAt && <span style={{ fontSize:'.74rem', color:'var(--green)', alignSelf:'center' }}>✓ Saved</span>}
           <span style={{ fontSize:'.72rem', color:'var(--text-3)', alignSelf:'center' }}>
             A new fill makes any prior fill balance due immediately.
           </span>
@@ -1336,11 +1357,24 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
   const lines: any[] = data?.lines ?? []
   const t = data?.totals
   if (!t || (t.spent === 0 && t.recovered === 0)) return null
-
+  // S652 (Nic): "spent zero, billed back $1,588.65, and not recovered
+  // $1,588.65… I want to fix this table so it's not confusing on anything."
+  // Four plain numbers, in the order the money moves: what the utility charged
+  // you, what you billed your tenants, what they have paid, what they still
+  // owe. The gap (charged but never billed) only shows where a charge was
+  // recorded — with nothing entered there is nothing to measure against.
+  const stat = (label: string, value: React.ReactNode, color?: string, hint?: string) => (
+    <div style={{ minWidth: 150 }}>
+      <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>{label}</div>
+      <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700, color }}>{value}</div>
+      {hint && <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginTop: 2 }}>{hint}</div>}
+    </div>
+  )
+  const th: React.CSSProperties = { textAlign: 'right' }
   return (
     <div style={{ marginBottom: 28 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-        <h2 style={{ fontSize: '.95rem', margin: 0 }}>What the utilities cost, and what came back</h2>
+        <h2 style={{ fontSize: '.95rem', margin: 0 }}>Utilities: billed, paid, and owed</h2>
         <select className="form-select" style={{ width: 'auto', fontSize: '.78rem', padding: '2px 8px' }}
           value={year} onChange={e => setYear(Number(e.target.value))}>
           {[thisYear, thisYear - 1, thisYear - 2].map(y => <option key={y} value={y}>{y}</option>)}
@@ -1348,35 +1382,22 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
       </div>
       <div className="card" style={{ padding: 14 }}>
         <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', marginBottom: 12 }}>
-          <div>
-            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Spent</div>
-            <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{fmt(t.spent)}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Billed back</div>
-            <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--green)' }}>{fmt(t.recovered)}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Not recovered</div>
-            <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700, color: t.notRecovered > 0 ? 'var(--gold)' : 'var(--text-1)' }}>
-              {fmt(t.notRecovered)}
-            </div>
-          </div>
-          {t.ownerOccupied > 0 && (
-            <div>
-              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Of that, your own units</div>
-              <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{fmt(t.ownerOccupied)}</div>
-            </div>
-          )}
+          {stat('Billed to tenants', fmt(t.recovered))}
+          {stat('Tenants have paid', fmt(t.collected), 'var(--green)')}
+          {stat('Tenants still owe', fmt(t.stillOwed), t.stillOwed > 0 ? 'var(--gold)' : undefined)}
+          {stat('The utility charged you', t.spent > 0 ? fmt(t.spent) : '—', undefined, t.spent > 0 ? undefined : 'none recorded yet')}
+          {t.notRecovered != null && stat('Charged but never billed', fmt(Math.max(0, t.notRecovered)), t.notRecovered > 0 ? 'var(--gold)' : undefined)}
+          {t.ownerOccupied > 0 && stat('Of that, your own units', fmt(t.ownerOccupied))}
         </div>
         <table style={{ width: '100%', fontSize: '.78rem', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ color: 'var(--text-3)', fontSize: '.68rem', textTransform: 'uppercase', letterSpacing: '.05em' }}>
               <th style={{ textAlign: 'left', padding: '4px 0' }}>Utility</th>
-              <th style={{ textAlign: 'right' }}>Spent</th>
-              <th style={{ textAlign: 'right' }}>Billed back</th>
-              <th style={{ textAlign: 'right' }}>Not recovered</th>
-              <th style={{ textAlign: 'right' }}>Your units</th>
+              <th style={th}>Billed to tenants</th>
+              <th style={th}>Paid</th>
+              <th style={th}>Still owed</th>
+              <th style={th}>Utility charged you</th>
+              <th style={th}>Never billed</th>
             </tr>
           </thead>
           <tbody>
@@ -1386,21 +1407,22 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
                   {UTILITY_ICONS[l.utilityType] || ''}{' '}
                   {l.utilityType === 'unspecified' ? 'Unspecified' : (UTILITY_TYPE_LABEL[l.utilityType as UtilityType] ?? l.utilityType)}
                 </td>
-                <td className="mono" style={{ textAlign: 'right' }}>{l.spent ? fmt(l.spent) : '—'}</td>
-                <td className="mono" style={{ textAlign: 'right', color: 'var(--green)' }}>{l.recovered ? fmt(l.recovered) : '—'}</td>
-                <td className="mono" style={{ textAlign: 'right', color: (l.notRecovered ?? 0) > 0 ? 'var(--gold)' : undefined }}>
-                  {l.notRecovered == null ? '—' : fmt(l.notRecovered)}
+                <td className="mono" style={th}>{l.recovered ? fmt(l.recovered) : '—'}</td>
+                <td className="mono" style={{ ...th, color: 'var(--green)' }}>{l.collected ? fmt(l.collected) : '—'}</td>
+                <td className="mono" style={{ ...th, color: l.stillOwed > 0 ? 'var(--gold)' : undefined }}>{l.stillOwed ? fmt(l.stillOwed) : '—'}</td>
+                <td className="mono" style={th}>{l.spent ? fmt(l.spent) : '—'}</td>
+                <td className="mono" style={{ ...th, color: (l.notRecovered ?? 0) > 0 ? 'var(--gold)' : undefined }}>
+                  {l.notRecovered == null ? '—' : fmt(Math.max(0, l.notRecovered))}
                 </td>
-                <td className="mono" style={{ textAlign: 'right' }}>{l.ownerOccupied ? fmt(l.ownerOccupied) : '—'}</td>
               </tr>
             ))}
           </tbody>
         </table>
         <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.6 }}>
-          &ldquo;Spent&rdquo; is what you recorded under <strong>Expenses → Utilities</strong> for this property; tag each
-          bill with its utility and these lines split out. A dash means no bill was recorded, so there
-          is nothing to compare against. What isn&apos;t your own units is common areas, stays with
-          utilities in the rate, vacancies, and anything a lease doesn&apos;t pass through.
+          &ldquo;The utility charged you&rdquo; comes from what you record under <strong>Expenses → Utilities</strong> for
+          this property. Until a bill is recorded there, the last two columns show a dash — there is nothing to
+          compare against. &ldquo;Never billed&rdquo; is common areas, stays with utilities in the rate, vacancies, and
+          anything a lease doesn&apos;t pass through.
         </div>
       </div>
     </div>
@@ -1642,7 +1664,7 @@ function ServicedSpacesCard({ propertyId, onChanged }: {
 }
 
 /*
- * S616: the "Link to a neighbour's landlord" button and its candidate picker
+ * S616: the "Link to a neighbor's landlord" button and its candidate picker
  * lived here and are gone. Nic: "We are gonna be linking the units on the back
  * end automatically, so you can remove the link user interface." GAM matches
  * the service address against other landlords' property addresses on a daily
@@ -2130,7 +2152,7 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
         ) : (
           <div style={{ marginTop: 6 }}>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-              {/* S613: TEXT, not number — a number input normalises away the
+              {/* S613: TEXT, not number — a number input normalizes away the
                   leading zeros as you type, so a padded 0000400 would collapse
                   to 400 the moment you touched it. Digits only, capped at the
                   meter face, matching how the reading-run walk takes a read. */}
@@ -2308,7 +2330,7 @@ function UnitPickerModal({ meter, units, unitHasSubmeter, unitLabel, conflicting
 }) {
   const assigned: string[] = meter.assignedUnitIds || []
   // ONLY the units that can actually be picked. S609 (Nic) — he overruled the
-  // first version, which greyed out the taken ones and kept them in the list:
+  // first version, which grayed out the taken ones and kept them in the list:
   //
   //   "The drop down is still too long. You have all the list in there of all
   //    the units just not selectable, and that looks like shit. It only needs to
@@ -2881,3 +2903,142 @@ function ReviewBillsModal({ runId, onClose, onDone }: { runId: string; onClose: 
   )
 }
 
+
+
+// ── READING HISTORY (S652) ───────────────────────────────────────────────
+// Nic: "I don't want to download readings… a spot to view the history as some
+// sort of spreadsheet, but make it look good, a nice curated report type of
+// thing." One row per meter in space order; one column per month with the
+// reading and what it used; tap a row for every reading on that meter with its
+// date, reason, note and photo. The download survives as a quiet link for an
+// accountant — nothing requires it.
+const READ_REASON_SHORT: Record<string, string> = {
+  monthly_cycle: 'Monthly', baseline: 'Opening', move_out_final: 'Move-out', stay_turnover: 'Turnover',
+  meter_replaced: 'New meter', billed_off_platform: 'Off platform', other: 'Other',
+}
+function ReadingHistoryModal({ propertyId, propertyName, onDownload, onClose }: {
+  propertyId: string; propertyName: string; onDownload: () => void; onClose: () => void
+}) {
+  const navigate = useNavigate()
+  const [months, setMonths] = useState(6)
+  const [utility, setUtility] = useState('all')
+  const [open, setOpen] = useState<string | null>(null)
+  const { data, isLoading } = useQuery<any>(
+    ['reading-history', propertyId, months],
+    () => apiGet(`/utility/reading-history?propertyId=${propertyId}&months=${months}`))
+  const meters: any[] = data?.meters ?? []
+  const utilities = [...new Set(meters.map(m => String(m.utilityType)))].sort()
+  const shown = meters.filter(m => utility === 'all' || m.utilityType === utility)
+  // Month columns, newest first, from the readings themselves (by the day read).
+  const monthKeys = [...new Set(meters.flatMap(m => m.readings.map((r: any) => String(r.date).slice(0, 7))))].sort().reverse().slice(0, months)
+  const monthName = (k: string) => new Date(k + '-15T12:00:00').toLocaleDateString('en-US', { month: 'short', year: '2-digit' })
+  const face = (v: number, d: number) => String(Math.trunc(Number(v))).padStart(Number(d) || 5, '0')
+  const usageText = (r: any, m: any) => r.usage == null ? '' : `${Number(r.usage).toLocaleString()} ${UTILITY_UNITS[m.utilityType] || ''}`.trim()
+  const cell: React.CSSProperties = { padding: '8px 10px', borderTop: '1px solid var(--border-0)', verticalAlign: 'top' }
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 1080, width: '96vw' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 12 }}>
+          <div>
+            <div className="modal-title" style={{ marginBottom: 2 }}>Meter reading history</div>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{propertyName} · every reading on file, newest first</div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            {utilities.length > 1 && (
+              <select className="form-select" style={{ width: 'auto', fontSize: '.78rem', padding: '2px 8px' }} value={utility} onChange={e => setUtility(e.target.value)}>
+                <option value="all">All utilities</option>
+                {utilities.map(u => <option key={u} value={u}>{UTILITY_TYPE_LABEL[u as UtilityType] ?? u}</option>)}
+              </select>
+            )}
+            <select className="form-select" style={{ width: 'auto', fontSize: '.78rem', padding: '2px 8px' }} value={months} onChange={e => setMonths(Number(e.target.value))}>
+              <option value={3}>Last 3 months</option><option value={6}>Last 6 months</option>
+              <option value={12}>Last 12 months</option><option value={24}>Last 2 years</option>
+            </select>
+            <button className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
+          </div>
+        </div>
+        {isLoading ? <div style={{ padding: 24, color: 'var(--text-3)' }}>Loading…</div> : shown.length === 0 ? (
+          <div style={{ padding: 24, color: 'var(--text-3)' }}>No meters with readings here yet.</div>
+        ) : (
+          <div style={{ maxHeight: '68vh', overflow: 'auto', border: '1px solid var(--border-0)', borderRadius: 10 }}>
+            <table style={{ width: '100%', borderCollapse: 'separate', borderSpacing: 0, fontSize: '.8rem' }}>
+              <thead>
+                <tr style={{ fontSize: '.68rem', textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--text-3)' }}>
+                  <th style={{ position: 'sticky', top: 0, left: 0, zIndex: 3, background: 'var(--bg-1)', textAlign: 'left', padding: '10px' }}>Space</th>
+                  {monthKeys.map(k => (
+                    <th key={k} style={{ position: 'sticky', top: 0, zIndex: 2, background: 'var(--bg-1)', textAlign: 'right', padding: '10px', whiteSpace: 'nowrap' }}>{monthName(k)}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map(m => (
+                  <Fragment key={m.meterId}>
+                    <tr onClick={() => setOpen(o => o === m.meterId ? null : m.meterId)} style={{ cursor: 'pointer' }} className="row-clickable">
+                      <td style={{ ...cell, position: 'sticky', left: 0, background: 'var(--bg-1)', zIndex: 1, whiteSpace: 'nowrap' }}>
+                        <div style={{ fontWeight: 700 }}>{m.unitNumbers || m.label}</div>
+                        <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                          {UTILITY_ICONS[m.utilityType]} {UTILITY_TYPE_LABEL[m.utilityType as UtilityType] ?? m.utilityType}
+                          {m.billingMethod === 'rubs' ? ' · master' : ''}{m.outOfService ? ' · out of service' : ''}
+                        </div>
+                      </td>
+                      {monthKeys.map(k => {
+                        const inMonth = m.readings.filter((r: any) => String(r.date).slice(0, 7) === k)
+                        const r = inMonth[0]
+                        return (
+                          <td key={k} style={{ ...cell, textAlign: 'right' }}>
+                            {!r ? <span style={{ color: 'var(--text-3)' }}>—</span> : (
+                              <>
+                                <div className="mono" style={{ fontWeight: 600, letterSpacing: '.04em' }}>{m.billingMethod === 'rubs' ? Number(r.value).toLocaleString() : face(r.value, m.digits)}</div>
+                                <div style={{ fontSize: '.7rem', color: r.needsReview ? 'var(--amber, #d97706)' : 'var(--text-3)' }}>
+                                  {m.billingMethod === 'rubs' ? 'used this cycle' : (usageText(r, m) || READ_REASON_SHORT[r.reason] || '')}
+                                  {inMonth.length > 1 ? ` · +${inMonth.length - 1}` : ''}
+                                </div>
+                              </>
+                            )}
+                          </td>
+                        )
+                      })}
+                    </tr>
+                    {open === m.meterId && (
+                      <tr>
+                        <td colSpan={monthKeys.length + 1} style={{ background: 'var(--bg-2)', padding: '10px 14px' }}>
+                          {m.readings.length === 0 ? <span style={{ color: 'var(--text-3)', fontSize: '.78rem' }}>No readings in this window.</span> : (
+                            <table style={{ width: '100%', fontSize: '.78rem', borderCollapse: 'collapse' }}>
+                              <thead><tr style={{ color: 'var(--text-3)', fontSize: '.66rem', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+                                <th style={{ textAlign: 'left', padding: '3px 0' }}>Read on</th><th style={{ textAlign: 'right' }}>Reading</th>
+                                <th style={{ textAlign: 'right' }}>Used since the one before</th><th style={{ textAlign: 'left', paddingLeft: 14 }}>Why</th>
+                                <th style={{ textAlign: 'left' }}>Note</th><th></th>
+                              </tr></thead>
+                              <tbody>
+                                {m.readings.map((r: any) => (
+                                  <tr key={r.id} style={{ borderTop: '1px solid var(--border-0)' }}>
+                                    <td style={{ padding: '5px 0', whiteSpace: 'nowrap' }}>{new Date(r.date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</td>
+                                    <td className="mono" style={{ textAlign: 'right' }}>{m.billingMethod === 'rubs' ? Number(r.value).toLocaleString() : face(r.value, m.digits)}</td>
+                                    <td className="mono" style={{ textAlign: 'right' }}>{m.billingMethod === 'rubs' ? '—' : (usageText(r, m) || '—')}</td>
+                                    <td style={{ paddingLeft: 14 }}>{METER_READ_REASON_LABEL[r.reason as keyof typeof METER_READ_REASON_LABEL] ?? r.reason}{r.needsReview ? ' · needs review' : ''}{r.isRollover ? ' · rolled over' : ''}</td>
+                                    <td style={{ color: 'var(--text-3)', maxWidth: 320 }}>{r.note || ''}</td>
+                                    <td style={{ textAlign: 'right' }}>{r.hasPhoto && (
+                                      <button className="btn btn-ghost btn-sm" onClick={() => navigate(`/view?src=${encodeURIComponent(`/utility/readings/${r.id}/photo`)}&title=${encodeURIComponent('Meter photo')}`)}>📷 Photo</button>
+                                    )}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 10, fontSize: '.72rem', color: 'var(--text-3)' }}>
+          <span>Each month shows the latest reading taken in it and what that reading used. Click a space for every reading.</span>
+          <button className="btn btn-ghost btn-sm" onClick={onDownload}>Download a copy</button>
+        </div>
+      </div>
+    </div>
+  )
+}

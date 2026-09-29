@@ -65,7 +65,7 @@ const link = (body: any) => request(buildApp())
   .post('/api/bank-feed/link-session').set('Authorization', `Bearer ${token}`).send(body)
 
 describe('POST /bank-feed/link-session', () => {
-  it('uses the company sent in the BODY — the picker is honoured', async () => {
+  it('uses the company sent in the BODY — the picker is honored', async () => {
     const res = await link({ entityId: coB })
     expect(res.status).toBe(200)
     const { createLinkSession } = await import('../services/bankFeed')

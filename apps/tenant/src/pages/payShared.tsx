@@ -76,7 +76,7 @@ export interface PayTarget {
   batch?: { leaseId: string; amount: number }[]
   // S609 pay-ahead (Nic): roughly what the balance plus the rest of the lease
   // term comes to — a SUGGESTION shown beside the box, never a limit. Present =
-  // the amount box is offered. Absent = the old fixed-amount behaviour, which is
+  // the amount box is offered. Absent = the old fixed-amount behavior, which is
   // what every non-rent target (a utility bill, a single charge) still wants.
   suggestedPayAhead?: number
   /** S622: the pay-in-full floor — the lease's own charges, excluding any

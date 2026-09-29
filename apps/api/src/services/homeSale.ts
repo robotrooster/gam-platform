@@ -327,7 +327,7 @@ export const homeSaleTermsSchema = z.object({
 /**
  * Both callers pass a different thing: a PoolClient (whose .query returns
  * `{ rows }`) inside a transaction, and db's `query` (which returns the rows
- * themselves) outside one. Normalising here rather than making each caller
+ * themselves) outside one. Normalizing here rather than making each caller
  * remember is the difference between a shared guard and a trap — TypeScript
  * cannot see the mismatch through `{ query: Function }`, so nothing would have
  * told anybody until it threw in production.

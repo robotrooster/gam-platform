@@ -83,7 +83,7 @@ const NAV_ITEMS: Array<{
   { to: '/expenses',      icon: ArrowDownToLine,  label: 'Expenses',         section: null, hub: 'financials' },
   // S645 (Nic): an owner whose book is split between managers reads it here,
   // in one place, with the managers side by side. Owner-level like the rest of
-  // the financials hub — it is a judgement about the people they hired.
+  // the financials hub — it is a judgment about the people they hired.
   { to: '/my-managers',   icon: BarChart2,        label: 'My Managers',      section: null, hub: 'financials' },
   // S605 (Nic): ONE Bank tab. Feed (S570) + reconciliation (S568) were two nav
   // items answering one question — "is my bank money right?" — because

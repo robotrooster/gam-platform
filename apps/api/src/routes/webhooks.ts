@@ -376,7 +376,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
           // the service and the column behind it. It applied a tenant's rent
           // money to propane FIRST, which Nic ruled out when the propane model
           // was rebuilt (S610): a refill never accelerates anything, it just
-          // adds future instalments. Nothing had set `accelerated` since, so the
+          // adds future installments. Nothing had set `accelerated` since, so the
           // query could never match and this was a call into a no-op.
         }
 
@@ -587,7 +587,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
       }
 
       for (const [, group] of eventGroups) {
-        // No rent in this event — unchanged behaviour, stay quiet.
+        // No rent in this event — unchanged behavior, stay quiet.
         if (!group.hasRent) continue
         try {
           const ctx = await query<{
@@ -623,7 +623,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
           const c = ctx[0]
           const total = Math.round(
             ctx.reduce((sum, r) => sum + parseFloat(r.amount), 0) * 100) / 100
-          // Only itemise when there is actually more than one charge — a plain
+          // Only itemize when there is actually more than one charge — a plain
           // rent payment should not grow a one-line "breakdown".
           const breakdown = ctx.length > 1
             ? ctx.map((r) => {
@@ -1593,7 +1593,7 @@ webhooksRouter.post('/resend', async (req, res) => {
       // He is right, and it is not only about workload. GAM cannot fix a
       // bounced address — only the person who can phone the tenant and ask how
       // it is actually spelled can, and that is the landlord. An alert that
-      // lands where nobody can act on it is a rumour.
+      // lands where nobody can act on it is a rumor.
       //
       // Pushed rather than left on a page, because a banner only works if
       // somebody happens to open the right screen. Nic went three weeks without

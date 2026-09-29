@@ -100,7 +100,7 @@ function GamChargesSection({ companyId }: { companyId: string }) {
       </div>
       <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.55, marginBottom: 10 }}>
         These come out of money already on its way to you, so they cost you no extra transfer —
-        which is why a payout can land smaller than the rent collected. The difference is itemised
+        which is why a payout can land smaller than the rent collected. The difference is itemized
         below. If a property takes only cash there’s no payout to take them from, and once the
         balance passes {fmt(banks[0]?.threshold ?? 100)} they’re transferred from your linked bank
         instead{banks[0]?.gamDebitBankLast4 ? ` (ending ${banks[0].gamDebitBankLast4})` : ''},

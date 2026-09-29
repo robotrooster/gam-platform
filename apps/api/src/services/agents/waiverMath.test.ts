@@ -10,7 +10,7 @@ import { __waiverInternals } from './agentRunner'
 
 const { WAIVER_REQUEST, claimedDaysLate, graceDaysFromResults, waiverArithmeticLine } = __waiverInternals
 
-describe('recognising a waiver request', () => {
+describe('recognizing a waiver request', () => {
   it.each([
     'any chance you can take that off? it was only two days late',
     'can you waive the late fee?',

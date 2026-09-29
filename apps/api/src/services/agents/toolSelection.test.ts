@@ -136,7 +136,7 @@ describe('the tools for this turn', () => {
     expect(sel.droppedActions).toBe(0)
   })
 
-  it('an unrecognisable message still leaves every lookup in place', () => {
+  it('an unrecognizable message still leaves every lookup in place', () => {
     // Nonsense must degrade to "can look things up, cannot act" rather than to
     // an agent with nothing at all.
     const sel = selectToolsForTurn(landlord, ALL, 'asdfgh qwerty zzz', {})

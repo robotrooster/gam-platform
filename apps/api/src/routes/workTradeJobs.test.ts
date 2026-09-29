@@ -2,7 +2,7 @@
  * S652 — work traders take maintenance jobs from their tenant portal.
  * Open work is visible to every work trader at the property, skilled work only
  * to those with the skill; a monitored person's skilled job waits for a check
- * by the landlord or a trusted work trader; a neighbour's contact details never
+ * by the landlord or a trusted work trader; a neighbor's contact details never
  * reach a work trader.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -45,8 +45,8 @@ async function world() {
       const uid = (await c.query(`SELECT user_id FROM tenants WHERE id=$1`, [tenant])).rows[0].user_id
       return { unit, tenant, uid }
     }
-    const trader = await mk(), trusted = await mk(), neighbour = await mk()
-    await c.query(`UPDATE users SET first_name='Nora', last_name='Neighbour', phone='5551234567' WHERE id=$1`, [neighbour.uid]).catch(() => {})
+    const trader = await mk(), trusted = await mk(), neighbor = await mk()
+    await c.query(`UPDATE users SET first_name='Nora', last_name='Neighbor', phone='5551234567' WHERE id=$1`, [neighbor.uid]).catch(() => {})
     for (const [t, isTrusted] of [[trader, false], [trusted, true]] as const) {
       await c.query(`INSERT INTO work_trade_agreements (unit_id, tenant_id, landlord_id, start_date, status, trusted)
                      VALUES ($1,$2,$3,'2026-01-01','active',$4)`, [t.unit, t.tenant, ll.landlordId, isTrusted])
@@ -54,16 +54,16 @@ async function world() {
     const job = async (title: string, category: string) => (await c.query(
       `INSERT INTO maintenance_requests (unit_id, tenant_id, landlord_id, title, description, priority, status, category)
        VALUES ($1,$2,$3,$4,'details','normal','open',$5) RETURNING id`,
-      [neighbour.unit, neighbour.tenant, ll.landlordId, title, category])).rows[0].id
+      [neighbor.unit, neighbor.tenant, ll.landlordId, title, category])).rows[0].id
     const weeds = await job('Pull weeds by lot 4', 'landscape')
     const leak = await job('Water leak under sink', 'plumbing')
     await c.query('COMMIT')
     return {
-      ll, prop, trader, trusted, neighbour, weeds, leak,
+      ll, prop, trader, trusted, neighbor, weeds, leak,
       landlordToken: sign({ userId: ll.userId, role: 'landlord', email: 'l@t.dev', profileId: null, landlordIds: [ll.landlordId], permissions: {} }),
       traderToken: sign({ userId: trader.uid, role: 'tenant', email: 't@t.dev', profileId: trader.tenant, permissions: {} }),
       trustedToken: sign({ userId: trusted.uid, role: 'tenant', email: 'tr@t.dev', profileId: trusted.tenant, permissions: {} }),
-      neighbourToken: sign({ userId: neighbour.uid, role: 'tenant', email: 'n@t.dev', profileId: neighbour.tenant, permissions: {} }),
+      neighborToken: sign({ userId: neighbor.uid, role: 'tenant', email: 'n@t.dev', profileId: neighbor.tenant, permissions: {} }),
     }
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
@@ -72,12 +72,12 @@ const jobs = async (token: string) =>
   (await request(app()).get('/api/work-trade/jobs').set('Authorization', `Bearer ${token}`).expect(200)).body.data
 
 describe('what a work trader sees', () => {
-  it('open work to everyone, skilled work only with the skill — and never the neighbour\'s details', async () => {
+  it('open work to everyone, skilled work only with the skill — and never the neighbor\'s details', async () => {
     const w = await world()
     let d = await jobs(w.traderToken)
     expect(d.available.map((j: any) => j.title)).toEqual(['Pull weeds by lot 4'])
     const body = JSON.stringify(d)
-    expect(body).not.toContain('Neighbour')
+    expect(body).not.toContain('Neighbor')
     expect(body).not.toContain('5551234567')
 
     await db.query(`UPDATE work_trade_agreements SET skills='{plumbing}' WHERE tenant_id=$1`, [w.trader.tenant])
@@ -87,8 +87,8 @@ describe('what a work trader sees', () => {
 
   it('a tenant with no work trade agreement sees nothing and can take nothing', async () => {
     const w = await world()
-    expect(await jobs(w.neighbourToken)).toEqual({ available: [], mine: [], toCheck: [] })
-    const r = await request(app()).post(`/api/work-trade/jobs/${w.weeds}/take`).set('Authorization', `Bearer ${w.neighbourToken}`)
+    expect(await jobs(w.neighborToken)).toEqual({ available: [], mine: [], toCheck: [] })
+    const r = await request(app()).post(`/api/work-trade/jobs/${w.weeds}/take`).set('Authorization', `Bearer ${w.neighborToken}`)
     expect(r.status).toBe(403)
   })
 
@@ -154,7 +154,7 @@ describe('the landlord assigning', () => {
     expect((await jobs(w.traderToken)).mine.map((j: any) => j.title)).toEqual(['Water leak under sink'])
 
     const stranger = await request(app()).patch(`/api/maintenance/${w.leak}`).set('Authorization', `Bearer ${w.landlordToken}`)
-      .send({ assignedTo: w.neighbour.uid })
+      .send({ assignedTo: w.neighbor.uid })
     expect(stranger.status).toBe(400)
 
     await request(app()).patch(`/api/maintenance/${w.leak}`).set('Authorization', `Bearer ${w.landlordToken}`)

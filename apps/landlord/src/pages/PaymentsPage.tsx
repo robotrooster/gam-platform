@@ -169,7 +169,7 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
           {group.propertyName ? ` · ${group.propertyName}` : ''}
         </div>
 
-        {/* What they owe, itemised — the breakdown is the useful part. */}
+        {/* What they owe, itemized — the breakdown is the useful part. */}
         {/* Capped rather than left to grow: a household with a long tail of
             charges must not push the total and the buttons off the screen,
             which is the whole complaint this dialog exists to answer. Its own
@@ -747,7 +747,7 @@ export function PaymentsPage() {
   //
   // Grouped by LEASE where there is one, else by tenant — the same scope the
   // settle uses, so what the row promises is exactly what the click does.
-  // SETTLED history stays itemised: that is a record of individual events, and
+  // SETTLED history stays itemized: that is a record of individual events, and
   // collapsing it would hide what was actually paid and when.
   const OUTSTANDING = new Set(['pending', 'failed'])
   const outstandingGroups = (() => {
@@ -815,13 +815,13 @@ export function PaymentsPage() {
   // charge."
   //
   // S636 consolidated what is OWED into one row per household and then left the
-  // full itemised table underneath untouched — so every charge that had just
+  // full itemized table underneath untouched — so every charge that had just
   // been summed into a household row was listed again below it, individually.
   // The consolidation did not replace the duplication, it sat on top of it.
   //
   // The two tables answer different questions and must not overlap: the top one
   // is WHAT IS OWED (grouped, actionable, expandable to its line items); the
-  // bottom is WHAT HAPPENED (itemised, historical, read-only). A charge belongs
+  // bottom is WHAT HAPPENED (itemized, historical, read-only). A charge belongs
   // to exactly one of them, and anything the grouping deliberately skipped
   // gets its own band rather than being dropped into whichever table is left.
   const groupedIds = new Set<string>(

@@ -1,18 +1,18 @@
 /**
- * S652 — THE ACKNOWLEDGEMENTS, AS THEIR OWN DOCUMENT.
+ * S652 — THE ACKNOWLEDGMENTS, AS THEIR OWN DOCUMENT.
  *
- * Nic, reading Blu's lease: "on the lease, there's an acknowledgement... is that
- * acknowledgement a legal requirement? And is that also in your disclosure
- * list?" Then: "can you get those acknowledgements, a copy of those into the
+ * Nic, reading Blu's lease: "on the lease, there's an acknowledgment... is that
+ * acknowledgment a legal requirement? And is that also in your disclosure
+ * list?" Then: "can you get those acknowledgments, a copy of those into the
  * system?"
  *
- * It is a requirement, and it is in the list — `statutory_acknowledgement`, one
+ * It is a requirement, and it is in the list — `statutory_acknowledgment`, one
  * of the 45 categories. What it was NOT was a document GAM could hand anybody:
  * it existed only as four initial lines buried on page 4 of one park's lease
  * form, which is exactly the shape that cannot be sent to a sitting tenant who
  * signed on paper years ago, and cannot be reused by the next Illinois park.
  *
- * So it becomes a one-page form of its own, categorised, state-tagged, and
+ * So it becomes a one-page form of its own, categorized, state-tagged, and
  * fielded. The four lines are the Illinois Mobile Home Landlord and Tenant
  * Rights Act's own list — the IDPH pamphlet, the lease exhibited before
  * signing, the 24-month written offer made on a date that precedes signature,
@@ -29,7 +29,7 @@
  * than one that asks once. This copy is for the next park, and for a tenant
  * whose lease predates GAM.
  *
- *     DRY=1 npx ts-node apps/api/src/scripts/mattoon/load9_il_acknowledgements.ts
+ *     DRY=1 npx ts-node apps/api/src/scripts/mattoon/load9_il_acknowledgments.ts
  */
 import fs from 'fs'
 import path from 'path'
@@ -39,7 +39,7 @@ import { query } from '../../db'
 const LANDLORD_ID = 'e8904104-ab16-4d02-b6f8-cac88d738aae' // TruBlu Management LLC
 const DRY = process.env.DRY === '1'
 
-const TITLE = 'STATUTORY ACKNOWLEDGEMENTS'
+const TITLE = 'STATUTORY ACKNOWLEDGMENTS'
 const SUBTITLE = 'Mobile Home Park Lot Lease — Illinois'
 const INTRO = 'Tenant acknowledges, by initialing:'
 const ITEMS = [
@@ -124,7 +124,7 @@ async function build(): Promise<Uint8Array> {
 async function main() {
   const existing = await query<{ id: string }>(
     `SELECT id FROM lease_templates
-      WHERE landlord_id=$1 AND disclosure_type='statutory_acknowledgement' AND state_code='IL'`,
+      WHERE landlord_id=$1 AND disclosure_type='statutory_acknowledgment' AND state_code='IL'`,
     [LANDLORD_ID])
   if (existing.length) { console.log('already loaded:', existing[0].id); return }
 
@@ -132,7 +132,7 @@ async function main() {
   const { initialBoxes, offerY, sigY, propY, tenantY } = (build as any).anchors as
     { initialBoxes: Array<{ y: number }>, offerY: number, sigY: number, propY: number, tenantY: number }
 
-  const filename = `${Date.now()}-il-statutory-acknowledgements.pdf`
+  const filename = `${Date.now()}-il-statutory-acknowledgments.pdf`
   const dir = path.resolve(__dirname, '../../../uploads/leases')
   const dest = path.join(dir, filename)
 
@@ -149,7 +149,7 @@ async function main() {
     ['date',      'primary', 'Date',      'date_signed',     390, top(tenantY - 2, 16), 168, 16, true,  4],
   ]
   initialBoxes.forEach((b, i) => fields.push(
-    ['initials', 'primary', `Acknowledgement ${i + 1}`, 'tenant_initial', 78, top(b.y - 2, 16), 42, 16, true, 10 + i]))
+    ['initials', 'primary', `Acknowledgment ${i + 1}`, 'tenant_initial', 78, top(b.y - 2, 16), 42, 16, true, 10 + i]))
   fields.push(['text', null, 'Date of the 24-month offer', null, 240, top(offerY - 2, 16), 150, 16, false, 20])
   fields.push(
     ['signature', 'landlord', 'Landlord signature', 'landlord_signature', 54,  top(sigY, 30), 200, 30, true, 30],
@@ -174,11 +174,11 @@ async function main() {
     `INSERT INTO lease_templates
        (landlord_id, name, description, base_pdf_url, page_count, unit_type,
         purpose, applies_to, disclosure_type, state_code)
-     VALUES ($1,$2,$3,$4,1,'mobile_home','state_disclosure','rental','statutory_acknowledgement','IL')
+     VALUES ($1,$2,$3,$4,1,'mobile_home','state_disclosure','rental','statutory_acknowledgment','IL')
      RETURNING id`,
     [LANDLORD_ID,
-     'Illinois Statutory Acknowledgements — Mobile Home Park',
-     'The four acknowledgements an Illinois park operator takes at signing: the IDPH pamphlet, the lease exhibited beforehand, the written 24-month offer, and the park rules. Reproduced as a standalone form so it can be sent on its own.',
+     'Illinois Statutory Acknowledgments — Mobile Home Park',
+     'The four acknowledgments an Illinois park operator takes at signing: the IDPH pamphlet, the lease exhibited beforehand, the written 24-month offer, and the park rules. Reproduced as a standalone form so it can be sent on its own.',
      `/api/esign/files/${filename}`])
   const templateId = tpl[0].id
 

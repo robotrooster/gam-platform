@@ -4,7 +4,7 @@
  * Lets a tenant cancel one of their OWN maintenance requests — but only
  * while it's still 'open' or 'awaiting_approval' (before a worker has been
  * assigned and work has started). Once assigned/in progress, the tenant
- * adds a comment or contacts the landlord instead of unilaterally cancelling.
+ * adds a comment or contacts the landlord instead of unilaterally canceling.
  * Hard-scoped: tenant_id = actor.profileId. The requestId comes from
  * get_my_maintenance_requests.
  */
@@ -20,7 +20,7 @@ export const cancelMaintenanceRequest: AgentTool = {
   description:
     'Cancel one of the tenant’s own maintenance requests they no longer need — only works while the ' +
     'request is still open or awaiting approval (not once it’s been assigned or work has started). ' +
-    'Get the requestId from get_my_maintenance_requests. Confirm with the tenant before cancelling.',
+    'Get the requestId from get_my_maintenance_requests. Confirm with the tenant before canceling.',
   parameters: {
     type: 'object',
     properties: {
@@ -54,7 +54,7 @@ export const cancelMaintenanceRequest: AgentTool = {
         WHERE id = $1 AND tenant_id = $2 AND status = ANY($3) RETURNING id`,
       [requestId, actor.profileId, TENANT_CANCELLABLE]
     )
-    if (!updated) return { ok: false, error: 'That request was just updated — it may now be in progress. Please re-check before cancelling.' }
+    if (!updated) return { ok: false, error: 'That request was just updated — it may now be in progress. Please re-check before canceling.' }
 
     await query(
       `INSERT INTO maintenance_comments (request_id, user_id, role, message, is_internal)

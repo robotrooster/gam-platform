@@ -15,11 +15,11 @@ let amounts: Set<string> = new Set()
  *
  * The first version queried the test database and found nothing — it is
  * schema-only — so every assertion passed against an empty set and the guard
- * was theatre. Exactly the failure requiredParams.test.ts had earlier the same
+ * was theater. Exactly the failure requiredParams.test.ts had earlier the same
  * day, which is why the reach is now asserted before anything else.
  *
  * The seeded values are deliberately the SHAPE of the ones that leaked: a
- * person with a surname, a named property, a labelled unit, and a rent figure.
+ * person with a surname, a named property, a labeled unit, and a rent figure.
  */
 beforeAll(async () => {
   await cleanupAllSchema()
@@ -57,7 +57,7 @@ describe('system prompts quote nothing that exists', () => {
     // The trap this suite could fall into is the one requiredParams already
     // fell into: a check that examined nothing and reported it clean. The test
     // database is schema-only, so if these lists come back empty every
-    // assertion below passes vacuously and the guard is theatre.
+    // assertion below passes vacuously and the guard is theater.
     //
     // Seeded here rather than read from a live database, so the suite is
     // self-contained and the comparison set is never empty.
@@ -93,8 +93,8 @@ describe('system prompts quote nothing that exists', () => {
   it('does not quote a real unit number in a way that reads as a record', () => {
     // A bare "4" is not a leak; "Apt 101" alongside a name and a balance is.
     for (const [id, sp] of prompts()) {
-      const labelled = [...new Set(sp.match(/\b(?:Apt|Unit|RV|Spot|Lot)\s+[A-Z0-9-]+/gi) ?? [])]
-      const collide = labelled.filter((l) => {
+      const labeled = [...new Set(sp.match(/\b(?:Apt|Unit|RV|Spot|Lot)\s+[A-Z0-9-]+/gi) ?? [])]
+      const collide = labeled.filter((l) => {
         const n = l.split(/\s+/)[1].toUpperCase()
         return units.some((u) => String(u).toUpperCase() === n)
       })

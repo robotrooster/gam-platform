@@ -3,7 +3,7 @@
 // This file is the arithmetic only: no database, no dates beyond a month key,
 // no side effects. The job (jobs/workTradeSettlement.ts) reads rows, calls
 // `settleMonth`, and writes what comes back. Keeping it pure is what lets the
-// interesting cases — a deficit ageing out, a bank covering a bad month, a
+// interesting cases — a deficit aging out, a bank covering a bad month, a
 // catch-up crediting an invoice from two months ago — be tested without
 // standing up a tenancy.
 //
@@ -29,12 +29,12 @@
 // going to be caught up would run forever.
 //
 // A carried hour keeps ITS OWN MONTH'S VALUE (`hourRate`, frozen at settlement).
-// A rent increase must not retroactively reprice labour somebody already failed
+// A rent increase must not retroactively reprice labor somebody already failed
 // to do.
 //
 // SURPLUS BANKS WITHOUT LIMIT. Deficits follow the tenant, so credits follow
 // them too. Banked hours buy months; they never become cash. That is what keeps
-// this a trade rather than paid labour — the cap that used to enforce that
+// this a trade rather than paid labor — the cap that used to enforce that
 // (clamping a single month to 100%) still holds per month, it just no longer
 // throws the excess away.
 
@@ -86,7 +86,7 @@ export interface PeriodOutcome {
   uncoveredAmount: number
   /**
    * How many month-closes this period has now survived while open. The job
-   * persists it; a period that settles or bills stops ageing.
+   * persists it; a period that settles or bills stops aging.
    */
   agedCloses: number
   status: 'open' | 'settled' | 'billed'

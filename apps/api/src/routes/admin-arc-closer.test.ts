@@ -100,7 +100,7 @@ async function seedAFixture(): Promise<AFixture> {
     // S609: admin routes are PORTFOLIO-SCOPED (S592) — a non-super admin may
     // only act on landlords in their own book. This fixture predates that rule
     // and left the admin with an empty book, so every call 404'd/403'd on scope
-    // before reaching the behaviour under test. Put the landlord in their book,
+    // before reaching the behavior under test. Put the landlord in their book,
     // which is what the test always meant.
     await client.query(
       `UPDATE landlords SET portfolio_manager_id = $2 WHERE id = $1`,
@@ -293,7 +293,7 @@ describe('GET /api/admin/tenants/:tenantId/flexsuite-acceptances', () => {
     let tenantId = ''
     // S609: this tenant must be under a DIFFERENT landlord — one who is not in
     // this admin's book. The shared fixture's landlord now IS in their book (so
-    // the resend tests can reach the behaviour they test), so an outside tenant
+    // the resend tests can reach the behavior they test), so an outside tenant
     // has to be built explicitly. Otherwise this test passes for the wrong
     // reason: "outside the portfolio" and "has no landlord at all" are not the
     // same thing, and only the first is what this rule is about.

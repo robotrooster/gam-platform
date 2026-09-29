@@ -520,7 +520,7 @@ describe('S605 renumbering during onboarding', () => {
 // ── S605: a bare number can no longer be CREATED, because the platform supplies
 // the prefix (see the standardized-numbering describe below). The earlier
 // reject-on-bare-number rule was superseded by canonicalisation — kept here as
-// the behaviour it became, so nobody re-adds a 400 that can never fire.
+// the behavior it became, so nobody re-adds a 400 that can never fire.
 describe('S605 bare numbers are canonicalised, not rejected', () => {
   it('a bare number is accepted and gains the type prefix', async () => {
     const f = await seedUnitsFixture()
@@ -567,7 +567,7 @@ describe('S605 standardized unit numbering', () => {
     expect(res.body.data.unitNumber ?? res.body.data.unit_number).toBe('RV 07')
   })
 
-  it('normalises a spelled-out label to the standard prefix', async () => {
+  it('normalizes a spelled-out label to the standard prefix', async () => {
     const f = await seedUnitsFixture()
     const res = await create(f, { unitNumber: 'Mobile Home Site 1', unitType: 'mobile_home' })
     expect(res.status).toBe(201)

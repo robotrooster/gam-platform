@@ -68,7 +68,7 @@ const DELIBERATE = new Map(Object.entries({
   // ── S641: signing packages ─────────────────────────────────────────────────
   // A package decides what a resident is asked to put their name to. Nic:
   // "some things are pertinent to some tenants and some things are not." That
-  // judgement is the landlord's, made once on a screen showing the whole list
+  // judgment is the landlord's, made once on a screen showing the whole list
   // in order — not assembled from a spoken sentence where a missing phrase
   // silently drops a disclosure from somebody's lease. The agent can still say
   // what a package contains; it just cannot author one.
@@ -158,12 +158,12 @@ const DELIBERATE = new Map(Object.entries({
   'inspections POST /:id/sign': 'signing is the person\'s own act',
   'inspections POST /:id/submit': 'the tenant submits their own periodic inspection',
   'tenants POST /lease/sign': 'signing a lease is the person\'s own act',
-  'tenants POST /flexpay/enroll': 'enrolment records an acceptance of terms with their IP',
-  'tenants POST /flexdeposit/enroll': 'enrolment records an acceptance of terms with their IP',
+  'tenants POST /flexpay/enroll': 'enrollment records an acceptance of terms with their IP',
+  'tenants POST /flexdeposit/enroll': 'enrollment records an acceptance of terms with their IP',
   'tenants POST /flexsuite/re-accept': 'accepting revised terms is the person\'s own act',
   'tenants POST /enroll-credit-reporting': 'consent to report to bureaus is the person\'s own act',
   'tenants POST /me/deposit/portability/authorize': 'takes a signature',
-  'tenants POST /me/deposit/portability/decline': 'the counterpart of a signed authorisation',
+  'tenants POST /me/deposit/portability/decline': 'the counterpart of a signed authorization',
   'landlords POST /complete-onboarding': 'takes the landlord\'s signature on the platform terms',
   'credit POST /attest': 'an attestation is the person\'s own statement, signed',
 
@@ -279,7 +279,7 @@ export interface Endpoint {
   method: string
   /** METHOD + the path the route file declares, e.g. 'POST /:id/cancel'. */
   declared: string
-  /** METHOD + the full normalised path, matched against the manifest. */
+  /** METHOD + the full normalized path, matched against the manifest. */
   key: string
 }
 

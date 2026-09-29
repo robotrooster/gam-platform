@@ -605,7 +605,7 @@ async function unitHistoryBlocker(unitId: string): Promise<string | null> {
     // function was written to express.
     // S630: this asked whether the METER had readings, not whether the UNIT did.
     // A space on a shared RUBS master became undeletable the moment anyone read
-    // that master for any neighbour — history belonging to other units, blocking
+    // that master for any neighbor — history belonging to other units, blocking
     // a unit that has none of its own. Nic hit it retiring RV 21, which slipped
     // through only because Oak Park's water masters had not been read yet; the
     // first master reading would have walled off every unit on the meter.
@@ -708,7 +708,7 @@ unitsRouter.patch('/:id/number', requirePerm('units.edit'), async (req, res, nex
     // called RV 14. Only labels still matching the generated pattern are
     // rewritten; anything the landlord renamed by hand is theirs and is left
     // alone.
-    const relabelled = await query<{ id: string }>(
+    const relabeled = await query<{ id: string }>(
       `UPDATE utility_meters m
           SET label = $3 || substring(m.label from char_length($2) + 1), updated_at = NOW()
         FROM utility_meter_units mu
@@ -718,7 +718,7 @@ unitsRouter.patch('/:id/number', requirePerm('units.edit'), async (req, res, nex
        RETURNING m.id`,
       [req.params.id, unit.unit_number, next_])
 
-    res.json({ success: true, data: updated, metersRelabelled: relabelled.length })
+    res.json({ success: true, data: updated, metersRelabeled: relabeled.length })
   } catch (e) { next(e) }
 })
 
@@ -777,7 +777,7 @@ export const UNIT_CLONE_COPIED = [
   // the physical space, and retire-and-replace is the same space under a new
   // number. Left uncopied it would silently reset to nothing, and a unit on a
   // fixture-count water split would then contribute zero — under-billing that
-  // unit and over-billing every neighbour on the same meter.
+  // unit and over-billing every neighbor on the same meter.
   'water_fixture_count',
   // S609: same reasoning. Retire-and-replace is a RENUMBERING of one physical
   // space, not a turnover — the same household is still in it. Resetting this to
@@ -1502,7 +1502,7 @@ unitsRouter.patch('/:id/utility-responsibility', requirePerm('properties.edit'),
     // is recorded as an addendum with who and when, and it lasts exactly as long
     // as this lease: "back on when another person assumes the spot" — the next
     // lease decides on its own terms. Before this, the route refused, and the
-    // only way to honour the ask was a row written by hand.
+    // only way to honor the ask was a row written by hand.
 
     const row = await queryOne<any>(
       `INSERT INTO lease_utility_responsibilities
@@ -2118,13 +2118,13 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       // there."
       //
       // A stay of 30 nights or more drafts a lease alongside the booking.
-      // Cancelling the booking left that lease behind as a live 'pending' row —
+      // Canceling the booking left that lease behind as a live 'pending' row —
       // it appeared in lease counts and on the leases page as a tenancy nobody
       // could explain, for a reservation that no longer exists.
       //
       // Only a lease that has not been executed: 'pending' and 'draft' are still
       // paperwork and follow the booking. An ACTIVE lease is a signed agreement
-      // and is never touched here — if somebody has signed, cancelling the
+      // and is never touched here — if somebody has signed, canceling the
       // calendar entry is not the instrument that ends their tenancy.
       try {
         const killed = await query<{ id: string }>(
@@ -2199,7 +2199,7 @@ unitsRouter.get('/schedule/master', requirePerm(
     const toDate = to || new Date(Date.now() + 30*24*60*60*1000).toISOString().split('T')[0]
     // S639 (Nic): "Master schedule needs to be scoped to a property, not having
     // all the different properties on one schedule." Unit numbers repeat across
-    // parks, so a merged timeline shows several rows labelled the same spot —
+    // parks, so a merged timeline shows several rows labeled the same spot —
     // unreadable, and a way to book the wrong one. Filtered here rather than in
     // the browser so a fifteen-park account is not shipped every unit it owns.
     const oneProperty = typeof req.query.propertyId === 'string' && req.query.propertyId

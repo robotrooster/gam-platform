@@ -18,4 +18,4 @@ Each notice names the affected service (water, power, gas, heat/AC, elevator, in
 
 Resolution is always a manual step — GAM never auto-resolves at the expected-restore time, because that time is an estimate and a false "service restored" signal is worse than none. When service is actually back, mark the notice resolved and choose whether to send residents an all-clear notification. Only send the all-clear once you've confirmed the service is really restored.
 
-If a notice was posted by mistake or the work is called off, cancel it instead — cancelling doesn't send any restoration message.
+If a notice was posted by mistake or the work is called off, cancel it instead — canceling doesn't send any restoration message.

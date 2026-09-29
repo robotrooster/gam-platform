@@ -259,7 +259,7 @@ export const TENANT_INTENTS: Intent[] = [
     // point of contact where tenants are gonna complain about the neighbor —
     // hey, tell my neighbor to turn their shit down."
     //
-    // The complaint must be RECORDED, not sympathised with. mustNotContain
+    // The complaint must be RECORDED, not sympathized with. mustNotContain
     // guards the two failures that make it worthless: promising the landlord
     // will do something, and promising a person will call.
     audience: 'tenant', id: 'file-complaint', needsTool: true,
@@ -400,7 +400,7 @@ export const LANDLORD_INTENTS: Intent[] = [
     ],
   },
   {
-    audience: 'landlord', id: 'neighbour-utilities', needsTool: false,
+    audience: 'landlord', id: 'neighbor-utilities', needsTool: false,
     phrasings: [
       'I supply trash cans to the building next door, can I bill them?',
       'can I charge someone who is not my tenant for utilities',
@@ -484,7 +484,7 @@ export const LANDLORD_INTENTS: Intent[] = [
       'will this unit rent quickly',
     ],
   },
-  // ── S618: the three behaviours S617 BUILT but never measured ────────────
+  // ── S618: the three behaviors S617 BUILT but never measured ────────────
   // Two tools were added because the question had nothing to call, and the
   // "spot number one" disambiguation was written to Nic's spec — and none of
   // it had a case here. A tool that is registered but never reached through
@@ -547,7 +547,7 @@ export const LANDLORD_INTENTS: Intent[] = [
  *
  * Found by hand means found by luck. These are the cases that make it not luck.
  *
- * Every group carries a CROSS-AUDIENCE case — the question from a NEIGHBOURING
+ * Every group carries a CROSS-AUDIENCE case — the question from a NEIGHBORING
  * audience — because that is the failure Nic reported: "the tenant agent keeps
  * telling people stuff about the landlord or the booking side that has nothing
  * to do with being a tenant."

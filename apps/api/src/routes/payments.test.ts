@@ -1017,7 +1017,7 @@ describe('GET /payments/balance-context — per-method price breakdown', () => {
 
   // Nic: the tenant must see the landlord is ACTIVELY covering it, "and that
   // they may choose to stop covering that at any time" — so a later $10 on their
-  // bill is recognisable as a change of policy, not a new surprise charge.
+  // bill is recognizable as a change of policy, not a new surprise charge.
   it('reports the landlord covering it, with the amount being absorbed', async () => {
     const f = await seed()
     await db.query(
@@ -1472,7 +1472,7 @@ describe('S636 a manual payment settles the whole balance', () => {
       .toEqual([])
   })
 
-  it('leaves work-trade suspended charges alone — labour already covers them', async () => {
+  it('leaves work-trade suspended charges alone — labor already covers them', async () => {
     const f = await seed()
     const b = await seedBalance(f, { suspendUtilities: true })
     await request(buildApp())
@@ -1680,7 +1680,7 @@ describe('S637 a credit reduces what is owed next month', () => {
 // money the resident hands over. Four places already knew that (the settlement
 // job, the move-in bundle, the manual settle, utility billing); the two the
 // TENANT actually sees did not. Tyler Rhoades was shown $687.57 owing on Oak
-// Park RV 03 and Matthew Conklin $776.11, every dollar of it covered by labour.
+// Park RV 03 and Matthew Conklin $776.11, every dollar of it covered by labor.
 describe('S637 work-trade suspended charges', () => {
   it('are left out of the balance the tenant is shown', async () => {
     const f = await seed()

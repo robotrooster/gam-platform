@@ -62,7 +62,7 @@ function declared(): Record<string, Set<string>> {
 }
 
 /** ':unitId' and ':id' are the same shape to a router. */
-const normalise = (p: string) => (p.replace(/:[A-Za-z0-9_]+/g, ':x') || '/')
+const normalize = (p: string) => (p.replace(/:[A-Za-z0-9_]+/g, ':x') || '/')
 
 describe('every allowlisted action resolves to a real route', () => {
   const MOUNTS = mounts()
@@ -80,10 +80,10 @@ describe('every allowlisted action resolves to a real route', () => {
       expect(router, `nothing is mounted at ${base}`).toBeTruthy()
 
       const sub = path.slice(base!.length) || '/'
-      const want = `${method} ${normalise(sub)}`
+      const want = `${method} ${normalize(sub)}`
       const have = [...(DECLARED[router!] ?? new Set<string>())].map((d) => {
         const [m, ...rest] = d.split(' ')
-        return `${m} ${normalise(rest.join(' '))}`
+        return `${m} ${normalize(rest.join(' '))}`
       })
       expect(have, `${router} declares no ${want}`).toContain(want)
     })

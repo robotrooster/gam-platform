@@ -8,13 +8,13 @@
  * their shit down."
  *
  * Before this, a tenant could say exactly that and it went nowhere: the agent
- * would sympathise, the conversation would end, and the landlord would never
- * know. Asked later which tenants complain most, or which neighbour is the
+ * would sympathize, the conversation would end, and the landlord would never
+ * know. Asked later which tenants complain most, or which neighbor is the
  * actual problem, nothing anywhere held the answer.
  *
  * IT IS DIRECTLY RUNNABLE, and that reversed an earlier call of mine. I first
  * withheld it from the phrase table on the grounds that a write about a named
- * neighbour is too consequential to fire from a misread sentence. Then the
+ * neighbor is too consequential to fire from a misread sentence. Then the
  * battery measured what actually happens: the model never called it — 0 of 4 —
  * and instead told the tenant "I've logged your complaint. Your landlord has
  * been notified and will follow up." while the table stayed empty. A tenant who
@@ -119,7 +119,7 @@ export const logComplaint: AgentTool = {
 
     // Same tenant, same words, within the hour — the phrase table may fire on
     // several turns of one conversation about one problem, and a landlord
-    // reading "loud neighbour" nine times learns nothing the first row did not
+    // reading "loud neighbor" nine times learns nothing the first row did not
     // already say.
     const dupe = await queryOne<any>(
       `SELECT id FROM tenant_complaints

@@ -77,10 +77,10 @@ describe('checkAgainstStatute (objective factual mismatch, not legal advice)', (
     expect(await checkAgainstStatute('AZ', 'deposit_max_months', 1)).toBeNull()
   })
 
-  it('returns null for a non-directional (info) rule and for an uncatalogued topic — no false flags', async () => {
+  it('returns null for a non-directional (info) rule and for an uncataloged topic — no false flags', async () => {
     mockQuery.mockResolvedValueOnce([{ topic: 'late_fee', rule_kind: 'info', threshold_numeric: '5', threshold_unit: 'x', summary: '', statute_citation: null, source_url: null, source_date: '2026-06-09' }])
     expect(await checkAgainstStatute('AZ', 'late_fee', 100)).toBeNull()
-    mockQuery.mockResolvedValueOnce([]) // uncatalogued
+    mockQuery.mockResolvedValueOnce([]) // uncataloged
     expect(await checkAgainstStatute('NV', 'late_fee', 100)).toBeNull()
   })
 })

@@ -29,7 +29,7 @@ export function PermissionCatalogEditor({
   return (
     <div>
       {/* Presets — additive quick-fills (turn a bundle ON); every toggle stays
-          adjustable below. Matches the permissions-page behaviour. */}
+          adjustable below. Matches the permissions-page behavior. */}
       <div style={{ marginBottom: 12 }}>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           {PERMISSION_PRESETS.map(preset => (

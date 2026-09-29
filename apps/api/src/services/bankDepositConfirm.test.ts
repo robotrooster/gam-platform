@@ -1,7 +1,7 @@
 /**
  * S624 — confirming a bank deposit against the charges it paid.
  *
- * The matcher and the backdating maths are pinned in their own files. This one
+ * The matcher and the backdating math are pinned in their own files. This one
  * checks the promises the software actually has to KEEP for a cash-paying
  * tenant: the payment lands on the date the money moved, the late fees that
  * accrued while it was in transit come off, a fee already paid comes back as a

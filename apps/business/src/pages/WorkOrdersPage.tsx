@@ -1137,7 +1137,7 @@ function CancelModal({
         display: 'flex', gap: 8, alignItems: 'start',
       }}>
         <AlertTriangle size={14} style={{ color: 'var(--amber)', flexShrink: 0, marginTop: 2 }} />
-        <span>Cancelling locks the work order. Stock isn't restored automatically — remove part lines first if you want stock back.</span>
+        <span>Canceling locks the work order. Stock isn't restored automatically — remove part lines first if you want stock back.</span>
       </div>
       <label style={labelStyle}>Reason</label>
       <input value={reason} onChange={e => setReason(e.target.value)}

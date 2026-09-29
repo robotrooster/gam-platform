@@ -56,7 +56,7 @@ function scope(req: any): string {
  *
  * The write resolver was doing double duty here. A read spans every entity the
  * account owns, narrowing only when `?entityId=` names one (and then only to an
- * entity they actually own — the same authorisation, via the same resolver).
+ * entity they actually own — the same authorization, via the same resolver).
  */
 function readScope(req: any): string[] {
   const explicit = req.query?.entityId

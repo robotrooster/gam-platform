@@ -119,7 +119,7 @@ describe('unit ↔ subtype linking (S613)', () => {
     expect(Number(lease.rent_amount)).toBe(380) // what the tenant actually pays
   })
 
-  // The behaviour Nic expected and did not have: raise the class, every unit
+  // The behavior Nic expected and did not have: raise the class, every unit
   // in it follows. Enforced by DB trigger, so it holds whichever door edits it.
   // S629 (Nic, DIRECTIVE — supersedes S613): "pricing should not necessarily be
   // linked to subtypes... the subtype is more just for classification,
@@ -129,7 +129,7 @@ describe('unit ↔ subtype linking (S613)', () => {
   //
   // These three tests asserted the S613 model — class owns the price, per-unit
   // pricing refused with a 400 — and are inverted rather than deleted, because
-  // the behaviour they describe is exactly what must NOT happen now.
+  // the behavior they describe is exactly what must NOT happen now.
   it('editing a class price leaves the units in it alone', async () => {
     const app = buildApp(); const f = await seed()
     const s = await makeSubtype(app, f, { unitType: 'rv_spot', name: 'Back-in 50 amp', rentAmount: 440 })
@@ -263,7 +263,7 @@ describe('unit ↔ subtype linking (S613)', () => {
     const rows = (await db.query(
       `SELECT id, rent_amount, subtype_id FROM units WHERE id = ANY($1::uuid[])`, [[f.rvA, f.rvB]])).rows
     expect(Number(rows.find((r: any) => r.id === f.rvA).rent_amount)).toBe(700)
-    // The neighbour is untouched — at its OWN price, which joining the class
+    // The neighbor is untouched — at its OWN price, which joining the class
     // never overwrote (S630) — and both keep the classification.
     expect(Number(rows.find((r: any) => r.id === f.rvB).rent_amount)).toBe(1000)
     expect(rows.every((r: any) => r.subtype_id === s.id)).toBe(true)

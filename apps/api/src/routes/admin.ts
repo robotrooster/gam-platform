@@ -242,7 +242,7 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
  *     [{m:'Oct',r:1800},{m:'Nov',r:2100},{m:'Dec',r:2400},
  *      {m:'Jan',r:2700},{m:'Feb',r:3000},{m:'Mar',r:<the one real number>}]
  *
- * Five invented points and one real one, mislabelled with a month it wasn't.
+ * Five invented points and one real one, mislabeled with a month it wasn't.
  * It drew a tidy upward line no matter what the platform actually did — the
  * worst kind of wrong on a financial dashboard, because it looks like
  * information. Nic spotted it as "the graph stops in March".
@@ -253,7 +253,7 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
  *
  * The card said "Rent Collected" while the query has always summed four types.
  * They coincided only because rent was the sole kind of row that existed. The
- * moment Oak Park bills a trash can or a parking violation, a card labelled
+ * moment Oak Park bills a trash can or a parking violation, a card labeled
  * "rent" would quietly start including them. Renamed rather than narrowed: for
  * a platform-health heartbeat, what matters is money crossing the rails, and
  * narrowing it to rent would have hidden the utility billing this session
@@ -1781,7 +1781,7 @@ async function computeComposition(key: string, startSql: string, label: string, 
   }))
 
   // Anything earning money under a type nobody has named yet still has to show
-  // up, or the pie quietly stops equalling the card the first time a new
+  // up, or the pie quietly stops equaling the card the first time a new
   // revenue type is added and nobody remembers this list.
   const named = new Set(REVENUE_SLICES.flatMap(sl => sl.types))
   const otherAmt = +rows.filter(r => !named.has(r.type))
@@ -3871,7 +3871,7 @@ adminRouter.delete('/invitations/:id', requireSuperAdmin, async (req, res, next)
 // is single-use, it dies in 72 hours, and it can only ever create the ONE email
 // address the super_admin typed. A stolen link cannot be pointed at a different
 // address, cannot choose its own role, and cannot reach anything before the
-// mandatory 2FA enrolment gate.
+// mandatory 2FA enrollment gate.
 export const adminInviteRouter = Router()
 
 const liveInvite = (token: string) => queryOne<any>(
@@ -3933,7 +3933,7 @@ adminInviteRouter.post('/:token/accept', async (req, res, next) => {
       await client.query('COMMIT')
 
       // No session is issued here on purpose. They sign in normally, which runs
-      // them straight into the mandatory 2FA enrolment every admin must pass —
+      // them straight into the mandatory 2FA enrollment every admin must pass —
       // handing back a token would route around the one gate that matters.
       res.status(201).json({ success: true, data: { email: user.email, role: user.role } })
     } catch (e) {

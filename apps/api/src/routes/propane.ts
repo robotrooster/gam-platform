@@ -88,7 +88,7 @@ const UNIT_FILL_COLS = `u.id, u.landlord_id, u.property_id, u.unit_number,
 // not being a meter. MEMBERSHIP semantics, like the trash picker: ticked spaces
 // have a tank, unticked ones don't.
 //
-// Removing a tank never touches money already owed — instalments on propane
+// Removing a tank never touches money already owed — installments on propane
 // already delivered keep billing. It only stops the space being offered on
 // Record Delivery.
 // GET /api/propane/mine — S613 (Nic): the TENANT's own propane ledger.

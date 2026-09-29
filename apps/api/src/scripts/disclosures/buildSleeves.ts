@@ -131,7 +131,7 @@ const TOPIC: Partial<Record<string, string>> = {
   defective_drywall:        String.raw`drywall`,
   military_ordnance:        String.raw`ordnance|munitions`,
   property_condition:       String.raw`(?:condition|defect)s?\s+of\s+the\s+(?:premises|dwelling|property|unit)`,
-  statutory_acknowledgement:String.raw`acknowledg\w+\s+(?:receipt|that\s+the\s+(?:tenant|resident))`,
+  statutory_acknowledgment:String.raw`acknowledg\w+\s+(?:receipt|that\s+the\s+(?:tenant|resident))`,
 }
 // What the DOCUMENT in each sleeve is called. The category labels describe a
 // topic ("Owner / agent identity and address"); a sleeve holds a document, and
@@ -157,7 +157,7 @@ const DOC_TITLE: Record<string, string> = {
   smoking_policy: 'Smoking Policy', move_in_condition: 'Move-In Condition Checklist',
   military_ordnance: 'Military Ordnance Disclosure', condemnation_orders: 'Condemnation Notice',
   shared_utilities: 'Shared Utility Disclosure', fire_damage: 'Fire Damage Disclosure',
-  statutory_acknowledgement: 'Acknowledgement of Receipt',
+  statutory_acknowledgment: 'Acknowledgment of Receipt',
 }
 
 // Library topics (government supplies the document) and non-documents.
@@ -213,7 +213,7 @@ async function mine(states: string[]) {
         AND act_key = ANY($2::text[])
       ORDER BY state_code, act_key, section_number`,
     [states, Object.keys(ACT_UNITS)])
-  // An RV act that is a copy of the state's mobile-home act is mislabelled in
+  // An RV act that is a copy of the state's mobile-home act is mislabeled in
   // the corpus (Illinois: 45 of 45 sections identical, text says "mobile home"
   // throughout). Mining it would put mobile-home duties on RV sites.
   const copies = await query<{ state_code: string; act_key: string }>(
@@ -224,7 +224,7 @@ async function mine(states: string[]) {
               WHERE a.state_code=r.state_code AND a.act_key=r.act_key
                 AND b.act_key IN ('mobile_home_park','manufactured_home_park')) >= 0.8 * r.n`)
   const skip = new Set(copies.map(c => `${c.state_code}|${c.act_key}`))
-  if (skip.size) console.error(`skipping mislabelled RV acts (copies of the mobile home act): ${[...skip].join(', ')}`)
+  if (skip.size) console.error(`skipping mislabeled RV acts (copies of the mobile home act): ${[...skip].join(', ')}`)
 
   // state -> act -> category -> first hit
   const found = new Map<string, Map<string, Map<string, Hit>>>()

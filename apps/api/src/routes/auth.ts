@@ -126,7 +126,7 @@ const registerSchema = z.object({
   // the entity name; it just is not asked for on the self-serve form.
   businessName: z.string().trim().min(1).optional(),
   // Legal acceptance — frontend gate sets this true when the user
-  // checks the Terms + Privacy acknowledgement at registration.
+  // checks the Terms + Privacy acknowledgment at registration.
   // We refuse the request if it's false or missing so the timestamps
   // on users.accepted_tos_at / accepted_privacy_at are never a lie.
   acceptedTerms: z.literal(true, {
@@ -141,14 +141,14 @@ const registerSchema = z.object({
 // and there is no such row, so the lookup misses and returns the deliberately
 // vague "Invalid credentials" with no hint that the address was the problem.
 //
-// Phone keyboards auto-capitalise the first letter of a text field, and both
+// Phone keyboards auto-capitalize the first letter of a text field, and both
 // Nicks and Ben were locked out simultaneously the first evening they all tried
 // to sign in to the admin portal. The API log shows it plainly: those 401s came
 // back in 5-12ms, far too fast for bcrypt to have run — the password was never
 // even checked, because no user was found. A genuine wrong password takes ~270ms
 // and there was exactly one of those all night.
 //
-// Normalised here, at the edge, so every path below sees the same string.
+// Normalized here, at the edge, so every path below sees the same string.
 const loginSchema = z.object({
   email:    z.string().trim().toLowerCase().pipe(z.string().email()),
   password: z.string(),
@@ -389,7 +389,7 @@ authRouter.post('/login', async (req, res, next) => {
        -- their business_id lives in the scope row.
        LEFT JOIN businesses b ON b.owner_user_id = u.id AND b.status = 'active'
        -- S639: case-insensitive. An address is the same address whatever a
-       -- phone keyboard capitalised on the way in.
+       -- phone keyboard capitalized on the way in.
        WHERE lower(u.email) = lower($1)`, [email]
     )
     if (!user) throw new AppError(401, 'Invalid credentials')
@@ -988,12 +988,12 @@ authRouter.post('/forgot-password', async (req, res, next) => {
         ...PORTAL_LABELS.map((l) => `https://${l}.${APEX}`),
       ].filter(Boolean).map((u) => String(u).replace(/\/$/, ''))
       const origin = String(req.get('origin') || '').replace(/\/$/, '')
-      // Only ever echo back an origin we recognise — an attacker who could set
+      // Only ever echo back an origin we recognize — an attacker who could set
       // Origin freely would otherwise redirect a real reset token to their host.
       // S639 (Nic): "the link you sent me is a password reset request for the
       // landlord page, not for my admin login. Why is that the case?"
       //
-      // Because with no recognised Origin this fell to a fixed default — the
+      // Because with no recognized Origin this fell to a fixed default — the
       // tenant app, or whatever RESET_PASSWORD_URL happened to say — with no
       // regard for WHO is resetting. A reset fired from a script, a CLI or any
       // client that does not send Origin therefore handed an admin a link into
@@ -1001,7 +1001,7 @@ authRouter.post('/forgot-password', async (req, res, next) => {
       //
       // The user is known here, so the fallback follows their ROLE, the same
       // map the verification link uses. Origin still wins when it is one we
-      // recognise: the portal that served the form is the best answer, and
+      // recognize: the portal that served the form is the best answer, and
       // echoing only allow-listed origins is what stops a forged Origin
       // redirecting a live reset token somewhere else.
       //
@@ -1231,7 +1231,7 @@ authRouter.post('/resend-verification', async (req, res, next) => {
 
 const EMAIL_CHANGE_TTL_HOURS = 24
 
-/** Only ever echo back an origin we recognise — see forgot-password. */
+/** Only ever echo back an origin we recognize — see forgot-password. */
 function portalBaseForRequest(req: any): string {
   const APEX = 'goldassetmanagement.com'
   const LABELS = ['landlord', 'tenant', 'admin', 'pm', 'business', 'pos']

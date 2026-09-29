@@ -151,7 +151,7 @@ async function invoiceFor(leaseId: string) {
 // which cannot be known on the 1st. Generation now issues the invoice GROSS and
 // OPENS a settlement period; jobs/workTradeSettlement.ts credits it at month
 // close. These tests were rewritten rather than deleted: the old expectations
-// describe behaviour that was wrong for the reason above, and the new ones pin
+// describe behavior that was wrong for the reason above, and the new ones pin
 // what replaced it.
 describe('generateInvoices — opens a work-trade period, credits nothing', () => {
   const periodOf = async (agreementId: string | null) => (await db.query<any>(

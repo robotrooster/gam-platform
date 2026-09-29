@@ -46,7 +46,7 @@ const IN_FLIGHT_STATUSES = ['processing']
  * leading interrogatives and filler, drop trailing possessives, and drop the
  * noun the landlord was asking ABOUT ("balance", "rent") when it trails a name.
  *
- * Deliberately conservative — it only trims recognised words from the ENDS. A
+ * Deliberately conservative — it only trims recognized words from the ENDS. A
  * real name is never removed, because whatever remains after the known filler is
  * what gets searched.
  */
@@ -164,7 +164,7 @@ export const lookupTenantPaymentStatus: AgentTool = {
               us.email ILIKE $2
            OR (COALESCE(us.first_name,'') || ' ' || COALESCE(us.last_name,'')) ILIKE $2
            OR un.unit_number ILIKE $2
-           -- S617: compared as NUMBERS, not text. "spot 1" normalises to "1"
+           -- S617: compared as NUMBERS, not text. "spot 1" normalizes to "1"
            -- and the unit "RV 01" to "01"; as strings those differ, so asking
            -- about spot 1 returned "no tenant matches" while the spot existed.
            OR ($3 ~ '[0-9]'

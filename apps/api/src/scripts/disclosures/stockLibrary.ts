@@ -147,7 +147,7 @@ const DOCS: Doc[] = [
   {
     file: 'library-us-epa-lessor-lead-disclosure.pdf',
     name: 'Federal: Lead-Based Paint Disclosure — Rentals (EPA Form 9600-041)',
-    description: "EPA's disclosure form for leasing housing built before 1978: the lead warning statement, the landlord's disclosure of known lead-based paint and records, and the tenant's acknowledgement of receiving them and the lead pamphlet.",
+    description: "EPA's disclosure form for leasing housing built before 1978: the lead warning statement, the landlord's disclosure of known lead-based paint and records, and the tenant's acknowledgment of receiving them and the lead pamphlet.",
     disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'rental', unitTypes: DWELLINGS,
     sourceName: 'U.S. Environmental Protection Agency',
     sourceUrl: 'https://www.epa.gov/sites/default/files/documents/lesr_eng.pdf',
@@ -177,7 +177,7 @@ const DOCS: Doc[] = [
   {
     file: 'library-us-epa-seller-lead-disclosure.pdf',
     name: 'Federal: Lead-Based Paint Disclosure — Sales (EPA Form 9600-040)',
-    description: "EPA's disclosure form for selling housing built before 1978: the lead warning statement, the seller's disclosure of known lead-based paint and records, and the purchaser's acknowledgement of receiving them, the lead pamphlet, and the 10-day inspection opportunity.",
+    description: "EPA's disclosure form for selling housing built before 1978: the lead warning statement, the seller's disclosure of known lead-based paint and records, and the purchaser's acknowledgment of receiving them, the lead pamphlet, and the 10-day inspection opportunity.",
     disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'sale', unitTypes: DWELLINGS,
     sourceName: 'U.S. Environmental Protection Agency',
     sourceUrl: 'https://www.epa.gov/sites/default/files/documents/selr_eng.pdf',
@@ -329,7 +329,7 @@ const DOCS: Doc[] = [
     file: 'library-il-idhr-safe-homes-summary-2025-12.pdf',
     replaces: 'library-il-idhr-safe-homes-summary-2025.pdf',
     name: 'Illinois: Summary of Rights for Safer Homes (Safe Homes Act, December 2025)',
-    description: "The Illinois Department of Human Rights' summary of tenants' rights under the Safe Homes Act for survivors of domestic violence, dating violence, sexual assault and stalking. Each page carries its own tenant acknowledgement.",
+    description: "The Illinois Department of Human Rights' summary of tenants' rights under the Safe Homes Act for survivors of domestic violence, dating violence, sexual assault and stalking. Each page carries its own tenant acknowledgment.",
     disclosureType: 'domestic_violence_rights', jurisdiction: 'IL', appliesTo: 'rental', unitTypes: DWELLINGS,
     sourceName: 'Illinois Department of Human Rights',
     sourceUrl: 'https://dhr.illinois.gov/content/dam/soi/en/web/dhr/publications/documents/sfa/Summary%20of%20Rights%20for%20Safer%20Homes%20-%20Safe%20Homes%20Act%20Lease%20Document%20-%2012-2025-R3.pdf',
@@ -345,7 +345,7 @@ const DOCS: Doc[] = [
   {
     file: 'library-il-iema-radon-disclosure-lease.pdf',
     name: 'Illinois: Disclosure of Information on Radon Hazards — Tenants',
-    description: "IEMA's radon disclosure for current and prospective tenants: the radon warning statement, the landlord's disclosure of known radon levels and records, and the tenant's acknowledgement of receiving them and the Radon Guide for Tenants.",
+    description: "IEMA's radon disclosure for current and prospective tenants: the radon warning statement, the landlord's disclosure of known radon levels and records, and the tenant's acknowledgment of receiving them and the Radon Guide for Tenants.",
     disclosureType: 'radon', jurisdiction: 'IL', appliesTo: 'rental', unitTypes: DWELLINGS,
     sourceName: 'Illinois Emergency Management Agency and Office of Homeland Security',
     sourceUrl: 'https://iemaohs.illinois.gov/content/dam/soi/en/web/iemaohs/nrs/radon/documents/disclosureradonhazards.pdf',
@@ -502,7 +502,7 @@ async function stock() {
              JOIN users u ON u.id=l.user_id WHERE t.library_document_id=$1 AND t.is_active`, [held[0].id])
         for (const t of adopted) {
           const own = await query<any>(`SELECT * FROM lease_template_fields WHERE template_id=$1`, [t.id])
-          if (sig(own) !== oldSig) { console.log(`    left alone (boxes customised): ${t.name}`); continue }
+          if (sig(own) !== oldSig) { console.log(`    left alone (boxes customized): ${t.name}`); continue }
           await query(`DELETE FROM lease_template_fields WHERE template_id=$1`, [t.id])
           await query(
             `INSERT INTO lease_template_fields

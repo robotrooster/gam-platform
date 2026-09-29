@@ -109,7 +109,7 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
   const { width, height } = page.getSize()
   const margin = 54
   const black = rgb(0, 0, 0)
-  const grey  = rgb(0.4, 0.4, 0.4)
+  const gray  = rgb(0.4, 0.4, 0.4)
   const gold  = rgb(0.788, 0.635, 0.153)
 
   let y = height - margin
@@ -138,14 +138,14 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
     ['Effective:', new Date().toLocaleDateString(undefined, { year:'numeric', month:'long', day:'numeric' })],
   ]
   for (const [label, value] of infoLines) {
-    page.drawText(label, { x: margin,       y, size: 10, font: helveticaBold, color: grey })
+    page.drawText(label, { x: margin,       y, size: 10, font: helveticaBold, color: gray })
     page.drawText(value, { x: margin + 110, y, size: 10, font: helvetica,     color: black })
     y -= 16
   }
   y -= 8
 
   // Parties
-  page.drawText('PARTIES', { x: margin, y, size: 11, font: helveticaBold, color: grey })
+  page.drawText('PARTIES', { x: margin, y, size: 11, font: helveticaBold, color: gray })
   y -= 16
   page.drawText('Sublessor (original tenant):', { x: margin, y, size: 10, font: helveticaBold, color: black })
   y -= 14
@@ -161,7 +161,7 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
   y -= 18
 
   // Terms / boilerplate
-  page.drawText('TERMS', { x: margin, y, size: 11, font: helveticaBold, color: grey })
+  page.drawText('TERMS', { x: margin, y, size: 11, font: helveticaBold, color: gray })
   y -= 16
   const terms = [
     '1. The Sublessor remains responsible to the property owner under the master lease.',
@@ -183,7 +183,7 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
   }
   y -= 10
   if (ctx.notes) {
-    page.drawText('ADDITIONAL NOTES', { x: margin, y, size: 10, font: helveticaBold, color: grey })
+    page.drawText('ADDITIONAL NOTES', { x: margin, y, size: 10, font: helveticaBold, color: gray })
     y -= 14
     const wrapped = wrapText(ctx.notes, 92)
     for (const line of wrapped) {
@@ -194,7 +194,7 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
   }
 
   // Signatures
-  page.drawText('SIGNATURES', { x: margin, y, size: 11, font: helveticaBold, color: grey })
+  page.drawText('SIGNATURES', { x: margin, y, size: 11, font: helveticaBold, color: gray })
   y -= 22
   for (const [label, name] of [
     ['Sublessor', ctx.sublessor_name],
@@ -206,11 +206,11 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
     }
     page.drawText(`${label}: ${name}`, { x: margin, y, size: 10, font: helveticaBold, color: black })
     y -= 14
-    page.drawLine({ start: { x: margin,       y }, end: { x: margin + 240, y }, thickness: 0.7, color: grey })
-    page.drawLine({ start: { x: margin + 280, y }, end: { x: margin + 420, y }, thickness: 0.7, color: grey })
+    page.drawLine({ start: { x: margin,       y }, end: { x: margin + 240, y }, thickness: 0.7, color: gray })
+    page.drawLine({ start: { x: margin + 280, y }, end: { x: margin + 420, y }, thickness: 0.7, color: gray })
     y -= 11
-    page.drawText('Signature', { x: margin,       y, size: 8, font: helvetica, color: grey })
-    page.drawText('Date',      { x: margin + 280, y, size: 8, font: helvetica, color: grey })
+    page.drawText('Signature', { x: margin,       y, size: 8, font: helvetica, color: gray })
+    page.drawText('Date',      { x: margin + 280, y, size: 8, font: helvetica, color: gray })
     y -= 26
   }
 

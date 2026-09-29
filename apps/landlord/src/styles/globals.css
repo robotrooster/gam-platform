@@ -778,12 +778,12 @@ fieldset:disabled { opacity: 1; }
  * "sidebar you can't close" — it is not a drawer, it is a marketing column
  * eating the whole viewport and pushing the form off-screen to the right.
  *
- * THE SCROLL LOCK. The right pane centred its child with `align-items:center`
+ * THE SCROLL LOCK. The right pane centered its child with `align-items:center`
  * on a `min-height:100vh` flex container. When the child is taller than the
- * viewport — which is every landscape phone — a centred flex item overflows
+ * viewport — which is every landscape phone — a centered flex item overflows
  * EQUALLY in both directions and the top is clipped into unreachable space:
  * scrolling cannot reach above the container's start edge. That is the "scrolled
- * briefly then locked" exactly. `margin:auto` centres the same way while leaving
+ * briefly then locked" exactly. `margin:auto` centers the same way while leaving
  * the overflow reachable, which is the fix.
  */
 .auth-split{ min-height:100dvh; background:var(--bg-0); display:flex; }
@@ -805,7 +805,7 @@ fieldset:disabled { opacity: 1; }
   .auth-aside{ display:none; }
   .auth-main{ padding:28px 18px; }
 }
-/* Short viewports — a landscape phone — must never centre-and-clip. */
+/* Short viewports — a landscape phone — must never center-and-clip. */
 @media (max-height: 620px){
   .auth-main{ align-items:flex-start; padding-top:20px; padding-bottom:32px; }
   .auth-main > *{ margin-top:0; }
@@ -815,7 +815,7 @@ fieldset:disabled { opacity: 1; }
  * co-owner invite itself) all shipped the same shape as the register page:
  *   minHeight:100vh; display:flex; align-items:center
  * which clips the top of any card taller than the viewport and makes it
- * unreachable — the landscape-phone lock. `margin:auto` centres identically
+ * unreachable — the landscape-phone lock. `margin:auto` centers identically
  * while keeping the overflow scrollable, and 100dvh keeps mobile browser
  * chrome from stealing the last rows. */
 .auth-center{

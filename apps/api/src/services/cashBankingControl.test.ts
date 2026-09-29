@@ -99,7 +99,7 @@ describe('cash collected but never banked', () => {
     expect(pos.oldestDays).toBe(0)
   })
 
-  it('honours a landlord’s own grace period', async () => {
+  it('honors a landlord’s own grace period', async () => {
     const ctx = await build()
     await collectInPerson(ctx, { amount: 500, daysAgo: 5, unit: 'Lot 1' })
     expect((await cashBankingPosition(ctx.landlordId, { graceDays: 7 })).unbanked)

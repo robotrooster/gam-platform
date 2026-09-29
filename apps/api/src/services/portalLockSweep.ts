@@ -12,7 +12,7 @@
  * gives the smaller landlords years to potentially not pay. And smaller or
  * bigger landlords would be locked out immediately on a technicality. So it
  * needs to be per billing cycle." A $500 trigger is four years of patience for
- * somebody running a duplex on the $10 minimum, and a fortnight's grace for a
+ * somebody running a duplex on the $10 minimum, and a two weeks's grace for a
  * 300-unit portfolio. The same number means two completely different things.
  *
  * THE RULE, in his words: "if somebody's on the $10 a month minimum to run their

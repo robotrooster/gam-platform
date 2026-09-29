@@ -82,7 +82,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
     // The route ran with no transaction at all, and three statements after that
     // UPDATE were unguarded while every other side effect in it sat in a
     // try/catch. One of them threw. Which one hardly matters: the shape was
-    // that a single-use credential was consumed BEFORE the work it authorised
+    // that a single-use credential was consumed BEFORE the work it authorized
     // was done, so any failure anywhere after it cost the tenant their only
     // route in.
     //
@@ -121,7 +121,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // somebody who had just successfully set a password, that is false and it
       // reads as being locked out of an account that exists and works.
       //
-      // The token is kept now and marked accepted instead. It authorises
+      // The token is kept now and marked accepted instead. It authorizes
       // nothing once accepted — this branch refuses it — so a forwarded link is
       // not a way in. It exists only so we can tell them the truth.
       if (user?.tenant_invite_accepted_at) {
@@ -150,7 +150,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // account whose state depended on how far the request happened to get.
       //
       // S637: the token is spent HERE, in the transaction, so it is spent only
-      // if the activation it authorises actually commits. It is MARKED rather
+      // if the activation it authorizes actually commits. It is MARKED rather
       // than deleted — see the ALREADY_ACCEPTED branch above. The expiry is
       // cleared so an accepted invite never also reports as timed out.
       await client.query(
@@ -1823,7 +1823,7 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
     // S579: invites are now PROPERTY-level as well as unit-level. A prospective
     // applicant is invited to a property (`propertyId`, no unit yet — the unit is
     // chosen later at lease); the legacy unit-bound invite still works and is
-    // left behaviourally untouched (no intent, no auto-draft change).
+    // left behaviorally untouched (no intent, no auto-draft change).
     const { email, firstName, lastName, unitId, phone, propertyId } = req.body
     // S652 (Nic, option 2): "This person has lived here before" — the landlord
     // attests it, the check is skipped, the attestation is recorded and counted
@@ -1883,7 +1883,7 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
     // same user. Everything downstream resolves a tenant by
     // `SELECT id FROM tenants WHERE user_id = ...` and would then get whichever
     // row came back first — the lease could attach to one and the payments to
-    // the other. A characterisation test caught it (tenantInvite.test.ts,
+    // the other. A characterization test caught it (tenantInvite.test.ts,
     // "re-inviting the same address reuses the account"); nothing had
     // re-invited the same address in the dev data, which is why it was quiet.
     //

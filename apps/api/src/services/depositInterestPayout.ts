@@ -12,7 +12,7 @@
  * require it annually. Paying annually in a termination-only state is not a
  * violation — the tenant gets their money sooner and GAM holds the principal
  * either way. So this pays annually wherever anything is owed, rather than
- * modelling thirteen cadences and getting one wrong.
+ * modeling thirteen cadences and getting one wrong.
  *
  * AS A CREDIT, not cash: it lands on the tenant's balance and comes off their
  * next bill automatically. Cash would mean opening a payout rail to a tenant

@@ -7,7 +7,7 @@
  * The admin overview counted settled + ACH-still-clearing; the landlord
  * dashboard and the Reports page counted settled only. The gap was one $460
  * ACH payment mid-flight — a mobile home whose tenant's bank had already been
- * debited. Two screens, both labelled "collected", disagreeing by a real
+ * debited. Two screens, both labeled "collected", disagreeing by a real
  * payment nobody could see.
  *
  * Money in flight is counted because the TENANT HAS SENT IT: Stripe holds an

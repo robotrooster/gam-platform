@@ -176,7 +176,7 @@ describe('cross-property convergence (S616)', () => {
   // The pay-in-full rule has to cover BOTH landlords' rows or it is not a
   // pay-in-full rule — it is a rule about one landlord that silently shorts
   // the other.
-  it('the tenant balance is rent AND the neighbour utilities, together', async () => {
+  it('the tenant balance is rent AND the neighbor utilities, together', async () => {
     const f = await twoLandlordsOnePlace()
     await linkAndActivate(f)
     await generateInvoices(new Date('2026-03-05T14:00:00Z'))
@@ -210,7 +210,7 @@ describe('cross-property convergence (S616)', () => {
     const { chargeLeaseBalance } = await import('../services/rentCharge')
     await expect(chargeLeaseBalance({
       tenantId: f.tenantId, leaseId: f.leaseId,
-      amount: 950,                       // the rent, but not the neighbour's $25
+      amount: 950,                       // the rent, but not the neighbor's $25
       paymentMethodId: 'pm_test', paymentMethodType: 'ach', source: 'portal',
     })).rejects.toThrow(/paid in full/i)
   })
@@ -227,7 +227,7 @@ describe('cross-property convergence (S616)', () => {
   })
 
   // Unlinked, it bills on its own exactly as S615 built it — the link is what
-  // changes the behaviour, not the presence of a lease somewhere.
+  // changes the behavior, not the presence of a lease somewhere.
   it('without a link, both landlords bill separately as before', async () => {
     const f = await twoLandlordsOnePlace()
 
@@ -323,7 +323,7 @@ describe('automatic linking (S616)', () => {
     expect((await autoLinkNeighborServices()).linked).toBe(1)
   })
 
-  it('links when the neighbour is on a different street — the corner-lot case', async () => {
+  it('links when the neighbor is on a different street — the corner-lot case', async () => {
     const f = await twoLandlordsOnePlace()
     await db.query(
       `UPDATE utility_service_agreements SET service_address = 'the blue house out back'

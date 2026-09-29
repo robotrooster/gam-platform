@@ -11,7 +11,7 @@
  * multi-company landlord, and the UI rendered that failure as "Loading…"
  * forever because it tested `!data`.
  *
- * These pin the contract the modal now honours.
+ * These pin the contract the modal now honors.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'

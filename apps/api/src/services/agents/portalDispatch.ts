@@ -237,7 +237,7 @@ export async function dispatchPortalAction(
   //
   // So a non-uuid unitId is read as what it plainly is — a unit NUMBER — and
   // resolved here, against this landlord's own units only. Scoped by
-  // landlord_id, so it cannot reach a neighbour's unit no matter what the model
+  // landlord_id, so it cannot reach a neighbor's unit no matter what the model
   // passes. An ambiguous or unknown number is REFUSED with the real list, which
   // turns a dead end into a question the landlord can answer.
   if (actor.role === 'landlord') {

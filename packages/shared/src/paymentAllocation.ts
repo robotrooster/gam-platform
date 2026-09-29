@@ -7,7 +7,7 @@ export interface AllocatablePayment {
   amount_paid?: number  // already applied from prior partial payments (default 0)
   due_date: string      // ISO date, used for oldest-first sort
   /** S609: charge kind. Only used to keep a propane fill from being paid
-   *  BEFORE the rent it is older than — see DEPRIORITISED below. */
+   *  BEFORE the rent it is older than — see DEPRIORITIZED below. */
   type?: string
   /** S609: propane marker, since a fill is billed as type 'utility'. */
   entry_description?: string | null

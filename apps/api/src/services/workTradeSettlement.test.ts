@@ -215,7 +215,7 @@ describe('the leniency window', () => {
 })
 
 describe('a carried hour keeps its own month’s value', () => {
-  // Nic's answer, S624: a rent increase must not retroactively reprice labour
+  // Nic's answer, S624: a rent increase must not retroactively reprice labor
   // somebody already failed to do.
   it('prices a caught-up hour at the rate of the month it was owed for', () => {
     const r = settleMonth({

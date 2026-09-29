@@ -405,7 +405,7 @@ const esign48hCutover = () => process.env.ESIGN_48H_CUTOVER || '2026-09-02T21:00
 // on every document in it so the cadence and the cap count packets, not pages.
 //
 // Link: landlords sign in the landlord portal with their signer token (S629 —
-// a document id is not recognised as a token URL and demanded a login);
+// a document id is not recognized as a token URL and demanded a login);
 // tenants get the one link that sets up their account and opens the lease
 // (S647). Same helper the send path uses.
 async function remindByPacket(rows: any[], tag: string): Promise<number> {
@@ -1368,14 +1368,14 @@ export function schedulerInit() {
     }
   })
 
-  // S616 (Nic): link a neighbour's serviced space to the unit its own landlord
+  // S616 (Nic): link a neighbor's serviced space to the unit its own landlord
   // leases, automatically. "We are gonna be linking the units on the back end
   // automatically." Daily, because either side can onboard first.
   cron.schedule('30 6 * * *', async () => {
     try {
       const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
       const r = await autoLinkNeighborServices()
-      if (r.linked > 0) logger.info(r, '[auto-link] neighbour services linked')
+      if (r.linked > 0) logger.info(r, '[auto-link] neighbor services linked')
     } catch (e) {
       logger.error({ err: e }, '[auto-link] fatal')
     }

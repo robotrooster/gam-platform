@@ -133,7 +133,7 @@ describe('S636 — window A: waiting on the landlord', () => {
 })
 
 describe('S636 — window B: waiting on the tenant', () => {
-  // S637 (Nic, DIRECTIVE) — REVERSES the S636 behaviour this test asserted.
+  // S637 (Nic, DIRECTIVE) — REVERSES the S636 behavior this test asserted.
   //
   //   "I'm not gonna fucking sign it every time somebody fails to do their part
   //    on time. It needs to be resent to them for signature."

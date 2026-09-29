@@ -56,7 +56,7 @@ const lockedAt = async (id: string) =>
 describe('the rule scales itself', () => {
   it('locks the $10 duplex and the $4,000 park at the same POINT', async () => {
     // Two cycles and 48 hours, whatever the money says. A flat $500 trigger
-    // would give the duplex four years and the park a fortnight.
+    // would give the duplex four years and the park a two weeks.
     const duplex = await billed([10, 10], { agoHoursOfLast: LOCK_GRACE_HOURS + 1 })
     const park   = await billed([4000, 4000], { agoHoursOfLast: LOCK_GRACE_HOURS + 1 })
 

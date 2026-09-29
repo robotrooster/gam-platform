@@ -82,7 +82,7 @@ export function distributeWorkTradeCredit(
    * S613 (Nic): which rows this agreement actually covers. A row that is NOT
    * covered is billed in FULL — it never takes credit here, and the caller must
    * also leave it out of the basis the credit was computed from, or the tenant's
-   * labour would buy dollars off a bill they are supposed to pay whole.
+   * labor would buy dollars off a bill they are supposed to pay whole.
    * Omitted = everything covered, which is what every agreement did before this.
    */
   covered: {

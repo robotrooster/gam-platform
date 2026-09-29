@@ -2,7 +2,7 @@
  * S626 — the cross-turn repetition guard.
  *
  * Four of the six tenant conversations and five of the nineteen in Nic's
- * two-turn review failed on one behaviour: turn two reissuing turn one. These
+ * two-turn review failed on one behavior: turn two reissuing turn one. These
  * pin the detector, since the net that uses it costs a whole extra generation
  * when it fires and must not fire on ordinary conversation.
  */
@@ -39,7 +39,7 @@ describe('repeatsPreviousReply', () => {
   })
 
   it('does NOT fire when a figure is restated inside a real answer', () => {
-    // The bar has to leave room for the correct behaviour. Repeating the number
+    // The bar has to leave room for the correct behavior. Repeating the number
     // while actually answering is what a person does; repeating the paragraph
     // is not. This must stay false or the guard costs a generation on every
     // good reply.
@@ -66,7 +66,7 @@ describe('repeatsPreviousReply', () => {
     )).toBe(false)
   })
 
-  it('does NOT fire on a short acknowledgement', () => {
+  it('does NOT fire on a short acknowledgment', () => {
     expect(repeatsPreviousReply(h(BALANCE), 'Understood — I will leave it there.')).toBe(false)
   })
 

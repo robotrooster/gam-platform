@@ -808,13 +808,13 @@ describe('S639 verification link is routed by role', () => {
 //
 // Nobody was locked — locked_until was null on every admin account. Login
 // compared the typed email RAW against users.email, an exact case-sensitive
-// match, while every stored address is lowercase. A phone keyboard capitalising
+// match, while every stored address is lowercase. A phone keyboard capitalizing
 // the first letter was enough to make the lookup miss, and a miss returns the
 // deliberately vague "Invalid credentials" with no hint that the ADDRESS was
 // wrong. The API log proved it: those 401s returned in 5-12ms, far too fast for
 // bcrypt to have run.
 describe('S639 login is case- and whitespace-insensitive on the address', () => {
-  it('signs in when the keyboard capitalised the address', async () => {
+  it('signs in when the keyboard capitalized the address', async () => {
     const email = `s639-case-${randomUUID().slice(0, 8)}@test.dev`
     const password = 'CorrectHorse!2026'
     await db.query(
@@ -919,9 +919,9 @@ describe('S650 staff consoles refuse non-staff accounts before sending a code', 
 // Nic: "the link you sent me is a password reset request for the landlord page,
 // not for my admin login. Why is that the case?"
 //
-// With no recognised Origin the link fell to a fixed default with no regard for
+// With no recognized Origin the link fell to a fixed default with no regard for
 // WHO was resetting, so an admin was handed a link into a product they do not
-// log in to. Origin still wins when we recognise it — the portal that served the
+// log in to. Origin still wins when we recognize it — the portal that served the
 // form is the best answer, and echoing only allow-listed origins is what keeps a
 // forged Origin from redirecting a live reset token.
 describe('S639 password reset link is routed by role when there is no Origin', () => {
@@ -957,12 +957,12 @@ describe('S639 password reset link is routed by role when there is no Origin', (
     expect(await resetLinkFor('tenant')).toContain('https://tenant.example.test/reset-password')
   })
 
-  it('a recognised Origin still wins — the portal that served the form knows best', async () => {
+  it('a recognized Origin still wins — the portal that served the form knows best', async () => {
     const url = await resetLinkFor('super_admin', 'https://landlord.example.test')
     expect(url).toContain('https://landlord.example.test/reset-password')
   })
 
-  it('an unrecognised Origin is ignored, so a forged one cannot capture the token', async () => {
+  it('an unrecognized Origin is ignored, so a forged one cannot capture the token', async () => {
     const url = await resetLinkFor('super_admin', 'https://evil.example.com')
     expect(url).toContain('https://admin.example.test/reset-password')
     expect(url).not.toContain('evil.example.com')

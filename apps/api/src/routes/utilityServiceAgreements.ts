@@ -118,7 +118,7 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
       }
       const landlordId = property.landlord_id
 
-      // The payer may already have an account — the neighbour could be an
+      // The payer may already have an account — the neighbor could be an
       // existing tenant of this landlord, and S614 is explicit that when their
       // space is later onboarded it must be the SAME person, same login, no
       // duplicate account. Reuse rather than collide.
@@ -239,7 +239,7 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
   })
 
 const patchBody = z.object({
-  /** S616: attest after the fact — the neighbour never clicks emails, but the
+  /** S616: attest after the fact — the neighbor never clicks emails, but the
    *  arrangement is real and the landlord is willing to say so on the record. */
   payerAlreadyAgreed: z.boolean().optional(),
   payerAgreementNote: z.string().trim().max(300).optional(),
@@ -310,7 +310,7 @@ utilityServiceAgreementsRouter.patch('/:id', requirePerm('properties.edit'),
  *    then it's gonna look for more utilities to go onto a new person after that
  *    final billing period."
  *
- * Nobody is watching the neighbour's front door. The one person who reliably
+ * Nobody is watching the neighbor's front door. The one person who reliably
  * knows they are leaving is the person leaving, so this is their button.
  *
  * It records a NOTICE, not a termination. The landlord confirms the final

@@ -78,7 +78,7 @@ describe('lot rent', () => {
     expect(res.status).toBe(200)                       // was 400 before S637
     expect(res.body.data.homes.length).toBe(2)         // one from each company
 
-    // ?entityId= still narrows, through the same authorisation.
+    // ?entityId= still narrows, through the same authorization.
     const justB = await request(buildApp()).get(`/api/lot-rent/portfolio?entityId=${llB}`)
       .set('Authorization', `Bearer ${token}`)
     expect(justB.status).toBe(200)

@@ -87,7 +87,7 @@ function sameStreet(a: string, b: string): boolean {
   return ta.some(t => tb.includes(t))
 }
 
-/** How far apart two street numbers may be and still be neighbours. Even and
+/** How far apart two street numbers may be and still be neighbors. Even and
  *  odd sides of a street run in twos, and a wide parcel can swallow several
  *  numbers, so this is deliberately loose — it only has to be tight enough to
  *  exclude the far end of the street. */
@@ -112,7 +112,7 @@ export interface AddressParts {
  *
  * Same postcode is the ordinary case. The city+state alternative is there
  * because postcode boundaries genuinely run down the middle of some streets,
- * and two neighbours on opposite sides of one should not be refused.
+ * and two neighbors on opposite sides of one should not be refused.
  */
 function sameLocality(a: AddressParts, b: AddressParts): boolean {
   const za = zip5(a.zip), zb = zip5(b.zip)

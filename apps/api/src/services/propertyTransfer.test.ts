@@ -60,7 +60,7 @@ describe('transferProperty', () => {
     expect(eq.landlord_id).toBe(f.buyer.landlordId)
   })
 
-  // The tenancy continues unchanged — a buyer honours the remaining term, and
+  // The tenancy continues unchanged — a buyer honors the remaining term, and
   // re-papering a sitting tenant's lease at a sale would alarm them for nothing.
   it('leaves the lease TERMS and the tenant untouched', async () => {
     const f = await seedSale()

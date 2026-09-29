@@ -139,7 +139,7 @@ describe('flagDepositInterestObligation', () => {
     expect(rows[0].severity).toBe('critical')
     expect(rows[0].body).toMatch(/mobile_home/)
     expect(rows[0].body).toMatch(/25\+ units/)
-    // Must warn in BOTH directions — under-pay is penalised, over-pay leaks margin.
+    // Must warn in BOTH directions — under-pay is penalized, over-pay leaks margin.
     expect(rows[0].body).toMatch(/twice the amount withheld/i)
     expect(rows[0].body).toMatch(/over-paying/i)
   })

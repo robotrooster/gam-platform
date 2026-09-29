@@ -69,7 +69,7 @@ describe('mirroring the provider suppression list', () => {
 
   it('does nothing at all without an API key, rather than wiping the mirror', async () => {
     // A key missing from one environment must never empty the list that the
-    // send path reads — that would quietly restore the old behaviour.
+    // send path reads — that would quietly restore the old behavior.
     await syncEmailSuppressions(fakeResend([[row('dead@icloud.com')]]))
     const saved = process.env.RESEND_API_KEY
     delete process.env.RESEND_API_KEY
@@ -130,7 +130,7 @@ describe('sending to an address the provider has given up on', () => {
  *
  * GAM cannot fix a dead address. Only the person who can phone the tenant and
  * ask how it is spelled can, and that is the landlord — an alert that lands
- * where nobody can act on it is a rumour.
+ * where nobody can act on it is a rumor.
  */
 describe('telling the landlord, not just GAM', () => {
   it('notifies the landlord when an address they mail goes dead', async () => {

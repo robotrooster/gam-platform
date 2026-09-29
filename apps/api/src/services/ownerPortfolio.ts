@@ -23,7 +23,7 @@
  * `lease_notices` is a generic title/body — there is no structured legal action
  * with stages and dates, so any "eviction promptness" number would be invented.
  * It is reported as unavailable rather than guessed. Building it properly means
- * modelling a legal action (notice served → filed → hearing → writ → possession),
+ * modeling a legal action (notice served → filed → hearing → writ → possession),
  * and those stages differ by state, which is a design question and not a query.
  *
  * SCOPE. Everything here is filtered to the entities the ACCOUNT owns. A manager

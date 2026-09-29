@@ -138,7 +138,7 @@ export async function getProvisionsForActIds(actIds: string[]): Promise<(Provisi
   )
 }
 
-/** The most-recent provision for (state, topic), or null if uncatalogued. */
+/** The most-recent provision for (state, topic), or null if uncataloged. */
 export async function getLatestProvision(stateCode: string, topic: StateLawTopic): Promise<ProvisionRow | null> {
   const st = String(stateCode || '').trim().toUpperCase()
   if (st.length !== 2) return null
@@ -318,7 +318,7 @@ export interface PropertyTaxProvisionRow {
  * The latest-year STRUCTURED property-tax facts for a state (exemptions,
  * assessment-appeal deadline, payment, redemption …). Returns the most recent
  * effective_year's rows only (annual-refresh inserts new years; we never show a
- * stale year alongside the current one). Empty for uncatalogued states. The
+ * stale year alongside the current one). Empty for uncataloged states. The
  * feature reads `params` per the shared PropertyTax*Params shapes;
  * `params.locally_variable` flags state-framework-but-locally-set facts.
  */
@@ -380,12 +380,12 @@ export interface LawFlag {
 
 /**
  * OBJECTIVE, factual comparison of a value (in the topic's canonical unit)
- * against the catalogued statutory figure (Nic S442: an obvious numeric or
+ * against the cataloged statutory figure (Nic S442: an obvious numeric or
  * timeline mismatch — a late fee, deposit amount, notice period — may be
  * flagged factually; that is NOT legal advice). Returns a hedged, FACTUAL
  * mismatch flag when the number is above a 'max' figure or below a 'min'
  * figure — never a legal conclusion (no "you're in violation", no "should").
- * Null when the value is within range, the topic is uncatalogued, or the rule
+ * Null when the value is within range, the topic is uncataloged, or the rule
  * isn't directional (no false alarms, no interpretation). Pure number compare.
  */
 export async function checkAgainstStatute(

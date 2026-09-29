@@ -225,7 +225,7 @@ describe('processPlatformFeeAccrual', () => {
     })
   })
 
-  // S650 (Nic): the fee was recognised as revenue and never charged to anybody
+  // S650 (Nic): the fee was recognized as revenue and never charged to anybody
   // — the payout nets what the landlord OWES, and nothing wrote that down.
   it('charges the landlord for the fee, so a payout can net it out', async () => {
     const stack = await buildPlatformStack({ unitCount: 6, platformFeePayer: 'landlord' })
@@ -746,7 +746,7 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
     const { rows } = await db.query<any>(
       `SELECT utility_service_unit_count, total_billable
          FROM platform_fee_accruals WHERE property_id = $1`, [propertyId])
-    // Trash AND electric on the one neighbour space.
+    // Trash AND electric on the one neighbor space.
     expect(rows[0].utility_service_unit_count).toBe(1)
   })
 
@@ -996,7 +996,7 @@ describe('a property under a property manager', () => {
   it('still floors a small manager-rate property at the Connect minimum', async () => {
     // Worth pinning because a bulk rate makes the floor bite far more often:
     // 3 units at 50 cents is $1.50, and the $10 minimum per PAYOUT SETUP (S630)
-    // tops it up. That is existing, deliberate behaviour — the floor is on the
+    // tops it up. That is existing, deliberate behavior — the floor is on the
     // banking setup, not the address — but a manager negotiating cents per unit
     // should know the floor is what they will actually pay on small owners.
     const s = await managed({ unitCount: 3, pmRate: 0.50 })

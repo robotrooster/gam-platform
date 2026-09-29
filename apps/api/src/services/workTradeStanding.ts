@@ -7,7 +7,7 @@
 //
 // And the landlord's side (Nic, S624): "at some point, a landlord's gonna know
 // that somebody's never gonna be able to physically catch up. There's just not
-// that many hours in a month." That judgement should not require arithmetic in
+// that many hours in a month." That judgment should not require arithmetic in
 // someone's head, so `catchUpHours` is stated plainly and `catchUpPlausible`
 // says whether a human could actually work it.
 
@@ -101,7 +101,7 @@ export function workTradeStanding(input: {
     carriedValue: forTenant ? null : carriedValue,
     catchUpPlausible,
     nextBillingMonth: soonest && soonest.closesRemaining < Number.MAX_SAFE_INTEGER ? soonest.periodMonth : null,
-    summary: summarise({
+    summary: summarize({
       currentMonthHours, carriedHours, catchUpHours, banked, carriedValue, forTenant,
     }),
   }
@@ -112,7 +112,7 @@ function hrs(n: number): string {
   return `${s} ${n === 1 ? 'hour' : 'hours'}`
 }
 
-function summarise(x: {
+function summarize(x: {
   currentMonthHours: number; carriedHours: number; catchUpHours: number
   banked: number; carriedValue: number; forTenant?: boolean
 }): string {
@@ -128,7 +128,7 @@ function summarise(x: {
   // The case the whole thing exists for: say BOTH numbers, and the total.
   const ahead = x.banked > 0 ? ` ${hrs(x.banked)} banked comes off that.` : ''
   // S643: the tenant's version carries no dollar figure. Hours beside dollars is
-  // an hourly rate whether or not it is labelled one, and the tenant page's own
+  // an hourly rate whether or not it is labeled one, and the tenant page's own
   // language is fractions of the bill for exactly that reason. They are still
   // told plainly that an unworked hour becomes a balance — just not priced.
   const cost = x.forTenant ? '' : ` — $${x.carriedValue.toFixed(2)} if it isn't worked`

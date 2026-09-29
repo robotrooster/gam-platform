@@ -23,7 +23,7 @@
  * CARDS ONLY, DELIBERATELY. A saved bank account is an ACH debit with a
  * multi-day settlement and a bounce window; handing somebody their propane on
  * the strength of one is a different decision from taking a card, and not one
- * to make silently behind a button labelled "card on file".
+ * to make silently behind a button labeled "card on file".
  */
 import { queryOne } from '../db'
 import { getStripe } from '../lib/stripe'

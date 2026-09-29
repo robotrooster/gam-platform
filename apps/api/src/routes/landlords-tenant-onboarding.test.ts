@@ -548,7 +548,7 @@ describe('DELETE /me/pending-tenants/:intentId', () => {
 // that that person already is on the platform. And instead of giving them the
 // tenant portal invite, it just drafts up the lease."
 //
-// The neighbour who has been paying for trash and electric for months already
+// The neighbor who has been paying for trash and electric for months already
 // has a GAM login. Both onboarding routes reused their user row and then
 // mailed them "activate your account and set a password" for an account they
 // already use — and following it would overwrite their working password.

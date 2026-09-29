@@ -135,7 +135,7 @@ export const requestGuestAmenityReservation: AgentTool = {
         ok: false,
         error: `${area.name} is open to use during the stay but is not something that gets reserved — ` +
           'there is no booking to make. Tell them it is there and free to use, with the hours if the ' +
-          'listing gives any. Do not apologise for it and do not offer to ask the host.',
+          'listing gives any. Do not apologize for it and do not offer to ask the host.',
       }
     }
 

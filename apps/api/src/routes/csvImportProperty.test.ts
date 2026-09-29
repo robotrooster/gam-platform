@@ -461,7 +461,7 @@ describe('S491: state-law warnings on CSV property validate', () => {
     expect(warns.length).toBe(0)
   })
 
-  it('Uncatalogued state ("XX") → no state-law warn even if deposit is huge', async () => {
+  it('Uncataloged state ("XX") → no state-law warn even if deposit is huge', async () => {
     const { token } = await seedLandlordWithToken()
     const csv = [
       'property_name,street1,city,state,zip,unit_number,rent_amount,security_deposit',

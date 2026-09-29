@@ -202,7 +202,7 @@ export async function platformFeesByProperty(
     const key = `${r.property_id}|${r.m}`
     if (billed.has(key)) continue
     // Still in onboarding grace, or this month predates the day billing began.
-    // An ACTUAL accrual (billed, above) is always honoured — if it was charged,
+    // An ACTUAL accrual (billed, above) is always honored — if it was charged,
     // it is owed, whatever the grace column says now.
     if (!billingStarts || r.m < billingStarts) continue
     // S614: a serviced space counts exactly once, like any occupied unit.

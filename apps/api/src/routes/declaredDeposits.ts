@@ -9,7 +9,7 @@
 // case the tenant just straight up lied and said they paid, and they never
 // actually went to the bank." Nothing here credits anything, pauses a late fee,
 // or touches the eviction clock. A tenant who lies gains precisely nothing,
-// which is a better defence than trying to catch them. The reward for telling
+// which is a better defense than trying to catch them. The reward for telling
 // the truth is real though: a corroborated declaration earns them the date THEY
 // paid rather than the date the bank got round to posting it, which on a Friday
 // deposit is worth several days of late fees (services/depositBackdate.ts).

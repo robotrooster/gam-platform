@@ -16,7 +16,7 @@
  * two options: contradict the article and look like a liar, or follow it and
  * tell a customer something false. Both look identical from outside.
  *
- * S625's own handoff: "Tests guard behaviour; nothing guards explanations."
+ * S625's own handoff: "Tests guard behavior; nothing guards explanations."
  * This guards the explanations.
  */
 import { describe, it, expect } from 'vitest'

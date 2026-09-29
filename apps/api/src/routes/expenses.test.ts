@@ -79,7 +79,7 @@ describe('landlord expenses', () => {
     expect((all.body.data as any[]).map(e => e.description).sort())
       .toEqual(['Company A roof', 'Company B fence'])
 
-    // ?entityId= still narrows — and still authorises through the same resolver.
+    // ?entityId= still narrows — and still authorizes through the same resolver.
     const justB = await request(buildApp()).get(`/api/expenses?entityId=${llB}`)
       .set('Authorization', `Bearer ${token}`)
     expect(justB.status).toBe(200)

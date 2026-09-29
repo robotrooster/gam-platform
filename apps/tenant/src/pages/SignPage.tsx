@@ -53,7 +53,7 @@ function authFetch(path: string, opts: RequestInit = {}) {
 // S637 (Nic): "the ones that need something that's a licensing pick, just
 // remove those." Script and Cursive are gone.
 //
-// They were the two options a PDF could not honour. Every style here is stamped
+// They were the two options a PDF could not honor. Every style here is stamped
 // into the executed lease by services/pdfStamp.ts, which can only use fonts the
 // PDF standard already carries — the remaining three are italic serif faces and
 // Times-Italic represents them faithfully. Snell Roundhand and Brush Script are
@@ -103,7 +103,7 @@ function SignatureChooser({ name, type, onSelect, onClose }: { name:string; type
     <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
       {/* S629 (Nic): "the page is locked from scrolling. I cannot scroll down
           far enough to confirm my selection." On a phone this card is taller
-          than the viewport; centred and overflow:hidden, it was clipped at both
+          than the viewport; centered and overflow:hidden, it was clipped at both
           ends with nothing scrollable, so the confirm button existed and could
           not be reached. 100dvh rather than 100vh because mobile browser chrome
           makes vh taller than what is actually visible. */}
@@ -489,7 +489,7 @@ export function SignPage() {
     // S629 (Nic): a tenant signing from an emailed link has no session, so
     // `Authorization: Bearer null` 401'd the file and the page drew signature
     // fields over a blank canvas. The signer's token goes on the query string
-    // instead; the file route's per-row check authorises it exactly as it does
+    // instead; the file route's per-row check authorizes it exactly as it does
     // a landlord's session.
     const base = url.startsWith('http') ? url : API+url
     const byToken = SIGNER_TOKEN_RE.test(documentId || '')
@@ -917,7 +917,7 @@ export function SignPage() {
                   // entered.
                   //
                   // Keying on the field id gives each one its own instance,
-                  // initialised from its own value. (The component was also
+                  // initialized from its own value. (The component was also
                   // hardened to re-sync — see its useEffect on `value` — so a
                   // future caller that forgets the key cannot lose an answer.)
                   key={activeField.id}

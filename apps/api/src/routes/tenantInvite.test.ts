@@ -1,5 +1,5 @@
 /**
- * S628 — CHARACTERISATION TESTS FOR THE TENANT INVITE.
+ * S628 — CHARACTERIZATION TESTS FOR THE TENANT INVITE.
  *
  * POST /api/tenants/invite is 120 lines that create a user account, mint a
  * seven-day activation token, and decide between two different downstream

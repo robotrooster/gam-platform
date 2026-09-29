@@ -390,7 +390,7 @@ export function SignPage() {
     // rendered signature fields over a blank canvas.
     //
     // The signer's token goes on the query string instead, and the file route's
-    // per-row check authorises it the same way it authorises the landlord: the
+    // per-row check authorizes it the same way it authorizes the landlord: the
     // token says who is asking, the document says what they may see.
     const base = url.startsWith('http') ? url : API+url
     const byToken = isSignerToken(token)
@@ -853,7 +853,7 @@ export function SignPage() {
             // Somebody else's completed field is part of the DOCUMENT now, not
             // an input — it belongs to the landlord's terms or to a co-signer who
             // already signed. Drawing it as a green box implies this signer did
-            // it, and drawing it as a grey one implies they still have to. It is
+            // it, and drawing it as a gray one implies they still have to. It is
             // neither: it is the page they are reading.
             // S652 (Nic): FIXED TEXT prints as text, never a box. The landlord —
             // and only the landlord, only while it is his turn — gets a pencil
@@ -942,12 +942,12 @@ export function SignPage() {
           Click highlighted fields to sign. Use <strong>Next Field</strong> to jump to the next one.
           {/* S629 (Nic): "it's got some boxes highlighted different colors that
               appear to belong to different signing roles." They are all his —
-              the API serves only this signer's fields — so the colours are
+              the API serves only this signer's fields — so the colors are
               STATE, not people. Nothing said so. */}
           <span style={{ display:'block', marginTop:4, color:'var(--text-3)', fontSize:'.72rem' }}>
             <span style={{ color:'#22c55e', fontWeight:700 }}>Green</span> = done ·{' '}
             <span style={{ color:'var(--gold,#c9a227)', fontWeight:700 }}>Glowing</span> = next up ·{' '}
-            <span style={{ fontWeight:700 }}>Grey</span> = still to do. All of them are yours.
+            <span style={{ fontWeight:700 }}>Gray</span> = still to do. All of them are yours.
           </span>
         </span>
       </div>}

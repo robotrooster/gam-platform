@@ -19,7 +19,7 @@
  * where they do not, because the whole point of this record is that somebody
  * reaches for it on the worst day of a resident's life. A wrong number is worse
  * than a blank one: a blank prompts a question at the counter, a wrong number
- * gets dialled.
+ * gets dialed.
  */
 
 export type EmergencyContactQuality = 'complete' | 'name_only' | 'phone_only' | 'unusable'
@@ -38,7 +38,7 @@ export interface ParsedEmergencyContact {
 const NOT_A_CONTACT = new Set([
   'na', 'n/a', 'n.a.', 'none', 'no', 'nobody', 'n/a.', '-', '--', 'x',
   'unknown', 'unk', 'tbd', 'same', 'self', 'me', 'n a',
-  // Somebody wrote 911. It is not a contact and must never be dialled as one.
+  // Somebody wrote 911. It is not a contact and must never be dialed as one.
   '911', '999', '112',
 ])
 
@@ -48,7 +48,7 @@ const NOT_A_CONTACT = new Set([
  */
 const RELATIONSHIP_ONLY = new Set([
   'wife', 'husband', 'spouse', 'partner', 'mother', 'mom', 'father', 'dad',
-  'son', 'daughter', 'sister', 'brother', 'friend', 'neighbor', 'neighbour',
+  'son', 'daughter', 'sister', 'brother', 'friend', 'neighbor', 'neighbor',
   'aunt', 'uncle', 'cousin', 'grandmother', 'grandfather', 'boyfriend',
   'girlfriend', 'fiance', 'fiancee', 'parents', 'family',
 ])
@@ -134,7 +134,7 @@ export function formatPhone(digits: string | null | undefined): string | null {
  * and Irma is a tenant here with a number on file.
  *
  * Deliberately strict: first AND last must both match, case and accents
- * normalised. A suggestion is shown to staff for confirmation and never
+ * normalized. A suggestion is shown to staff for confirmation and never
  * applied on its own, but a loose match would put a stranger's number in front
  * of somebody as though it were checked.
  */

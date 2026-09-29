@@ -14,7 +14,7 @@
 import { describe, it, expect } from 'vitest'
 import { PORTAL_ACTIONS } from './portalActions'
 
-/** Anything that ends, removes, empties or finalises something. */
+/** Anything that ends, removes, empties or finalizes something. */
 const DESTRUCTIVE =
   /^(delete|remove|cancel|void|terminate|retire|archive|revoke|withdraw|clear|unassign|finalize|close|deny|reject)_|_(cancel|void|delete)$|eviction/
 
@@ -73,7 +73,7 @@ describe('what every action description must be', () => {
  * The model reads these descriptions to decide what it can do. When an action
  * REQUIRES a person's name, email or phone and the description never mentions
  * collecting them, the model is left holding a tool it cannot call — and the
- * measured behaviour in that position is not to ask, it is to promise.
+ * measured behavior in that position is not to ask, it is to promise.
  *
  * A prospect picked a call time and was told "Great, I can book that. I'll send
  * over a calendar invite." Nothing was booked: book_sales_call requires a name

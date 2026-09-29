@@ -7,7 +7,7 @@
 // He's right, and the reason is that the money is already handled elsewhere: if
 // rent was paid on the 1st and the sale closes on the 20th, the buyer gets a
 // credit at closing. That is what a closing statement is for. GAM moves no
-// funds, computes no proration and cuts no cheques.
+// funds, computes no proration and cuts no checks.
 //
 // WHAT MOVES — live state the buyer is now responsible for:
 //   properties, units, leases, security deposits, equipment, open maintenance.
@@ -18,7 +18,7 @@
 //   would rewrite the seller's books for a period they owned the property, and
 //   break every report either party has already filed.
 //
-// Leases move UNCHANGED — no re-papering. Most states oblige a buyer to honour
+// Leases move UNCHANGED — no re-papering. Most states oblige a buyer to honor
 // the remaining term, and reissuing a sitting tenant's lease at a sale would
 // alarm them for no reason.
 //
@@ -155,7 +155,7 @@ export async function transferProperty(args: {
 // every owner has confirmed. Raising a request no longer moves anything.
 const TRANSFER_REQUEST_TTL_DAYS = 7
 
-/** Six digits, from a CSPRNG — this authorises handing over an asset. */
+/** Six digits, from a CSPRNG — this authorizes handing over an asset. */
 function approvalCode(): string {
   return String(randomInt(0, 1_000_000)).padStart(6, '0')
 }

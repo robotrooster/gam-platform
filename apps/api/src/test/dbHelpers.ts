@@ -492,7 +492,7 @@ export async function seedLandlord(
     // S600: default test landlords to "live since the epoch" so the platform-fee
     // accrual gate lets them bill for ANY accrual month — including the fixed past
     // months (e.g. 2026-05) the platformFeeAccrual tests pass. Matches pre-grace
-    // behaviour. Grace-specific tests override billing_starts_at / billing_grace_until.
+    // behavior. Grace-specific tests override billing_starts_at / billing_grace_until.
     `INSERT INTO landlords (user_id, billing_starts_at)
      VALUES ($1, DATE '2000-01-01') RETURNING id`,
     [userId]

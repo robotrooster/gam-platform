@@ -143,7 +143,7 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
         // and then handed the landlord a button that makes exactly that choice,
         // guest by guest, at the moment they are looking at somebody's name.
         // The consistent policy is the automatic one: every stay that crosses
-        // the threshold gets the same email, so there is no judgement call to
+        // the threshold gets the same email, so there is no judgment call to
         // apply unevenly.
         //
         // Skipped for a guest who already passed a GAM check and has had

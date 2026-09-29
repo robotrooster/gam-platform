@@ -119,7 +119,7 @@ interface ProcessingRateRow {
  *                   rounding remainder.
  *
  * A payment with no PaymentIntent (a recorded cash/check payment) is its own
- * charge of one row, which collapses to the pre-S603 behaviour.
+ * charge of one row, which collapses to the pre-S603 behavior.
  */
 interface ChargeContext {
   feeBase:    number

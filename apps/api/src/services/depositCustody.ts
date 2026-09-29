@@ -147,8 +147,8 @@ export async function flagUnsupportedCustodyState(opts: {
  * as being mandatory the minute a landlord onboards a property in that state."
  *
  * Separate from the custody flag: a state can be perfectly fine to HOLD deposits
- * in and still impose an interest obligation that has to be honoured from day
- * one. Getting it wrong is expensive in both directions — Arizona penalises a
+ * in and still impose an interest obligation that has to be honored from day
+ * one. Getting it wrong is expensive in both directions — Arizona penalizes a
  * shortfall at TWICE the amount wrongfully withheld (§ 33-1431(D)), and
  * over-paying a lesser-of state is a permanent silent margin leak.
  *
@@ -218,7 +218,7 @@ export async function flagDepositInterestObligation(opts: {
         `The accrual engine handles this automatically once the property's units carry the ` +
         `right unit_type. Verify the unit types are correct — the obligation is unit-type ` +
         `specific and the wrong type pays the wrong amount in either direction. ` +
-        `Under-paying is penalised (AZ § 33-1431(D) is twice the amount withheld); ` +
+        `Under-paying is penalized (AZ § 33-1431(D) is twice the amount withheld); ` +
         `over-paying is a silent permanent margin leak.`,
         JSON.stringify({
           state_code:    state,

@@ -290,7 +290,7 @@ const NOT_A_REQUEST =
  * actually checked. Which booking do you mean — the dates, the total, or the
  * site you're on?" She had answered honestly; the account-data net classified
  * the question as being about their booking, demanded a tool, got none, and
- * SUPPRESSED her real reply in favour of a canned deflection — to someone who
+ * SUPPRESSED her real reply in favor of a canned deflection — to someone who
  * had asked whether she was human.
  *
  * This is why the bot-probe scenarios kept failing for tenant, landlord and
@@ -530,7 +530,7 @@ export function buildTemporalBlock(now: DateTime): string {
  * a platform, and nobody finds out until the call does not happen.
  *
  * The sales calendar is real — listAvailableSlots reads live windows from
- * sales_call_availability, excludes booked slots and honours the notice period.
+ * sales_call_availability, excludes booked slots and honors the notice period.
  * There is no reason to guess at it.
  */
 const OFFERS_A_MEETING_TIME = new RegExp([
@@ -538,7 +538,7 @@ const OFFERS_A_MEETING_TIME = new RegExp([
   /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/,
   // a named day being proposed or confirmed
   /\b(?:how about|what about|does|would|shall we say|let's say|pencil(?:ling)? (?:you )?in|set (?:you )?up for)\b[^.?!]{0,40}\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week)\b/,
-  // promising the artefact of a booking
+  // promising the artifact of a booking
   /\b(?:calendar invite|meeting invite|invite|invitation)\b/,
   /\b(?:i'?ll|i will|i can)\s+(?:send|shoot|fire|get)\b[^.?!]{0,30}\b(?:invite|link|calendar|confirmation)\b/,
 ].map((r) => r.source).join('|'), 'i')
@@ -551,7 +551,7 @@ const SCHEDULING_TOOLS = new Set(['get_available_call_times', 'book_sales_call']
  * S628 — the sentence written FOR the model when it will not write it itself.
  *
  * Four attempts at instructing it failed (S624 in profiles.ts, two rewrites in
- * S626's net, and the S628 run). The arithmetic is not a judgement — it is a
+ * S626's net, and the S628 run). The arithmetic is not a judgment — it is a
  * grace period from a real lease plus the number the person themselves said —
  * so it is computed and placed in front of the reply rather than asked for a
  * fifth time.
@@ -1242,7 +1242,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
    * Scoped per-iteration rather than removed outright: the block below is
    * straight-line code that already runs at most once per draft, so the flag
    * only ever governed what happens ACROSS iterations, which is precisely the
-   * behaviour that was wrong.
+   * behavior that was wrong.
    */
   let composed = false
   let nudgedForAccountData = false
@@ -1269,7 +1269,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   }
 
   // Which lookup does this phrasing call for? Undefined when the table does not
-  // recognise it, in which case a forced turn falls back to plain 'required'.
+  // recognize it, in which case a forced turn falls back to plain 'required'.
   // Consulted ONLY on a forced turn — it never overrides a tool the model chose
   // for itself, and never fires on an ordinary turn.
   // S626: hand the table the previous user turn so an anaphoric follow-up can
@@ -1463,7 +1463,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // worse. Under the real profile — ~30 tools, long system prompt — pinning
       // tool_choice to one function made the model LESS likely to call anything
       // than simply requiring a call: "is bob behind on rent?" and its four
-      // neighbours went from answering correctly to no tool at all. (Both forms
+      // neighbors went from answering correctly to no tool at all. (Both forms
       // are obeyed perfectly by a three-tool prompt, which is what made the
       // isolated test misleading.)
       //
@@ -1473,7 +1473,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // can supply — WHICH tenant, WHICH unit — 'required' is the better prompt.
       toolChoice: forceToolThisTurn && turnTools.length > 0 ? 'required' : undefined,
     })
-    // NOT cleared here. S617: tool_choice 'required' is honoured most of the
+    // NOT cleared here. S617: tool_choice 'required' is honored most of the
     // time, not every time — the same question that answered "$2,330" on one
     // run came back empty on the next. Clearing the flag after a single attempt
     // meant one non-compliant turn dropped straight through to a suppressed
@@ -1537,7 +1537,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // handled entirely by a bot.
       //
       // The nudge is a REQUEST and a request can be refused; that is exactly why
-      // tool_choice 'required' is documented above as honoured "most of the time,
+      // tool_choice 'required' is documented above as honored "most of the time,
       // not every time". So once the money nudge has already been spent on this
       // turn, stop asking and synthesize it. The escalation is the floor for a
       // money dispute, not a preference.
@@ -1675,7 +1675,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // NOT catch a bare ordinal, and that answer must still be forced through
       // a tool. The repeat only exists where there is something to repeat, so
       // the relaxation is confined to turns that carry history — which is also
-      // the only place the old behaviour was doing harm.
+      // the only place the old behavior was doing harm.
       if (
         !nudgedForAccountData &&
         toolInvocations.length === 0 &&
@@ -1919,7 +1919,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
             'said would have sent anything.\n' +
             'The real openings are in the tool result above. Offer two or three of THOSE, ' +
             'conversationally — never the whole list.\n' +
-            'If they have already named a day or a rough time, honour it: offer what is free then, ' +
+            'If they have already named a day or a rough time, honor it: offer what is free then, ' +
             'and if nothing is, say so plainly and offer the nearest alternative. Do not quietly ' +
             'move them to a different day.\n' +
             'ASK FOR THEIR NAME AND EMAIL IN THIS SAME REPLY. book_sales_call cannot run without ' +
@@ -1964,7 +1964,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
             content:
               // S626: this instruction did not work as a polite briefing. The
               // model read it and recited the fee policy again anyway. Every
-              // net in this file that actually changes behaviour opens by
+              // net in this file that actually changes behavior opens by
               // REJECTING the draft — "STOP —" — rather than describing a
               // better one, so this now does the same.
               'STOP — you answered a request to remove a fee by reading the fee policy back to ' +
@@ -2009,7 +2009,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         // phrased. The rest of this file already knows what to do about that:
         // when the phrase table needs a lookup the model will not make, it runs
         // the lookup itself rather than asking again. Same principle. The
-        // arithmetic is not a judgement call — it is grace + claimed, from a
+        // arithmetic is not a judgment call — it is grace + claimed, from a
         // real lease and their own words — so compute the sentence and put it
         // in front of the reply.
         //

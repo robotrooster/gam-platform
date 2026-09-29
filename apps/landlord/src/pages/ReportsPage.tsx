@@ -51,7 +51,7 @@ function PrintStyles() {
         .data-table { font-size: .72rem; }
         body { background: #fff !important; }
         /* S603: the T-12 is a document that leaves the building — its branding
-           and watermark must survive printing, so force colour rendering and
+           and watermark must survive printing, so force color rendering and
            keep the letterhead with the figures. */
         .t12-brand { break-inside: avoid; }
         .t12-watermark {

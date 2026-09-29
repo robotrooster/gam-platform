@@ -230,7 +230,7 @@ export function monthEndSweepDateUtc(year: number, month0: number): string {
  *
  * Measured in UTC, like the weekly gate: the cron fires at 01:00 UTC and Stripe
  * books the payout on that UTC day, which is the day a landlord's statement
- * shows and the day the arrival maths is done in.
+ * shows and the day the arrival math is done in.
  */
 export function isMonthEndSweepDay(now: Date = new Date()): boolean {
   const iso = now.toISOString().slice(0, 10)
@@ -478,7 +478,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
     // The thresholds existed to pay a landlord FASTER than a weekly calendar.
     // They do not: they schedule four business days out, which is slower than
     // the next Tuesday for most of the week, and they made payment depend on
-    // the collective behaviour of a landlord's other residents — Mountain View
+    // the collective behavior of a landlord's other residents — Mountain View
     // reached 50% on Sep 9 and its money was booked for Sep 16 while sitting
     // available the whole time.
     //

@@ -140,7 +140,7 @@ export async function runAutopayForTimezone(tz: string, now: Date = new Date()):
       // a tenant who set up autopay for $800 of rent would wake up to an $1,800
       // debit on their chosen day, out of an account that may hold neither. That
       // is worse than the FIFO trap this carve-out exists to prevent — it does
-      // not just misapply the money, it takes money that was never authorised.
+      // not just misapply the money, it takes money that was never authorized.
       //
       // Paying arrears down stays a deliberate act by the tenant, in whatever
       // amount they can manage, through Pay Now.
@@ -317,7 +317,7 @@ async function notifyTenant(
  * Register autopay with the timezone cron manager.
  *
  * 09:00 in the PROPERTY's local time — the pull happens during a business day
- * the tenant would recognise, not at whatever hour the server happens to be in.
+ * the tenant would recognize, not at whatever hour the server happens to be in.
  * Late fees run at local midnight and invoices at local 07:00, so by 09:00 the
  * balance this job reads already includes today's charges and today's accrual.
  */

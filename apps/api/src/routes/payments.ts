@@ -742,7 +742,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
           -- S637 (Nic): "Work trade is still showing people they owe a full
           -- balance." This is the number the TENANT sees on their own payments
           -- page, and it summed suspended rows — so Tyler Rhoades was shown
-          -- $687.57 owing on charges his labour already covers, and Matthew
+          -- $687.57 owing on charges his labor already covers, and Matthew
           -- Conklin $776.11. A suspended row settles at month close against
           -- approved hours; it is never money the resident hands over.
           AND p.work_trade_suspended_at IS NULL
@@ -794,7 +794,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     // S607 (Nic): "maybe on the invoice, it can show a breakdown of what each
     // bill would be by payment method... that way they see all the avenues and
     // the price at the point the invoice comes out." Priced from the same
-    // formula that charges (processingFeeFor), so the quote is honoured.
+    // formula that charges (processingFeeFor), so the quote is honored.
     // ── S638 (Nic, DIRECTIVE): THE CREDIT COMES OFF THE ONE TOTAL ───────────
     //
     //   "When the line items are on an invoice, it becomes one total charge.
@@ -871,7 +871,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     // the existing per-charge route. Deliberately NOT run through /pay-balance:
     // that path is lease-keyed end to end (FIFO scope, pay-in-full guard,
     // eviction hold, sublease markup), and widening the engine that moves every
-    // tenant's rent is a bigger change than billing the neighbour needs.
+    // tenant's rent is a bigger change than billing the neighbor needs.
     // S616 (Nic): the payer's outstanding balance, grouped PER AGREEMENT —
     // exactly the way `leases` above groups a tenant's balance per lease.
     //
@@ -1019,7 +1019,7 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
     }
     const tenantId = req.user!.profileId
 
-    // S616 (Nic): a payer with no lease — the neighbour buying trash and
+    // S616 (Nic): a payer with no lease — the neighbor buying trash and
     // electric — settles their agreement's whole bill in one charge. "Their
     // trash and electric needs to be on one bill if they have more than one
     // utility through this subsystem." Ownership is checked against the

@@ -23,7 +23,7 @@ import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 const NOT_A_NAME = new Set([
   'what', "what's", 'whats', 'who', "who's", 'the', 'a', 'my', 'tenant', 'for',
-  'paid', 'pay', 'rent', 'cash', 'check', 'cheque', 'money', 'order', 'me', 'in',
+  'paid', 'pay', 'rent', 'cash', 'check', 'check', 'money', 'order', 'me', 'in',
 ])
 function cleanName(raw: string): string {
   const w = String(raw ?? '').trim().split(/\s+/).filter(Boolean)

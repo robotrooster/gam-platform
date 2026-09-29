@@ -30,7 +30,7 @@ describe('action parity — the gap stays closed', () => {
 
   it('every endpoint is either reachable or deliberately not — nothing is merely forgotten', () => {
     const forgotten = gap.open.map((e) => `${e.area} ${e.declared}`)
-    // Printed rather than summarised: the failure message IS the work list.
+    // Printed rather than summarized: the failure message IS the work list.
     expect(forgotten, forgotten.length
       ? `\nThese have no agent action and no stated reason:\n  ${forgotten.join('\n  ')}\n` +
         'Either add an action to portalActions.ts, or name it in DELIBERATE in ' +

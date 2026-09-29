@@ -90,7 +90,7 @@ describe('the pause before the message is noticed (S617)', () => {
     expect(noticeDelayMs(ENGAGED_WINDOW_MS + 60_000, lo)).toBe(NOTICE_MIN_MS);
   });
 
-  it('varies, so the delay is never a recognisable constant', () => {
+  it('varies, so the delay is never a recognizable constant', () => {
     const seen = new Set(Array.from({ length: 200 }, () => noticeDelayMs(null)));
     expect(seen.size).toBeGreaterThan(50);
   });

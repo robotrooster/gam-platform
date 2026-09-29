@@ -15,7 +15,7 @@
  *
  * IT REPORTS AND NEVER ACCUSES. Cash legitimately sits in a drawer over a
  * weekend and a deposit legitimately spans two days of collection, so the tool
- * returns figures and ages and leaves the judgement to a person. Hard-scoped to
+ * returns figures and ages and leaves the judgment to a person. Hard-scoped to
  * the landlord's own records.
  */
 

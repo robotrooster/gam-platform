@@ -259,7 +259,7 @@ describe('GET /api/admin/nacha/monitoring', () => {
  * still that stops in March. It's not updated with the rolling last six months."
  *
  * It wasn't a stale window — the chart was a HARDCODED array of five invented
- * months plus one real value labelled with a month it wasn't. It drew a tidy
+ * months plus one real value labeled with a month it wasn't. It drew a tidy
  * rising line no matter what the platform did, which on a financial dashboard is
  * worse than showing nothing.
  *

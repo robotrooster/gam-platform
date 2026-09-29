@@ -201,7 +201,7 @@ describe('welcome outreach is per person, not per entity', () => {
       const seeded = await seedLandlord(c)
       userId = seeded.userId
       await c.query(`UPDATE users SET email_verified = TRUE WHERE id = $1`, [userId])
-      // Their original entity: signed up a fortnight ago, already written to.
+      // Their original entity: signed up a two weeks ago, already written to.
       await c.query(
         `UPDATE landlords SET created_at = now() - INTERVAL '14 days',
                               welcome_outreach_sent_at = now() - INTERVAL '13 days',

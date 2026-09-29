@@ -28,7 +28,7 @@ const Q: Record<KnowledgeScope, string[]> = {
     'my ACH payment was returned, what happens now', 'did my payment go through',
     'why am I still marked late when I paid', 'can I pay with a credit card',
     'what does it cost to pay by bank', 'my kitchen sink is leaking',
-    'my neighbour is being loud at night', 'when does my lease end',
+    'my neighbor is being loud at night', 'when does my lease end',
     'what happens if I want to stay after my lease ends', 'can I break my lease early',
     'how much is my deposit and when do I get it back', 'is my deposit earning interest',
     'can I have a pet', 'someone wants to enter my apartment', 'what is a move-out inspection',

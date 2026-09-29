@@ -856,7 +856,7 @@ function CancelModal({
         <>
           <button onClick={onClose} style={ghostBtn}>Keep it</button>
           <button onClick={submit} disabled={saving} style={dangerBtnStyle}>
-            {saving ? 'Cancelling…' : 'Cancel appointment'}
+            {saving ? 'Canceling…' : 'Cancel appointment'}
           </button>
         </>
       }>

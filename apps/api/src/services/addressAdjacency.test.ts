@@ -131,7 +131,7 @@ describe('address adjacency (S616)', () => {
   })
 
   // Postcode boundaries genuinely run down the middle of some streets, so two
-  // neighbours on opposite sides of one must not be refused.
+  // neighbors on opposite sides of one must not be refused.
   it('tolerates a postcode boundary when the town agrees', () => {
     const r = compareAddresses(
       '122 Bellefontaine Ave',

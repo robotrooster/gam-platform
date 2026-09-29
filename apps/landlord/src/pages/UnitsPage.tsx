@@ -54,7 +54,7 @@ export function UnitsPage() {
   // list stays the live units. Turning this on shows the history alongside.
   const [showRetired, setShowRetired] = useState(false)
   // Carried on navigation state so the confirmation is not lost by leaving the
-  // invite form — sending and then landing on a page with no acknowledgement
+  // invite form — sending and then landing on a page with no acknowledgment
   // reads as though nothing happened.
   const invitedJustNow = (useLocation().state as any)?.invited as string[] | undefined
   const { data: units = [], isLoading } = useQuery<any[]>(

@@ -813,7 +813,7 @@ describe('PATCH /api/units/:id/number', () => {
     expect(rows.length).toBeGreaterThanOrEqual(2)
     expect(rows.at(-1)!.effective_to).toBeNull()
     // canonicalised against the unit's TYPE — the fixture unit is an apartment,
-    // so 'RV 99' is stored as 'APT 99'. Long-standing behaviour, not new here.
+    // so 'RV 99' is stored as 'APT 99'. Long-standing behavior, not new here.
     expect(rows.at(-1)!.unit_number).toBe('APT 99')
     expect(rows.at(-2)!.effective_to).not.toBeNull()
   })
@@ -868,10 +868,10 @@ describe('DELETE /api/units/:id', () => {
 
   // S630 (Nic): a space with no history of its own must stay deletable even when
   // it shares a RUBS master that HAS been read. The guard asked whether the METER
-  // had readings, so one master reading taken for a neighbour walled off every
+  // had readings, so one master reading taken for a neighbor walled off every
   // unit on the meter. Nic hit this retiring RV 21; it slipped through only
   // because Oak Park's water masters were still unread.
-  it('deletes a unit on a SHARED read meter — the readings are its neighbours\' history', async () => {
+  it('deletes a unit on a SHARED read meter — the readings are its neighbors\' history', async () => {
     const f = await seed()
     const app = buildApp()
     const made = await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
@@ -884,7 +884,7 @@ describe('DELETE /api/units/:id', () => {
         `INSERT INTO utility_meters (property_id, utility_type, billing_method, rubs_allocation_method, label)
          VALUES ($1,'water','rubs','occupant_count','master') RETURNING id`, [f.aPropId])
       const meterId = m.rows[0].id
-      // The master serves the new unit AND an existing neighbour.
+      // The master serves the new unit AND an existing neighbor.
       await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2),($1,$3)`,
         [meterId, id, f.aUnitId])
       await c.query(

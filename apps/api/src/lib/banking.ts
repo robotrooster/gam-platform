@@ -23,7 +23,7 @@ const VALID_PREFIX_RANGES: Array<[number, number]> = [
   [1, 12],    // Federal Reserve banks (primary commercial)
   [21, 32],   // Thrift institutions
   [61, 72],   // Electronic transactions, government
-  [80, 80],   // Travelers Cheques (rarely on ACH but technically valid)
+  [80, 80],   // Travelers Checks (rarely on ACH but technically valid)
 ]
 
 export function validateAbaRoutingNumber(routing: string): AbaValidation {

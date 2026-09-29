@@ -58,7 +58,7 @@ async function seedBaseProperty(): Promise<BaseCtx> {
 }
 
 // S648: a stuck or broken meter is only ESTIMATED where the landlord chose it
-// for the property. Tests of that behaviour use this.
+// for the property. Tests of that behavior use this.
 async function seedEstimatingProperty(): Promise<BaseCtx> {
   const base = await seedBaseProperty()
   await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id = $1`, [base.propertyId])
@@ -603,7 +603,7 @@ describe('generateBillsForMeter — rubs', () => {
 // This REPLACES the S558/S605/S607 exclusion tests wholesale. Those asserted
 // that a submetered unit's usage (S558) or dollars (S607) came off the pool
 // before the split, and that the pool clamped at zero when the carve-out
-// overshot (S605). All three behaviours are gone: nothing is subtracted from the
+// overshot (S605). All three behaviors are gone: nothing is subtracted from the
 // pool, so there is nothing to clamp and nothing to estimate for.
 //
 // The tests below are written against the failure that ended the model. See
@@ -715,7 +715,7 @@ describe('generateBillsForMeter — the RUBS pool is the whole bill (S634)', () 
     const { rows } = await db.query<any>(
       `SELECT charge_amount FROM utility_bills WHERE meter_id=$1`, [masterId])
     expect(res.billsCreated).toBe(2)
-    // Whole bill, split two ways — the neighbour's meter is irrelevant to it.
+    // Whole bill, split two ways — the neighbor's meter is irrelevant to it.
     expect(rows.map((r: any) => Number(r.charge_amount)).sort()).toEqual([47.00, 47.01])
   })
 
@@ -993,7 +993,7 @@ describe('generateBillsForMeter — flat_rate (S558)', () => {
   })
 
   it('a meter-level amount can no longer change what a unit is billed', async () => {
-    // The old behaviour read base_fee off the meter. Setting it now must have no
+    // The old behavior read base_fee off the meter. Setting it now must have no
     // effect — that field is exactly the discrimination lever being removed.
     const base = await seedBaseProperty()
     const meterId = await seedFlatMeter(base, 25)
@@ -2058,7 +2058,7 @@ describe('S616 a serviced space bills by every method', () => {
  * 30 — a 5x overcharge on the people who signed on time.
  */
 describe('S650 hibernating leases are asleep — nothing bills', () => {
-  it('takes no RUBS share and gets no bill; the awake neighbour carries the whole master', async () => {
+  it('takes no RUBS share and gets no bill; the awake neighbor carries the whole master', async () => {
     const base = await seedBaseProperty()
     const c = await db.connect()
     let meterId = ''
@@ -2129,7 +2129,7 @@ describe('suspended utility charges for units mid-onboarding', () => {
     const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
 
     // One occupant each → 50/50. The signed unit must NOT absorb all 100 just
-    // because its neighbour has not signed yet.
+    // because its neighbor has not signed yet.
     const bills = await db.query<any>(
       `SELECT unit_id, charge_amount FROM utility_bills WHERE meter_id=$1`, [meterId])
     expect(res.billsCreated).toBe(1)
@@ -2354,10 +2354,10 @@ describe('suspended utility charges for units mid-onboarding', () => {
     // ...and only THEN does May get billed.
     await generateBillsForMeter(meterId, new Date(2026, 4, 1))
 
-    // Their neighbour must still be split 50/50, not handed the whole 100.
-    const neighbour = await db.query<any>(
+    // Their neighbor must still be split 50/50, not handed the whole 100.
+    const neighbor = await db.query<any>(
       `SELECT charge_amount FROM utility_bills WHERE unit_id=$1`, [signed.unitId])
-    expect(Number(neighbour.rows[0].charge_amount)).toBe(50)
+    expect(Number(neighbor.rows[0].charge_amount)).toBe(50)
 
     // And the 50 they used must land on them — as a bill or as a held share,
     // but never silently absorbed by the landlord.
@@ -2726,7 +2726,7 @@ describe('S637 stuck meter on an occupied spot', () => {
   // they're paying the utilities on behalf of somebody, that's actual real
   // money going out." ──────────────────────────────────────────────────────
   //
-  // Free rent costs the landlord nothing they had. The power bill is a cheque
+  // Free rent costs the landlord nothing they had. The power bill is a check
   // they write, and a broken meter meant that number was never even estimated.
   it('records the absorption on an OWNER-OCCUPIED spot instead of billing nobody', async () => {
     const base = await seedEstimatingProperty()

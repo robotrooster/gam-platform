@@ -14,7 +14,7 @@
  * charge (money lands on GAM's balance and batches to the landlord), and the
  * not-Connect-ready admin notification.
  *
- * TWO behaviours changed here versus the route it came from, both S609:
+ * TWO behaviors changed here versus the route it came from, both S609:
  *
  * 1. PAY-AHEAD IS ALLOWED (Nic, §8). The old guard rejected any amount that
  *    wasn't exactly the balance — over AND under. The comment beside it said
@@ -65,7 +65,7 @@ export interface ChargeLeaseBalanceInput {
   tenantId:          string
   /** The ONE lease this charge settles. Resolve it before calling.
    *  S616: omit it and pass serviceAgreementId instead for a payer who has no
-   *  lease — the neighbour buying trash and electric. */
+   *  lease — the neighbor buying trash and electric. */
   leaseId?:          string
   /** S616 (Nic): "their trash and electric needs to be on one bill if they have
    *  more than one utility through this subsystem." One agreement is one bill
@@ -96,7 +96,7 @@ export interface ChargeLeaseBalanceResult {
  *  the number the tenant is shown is the number the server enforces. */
 export type BalanceScope =
   | { kind: 'lease'; leaseId: string }
-  /** S616 (Nic): a payer with no lease at all — the neighbour buying trash and
+  /** S616 (Nic): a payer with no lease at all — the neighbor buying trash and
    *  electric. "Their trash and electric needs to be on one bill if they have
    *  more than one utility through this subsystem." One agreement is one bill,
    *  however many utilities are on it. */
@@ -137,7 +137,7 @@ export async function fetchOutstandingRows(tenantId: string, scope: BalanceScope
         -- once, not just pay in full locked to what the lease says."
         --
         -- A converged invoice carries rent owed to this landlord and utilities
-        -- owed to the neighbouring landlord. Those utility rows are deliberately
+        -- owed to the neighboring landlord. Those utility rows are deliberately
         -- NOT tied to this lease — they are not part of it — so scoping by
         -- lease_id alone made them invisible here: the pay-in-full guard would
         -- not have covered them and FIFO would never have allocated to them,
@@ -148,7 +148,7 @@ export async function fetchOutstandingRows(tenantId: string, scope: BalanceScope
         --
         --   "Work trade is still showing people they owe a full balance."
         --
-        -- A suspended row is a charge somebody's labour is paying — it settles
+        -- A suspended row is a charge somebody's labor is paying — it settles
         -- at month close against approved hours, not in cash. Four other places
         -- already know this (the settlement job, the move-in bundle, the manual
         -- settle, utility billing) and skip them. This one did not, so a

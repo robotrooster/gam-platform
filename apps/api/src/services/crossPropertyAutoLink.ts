@@ -104,7 +104,7 @@ export async function autoLinkNeighborServices(): Promise<AutoLinkResult> {
           await createAdminNotification({
             severity: 'warn',
             category: 'cross_property_link_ambiguous',
-            title: 'Two units match one neighbour utility agreement',
+            title: 'Two units match one neighbor utility agreement',
             body: `The same person rents more than one unit that could be the space this landlord supplies, so GAM cannot tell which. Nothing was linked and both parties keep billing separately — no money is at risk. Link it by hand once you know which unit it is.`,
             context: { service_agreement_id: sa.id, candidate_unit_ids: matched },
           }).catch(() => {})

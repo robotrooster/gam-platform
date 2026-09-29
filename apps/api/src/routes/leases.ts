@@ -676,7 +676,7 @@ leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) =>
     // Material changes (rent, term) on an active/signed lease require
     // a NEW lease + new signatures, not an in-place edit. Non-material
     // changes (late fee, notice days, security deposit) require an
-    // explicit `confirm_addendum: true` acknowledgement so the
+    // explicit `confirm_addendum: true` acknowledgment so the
     // landlord knows the change becomes an addendum on the tenant's
     // record.
     //
@@ -969,7 +969,7 @@ leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) =>
     // S476 + S483: state-law mismatches against the property state.
     // Only fields TOUCHED in this PATCH get checked — landlord sees a
     // hedged factual notice when they ACT, not on every read. Returns
-    // empty array when within range, uncatalogued, or non-directional.
+    // empty array when within range, uncataloged, or non-directional.
     // Shared helper with tenant GET /lease (S483) so both surfaces
     // render identical warnings.
     let stateLawWarnings: LawFlag[] = []

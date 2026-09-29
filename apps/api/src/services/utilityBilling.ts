@@ -172,7 +172,7 @@ export async function lowestComparableUsage(args: {
   // Alvarado's household of three was estimated off them. The 25th percentile of
   // the credible occupied usage is the low edge of the main group — 387 on that
   // cycle, which is the number Nic picked by eye — and it stays conservative:
-  // three quarters of the neighbours used more.
+  // three quarters of the neighbors used more.
   //
   // Nearest-rank, so the answer is always a usage somebody actually had.
   // S637's reasoning still stands for what it covered: a genuinely frugal
@@ -186,7 +186,7 @@ export async function lowestComparableUsage(args: {
   //    the history of that spot and sees that, hey, it was a lot higher — that
   //    it would flag that one as broken mid month and charge the right amount."
   //
-  // Everything above compares a spot against its NEIGHBOURS this cycle. It
+  // Everything above compares a spot against its NEIGHBORS this cycle. It
   // cannot see a meter that ran for two weeks and then stopped: the reading
   // moved, so nothing here calls it stuck, and a half-month of usage bills as a
   // full month. Catching that needs the spot's OWN history — several cycles of
@@ -333,7 +333,7 @@ async function blendedRateForUnit(
  *  it does apply the LANDLORD absorbs the difference. Under S634 that is
  *  automatic: the RUBS pool is the whole master bill and no submeter's charge is
  *  subtracted from it, so a capped submetered tenant's shortfall cannot reach
- *  the neighbouring spaces by construction. */
+ *  the neighboring spaces by construction. */
 async function prevailingRateCap(propertyId: string, utilityType: string): Promise<number | null> {
   const r = await queryOne<{ prevailing_residential_rate: string | null }>(
     `SELECT prevailing_residential_rate FROM property_utility_rates
@@ -448,7 +448,7 @@ async function allocationBases(
         // S615: a UTILITY-SERVICE space is the same shape and was missed. It
         // has no lease either, so it scored 0 — and its consumption was then
         // divided among the paying tenants, who would have quietly covered the
-        // neighbour's water. Unlike an owner-occupied space this one BILLS:
+        // neighbor's water. Unlike an owner-occupied space this one BILLS:
         // there is a payer on the agreement, so it takes its share and is
         // charged for it rather than absorbed.
         basis = (u.status === 'owner_use' || u.status === 'utility_service'
@@ -496,7 +496,7 @@ async function allocationBases(
   }
 
   // A percentage blend of two other bases (50% sq ft + 50% occupancy is the
-  // common third-party RUBS split). Each side is normalised to shares FIRST, so
+  // common third-party RUBS split). Each side is normalized to shares FIRST, so
   // the blend is of proportions rather than of raw numbers — otherwise square
   // footage, being in the hundreds, would swamp a headcount in the ones.
   // The result already sums to 1, which the caller's divide handles unchanged.
@@ -721,7 +721,7 @@ export async function generateBillsForMeter(
   // catch-up bill when somebody notices. Nic found this one by eye.
   //
   // Everything downstream is unchanged: a stuck meter still bills the LOWEST
-  // real usage among occupied neighbours, so the estimate can only ever be
+  // real usage among occupied neighbors, so the estimate can only ever be
   // conservative.
   //
   // S640 (Nic, DIRECTIVE, second pass): "Any occupied spot of any status gets
@@ -738,13 +738,13 @@ export async function generateBillsForMeter(
   // we're supposed to be matching broken reads that are active spots."
   //
   // The test was the unit's status AT THIS INSTANT, and the instant is wrong.
-  // A lease finalising bills its utilities BEFORE the unit is marked occupied,
+  // A lease finalizing bills its utilities BEFORE the unit is marked occupied,
   // so a space somebody had lived in all cycle still read 'vacant' while its
   // bill was being written — the stuck check was skipped and the charge came
   // out $0. Four spaces at Mountain View were billed nothing that way: MH 04,
   // RV 07, RV 40, RV 41, every one within days of its lease starting.
   //
-  // Reordering the finalise path would fix that one caller and leave every
+  // Reordering the finalize path would fix that one caller and leave every
   // other one exposed. The real question is not what the status says right now,
   // it is whether anybody was in the space DURING THE CYCLE — which a lease
   // overlapping the cycle answers, whatever order the writes happened in.
@@ -858,7 +858,7 @@ export async function generateBillsForMeter(
       //    utilities on behalf of somebody, that's actual real money going out."
       //
       // The distinction is exact. Free rent costs the landlord nothing they had;
-      // the power bill is a cheque they write. A broken meter on such a spot
+      // the power bill is a check they write. A broken meter on such a spot
       // meant the usage was never even estimated, so the one number that IS a
       // real loss was the one nobody had.
       if (unit.status === 'owner_use') {
@@ -1122,7 +1122,7 @@ export async function generateBillsForMeter(
   //
   // Under S634's one-meter-type-per-utility rule a unit can no longer be on both
   // this master and a same-utility submeter, so `subOnUnit` is empty on any
-  // correctly-configured property. It is still honoured for legacy rows — such a
+  // correctly-configured property. It is still honored for legacy rows — such a
   // unit bills its submeter, not a RUBS share — and reported, because a landlord
   // whose data predates the constraint should be told which unit to fix.
   if (excludedUnitIds.size > 0) {
@@ -1282,7 +1282,7 @@ export async function generateBillsForMeter(
       // Each portion taxed at its own type's landlord rate, as on a submeter
       // bill. With no sewer rate configured this is left undefined so
       // tryInsertBill keeps computing tax off the final (post-residual)
-      // charge exactly as before — no sewer, no behaviour change.
+      // charge exactly as before — no sewer, no behavior change.
       ...(sewerRate > 0
         ? { taxAmount: Math.round(a.waterShare * effTaxRatePct + a.sewerShare * sewerTaxRatePct) / 100,
             sewerRatePerUnit: sewerRate }
@@ -1691,7 +1691,7 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
   // against — the share would be silently absorbed by the landlord.
   //
   // They were living there and using it. `occupants` already counted them into
-  // the divisor on the strength of the invite, so their neighbours were split
+  // the divisor on the strength of the invite, so their neighbors were split
   // correctly against a share that has to land somewhere; this is where it
   // lands. The invite is the evidence of residence, which is why the same
   // "invited before the cycle ended" test used by `occupants` gates it here —
@@ -2158,7 +2158,7 @@ export async function releaseSuspendedChargesForLease(args: {
              usage_amount, allocation_method, rate_per_unit, charge_amount,
              reading_start, reading_end, reading_start_date, reading_end_date, notes)
           VALUES ($1,$2,$3,$4::date,$5,$6,'comparable_low',$7,$8,$9,$10,$11,$12,
-                  'Meter did not move this cycle; billed at the low end of what occupied neighbours used.')
+                  'Meter did not move this cycle; billed at the low end of what occupied neighbors used.')
           ON CONFLICT DO NOTHING`,
           [st.meter_id, args.unitId, args.landlordId, st.cycle, st.utility_type,
            est, st.rate, round2(est * Number(st.rate)),
@@ -2304,11 +2304,11 @@ export async function releaseSuspendedChargesForLease(args: {
  * Mirrors the move-in bundle's utility rows exactly — a payments row of
  * type 'utility' linked to the invoice, the bill stamped 'billed' so no
  * later run double-bills it, and the invoice's own subtotals moved. Work
- * trade is honoured the same way: a covered utility rides as a suspended
+ * trade is honored the same way: a covered utility rides as a suspended
  * $0-owed line rather than money due, so hours worked cover it.
  *
  * Silent no-op when there is no open invoice — the bill stays 'unbilled'
- * and the next run picks it up, which is the pre-existing behaviour.
+ * and the next run picks it up, which is the pre-existing behavior.
  */
 async function attachBillToOpenInvoice(
   billId: string,

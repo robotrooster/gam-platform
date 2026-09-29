@@ -25,7 +25,7 @@ import { dueDatesInRange } from './invoiceGeneration'
 // branch inside invoiceGeneration, because almost nothing in that function
 // applies here: no rent, no monthly fees, no proration, no move-in bundle to
 // avoid double-billing, no sublease, no booking schedule, no work trade (there
-// is no labour arrangement with the neighbour), no prepaid rent. Threading a
+// is no labor arrangement with the neighbor), no prepaid rent. Threading a
 // "lease might be null" flag through 900 lines of rent logic to reach the ~80
 // that matter would put every rent tenant one null-check away from a bad bill.
 //
@@ -187,7 +187,7 @@ async function runServiceGeneration(
         // lease_id, so a service payer cannot hold a credit at all today — a
         // call to applyCreditsToOpenCharges would find nothing by construction,
         // which reads like "credits are handled" while handling nothing. When a
-        // landlord needs to forgive part of a neighbour's utility bill, that
+        // landlord needs to forgive part of a neighbor's utility bill, that
         // wants the same nullable-lease treatment this migration gave invoices,
         // plus a way to issue one from the agreement. Left undone and visible
         // rather than stubbed and invisible.

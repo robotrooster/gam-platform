@@ -429,7 +429,7 @@ describe('drafting a package as one bundle', () => {
  * populate... page 7 didn't auto populate... Area for a date on page 7 didn't
  * auto-populate or give the option to manually enter anything."
  *
- * draftHouseholdLease labelled every resident 'tenant'; lease templates bind
+ * draftHouseholdLease labeled every resident 'tenant'; lease templates bind
  * their fields to 'primary' and 'co_tenant_1..3'. Nothing matched, so every
  * tenant field was pruned as an unused role slot — 70 of 125 on those
  * documents — and they went out looking finished.

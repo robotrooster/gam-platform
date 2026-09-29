@@ -430,7 +430,7 @@ class CheckrProvider implements BackgroundProvider {
           reportRef:   d.id || d.report_id || null,
           receivedAt:  new Date(),
         }
-      // S640: an event we do not recognise is acknowledged, not retried.
+      // S640: an event we do not recognize is acknowledged, not retried.
       // Providers add event types without asking; the alternative is a retry
       // storm on every one of them, which is exactly what happened here.
       default:
@@ -488,7 +488,7 @@ class CheckrProvider implements BackgroundProvider {
     if (!res.ok) return null
     const report = await res.json() as Record<string, any>
     // S639: the payload verbatim, before it is narrowed to a summary. The
-    // normalisation below answers today's question; the archive answers the ones
+    // normalization below answers today's question; the archive answers the ones
     // that come later — a dispute, a re-screen, "what did it actually say".
     this.rawReport = report
     const products: Record<string, string> = {}

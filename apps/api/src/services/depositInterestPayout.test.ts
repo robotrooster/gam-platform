@@ -69,7 +69,7 @@ describe('S642 statutory deposit interest is actually handed over', () => {
     const credits = await creditsFor(f.tenantId)
     expect(credits).toHaveLength(1)
     expect(credits[0].amt).toBeCloseTo(24.96, 2)
-    // Categorised, not dumped in "other" — this is a statutory obligation and
+    // Categorized, not dumped in "other" — this is a statutory obligation and
     // has to be findable as one.
     expect(credits[0].category).toBe('deposit_interest')
   })
@@ -139,7 +139,7 @@ describe('S642 statutory deposit interest is actually handed over', () => {
 // explanation reads as a bug — to the tenant especially, who can least afford
 // to guess.
 describe('S642 a paid credit is explicable from both sides', () => {
-  it('the tenant credit is categorised so it can be named, not lumped in "other"', async () => {
+  it('the tenant credit is categorized so it can be named, not lumped in "other"', async () => {
     const f = await seedAccruals({ months: 12, perMonth: 1.5, ageMonths: 12 })
     await payAnnualDepositInterest()
     const { rows } = await db.query<any>(

@@ -21,7 +21,7 @@ const LANDLORD = 'e8904104-ab16-4d02-b6f8-cac88d738aae'   // TruBlu Management L
 
 /** The city removed these pads. They exist in the numbering and nowhere else. */
 const REMOVED = new Set(['12', '13', '14', '25', '26'])
-/** Blocked until the neighbouring trailer is rotated off them. */
+/** Blocked until the neighboring trailer is rotated off them. */
 const BLOCKED: Record<string, string> = {
   '5':  'Needs the lot 6 trailer rotated to free the spot',
   '27': 'Needs the lot 28 trailer rotated to free the spot',

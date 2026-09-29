@@ -222,7 +222,7 @@ describe('POST /accept-invite — tenant activates account', () => {
   // Laurel Rhoades, MH 02 Mountain View. She set a password and a phone number,
   // the page told her it failed, and her retry said "invalid or expired invite
   // link" — because the token was cleared two statements in, before the work it
-  // authorised was done, in a route with no transaction. Her password, phone and
+  // authorized was done, in a route with no transaction. Her password, phone and
   // terms acceptance were saved; her invite was never marked accepted and her
   // lease was never drafted. She had an account she could not reach and a link
   // that was already spent.
@@ -259,7 +259,7 @@ describe('POST /accept-invite — tenant activates account', () => {
     // spent link used to be indistinguishable from a bad one, so tenants who had
     // already set up their account were told the invite "expired" and asked Nic
     // for a new one. The row now knows the difference — and the kept token
-    // authorises nothing once accepted.
+    // authorizes nothing once accepted.
     expect(u.rows[0].tok).toBe(f.token)
     expect(u.rows[0].accepted).not.toBeNull()
   })

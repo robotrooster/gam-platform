@@ -122,7 +122,7 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
   // cannot be known in advance — a spot might turn over five times — so those
   // stay in arrears for the month just ended, and land on the same bill.
   //
-  // S637's all-arrears behaviour is why September's fee had to be run by hand:
+  // S637's all-arrears behavior is why September's fee had to be run by hand:
   // the run on the 1st was still billing the month before it.
   const monthStart   = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
   const monthIso     = monthStart.toISOString().slice(0, 10)
@@ -218,7 +218,7 @@ export async function applyConnectAccountMinimums(monthIso: string): Promise<num
   // The floor used to apply to any past-grace account whether or not it earned
   // anything — it would create a zero row purely to hang a $10 top-up off. That
   // turned every abandoned signup into a $10/month invoice the moment the grace
-  // cap stamped billing_starts_at: a landlord who kicked the tyres, added one
+  // cap stamped billing_starts_at: a landlord who kicked the tires, added one
   // space, never came back and never had a tenant would be billed forever. It
   // also contradicted the standing rule that a landlord goes non-charged when
   // every unit is vacant, since a fully-vacant portfolio earns zero and would
@@ -641,7 +641,7 @@ async function accrueOneProperty(
       // payouts net out this amount via Stripe Connect destination charge math"
       // described the PRE-S561 money model; under platform-holds a payout nets
       // what the landlord OWES (landlord_gam_charges) and nothing else. No
-      // charge was ever written, so the platform fee has been recognised as
+      // charge was ever written, so the platform fee has been recognized as
       // revenue and never collected from anybody — GAM has been running the
       // parks for free while the books said otherwise.
       //

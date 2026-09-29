@@ -486,7 +486,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     // at all" — and the one real screening on file proves it: that charge has
     // on_behalf_of null, transfer_data null and no application fee, settling
     // 100% to the platform. The stale sentence cost real time today, read as
-    // current behaviour. Landlord handles any state fee-cap by issuing the
+    // current behavior. Landlord handles any state fee-cap by issuing the
     // tenant a credit (POST /:id/screening-credit); GAM never computes caps.
     if (!applicantPaymentIntentId) throw new AppError(402, 'Payment required before screening can start')
     const chargedCents = await verifyPaymentIntent(applicantPaymentIntentId, {

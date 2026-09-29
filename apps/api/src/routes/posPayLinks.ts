@@ -127,7 +127,7 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
   //
   // The failure this replaces was narrow and real: a cashier could tap a stay
   // item into the cart and press "Email a pay link" instead of taking payment.
-  // That path accepted any list of items, totalled them and emailed a link —
+  // That path accepted any list of items, totaled them and emailed a link —
   // it had no notion of a site or a date to ask for. Paid, it wrote a sale and
   // the Master Schedule never heard about it, which is the same failure
   // register stays were built to end, through a different door. (The booking

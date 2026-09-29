@@ -127,7 +127,7 @@ export async function generateAddendumPdf(
   const margin = 54
 
   const black = rgb(0, 0, 0)
-  const grey  = rgb(0.4, 0.4, 0.4)
+  const gray  = rgb(0.4, 0.4, 0.4)
   const gold  = rgb(0.788, 0.635, 0.153) // #c9a227
 
   let y = height - margin
@@ -152,14 +152,14 @@ export async function generateAddendumPdf(
     ['Lease ID:',       ctx.lease_id],
   ]
   for (const [label, value] of infoLines) {
-    page.drawText(label, { x: margin,        y, size: 10, font: helveticaBold, color: grey })
+    page.drawText(label, { x: margin,        y, size: 10, font: helveticaBold, color: gray })
     page.drawText(value, { x: margin + 110,  y, size: 10, font: helvetica,     color: black })
     y -= 16
   }
   y -= 8
 
   // ── PARTIES ──
-  page.drawText('PARTIES', { x: margin, y, size: 11, font: helveticaBold, color: grey })
+  page.drawText('PARTIES', { x: margin, y, size: 11, font: helveticaBold, color: gray })
   y -= 16
   page.drawText('Landlord:', { x: margin,       y, size: 10, font: helveticaBold, color: black })
   page.drawText(ctx.landlord_name, { x: margin + 70, y, size: 10, font: helvetica, color: black })
@@ -172,7 +172,7 @@ export async function generateAddendumPdf(
   y -= 6
 
   // ── CHANGES ──
-  page.drawText('CHANGES TO LEASE TERMS', { x: margin, y, size: 11, font: helveticaBold, color: grey })
+  page.drawText('CHANGES TO LEASE TERMS', { x: margin, y, size: 11, font: helveticaBold, color: gray })
   y -= 16
 
   for (const c of input.changes) {
@@ -183,7 +183,7 @@ export async function generateAddendumPdf(
     page.drawText('•', { x: margin,      y, size: 10, font: helveticaBold, color: black })
     page.drawText(label,   { x: margin + 14, y, size: 10, font: helveticaBold, color: black })
     y -= 14
-    page.drawText(`From: ${fromVal}`, { x: margin + 24, y, size: 10, font: helvetica, color: grey })
+    page.drawText(`From: ${fromVal}`, { x: margin + 24, y, size: 10, font: helvetica, color: gray })
     y -= 13
     page.drawText(`To:   ${toVal}`,   { x: margin + 24, y, size: 10, font: helveticaBold, color: gold })
     y -= 18
@@ -204,12 +204,12 @@ export async function generateAddendumPdf(
   y -= 6
 
   page.drawText(`Recorded by: ${ctx.recorded_by} on ${recordedAt.toLocaleString()}`, {
-    x: margin, y, size: 9, font: helvetica, color: grey,
+    x: margin, y, size: 9, font: helvetica, color: gray,
   })
   y -= 26
 
   // ── SIGNATURE BLOCKS ──
-  page.drawText('SIGNATURES', { x: margin, y, size: 11, font: helveticaBold, color: grey })
+  page.drawText('SIGNATURES', { x: margin, y, size: 11, font: helveticaBold, color: gray })
   y -= 22
 
   const signers = [
@@ -221,16 +221,16 @@ export async function generateAddendumPdf(
       // unlikely with current change-set sizes, but page-overflow guard
       const next = pdfDoc.addPage([612, 792])
       y = next.getSize().height - margin
-      next.drawText('(continued)', { x: margin, y, size: 9, font: helvetica, color: grey })
+      next.drawText('(continued)', { x: margin, y, size: 9, font: helvetica, color: gray })
       y -= 20
     }
     page.drawText(s.role + ': ' + s.name, { x: margin, y, size: 10, font: helveticaBold, color: black })
     y -= 14
-    page.drawLine({ start: { x: margin,     y }, end: { x: margin + 240, y }, thickness: 0.7, color: grey })
-    page.drawLine({ start: { x: margin + 280, y }, end: { x: margin + 420, y }, thickness: 0.7, color: grey })
+    page.drawLine({ start: { x: margin,     y }, end: { x: margin + 240, y }, thickness: 0.7, color: gray })
+    page.drawLine({ start: { x: margin + 280, y }, end: { x: margin + 420, y }, thickness: 0.7, color: gray })
     y -= 11
-    page.drawText('Signature', { x: margin,     y, size: 8, font: helvetica, color: grey })
-    page.drawText('Date',      { x: margin + 280, y, size: 8, font: helvetica, color: grey })
+    page.drawText('Signature', { x: margin,     y, size: 8, font: helvetica, color: gray })
+    page.drawText('Date',      { x: margin + 280, y, size: 8, font: helvetica, color: gray })
     y -= 26
   }
 

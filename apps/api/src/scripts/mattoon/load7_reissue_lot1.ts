@@ -11,7 +11,7 @@
  * its signers stay forever and show up in history. That is right for a document
  * that meant something and was withdrawn. These meant nothing: they were built
  * from a template Blu has since replaced, and they were missing 70 of its 125
- * fields because every resident was labelled with a signer role no template
+ * fields because every resident was labeled with a signer role no template
  * binds to, so not one tenant name, initial or signature date ever reached them.
  * Nic: "something that was never a real issue, of real substance or value to the
  * system needs to just kind of be pruned completely."

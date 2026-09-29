@@ -119,7 +119,7 @@ export function stayRateLabel(stayUnit: StayUnit): string {
  * THE SITE FIRST, THEN THE PROPERTY — the same order, and the same two places,
  * the booking site already quotes from (services/propertyBookingQuote: `rep
  * .nightly_rate ?? prop.nightly_rate`). A site may be worth more or less than
- * its neighbours and carries its own number; the property's rate is what the
+ * its neighbors and carries its own number; the property's rate is what the
  * rest of the sites cost. If the register consulted only the unit, a property
  * that prices at the property level would sell on the booking site and be
  * refused at the counter — the identical split this whole change exists to
@@ -254,7 +254,7 @@ export async function createStayBooking(
     [details.unitId, opts.propertyId])
   if (!unit.rows.length) throw new AppError(400, 'That site is not at this property')
 
-  // Serialise everybody selling THIS site, then re-check under the lock.
+  // Serialize everybody selling THIS site, then re-check under the lock.
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`unit-booking:${details.unitId}`])
   if (!await siteIsFree(client, details.unitId, checkIn, checkOut)) {
     throw new AppError(409, 'That site is already taken for those dates — pick another one.')

@@ -97,7 +97,7 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
   })
   const dPath = 'M ' + pts.map(p => `${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(' L ')
 
-  // The colour reads MOMENTUM, not health: this month against the average of
+  // The color reads MOMENTUM, not health: this month against the average of
   // the ones before it. A platform-wide total has no "expected" to measure
   // against the way one property's rent roll does, so inventing a target would
   // be a made-up number on a dashboard that just had one removed.
@@ -208,7 +208,7 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
           <div className="rvm-readout">
             {/* S639 (Nic): "the heartbeat monitor is saying nine point nine k
                 collected versus the other heartbeat monitor saying eight point
-                nine k." Both right, neither labelled. This one counts money the
+                nine k." Both right, neither labeled. This one counts money the
                 TENANT HAS SENT — including ACH still clearing — which was a
                 deliberate S616 decision so the chart does not flatline during
                 the first week of every month, exactly when rent arrives. The

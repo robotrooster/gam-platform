@@ -5,7 +5,7 @@ import { requireAuth, requireAdmin, requireLandlord, requirePerm, getScopedPrope
 import { canAccessLandlordResource, canViewLandlordFinances, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 // S633 — the account is not an entity. Reads span every company the account
-// owns; writes name their target and are authorised against it.
+// owns; writes name their target and are authorized against it.
 import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, isEntityMember } from '../lib/landlordScope'
 // S640: the dashboard shows the date the payout ENGINE will fire, never its own guess.
 import { nextPayoutDateUtc } from '../jobs/autoPayouts'
@@ -100,7 +100,7 @@ export const adminLandlordsListHandler = async (req: any, res: any, next: any) =
         smu.first_name AS sm_first_name, smu.last_name AS sm_last_name,
         rbu.first_name AS referrer_first_name, rbu.last_name AS referrer_last_name,
         COUNT(DISTINCT p.id)::int AS property_count,
-        -- S616 (Nic): a neighbour's serviced space is NEITHER. "It doesn't
+        -- S616 (Nic): a neighbor's serviced space is NEITHER. "It doesn't
         -- count as a vacancy. It doesn't count as an occupied unit. It doesn't
         -- count as anything in terms of that — just utilities coming in."
         --
@@ -175,7 +175,7 @@ landlordsRouter.get('/', requireAdmin, adminLandlordsListHandler)
 // (customer, property) account semantics. Engine + statement math
 // live in services/flexCharge.ts.
 
-// ── S642: THE LANDLORD REFERRAL PROGRAMME IS WITHDRAWN ───────────────────
+// ── S642: THE LANDLORD REFERRAL PROGRAM IS WITHDRAWN ───────────────────
 //
 // Nic: "Not having something there is better than offering it to landlords
 // and then taking it away… the referral program can't happen when landlords
@@ -192,7 +192,7 @@ landlordsRouter.get('/', requireAdmin, adminLandlordsListHandler)
 //     erase history. See gam-data-retention-keep-everything.
 //   • the ?ref= parameter on landlord signup, and the whole commission engine.
 //     Those serve the SALES REP model (closing/service/pot), which is a
-//     different programme that stands. Only the landlord-facing offer is gone.
+//     different program that stands. Only the landlord-facing offer is gone.
 //
 // Nothing was ever earned on it: commission_accruals is empty, so withdrawing
 // it deprives nobody of money they had been promised.
@@ -310,7 +310,7 @@ landlordsRouter.post('/flex-charge/accounts', requireAuth, requireLandlord, asyn
     const { tenantId, posCustomerId, propertyId, creditLimit, notes } = req.body
     if (!propertyId) throw new AppError(400, 'propertyId required')
     // S633: the company is the one that owns the named property — there is
-    // nothing for the caller to get wrong, and the authorisation is the same.
+    // nothing for the caller to get wrong, and the authorization is the same.
     const row = await createFlexChargeAccount({
       landlordId:     await landlordIdForProperty(req.user!, propertyId, query),
       propertyId,
@@ -391,7 +391,7 @@ landlordsRouter.patch('/flex-charge/finance-rate', requireAuth, requireLandlord,
 // S633: the theme belongs to the ACCOUNT, not to a company. It is chrome for
 // the person looking at the screen, and it used to be read off `landlords`
 // through whichever entity the session sat on — so an account that owns two
-// companies saw the portal change colour depending on invisible session state,
+// companies saw the portal change color depending on invisible session state,
 // and selling that company would have taken the theme with it.
 landlordsRouter.get('/theme', requireAuth, async (req, res, next) => {
   try {
@@ -675,7 +675,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COUNT(*) FILTER (WHERE u.status='delinquent')::int AS delinquent_units,
         COUNT(*) FILTER (WHERE u.status='suspended')::int AS suspended_units,
         COUNT(*) FILTER (WHERE u.payment_block=TRUE)::int AS eviction_mode_units,
-        -- S616 (Nic): a neighbour's serviced space is not inventory. Every
+        -- S616 (Nic): a neighbor's serviced space is not inventory. Every
         -- status count above already excludes it by naming a status explicitly;
         -- this one counted everything, so the portfolio total was the one place
         -- it still inflated.
@@ -695,7 +695,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         --    revenue that's not coming in, but don't keep track of it in the
         --    outstanding balance or the expected monthly rent."
         --
-        -- Six spaces trade rent for labour. Their rent is contracted and it is
+        -- Six spaces trade rent for labor. Their rent is contracted and it is
         -- real, but it is never going to arrive as money — it arrives as work.
         -- Summing it into Expected made the card promise $2,869 a month that no
         -- bank account will ever see, and then Outstanding billed the landlord's
@@ -792,7 +792,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // Three separate disagreements with collected_mtd below, only one of which
     // was biting: this summed EVERY payment type while the card counts rent
     // only. The $895.95 was 14 settled utility payments — both figures right,
-    // neither one labelled. The trend is a REVENUE line and should keep counting
+    // neither one labeled. The trend is a REVENUE line and should keep counting
     // everything; it now returns the split so the tooltip can say so instead of
     // silently contradicting the card.
     //
@@ -1128,7 +1128,7 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
     // both properties at this point, so it should be showing something."
     //
     // The S633 conversion was done HALFWAY here, which is worse than not at
-    // all: it built the full entity set, authorised EVERY id in it — and then
+    // all: it built the full entity set, authorized EVERY id in it — and then
     // queried with `rentRollIds[0]`. So the permission check said "you may see
     // both companies" and the query returned one, whichever sorted first. On an
     // account with two companies the roll silently lost half the portfolio, and
@@ -1156,10 +1156,10 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
         -- S640: this page explains the Expected Monthly Rent card, so it has to
         -- split the roll the same way the card does. A traded space stays on
         -- the list — it IS rented, and hiding it would make the roll disagree
-        -- with the unit count beside it — but its rent is labelled and totalled
+        -- with the unit count beside it — but its rent is labeled and totaled
         -- separately, because it is never arriving as money.
         COALESCE(wt.trades_rent, FALSE) AS work_trade,
-        -- S650: asleep — listed, totalled apart, never payable.
+        -- S650: asleep — listed, totaled apart, never payable.
         COALESCE(l.is_hibernating, FALSE) AS hibernating
       FROM units u
       JOIN properties p ON p.id = u.property_id
@@ -2247,7 +2247,7 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
     // already is on the platform. And instead of giving them the tenant portal
     // invite, it just drafts up the lease." Same interception as
     // /me/onboard-new-lease-tenant; this is the second door onto the same
-    // problem, and leaving it would still mail "set a password" to a neighbour
+    // problem, and leaving it would still mail "set a password" to a neighbor
     // who has been signing in for months to pay their trash bill.
     //
     // S410 (S377): store on tenant_invite_token with 7-day expiry. Pre-S410
@@ -2523,7 +2523,7 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     //    that person already is on the platform. And instead of giving them the
     //    tenant portal invite, it just drafts up the lease."
     //
-    // The neighbour who has been paying for trash and electric for months
+    // The neighbor who has been paying for trash and electric for months
     // already has a GAM login. This route reused their user row and then
     // unconditionally issued a fresh invite token and mailed them "activate
     // your account and set a password" — for an account they already use. If
@@ -2572,7 +2572,7 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     // so inviting somebody to a second spot MOVED their existing invite off the
     // first one. A person with two spots ended up with one lease and no sign
     // that an invite had been lost. Re-inviting to the SAME unit still reopens
-    // that invite, which is the behaviour this clause was written for.
+    // that invite, which is the behavior this clause was written for.
     await client.query(
       `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, home_sale_terms, package_template_ids)
        VALUES ($1, $2, 'not_uploaded', $3, $4, $5)
@@ -3438,7 +3438,7 @@ landlordsRouter.delete('/me/pending-tenants/:intentId', requirePerm('tenant_onbo
 
     // S639: cancel the paired screening-waiver row with it. A waive writes a
     // SECOND, unit-less intent purely to hold the audit (who waived, when,
-    // attested). Cancelling the real invite left that one open, and once its
+    // attested). Canceling the real invite left that one open, and once its
     // partner was gone it had nothing to hide behind — Illyana Gonzalez's
     // corrected-address cancellation on 2026-09-02 left a ghost of a dead
     // account sitting in Nic's pending pool for a week.
@@ -4016,7 +4016,7 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
 
     // S491: state-law mismatch check. Run after the per-row validation
     // so blocker issues stay leading. Fires only on rows that already
-    // have both a parseable rent + deposit + state — uncatalogued or
+    // have both a parseable rent + deposit + state — uncataloged or
     // missing-data rows return no flag. Best-effort: one failed
     // checkAgainstStatute call doesn't suppress the others.
     for (const row of rows) {
@@ -6028,7 +6028,7 @@ landlordsRouter.post('/me/pm-property-invitations', requirePerm('pm_invitations.
     }).parse(req.body)
 
     // S633: the company handing the property over is the one that OWNS it —
-    // derived from the property named in the request, and authorised by the same
+    // derived from the property named in the request, and authorized by the same
     // check. Handing over a property from the wrong company is a real-world
     // authority mistake, not a display bug.
     const pmInviteLandlordId = await landlordIdForProperty(req.user!, body.propertyId, query)

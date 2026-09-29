@@ -18,7 +18,7 @@
  * and an accepted-but-unfinished one both block, and only a lapsed one
  * releases the unit.
  *
- * Hidden rather than greyed, per the rule Nic set for the meter pickers — "I
+ * Hidden rather than grayed, per the rule Nic set for the meter pickers — "I
  * don't want them grayed out because then I still have to scroll around
  * looking for just the odd one or two" — with a count underneath, so nothing
  * vanishes unexplained.

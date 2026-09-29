@@ -38,7 +38,7 @@ export interface ChatCompletionOptions {
    * 'required' forces SOME tool. S618 adds the named form —
    * { type:'function', function:{ name } } — which forces ONE specific tool,
    * so the phrase table in toolRouting.ts can say WHICH lookup answers a
-   * question instead of leaving the model to pick. Verified honoured by the
+   * question instead of leaving the model to pick. Verified honored by the
    * local mlx server in both forms.
    */
   toolChoice?: 'auto' | 'required' | 'none' | { type: 'function'; function: { name: string } }
@@ -147,7 +147,7 @@ export async function chatCompletion(
   //
   // Turning the temperature down is NOT the fix here: the Hermes sampler
   // defaults above are deliberately non-greedy because Hermes degenerates into
-  // looping when sampled greedily. A seed keeps the sampling behaviour exactly
+  // looping when sampled greedily. A seed keeps the sampling behavior exactly
   // as it is in production and only makes it repeatable.
   //
   // Unset in production, where variety between two tenants asking the same

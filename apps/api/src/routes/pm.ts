@@ -1136,7 +1136,7 @@ pmRouter.get('/companies/:id/connect/account-status', async (req: any, res, next
 // so there was nowhere to put the two things that belong to it: how that owner
 // is paid, and whether they can see any of this for themselves.
 //
-// AUTHORISATION. Every route below resolves the (company, owner) relationship
+// AUTHORIZATION. Every route below resolves the (company, owner) relationship
 // row FIRST and 404s when there isn't one. A manager passing a landlordId they
 // do not manage must not be able to tell the difference between "no such owner"
 // and "not yours" — and more importantly must never read that owner's money.

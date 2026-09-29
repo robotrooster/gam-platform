@@ -20,7 +20,7 @@
  *     home is being sold, so Sales — never both), the January 2026 lead
  *     pamphlet that line (d) of that form says the buyer received, and IDPH's
  *     "Living in a Manufactured Home Community," the pamphlet his own lease's
- *     acknowledgement says was offered.
+ *     acknowledgment says was offered.
  *
  *  3. Retire Blu's own two lead-paint uploads. They are the same federal form in
  *     his attorney's layout, tagged as LEASES rather than disclosures — so the

@@ -12,7 +12,7 @@
  * transaction. Three reasons: a mail provider timing out must never roll back
  * an invoice; a send that fails can be retried on the next pass without
  * double-billing anybody; and the catch-up/backfill paths get the same
- * behaviour for free.
+ * behavior for free.
  *
  * `invoices.sent_at` already existed and had never been set on a single row —
  * it is exactly the "the tenant has been told" stamp, so no migration.
@@ -56,7 +56,7 @@ interface PendingInvoice {
   landlord_name: string | null
 }
 
-/** The same plain-English labelling the landlord's balance reminder uses. */
+/** The same plain-English labeling the landlord's balance reminder uses. */
 function labelFor(row: { type: string; notes: string | null }): string {
   const note = String(row.notes ?? '').split(' — ')[0].trim()
   if (row.type === 'rent') return 'Rent'

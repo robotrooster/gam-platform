@@ -123,7 +123,7 @@ describe('POST /webhooks/resend', () => {
     expect((await readEvent()).last_event).toBe('bounced')
   })
 
-  it('acks unmodelled event types instead of making Svix retry forever', async () => {
+  it('acks unmodeled event types instead of making Svix retry forever', async () => {
     const { body, headers } = signed({ type: 'email.opened', data: { email_id: MSG } })
     const r = await request(buildApp()).post('/webhooks/resend').set(headers).send(body).expect(200)
     expect(r.body.ignored).toBe(true)

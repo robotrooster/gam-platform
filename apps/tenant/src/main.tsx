@@ -559,7 +559,7 @@ function Layout() {
   // honest state is the full nav, not the most restrictive one.
   //
   // Failing open costs nothing that matters: the nav is a list of links, and
-  // every page behind it authorises itself against the API. A link someone
+  // every page behind it authorizes itself against the API. A link someone
   // cannot use is a dead end; a hidden portal is a tenant who cannot pay rent.
   // The screen was never the security boundary — the API response is.
   const tenantMeUnknown = tenantMeLoading || tenantMeFailed || tenantMe === undefined
@@ -1032,14 +1032,14 @@ function HomeAlerts() {
  * behind it, and says plainly what the arrangement is.
  */
 /**
- * S616 (Nic) — the neighbour tells us they are leaving.
+ * S616 (Nic) — the neighbor tells us they are leaving.
  *
  *   "Maybe that tenant portal profile that only has the utilities gets a big
  *    button that says 'hey, I need my final bill because I'm moving out', and
  *    then it's gonna look for more utilities to go onto a new person after that
  *    final billing period."
  *
- * Nobody is watching the neighbour's front door. This person is the only one
+ * Nobody is watching the neighbor's front door. This person is the only one
  * who reliably knows, so it is their button. It gives NOTICE — the landlord
  * still takes the closing read and sets up whoever moves in. Letting a payer
  * close their own account would let somebody walk away from a balance.
@@ -1759,7 +1759,7 @@ function LeaseNoticeGate() {
   //
   // It already blocked the portal. What it did not do was make anyone read:
   // Acknowledge was live the instant the box appeared, so a long notice could be
-  // dismissed unseen — and an acknowledgement nobody read is worth nothing as
+  // dismissed unseen — and an acknowledgment nobody read is worth nothing as
   // proof. The button now waits until the notice has actually been scrolled
   // through. A notice short enough to fit needs no scrolling, so it enables
   // immediately rather than trapping somebody on a box with no scrollbar.

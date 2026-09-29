@@ -57,7 +57,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   // matched rows. Now one does.
   // S652 (Nic): "the transaction log of the bank account is all money going in
   // and out of that bank account." The log opens on everything, newest first —
-  // GAM's payouts landing included, labelled as matched so nothing is booked
+  // GAM's payouts landing included, labeled as matched so nothing is booked
   // twice. The buttons are filters over it, not separate pages.
   const [view, setView] = useState<'all' | 'needs_review' | 'categorized' | 'ignored'>('all')
 
@@ -393,7 +393,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                           {t.description && t.description !== t.normalizedMerchant ? ` · ${t.description}` : ''}
                         </div>
                       </div>
-                      {/* S605 (Nic): colour alone didn't say which way the money
+                      {/* S605 (Nic): color alone didn't say which way the money
                           went — "green numbers and white numbers" was a guess.
                           Label it. These are single transaction amounts, not a
                           running balance. */}

@@ -85,7 +85,7 @@ describe('GET /api/autopay carries the grace period (S616)', () => {
   })
 
   // The engine's own fallback is 5. If these two ever disagree the screen
-  // promises a free day the charge then penalises.
+  // promises a free day the charge then penalizes.
   it('falls back to 5 exactly as the late-fee engine does', async () => {
     const f = await seed({ graceDays: null })
     const res = await request(buildApp())

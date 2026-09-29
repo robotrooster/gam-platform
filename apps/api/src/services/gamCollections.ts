@@ -124,7 +124,7 @@ export async function collectionsBook(): Promise<CollectionsBook> {
  * Nic: "immediately reach out to people when there's a problem." The problem
  * here is silent by construction: the fee accrues, the sweep finds no bank, and
  * the only trace is an error line. The landlord's first hint under the old
- * behaviour would have been a locked portal, which is an ambush.
+ * behavior would have been a locked portal, which is an ambush.
  *
  * Sent ONCE per landlord (uncollectable_notice_at). A monthly drip about the
  * same unlinked bank teaches people to filter GAM's mail, and the one message

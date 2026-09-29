@@ -9,11 +9,11 @@
  * cost something when it is wrong.
  *
  * The vendor names in AUDIT_TRAIL_SIGNALS are deliberate and load-bearing
- * (Nic): they are how a competitor-signed lease is recognised during
+ * (Nic): they are how a competitor-signed lease is recognized during
  * onboarding, which is a migration asset. They are nominative — matching text
  * another tool printed — not branding. Do not "clean them up".
  *
- * These tests assert the CURRENT behaviour exactly. They were written after an
+ * These tests assert the CURRENT behavior exactly. They were written after an
  * attempt to replace those vendor strings with structural markers was reverted;
  * their job is to make the next such attempt fail loudly instead of silently
  * degrading imports.
@@ -89,10 +89,10 @@ describe('isAuditTrailPage — lease BODY text must NOT be detected', () => {
   })
 
   it('does not fire on lowercase lease prose — the signals are case-sensitive', () => {
-    // Documents the CURRENT contract. 'Signed by' is capitalised on a
+    // Documents the CURRENT contract. 'Signed by' is capitalized on a
     // certificate; a lease body says "signed by both parties" in prose, and
     // matching that would skip a real page. Loosening case here is a
-    // behaviour change, not a cleanup.
+    // behavior change, not a cleanup.
     expect(isAuditTrailPage(page(
       'This Agreement is not binding until it has been signed by both parties.',
       'Any amendment must be sent for signature to each occupant of record.',

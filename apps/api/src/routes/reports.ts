@@ -184,7 +184,7 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     const outstanding = parseFloat(outstandingRow?.amount ?? '0')
 
     // S616 (Nic): occupancy counts SHORT STAYS — "aggregate thirty nights of
-    // bookings as well" — and excludes service points, which are a neighbour's
+    // bookings as well" — and excludes service points, which are a neighbor's
     // building rather than this landlord's inventory. Shares one formula with
     // the Dashboard's Occupancy card so the two cannot disagree.
     const occRow = isAdmin
@@ -653,7 +653,7 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
     // drill-in reconcile with this row).
     const properties = await query<any>(`
       SELECT p.*,
-        -- S616: a service point carries a neighbour's utility bill and is not
+        -- S616: a service point carries a neighbor's utility bill and is not
         -- this landlord's inventory. Every other count here names a status,
         -- which is why this bare one was the place it still leaked in.
         (SELECT COUNT(*) FROM units u WHERE u.property_id = p.id
@@ -711,7 +711,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
     const month = req.query.month ? parseInt(req.query.month as string) : null
     if (month !== null && (month < 1 || month > 12)) throw new AppError(400, 'month must be 1-12')
     // S633: the company is the one that owns the property being reported on —
-    // derived, not guessed from session state. Authorised below by the same
+    // derived, not guessed from session state. Authorized below by the same
     // landlord_id filter that has always been there.
     const landlordIds = reportScope(req.user!)
 
@@ -721,7 +721,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
 
     const property = await queryOne<any>(`
       SELECT p.id, p.name, p.city, p.state, p.type,
-        -- S616: a service point carries a neighbour's utility bill and is not
+        -- S616: a service point carries a neighbor's utility bill and is not
         -- this landlord's inventory. Every other count here names a status,
         -- which is why this bare one was the place it still leaked in.
         (SELECT COUNT(*) FROM units u WHERE u.property_id = p.id

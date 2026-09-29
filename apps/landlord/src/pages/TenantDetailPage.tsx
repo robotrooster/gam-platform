@@ -280,7 +280,7 @@ function PaymentTimelinessModal({ payments, tenantName, onClose }: { payments: a
  * a fire-lane violation, a broken window or a replaced key had no door at all.
  *
  * This is the door. The charge rides the tenant's next invoice as an ordinary
- * line with the reason and the date printed on it, so they recognise it instead
+ * line with the reason and the date printed on it, so they recognize it instead
  * of phoning up about an amount.
  */
 const CHARGE_TYPES = [

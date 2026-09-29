@@ -120,7 +120,7 @@ export async function billableUnitsForProperty(
   // S616 (Nic): "$2 per occupied unit next door THAT IS ON SOME SORT OF
   // UTILITY CHARGE — trash or electric or whatever."
   //
-  // Counted per SPACE, never per utility: a neighbour on both trash and
+  // Counted per SPACE, never per utility: a neighbor on both trash and
   // electric is $2, not $4. That is what COUNT(DISTINCT sa.unit_id) buys.
   //
   // Two conditions decide whether GAM has earned it, and neither is an event

@@ -51,7 +51,7 @@ publicSalesCalendarRouter.get('/sales-calendar/:token', async (req, res, next) =
     }
 
     // Window: recent-past (a just-finished call still resolves) through the
-    // next ~6 months. Include cancelled/no_show so they grey out on the
+    // next ~6 months. Include cancelled/no_show so they gray out on the
     // subscriber's calendar rather than lingering.
     const rows = await query<DemoSlotRow>(
       `SELECT s.id, s.starts_at, s.duration_minutes, s.kind, s.status, s.meeting_url,

@@ -175,7 +175,7 @@ export function principalSubjectToInterest(
  * `earned` is null when no market rate is on file. In that case a basis that
  * depends on actual earnings cannot be evaluated, so it falls back to the flat
  * rate — the conservative direction, since under-paying a statutory obligation
- * is the expensive mistake (AZ § 33-1431(D) penalises at TWICE the amount
+ * is the expensive mistake (AZ § 33-1431(D) penalizes at TWICE the amount
  * wrongfully withheld).
  */
 export function applyRateBasis(
@@ -278,7 +278,7 @@ export function gateApplies(
  *   4. null — the state owes nothing on this unit type
  *
  * `unitType` is optional so existing callers keep working; without it only the
- * blanket row can match, which is the pre-S603 behaviour.
+ * blanket row can match, which is the pre-S603 behavior.
  */
 export async function resolveRateForLandlord(
   landlordId: string,

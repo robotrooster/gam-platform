@@ -43,7 +43,7 @@ async function seedStack(heldAmount = 185.01) {
     // S649: held usage only ever belongs to a resident being onboarded
     await client.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
     // The share held while the unit was mid-onboarding: real usage the
-    // neighbours were already charged around.
+    // neighbors were already charged around.
     await client.query(
       `INSERT INTO suspended_utility_charges
          (meter_id, unit_id, landlord_id, billing_cycle_month, utility_type,

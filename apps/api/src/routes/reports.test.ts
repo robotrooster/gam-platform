@@ -646,7 +646,7 @@ describe('GET /api/reports/property-detail', () => {
     const onbUnit = await seedUnit(db as any, { propertyId: propId, landlordId: f.aLid })
     // S637: give it a real tenancy from the day it onboarded. This used to be a
     // bare unit, and May's $10 came from the floor being applied to a month
-    // with nobody in it — the behaviour S631 removed. The point of the test is
+    // with nobody in it — the behavior S631 removed. The point of the test is
     // that months BEFORE onboarding bill nothing; occupancy is what makes the
     // month after it bill at all.
     const onbLease = await seedLease(db as any, {

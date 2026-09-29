@@ -8,7 +8,7 @@
  *    but don't keep track of it in the outstanding balance or the expected
  *    monthly rent."
  *
- * Six spaces at Mountain View and Oak Park trade rent for labour, $2,869 a month
+ * Six spaces at Mountain View and Oak Park trade rent for labor, $2,869 a month
  * of it. That rent is real and contracted, but it arrives as work, never as
  * money — so counting it as Expected promises the landlord cash that no bank
  * account will ever see, and counting the open invoice as Outstanding sends them
@@ -238,7 +238,7 @@ describe('S640 next disbursement says what is coming', () => {
 
   // S650 (Nic): "show what the $495 is made of" — the Disbursements page's
   // breakdown lists exactly the payments the dashboard card adds up.
-  it('the next-payout breakdown itemises the same money the card shows', async () => {
+  it('the next-payout breakdown itemizes the same money the card shows', async () => {
     const f = await seedHeld({ settled: 495, processing: 120 })
     const card = await request(buildApp())
       .get('/api/landlords/me/dashboard').set('Authorization', `Bearer ${f.token}`)

@@ -119,7 +119,7 @@ export async function isEntityMember(
  * The replacement is two rules, and every landlord call site is one of them:
  *
  *   READS  span every entity the account owns   -> landlordScopeIds()
- *   WRITES take an explicit target, authorised  -> the resolvers below
+ *   WRITES take an explicit target, authorized  -> the resolvers below
  *
  * Once both hold, `profileId` no longer decides what a landlord can see or
  * touch, which is exactly what "the account sits outside the entities" means.
@@ -184,7 +184,7 @@ export function resolveLandlordTarget(
  * The best answer to "which company?" is almost always "the one that owns the
  * property you just named", and most write paths already carry a propertyId.
  * Deriving beats asking: there is nothing for the caller to get wrong, and the
- * authorisation is the same check either way.
+ * authorization is the same check either way.
  *
  * 403, never 404, when the property exists but belongs to someone else — the
  * distinction is deliberate. A 404 tells a landlord their own property does not
@@ -267,7 +267,7 @@ export function ownsLandlord(user: AuthPayload, landlordId: string | null | unde
  * The entity a write lands on, DERIVED FROM THE UNIT it concerns.
  *
  * Same reasoning as landlordIdForProperty: most unit-level writes already name
- * the unit, and the unit knows its company. `units.landlord_id` is denormalised
+ * the unit, and the unit knows its company. `units.landlord_id` is denormalized
  * from the property, so this is one lookup rather than a join.
  */
 export async function landlordIdForUnit(

@@ -172,7 +172,7 @@ export async function generateMoneyAddonPdf(
   const fontBold = await pdf.embedFont(StandardFonts.HelveticaBold)
 
   const black = rgb(0, 0, 0)
-  const grey  = rgb(0.4, 0.4, 0.4)
+  const gray  = rgb(0.4, 0.4, 0.4)
   const gold  = rgb(0.788, 0.635, 0.153)
   const margin = 54
   const PAGE_W = 612, PAGE_H = 792
@@ -201,7 +201,7 @@ export async function generateMoneyAddonPdf(
     }
     if (ln) line(ln, size, f, color, indent, 4)
   }
-  const heading = (t: string) => { ensure(26); y -= 4; page.drawText(t, { x: margin, y, size: 11, font: fontBold, color: grey }); y -= 16 }
+  const heading = (t: string) => { ensure(26); y -= 4; page.drawText(t, { x: margin, y, size: 11, font: fontBold, color: gray }); y -= 16 }
 
   // ── HEADER ──
   page.drawText('LEASE ADDENDUM', { x: margin, y, size: 22, font: fontBold, color: black })
@@ -213,7 +213,7 @@ export async function generateMoneyAddonPdf(
   // ── INFO ──
   const kv = (k: string, v: string) => {
     ensure(16)
-    page.drawText(k, { x: margin, y, size: 10, font: fontBold, color: grey })
+    page.drawText(k, { x: margin, y, size: 10, font: fontBold, color: gray })
     page.drawText(v, { x: margin + 110, y, size: 10, font, color: black })
     y -= 15
   }
@@ -232,7 +232,7 @@ export async function generateMoneyAddonPdf(
   for (const c of input.changes) {
     const d = describeChange(c, ctx)
     line('•  ' + d.title, 10, fontBold, black, 0, 6)
-    line(d.from, 10, font, grey, 16, 4)
+    line(d.from, 10, font, gray, 16, 4)
     line(d.to,   10, fontBold, gold, 16, 10)
   }
 
@@ -262,11 +262,11 @@ export async function generateMoneyAddonPdf(
     page.drawText(`${roleLabel}: ${s.name}`, { x: margin, y, size: 10, font: fontBold, color: black })
     y -= 20
     const lineY = y            // pdf-lib baseline for both the signature + date underline
-    page.drawLine({ start: { x: margin, y: lineY }, end: { x: margin + SIG_W, y: lineY }, thickness: 0.7, color: grey })
-    page.drawLine({ start: { x: DATE_X, y: lineY }, end: { x: DATE_X + DATE_W, y: lineY }, thickness: 0.7, color: grey })
+    page.drawLine({ start: { x: margin, y: lineY }, end: { x: margin + SIG_W, y: lineY }, thickness: 0.7, color: gray })
+    page.drawLine({ start: { x: DATE_X, y: lineY }, end: { x: DATE_X + DATE_W, y: lineY }, thickness: 0.7, color: gray })
     y -= 11
-    page.drawText('Signature', { x: margin, y, size: 8, font, color: grey })
-    page.drawText('Date',      { x: DATE_X, y, size: 8, font, color: grey })
+    page.drawText('Signature', { x: margin, y, size: 8, font, color: gray })
+    page.drawText('Date',      { x: DATE_X, y, size: 8, font, color: gray })
     y -= 22
 
     const topY = PAGE_H - lineY - BOX_H    // convert baseline → top-left box origin
