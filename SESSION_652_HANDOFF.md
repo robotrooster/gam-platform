@@ -1038,3 +1038,7 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 - **Invoice after a move:** already two utility lines, each naming its space (S641 `bill_unit_number`).
 - Leases page: within each property folder, sorted by space number (numeric). Move dropdown: open spaces only (vacant/available, same property), now in space-number order. Move screen: each meter shows "Last on file: NNNNN on <date>"; the space being moved INTO gets a one-tap "Nobody's been there — use it".
 - Nic asked for a full reading-history table somewhere in the platform ("just an idea") — NOT built; the move screen reference covers today's need.
+
+## Deploy 79 — a move emails nobody about meter reads (2026-09-29)
+
+- Nic: "after I moved Dakota, I got an email saying that the meter reads were needed for a space move… I can't do the move without the meter reads in the first place. So that email is kind of redundant." The S641 chase (`move_meter_reads_due`, landlord + every staffer who can read meters, email + in-app) is REMOVED from `moveLeaseToUnit`; the move refuses without both readings, so there is nothing to chase. Test in unitMove.test.ts.

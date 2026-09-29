@@ -269,3 +269,17 @@ describe('the master schedule after a move', () => {
     expect((res.body.data.leases as any[]).filter(l => l.id === w.otherLease)).toHaveLength(1)
   })
 })
+
+// S652 (Nic): the move takes its readings itself — nobody is emailed to go
+// and get them afterwards.
+describe('a move sends no meter-reads email', () => {
+  it('raises no notification once the readings are recorded with the move', async () => {
+    const w = await world({ withMeters: true })
+    const meters = await db.query<{ id: string }>(`SELECT id FROM utility_meters ORDER BY label`)
+    await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15', actorUserId: w.userId,
+      reads: [{ meterId: meters.rows[0].id, value: 100 }, { meterId: meters.rows[1].id, value: 200 }] })
+    await new Promise(r => setTimeout(r, 300))   // the old chase was fire-and-forget
+    const n = await db.query(`SELECT count(*)::int AS n FROM notifications WHERE type = 'move_meter_reads_due'`)
+    expect(n.rows[0].n).toBe(0)
+  })
+})
