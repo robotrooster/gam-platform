@@ -1058,3 +1058,18 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 - Nic: "tenants do not still owe $744.45… I have one guy that hasn't paid." CAUSE: a utility bill was marked paid ONLY by the Stripe webhook; cash, check, bank-deposit confirm, applied credit and released prepayments settled the PAYMENT and left the bill "billed". Mountain View had 5 ($532.14), Oak Park 33.
 - FIX: migration 20260929120000 — trigger `trg_utility_bills_follow_payment` on payments: status → settled marks the payment's utility bills paid (paid_at = settled_at); settled → anything else puts them back to billed. Backfilled 38 bills. Test in utilityRecovery.test.ts.
 - Mountain View now: billed $1,538.25 · paid $1,325.94 · still owed $212.31 = RV 45 Matthew Conklin $187.11 (September utility invoice pending, alongside his $589 rent, also pending) + RV 23 Jared Coyle $25.20 (August estimate "used before the lease was signed", billed 9/10, on NO invoice; RV 07 and RV 41's identical August estimates were voided in S642 as pre-onboarding). Waiting on Nic: void RV 23's? and is Matthew's $187.11 right (Nic remembers ~$90)?
+
+## Deploys 81–82 (2026-09-29) — utilities table truth + propane delivery screen
+
+**Nic's corrections (all three were right):**
+- Jared Coyle RV 23 $25.20 was settled 9/10 on INV-2026-00022. The utility bill row had lost its `payment_id` (hand-made payment in an earlier session), so it read "billed". Re-linked in production, now `paid`. It was the only orphan at any property.
+- Matthew Conklin RV 45 $187.11 (and his $589 rent) are parked under his work trade — not owed.
+- The only real open utility at Mountain View is Andres Razo's pay link ($670.27 = $589 site + 387 kWh × $0.21 = $81.27). No lease; Nic sent a pay link.
+
+**Shipped:**
+- `GET /utility/recovery`: three buckets now — paid, covered by work trade, still owed. Work trade = payment pending with `work_trade_suspended_at`, or settled at $0 with "work-trade credit" in the note.
+- Same route counts register/pay-link utility lines: open one-time pay link = owed; completed register sale (incl. a paid link) = paid. Only lines in the register's Utilities category naming a metered utility (electric/water/sewer/trash/gas). Register propane is retail and excluded.
+- Propane delivery modal: tenant price = the property's set rate; gallons per tank is the only required input; optional supplier invoice (total + gallons) records cost/margin only. API: `pricePerGallon` + `invoiceTotal`/`invoiceGallons` together bills at the set price and stores true cost + actual margin.
+- Verified live: Mountain View reads billed $1,619.52 / paid $1,351.14 / work trade $187.11 / owed $81.27.
+
+**Open with Nic:** only MH 01, MH 02, MH 04 are marked as having a propane tank at Mountain View — the delivery screen only offers marked spaces. He is to say which others were filled.
