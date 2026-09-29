@@ -1097,3 +1097,17 @@ Nic still saw bars/stripes flash across the site numbers on fast vertical scroll
 `SchedulePage.tsx` timeline is now two boxes: `vScrollRef` (up/down; carries the date header, the site column and the timeline) and `scrollContainerRef` (the timeline only; sideways; clips at the column's edge). Date header strip is slid sideways by transform in `updateHbar`. Site-column rows take the measured height of their timeline row (`rowGeom`). Sideways wheel over the column/header is forwarded to the timeline. `STICKY_LEFT` is now 4 (pin for floating names inside the timeline).
 
 Verified on demo grown to 100 sites (scratch rows removed after): 0 timeline elements over the column across 120 scroll positions, row alignment exact, header within 0.5px, double-click booking works. NOT measured: frame rate (Browser pane was hidden; rAF stalls). Known trade: date header may trail by a frame on a fast sideways scroll.
+
+## Deploy 85 (2026-09-29) — billing on each tenant's own date: gaps closed
+
+Nic is onboarding a park that lets "their due date be whenever they come in." The S648 build (property rule, per-lease due day, read-by-the-business-day-before, invoice hold) held up. Dress rehearsal: `apps/api/src/jobs/tenantDateBilling.test.ts` (10 tests).
+
+**Fixed:**
+- Invite asks an existing resident's due day. Migration `20260929150000_intent_rent_due_day.sql` (`pending_tenant_intents.rent_due_day`, 1–28, NULL = property's rule). Both invite routes accept `rentDueDay`; both lease-draft sites in esign.ts prefer the invite's day. `DueDayPicker` in TenantOnboardingPage (both forms), existing residents only.
+- `promptTenantDateMeterReads()` in utilityReadingRuns.ts, scheduled with the 7am Phoenix meter jobs. One notice per property per day (type `tenant_date_meter_reads_due`), due-today + overdue.
+- Invoice holds (read, flag, review) compare `billing_cycle_month < month(due date)`. Was `<=`.
+- `existingTenancyFirstDue()` in moveInBundle.ts; move-in invoice and work period use it; invoiceGeneration bills an existing tenancy with due day ≠ 1 from that date instead of skipping the start month.
+
+**Waiting on Nic:** confirm "first bill = their day in the property's first billing month."
+**Read, not tested:** late fees and Flex products on tenant dates.
+**Demo DB** migrated to 20260929150000.
