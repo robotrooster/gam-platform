@@ -77,7 +77,8 @@ const dayOnly = (s: any) => String(s ?? '').slice(0, 10)
 // five places. 200 since S652: at 180 "RV 08" wrapped under the "RV" while
 // "RV 11" (narrower digits) did not, so two sites looked different for no reason.
 const UNIT_COL_W = 200
-const STICKY_LEFT = UNIT_COL_W + 4
+// Where a floating reservation name pins: just inside the timeline's left edge.
+const STICKY_LEFT = 4
 
 // W-22: which unit types rent by the stay (rates/min-stay/bookability apply).
 // Storage + commercial rent by lease only.
@@ -331,8 +332,27 @@ export function SchedulePage() {
     show:boolean; booking:any; loading:boolean; error:string|null;
     data:{url:string; expiresAt:string; emailed?:boolean}|null; emailing:boolean
   }>({show:false, booking:null, loading:false, error:null, data:null, emailing:false})
+  // S652 (Nic): "scrolling up and down on the schedule really fast... the
+  // overlay is overlapping the site numbers... it makes it look like it's
+  // lagging really bad."
+  //
+  // The site column used to be PINNED over the timeline (position:sticky), in
+  // the same scrolling box as the bars. A browser draws a pinned column as its
+  // own layer and draws it separately from what scrolls beneath — so on a fast
+  // scroll the bars of a newly-revealed row could be on screen a moment before
+  // the column that was supposed to cover them. Stacking order (tried twice)
+  // cannot fix that; it is about WHEN each piece gets drawn, not which is on top.
+  //
+  // So the column is no longer on top of anything. It sits BESIDE the timeline:
+  //   vScrollRef ......... scrolls up/down, and carries the site column and the
+  //                        timeline together, natively
+  //   scrollContainerRef . the timeline only; scrolls sideways
+  // A bar lives inside the timeline box and that box ends where the site column
+  // begins. There is nothing for it to overlap.
+  const vScrollRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
-  const theadRef = useRef<HTMLTableSectionElement>(null)
+  const headerRef = useRef<HTMLDivElement>(null)
+  const headerStripRef = useRef<HTMLDivElement>(null)
   const legendRef = useRef<HTMLDivElement>(null)
 
   // ── Reservations tab (ported from BookingsPage) ──
@@ -357,8 +377,8 @@ export function SchedulePage() {
 
 
   useEffect(() => {
-    if (!selectedCell || !scrollContainerRef.current) return
-    const container = scrollContainerRef.current
+    const container = scrollContainerRef.current, vbox = vScrollRef.current
+    if (!selectedCell || !container || !vbox) return
     const cell = container.querySelector(
       `[data-unit="${selectedCell.unitId}"][data-date="${selectedCell.date}"]`
     ) as HTMLElement
@@ -366,29 +386,22 @@ export function SchedulePage() {
     const row = cell.closest('tr') as HTMLElement
     if (!row) return
 
-    const headerHeight = container.querySelector('thead')?.offsetHeight || 36
-    const rowTop = row.offsetTop
+    // Up/down is the outer box, whose content starts with the date header.
+    const headerHeight = headerRef.current?.offsetHeight || 36
+    const rowTop = headerHeight + row.offsetTop
     const rowBottom = rowTop + row.offsetHeight
-    const visibleTop = container.scrollTop + headerHeight
-    const visibleBottom = container.scrollTop + container.clientHeight
-
-    // Snap vertically — full row always visible
-    if (rowTop < visibleTop) {
-      container.scrollTop = rowTop - headerHeight
-    } else if (rowBottom > visibleBottom) {
-      container.scrollTop = rowBottom - container.clientHeight
+    if (rowTop < vbox.scrollTop + headerHeight) {
+      vbox.scrollTop = row.offsetTop
+    } else if (rowBottom > vbox.scrollTop + vbox.clientHeight) {
+      vbox.scrollTop = rowBottom - vbox.clientHeight
     }
 
-    // Pan horizontally — account for sticky unit column
-    const stickyWidth = STICKY_LEFT
+    // Sideways is the timeline, which no longer has a column in front of it.
     const cellLeft = cell.offsetLeft
     const cellRight = cellLeft + cell.offsetWidth
-    const visLeft = container.scrollLeft + stickyWidth
-    const visRight = container.scrollLeft + container.clientWidth
-
-    if (cellLeft < visLeft) {
-      container.scrollLeft = cellLeft - stickyWidth - 4
-    } else if (cellRight > visRight) {
+    if (cellLeft < container.scrollLeft) {
+      container.scrollLeft = cellLeft - 4
+    } else if (cellRight > container.scrollLeft + container.clientWidth) {
       container.scrollLeft = cellRight - container.clientWidth + 4
     }
   }, [selectedCell])
@@ -981,7 +994,7 @@ export function SchedulePage() {
         if (sIdx < 0 || eIdx < 0 || eIdx < sIdx) return
         out.push({
           key: id,
-          left: UNIT_COL_W + sIdx * colW,
+          left: sIdx * colW,
           top: rg.top,
           height: rg.h,
           width: (eIdx - sIdx + 1) * colW,
@@ -1028,6 +1041,9 @@ export function SchedulePage() {
       thumbPct: show ? Math.max(5, (clientWidth / scrollWidth) * 100) : 100,
       leftPct:  show ? (scrollLeft / scrollWidth) * 100 : 0,
     }
+    // The date header is outside the timeline box (it has to stay put when the
+    // page scrolls up and down), so it is slid sideways to match.
+    if (headerStripRef.current) headerStripRef.current.style.transform = `translate3d(${-scrollLeft}px,0,0)`
     const thumb = hbarThumbRef.current
     if (thumb) {
       thumb.style.left = `${hbarPos.current.leftPct}%`
@@ -1042,6 +1058,13 @@ export function SchedulePage() {
     return () => window.removeEventListener('resize', onResize)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [days.length, filteredUnits.length, view, isLoading, rowGeom.length])
+  // A sideways swipe over the site column or the date header still moves the
+  // timeline — the pointer being a few pixels left of it shouldn't matter.
+  const forwardSidewaysWheel = (e: React.WheelEvent) => {
+    const r = scrollContainerRef.current
+    if (!r || r.contains(e.target as Node)) return
+    if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) r.scrollLeft += e.deltaX
+  }
   // Drag the thumb: map thumb travel across the track to the full scrollWidth.
   const dragHbar = (e: React.MouseEvent) => {
     e.preventDefault(); e.stopPropagation()
@@ -1432,13 +1455,58 @@ export function SchedulePage() {
           .schedule-scroll{scrollbar-width:none;-ms-overflow-style:none;}
         `}</style>
         <div
-          ref={scrollContainerRef}
+          ref={vScrollRef}
           className="card schedule-scroll"
-          onScroll={() => { updateHbar(); maybeExtendForward() }}
-          style={{padding:0,position:'relative',overflowX:'auto',overflowY:'auto',overscrollBehavior:'contain',flex:1,minHeight:0,marginBottom:0,borderRadius:'12px 12px 0 0'}}
+          onWheel={forwardSidewaysWheel}
+          style={{padding:0,position:'relative',overflowX:'hidden',overflowY:'auto',overscrollBehavior:'contain',flex:1,minHeight:0,marginBottom:0,borderRadius:'12px 12px 0 0'}}
         >
+          {/* Date header — pinned to the top of the up/down box. */}
+          <div ref={headerRef} style={{position:'sticky',top:0,zIndex:3,display:'flex',background:'var(--bg-3)',borderBottom:'1px solid var(--border-1)'}}>
+            <div style={{width:UNIT_COL_W,flexShrink:0,boxSizing:'border-box',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600}}>Unit</div>
+            <div style={{flex:1,minWidth:0,overflow:'hidden'}}>
+              <div ref={headerStripRef} style={{display:'flex',width:days.length*colW,willChange:'transform'}}>
+                {days.map(d => (
+                  <div key={d} style={{boxSizing:'border-box',width:colW,flexShrink:0,padding:'6px 2px',fontSize:'.6rem',color:d===today?'var(--gold)':'var(--text-3)',fontWeight:d===today?700:400,textAlign:'center',borderLeft:'1px solid var(--border-1)',display:'flex',alignItems:'center',justifyContent:'center'}}>
+                    {new Date(d+'T12:00:00').toLocaleDateString('en-US',{month:'numeric',day:'numeric'})}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div style={{display:'flex',alignItems:'flex-start'}}>
+          {/* Site column — beside the timeline, never over it. Each row takes the
+              measured height of its timeline row so the two can't drift. */}
+          <div style={{width:UNIT_COL_W,flexShrink:0,background:'var(--bg-2)'}}>
+            {filteredUnits.map((unit, rowIdx) => (
+              <div key={unit.id} style={{height:rowGeom[rowIdx]?.h ?? 56,boxSizing:'border-box',padding:'6px 12px',borderBottom:'1px solid var(--border-1)',overflow:'hidden',display:'flex',alignItems:'center'}}>
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,height:44,overflow:'hidden',width:'100%'}}>
+                      {/* S652 (Nic): "RV sites 11 and 17 display the number next to the
+                          RV moniker, and all the other RV sites display the number
+                          underneath... I want consistency." One line, always. */}
+                      <div style={{flexShrink:0}}>
+                        <div style={{fontWeight:700,fontSize:'.86rem',whiteSpace:'nowrap',color:TYPE_COLORS[unit.unitType]||'var(--text-0)'}} title={`${UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)} · ${unit.propertyName}`}>{unit.unitNumber}</div>
+                      </div>
+                      <div style={{display:'flex',gap:4,flexShrink:0}}>
+                        {unit.isBookable && can('schedule.create_reservation') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
+                        {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" title="Set up this space" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openTypeModal(unit)}>⚙</button>}
+                        {/* S652 (Nic): "the button should flip on a site that's marked
+                            out of order." Out today → the button puts it back. */}
+                        {can('schedule.configure_unit') && (oooFor(unit.id, today)
+                          ? <button className="btn btn-primary btn-sm" title="Out of order — put it back in service" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>setOooUnit(unit)}>↺</button>
+                          : <button className="btn btn-ghost btn-sm" title="Mark out of order" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>setOooUnit(unit)}>⛔</button>)}
+                      </div>
+                    </div>
+              </div>
+            ))}
+          </div>
+          <div
+            ref={scrollContainerRef}
+            className="schedule-scroll"
+            onScroll={() => { updateHbar(); maybeExtendForward() }}
+            style={{flex:1,minWidth:0,position:'relative',overflowX:'auto',overflowY:'hidden',overscrollBehaviorX:'contain'}}
+          >
           <table
-            style={{borderCollapse:'collapse',tableLayout:'fixed',width:UNIT_COL_W+days.length*colW}}
+            style={{borderCollapse:'collapse',tableLayout:'fixed',width:days.length*colW}}
             tabIndex={0}
             onKeyDown={e => {
               if (!selectedCell) return
@@ -1457,16 +1525,6 @@ export function SchedulePage() {
               if (e.key === 'Escape') setSelectedCell(null)
             }}
           >
-            <thead ref={theadRef} style={{position:'sticky',top:0,zIndex:7,willChange:'transform'}}>
-              <tr>
-                <th style={{background:'var(--bg-3)',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600,position:'sticky',left:0,zIndex:6,width:UNIT_COL_W,minWidth:UNIT_COL_W,borderBottom:'1px solid var(--border-1)'}}>Unit</th>
-                {days.map(d => (
-                  <th key={d} style={{background:'var(--bg-3)',padding:'6px 2px',fontSize:'.6rem',color:d===today?'var(--gold)':'var(--text-3)',fontWeight:d===today?700:400,textAlign:'center',width:colW,minWidth:colW,maxWidth:colW,borderBottom:'1px solid var(--border-1)',borderLeft:'1px solid var(--border-1)'}}>
-                    <div>{new Date(d+'T12:00:00').toLocaleDateString('en-US',{month:'numeric',day:'numeric'})}</div>
-                  </th>
-                ))}
-              </tr>
-            </thead>
             <tbody>
               {/* S575: every row is a UNIFORM 88px. The only thing that made rows vary
                   was the sticky Unit cell's content — bookable units carry a "+ Book"
@@ -1477,36 +1535,6 @@ export function SchedulePage() {
                   truly hidden. */}
               {filteredUnits.map(unit => (
                 <tr key={unit.id} style={{height:56}}>
-                  {/* zIndex 3: must beat the day-cell bars (zIndex 1–2). When the grid
-                      is scrolled, past day-cells slide UNDER this sticky column — at
-                      zIndex 1 the bars painted over the unit info (S526 glitch). */}
-                  {/* S652 (Nic): the space number and nothing else — the property is
-                      chosen at the top of the page and the type is on the button
-                      color. Three lines per row made the grid scroll for no reason.
-                      zIndex 5: the long-stay bars and the floating names (2) slid
-                      over this column during a fast scroll. */}
-                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:5,height:56,boxSizing:'border-box',overflow:'hidden',
-                    // Its own layer, always: the browser keeps the pinned column painted
-                    // above the bars instead of deciding that mid-scroll.
-                    willChange:'transform'}}>
-                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,height:44,overflow:'hidden'}}>
-                      {/* S652 (Nic): "RV sites 11 and 17 display the number next to the
-                          RV moniker, and all the other RV sites display the number
-                          underneath... I want consistency." One line, always. */}
-                      <div style={{flexShrink:0}}>
-                        <div style={{fontWeight:700,fontSize:'.86rem',whiteSpace:'nowrap',color:TYPE_COLORS[unit.unitType]||'var(--text-0)'}} title={`${UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)} · ${unit.propertyName}`}>{unit.unitNumber}</div>
-                      </div>
-                      <div style={{display:'flex',gap:4,flexShrink:0}}>
-                        {unit.isBookable && can('schedule.create_reservation') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
-                        {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" title="Set up this space" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openTypeModal(unit)}>⚙</button>}
-                        {/* S652 (Nic): "the button should flip on a site that's marked
-                            out of order." Out today → the button puts it back. */}
-                        {can('schedule.configure_unit') && (oooFor(unit.id, today)
-                          ? <button className="btn btn-primary btn-sm" title="Out of order — put it back in service" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>setOooUnit(unit)}>↺</button>
-                          : <button className="btn btn-ghost btn-sm" title="Mark out of order" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>setOooUnit(unit)}>⛔</button>)}
-                      </div>
-                    </div>
-                  </td>
                   {days.map(d => {
                     const booking = getBookingForDate(unit.id, d)
                     const isBooked = !!booking
@@ -1708,13 +1736,13 @@ export function SchedulePage() {
                 </tr>
               ))}
               {filteredUnits.length===0 && (
-                <tr><td colSpan={days.length+1} style={{textAlign:'center',padding:48,color:'var(--text-3)'}}>No units found.</td></tr>
+                <tr><td colSpan={days.length} style={{textAlign:'left',padding:48,color:'var(--text-3)'}}>No units found.</td></tr>
               )}
             </tbody>
           </table>
           {/* S575: floating-name overlay (see the nameOverlays comment). Sits above
-              the bars (zIndex 2) but below the sticky Unit column + header (zIndex 3),
-              so a name sliding left disappears cleanly under the Unit column. */}
+              the bars, inside the timeline box — a name sliding left is cut off at
+              the box's edge, where the site column begins. */}
           <div aria-hidden style={{position:'absolute',top:0,left:0,zIndex:2,pointerEvents:'none'}}>
             {nameOverlays.filter(o => o.key !== dragging).map(o => (
               <div key={o.key} style={{position:'absolute',left:o.left,top:o.top,width:o.width,height:o.height,display:'flex',alignItems:'center',pointerEvents:'none'}}>
@@ -1723,6 +1751,8 @@ export function SchedulePage() {
                 </div>
               </div>
             ))}
+          </div>
+          </div>
           </div>
         </div>
         {/* S575: always-visible horizontal scrollbar hovering just above the legend
