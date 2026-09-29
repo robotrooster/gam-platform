@@ -72,6 +72,12 @@ function getDaysInRange(from: string, to: string) {
 // (check_in = "2026-06-20T00:00:00.000Z"); slicing keeps the date math (which
 // appends T12:00:00) from producing an Invalid Date.
 const dayOnly = (s: any) => String(s ?? '').slice(0, 10)
+// The sticky Unit column. ONE width, used by the header cell, the table, the
+// floating names and the keyboard pan — it was written as a bare 180/184 in
+// five places. 200 since S652: at 180 "RV 08" wrapped under the "RV" while
+// "RV 11" (narrower digits) did not, so two sites looked different for no reason.
+const UNIT_COL_W = 200
+const STICKY_LEFT = UNIT_COL_W + 4
 
 // W-22: which unit types rent by the stay (rates/min-stay/bookability apply).
 // Storage + commercial rent by lease only.
@@ -374,7 +380,7 @@ export function SchedulePage() {
     }
 
     // Pan horizontally — account for sticky unit column
-    const stickyWidth = 184
+    const stickyWidth = STICKY_LEFT
     const cellLeft = cell.offsetLeft
     const cellRight = cellLeft + cell.offsetWidth
     const visLeft = container.scrollLeft + stickyWidth
@@ -611,6 +617,11 @@ export function SchedulePage() {
     outOfOrder.find((o: any) => o.unitId === unitId && date >= o.startsOn && (!o.endsOn || date < o.endsOn))
   const oooOverlaps = (unitId: string, ci: string, co: string) =>
     outOfOrder.some((o: any) => o.unitId === unitId && o.startsOn < co && (!o.endsOn || o.endsOn > ci))
+  // S652 (Nic): "when you mark it back in service, have it still show that."
+  // Outages that are over — drawn, never blocking.
+  const outOfOrderHistory: any[] = schedule?.outOfOrderHistory || []
+  const oooPastFor = (unitId: string, date: string) =>
+    outOfOrderHistory.find((o: any) => o.unitId === unitId && date >= o.startsOn && date < o.endedOn)
   const [oooUnit, setOooUnit] = useState<any | null>(null)
   const days = getDaysInRange(fromDate, toDate)
 
@@ -923,8 +934,6 @@ export function SchedulePage() {
   // within its own bar (Nic's end-of-reservation case). The layer is
   // pointer-events:none, so every drag/resize/click on the bars underneath is
   // untouched. UNIT_COL_W matches the sticky Unit column; STICKY_LEFT is the pin.
-  const UNIT_COL_W = 180
-  const STICKY_LEFT = 184
   // Per-row geometry (offsetTop + height). Rows AREN'T a uniform height — unit
   // cells with more content run taller (e.g. 85px vs 72px) — so assuming a fixed
   // row height drifts lower-row names a full row high. Measure each row's actual
@@ -997,17 +1006,34 @@ export function SchedulePage() {
   // thumb scrolls the grid). thumb width/left are % of the full scrollWidth, so the
   // track maps 1:1 to the scrollable range.
   const hbarTrackRef = useRef<HTMLDivElement>(null)
-  const [hbar, setHbar] = useState({ thumbPct: 100, leftPct: 0, show: false })
+  // S652 (Nic): "when I scroll up or down really fast... it overlays those blue
+  // lines or the red lines straight across the RV site... it slightly renders in
+  // front of the RV spot until it realizes it needs to be behind it."
+  //
+  // The thumb's position used to live in React state, and it was set on EVERY
+  // scroll event — so every frame of a scroll re-rendered this whole page, all
+  // ~100 rows × every day column. The browser kept scrolling while that render
+  // was still running, and for those frames it had moved the bars but not yet
+  // re-pinned the Unit column over them. Now a scroll moves the thumb directly
+  // and renders nothing; state holds only whether the bar is shown at all.
+  const hbarThumbRef = useRef<HTMLDivElement>(null)
+  const hbarPos = useRef({ thumbPct: 100, leftPct: 0 })
+  const [hbar, setHbar] = useState({ show: false })
   const updateHbar = () => {
     const c = scrollContainerRef.current
     if (!c) return
     const { scrollWidth, clientWidth, scrollLeft } = c
     const show = scrollWidth > clientWidth + 1
-    setHbar({
-      show,
+    hbarPos.current = {
       thumbPct: show ? Math.max(5, (clientWidth / scrollWidth) * 100) : 100,
       leftPct:  show ? (scrollLeft / scrollWidth) * 100 : 0,
-    })
+    }
+    const thumb = hbarThumbRef.current
+    if (thumb) {
+      thumb.style.left = `${hbarPos.current.leftPct}%`
+      thumb.style.width = `${hbarPos.current.thumbPct}%`
+    }
+    setHbar(prev => prev.show === show ? prev : { show })
   }
   useEffect(() => {
     updateHbar()
@@ -1412,7 +1438,7 @@ export function SchedulePage() {
           style={{padding:0,position:'relative',overflowX:'auto',overflowY:'auto',overscrollBehavior:'contain',flex:1,minHeight:0,marginBottom:0,borderRadius:'12px 12px 0 0'}}
         >
           <table
-            style={{borderCollapse:'collapse',tableLayout:'fixed',width:180+days.length*colW}}
+            style={{borderCollapse:'collapse',tableLayout:'fixed',width:UNIT_COL_W+days.length*colW}}
             tabIndex={0}
             onKeyDown={e => {
               if (!selectedCell) return
@@ -1431,9 +1457,9 @@ export function SchedulePage() {
               if (e.key === 'Escape') setSelectedCell(null)
             }}
           >
-            <thead ref={theadRef} style={{position:'sticky',top:0,zIndex:3}}>
+            <thead ref={theadRef} style={{position:'sticky',top:0,zIndex:7,willChange:'transform'}}>
               <tr>
-                <th style={{background:'var(--bg-3)',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600,position:'sticky',left:0,zIndex:6,width:180,minWidth:180,borderBottom:'1px solid var(--border-1)'}}>Unit</th>
+                <th style={{background:'var(--bg-3)',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600,position:'sticky',left:0,zIndex:6,width:UNIT_COL_W,minWidth:UNIT_COL_W,borderBottom:'1px solid var(--border-1)'}}>Unit</th>
                 {days.map(d => (
                   <th key={d} style={{background:'var(--bg-3)',padding:'6px 2px',fontSize:'.6rem',color:d===today?'var(--gold)':'var(--text-3)',fontWeight:d===today?700:400,textAlign:'center',width:colW,minWidth:colW,maxWidth:colW,borderBottom:'1px solid var(--border-1)',borderLeft:'1px solid var(--border-1)'}}>
                     <div>{new Date(d+'T12:00:00').toLocaleDateString('en-US',{month:'numeric',day:'numeric'})}</div>
@@ -1459,15 +1485,25 @@ export function SchedulePage() {
                       color. Three lines per row made the grid scroll for no reason.
                       zIndex 5: the long-stay bars and the floating names (2) slid
                       over this column during a fast scroll. */}
-                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:5,height:56,boxSizing:'border-box',overflow:'hidden'}}>
+                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:5,height:56,boxSizing:'border-box',overflow:'hidden',
+                    // Its own layer, always: the browser keeps the pinned column painted
+                    // above the bars instead of deciding that mid-scroll.
+                    willChange:'transform'}}>
                     <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,height:44,overflow:'hidden'}}>
-                      <div style={{minWidth:0}}>
-                        <div style={{fontWeight:700,fontSize:'.86rem',color:TYPE_COLORS[unit.unitType]||'var(--text-0)'}} title={`${UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)} · ${unit.propertyName}`}>{unit.unitNumber}</div>
+                      {/* S652 (Nic): "RV sites 11 and 17 display the number next to the
+                          RV moniker, and all the other RV sites display the number
+                          underneath... I want consistency." One line, always. */}
+                      <div style={{flexShrink:0}}>
+                        <div style={{fontWeight:700,fontSize:'.86rem',whiteSpace:'nowrap',color:TYPE_COLORS[unit.unitType]||'var(--text-0)'}} title={`${UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)} · ${unit.propertyName}`}>{unit.unitNumber}</div>
                       </div>
-                      <div style={{display:'flex',gap:4}}>
+                      <div style={{display:'flex',gap:4,flexShrink:0}}>
                         {unit.isBookable && can('schedule.create_reservation') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
-                        {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openTypeModal(unit)}>⚙</button>}
-                        {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" title="Out of order" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>setOooUnit(unit)}>⛔</button>}
+                        {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" title="Set up this space" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openTypeModal(unit)}>⚙</button>}
+                        {/* S652 (Nic): "the button should flip on a site that's marked
+                            out of order." Out today → the button puts it back. */}
+                        {can('schedule.configure_unit') && (oooFor(unit.id, today)
+                          ? <button className="btn btn-primary btn-sm" title="Out of order — put it back in service" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>setOooUnit(unit)}>↺</button>
+                          : <button className="btn btn-ghost btn-sm" title="Mark out of order" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>setOooUnit(unit)}>⛔</button>)}
                       </div>
                     </div>
                   </td>
@@ -1652,6 +1688,14 @@ export function SchedulePage() {
                             <div title={`Out of order${oooFor(unit.id, d)?.reason ? ` — ${oooFor(unit.id, d)?.reason}` : ''}`}
                               style={{height:24, borderRadius:3, opacity:.55,
                                 background:'repeating-linear-gradient(45deg, var(--red) 0 4px, transparent 4px 9px)'}} />
+                          ) : oooPastFor(unit.id, d) ? (
+                            // S652: an outage that is over — same hazard stripe, faded,
+                            // so the calendar keeps the record of how long it was down.
+                            (() => { const h = oooPastFor(unit.id, d); return (
+                              <div title={`Was out of order ${fmtDate(h.startsOn)} – ${fmtDate(h.endedOn)} (${Number(h.daysOut) < 1 ? 'less than a day' : `${h.daysOut} day${Number(h.daysOut) === 1 ? '' : 's'}`})${h.reason ? ` — ${h.reason}` : ''}`}
+                                style={{height:24, borderRadius:3, opacity:.22,
+                                  background:'repeating-linear-gradient(45deg, var(--red) 0 4px, transparent 4px 9px)'}} />
+                            ) })()
                           ) : (
                           <div
                             style={{height:24, background: unit.isBookable ? 'transparent' : 'var(--bg-3)', borderRadius:3, opacity:.3}}
@@ -1692,9 +1736,10 @@ export function SchedulePage() {
             style={{position:'relative',height:16,background:'var(--bg-3)',borderTop:'1px solid var(--border-1)',cursor:'pointer',flexShrink:0}}
           >
             <div
+              ref={hbarThumbRef}
               onMouseDown={dragHbar}
               className="hbar-thumb"
-              style={{position:'absolute',top:3,bottom:3,left:`${hbar.leftPct}%`,width:`${hbar.thumbPct}%`,minWidth:32,background:'var(--text-3)',borderRadius:5,cursor:'grab'}}
+              style={{position:'absolute',top:3,bottom:3,left:`${hbarPos.current.leftPct}%`,width:`${hbarPos.current.thumbPct}%`,minWidth:32,background:'var(--text-3)',borderRadius:5,cursor:'grab'}}
             />
           </div>
         )}
@@ -1702,6 +1747,7 @@ export function SchedulePage() {
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--green)',borderRadius:2,marginRight:4}}/>Reservation (draggable)</span>
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--blue)',borderRadius:2,marginRight:4}}/>🔒 Lease (managed on Leases page)</span>
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--gold)',borderRadius:2,opacity:.3,marginRight:4}}/>Today</span>
+          <span><span style={{display:'inline-block',width:12,height:12,borderRadius:2,opacity:.6,marginRight:4,background:'repeating-linear-gradient(45deg, var(--red) 0 3px, transparent 3px 6px)'}}/>Out of order (faded = was out, now back)</span>
           <span><span style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:'var(--amber)',marginRight:4,verticalAlign:'middle'}}/>Ack pending</span>
           <span>· Double-click empty cell to book · Drag block to move · Drag an edge to extend/shorten</span>
         </div>

@@ -696,6 +696,22 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
   } catch (e) { next(e) }
 })
 
+// GET /api/reports/site-downtime?year=YYYY[&month=M] — S652 (Nic): "our average
+// RV sites, when they go down, they're down for a day or 10 days... another
+// metric to have in a reporting category somewhere." Same period rules as the
+// P&L beside it: outages that ENDED in the period. Out-right-now is as of today.
+reportsRouter.get('/site-downtime', requirePerm('payments.view_all'), async (req, res, next) => {
+  try {
+    const year  = parseInt(req.query.year as string)  || new Date().getFullYear()
+    const month = req.query.month ? parseInt(req.query.month as string) : null
+    const start = month ? `${year}-${String(month).padStart(2,'0')}-01` : `${year}-01-01`
+    const end   = month ? new Date(year, month, 0).toISOString().split('T')[0] : `${year}-12-31`
+    const { siteDowntimeReport } = await import('../services/outOfOrder')
+    const rows = await siteDowntimeReport(reportScope(req.user!), start, end)
+    res.json({ success: true, data: { year, month, period: { start, end }, rows } })
+  } catch (e) { next(e) }
+})
+
 // ── PER-PROPERTY DETAIL DRILL-IN ──────────────────────────────
 // GET /api/reports/property-detail?propertyId=UUID&year=YYYY[&month=M]
 // Backs the click-into-a-property drill-in on the By Property tab. Same

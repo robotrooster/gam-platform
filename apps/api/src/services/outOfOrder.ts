@@ -76,3 +76,66 @@ export async function alertStaysOnOutOfOrderSites(propertyId: string): Promise<n
   }
   return stuck.length
 }
+
+/**
+ * S652 (Nic): "When I mark it back in service, is it going to show a history of
+ * how long the site was out of order?... keep track of it on the back end so we
+ * can say, okay, our average RV sites, when they go down, they're down for a
+ * day or 10 days."
+ *
+ * Nothing is ever deleted from unit_out_of_order — putting a site back in
+ * service only stamps cleared_at — so the history was always there; nothing
+ * read it. An outage's real end is the EARLIER of its planned end and the day
+ * it was put back. One cancelled before it began was never an outage.
+ */
+export const OOO_EFFECTIVE_END_SQL = `LEAST(o.ends_on, (o.cleared_at AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date)`
+export const OOO_TODAY_SQL = `(NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date`
+
+export async function outOfOrderHistoryForUnit(unitId: string): Promise<any[]> {
+  return query<any>(
+    `SELECT o.id, to_char(o.starts_on, 'YYYY-MM-DD') AS starts_on,
+            to_char(${OOO_EFFECTIVE_END_SQL}, 'YYYY-MM-DD') AS ended_on,
+            (${OOO_EFFECTIVE_END_SQL} - o.starts_on) AS days_out,
+            o.reason, (o.cleared_at IS NOT NULL) AS put_back
+       FROM unit_out_of_order o
+       JOIN units u ON u.id = o.unit_id
+       JOIN properties p ON p.id = u.property_id
+      WHERE o.unit_id = $1
+        AND ${OOO_EFFECTIVE_END_SQL} IS NOT NULL
+        AND ${OOO_EFFECTIVE_END_SQL} >= o.starts_on
+        AND ${OOO_EFFECTIVE_END_SQL} <= ${OOO_TODAY_SQL}
+      ORDER BY o.starts_on DESC
+      LIMIT 50`, [unitId])
+}
+
+/**
+ * Downtime per property and kind of space: how many outages are over, how long
+ * they ran on average, the longest one, and how many spaces are out right now.
+ * The average is over FINISHED outages only — a site still out has no length
+ * yet, and twenty new sites waiting to be built would otherwise swamp it.
+ */
+export async function siteDowntimeReport(landlordIds: string[], from: string, to: string): Promise<any[]> {
+  return query<any>(
+    `WITH w AS (
+       SELECT u.property_id, p.name AS property_name, u.unit_type, o.unit_id, o.starts_on,
+              ${OOO_EFFECTIVE_END_SQL} AS ended_on,
+              ${OOO_TODAY_SQL} AS today
+         FROM unit_out_of_order o
+         JOIN units u ON u.id = o.unit_id
+         JOIN properties p ON p.id = u.property_id
+        WHERE u.landlord_id = ANY($1::uuid[])
+     )
+     SELECT property_id, property_name, unit_type,
+            COUNT(*) FILTER (WHERE ended_on IS NOT NULL AND ended_on >= starts_on AND ended_on <= today
+                               AND ended_on BETWEEN $2::date AND $3::date)::int AS finished,
+            ROUND(AVG(ended_on - starts_on) FILTER (WHERE ended_on IS NOT NULL AND ended_on >= starts_on AND ended_on <= today
+                               AND ended_on BETWEEN $2::date AND $3::date), 1)::float AS avg_days,
+            MAX(ended_on - starts_on) FILTER (WHERE ended_on IS NOT NULL AND ended_on >= starts_on AND ended_on <= today
+                               AND ended_on BETWEEN $2::date AND $3::date)::int AS longest_days,
+            COUNT(DISTINCT unit_id) FILTER (WHERE starts_on <= today AND (ended_on IS NULL OR ended_on > today))::int AS out_now,
+            MAX(today - starts_on) FILTER (WHERE starts_on <= today AND (ended_on IS NULL OR ended_on > today))::int AS longest_open_days
+       FROM w
+      GROUP BY 1, 2, 3
+     HAVING COUNT(*) FILTER (WHERE ended_on IS NULL OR ended_on >= starts_on) > 0
+      ORDER BY 2, 3`, [landlordIds, from, to])
+}

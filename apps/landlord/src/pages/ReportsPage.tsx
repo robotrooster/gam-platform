@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
-import { humanize, EXPENSE_CATEGORY_LABEL } from '@gam/shared'
+import { humanize, EXPENSE_CATEGORY_LABEL, UNIT_TYPE_LABEL } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X, Printer, Download } from 'lucide-react'
@@ -425,7 +425,53 @@ function ByPropertyTab() {
           )}
         </div>
       </div>
+      <SiteDowntimeCard year={year} month={month} periodLabel={periodLabel} />
       {openProp && <PropertyDetailModal propertyId={openProp.id} name={openProp.name} year={year} month={month} onClose={() => setOpenProp(null)} />}
+    </div>
+  )
+}
+
+// S652 (Nic): "our average RV sites, when they go down, they're down for a day
+// or 10 days or whatever. Just another fancy little metric to have in a
+// reporting category somewhere." Finished outages in the period, by property
+// and kind of space. Hidden until a site has ever been marked out of order.
+function SiteDowntimeCard({ year, month, periodLabel }: { year: number; month: number | null; periodLabel: string }) {
+  const qs = `year=${year}${month ? `&month=${month}` : ''}`
+  const { data } = useQuery<any>(['site-downtime', year, month], () => apiGet(`/reports/site-downtime?${qs}`))
+  const rows: any[] = data?.rows ?? []
+  if (!rows.length) return null
+  const days = (n: any) => n == null ? '—' : Number(n) < 1 ? 'under a day' : `${n} day${Number(n) === 1 ? '' : 's'}`
+  return (
+    <div className="card">
+      <div className="card-header">
+        <span className="card-title">Site downtime — {periodLabel}</span>
+        <span className="no-print" style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Outages that ended in this period. Out now is as of today.</span>
+      </div>
+      <div style={{ padding: '4px 0 12px' }}>
+        <table className="data-table">
+          <thead><tr>
+            <th>Property</th><th>Kind of space</th>
+            <th style={{ textAlign: 'center' }}>Outages finished</th>
+            <th style={{ textAlign: 'center' }}>Average time down</th>
+            <th style={{ textAlign: 'center' }}>Longest</th>
+            <th style={{ textAlign: 'center' }}>Out right now</th>
+            <th style={{ textAlign: 'center' }}>Longest still out</th>
+          </tr></thead>
+          <tbody>
+            {rows.map((r: any) => (
+              <tr key={`${r.propertyId}-${r.unitType}`}>
+                <td style={{ color: 'var(--text-0)', fontWeight: 600 }}>{r.propertyName}</td>
+                <td>{(UNIT_TYPE_LABEL as Record<string, string>)[r.unitType] ?? humanize(r.unitType)}</td>
+                <td className="mono" style={{ textAlign: 'center' }}>{r.finished}</td>
+                <td className="mono" style={{ textAlign: 'center' }}>{r.finished ? days(r.avgDays) : '—'}</td>
+                <td className="mono" style={{ textAlign: 'center' }}>{r.finished ? days(r.longestDays) : '—'}</td>
+                <td className="mono" style={{ textAlign: 'center', color: r.outNow > 0 ? 'var(--red)' : 'var(--text-3)' }}>{r.outNow}</td>
+                <td className="mono" style={{ textAlign: 'center' }}>{r.outNow > 0 ? days(r.longestOpenDays) : '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }

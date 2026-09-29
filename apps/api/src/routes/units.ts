@@ -846,7 +846,15 @@ unitsRouter.get('/:id/out-of-order', async (req, res, next) => {
       `SELECT id, to_char(starts_on, 'YYYY-MM-DD') AS starts_on, to_char(ends_on, 'YYYY-MM-DD') AS ends_on,
               reason, created_at
          FROM unit_out_of_order WHERE unit_id = $1 AND cleared_at IS NULL
+          AND (ends_on IS NULL OR ends_on > CURRENT_DATE)
         ORDER BY starts_on`, [req.params.id])
+    // S652: ?history=1 adds the outages that are over. The plain list stays
+    // what it was — open windows only — because that is what the agent and the
+    // "back in service" button act on.
+    if (req.query.history === '1') {
+      const { outOfOrderHistoryForUnit } = await import('../services/outOfOrder')
+      return res.json({ success: true, data: { open: rows, history: await outOfOrderHistoryForUnit(req.params.id) } })
+    }
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -2315,7 +2323,27 @@ unitsRouter.get('/schedule/master', requirePerm(
          AND ($5::uuid IS NULL OR u.property_id = $5)`,
       [callerLandlordIds, fromDate, toDate, scopedIds, oneProperty])
 
-    res.json({ success: true, data: { units, bookings, leases, outOfOrder, range: { from: fromDate, to: toDate } } })
+    // S652 (Nic): "when you mark it back in service, have it still show that."
+    // The outages that were put back in service, drawn as what they were: time
+    // the site was down. ended_on is the day it came back (exclusive, like
+    // ends_on), and a site down and back the same day still shows that day.
+    // These block nothing — only the open windows above do.
+    const { OOO_EFFECTIVE_END_SQL } = await import('../services/outOfOrder')
+    const outOfOrderHistory = await query<any>(`
+      SELECT o.id, o.unit_id, to_char(o.starts_on, 'YYYY-MM-DD') AS starts_on,
+             to_char(GREATEST(${OOO_EFFECTIVE_END_SQL}, o.starts_on + 1), 'YYYY-MM-DD') AS ended_on,
+             (${OOO_EFFECTIVE_END_SQL} - o.starts_on) AS days_out, o.reason
+        FROM unit_out_of_order o
+        JOIN units u ON u.id = o.unit_id
+        JOIN properties p ON p.id = u.property_id
+       WHERE u.landlord_id = ANY($1::uuid[]) AND o.cleared_at IS NOT NULL
+         AND ${OOO_EFFECTIVE_END_SQL} >= o.starts_on
+         AND GREATEST(${OOO_EFFECTIVE_END_SQL}, o.starts_on + 1) > $2 AND o.starts_on <= $3
+         AND ($4::uuid[] IS NULL OR u.property_id = ANY($4::uuid[]))
+         AND ($5::uuid IS NULL OR u.property_id = $5)`,
+      [callerLandlordIds, fromDate, toDate, scopedIds, oneProperty])
+
+    res.json({ success: true, data: { units, bookings, leases, outOfOrder, outOfOrderHistory, range: { from: fromDate, to: toDate } } })
   } catch (e) { next(e) }
 })
 
