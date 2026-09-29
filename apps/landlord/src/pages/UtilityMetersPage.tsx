@@ -989,6 +989,13 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
   useEffect(() => {
     if (ppg === '' && propaneRate != null) setPpg(String(Number(propaneRate)))
   }, [propaneRate])
+  // S652 (Nic): "I just need to put the gallons. The rate is already set. So why
+  // would I put the price per gallon on the supplier's bill? Unless we're
+  // keeping track of our profit margin." Exactly that, and only if he wants to:
+  // the supplier's invoice is optional and changes nothing a tenant is charged.
+  const [supplierOpen, setSupplierOpen] = useState(false)
+  const [invoiceTotal, setInvoiceTotal] = useState('')
+  const [invoiceGallons, setInvoiceGallons] = useState('')
   const [gallonsBy, setGallonsBy] = useState<Record<string, string>>({})
   // S609: what each unit still owes on EARLIER fills. Recording a new fill
   // ACCELERATES that balance — every unbilled installment becomes due at once
@@ -1030,9 +1037,12 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
   const splitOpts = allowSplits && lines.length ? propaneSplitOptions(smallest, splitMin, splitFourMin) : [1]
   useEffect(() => { if (!splitOpts.includes(installments)) setInstallments(1) }, [totalGallons, allowSplits, smallest])
 
+  const supplierCost = Number(invoiceTotal) > 0 && Number(invoiceGallons) > 0 ? Number(invoiceTotal) / Number(invoiceGallons) : null
+  const margin = supplierCost != null ? Math.round((Number(ppg) - supplierCost) * totalGallons * 100) / 100 : null
   const mut = useMutation(
     () => apiPost('/propane/deliveries', {
       ...(fee > 0 ? { deliveryCharge: fee, deliveryChargeSplit: feeSplit } : {}),
+      ...(supplierCost != null ? { invoiceTotal: Number(invoiceTotal), invoiceGallons: Number(invoiceGallons) } : {}),
       propertyId, pricePerGallon: Number(ppg), installments, lines, clientKey,
     }),
     { onSuccess: onClose,
@@ -1046,17 +1056,42 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
       <div className="modal" style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
         <div className="modal-title">Record propane delivery</div>
         <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
-          Straight off the delivery invoice: the price once, then the gallons that went into each
-          tank. Leave a unit blank if it wasn&apos;t filled.
+          Type the gallons that went into each tank. Leave a unit blank if it wasn&apos;t filled.
         </div>
 
         <div style={{ marginBottom: 12 }}>
-          <label style={lbl}>Price per gallon (from the invoice)</label>
-          <input className="input" type="number" step="0.001" value={ppg} autoFocus
-            onChange={e => setPpg(e.target.value)} placeholder="e.g. 3.25" style={{ width: 140 }} />
-          {propaneRate != null && (
-            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 4 }}>
-              Prefilled from this property&apos;s propane rate. Change it if this delivery was priced differently.
+          <label style={lbl}>What tenants pay per gallon</label>
+          <input className="input" type="number" step="0.001" value={ppg}
+            onChange={e => setPpg(e.target.value)} placeholder="e.g. 2.25" style={{ width: 140 }} />
+          <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 4 }}>
+            {propaneRate != null
+              ? <>This property&apos;s propane rate. It&apos;s already set — change it only if this delivery is priced differently.</>
+              : <>No propane rate is set for this property yet. Set one under Rates and it fills in here.</>}
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          {!supplierOpen ? (
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setSupplierOpen(true)}>
+              + Track what it cost you (optional)
+            </button>
+          ) : (
+            <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--bg-2)', border: '1px solid var(--border-1)' }}>
+              <div style={{ fontSize: '.74rem', color: 'var(--text-2)', marginBottom: 8 }}>
+                From the supplier&apos;s invoice. Only for your own margin — it changes nothing a tenant is charged.
+              </div>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                <div><label style={lbl}>Invoice total</label>
+                  <input className="input" type="number" step="0.01" value={invoiceTotal} onChange={e => setInvoiceTotal(e.target.value)} placeholder="e.g. 925.00" style={{ width: 130 }} /></div>
+                <div><label style={lbl}>Gallons delivered</label>
+                  <input className="input" type="number" step="0.1" value={invoiceGallons} onChange={e => setInvoiceGallons(e.target.value)} placeholder="e.g. 500" style={{ width: 130 }} /></div>
+                {supplierCost != null && (
+                  <div style={{ fontSize: '.78rem', color: 'var(--text-1)' }}>
+                    Cost <strong className="mono">${supplierCost.toFixed(3)}</strong>/gal
+                    {margin != null && totalGallons > 0 && <> · margin on this delivery <strong className="mono" style={{ color: margin >= 0 ? 'var(--green)' : 'var(--red)' }}>{fmt(margin)}</strong></>}
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -1384,6 +1419,7 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
         <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', marginBottom: 12 }}>
           {stat('Billed to tenants', fmt(t.recovered))}
           {stat('Tenants have paid', fmt(t.collected), 'var(--green)')}
+          {t.workTrade > 0 && stat('Covered by work trade', fmt(t.workTrade), undefined, 'worked off, not owed')}
           {stat('Tenants still owe', fmt(t.stillOwed), t.stillOwed > 0 ? 'var(--gold)' : undefined)}
           {stat('The utility charged you', t.spent > 0 ? fmt(t.spent) : '—', undefined, t.spent > 0 ? undefined : 'none recorded yet')}
           {t.notRecovered != null && stat('Charged but never billed', fmt(Math.max(0, t.notRecovered)), t.notRecovered > 0 ? 'var(--gold)' : undefined)}
@@ -1395,6 +1431,7 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
               <th style={{ textAlign: 'left', padding: '4px 0' }}>Utility</th>
               <th style={th}>Billed to tenants</th>
               <th style={th}>Paid</th>
+              {t.workTrade > 0 && <th style={th}>Work trade</th>}
               <th style={th}>Still owed</th>
               <th style={th}>Utility charged you</th>
               <th style={th}>Never billed</th>
@@ -1409,6 +1446,7 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
                 </td>
                 <td className="mono" style={th}>{l.recovered ? fmt(l.recovered) : '—'}</td>
                 <td className="mono" style={{ ...th, color: 'var(--green)' }}>{l.collected ? fmt(l.collected) : '—'}</td>
+                {t.workTrade > 0 && <td className="mono" style={th}>{l.workTrade ? fmt(l.workTrade) : '—'}</td>}
                 <td className="mono" style={{ ...th, color: l.stillOwed > 0 ? 'var(--gold)' : undefined }}>{l.stillOwed ? fmt(l.stillOwed) : '—'}</td>
                 <td className="mono" style={th}>{l.spent ? fmt(l.spent) : '—'}</td>
                 <td className="mono" style={{ ...th, color: (l.notRecovered ?? 0) > 0 ? 'var(--gold)' : undefined }}>
@@ -1419,7 +1457,8 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
           </tbody>
         </table>
         <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.6 }}>
-          &ldquo;The utility charged you&rdquo; comes from what you record under <strong>Expenses → Utilities</strong> for
+          &ldquo;Billed to tenants&rdquo; counts utility bills on invoices and utility lines sent on a pay link or rung
+          up at the register. &ldquo;The utility charged you&rdquo; comes from what you record under <strong>Expenses → Utilities</strong> for
           this property. Until a bill is recorded there, the last two columns show a dash — there is nothing to
           compare against. &ldquo;Never billed&rdquo; is common areas, stays with utilities in the rate, vacancies, and
           anything a lease doesn&apos;t pass through.

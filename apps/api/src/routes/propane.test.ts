@@ -702,6 +702,30 @@ describe('S632 true cost + property markup', () => {
     expect(res.body.data.unallocatedGallons).toBe(800)
   })
 
+  // S652 (Nic): "I just need to put the gallons. The rate is already set…
+  // we're getting it for about a dollar eighty to a dollar ninety a gallon, and
+  // we're charging the tenants two twenty-five."
+  it('a set price bills at the set price; the supplier invoice only records the margin', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const unitId = await unitWithTank(f)
+    const res = await request(app).post('/api/propane/deliveries')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, pricePerGallon: 2.25,
+              invoiceTotal: 925, invoiceGallons: 500,
+              installments: 1, lines: [{ unitId, gallons: 100 }] })
+    expect(res.status).toBe(201)
+    expect(res.body.data.billedPerGallon).toBe(2.25)
+    expect(res.body.data.totalAmount).toBe(225)          // 100 × $2.25, not cost-plus
+    expect(res.body.data.trueCostPerGallon).toBe(1.85)
+    expect(res.body.data.margin).toBe(40)                // 100 × (2.25 − 1.85)
+    const { rows: [fill] } = await db.query<any>(
+      `SELECT price_per_gallon, true_cost_per_gallon, markup_per_gallon FROM propane_fills WHERE unit_id = $1`, [unitId])
+    expect(Number(fill.price_per_gallon)).toBe(2.25)
+    expect(Number(fill.true_cost_per_gallon)).toBe(1.85)
+    expect(Number(fill.markup_per_gallon)).toBeCloseTo(0.40, 4)
+  })
+
   it('keeps full precision on a rate that does not divide cleanly', async () => {
     const f = await seed()
     const app = buildApp()

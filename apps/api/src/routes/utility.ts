@@ -883,6 +883,21 @@ utilityRouter.delete('/meters/:id/units/:unitId', requirePerm('properties.edit')
   } catch (e) { next(e) }
 })
 
+// Which metered utility a register / pay-link line is, or NULL when it is not
+// one. The register has no utility column — a line is utility billed back when
+// it sits in the Utilities category AND names a metered utility. Propane there
+// is the pump price, a retail sale, and deliberately matches nothing.
+function registerUtilityType(catExpr: string, nameExpr: string): string {
+  return `SELECT CASE
+            WHEN COALESCE(${catExpr}, '') NOT ILIKE 'utilit%' THEN NULL
+            WHEN ${nameExpr} ~* '\\melectric' THEN 'electric'
+            WHEN ${nameExpr} ~* '\\mwater'    THEN 'water'
+            WHEN ${nameExpr} ~* '\\msewer'    THEN 'sewer'
+            WHEN ${nameExpr} ~* '\\m(trash|garbage)' THEN 'trash'
+            WHEN ${nameExpr} ~* '\\mgas\\M' THEN 'gas'
+          END AS utility_type`
+}
+
 // GET /api/utility/recovery?propertyId=&from=&to= — S613 (Nic).
 //
 // "Unbilled utility tracking would just be the difference between an owner
@@ -926,16 +941,73 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       -- how much of what was billed had actually been PAID. Billed excludes
       -- void; collected is what tenants paid; the gap only exists where the
       -- property recorded what the utility charged it.
-      recovered AS (
+      --
+      -- S652 (Nic): "He is on a work trade. It's unpaid because of a work
+      -- trade." A charge the work trade covers is not money a tenant owes — it
+      -- is being worked off. It gets its own column: parked under the agreement
+      -- while the hours are worked, or closed by the work-trade credit at month
+      -- end. Neither one is "paid" and neither one is "still owed".
+      --
+      -- S652 (Nic): "It needs to count the 387 kilowatts for $81.27 as still
+      -- outstanding. It's billed back and not paid." A tenant with no lease is
+      -- billed his meter on a PAY LINK — Andres Razo, leaving, got a link
+      -- instead of a lease. That is utility billed back exactly like a bill
+      -- on an invoice, so it is counted the same: an open link is still owed,
+      -- and a utility line rung up and paid (a paid link is a register sale)
+      -- is paid. Only lines in the register's Utilities category that name a
+      -- metered utility count — propane at the pump is a retail sale.
+      billed AS (
         SELECT ub.utility_type,
-               SUM(ub.charge_amount + COALESCE(ub.tax_amount, 0))::numeric AS amount,
-               SUM(ub.charge_amount + COALESCE(ub.tax_amount, 0)) FILTER (WHERE ub.status = 'paid')::numeric AS collected
+               (ub.charge_amount + COALESCE(ub.tax_amount, 0))::numeric AS amount,
+               CASE WHEN wt.covered THEN 'work_trade'
+                    WHEN ub.status = 'paid' THEN 'paid'
+                    ELSE 'owed' END AS bucket
           FROM utility_bills ub
           JOIN units u ON u.id = ub.unit_id
+          LEFT JOIN payments pay ON pay.id = ub.payment_id
+          CROSS JOIN LATERAL (
+            SELECT COALESCE(
+              (pay.status = 'pending' AND pay.work_trade_suspended_at IS NOT NULL)
+              OR (pay.status = 'settled' AND pay.amount = 0 AND pay.notes ILIKE '%work-trade credit%'),
+              false) AS covered
+          ) wt
          WHERE u.property_id = $1
            AND ub.status <> 'void'
            AND ub.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
                                           AND date_trunc('month', $3::date)::date
+        UNION ALL
+        SELECT k.utility_type,
+               ROUND((it->>'qty')::numeric * (it->>'price')::numeric
+                     * (1 + COALESCE((it->>'tax')::numeric, 0)), 2) AS amount,
+               'owed' AS bucket
+          FROM pos_pay_links l
+          CROSS JOIN LATERAL jsonb_array_elements(l.items) it
+          CROSS JOIN LATERAL (${registerUtilityType(`it->>'cat'`, `it->>'name'`)}) k
+         WHERE l.property_id = $1
+           AND l.kind = 'one_time' AND l.status = 'open'
+           AND (l.expires_at IS NULL OR l.expires_at > NOW())
+           AND k.utility_type IS NOT NULL
+           AND date_trunc('month', l.created_at)::date BETWEEN date_trunc('month', $2::date)::date
+                                                           AND date_trunc('month', $3::date)::date
+        UNION ALL
+        SELECT k.utility_type,
+               ROUND(ti.subtotal * (1 + COALESCE(ti.tax_rate, 0)), 2) AS amount,
+               'paid' AS bucket
+          FROM pos_transaction_items ti
+          JOIN pos_transactions t ON t.id = ti.transaction_id
+          CROSS JOIN LATERAL (${registerUtilityType('ti.item_category', 'ti.item_name')}) k
+         WHERE t.property_id = $1
+           AND t.status = 'completed'
+           AND k.utility_type IS NOT NULL
+           AND date_trunc('month', t.created_at)::date BETWEEN date_trunc('month', $2::date)::date
+                                                           AND date_trunc('month', $3::date)::date
+      ),
+      recovered AS (
+        SELECT b.utility_type,
+               SUM(b.amount)::numeric AS amount,
+               SUM(b.amount) FILTER (WHERE b.bucket = 'work_trade')::numeric AS work_trade,
+               SUM(b.amount) FILTER (WHERE b.bucket = 'paid')::numeric AS collected
+          FROM billed b
          GROUP BY 1
       ),
       owner_use AS (
@@ -951,6 +1023,7 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
              COALESCE(s.amount, 0)::float  AS spent,
              COALESCE(r.amount, 0)::float  AS recovered,
              COALESCE(r.collected, 0)::float AS collected,
+             COALESCE(r.work_trade, 0)::float AS work_trade,
              COALESCE(o.amount, 0)::float  AS owner_occupied
         FROM (SELECT utility_type FROM spent
               UNION SELECT utility_type FROM recovered
@@ -966,7 +1039,8 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       spent: Number(r.spent),
       recovered: Number(r.recovered),
       collected: Number(r.collected),
-      stillOwed: Math.round((Number(r.recovered) - Number(r.collected)) * 100) / 100,
+      workTrade: Number(r.work_trade),
+      stillOwed: Math.round((Number(r.recovered) - Number(r.collected) - Number(r.work_trade)) * 100) / 100,
       ownerOccupied: Number(r.owner_occupied),
       // Only meaningful where the landlord recorded what he SPENT. Without the
       // bill on the expense side there is nothing to subtract from, so this
@@ -975,7 +1049,7 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
         ? Math.round((Number(r.spent) - Number(r.recovered)) * 100) / 100
         : null,
     }))
-    const sum = (k: 'spent' | 'recovered' | 'collected' | 'stillOwed' | 'ownerOccupied') =>
+    const sum = (k: 'spent' | 'recovered' | 'collected' | 'workTrade' | 'stillOwed' | 'ownerOccupied') =>
       Math.round(lines.reduce((n: number, l: any) => n + l[k], 0) * 100) / 100
     // The gap is only a number where a spend was recorded — summed over those
     // utilities alone, so a utility with no bill entered cannot make the
@@ -984,7 +1058,7 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
     res.json({ success: true, data: {
       from, to, lines,
       totals: {
-        spent: sum('spent'), recovered: sum('recovered'), collected: sum('collected'), stillOwed: sum('stillOwed'),
+        spent: sum('spent'), recovered: sum('recovered'), collected: sum('collected'), workTrade: sum('workTrade'), stillOwed: sum('stillOwed'),
         ownerOccupied: sum('ownerOccupied'),
         notRecovered: measured.length
           ? Math.round(measured.reduce((n: number, l: any) => n + l.notRecovered, 0) * 100) / 100

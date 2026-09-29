@@ -345,7 +345,13 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
       // Full precision on purpose — rounding the rate here loses real money
       // across a large delivery. The per-fill totals round to the cent.
       trueCost = body.invoiceTotal / body.invoiceGallons
-      billedRate = trueCost + markup
+      // S652 (Nic): "The rate is already set… we're getting it for about a
+      // dollar eighty to a dollar ninety a gallon, and we're charging the
+      // tenants two twenty-five." A property with a SET price charges that
+      // price; the supplier's invoice is recorded beside it only so the margin
+      // is known. Cost-plus (cost + the property's markup) remains for a
+      // delivery that names no price.
+      billedRate = body.pricePerGallon != null ? body.pricePerGallon : trueCost + markup
     } else if (body.pricePerGallon != null) {
       billedRate = body.pricePerGallon
     } else {
@@ -409,7 +415,7 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
           gallons: p.gallons, pricePerGallon: billedRate,
           deliveryFeeShare: feeShares[i],
           trueCostPerGallon: trueCost,
-          markupPerGallon: trueCost != null ? markup : null,
+          markupPerGallon: trueCost != null ? Math.round((billedRate - trueCost) * 10000) / 10000 : null,
           invoiceTotal: body.invoiceTotal ?? null,
           invoiceGallons: body.invoiceGallons ?? null,
           installments: body.installments, createdByUserId: req.user!.userId,
@@ -429,9 +435,9 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
         totalAmount: Math.round(fills.reduce((s, f) => s + Number(f.total_amount), 0) * 100) / 100,
         // S632: the margin, stated rather than inferred.
         trueCostPerGallon: trueCost != null ? Math.round(trueCost * 10000) / 10000 : null,
-        markupPerGallon: trueCost != null ? markup : null,
+        markupPerGallon: trueCost != null ? Math.round((billedRate - trueCost) * 10000) / 10000 : null,
         billedPerGallon: Math.round(billedRate * 10000) / 10000,
-        margin: trueCost != null ? Math.round(markup * allocated * 100) / 100 : null,
+        margin: trueCost != null ? Math.round((billedRate - trueCost) * allocated * 100) / 100 : null,
         // Gallons on the invoice that were NOT put on a tank — the park's own
         // usage, or a line missed. Surfaced because it is the number that
         // silently eats a margin.

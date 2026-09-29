@@ -207,5 +207,79 @@ describe('GET /api/utility/recovery (S613)', () => {
     expect((await status()).status).toBe('billed')
     expect((await status()).paid_at).toBeNull()
   })
+
+  // S652 (Nic): "It needs to count the 387 kilowatts for $81.27 as still
+  // outstanding. It's billed back and not paid." Andres Razo had no lease — his
+  // meter was billed on a pay link.
+  it('electric billed on a pay link is billed back: owed while the link is open, paid once it is rung up', async () => {
+    const f = await seed()
+    const items = [
+      { id: null, cat: 'Stays', name: 'RV site — monthly', qty: 1, price: 589, tax: 0 },
+      { id: null, cat: 'Utilities', name: 'Electric (per kWh)', qty: 387, price: 0.21, tax: 0 },
+      { id: null, cat: 'Utilities', name: 'Propane', qty: 10, price: 3.30, tax: 0 },   // pump sale, not a bill-back
+    ]
+    const { rows: [link] } = await db.query<any>(
+      `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items,
+                                  subtotal, total, customer_name, customer_email, created_at)
+       VALUES ('tok-recovery-1', $1, $2, $3, 'one_time', '3 items', $4::jsonb, 703.27, 703.27,
+               'Andres Razo', 'razo@example.com', '2026-09-18') RETURNING id`,
+      [f.landlordId, f.propertyId, f.userId, JSON.stringify(items)])
+    const get = async () => (await request(buildApp())
+      .get(`/api/utility/recovery?propertyId=${f.propertyId}&from=2026-01-01&to=2026-12-31`)
+      .set('Authorization', `Bearer ${f.token}`)).body.data
+
+    let d = await get()
+    expect(d.lines.map((l: any) => l.utilityType)).toEqual(['electric'])
+    expect(d.totals).toMatchObject({ recovered: 81.27, collected: 0, workTrade: 0, stillOwed: 81.27 })
+
+    // he pays the link: the link closes and the sale is on the register — once
+    const { rows: [tx] } = await db.query<any>(
+      `INSERT INTO pos_transactions (landlord_id, property_id, cashier_id, payment_method, subtotal, total, status, pay_link_id, created_at)
+       VALUES ($1, $2, $3, 'card', 703.27, 703.27, 'completed', $4, '2026-09-30') RETURNING id`,
+      [f.landlordId, f.propertyId, f.userId, link.id])
+    await db.query(
+      `INSERT INTO pos_transaction_items (transaction_id, item_name, item_category, qty, unit_price, subtotal)
+       VALUES ($1,'RV site — monthly','Stays',1,589,589),
+              ($1,'Electric (per kWh)','Utilities',387,0.21,81.27),
+              ($1,'Propane','Utilities',10,3.30,33.00)`, [tx.id])
+    await db.query(`UPDATE pos_pay_links SET status='paid', paid_at=NOW(), pos_transaction_id=$1 WHERE id=$2`, [tx.id, link.id])
+    d = await get()
+    expect(d.totals).toMatchObject({ recovered: 81.27, collected: 81.27, stillOwed: 0 })
+  })
+
+  // S652 (Nic): "He is on a work trade. It's unpaid because of a work trade."
+  // Matthew Conklin's August electric was reported as money a tenant owed.
+  it('a charge the work trade covers is worked off — never "still owed", never "paid"', async () => {
+    const f = await seed()
+    const { rows: [meter] } = await db.query<any>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, rubs_allocation_method)
+       VALUES ($1,'electric','E','rubs',0,'occupant_count') RETURNING id`, [f.propertyId])
+    const charge = async (month: string, amount: number, suspended: boolean) => {
+      const { rows: [pay] } = await db.query<any>(
+        `INSERT INTO payments (landlord_id, tenant_id, unit_id, lease_id, type, amount, status, due_date, entry_description, work_trade_suspended_at)
+         VALUES ($1,$2,$3,$4,'utility',$5,'pending','2026-09-01','UTILITY',$6) RETURNING id`,
+        [f.landlordId, f.tenantId, f.unitId, f.leaseId, amount, suspended ? new Date().toISOString() : null])
+      await db.query(
+        `INSERT INTO utility_bills (meter_id, unit_id, tenant_id, lease_id, landlord_id,
+                                    billing_cycle_month, allocation_method, rate_per_unit,
+                                    base_fee_share, charge_amount, tax_rate_pct, tax_amount, utility_type, status, payment_id)
+         VALUES ($1,$2,$3,$4,$5,$6,'equal',0,0,$7,0,0,'electric','billed',$8)`,
+        [meter.id, f.unitId, f.tenantId, f.leaseId, f.landlordId, month, amount, pay.id])
+      return pay.id as string
+    }
+    const covered = await charge('2026-08-01', 187.11, true)
+    await charge('2026-07-01', 40, false)
+    const get = async () => (await request(buildApp())
+      .get(`/api/utility/recovery?propertyId=${f.propertyId}&from=2026-01-01&to=2026-12-31`)
+      .set('Authorization', `Bearer ${f.token}`)).body.data.totals
+
+    expect(await get()).toMatchObject({ recovered: 227.11, collected: 0, workTrade: 187.11, stillOwed: 40 })
+
+    // month close: the hours were worked, the charge is closed by the credit
+    await db.query(
+      `UPDATE payments SET amount = 0, status = 'settled', settled_at = NOW(), work_trade_suspended_at = NULL,
+              notes = 'Covered by work-trade credit' WHERE id = $1`, [covered])
+    expect(await get()).toMatchObject({ recovered: 227.11, collected: 0, workTrade: 187.11, stillOwed: 40 })
+  })
 })
 
