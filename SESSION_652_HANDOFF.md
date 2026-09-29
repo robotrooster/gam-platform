@@ -1073,3 +1073,19 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 - Verified live: Mountain View reads billed $1,619.52 / paid $1,351.14 / work trade $187.11 / owed $81.27.
 
 **Open with Nic:** only MH 01, MH 02, MH 04 are marked as having a propane tank at Mountain View — the delivery screen only offers marked spaces. He is to say which others were filled.
+
+## Deploy 83 (2026-09-29) — out-of-order history, new Mountain View sites, calendar fixes
+
+**Data (live):** Mountain View RV 54–73 created through the API, all out of order ("New site — being built out"), each with an electric submeter at the property rate. Nic confirmed: BACK-IN, 30 AND 50 amp at completion (out of order because pedestals are being upgraded 30 → 50). Set via POST /units/subtype. Rates $589/$269/$49, deposit $200.
+
+**Shipped:**
+- `unit_out_of_order` history is now read: master schedule returns `outOfOrderHistory` (cleared windows; block nothing), drawn as faded hazard stripes. `GET /units/:id/out-of-order?history=1` returns `{ open, history }`; the plain list is unchanged (agents use it) except naturally-ended windows no longer list.
+- `GET /reports/site-downtime` + "Site downtime" card on Reports → By Property. Average is over FINISHED outages only.
+- Schedule row button flips (gold ↺) when the site is out today; OutOfOrderModal opens on "Put back in service" with past outages listed.
+- Unit column is one constant (`UNIT_COL_W` 200): labels never wrap (RV 08 wrapped, RV 11 did not).
+- Scroll: the horizontal-scrollbar thumb was React state set on every scroll event, re-rendering the whole grid per frame. Now moved by ref, no render. Sticky unit cells + thead `will-change: transform`; thead z-index 3 → 7 (unit cells at 5 were painting over the header).
+- Tests: `services/outOfOrder.test.ts` (6).
+
+**Not proven:** scroll smoothness was measured on demo (12 units, steady 60fps, zero DOM changes during scroll). Mountain View has 99 rows — Nic is to confirm by eye.
+
+**Demo DB:** gam_demo was 42 migrations behind (landlord sign-in 401 on demo). Migrated to 20260929120000.
