@@ -1089,3 +1089,11 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 **Not proven:** scroll smoothness was measured on demo (12 units, steady 60fps, zero DOM changes during scroll). Mountain View has 99 rows — Nic is to confirm by eye.
 
 **Demo DB:** gam_demo was 42 migrations behind (landlord sign-in 401 on demo). Migrated to 20260929120000.
+
+## Deploy 84 (2026-09-29) — schedule: site column beside the timeline
+
+Nic still saw bars/stripes flash across the site numbers on fast vertical scroll after deploy 83. Cause is draw TIMING, not stacking: a sticky column is its own layer, drawn separately from the rows under it. z-index (S526, S652) and will-change (deploy 83) could not fix it.
+
+`SchedulePage.tsx` timeline is now two boxes: `vScrollRef` (up/down; carries the date header, the site column and the timeline) and `scrollContainerRef` (the timeline only; sideways; clips at the column's edge). Date header strip is slid sideways by transform in `updateHbar`. Site-column rows take the measured height of their timeline row (`rowGeom`). Sideways wheel over the column/header is forwarded to the timeline. `STICKY_LEFT` is now 4 (pin for floating names inside the timeline).
+
+Verified on demo grown to 100 sites (scratch rows removed after): 0 timeline elements over the column across 120 scroll positions, row alignment exact, header within 0.5px, double-click booking works. NOT measured: frame rate (Browser pane was hidden; rAF stalls). Known trade: date header may trail by a frame on a fast sideways scroll.
