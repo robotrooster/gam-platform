@@ -1926,6 +1926,25 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
          ON CONFLICT (tenant_id, unit_id) WHERE cancelled_at IS NULL AND unit_id IS NOT NULL
          DO UPDATE SET resolved_at = NULL, accepted_at = NULL, draft_document_id = NULL, updated_at = NOW()`,
         [inviteLandlordId, tenantId, unitId, inviterPropertyId ?? null])
+      // S647/S652: the lease drafts NOW, the way the onboarding page's invite
+      // does, so the household lands in "Waiting on you to sign" the moment it
+      // is invited — not at the next hourly sweep. Best-effort: a template
+      // problem must not undo the invite; the sweep and acceptance retry it.
+      const draftClient = await getClient()
+      try {
+        await draftClient.query('BEGIN')
+        const { autoDraftLeasesForUnit } = await import('../services/leaseOnboarding')
+        const { createDocumentRecord, autoSendDraftedDocument } = await import('./esign')
+        const out = await autoDraftLeasesForUnit(draftClient as any, unitId, createDocumentRecord)
+        await draftClient.query('COMMIT')
+        for (const docId of out.draftedDocumentIds) {
+          await autoSendDraftedDocument(docId).catch(err =>
+            logger.error({ err, docId }, '[INVITE] auto-send after draft failed'))
+        }
+      } catch (draftErr) {
+        await draftClient.query('ROLLBACK').catch(() => {})
+        logger.warn({ err: draftErr, unitId }, '[INVITE] lease did not draft at invite — the sweep will retry')
+      } finally { draftClient.release() }
     }
 
     if (propertyId && !unitId && tenantId) {

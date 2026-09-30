@@ -454,6 +454,56 @@ posPayLinksRouter.get('/', requirePerm('pos.ring_sale'), async (req, res, next) 
 })
 
 // POST /api/pos/pay-links/:id/cancel
+// PATCH /api/pos/pay-links/:id — S652 (Nic): "does it let you edit the ticket
+// or pay link, or once the link is sent is it fixed to those items? ...if we
+// need to do last minute prorations or adjustments, the functionality of the
+// front counter person needs to be there." An OPEN one-time link can have its
+// lines changed until it is paid: a final electric read, the extra days
+// somebody stayed, a correction. Same link, same address; the person just sees
+// the new total. A checkout the payer already started at the old amount is
+// closed at Stripe first, so the old figure can never be paid.
+posPayLinksRouter.patch('/:id', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      items: z.array(itemSchema).min(1).max(60),
+      discountAmount: z.number().min(0).optional(),
+      label: z.string().max(120).optional(),
+    }).parse(req.body)
+    const link = await queryOne<any>(`SELECT * FROM pos_pay_links WHERE id = $1`, [req.params.id])
+    if (!link) throw new AppError(404, 'No such pay link')
+    if (!canManageLandlordResource(req.user, link.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, link.property_id)
+    if (link.kind !== 'one_time') throw new AppError(400, 'A standing link has no lines to edit.')
+    if (link.status !== 'open') throw new AppError(409, 'This link has already been paid or closed.')
+
+    const totals = await computeCartTotals(link.landlord_id, body.items as any[], {
+      surcharge: 0, discountAmount: body.discountAmount ?? Number(link.discount_amount) ?? 0,
+    })
+    if (!(Number(totals.total) > 0)) throw new AppError(400, 'Nothing to charge — the total is $0.')
+
+    // The payer may have a card page open at the OLD amount. Close it.
+    if (link.last_checkout_session_id) {
+      try {
+        const { expirePayLinkCheckoutSession } = await import('../services/stripeConnect')
+        await expirePayLinkCheckoutSession(link.landlord_id, link.last_checkout_session_id)
+      } catch (e) {
+        logger.warn({ err: e, payLinkId: link.id }, '[pay-link] could not close the old checkout — it may already be gone')
+      }
+    }
+    const label = body.label?.trim()
+      || (body.items.length === 1 ? body.items[0].name : `${body.items.length} items`)
+    const updated = await queryOne<any>(
+      `UPDATE pos_pay_links
+          SET items = $2::jsonb, subtotal = $3, tax_amount = $4, discount_amount = $5, total = $6,
+              label = $7, last_checkout_session_id = NULL, updated_at = NOW()
+        WHERE id = $1 AND status = 'open' RETURNING *`,
+      [link.id, JSON.stringify(body.items), totals.subtotal, totals.taxAmount, totals.discount, totals.total, label.slice(0, 120)])
+    if (!updated) throw new AppError(409, 'This link was paid a moment ago.')
+    const { customerFee, charged } = payLinkCharge(Number(updated.total), payerOf(updated))
+    res.json({ success: true, data: { ...updated, url: payLinkUrl(updated.token), card_fee: customerFee, charged } })
+  } catch (e) { next(e) }
+})
+
 posPayLinksRouter.post('/:id/cancel', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const link = await queryOne<any>(`SELECT * FROM pos_pay_links WHERE id = $1`, [req.params.id])

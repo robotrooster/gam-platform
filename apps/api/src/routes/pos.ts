@@ -901,8 +901,15 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         `SELECT * FROM pos_pay_links WHERE id = $1 AND landlord_id = $2`, [payLinkId, posLandlordId(req)])
       if (!payLink) throw new AppError(404, 'No such pay link')
       if (payLink.status !== 'open') throw new AppError(409, 'That pay link has already been paid or closed.')
-      items = payLink.items
-      discountAmount = Number(payLink.discount_amount) || 0
+      // S652 (Nic): "if we need to do last minute prorations or adjustments,
+      // the functionality of the front counter person needs to be there." The
+      // cart the cashier settles is what is charged — the link's lines loaded
+      // into it, plus whatever they added or changed standing there. An empty
+      // cart falls back to the link as sent.
+      if (!Array.isArray(items) || items.length === 0) {
+        items = payLink.items
+        discountAmount = Number(payLink.discount_amount) || 0
+      }
     }
     if (!Array.isArray(items) || items.length === 0) {
       throw new AppError(400, 'items array required')
@@ -994,7 +1001,8 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     }
 
     // A pay link's stay was arranged when the link was made; its line is a
-    // plain amount here, not a booking to place.
+    // plain amount here, not a booking to place. (The cashier's cart for a
+    // link is charged as sent, stay lines included, at the prices on it.)
     const stayLines = payLink ? [] : await resolveStayLines(posLandlordId(req), items,
       stay?.unitId ?? (ticketBookingId
         ? (await queryOne<{ unit_id: string }>(

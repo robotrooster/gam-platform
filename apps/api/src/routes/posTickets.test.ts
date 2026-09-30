@@ -342,14 +342,19 @@ describe('an emailed pay link on the open list', () => {
     expect(row.note).toMatch(/Emailed pay link/)
   })
 
-  it('settled at the register, the link is paid and the sale points at it — even with a stay line on it', async () => {
+  it('settled at the register, the link is paid and the sale points at it — cashier adjustments included, stay line and all', async () => {
     const f = await seed()
     const link = await mkLink(f)
+    // The cashier loads the link and adds two more nights the person stayed.
     const res = await request(buildApp()).post('/api/pos/transactions').set('Authorization', `Bearer ${f.token}`)
-      .send({ items: [{ id: f.itemId, name: 'anything — the link is the bill', qty: 1, price: 1 }],
+      .send({ items: [
+                { id: f.stayItemId, name: 'RV site — nightly', qty: 1, price: 589, tax: 0 },
+                { id: f.itemId, name: 'Propane (per gal)', qty: 18.4, price: 3.30, tax: 0 },
+                { id: f.stayItemId, name: 'Extra nights — Oct 1–2', qty: 2, price: 49, tax: 0 },
+              ],
               paymentMethod: 'cash', propertyId: f.propertyId, payLinkId: link })
     expect(res.status, JSON.stringify(res.body)).toBe(201)
-    expect(Number(res.body.data.total)).toBeCloseTo(649.72, 2)
+    expect(Number(res.body.data.total)).toBeCloseTo(747.72, 2)   // 649.72 + 2 × 49
     const [l] = await query<any>(`SELECT status, pos_transaction_id FROM pos_pay_links WHERE id = $1`, [link])
     expect(l.status).toBe('paid')
     expect(l.pos_transaction_id).toBe(res.body.data.id)
@@ -361,5 +366,39 @@ describe('an emailed pay link on the open list', () => {
     const again = await request(buildApp()).post('/api/pos/transactions').set('Authorization', `Bearer ${f.token}`)
       .send({ items: [{ id: f.itemId, qty: 1, price: 1 }], paymentMethod: 'cash', propertyId: f.propertyId, payLinkId: link })
     expect(again.status).toBe(409)
+  })
+
+  it('an empty cart settles the link exactly as it was sent', async () => {
+    const f = await seed()
+    const link = await mkLink(f)
+    const res = await request(buildApp()).post('/api/pos/transactions').set('Authorization', `Bearer ${f.token}`)
+      .send({ items: [], paymentMethod: 'cash', propertyId: f.propertyId, payLinkId: link })
+    expect(res.status, JSON.stringify(res.body)).toBe(201)
+    expect(Number(res.body.data.total)).toBeCloseTo(649.72, 2)
+  })
+
+  // S652 (Nic): "once the link is sent is it fixed to those items?" No.
+  it('an open link can be adjusted before it is paid; the person sees the new total', async () => {
+    const f = await seed()
+    const link = await mkLink(f)
+    const { posPayLinksRouter } = await import('./posPayLinks')
+    const app = express(); app.use(express.json()); app.use('/api/pos/pay-links', posPayLinksRouter); app.use(errorHandler)
+    const res = await request(app).patch(`/api/pos/pay-links/${link}`).set('Authorization', `Bearer ${f.token}`)
+      .send({ items: [
+        { id: f.stayItemId, name: 'RV site — nightly', qty: 1, price: 589, tax: 0 },
+        { id: f.itemId, name: 'Propane (per gal)', qty: 18.4, price: 3.30, tax: 0 },
+        { id: f.itemId, name: 'Final electric — RV 27 (110 kWh)', qty: 110, price: 0.21, tax: 0 },
+      ] })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(Number(res.body.data.total)).toBeCloseTo(672.82, 2)   // 649.72 + 23.10
+    expect(res.body.data.label).toBe('3 items')
+    const [row] = await query<any>(`SELECT total, jsonb_array_length(items) AS n FROM pos_pay_links WHERE id = $1`, [link])
+    expect(Number(row.total)).toBeCloseTo(672.82, 2)
+    expect(Number(row.n)).toBe(3)
+    // Paid links are fixed.
+    await query(`UPDATE pos_pay_links SET status = 'paid', paid_at = NOW() WHERE id = $1`, [link])
+    const locked = await request(app).patch(`/api/pos/pay-links/${link}`).set('Authorization', `Bearer ${f.token}`)
+      .send({ items: [{ id: f.itemId, name: 'x', qty: 1, price: 1 }] })
+    expect(locked.status).toBe(409)
   })
 })

@@ -1024,6 +1024,19 @@ export async function createBookingDepositCheckoutSession(
  * weekly batch, GAM keeps the card fee the customer paid on top. A standing
  * link (the dump-station QR) asks the payer's name, since nobody entered it.
  */
+/**
+ * S652: an open pay link was edited. Close any card page the payer already has
+ * at the old amount, so the only amount that can be paid is the current one.
+ * Missing or already-closed sessions are not errors.
+ */
+export async function expirePayLinkCheckoutSession(_landlordId: string, sessionId: string): Promise<void> {
+  // Pay-link checkouts are made on the platform account (platform-held), so
+  // they are closed there too.
+  const stripe = getStripe()
+  const s = await stripe.checkout.sessions.retrieve(sessionId)
+  if (s.status === 'open') await stripe.checkout.sessions.expire(sessionId)
+}
+
 export async function createPayLinkCheckoutSession(opts: {
   lineItems: Array<{ name: string; amountCents: number }>
   customerEmail?: string | null

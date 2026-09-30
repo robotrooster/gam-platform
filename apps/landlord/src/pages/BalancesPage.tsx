@@ -1,6 +1,6 @@
 import { Fragment, useState } from 'react'
-import { useQuery } from 'react-query'
-import { apiGet, apiPost } from '../lib/api'
+import { useQuery, useQueryClient } from 'react-query'
+import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { PropertySelect } from '../components/ListControls'
 
 // Front-desk "who owes" view. Read-only list of tenants with an unpaid balance
@@ -51,24 +51,78 @@ function TicketBreakdown({ ticket }: { ticket?: Owed['ticket'] }) {
 }
 
 // S649: what an open pay link is for, with the two ways to chase it.
+// S652 (Nic): "if we need to do last minute prorations or adjustments, the
+// functionality of the front counter person needs to be there." Adjust changes
+// the lines on the open link — a final electric read, the extra days somebody
+// stayed — and the person sees the new total at the same address.
+type LinkLine = { id?: string | null; cat?: string; name: string; qty: number; price: number; tax?: number }
 function PayLinkBreakdown({ id, link }: { id: string; link?: Owed['payLink'] }) {
+  const qc = useQueryClient()
   const [msg, setMsg] = useState<string | null>(null)
+  const [editing, setEditing] = useState(false)
+  const [lines, setLines] = useState<LinkLine[]>([])
+  const [saving, setSaving] = useState(false)
   const resend = async () => {
     try { await apiPost(`/pos/pay-links/${id}/resend`, {}); setMsg('Sent again.') }
     catch (e: any) { setMsg(e?.response?.data?.error || 'Could not send it again.') }
   }
+  const startEdit = () => {
+    setLines(((link?.items || []) as any[]).map(it => ({ ...it, qty: Number(it.qty), price: Number(it.price) })))
+    setEditing(true); setMsg(null)
+  }
+  const total = lines.reduce((t, l) => t + (Number(l.qty) || 0) * (Number(l.price) || 0), 0)
+  const save = async () => {
+    const clean = lines.filter(l => l.name.trim() && Number(l.qty) > 0)
+    if (!clean.length) { setMsg('Keep at least one line.'); return }
+    setSaving(true)
+    try {
+      await apiPatch(`/pos/pay-links/${id}`, { items: clean.map(l => ({ ...l, name: l.name.trim(), qty: Number(l.qty), price: Number(l.price) || 0, tax: Number(l.tax) || 0 })) })
+      setEditing(false); setMsg('Updated — the same link now shows the new total.')
+      qc.invalidateQueries('outstanding-balances')
+    } catch (e: any) { setMsg(e?.response?.data?.error || e?.message || 'Could not update the link.') }
+    finally { setSaving(false) }
+  }
+  const setLine = (i: number, patch: Partial<LinkLine>) => setLines(ls => ls.map((l, idx) => idx === i ? { ...l, ...patch } : l))
   return (
     <div style={{ padding: '10px 16px 14px 32px' }}>
       <div style={{ fontSize: '.8rem', color: 'var(--text-2)', marginBottom: 6 }}>{link?.label}</div>
-      {(link?.items || []).map((it, i) => (
+      {!editing ? (link?.items || []).map((it, i) => (
         <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.8rem', maxWidth: 420 }}>
           <span>{it.name}{Number(it.qty) !== 1 ? ` × ${it.qty}` : ''}</span>
           <span className="mono">{fmt(Number(it.price) * Number(it.qty))}</span>
         </div>
-      ))}
-      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', margin: '6px 0 10px' }}>Card fee is added when they pay by card.</div>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-        <button className="btn btn-primary btn-sm" onClick={resend}>Send again</button>
+      )) : (
+        <div style={{ display: 'grid', gap: 6, maxWidth: 560 }}>
+          {lines.map((l, i) => (
+            <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 80px 100px 90px 28px', gap: 6, alignItems: 'center' }}>
+              <input className="input" value={l.name} onChange={e => setLine(i, { name: e.target.value })} placeholder="What it is" style={{ fontSize: '.8rem' }} />
+              <input className="input mono" type="number" step="any" value={l.qty} onChange={e => setLine(i, { qty: Number(e.target.value) })} placeholder="qty" style={{ fontSize: '.8rem' }} />
+              <input className="input mono" type="number" step="0.01" value={l.price} onChange={e => setLine(i, { price: Number(e.target.value) })} placeholder="each" style={{ fontSize: '.8rem' }} />
+              <span className="mono" style={{ fontSize: '.8rem', textAlign: 'right' }}>{fmt((Number(l.qty) || 0) * (Number(l.price) || 0))}</span>
+              <button type="button" className="btn btn-ghost btn-sm" title="Remove this line" style={{ padding: '1px 6px' }} onClick={() => setLines(ls => ls.filter((_, idx) => idx !== i))}>✕</button>
+            </div>
+          ))}
+          <div>
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => setLines(ls => [...ls, { id: null, name: '', qty: 1, price: 0, tax: 0 }])}>+ Add a line</button>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.85rem', fontWeight: 700, borderTop: '1px solid var(--border-1)', paddingTop: 6 }}>
+            <span>New total</span><span className="mono" style={{ color: 'var(--gold)' }}>{fmt(total)}</span>
+          </div>
+        </div>
+      )}
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', margin: '6px 0 10px' }}>Card fee is added when they pay by card. They can also settle it at the register from its open list.</div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        {editing ? (
+          <>
+            <button className="btn btn-primary btn-sm" disabled={saving} onClick={save}>{saving ? 'Saving…' : 'Save changes'}</button>
+            <button className="btn btn-ghost btn-sm" disabled={saving} onClick={() => setEditing(false)}>Cancel</button>
+          </>
+        ) : (
+          <>
+            <button className="btn btn-primary btn-sm" onClick={startEdit}>Adjust</button>
+            <button className="btn btn-primary btn-sm" onClick={resend}>Send again</button>
+          </>
+        )}
         {msg && <span style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>{msg}</span>}
       </div>
     </div>
