@@ -71,6 +71,9 @@ const DELIBERATE = new Map(Object.entries({
     'writes down the day a household said they are pulling out, which ends their lease that day: the space opens on the schedule, the final read is asked for that morning, the closing utility invoice and deposit return follow. A misheard "Saturday" vacates somebody who is not leaving. Done at the desk, face to face, with the calendar on screen.',
   'leases DELETE /:id/leaving':
     'calls off a leaving date and puts the lease back as it was. Done from the same screen, where the desk can see whether anyone has since been booked behind them.',
+  // ── S653: how much paid-ahead credit a month may use ───────────────────────
+  'leases PATCH /:id/prepaid-draw':
+    'sets how much of a resident\'s paid-ahead money each month\'s bill may use — a number that changes what they are asked to pay every month from here on. Set on the lease with the credit balance on screen, by the landlord or the desk, when the resident asks for it.',
   // ── S641: the filing cabinet ───────────────────────────────────────────────
   'documents PUT /:id/properties':
     'pins a document to the properties it applies to. The mistake this guards against is exactly a mis-pin — Nic: "assigned parking spots in one place and that gets sent to a property that doesn\'t have that, and then it\'s just generating confusion" — and property names spoken aloud is where that mistake happens. Ticked on a screen that lists every park.',

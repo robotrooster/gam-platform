@@ -302,7 +302,9 @@ leasesRouter.get('/', async (req, res, next) => {
           -- is why the setting lives on its own tenant-owned table and no
           -- landlord route writes to it. Do not add one.
           ap.enabled AS autopay_enabled,
-          ap.pull_day AS autopay_pull_day
+          ap.pull_day AS autopay_pull_day,
+          -- S653: money the resident paid ahead, for the monthly-draw control.
+          COALESCE((SELECT SUM(c.amount_remaining) FROM lease_prepaid_credits c WHERE c.lease_id = l.id AND c.amount_remaining > 0), 0) AS prepaid_credit_remaining
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -2006,6 +2008,34 @@ async function leaseInScope(req: any, leaseId: string) {
   if (scoped && !scoped.includes(lease.property_id)) throw new AppError(403, 'That resident is at a property you do not work at')
   return lease
 }
+
+// ── S653 (Nic): A MONTHLY DRAW ON PAID-AHEAD CREDIT ────────────────────────
+//
+//   "she prepays ahead of time with her tax return but she likes part of the
+//    tax return to be credited on her bill each month so she still pays a
+//    little bit out of pocket each month... use only a dedicated amount of the
+//    credit each month."
+//
+// One number on the lease: the most credit a billing month may use. Null
+// clears it (the credit covers whole bills as it always has). Read by the
+// invoice run, the tenant's Pay Now and the desk alike (services/prepaidRelease).
+leasesRouter.patch('/:id/prepaid-draw', requirePerm('leases.edit', 'take_payment', 'front_desk.mark_leaving'), async (req: any, res, next) => {
+  try {
+    const body = z.object({ monthlyDraw: z.number().positive().max(100000).nullable() }).parse(req.body)
+    const lease = await queryOne<{ id: string; landlord_id: string; status: string }>(
+      'SELECT id, landlord_id, status FROM leases WHERE id = $1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE leases SET prepaid_monthly_draw = $2, updated_at = NOW() WHERE id = $1`,
+      [lease.id, body.monthlyDraw == null ? null : body.monthlyDraw.toFixed(2)])
+    const { prepaidDrawAvailable } = await import('../services/prepaidRelease')
+    const { db } = await import('../db')
+    const month = new Date().toISOString().slice(0, 7) + '-01'
+    const draw = await prepaidDrawAvailable(db as any, lease.id, month).catch(() => null)
+    logger.info({ leaseId: lease.id, monthlyDraw: body.monthlyDraw, by: req.user!.userId }, '[lease] prepaid monthly draw set')
+    res.json({ success: true, data: { leaseId: lease.id, monthlyDraw: body.monthlyDraw, credit: draw } })
+  } catch (e) { next(e) }
+})
 
 /** POST /api/leases/:id/leaving { on, note? } — record the day they said. */
 leasesRouter.post('/:id/leaving', requirePerm(...LEAVING_PERMS), async (req: any, res, next) => {

@@ -113,7 +113,7 @@ describe('the tag on a money box decides what the money is', () => {
     // everything else on the invoice paid, so nothing sweeps
     await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE lease_id=$1 AND status='pending'`, [s.leaseId])
     await db.query(`UPDATE leases SET status='expired', end_date='2026-12-31' WHERE id=$1`, [s.leaseId])
-    const calc = await calculateDepositReturn(s.leaseId)
+    const calc = (await calculateDepositReturn(s.leaseId))!
     expect(calc.total_deposit).toBe(650)          // 500 security + 150 pet deposit
     expect(calc.prepaid_credit_remaining).toBe(1200) // the unspent pre-payment is the renter's too
     expect(calc.refund_amount).toBe(650 + 1200)
@@ -124,7 +124,7 @@ describe('the tag on a money box decides what the money is', () => {
     await moveIn(s)
     await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE lease_id=$1 AND lease_fee_id IS DISTINCT FROM $2`, [s.leaseId, s.petDepositFee])
     await db.query(`UPDATE leases SET status='expired', end_date='2026-12-31' WHERE id=$1`, [s.leaseId])
-    const calc = await calculateDepositReturn(s.leaseId)
+    const calc = (await calculateDepositReturn(s.leaseId))!
     expect(calc.total_deposit).toBe(0)
   })
 })

@@ -2,7 +2,7 @@ import { useState, useEffect, Fragment } from 'react'
 import type React from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate, Link } from 'react-router-dom'
-import { apiGet, apiPost } from '../lib/api'
+import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, ArrowRight } from 'lucide-react'
 import { LEASE_TYPE_LABEL, LeaseStatus, humanize } from '@gam/shared'
 import { ChevronDown, ChevronRight } from 'lucide-react'
@@ -53,6 +53,8 @@ export function LeasesPage() {
   const [moveLease, setMoveLease] = useState<any | null>(null)
   // S653: "they're leaving on…" — a desk mark, never on the document.
   const [leavingLease, setLeavingLease] = useState<LeavingLease | null>(null)
+  // S653: how much paid-ahead credit a month may use.
+  const [drawLease, setDrawLease] = useState<any | null>(null)
   // S581: money add-on / notice modal (recurring charge or rent change that
   // reaches billing on a landlord-set date).
   const [addonLease, setAddonLease] = useState<any | null>(null)
@@ -487,6 +489,9 @@ export function LeasesPage() {
                             ...(can('leases.edit') && l.status === 'active' ? [
                               { label: 'Move to another space', hint: 'Same lease, same rent, same terms', onClick: () => setMoveLease(l) },
                             ] : []),
+                            ...((can('leases.edit') || can('take_payment')) && l.status === 'active' ? [
+                              { label: 'Credit draw per month…', hint: l.prepaidMonthlyDraw ? `Uses ${fmt(l.prepaidMonthlyDraw)} of their paid-ahead money each month` : 'How much paid-ahead money each bill may use', onClick: () => setDrawLease(l) },
+                            ] : []),
                             ...(can('leases.deposit_return') ? [
                               { label: 'Move out', hint: 'Move-out and deposit return', onClick: () => navigate(`/leases/${l.id}/deposit-return`) },
                             ] : []),
@@ -544,6 +549,9 @@ export function LeasesPage() {
       )}
       {leavingLease && (
         <LeavingModal lease={leavingLease} onClose={() => setLeavingLease(null)} />
+      )}
+      {drawLease && (
+        <PrepaidDrawModal lease={drawLease} onClose={() => setDrawLease(null)} />
       )}
       {chargeLease && (
         <OneOffChargeModal
@@ -1355,6 +1363,67 @@ function toLeaving(l: any, tenantName: string): LeavingLease {
     moveOutNoticeAt: l.moveOutNoticeAt ?? null, moveOutNoticeNote: l.moveOutNoticeNote ?? null,
     moveOutNoticePrevEndDate: l.moveOutNoticePrevEndDate ? String(l.moveOutNoticePrevEndDate).slice(0, 10) : null,
   }
+}
+
+// ── S653 (Nic): A MONTHLY DRAW ON PAID-AHEAD CREDIT ─────────────────────────
+// "she likes part of the tax return to be credited on her bill each month so
+// she still pays a little bit out of pocket each month." One number: the most
+// of their paid-ahead money each month's bill may use. Cleared = the credit
+// covers whole bills until it runs out.
+function PrepaidDrawModal({ lease, onClose }: { lease: any; onClose: () => void }) {
+  const qc = useQueryClient()
+  const [amount, setAmount] = useState<string>(lease.prepaidMonthlyDraw ? String(Number(lease.prepaidMonthlyDraw)) : '')
+  const [error, setError] = useState('')
+  const credit = Number(lease.prepaidCreditRemaining || 0)
+  const save = useMutation(
+    (monthlyDraw: number | null) => apiPatch(`/leases/${lease.id}/prepaid-draw`, { monthlyDraw }),
+    {
+      onSuccess: (_d, monthlyDraw) => {
+        qc.invalidateQueries('leases')
+        toast(monthlyDraw ? `Each month's bill will use up to ${fmt(monthlyDraw)} of their paid-ahead money.` : 'Their paid-ahead money now covers whole bills until it runs out.')
+        onClose()
+      },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Could not save that.'),
+    })
+  const n = Number(amount)
+  const valid = amount.trim() !== '' && Number.isFinite(n) && n > 0
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <span className="modal-title" style={{ marginBottom: 0 }}>Credit draw per month</span>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={14} /></button>
+        </div>
+        <div style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 10 }}>
+          <strong>{lease.unitNumber}</strong>{lease.propertyName ? <span style={{ color: 'var(--text-3)' }}> · {lease.propertyName}</span> : null}
+          <div style={{ marginTop: 6 }}>Paid ahead on account: <strong style={{ color: 'var(--gold)' }}>{fmt(credit)}</strong></div>
+        </div>
+        <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.5, marginBottom: 12 }}>
+          Left blank, their paid-ahead money covers each bill in full until it runs out. Enter an amount and each month's bill uses only that much of it — they pay the rest themselves, online or at the desk.
+        </div>
+        <label style={{ display: 'block', fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 12 }}>
+          Use per month
+          <input className="input" type="number" min="1" step="1" value={amount} placeholder="e.g. 200"
+            onChange={e => setAmount(e.target.value)} style={{ display: 'block', marginTop: 4, width: '100%' }} />
+        </label>
+        {valid && credit > 0 && (
+          <div style={{ fontSize: '.76rem', color: 'var(--text-2)', marginBottom: 12 }}>
+            At {fmt(n)} a month, {fmt(credit)} lasts about {Math.ceil(credit / n)} month{Math.ceil(credit / n) === 1 ? '' : 's'}.
+          </div>
+        )}
+        {error && <div style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'rgba(239,68,68,.08)', border: '1px solid rgba(239,68,68,.3)', color: 'var(--red)', fontSize: '.78rem' }}>{error}</div>}
+        <div className="modal-footer" style={{ display: 'flex', gap: 8 }}>
+          {lease.prepaidMonthlyDraw && (
+            <button className="btn btn-ghost" disabled={save.isLoading} onClick={() => save.mutate(null)}>Use it all as needed</button>
+          )}
+          <button className="btn btn-ghost" style={{ marginLeft: 'auto' }} onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!valid || save.isLoading} onClick={() => save.mutate(Math.round(n * 100) / 100)}>
+            {save.isLoading ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // A small menu button for the leases table: one button, a list of actions.

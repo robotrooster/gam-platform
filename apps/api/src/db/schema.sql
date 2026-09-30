@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict zof1yxzpCl3vaZi1mokFdf7MTp1z3k13t9xfeiQcYdq4yA2OoMcPG1bb1lu3c2m
+\restrict nuSS312v5h5hU6SEMDTKKEloFo6QdsinX8Bb2wfnjGKUrAGQN7RPmmiwB1Vo6ce
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4557,7 +4557,7 @@ CREATE TABLE public.held_payout_items (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT held_payout_items_amount_check CHECK ((amount <> (0)::numeric)),
     CONSTRAINT held_payout_items_one_payee CHECK (((landlord_id IS NULL) <> (business_id IS NULL))),
-    CONSTRAINT held_payout_items_source_type_check CHECK ((source_type = ANY (ARRAY['pos_sale'::text, 'booking_deposit'::text, 'business_invoice_payment'::text, 'business_pos_sale'::text, 'refund'::text, 'dispute'::text, 'platform_fee'::text])))
+    CONSTRAINT held_payout_items_source_type_check CHECK ((source_type = ANY (ARRAY['pos_sale'::text, 'booking_deposit'::text, 'business_invoice_payment'::text, 'business_pos_sale'::text, 'refund'::text, 'dispute'::text, 'platform_fee'::text, 'prepaid_draw'::text])))
 );
 
 
@@ -5624,6 +5624,29 @@ CREATE TABLE public.lease_pets (
 
 
 --
+-- Name: lease_prepaid_credit_draws; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_prepaid_credit_draws (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    lease_id uuid NOT NULL,
+    credit_id uuid,
+    payment_id uuid,
+    amount numeric(12,2) NOT NULL,
+    billing_month date NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT lease_prepaid_credit_draws_amount_check CHECK ((amount > (0)::numeric))
+);
+
+
+--
+-- Name: TABLE lease_prepaid_credit_draws; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.lease_prepaid_credit_draws IS 'S653: each draw of paid-ahead credit, by billing month — the monthly cap is measured here.';
+
+
+--
 -- Name: lease_prepaid_credits; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6014,6 +6037,7 @@ CREATE TABLE public.leases (
     move_out_notice_by uuid,
     move_out_notice_note text,
     move_out_notice_prev_end_date date,
+    prepaid_monthly_draw numeric(12,2),
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
     CONSTRAINT leases_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
@@ -6024,6 +6048,7 @@ CREATE TABLE public.leases (
     CONSTRAINT leases_lease_source_check CHECK ((lease_source = ANY (ARRAY['esigned'::text, 'imported'::text, 'booking_draft'::text, 'application_draft'::text]))),
     CONSTRAINT leases_lease_type_check CHECK ((lease_type = ANY (ARRAY['month_to_month'::text, 'fixed_term'::text, 'nnn_commercial'::text]))),
     CONSTRAINT leases_move_in_amounts_nonneg CHECK (((COALESCE(move_in_first_month_rent, (0)::numeric) >= (0)::numeric) AND (COALESCE(move_in_proration, (0)::numeric) >= (0)::numeric))),
+    CONSTRAINT leases_prepaid_monthly_draw_check CHECK (((prepaid_monthly_draw IS NULL) OR (prepaid_monthly_draw > (0)::numeric))),
     CONSTRAINT leases_rent_due_day_range CHECK (((rent_due_day IS NULL) OR ((rent_due_day >= 1) AND (rent_due_day <= 28)))),
     CONSTRAINT leases_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'expired'::text, 'terminated'::text]))),
     CONSTRAINT leases_subleasing_allowed_check CHECK ((subleasing_allowed = ANY (ARRAY['prohibited'::text, 'with_consent'::text, 'allowed'::text]))),
@@ -6064,6 +6089,13 @@ COMMENT ON COLUMN public.leases.move_out_notice_at IS 'S653: when the front desk
 --
 
 COMMENT ON COLUMN public.leases.move_out_notice_prev_end_date IS 'S653: what end_date was before the notice (NULL for month-to-month), restored if the notice is called off.';
+
+
+--
+-- Name: COLUMN leases.prepaid_monthly_draw; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.leases.prepaid_monthly_draw IS 'S653: the most paid-ahead credit one billing month may use; NULL = no cap. The resident pays the rest of each bill themselves.';
 
 
 --
@@ -13257,6 +13289,14 @@ ALTER TABLE ONLY public.lease_pets
 
 
 --
+-- Name: lease_prepaid_credit_draws lease_prepaid_credit_draws_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credit_draws
+    ADD CONSTRAINT lease_prepaid_credit_draws_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: lease_prepaid_credits lease_prepaid_credits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -19579,6 +19619,13 @@ CREATE UNIQUE INDEX landlords_stripe_connect_account_id_uniq ON public.landlords
 
 
 --
+-- Name: lease_prepaid_credit_draws_lease_month_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_prepaid_credit_draws_lease_month_idx ON public.lease_prepaid_credit_draws USING btree (lease_id, billing_month);
+
+
+--
 -- Name: lease_prepaid_credits_source_payment_uidx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -24396,6 +24443,30 @@ ALTER TABLE ONLY public.lease_pets
 
 
 --
+-- Name: lease_prepaid_credit_draws lease_prepaid_credit_draws_credit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credit_draws
+    ADD CONSTRAINT lease_prepaid_credit_draws_credit_id_fkey FOREIGN KEY (credit_id) REFERENCES public.lease_prepaid_credits(id);
+
+
+--
+-- Name: lease_prepaid_credit_draws lease_prepaid_credit_draws_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credit_draws
+    ADD CONSTRAINT lease_prepaid_credit_draws_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: lease_prepaid_credit_draws lease_prepaid_credit_draws_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credit_draws
+    ADD CONSTRAINT lease_prepaid_credit_draws_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id);
+
+
+--
 -- Name: lease_prepaid_credits lease_prepaid_credits_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -28239,5 +28310,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict zof1yxzpCl3vaZi1mokFdf7MTp1z3k13t9xfeiQcYdq4yA2OoMcPG1bb1lu3c2m
+\unrestrict nuSS312v5h5hU6SEMDTKKEloFo6QdsinX8Bb2wfnjGKUrAGQN7RPmmiwB1Vo6ce
 

@@ -40,6 +40,69 @@ import { executeRentAllocation, ALLOCATABLE_PAYMENT_TYPES, type PaymentMethod } 
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
 
+/**
+ * S653 (Nic): "use only a dedicated amount of the credit each month, to where
+ * she would still get a partial bill each month."
+ *
+ * How much paid-ahead credit this lease may spend against `billingMonth`
+ * (YYYY-MM-01): the credit on hand, capped by leases.prepaid_monthly_draw less
+ * whatever this month has already drawn. NULL cap = the whole balance, which
+ * is how a year's prepayment has always worked.
+ */
+export async function prepaidDrawAvailable(
+  client: PoolClient,
+  leaseId: string,
+  billingMonth: string,
+): Promise<{ remaining: number; cap: number | null; drawnThisMonth: number; available: number }> {
+  const r = await client.query<{ remaining: string; cap: string | null; drawn: string }>(`
+    SELECT COALESCE((SELECT SUM(amount_remaining) FROM lease_prepaid_credits WHERE lease_id = $1 AND amount_remaining > 0), 0)::text AS remaining,
+           (SELECT prepaid_monthly_draw::text FROM leases WHERE id = $1) AS cap,
+           COALESCE((SELECT SUM(amount) FROM lease_prepaid_credit_draws WHERE lease_id = $1 AND billing_month = $2::date), 0)::text AS drawn`,
+    [leaseId, billingMonth])
+  const row = r.rows[0]
+  const remaining = Math.round(Number(row?.remaining ?? 0) * 100) / 100
+  const cap = row?.cap == null ? null : Math.round(Number(row.cap) * 100) / 100
+  const drawnThisMonth = Math.round(Number(row?.drawn ?? 0) * 100) / 100
+  const available = cap == null ? remaining : Math.max(0, Math.min(remaining, Math.round((cap - drawnThisMonth) * 100) / 100))
+  return { remaining, cap, drawnThisMonth, available }
+}
+
+/** The billing month a payment row belongs to: its invoice's due month. */
+export async function billingMonthOfInvoice(client: PoolClient, invoiceId: string): Promise<string> {
+  const r = await client.query<{ m: string }>(
+    `SELECT to_char(date_trunc('month', due_date), 'YYYY-MM-01') AS m FROM invoices WHERE id = $1`, [invoiceId])
+  return r.rows[0]?.m ?? new Date().toISOString().slice(0, 7) + '-01'
+}
+
+/**
+ * Spend `amount` of the lease's paid-ahead credit, oldest credit first, and
+ * write the draw against `billingMonth` so the monthly cap can see it. Shared
+ * by the invoice run and the desk (which settles one bill from cash + credit).
+ */
+export async function drawPrepaidCredit(
+  client: PoolClient,
+  opts: { leaseId: string; amount: number; billingMonth: string; paymentId?: string | null },
+): Promise<number> {
+  const credits = await client.query<{ id: string; amount_remaining: string }>(
+    `SELECT id, amount_remaining::text FROM lease_prepaid_credits
+      WHERE lease_id = $1 AND amount_remaining > 0 ORDER BY created_at ASC FOR UPDATE`, [opts.leaseId])
+  let toDraw = Math.round(opts.amount * 100) / 100
+  let drawn = 0
+  for (const c of credits.rows) {
+    if (toDraw <= 0.005) break
+    const draw = Math.min(Number(c.amount_remaining), toDraw)
+    await client.query(
+      `UPDATE lease_prepaid_credits SET amount_remaining = amount_remaining - $2::numeric, updated_at = NOW() WHERE id = $1`,
+      [c.id, draw.toFixed(2)])
+    await client.query(
+      `INSERT INTO lease_prepaid_credit_draws (lease_id, credit_id, payment_id, amount, billing_month) VALUES ($1, $2, $3, $4, $5)`,
+      [opts.leaseId, c.id, opts.paymentId ?? null, draw.toFixed(2), opts.billingMonth])
+    toDraw = Math.round((toDraw - draw) * 100) / 100
+    drawn = Math.round((drawn + draw) * 100) / 100
+  }
+  return drawn
+}
+
 export interface PrepaidReleaseResult {
   /** Dollars of prepaid credit consumed. */
   consumed:      number
@@ -106,7 +169,12 @@ async function releaseInner(
       FOR UPDATE`,
     [opts.leaseId])
 
-  let available = credits.rows.reduce((sum, c) => sum + Number(c.amount_remaining), 0)
+  // S653: the month's cap, if the resident asked for one. What this invoice
+  // may use is the smaller of the credit on hand and the cap less what the
+  // month has already drawn.
+  const billingMonth = await billingMonthOfInvoice(client, opts.invoiceId)
+  const draw = await prepaidDrawAvailable(client, opts.leaseId, billingMonth)
+  let available = draw.available
   if (available <= 0.005) return { consumed: 0, rowsCovered: 0, releasedToLandlord: 0 }
 
   // How the tenant originally paid. Only used to pick which rate row the
@@ -174,16 +242,10 @@ async function releaseInner(
     rowsCovered++
   }
 
-  // Draw the consumed total down across the credits themselves, oldest first.
-  let toDraw = consumed
-  for (const c of credits.rows) {
-    if (toDraw <= 0.005) break
-    const draw = Math.min(Number(c.amount_remaining), toDraw)
-    await client.query(
-      `UPDATE lease_prepaid_credits
-          SET amount_remaining = amount_remaining - $2::numeric, updated_at = NOW()
-        WHERE id = $1`, [c.id, draw.toFixed(2)])
-    toDraw -= draw
+  // Draw the consumed total down across the credits themselves, oldest first,
+  // written against the month so the cap can see it (S653).
+  if (consumed > 0.005) {
+    await drawPrepaidCredit(client, { leaseId: opts.leaseId, amount: consumed, billingMonth })
   }
 
   // Book the landlord's share of what they just earned. Without this the money

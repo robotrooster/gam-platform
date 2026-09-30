@@ -1002,9 +1002,17 @@ paymentsRouter.get('/remittances', async (req: any, res, next) => {
       otherCredits.filter((c: any) => c.category !== 'deposit_interest')
         .reduce((s: number, c: any) => s + Number(c.remaining), 0) * 100) / 100
 
+    // S653: if the resident asked for a monthly cap on their paid-ahead money,
+    // say so — "$200 of this goes on each bill" is the sentence they expect.
+    const drawRow = await queryOne<{ draw: string | null }>(
+      `SELECT MAX(prepaid_monthly_draw)::text AS draw FROM leases l
+        JOIN lease_tenants lt ON lt.lease_id = l.id
+       WHERE lt.tenant_id = $1 AND lt.status = 'active' AND l.status = 'active'`, [tenantId])
+    const prepaidMonthlyDraw = drawRow?.draw != null ? Number(drawRow.draw) : null
     res.json({ success: true, data: {
       remittances: remits.map((r: any) => ({ ...r, lines: linesByRemit.get(r.id) ?? [] })),
       prepaidRemaining,
+      prepaidMonthlyDraw,
       depositInterestCredit,
       otherCreditTotal,
     } })

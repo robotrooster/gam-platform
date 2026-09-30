@@ -52,6 +52,7 @@ import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { applyCreditsToOpenCharges } from './creditApplication'
+import { prepaidDrawAvailable, billingMonthOfInvoice, consumePrepaidCreditForInvoice } from './prepaidRelease'
 import { allocateOldestFirst } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
 import { computePlatformCut, createRentPlatformCharge } from './stripeConnect'
@@ -115,7 +116,7 @@ export async function fetchOutstandingRows(tenantId: string, scope: BalanceScope
     `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
             -- S609: the allocator pays PROPANE last whatever its date, so a fill
             -- can't absorb money ahead of the rent it happens to predate.
-            p.entry_description,
+            p.entry_description, p.invoice_id,
             p.lease_id, p.unit_id, p.landlord_id,
             u.property_id, u.payment_block,
             t.stripe_customer_id,
@@ -318,12 +319,16 @@ export async function chargeLeaseBalance(
                       -- S648: a general credit is only the issuing landlord's to give
                       AND (lease_id = $2 OR (lease_id IS NULL
                            AND landlord_id = (SELECT landlord_id FROM leases WHERE id = $2)))), 0)
-       + COALESCE((SELECT SUM(amount_remaining) FROM lease_prepaid_credits
-                    WHERE tenant_id = $1 AND amount_remaining > 0
-                      AND ($2::uuid IS NULL OR lease_id = $2)), 0)
        )::text AS credit`,
       [tenantId, leaseId ?? null])
-    const creditAvailable = Math.round(Number(creditRow.rows[0]?.credit ?? 0) * 100) / 100
+    // S653 (Nic): paid-ahead credit is netted too — but only as much as this
+    // month may draw when the resident set a monthly cap ("she still pays a
+    // little out of pocket each month"). The month is the one the oldest open
+    // bill belongs to.
+    const payMonth = ctx.invoice_id ? await billingMonthOfInvoice(client, ctx.invoice_id)
+      : `${String(ctx.due_date).slice(0, 7)}-01`
+    const prepaidPart = leaseId ? (await prepaidDrawAvailable(client, leaseId, payMonth)).available : 0
+    const creditAvailable = Math.round((Number(creditRow.rows[0]?.credit ?? 0) + prepaidPart) * 100) / 100
 
     // The credit covers the lease's own charges first — those are what the
     // pay-in-full rule and the eviction clock run on. Never below zero: a credit
@@ -591,6 +596,12 @@ export async function chargeLeaseBalance(
     // credit are one payment event; this is the second half of it, inside the
     // same transaction so a tenant is never briefly both charged and credited.
     if (leaseId && creditAvailable > 0) {
+      // S653: paid-ahead money first (it is real money GAM holds, and it books
+      // the landlord's share as it goes), capped by the month's draw; then the
+      // landlord's own credits on whatever is still open.
+      for (const invoiceId of Array.from(new Set(plan.lines.map(l => rowById.get(l.payment_id)?.invoice_id).filter(Boolean))) as string[]) {
+        await consumePrepaidCreditForInvoice(client, { leaseId, invoiceId })
+      }
       await applyCreditsToOpenCharges(client, { leaseId, scope: 'lease' })
     }
 

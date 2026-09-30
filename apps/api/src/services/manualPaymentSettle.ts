@@ -22,6 +22,8 @@ import type { PoolClient } from 'pg'
 import { activateBillingForSettledRent } from './billingActivation'
 import { MANUAL_PAYMENT_FEE } from '@gam/shared'
 import { chargeLandlord } from './landlordGamAccount'
+import { prepaidDrawAvailable, drawPrepaidCredit } from './prepaidRelease'
+import { recordHeldItem } from './heldPayouts'
 import { AppError } from '../middleware/errorHandler'
 import { emitPaymentSettledEvent } from './creditLedgerEmitters'
 import type { ManualPaymentMethod } from '@gam/shared'
@@ -207,7 +209,14 @@ export async function settleManualRentPayment(
         -- S648: a general credit is only the issuing landlord's to give
         AND (lease_id = $2 OR (lease_id IS NULL AND landlord_id = $3) OR ($4::boolean AND landlord_id = $3))`,
     [payment.tenant_id, payment.lease_id, payment.landlord_id, input.settleHousehold === true])
-  const creditAvailable = Math.round(Number(creditRow.rows[0]?.credit ?? 0) * 100) / 100
+  const landlordCreditAvailable = Math.round(Number(creditRow.rows[0]?.credit ?? 0) * 100) / 100
+  // S653 (Nic): paid-ahead credit counts at the desk too — capped by the
+  // resident's monthly draw, so "she still pays a little out of pocket each
+  // month" holds whether she pays online or at the counter. Measured against
+  // the month of the bill being settled.
+  const payMonth = `${String(payment.due_date).slice(0, 7)}-01`
+  const prepaidAvailable = payment.lease_id ? (await prepaidDrawAvailable(client, payment.lease_id, payMonth)).available : 0
+  const creditAvailable = Math.round((landlordCreditAvailable + prepaidAvailable) * 100) / 100
   const creditUsed = Math.min(creditAvailable, chargesOpen)
   const amountSettled = Math.round((chargesOpen - creditUsed) * 100) / 100
 
@@ -391,8 +400,22 @@ export async function settleManualRentPayment(
   // Spend the credit that just covered part of this bill. Drawn oldest first,
   // and only by what was actually used — never by settling a line item, which
   // is what chopped Kim's $450 into a water row, a trash row and five late fees.
-  if (creditUsed > 0) {
-    let left = creditUsed
+  // S653: the paid-ahead money goes first (it is the resident's own cash GAM
+  // is holding), the landlord's credits cover the rest.
+  let prepaidDrawn = 0
+  if (creditUsed > 0 && prepaidAvailable > 0 && payment.lease_id) {
+    prepaidDrawn = await drawPrepaidCredit(client, {
+      leaseId: payment.lease_id, amount: Math.min(prepaidAvailable, creditUsed), billingMonth: payMonth, paymentId: payment.id,
+    })
+    // That share of the bill is the landlord's, and GAM is holding it — it
+    // rides out on the weekly payout like a register card sale does.
+    await recordHeldItem({
+      landlordId: payment.landlord_id, sourceType: 'prepaid_draw', sourceId: payment.id,
+      amount: prepaidDrawn, description: 'Paid-ahead credit applied at the desk',
+    }, client)
+  }
+  if (creditUsed - prepaidDrawn > 0.005) {
+    let left = Math.round((creditUsed - prepaidDrawn) * 100) / 100
     const open = await client.query<{ id: string; amount_remaining: string }>(
       `SELECT id, amount_remaining::text FROM tenant_credits
         WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0

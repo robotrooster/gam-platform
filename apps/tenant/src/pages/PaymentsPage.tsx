@@ -178,6 +178,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   const { data: remitData } = useQuery<{
     remittances: Remittance[]
     prepaidRemaining: number
+    prepaidMonthlyDraw?: number | null
     /** S642: statutory deposit interest credited to the account. */
     depositInterestCredit?: number
     otherCreditTotal?: number
@@ -501,7 +502,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
       <SecurityDepositCard />
 
       {remitData && (remitData.remittances.length > 0 || remitData.prepaidRemaining > 0) && (
-        <RemittancesCard remittances={remitData.remittances} prepaidRemaining={remitData.prepaidRemaining} />
+        <RemittancesCard remittances={remitData.remittances} prepaidRemaining={remitData.prepaidRemaining} prepaidMonthlyDraw={remitData.prepaidMonthlyDraw ?? null} />
       )}
 
       <div className="card" style={{ padding: 0, overflowX: 'auto', marginTop: 16 }}>
@@ -599,9 +600,10 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
 // its per-line FIFO application ("where every dollar went"). Read-only,
 // same posture as the outstanding ledger: the tenant never picks
 // targets, but they can always see exactly what each dollar covered.
-function RemittancesCard({ remittances, prepaidRemaining }: {
+function RemittancesCard({ remittances, prepaidRemaining, prepaidMonthlyDraw }: {
   remittances: Remittance[]
   prepaidRemaining: number
+  prepaidMonthlyDraw?: number | null
 }) {
   const [openId, setOpenId] = useState<string | null>(null)
 
@@ -627,7 +629,9 @@ function RemittancesCard({ remittances, prepaidRemaining }: {
               {formatCurrency(prepaidRemaining)}
             </div>
             <div style={{ fontSize: '.7rem', color: 'var(--t3)' }}>
-              Prepaid credit — applies to your next bill automatically
+              {prepaidMonthlyDraw
+                ? `Prepaid credit — ${formatCurrency(prepaidMonthlyDraw)} of it goes on each month's bill; you pay the rest`
+                : 'Prepaid credit — applies to your next bill automatically'}
             </div>
           </div>
         )}

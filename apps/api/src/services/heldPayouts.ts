@@ -21,7 +21,7 @@ import { logger } from '../lib/logger'
 
 export const HELD_ITEM_SOURCES = [
   'pos_sale', 'booking_deposit', 'business_invoice_payment',
-  'business_pos_sale', 'refund', 'dispute', 'platform_fee',
+  'business_pos_sale', 'refund', 'dispute', 'platform_fee', 'prepaid_draw',
 ] as const
 export type HeldItemSource = typeof HELD_ITEM_SOURCES[number]
 

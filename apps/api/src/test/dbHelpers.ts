@@ -203,6 +203,7 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM flex_charge_statements`)
   await db.query(`DELETE FROM flex_charge_accounts`)
   await db.query(`DELETE FROM remittance_applications`)
+  await db.query(`DELETE FROM lease_prepaid_credit_draws`)
   await db.query(`DELETE FROM lease_prepaid_credits`)
   // S609: tenant autopay schedules (one per lease, cascades from leases anyway,
   // but leases are deleted later in this chain).
