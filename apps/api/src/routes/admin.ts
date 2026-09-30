@@ -1770,12 +1770,22 @@ const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recur
   { key: 'adjustments',        label: 'Adjustments',         types: ['adjustment'],                recurring: false },
 ]
 
+// S653 (Nic): "Where are those adjustments coming from? Because we are not
+// spending any money." The monthly processing true-up (services/platformRevenue
+// trueUpProcessingMargin) is typed 'adjustment' with its own reference_type, but
+// it IS processing income — it is the correction that makes the estimated
+// per-payment spreads equal Stripe's real invoice. It belongs in the slice it
+// corrects, or the Processing slice under-reads every month and an unexplained
+// "adjustment" appears beside it.
+const SLICE_TYPE_SQL = `CASE WHEN type = 'adjustment' AND reference_type = 'processing_margin_true_up'
+                             THEN 'banking_spread' ELSE type END`
+
 async function computeComposition(key: string, startSql: string, label: string, platformRunRate: number) {
   const rows = await query<{ type: string; amt: number }>(`
-    SELECT type, COALESCE(SUM(amount), 0)::float AS amt
+    SELECT ${SLICE_TYPE_SQL} AS type, COALESCE(SUM(amount), 0)::float AS amt
       FROM platform_revenue_ledger
      WHERE created_at >= ${startSql}
-     GROUP BY type`)
+     GROUP BY 1`)
   const byType = new Map(rows.map(r => [r.type, Number(r.amt)]))
 
   const sources = REVENUE_SLICES.map(sl => ({
@@ -1880,7 +1890,7 @@ adminRouter.get('/income/breakdown', requireSuperAdmin, async (req, res, next) =
     // times a constant — so a slice worth $5 could open onto items worth
     // something else, and nobody could tell which number was the real one.
     const rows = await query<any>(`
-      SELECT type,
+      SELECT ${SLICE_TYPE_SQL} AS type,
              to_char(created_at, 'Mon DD') AS date,
              COALESCE(NULLIF(notes, ''), reference_type, type) AS label,
              amount::float AS amount,

@@ -185,14 +185,14 @@ describe('S652: the money page agrees with itself', () => {
   let superToken = ''
   beforeEach(async () => { superToken = (await seedAFixture()).superAdminToken })
 
-  async function ledger(rows: Array<{ type: string; amount: number; monthsAgo?: number }>) {
+  async function ledger(rows: Array<{ type: string; amount: number; monthsAgo?: number; referenceType?: string }>) {
     for (const r of rows) {
       await db.query(
         // balance_after is the running balance the real helper maintains; these
         // fixtures only care about `amount`, so it carries the same value.
-        `INSERT INTO platform_revenue_ledger (type, amount, balance_after, notes, created_at)
-         VALUES ($1, $2, $2, 'test', NOW() - ($3 || ' months')::interval)`,
-        [r.type, r.amount, r.monthsAgo ?? 0])
+        `INSERT INTO platform_revenue_ledger (type, amount, balance_after, notes, reference_type, created_at)
+         VALUES ($1, $2, $2, 'test', $4, NOW() - ($3 || ' months')::interval)`,
+        [r.type, r.amount, r.monthsAgo ?? 0, r.referenceType ?? null])
     }
   }
 
@@ -251,6 +251,21 @@ describe('S652: the money page agrees with itself', () => {
       .set('Authorization', `Bearer ${superToken}`)
     expect(all.body.data.recurringMonthly).toBeCloseTo(130, 2)
     expect(all.body.data.recurringAnnual).toBeCloseTo(1560, 2)
+  })
+
+  // S653 (Nic): "we are not spending any money" — the monthly true-up is
+  // processing income and sits in the Processing slice, not under Adjustments.
+  it('files the processing true-up under Processing, not Adjustments', async () => {
+    await ledger([
+      { type: 'banking_spread', amount: 41.75, monthsAgo: 0 },
+      { type: 'adjustment',     amount: 31.95, monthsAgo: 0, referenceType: 'processing_margin_true_up' },
+    ])
+    const res = await request(buildApp())
+      .get('/api/admin/income/composition?window=month')
+      .set('Authorization', `Bearer ${superToken}`)
+    const by = Object.fromEntries(res.body.data.sources.map((s: any) => [s.key, s.amount]))
+    expect(by.processing).toBeCloseTo(73.70, 2)
+    expect(by.adjustments ?? 0).toBe(0)
   })
 
   it('does not read an unbilled current month as a collapse in revenue', async () => {
