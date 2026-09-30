@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 8dVZzhQAs5TZhZbppAXeVQ7zR7Ezro7nv5kr777Eswqod0G0XYlnRgczimkb6xt
+\restrict zof1yxzpCl3vaZi1mokFdf7MTp1z3k13t9xfeiQcYdq4yA2OoMcPG1bb1lu3c2m
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -691,6 +691,29 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: prepaid_fee_follows_payment(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.prepaid_fee_follows_payment() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  kind text;
+BEGIN
+  IF NEW.status = 'settled' AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM 'settled')
+     AND NEW.lease_fee_id IS NOT NULL AND NEW.lease_id IS NOT NULL THEN
+    SELECT money_kind INTO kind FROM lease_fees WHERE id = NEW.lease_fee_id;
+    IF kind = 'prepaid' THEN
+      INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, source_payment_id, note)
+      VALUES (NEW.lease_id, NEW.tenant_id, NEW.amount, NEW.amount, NEW.id, 'Rent paid ahead on the lease (move-in)')
+      ON CONFLICT (source_payment_id) WHERE source_payment_id IS NOT NULL DO NOTHING;
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
 
 
 --
@@ -5516,11 +5539,20 @@ CREATE TABLE public.lease_fees (
     condition_result text,
     condition_assessed_at timestamp with time zone,
     condition_assessed_by uuid,
+    money_kind text DEFAULT 'fee'::text NOT NULL,
     CONSTRAINT lease_fees_amount_check CHECK ((amount >= (0)::numeric)),
     CONSTRAINT lease_fees_condition_result_check CHECK (((condition_result IS NULL) OR (condition_result = ANY (ARRAY['met'::text, 'failed'::text])))),
     CONSTRAINT lease_fees_due_timing_check CHECK ((due_timing = ANY (ARRAY['move_in'::text, 'monthly_ongoing'::text, 'move_out'::text, 'other'::text]))),
-    CONSTRAINT lease_fees_fee_type_check CHECK ((fee_type = ANY (ARRAY['security_deposit'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'utility_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text])))
+    CONSTRAINT lease_fees_fee_type_check CHECK ((fee_type = ANY (ARRAY['security_deposit'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'utility_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text]))),
+    CONSTRAINT lease_fees_money_kind_check CHECK ((money_kind = ANY (ARRAY['fee'::text, 'deposit'::text, 'prepaid'::text])))
 );
+
+
+--
+-- Name: COLUMN lease_fees.money_kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_fees.money_kind IS 'S653: what this money IS on the signed lease — fee (landlord keeps), deposit (held, returned at move-out) or prepaid (credit to the renter, drawn down by rent).';
 
 
 --
@@ -5604,6 +5636,8 @@ CREATE TABLE public.lease_prepaid_credits (
     source_remittance_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    source_payment_id uuid,
+    note text,
     CONSTRAINT lease_prepaid_credits_amount_original_check CHECK ((amount_original > (0)::numeric)),
     CONSTRAINT lease_prepaid_credits_amount_remaining_check CHECK ((amount_remaining >= (0)::numeric))
 );
@@ -5702,9 +5736,18 @@ CREATE TABLE public.lease_template_fields (
     parent_option text,
     default_value text,
     checkbox_mark text DEFAULT 'x'::text NOT NULL,
+    money_kind text,
     CONSTRAINT lease_template_fields_checkbox_mark_check CHECK ((checkbox_mark = ANY (ARRAY['x'::text, 'check'::text]))),
-    CONSTRAINT lease_template_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'date_signed_day'::text, 'date_signed_month'::text, 'tenant_2_name'::text, 'tenant_3_name'::text, 'tenant_4_name'::text, 'occupant_names'::text, 'sale_price'::text, 'sale_down_payment'::text, 'sale_financed_amount'::text, 'sale_monthly_payment'::text, 'sale_term_months'::text, 'sale_interest_rate'::text, 'sale_first_payment_month'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'move_in_first_month_rent'::text, 'move_in_proration'::text, 'move_in_security_deposit'::text, 'move_in_total_due'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'utility_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'custom_text'::text, 'sale_final_payment_amount'::text, 'sale_final_payment_month'::text]))))
+    CONSTRAINT lease_template_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'date_signed_day'::text, 'date_signed_month'::text, 'tenant_2_name'::text, 'tenant_3_name'::text, 'tenant_4_name'::text, 'occupant_names'::text, 'sale_price'::text, 'sale_down_payment'::text, 'sale_financed_amount'::text, 'sale_monthly_payment'::text, 'sale_term_months'::text, 'sale_interest_rate'::text, 'sale_first_payment_month'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'move_in_first_month_rent'::text, 'move_in_proration'::text, 'move_in_security_deposit'::text, 'move_in_total_due'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'utility_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'custom_text'::text, 'sale_final_payment_amount'::text, 'sale_final_payment_month'::text])))),
+    CONSTRAINT lease_template_fields_money_kind_check CHECK ((money_kind = ANY (ARRAY['fee'::text, 'deposit'::text, 'prepaid'::text])))
 );
+
+
+--
+-- Name: COLUMN lease_template_fields.money_kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_template_fields.money_kind IS 'S653: the landlord''s tag on a money box — fee (kept), deposit (held, returned at move-out) or prepaid (credit drawn down by rent). NULL = the box name''s default.';
 
 
 --
@@ -6478,7 +6521,7 @@ CREATE TABLE public.payments (
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
     CONSTRAINT payments_manual_method_check CHECK (((manual_method IS NULL) OR (manual_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'prior_arrangement'::text])))),
     CONSTRAINT payments_retry_count_check CHECK (((retry_count >= 0) AND (retry_count <= 2))),
-    CONSTRAINT payments_revenue_owner_check CHECK ((revenue_owner = ANY (ARRAY['landlord'::text, 'gam'::text]))),
+    CONSTRAINT payments_revenue_owner_check CHECK ((revenue_owner = ANY (ARRAY['landlord'::text, 'gam'::text, 'held'::text]))),
     CONSTRAINT payments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text, 'returned'::text, 'paid_via_deposit'::text]))),
     CONSTRAINT payments_type_check CHECK ((type = ANY (ARRAY['rent'::text, 'fee'::text, 'deposit'::text, 'utility'::text, 'float_fee'::text, 'late_fee'::text, 'platform_fee'::text, 'home_payment'::text, 'carried_balance'::text])))
 );
@@ -19536,6 +19579,13 @@ CREATE UNIQUE INDEX landlords_stripe_connect_account_id_uniq ON public.landlords
 
 
 --
+-- Name: lease_prepaid_credits_source_payment_uidx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX lease_prepaid_credits_source_payment_uidx ON public.lease_prepaid_credits USING btree (source_payment_id) WHERE (source_payment_id IS NOT NULL);
+
+
+--
 -- Name: lease_templates_disclosure_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -21374,6 +21424,13 @@ CREATE TRIGGER trg_payments_invoice_status_rollup AFTER INSERT OR DELETE OR UPDA
 --
 
 CREATE TRIGGER trg_pool_match_requests_updated_at BEFORE UPDATE ON public.pool_match_requests FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: payments trg_prepaid_fee_follows_payment; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_prepaid_fee_follows_payment AFTER INSERT OR UPDATE OF status ON public.payments FOR EACH ROW EXECUTE FUNCTION public.prepaid_fee_follows_payment();
 
 
 --
@@ -24344,6 +24401,14 @@ ALTER TABLE ONLY public.lease_pets
 
 ALTER TABLE ONLY public.lease_prepaid_credits
     ADD CONSTRAINT lease_prepaid_credits_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: lease_prepaid_credits lease_prepaid_credits_source_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credits
+    ADD CONSTRAINT lease_prepaid_credits_source_payment_id_fkey FOREIGN KEY (source_payment_id) REFERENCES public.payments(id);
 
 
 --
@@ -28174,5 +28239,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 8dVZzhQAs5TZhZbppAXeVQ7zR7Ezro7nv5kr777Eswqod0G0XYlnRgczimkb6xt
+\unrestrict zof1yxzpCl3vaZi1mokFdf7MTp1z3k13t9xfeiQcYdq4yA2OoMcPG1bb1lu3c2m
 

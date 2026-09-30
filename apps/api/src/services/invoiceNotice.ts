@@ -61,7 +61,7 @@ function labelFor(row: { type: string; notes: string | null }): string {
   const note = String(row.notes ?? '').split(' — ')[0].trim()
   if (row.type === 'rent') return 'Rent'
   if (row.type === 'utility') return note || 'Utilities'
-  if (row.type === 'deposit') return 'Security deposit'
+  if (row.type === 'deposit') return note || 'Security deposit'
   if (row.type === 'late_fee') return 'Late fee'
   return note || row.type.replace(/_/g, ' ')
 }

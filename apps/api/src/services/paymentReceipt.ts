@@ -21,7 +21,7 @@ function labelFor(row: { type: string; notes: string | null; due_date: string })
   if (row.type === 'utility' && note) return note
   if (row.type === 'rent') return `Rent — due ${row.due_date}`
   if (row.type === 'fee') return note || 'Fee'
-  if (row.type === 'deposit') return 'Security deposit'
+  if (row.type === 'deposit') return note || 'Security deposit'
   return note || row.type
 }
 

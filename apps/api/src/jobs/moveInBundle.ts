@@ -1,5 +1,5 @@
 import { DateTime } from 'luxon'
-import { prorateMoveInRent, nextDueDateAfter } from '@gam/shared'
+import { prorateMoveInRent, nextDueDateAfter, LEASE_COLUMN_LABEL } from '@gam/shared'
 import type { PoolClient } from 'pg'
 import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
 import { getClient, queryOne } from '../db'
@@ -339,13 +339,15 @@ export async function generateMoveInInvoice(
   // separate pool connection at READ COMMITTED. Reading via `client` ensures
   // we see the in-flight inserts.
   const feesRes = await client.query(
-    `SELECT id, fee_type, amount, description
+    `SELECT id, fee_type, amount, description, money_kind
      FROM lease_fees
      WHERE lease_id = $1 AND due_timing = 'move_in'`,
     [inputs.lease_id]
   )
   const fees = feesRes.rows as Array<{
     id: string; fee_type: string; amount: string; description: string | null
+    // S653: what the landlord tagged the box as — fee / deposit / prepaid.
+    money_kind: 'fee' | 'deposit' | 'prepaid'
   }>
 
   try {
@@ -491,16 +493,31 @@ export async function generateMoveInInvoice(
 
     let moveInFeesInserted = 0
     for (const fee of nonDepositFees) {
+      // S653 (Nic): the box's TAG decides what the money is, never its name.
+      //   deposit — a type='deposit' row: held in trust like the security
+      //             deposit (the allocation never pays it to the landlord), and
+      //             returned at move-out by services/depositReturn.
+      //   prepaid — a fee row GAM HOLDS for the tenant (revenue_owner='held'):
+      //             not the landlord's at settlement, not GAM's revenue. When it
+      //             settles, the payments trigger banks it as paid-ahead credit
+      //             and the next rent invoices draw it down, releasing each
+      //             month's share to the landlord then.
+      //   fee     — the landlord's money, as before.
+      const kind = fee.money_kind ?? 'fee'
       await client.query(
         `INSERT INTO payments (
            invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-           type, amount, status, due_date, entry_description, lease_fee_id
-         ) VALUES ($1, $2, $3, $4, $5, 'fee', $6, 'pending', $7, $8, $9)`,
+           type, amount, status, due_date, entry_description, lease_fee_id, revenue_owner, notes
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10, $11, $12)`,
         [
           invoiceId, inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
+          kind === 'deposit' ? 'deposit' : 'fee',
           fee.amount, invoiceDueDate,
-          entryDescriptionForFeeType(fee.fee_type),
+          kind === 'deposit' ? 'DEPOSIT' : entryDescriptionForFeeType(fee.fee_type),
           fee.id,
+          kind === 'prepaid' ? 'held' : 'landlord',
+          // The box's printed label, so the tenant's invoice says what the lease said.
+          fee.description || (LEASE_COLUMN_LABEL as Record<string, string>)[fee.fee_type] || null,
         ]
       )
       moveInFeesInserted++

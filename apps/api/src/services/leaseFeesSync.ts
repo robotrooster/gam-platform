@@ -219,11 +219,16 @@ export async function reconcileSettledDepositPayment(
     return queryOne<T>(sql, params)
   }
 
-  const p = await one<{ lease_id: string | null; type: string; amount: string }>(
-    `SELECT lease_id, type, amount::text FROM payments WHERE id = $1`,
+  const p = await one<{ lease_id: string | null; type: string; amount: string; lease_fee_id: string | null }>(
+    `SELECT lease_id, type, amount::text, lease_fee_id FROM payments WHERE id = $1`,
     [paymentId],
   )
   if (!p || p.type !== 'deposit' || !p.lease_id) return
+  // S653: a pet / key / cleaning deposit is its own held deposit (it carries
+  // its lease_fees row). It is returned by depositReturn alongside the security
+  // deposit but it does not fund THIS pool, or a pet deposit settling first
+  // would read as the security deposit being paid.
+  if (p.lease_fee_id) return
 
   const dep = await one<{ id: string; flex_deposit_enabled: boolean; status: string }>(
     `SELECT id, flex_deposit_enabled, status

@@ -11,8 +11,7 @@ import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLock
   AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs, LEASE_COLUMN_CATEGORY, FEE_TYPE_META,
   SCREENING_FEE_EXCLUSION_REASON,
   isAutoFilledLeaseColumn, matchesUnitQuery,
-  LEASE_TEMPLATE_PURPOSE_LABEL,
-} from '@gam/shared'
+  LEASE_TEMPLATE_PURPOSE_LABEL, MONEY_KINDS, MONEY_KIND_LABEL, defaultMoneyKind, isMoneyBoxColumn } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
 import { SearchBox } from '../components/ListControls'
@@ -82,8 +81,7 @@ function billingEffect(col: string | null | undefined): { text: string; billing:
   const cat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[col]
   if (cat === 'fee_row') {
     const meta = (FEE_TYPE_META as Record<string, any>)[col]
-    const refund = meta?.isRefundable ? ' Refundable — returned at move-out.' : ''
-    if (meta?.dueTiming === 'move_in') return { text: `Billed on the tenant's FIRST invoice, at move-in.${refund}`, billing: true }
+    if (meta?.dueTiming === 'move_in') return { text: `Billed on the tenant's FIRST invoice, at move-in.`, billing: true }
     if (meta?.dueTiming === 'monthly_ongoing') return { text: 'Billed EVERY MONTH alongside rent.', billing: true }
     if (meta?.dueTiming === 'move_out') return { text: 'Charged at move-out, from the deposit.', billing: true }
     return { text: 'Recorded on the lease; billed when you choose to bill it.', billing: true }
@@ -499,6 +497,8 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
       // both to new DB ids after the full-replace insert).
       clientId: f.id, parentClientId: f.parentFieldId || null, parentOption: f.parentOption || null,
       defaultValue: f.defaultValue ?? null, checkboxMark: f.checkboxMark ?? null,
+      // S653: the landlord's tag on a money box (fee / deposit / prepaid).
+      moneyKind: f.moneyKind ?? null,
     })), lateFeeTerms, conditionalFees: conditionalFees.map((c: any) => ({
       label: c.label, amount: c.amount, conditionText: c.conditionText,
     })) }),
@@ -977,6 +977,26 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                       </div>
                     )
                   })()}
+                </div>
+              )}
+              {/* S653 (Nic): "tag the money boxes as either credits or debits...
+                  that's the difference between a refundable pet deposit versus a
+                  non-refundable pet fee." The tag decides what the engine DOES
+                  with the money; the box's name only suggests a default. */}
+              {isMoneyBoxColumn(sel.leaseColumn) && (FEE_TYPE_META as Record<string, any>)[sel.leaseColumn]?.dueTiming === 'move_in' && (
+                <div style={{ marginBottom:8 }}>
+                  <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>This money is</label>
+                  <select className="input" value={sel.moneyKind || defaultMoneyKind(sel.leaseColumn as any)}
+                    onChange={e => updateSelected('moneyKind', e.target.value)} style={{ width:'100%', fontSize:'.75rem' }}>
+                    {MONEY_KINDS.map(k => <option key={k} value={k}>{MONEY_KIND_LABEL[k]}</option>)}
+                  </select>
+                  <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2, lineHeight:1.4 }}>
+                    {(sel.moneyKind || defaultMoneyKind(sel.leaseColumn as any)) === 'deposit'
+                      ? 'Held for the renter and returned at move-out, less any deductions.'
+                      : (sel.moneyKind || defaultMoneyKind(sel.leaseColumn as any)) === 'prepaid'
+                        ? 'Becomes credit on their account the day it is paid; each upcoming rent invoice draws it down. Anything left comes back at move-out.'
+                        : 'Yours to keep once paid.'}
+                  </div>
                 </div>
               )}
               {sel.fieldType === 'choice' && (

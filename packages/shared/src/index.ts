@@ -3927,11 +3927,13 @@ export const FEE_TYPE_META: Record<FeeType, FeeTypeMeta> = {
 export interface FeeRowSpec {
   // parse returns a single lease_fees row ready to insert, or null if the
   // tag was not bound / value empty.
-  parse: (vals: LeaseColumnVals) => null | {
+  // S653: `kinds` = the template's per-box tags (lease_column → money_kind).
+  parse: (vals: LeaseColumnVals, kinds?: Partial<Record<string, MoneyKind>>) => null | {
     fee_type: FeeType
     amount: string
     is_refundable: boolean
     due_timing: FeeDueTiming
+    money_kind: MoneyKind
   }
 }
 
@@ -3964,18 +3966,49 @@ function parseMoney(raw: unknown): number | null {
 
 function makeFeeRowSpec(tag: FeeType): FeeRowSpec {
   return {
-    parse: (v) => {
+    parse: (v, kinds) => {
       const amount = parseMoney(v[tag])
       if (amount == null) return null
       const meta = FEE_TYPE_META[tag]
+      // S653: the landlord's tag on the box wins over the name's default.
+      const money_kind: MoneyKind = kinds?.[tag] ?? defaultMoneyKind(tag)
       return {
         fee_type: tag,
         amount: String(amount),
-        is_refundable: meta.isRefundable,
+        is_refundable: money_kind !== 'fee',
         due_timing: meta.dueTiming,
+        money_kind,
       }
     },
   }
+}
+
+// ── S653 (Nic): WHAT A MONEY BOX IS — the landlord's tag ─────────────────────
+//
+//   "we need to be able to tag the money boxes as either credits or debits...
+//    that's the difference between a refundable pet deposit versus a
+//    non-refundable pet fee."
+//
+// Three kinds, because two credits differ in WHEN the renter gets the money:
+//   fee      — the landlord keeps it (pet fee, move-in fee)
+//   deposit  — held for the renter, returned at move-out less deductions
+//   prepaid  — credit to the renter, drawn down by the upcoming rent invoices
+// Every money box defaults from its tag name; the landlord may change it per
+// template. The signed lease records the choice on lease_fees.money_kind, and
+// the engine bills, holds, applies and returns by THAT — never by the name.
+export const MONEY_KINDS = ['fee', 'deposit', 'prepaid'] as const
+export type MoneyKind = typeof MONEY_KINDS[number]
+export const MONEY_KIND_LABEL: Record<MoneyKind, string> = {
+  fee:     'Fee — you keep it',
+  deposit: 'Deposit — held, returned at move-out',
+  prepaid: 'Prepaid rent — credit toward upcoming rent',
+}
+export function defaultMoneyKind(feeType: FeeType): MoneyKind {
+  if (feeType === 'last_month_rent') return 'prepaid'
+  return FEE_TYPE_META[feeType]?.isRefundable ? 'deposit' : 'fee'
+}
+export function isMoneyBoxColumn(col: string | null | undefined): col is FeeType {
+  return !!col && (LEASE_COLUMN_CATEGORY as Record<string, string>)[col] === 'fee_row'
 }
 
 export const FEE_ROW_SPECS: Record<FeeRowTag, FeeRowSpec> = {

@@ -25,7 +25,7 @@ import {
   leaseColumnDisplayValue,
   isAutoFilledLeaseColumn,
   FEE_TYPES,
-  FEE_TYPE_META,
+  FEE_TYPE_META, MONEY_KINDS, isMoneyBoxColumn,
   moveInDefaults,
   leaseDueDay,
   dueDayLabel,
@@ -1412,8 +1412,25 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     if (!scheduleByType[s.fee_type]) scheduleByType[s.fee_type] = s
   }
 
+  // S653 (Nic): the landlord's tag on each money box — fee / deposit / prepaid —
+  // decides what the money IS. Read off the template the document came from.
+  const boxKinds: Record<string, any> = {}
+  if (doc.template_id) {
+    const kindRows = await client.query(
+      `SELECT lease_column, money_kind FROM lease_template_fields
+        WHERE template_id = $1 AND money_kind IS NOT NULL AND lease_column IS NOT NULL`, [doc.template_id])
+    for (const r of kindRows.rows as any[]) boxKinds[r.lease_column] = r.money_kind
+  }
+  // S653: the box's own printed label ("Rent pre-payment", "Pet deposit") is
+  // what the tenant sees on the invoice and receipt — not the tag's name.
+  const boxLabels: Record<string, string> = {}
+  for (const r of (await client.query(
+    `SELECT lease_column, label FROM lease_document_fields
+      WHERE document_id = $1 AND lease_column IS NOT NULL AND label IS NOT NULL`, [doc.id])).rows as any[]) {
+    if (!boxLabels[r.lease_column]) boxLabels[r.lease_column] = String(r.label).trim()
+  }
   for (const [, spec] of Object.entries(FEE_ROW_SPECS)) {
-    const parsed = spec.parse(vals)
+    const parsed = spec.parse(vals, boxKinds)
     if (!parsed) continue
 
     // S534: on a RENEWAL the deposit printed in the document is the
@@ -1473,9 +1490,10 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
 
     await client.query(
       `INSERT INTO lease_fees (
-         lease_id, fee_type, amount, is_refundable, due_timing, is_override
-       ) VALUES ($1, $2, $3, $4, $5, $6)`,
-      [lease.id, parsed.fee_type, parsed.amount, parsed.is_refundable, parsed.due_timing, isOverride]
+         lease_id, fee_type, amount, is_refundable, due_timing, is_override, money_kind, description
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [lease.id, parsed.fee_type, parsed.amount, parsed.is_refundable, parsed.due_timing, isOverride, parsed.money_kind,
+       boxLabels[parsed.fee_type] ?? null]
     )
   }
 
@@ -2657,8 +2675,8 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
     for (const f of (fields || [])) {
       const row = await queryOne<{ id: string }>(`INSERT INTO lease_template_fields
         (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order, font_css, options,
-         default_value, checkbox_mark)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+         default_value, checkbox_mark, money_kind)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
         // S636 (Nic): an IDENTITY column belongs to nobody, enforced on the way
         // in. The editor clears the role when the label is picked, but a template
         // saved before that shipped — or by any other client — would otherwise
@@ -2684,7 +2702,9 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
            : (f.defaultValue ?? null),
          // S652: a CHOICE group's boxes are marked X, a check, or the signer's
          // initials (Blu's lead-paint form initials the option that applies).
-         (f.checkboxMark === 'check' || f.checkboxMark === 'initials') ? f.checkboxMark : 'x'])
+         (f.checkboxMark === 'check' || f.checkboxMark === 'initials') ? f.checkboxMark : 'x',
+         // S653: the landlord's tag on a money box; only meaningful on a fee tag.
+         (isMoneyBoxColumn(f.leaseColumn) && (MONEY_KINDS as readonly string[]).includes(f.moneyKind)) ? f.moneyKind : null])
       if (f.clientId != null) clientToDbId.set(String(f.clientId), row!.id)
       inserted.push({ f, dbId: row!.id })
     }

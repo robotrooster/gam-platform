@@ -6731,7 +6731,7 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
         const note = String(r.notes ?? '').split(' — ')[0].trim()
         if (r.type === 'utility') return note || 'Utilities'
         if (r.type === 'rent') return 'Rent'
-        if (r.type === 'deposit') return 'Security deposit'
+        if (r.type === 'deposit') return note || 'Security deposit'
         return note || r.type
       }
       const unitLabel = `${rows[0].property_name} — ${rows[0].unit_number}`

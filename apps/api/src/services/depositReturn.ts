@@ -215,7 +215,20 @@ export async function calculateDepositReturn(
   // collected_amount ≈ total_amount. When it doesn't (genuine default
   // through to the end), the landlord disbursement reflects reality —
   // they get what's actually in escrow, not what was promised.
-  const totalDeposit = Number(sd?.collected_amount ?? sd?.total_amount ?? leaseFeeDeposit?.amount ?? 0)
+  const securityDeposit = Number(sd?.collected_amount ?? sd?.total_amount ?? leaseFeeDeposit?.amount ?? 0)
+  // S653 (Nic): every box the landlord tagged DEPOSIT is held for the renter
+  // and comes back here — pet deposit, key deposit, cleaning deposit. They are
+  // billed as type='deposit' rows carrying their lease_fees row (moveInBundle);
+  // only what actually settled is in the pool. Before this, only the security
+  // deposit was ever returned and "refundable" on those boxes was just a word.
+  const otherHeld = await queryOne<{ total: string }>(
+    `SELECT COALESCE(SUM(p.amount), 0)::text AS total
+       FROM payments p JOIN lease_fees lf ON lf.id = p.lease_fee_id
+      WHERE p.lease_id = $1 AND p.type = 'deposit' AND p.status = 'settled'
+        AND lf.money_kind = 'deposit' AND lf.fee_type <> 'security_deposit'`,
+    [leaseId],
+  )
+  const totalDeposit = round2(securityDeposit + Number(otherHeld?.total ?? 0))
   // S188: statutory interest accrued (state-hardcoded rates per S177
   // carve-out). Added to the available pool for refund — tenant gets
   // their deposit + interest minus deductions. Reduces gap_amount
