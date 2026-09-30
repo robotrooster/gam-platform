@@ -1121,3 +1121,9 @@ Month end: rounds opened 7am for MV (73 meters incl. 20 new), Oak Park (49), Cou
 ## Deploy 87 (2026-09-30) — own-day residents anchor to the day the property was added
 
 Nic: "we're only going to bill going forward from the day the property was added." `existingTenancyFirstDue(start, fbc, dueDay, propertyAddedOn)` — first occurrence of the day on/after `properties.onboarding_started_at` (fallback created_at, property tz); not the signing date; not floored by first_billing_cycle (the nightly floor is skipped for existing tenancies with a day ≠ 1). The 1st keeps S631. Every meter stays in every round; out-of-order sites are never excluded.
+
+## Deploys 88–89 (2026-09-30) — reading list Fix; review closes the walk entry
+
+- MeterWalk `ReadingListForm`: "Fix" on a line saved this sitting reopens it (server already allowed own corrections; someone else's still 409s).
+- `POST /utility/readings/:id/resolve-review` now closes the meter's open `utility_reading_double_checks` row (second_value = reviewed value, verified/replaced), deletes a stale un-invoiced bill if the value changed, and completes the run when the walk list is empty (or tells the landlord bills are ready when the company reviews first). Tests in routes/utilityReadingRuns.test.ts.
+- Mountain View Sept round: Nic had resolved all 7 flagged reads via the queue; the walk still listed the same 7. Closed those 7 by hand with his reviewed values and completed the run through /complete: 26 bills, $1,697.01, status billed, riding Oct 1 invoices.
