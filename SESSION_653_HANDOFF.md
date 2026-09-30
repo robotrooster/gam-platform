@@ -194,3 +194,29 @@ And from the same conversation, earlier:
   whether to redo as a 3-way split before the Oct 1 invoices.
 - Migration `20260930170000_lease_move_out_notice.sql` committed (columns for
   the "they're leaving on…" front-desk mark; code not built yet).
+
+## Deploys 95–97 (2026-09-30 afternoon)
+
+- **95** — "They're leaving on…" (`services/moveOutNotice.ts`; `POST/DELETE
+  /leases/:id/leaving`; `GET /leases/desk/residents`; Front Desk → Move-outs tab;
+  Leases page Change menu + "Leaving Oct 3" badge; `components/LeavingModal.tsx`;
+  permission `front_desk.mark_leaving`). Register history tells `pay_link` /
+  `card_reader` / `card_on_file` apart (`pos_transactions.paid_online`, migration
+  `20260930190000`); a history row opens to its lines. Fee ESTIMATE
+  (`services/platformFee.ts`) now counts owner-use spaces (the accrual already
+  did). MH 03 at Mountain View bills from October (dry run: MV 43, Oak Park 24).
+- **96** — Admin "Recurring Revenue" card = platform fees only ($130); the
+  processing spread is no longer tagged recurring.
+- **97** — Approving a screening drafts its lease in the same click
+  (`draftLeaseForApprovedCheck` in `routes/background.ts`; `/decision` returns
+  `lease | needsUnit`); walk-ups are asked which space. Admin income: the
+  processing true-up files under Processing (`SLICE_TYPE_SQL`); the −$50 of
+  Sept 25 "phantom_minimum_reversal" rows were a DOUBLE reversal (S650 had
+  already reversed them on Aug 1) — corrected with one +$50 ledger row
+  (`double_reversal_correction`).
+- Country Acres: still inside onboarding grace (`billing_grace_until`
+  2026-10-01, 12 active leases) — the Oct 1 sweep stamps it live and October bills
+  its 12 spaces.
+- RV 24 water (Oak Park): Nic will fix September's $14.50 RUBS share after he
+  gets the original submeter readings.
+- Next: avoided sites on reservations (build list #2), then the waitlist design.
