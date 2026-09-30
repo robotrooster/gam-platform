@@ -1127,3 +1127,11 @@ Nic: "we're only going to bill going forward from the day the property was added
 - MeterWalk `ReadingListForm`: "Fix" on a line saved this sitting reopens it (server already allowed own corrections; someone else's still 409s).
 - `POST /utility/readings/:id/resolve-review` now closes the meter's open `utility_reading_double_checks` row (second_value = reviewed value, verified/replaced), deletes a stale un-invoiced bill if the value changed, and completes the run when the walk list is empty (or tells the landlord bills are ready when the company reviews first). Tests in routes/utilityReadingRuns.test.ts.
 - Mountain View Sept round: Nic had resolved all 7 flagged reads via the queue; the walk still listed the same 7. Closed those 7 by hand with his reviewed values and completed the run through /complete: 26 bills, $1,697.01, status billed, riding Oct 1 invoices.
+
+## Deploy 90 (2026-09-30) — one window for flagged reads
+
+Nic: "get rid of the clean meters random blind reread. Just flag the ones that need flagging, with limited to one window." `finishReadingPhase` (last read → complete, or wait in `double_check` with no re-read list + `utility_reads_need_review` notice), `settleFlaggedOnRun` (last flagged read resolved → complete). Double-check routes, `enterDoubleCheck`, `getDoubleChecks`, `countEscalations`, the walk's verify mode and the agent action `submit_meter_double_check` are gone; `utility_reading_double_checks` stays as history. Reading-runs list carries `flagged_count`. Reading POST returns `flagged` + `awaitingApproval`. Tests rewritten in routes/utilityReadingRuns.test.ts.
+
+Mountain View Sept: 7 vacant spots with electric used and nobody billed (RV 05, 16, 27, 30, 33, 37, 43 — 1,808 kWh, $379.68). Reported to Nic; no action taken.
+
+Email: support@ is a Cloudflare forward; Nic replies from nic@golddoor.io until the partner enables "Allow per-user outbound gateways" (Nic will chase him). Free send-as route chosen over a paid mailbox.
