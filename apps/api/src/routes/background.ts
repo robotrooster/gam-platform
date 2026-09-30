@@ -30,7 +30,6 @@ import { archiveProviderPayload } from '../services/backgroundReportArchive'
 // S640: shared with the status poller — see services/applicationPool.ts.
 import { isPoolEligible, upsertPoolEntry } from '../services/applicationPool'
 import { applyProviderUpdate } from '../services/backgroundApplyUpdate'
-import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 
 // S83: real Stripe PaymentIntents for applicant intake fee + landlord pool
 // unlock fee. When STRIPE_SECRET_KEY is unset (dev mode without Stripe
@@ -915,53 +914,44 @@ backgroundRouter.get('/:id', requireAuth, requirePerm('tenants.run_background_ch
 // Master Schedule and the same review flow.
 // S653 (Nic): "When we approve somebody for a background check, it doesn't
 // automatically draft up a lease for me to sign... that should start another
-// workflow." Approval now calls this directly (see /decision); the route below
-// stays for the walk-up whose screening named no space, and as the retry.
-async function draftLeaseForApprovedCheck(check: any, scope: string[], bodyUnitId: string | null) {
+// workflow." And, on what the old version produced: "creating the bare lease
+// row with no tenant or document and opens an empty edit window. That edit
+// window should not even fucking exist."
+//
+// So an approval now does what the Tenants-page invite does (routes/tenants.ts
+// POST /invite): it records the household on the space as a unit-bound intent
+// and drafts the SIGNING PACKET off the unit's default template — the real
+// lease, with the applicant on it as primary, carrying the move-in date and
+// term they gave at screening — then puts it in front of the landlord to sign.
+// No unit_applications shell, no bare `leases` row, no edit form.
+const ymd = (v: any): string | null => {
+  if (!v) return null
+  if (v instanceof Date) return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`
+  return String(v).slice(0, 10)
+}
+
+async function draftLeaseForApprovedCheck(check: any, scope: string[], bodyUnitId: string | null, actorUserId: string) {
   // The unit may come from the check (a QR scan or a landlord-sent link that
   // named a space) or from the landlord picking one now for a walk-up. Either
   // way it has to belong to a company this account can read — a body-supplied
-  // id is never trusted on its own.
+  // id is never trusted on its own (draftPacketForHousehold checks the scope).
   const unitId = check.unit_id || bodyUnitId || null
   if (!unitId) throw new AppError(400, 'Pick a unit for this applicant first')
-  const unit = await queryOne<any>(
-    `SELECT u.id, u.unit_number, p.landlord_id
-       FROM units u JOIN properties p ON p.id = u.property_id
-      WHERE u.id = $1`,
-    [unitId],
-  )
-  if (!unit || !scope.includes(unit.landlord_id)) throw new AppError(404, 'Unit not found')
-
-  const applicant = await queryOne<any>(
-    'SELECT email, phone FROM users WHERE id=$1', [check.user_id])
-
-  // One application per screening — the unique index is the real guard, this
-  // just means a second click returns the first draft instead of an error.
-  let app = await queryOne<any>(
-    'SELECT id FROM unit_applications WHERE background_check_id=$1', [check.id])
-  if (!app) {
-    app = await queryOne<any>(
-      `INSERT INTO unit_applications
-         (unit_id, landlord_id, property_id, applicant_user_id, background_check_id,
-          first_name, last_name, email, phone,
-          move_in_date, monthly_income, desired_term_months, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'approved')
-       ON CONFLICT (background_check_id) WHERE background_check_id IS NOT NULL DO NOTHING
-       RETURNING id`,
-      [
-        unit.id, unit.landlord_id, check.property_id || null, check.user_id, check.id,
-        check.first_name, check.last_name, applicant?.email || '', applicant?.phone || null,
-        check.desired_move_in || null, check.monthly_income || null,
-        check.desired_month_to_month ? null : (check.desired_term_months || null),
-      ],
-    ) || await queryOne<any>(
-      'SELECT id FROM unit_applications WHERE background_check_id=$1', [check.id])
+  const { draftPacketForHousehold } = await import('../services/householdPacketDraft')
+  const out = await draftPacketForHousehold({
+    unitId, applicantUserId: check.user_id, landlordScope: scope,
+    // node-postgres hands DATE back as a Date object; format it as a day, not
+    // via String() ("Thu Oct 01 …" is not a date the drafter can read).
+    startDate: ymd(check.desired_move_in),
+    termMonths: check.desired_term_months ? Number(check.desired_term_months) : null,
+    monthToMonth: !!check.desired_month_to_month,
+    actorUserId,
+  })
+  // A walk-up's pick is remembered on the check so a second click needs no pick.
+  if (!check.unit_id) {
+    await query('UPDATE background_checks SET unit_id = $2 WHERE id = $1', [check.id, out.unitId])
   }
-  if (!app) throw new AppError(500, 'Could not file the application')
-
-  const result = await draftLeaseFromApplication(app.id)
-  if (!result.leaseId) throw new AppError(400, `Could not draft a lease (${result.reason || 'unknown'})`)
-  return { leaseId: result.leaseId, applicationId: app.id, drafted: result.drafted }
+  return out
 }
 
 backgroundRouter.post('/:id/draft-lease', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
@@ -975,7 +965,7 @@ backgroundRouter.post('/:id/draft-lease', requireAuth, requirePerm('tenants.run_
     if (check.status !== 'approved') {
       throw new AppError(400, 'Approve the screening before drafting a lease')
     }
-    res.json({ success: true, data: await draftLeaseForApprovedCheck(check, scope, req.body?.unitId || null) })
+    res.json({ success: true, data: await draftLeaseForApprovedCheck(check, scope, req.body?.unitId || null, req.user!.userId) })
   } catch (e) { next(e) }
 })
 
@@ -1063,11 +1053,11 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
     // it to review and sign. A walk-up that named no space is told so — the
     // client asks which space and calls /draft-lease. Drafting is best-effort:
     // the approval itself is recorded above whatever happens here.
-    let lease: { leaseId: string; applicationId: string; drafted: boolean } | null = null
+    let lease: Awaited<ReturnType<typeof draftLeaseForApprovedCheck>> | null = null
     let draftError: string | null = null
     if (decision === 'approved' && check.unit_id) {
       try {
-        lease = await draftLeaseForApprovedCheck({ ...check, status: 'approved' }, landlordScopeIds(req.user!), null)
+        lease = await draftLeaseForApprovedCheck({ ...check, status: 'approved' }, landlordScopeIds(req.user!), null, req.user!.userId)
       } catch (e: any) {
         draftError = e?.message || 'Could not draft a lease'
         logger.error({ err: e, checkId: check.id }, '[background] approval could not draft the lease')

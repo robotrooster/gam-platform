@@ -477,9 +477,11 @@ propertiesRouter.post('/applications/:id/onboard', requirePerm('tenants.create')
     if (!app) throw new AppError(404, 'Application not found')
     if (!canManageLandlordResource(req.user, app.landlord_id)) throw new AppError(403, 'Forbidden')
     if (!app.unit_id) throw new AppError(400, 'This application is not tied to a specific unit — assign a unit first.')
-    const result = await draftLeaseFromApplication(req.params.id)
-    if (!result.leaseId) throw new AppError(400, 'Could not draft a lease from this application.')
-    res.status(201).json({ success: true, data: { leaseId: result.leaseId, alreadyDrafted: !result.drafted } })
+    // S653: drafts the signing packet (services/householdPacketDraft), never a
+    // bare lease row. The client lands on the signing page.
+    const result = await draftLeaseFromApplication(req.params.id, req.user?.userId ?? null)
+    if (result.reason === 'no_account') throw new AppError(400, 'This applicant has no account yet — invite them from the Tenants page.')
+    res.status(201).json({ success: true, data: result })
   } catch (e) { next(e) }
 })
 

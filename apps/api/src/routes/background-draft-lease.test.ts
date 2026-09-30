@@ -1,17 +1,16 @@
 /**
- * S639 (Nic): "I've marked him as approved, but what is the next course of
- * action? I need to generate him a lease... I wanted to just, like, draft up a
- * lease, essentially, from the information on the background check."
+ * S639 → S653 (Nic): an approved screening turns into the LEASE PACKET for the
+ * landlord's signature — not a bare lease row and not an edit window.
  *
- * The screening now asks when they want to move in and how long they want the
- * space, so an approval has everything a draft needs. This route files the
- * screening as an application and hands it to the ONE lease drafter — it does
- * not grow a second one.
+ *   "It needs to draft a lease for my signature first, not just the fucking
+ *    little window that pops up for nothing."
  *
- * The thing this test is really guarding is the walk-up case: a QR applicant
- * named no unit, so the landlord picks one at the drafting step, and that pick
- * is a body-supplied id — it has to be ownership-checked, because unit numbers
- * repeat across parks and a lease filed at the wrong property is a real one.
+ * The applicant lands on the space as a unit-bound intent (the same row the
+ * Tenants-page invite writes), the packet drafts off the unit's default
+ * template with them as primary and the move-in date and term they gave at
+ * screening, and the landlord is first signer. A walk-up who scanned the park
+ * QR named no space, so the landlord picks one — a body-supplied id that has
+ * to be ownership-checked, because unit numbers repeat across parks.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
@@ -40,11 +39,7 @@ const llToken = (userId: string, landlordId: string) => jwt.sign(
   { userId, role: 'landlord', email: 'll@t.dev', landlordIds: [landlordId], permissions: {} },
   process.env.JWT_SECRET!, { expiresIn: '1h' })
 
-interface Fx {
-  landlordUserId: string; landlordId: string
-  propertyId: string; unitId: string
-  applicantUserId: string; checkId: string
-}
+type Fx = { landlordUserId: string; landlordId: string; propertyId: string; unitId: string; applicantUserId: string; checkId: string }
 
 async function seedFixture(opts: {
   status?: string
@@ -52,6 +47,7 @@ async function seedFixture(opts: {
   moveIn?: string | null
   term?: number | null
   monthToMonth?: boolean
+  template?: boolean
 } = {}): Promise<Fx> {
   const c = await getClient()
   try {
@@ -72,105 +68,127 @@ async function seedFixture(opts: {
        opts.status ?? 'approved',
        opts.moveIn === undefined ? '2026-10-01' : opts.moveIn,
        opts.term ?? null, !!opts.monthToMonth])
+    if (opts.template !== false) {
+      const t = await c.query<{ id: string }>(
+        `INSERT INTO lease_templates (landlord_id, name, page_count, unit_type, deposit_months, default_term_months, is_unit_type_default)
+         VALUES ($1, 'Primary Apartment', 1, 'apartment', 1, 12, true) RETURNING id`, [landlordId])
+      const tid = t.rows[0].id
+      for (const col of ['rent_amount', 'security_deposit', 'start_date', 'end_date', 'lease_type']) {
+        await c.query(
+          `INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y, width, height)
+           VALUES ($1, 'text', 'landlord', $2, 1, 10, 10, 100, 20)`, [tid, col])
+      }
+      await c.query(`INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y) VALUES ($1,'signature','primary','tenant_signature',1,10,100)`, [tid])
+      await c.query(`INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y) VALUES ($1,'signature','landlord','landlord_signature',1,10,180)`, [tid])
+    }
     await c.query('COMMIT')
     return { landlordUserId, landlordId, propertyId, unitId, applicantUserId, checkId: bc.rows[0].id }
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
 
+const liveDrafts = async (unitId: string) => (await db.query<any>(
+  `SELECT id, status FROM lease_documents WHERE unit_id=$1 AND document_type='original_lease' AND status <> 'voided' ORDER BY created_at`, [unitId])).rows
+const signers = async (documentId: string) => (await db.query<any>(
+  `SELECT role, order_index, user_id FROM lease_document_signers WHERE document_id=$1 ORDER BY order_index`, [documentId])).rows
+const fieldVals = async (documentId: string) => Object.fromEntries((await db.query<any>(
+  `SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1 AND lease_column IS NOT NULL`, [documentId])).rows.map((x: any) => [x.lease_column, x.value]))
+
+const draft = (fx: Fx, body: any = {}) => request(buildApp())
+  .post(`/api/background/${fx.checkId}/draft-lease`)
+  .set('Authorization', `Bearer ${llToken(fx.landlordUserId, fx.landlordId)}`)
+  .send(body)
+
 describe('POST /api/background/:id/draft-lease', () => {
-  it('drafts a fixed-term lease from an approved screening that named a unit', async () => {
+  it('drafts the signing packet with the applicant as primary and the landlord first, carrying their dates', async () => {
     const fx = await seedFixture({ withUnit: true, term: 6 })
-    const res = await request(buildApp())
-      .post(`/api/background/${fx.checkId}/draft-lease`)
-      .set('Authorization', `Bearer ${llToken(fx.landlordUserId, fx.landlordId)}`)
-      .send({})
-    expect(res.status).toBe(200)
-    const leaseId = res.body.data.leaseId
-    const l = (await db.query<any>('SELECT * FROM leases WHERE id=$1', [leaseId])).rows[0]
-    expect(l.unit_id).toBe(fx.unitId)
-    expect(l.status).toBe('pending')
-    expect(l.needs_review).toBe(true)
-    expect(l.lease_type).toBe('fixed_term')
-    expect(l.start_date.toISOString().slice(0, 10)).toBe('2026-10-01')
-    expect(l.end_date.toISOString().slice(0, 10)).toBe('2027-03-31')
-    expect(Number(l.rent_amount)).toBe(725)
+    const res = await draft(fx)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data.drafted).toBe(true)
+    const docId = res.body.data.documentId
+    expect(docId).toBeTruthy()
+
+    const s = await signers(docId)
+    expect(s.map((x: any) => x.role)).toEqual(['landlord', 'primary'])
+    expect(s[1].user_id).toBe(fx.applicantUserId)
+    const vals = await fieldVals(docId)
+    expect(vals.start_date).toBe('2026-10-01')
+    expect(vals.end_date).toBe('2027-03-31')      // 6 months, month-end snapped
+    expect(vals.lease_type).toBe('Fixed term')
+    expect(vals.rent_amount).toBe('725.00')
+
+    // The household is on the space the way an invite puts them there.
+    const intent = (await db.query(`SELECT unit_id, draft_document_id FROM pending_tenant_intents WHERE unit_id=$1 AND cancelled_at IS NULL`, [fx.unitId])).rows
+    expect(intent).toHaveLength(1)
+    expect(intent[0].draft_document_id).toBe(docId)
+    // and NO bare lease row was written outside the packet
+    expect((await db.query(`SELECT 1 FROM leases WHERE lease_source = 'application_draft'`)).rows).toHaveLength(0)
   })
 
   it('drafts month-to-month when the applicant said month to month', async () => {
     const fx = await seedFixture({ withUnit: true, monthToMonth: true })
-    const res = await request(buildApp())
-      .post(`/api/background/${fx.checkId}/draft-lease`)
-      .set('Authorization', `Bearer ${llToken(fx.landlordUserId, fx.landlordId)}`)
-      .send({})
+    const res = await draft(fx)
     expect(res.status).toBe(200)
-    const l = (await db.query<any>('SELECT lease_type, end_date FROM leases WHERE id=$1', [res.body.data.leaseId])).rows[0]
-    expect(l.lease_type).toBe('month_to_month')
-    expect(l.end_date).toBeNull()
+    const vals = await fieldVals(res.body.data.documentId)
+    expect(vals.lease_type).toBe('Month-to-month')
+    expect(vals.end_date).toBe('-')   // the document's own "no end date" mark
   })
 
-  it('takes the unit the landlord picks for a walk-up who named none', async () => {
+  it('takes the unit the landlord picks for a walk-up who named none, and remembers it', async () => {
     const fx = await seedFixture({ withUnit: false, term: 12 })
-    const res = await request(buildApp())
-      .post(`/api/background/${fx.checkId}/draft-lease`)
-      .set('Authorization', `Bearer ${llToken(fx.landlordUserId, fx.landlordId)}`)
-      .send({ unitId: fx.unitId })
+    const res = await draft(fx, { unitId: fx.unitId })
     expect(res.status).toBe(200)
-    const l = (await db.query<any>('SELECT unit_id FROM leases WHERE id=$1', [res.body.data.leaseId])).rows[0]
-    expect(l.unit_id).toBe(fx.unitId)
+    expect(res.body.data.unitId).toBe(fx.unitId)
+    const bc = (await db.query(`SELECT unit_id FROM background_checks WHERE id=$1`, [fx.checkId])).rows[0]
+    expect(bc.unit_id).toBe(fx.unitId)
   })
 
   it('refuses a unit belonging to somebody else — a picked id is never trusted', async () => {
-    const mine = await seedFixture({ withUnit: false })
-    const theirs = await seedFixture({ withUnit: false })
-    const res = await request(buildApp())
-      .post(`/api/background/${mine.checkId}/draft-lease`)
-      .set('Authorization', `Bearer ${llToken(mine.landlordUserId, mine.landlordId)}`)
-      .send({ unitId: theirs.unitId })
+    const fx = await seedFixture({ withUnit: false })
+    const other = await seedFixture({ withUnit: true })
+    const res = await draft(fx, { unitId: other.unitId })
     expect(res.status).toBe(404)
-    const n = await db.query<any>('SELECT COUNT(*)::int AS c FROM leases')
-    expect(n.rows[0].c).toBe(0)
+    expect(await liveDrafts(other.unitId)).toHaveLength(0)
   })
 
   it('will not draft before the screening is approved', async () => {
     const fx = await seedFixture({ withUnit: true, status: 'complete' })
-    const res = await request(buildApp())
-      .post(`/api/background/${fx.checkId}/draft-lease`)
-      .set('Authorization', `Bearer ${llToken(fx.landlordUserId, fx.landlordId)}`)
-      .send({})
+    const res = await draft(fx)
     expect(res.status).toBe(400)
   })
 
   it('will not read another account’s screening', async () => {
-    const mine = await seedFixture({ withUnit: true })
-    const theirs = await seedFixture({ withUnit: true })
+    const fx = await seedFixture({ withUnit: true })
+    const stranger = await seedFixture({ withUnit: true })
     const res = await request(buildApp())
-      .post(`/api/background/${theirs.checkId}/draft-lease`)
-      .set('Authorization', `Bearer ${llToken(mine.landlordUserId, mine.landlordId)}`)
+      .post(`/api/background/${fx.checkId}/draft-lease`)
+      .set('Authorization', `Bearer ${llToken(stranger.landlordUserId, stranger.landlordId)}`)
       .send({})
     expect(res.status).toBe(404)
   })
 
-  it('a second click returns the same draft instead of a second lease', async () => {
-    const fx = await seedFixture({ withUnit: true, term: 12 })
-    const app = buildApp()
-    const auth = `Bearer ${llToken(fx.landlordUserId, fx.landlordId)}`
-    const a = await request(app).post(`/api/background/${fx.checkId}/draft-lease`).set('Authorization', auth).send({})
-    const b = await request(app).post(`/api/background/${fx.checkId}/draft-lease`).set('Authorization', auth).send({})
-    expect(a.status).toBe(200)
+  it('a second click returns the same packet instead of a second one', async () => {
+    const fx = await seedFixture({ withUnit: true, term: 6 })
+    const a = await draft(fx)
+    const b = await draft(fx)
     expect(b.status).toBe(200)
-    expect(b.body.data.leaseId).toBe(a.body.data.leaseId)
-    const n = await db.query<any>('SELECT COUNT(*)::int AS c FROM leases')
-    expect(n.rows[0].c).toBe(1)
-    const m = await db.query<any>('SELECT COUNT(*)::int AS c FROM unit_applications WHERE background_check_id=$1', [fx.checkId])
-    expect(m.rows[0].c).toBe(1)
+    expect(await liveDrafts(fx.unitId)).toHaveLength(1)
+    expect(b.body.data.documentId).toBe(a.body.data.documentId)
+  })
+
+  it('says so when the unit type has no default template — the household stays on the space', async () => {
+    const fx = await seedFixture({ withUnit: true, term: 6, template: false })
+    const res = await draft(fx)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toMatchObject({ drafted: false, needsTemplate: true, documentId: null })
+    expect((await db.query(`SELECT 1 FROM pending_tenant_intents WHERE unit_id=$1 AND cancelled_at IS NULL`, [fx.unitId])).rows).toHaveLength(1)
   })
 })
 
 // S653 (Nic): "When we approve somebody for a background check, it doesn't
 // automatically draft up a lease for me to sign... that should start another
-// workflow." Approval IS the workflow now.
-describe('PATCH /api/background/:id/decision — approval drafts the lease', () => {
-  it('approving a screening that named a space drafts its lease in the same click', async () => {
+// workflow." Approval IS the workflow.
+describe('PATCH /api/background/:id/decision — approval drafts the packet', () => {
+  it('approving a screening that named a space drafts its packet in the same click', async () => {
     const fx = await seedFixture({ withUnit: true, term: 6, status: 'complete' })
     const res = await request(buildApp())
       .patch(`/api/background/${fx.checkId}/decision`)
@@ -178,10 +196,8 @@ describe('PATCH /api/background/:id/decision — approval drafts the lease', () 
       .send({ decision: 'approved' })
     expect(res.status).toBe(200)
     expect(res.body.data.needsUnit).toBe(false)
-    const leaseId = res.body.data.lease?.leaseId
-    expect(leaseId).toBeTruthy()
-    const l = (await db.query<any>('SELECT unit_id, status FROM leases WHERE id=$1', [leaseId])).rows[0]
-    expect(l).toMatchObject({ unit_id: fx.unitId, status: 'pending' })
+    expect(res.body.data.lease?.documentId).toBeTruthy()
+    expect(await liveDrafts(fx.unitId)).toHaveLength(1)
     const bc = (await db.query<any>('SELECT status FROM background_checks WHERE id=$1', [fx.checkId])).rows[0]
     expect(bc.status).toBe('approved')
   })
@@ -195,7 +211,7 @@ describe('PATCH /api/background/:id/decision — approval drafts the lease', () 
     expect(res.status).toBe(200)
     expect(res.body.data.needsUnit).toBe(true)
     expect(res.body.data.lease).toBeNull()
-    expect((await db.query('SELECT 1 FROM leases')).rows).toHaveLength(0)
+    expect(await liveDrafts(fx.unitId)).toHaveLength(0)
   })
 
   it('a denial drafts nothing', async () => {
@@ -206,6 +222,6 @@ describe('PATCH /api/background/:id/decision — approval drafts the lease', () 
       .send({ decision: 'denied' })
     expect(res.status).toBe(200)
     expect(res.body.data.lease).toBeNull()
-    expect((await db.query('SELECT 1 FROM leases')).rows).toHaveLength(0)
+    expect(await liveDrafts(fx.unitId)).toHaveLength(0)
   })
 })

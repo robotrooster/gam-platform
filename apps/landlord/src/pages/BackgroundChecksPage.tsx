@@ -131,15 +131,30 @@ function ReviewModal({ check, onClose, onDecided }: {
   )
   const choosable = (vacants as any[]).filter(u => u.status === 'vacant')
 
+  // S653 (Nic): the draft IS the signing packet. Land on it to sign — never on
+  // an edit window. No default template for the unit type → GoldSign, where
+  // one is set, and the sweep drafts the moment it exists.
+  const landOnDraft = (d: any) => {
+    if (d?.documentId) {
+      toast(`Lease drafted for ${d.unitNumber || 'the space'} — sign it and it goes to them.`)
+      window.location.href = `/sign/${d.documentId}`
+    } else if (d?.needsTemplate) {
+      toast.error(`No default lease template for that unit type yet — set one in GoldSign and the lease drafts on its own.`)
+      window.location.href = '/esign'
+    } else {
+      toast('Lease drafted — it is waiting for your signature in GoldSign.')
+      window.location.href = '/esign'
+    }
+  }
+
   const draftLease = async () => {
     setDrafting(true)
     try {
       const res: any = await apiPost(`/background/${check.id}/draft-lease`,
         pickedUnit ? { unitId: pickedUnit } : {})
-      const leaseId = res?.leaseId || res?.data?.leaseId
-      toast('Draft lease created — review the terms, then send it for signing.')
+      const d = res?.data ?? res
       onClose()
-      if (leaseId) window.location.href = `/leases?open=${leaseId}`
+      landOnDraft(d)
     } catch (e: any) {
       toast.error(e?.response?.data?.error || 'Could not draft a lease.')
       setDrafting(false)
@@ -154,11 +169,9 @@ function ReviewModal({ check, onClose, onDecided }: {
         // S653 (Nic): "When we approve somebody... it doesn't automatically draft
         // up a lease for me to sign." Now it does: the approval drafted it, so
         // go straight to it. A walk-up with no space named stays here to pick one.
-        const leaseId = res?.lease?.leaseId
-        if (leaseId) {
-          toast('Approved — lease drafted. Review the terms, then send it for signing.')
+        if (res?.lease) {
           onDecided(null)
-          window.location.href = `/leases?open=${leaseId}`
+          landOnDraft(res.lease)
           return
         }
         if (res?.needsUnit) {

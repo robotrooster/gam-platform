@@ -7,7 +7,6 @@ import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, ArrowRight } fro
 import { LEASE_TYPE_LABEL, LeaseStatus, humanize } from '@gam/shared'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
-import { LeaseFormModal } from './LeaseFormModal'
 import { LeaseOverviewModal } from './LeaseOverviewModal'
 import { RenewalDecisionModal } from './RenewalDecisionModal'
 import { LeavingModal, type LeavingLease } from '../components/LeavingModal'
@@ -41,7 +40,6 @@ export function LeasesPage() {
   const [editingLeaseId, setEditingLeaseId] = useState<string | undefined>(undefined)
   // S511 #15: confirmed leases open read-only (terms locked once signed); only
   // needs-review imports open editable so the owner can confirm defaults.
-  const [viewOnly, setViewOnly] = useState(false)
   const [carriedLease, setCarriedLease] = useState<any | null>(null)
   // S181 / A2: bill-fee modal state. Holds the lease object to bill against,
   // or null when the modal is closed.
@@ -80,7 +78,10 @@ export function LeasesPage() {
   )
   const { can } = usePerms()
 
-  // Deep-link: ?open=<leaseId> opens the edit modal directly
+  // Deep-link: ?open=<leaseId> opens the lease DETAILS. S653 (Nic): "You
+  // should not be able to edit a lease in any way, shape, or form from a screen
+  // like that." The edit form is gone — a lease changes only through a signed
+  // document (addendum, renewal, new lease).
   useEffect(() => {
     const openId = searchParams.get('open')
     if (openId && !modalOpen) {
@@ -145,15 +146,13 @@ export function LeasesPage() {
   }
 
   const openDetails = (l: any) => {
-    // S639: always read-only — see openLease above.
-    setViewOnly(true)
+    // S639/S653: always read-only — the edit form no longer exists.
     setEditingLeaseId(l.id)
     setModalOpen(true)
   }
   const closeModal = () => {
     setModalOpen(false)
     setEditingLeaseId(undefined)
-    setViewOnly(false)
     if (searchParams.get('open')) {
       searchParams.delete('open')
       setSearchParams(searchParams, { replace: true })
@@ -527,15 +526,9 @@ export function LeasesPage() {
           disabled inputs). The editable needs-review confirm path keeps the
           full form. */}
       {renewalLeaseId && <RenewalDecisionModal leaseId={renewalLeaseId} onClose={closeRenewal} />}
-      {modalOpen && (viewOnly && editingLeaseId ? (
+      {modalOpen && editingLeaseId && (
         <LeaseOverviewModal leaseId={editingLeaseId} onClose={closeModal} />
-      ) : (
-        <LeaseFormModal
-          onClose={closeModal}
-          leaseId={editingLeaseId}
-          readOnly={viewOnly}
-        />
-      ))}
+      )}
 
       {billFeeLease && (
         <BillFeeModal

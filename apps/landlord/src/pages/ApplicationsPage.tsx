@@ -37,8 +37,11 @@ export function ApplicationsPage() {
     {
       onSuccess: (res: any) => {
         qc.invalidateQueries('applications')
-        // Land on the drafted lease so the landlord reviews terms + sends to sign.
-        navigate(`/leases?open=${res.data.leaseId}`)
+        // S653: the draft IS the signing packet — land on it to sign. No
+        // default template for the unit type → GoldSign, where one is set.
+        const d = res.data
+        if (d?.documentId) navigate(`/sign/${d.documentId}`)
+        else { setError('No default lease template for that unit type yet — set one in GoldSign and the lease drafts on its own.'); navigate('/esign') }
       },
       onError: (e: any) => setError(e?.response?.data?.error || 'Could not start onboarding. Please try again.'),
     })

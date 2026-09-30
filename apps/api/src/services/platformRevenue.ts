@@ -43,6 +43,16 @@ export interface PlatformRevenueEntry {
 export async function recordPlatformRevenue(e: PlatformRevenueEntry): Promise<void> {
   try {
     if (!(e.amount > 0)) return
+    // S653 (Nic): "any demo money should not be billed. It should not exist in
+    // the system at all." A row tied to a demo or GAM-internal account is not
+    // revenue and never reaches the book — no charge, and therefore never a
+    // reversal of one either.
+    if (e.propertyId) {
+      const owner = await queryOne<{ is_system: boolean; is_demo: boolean }>(
+        `SELECT l.is_system, l.is_demo FROM properties p JOIN landlords l ON l.id = p.landlord_id WHERE p.id = $1`,
+        [e.propertyId])
+      if (owner && (owner.is_system || owner.is_demo)) return
+    }
     if (e.referenceId) {
       const dup = await queryOne<{ id: string }>(
         `SELECT id FROM platform_revenue_ledger

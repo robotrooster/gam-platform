@@ -73,7 +73,12 @@ function termPrefill(defaultTermMonths: number | null, availableDate: string | D
   const out: Record<string, string> = { start_date: start }
   const end = computeLeaseEnd(start, defaultTermMonths)
   if (end) { out.end_date = end; out.lease_type = 'fixed_term' }
-  else { out.lease_type = 'month_to_month' }
+  // S653: say "no end date" OUT LOUD. createDocumentRecord fills any blank
+  // end_date from the template's default term (suggestUnitPrefill), so a
+  // month-to-month draft that merely omitted the key came out with a 12-month
+  // end date under a "Month-to-month" label. "-" is the document's own no-end
+  // entry; execution maps it to end_date NULL.
+  else { out.lease_type = 'month_to_month'; out.end_date = '-' }
   return out
 }
 
@@ -111,10 +116,21 @@ async function landlordSigner(client: Client, landlordId: string, unitId: string
  * Best-effort per group: a missing default template notifies the landlord
  * instead of drafting.
  */
+export interface DraftTermOverride {
+  /** YYYY-MM-DD the household said they are moving in; falls back to the unit's available date. */
+  startDate?: string | null
+  /** Months they asked for; null with monthToMonth = true means month to month. */
+  termMonths?: number | null
+  monthToMonth?: boolean
+}
+
 export async function autoDraftLeasesForUnit(
   client: Client,
   unitId: string,
   createDocumentRecord: (client: any, opts: any) => Promise<any>,
+  // S653 (Nic): an approved screening already says when they want in and for
+  // how long — the draft carries THAT, not the template's default term.
+  terms?: DraftTermOverride,
 ): Promise<{ draftedDocumentIds: string[] }> {
   const unit = await client.query(
     `SELECT u.id, u.occupancy_mode, u.unit_number, u.available_date, p.landlord_id, p.name AS property_name
@@ -139,7 +155,9 @@ export async function autoDraftLeasesForUnit(
   }
   if (!tmpl) { await notifyNeedsTemplate(); return { draftedDocumentIds: [] } }
 
-  const term = termPrefill(tmpl.default_term_months, unit.available_date)
+  const term = terms
+    ? termPrefill(terms.monthToMonth ? null : (terms.termMonths ?? tmpl.default_term_months), terms.startDate ?? unit.available_date)
+    : termPrefill(tmpl.default_term_months, unit.available_date)
   const roster = await loadRoster(client, unitId)
   const drafted: string[] = []
 
