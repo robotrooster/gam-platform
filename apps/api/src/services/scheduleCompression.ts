@@ -125,7 +125,7 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
   const bookingRows = await query<any>(`
     SELECT b.id, b.unit_id, b.guest_name, b.status, b.hold_expires_at,
            b.site_reveal_sent_at, b.required_site_layout, b.required_amp_service,
-           b.locked_to_unit,
+           b.locked_to_unit, b.avoided_unit_ids,
            b.check_in::text AS check_in, b.check_out::text AS check_out,
            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id) AS has_lease
       FROM unit_bookings b
@@ -162,6 +162,8 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
     for (const s of sites) {
       if (isSiteLayoutMismatch(b.required_site_layout, s.rv_site_layout)) continue
       if (isAmpServiceMismatch(b.required_amp_service, s.rv_amp_service)) continue
+      // S653 (Nic): "they didn't like the spot they were in last year."
+      if ((b.avoided_unit_ids ?? []).includes(s.id)) continue
       if (s.timeline.some(t => overlaps(t, win))) continue
       const score = slackScore(s.timeline, win)
       if (score < bestScore) { bestScore = score; placed = s }
@@ -278,7 +280,7 @@ export async function relocateBlockingBookings(
   const winN = { checkIn: dayStr(win.checkIn), checkOut: dayStr(win.checkOut) }
   const blockers = await query<any>(`
     SELECT b.id, b.guest_name, b.status, b.hold_expires_at, b.site_reveal_sent_at,
-           b.required_site_layout, b.required_amp_service, b.locked_to_unit,
+           b.required_site_layout, b.required_amp_service, b.locked_to_unit, b.avoided_unit_ids,
            b.check_in::text AS check_in, b.check_out::text AS check_out,
            u.property_id, u.unit_number,
            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id) AS has_lease
@@ -317,7 +319,8 @@ export async function relocateBlockingBookings(
        ORDER BY unit_number`, [blk.property_id, unitId])
     const compatible = candidates.filter((c: any) =>
       !isSiteLayoutMismatch(blk.required_site_layout, c.rv_site_layout) &&
-      !isAmpServiceMismatch(blk.required_amp_service, c.rv_amp_service))
+      !isAmpServiceMismatch(blk.required_amp_service, c.rv_amp_service) &&
+      !(blk.avoided_unit_ids ?? []).includes(c.id))   // S653: never onto a site they asked not to have
     const ranked = await rankUnitsBestFit(
       compatible.map((c: any) => c.id),
       { checkIn: blk.check_in, checkOut: blk.check_out })

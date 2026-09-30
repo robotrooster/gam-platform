@@ -117,6 +117,26 @@ describe('the counter takes a reservation', () => {
     expect(b.locked_to_unit).toBe(true)
   })
 
+  // S653 (Nic): "they didn't like the spot they were in last year."
+  it('keeps the sites the guest asked not to have, and refuses to book one of them', async () => {
+    const f = await seed(3)
+    const refused = await reserve(f, f.unitIds[0], { sendDepositLink: true, avoidedUnitIds: [f.unitIds[0]] })
+    expect(refused.status).toBe(409)
+    expect(refused.body.error).toMatch(/avoid list/)
+    const ok = await reserve(f, f.unitIds[1], { sendDepositLink: true, avoidedUnitIds: [f.unitIds[0], '00000000-0000-0000-0000-000000000000'] })
+    expect(ok.status, JSON.stringify(ok.body)).toBe(201)
+    const [b] = await query<any>(`SELECT avoided_unit_ids FROM unit_bookings`)
+    expect(b.avoided_unit_ids).toEqual([f.unitIds[0]])   // the stray id was dropped
+    // and an edit cannot drag them onto it either
+    const moved = await request(buildApp()).patch(`/api/units/${f.unitIds[1]}/bookings/${ok.body.data.id}`)
+      .set('Authorization', `Bearer ${f.token}`).send({ unitId: f.unitIds[0] })
+    expect(moved.status).toBe(409)
+    const edited = await request(buildApp()).patch(`/api/units/${f.unitIds[1]}/bookings/${ok.body.data.id}`)
+      .set('Authorization', `Bearer ${f.token}`).send({ avoidedUnitIds: [f.unitIds[2]] })
+    expect(edited.status).toBe(200)
+    expect(edited.body.data.avoidedUnitIds).toEqual([f.unitIds[2]])
+  })
+
   it('an unpaid hold moves aside for a reservation being paid for', async () => {
     const f = await seed(2)
     await reserve(f, f.unitIds[0], { sendDepositLink: true })      // holds RV 01, unpaid

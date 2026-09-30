@@ -88,6 +88,27 @@ describe('compressPropertySchedule', () => {
     expect(await unitOf(b)).toBe(p.s3)
   })
 
+  // S653 (Nic): "they didn't like the spot they were in last year... an
+  // avoidance type situation."
+  it('never packs a guest onto a site they asked not to have', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8),
+      { avoided_unit_ids: [p.s1] })
+    const moves = await compressPropertySchedule(p.propertyId)
+    expect(moves).toHaveLength(1)
+    expect(await unitOf(b)).toBe(p.s2)   // RV 01 is the best fit, but it is on the list
+  })
+
+  it('relocation for an extension skips the avoided sites too', async () => {
+    const p = await seedPark()
+    const extending = await booking(p.s1, p.landlordId, plusDays(1), plusDays(5), { site_reveal_sent_at: new Date() })
+    const incoming = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8), { avoided_unit_ids: [p.s2, p.s3] })
+    const { relocateBlockingBookings } = await import('./scheduleCompression')
+    const r = await relocateBlockingBookings(p.s1, { checkIn: plusDays(1), checkOut: plusDays(7) }, extending)
+    expect(r.ok).toBe(true)
+    expect(await unitOf(incoming)).toBe(p.s4)   // RV 02 and 03 avoided → RV 04
+  })
+
   it('never moves pinned bookings — the reveal stamp is THE fence (revealed / checked-in stay; same-day UNREVEALED may move)', async () => {
     const p = await seedPark()
     const revealed = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8),

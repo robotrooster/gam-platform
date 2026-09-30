@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict ddd6lPHNiz1fw9yDVWAhzhoPd613XwtgprSm7hmmiZ25khWCbu0FbweSZT50Uxn
+\restrict 8dVZzhQAs5TZhZbppAXeVQ7zR7Ezro7nv5kr777Eswqod0G0XYlnRgczimkb6xt
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -10401,6 +10401,7 @@ CREATE TABLE public.unit_bookings (
     displaced_reason text,
     displaced_from_unit uuid,
     cancelled_at timestamp with time zone,
+    avoided_unit_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -10434,6 +10435,13 @@ COMMENT ON COLUMN public.unit_bookings.displaced_at IS 'S652: when an unpaid hol
 --
 
 COMMENT ON COLUMN public.unit_bookings.cancelled_at IS 'S652: when the cancellation happened. Nights are exempt from the platform fee only when this is strictly before check_in — a stay cancelled on or after arrival was a stay.';
+
+
+--
+-- Name: COLUMN unit_bookings.avoided_unit_ids; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.avoided_unit_ids IS 'S653: sites this guest asked not to be put on. Every placement path skips them.';
 
 
 --
@@ -28166,5 +28174,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict ddd6lPHNiz1fw9yDVWAhzhoPd613XwtgprSm7hmmiZ25khWCbu0FbweSZT50Uxn
+\unrestrict 8dVZzhQAs5TZhZbppAXeVQ7zR7Ezro7nv5kr777Eswqod0G0XYlnRgczimkb6xt
 

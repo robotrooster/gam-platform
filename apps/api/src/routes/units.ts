@@ -162,6 +162,17 @@ unitsRouter.get('/', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// S653: the avoid list is body-supplied ids. Keep only units that exist at the
+// property the stay is at — a stray id from another park (or another landlord)
+// is dropped, never stored.
+async function scopedAvoidedUnits(ids: string[], propertyId: string): Promise<string[]> {
+  const clean = Array.from(new Set(ids.filter(x => /^[0-9a-f-]{36}$/i.test(x))))
+  if (clean.length === 0) return []
+  const rows = await query<{ id: string }>(
+    `SELECT id FROM units WHERE id = ANY($1::uuid[]) AND property_id = $2`, [clean, propertyId])
+  return rows.map(r => r.id)
+}
+
 // GET /api/units/available — W-19/W-48 (S529): the ONE availability surface.
 // Free-for-window units (no overlapping non-cancelled booking / active lease
 // via services/unitAvailability) with optional RV-requirement filtering, so
@@ -1577,6 +1588,10 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       // compression move it to an equivalent one. Movable is the default — the
       // lock is for when the counter promised somebody that particular space.
       lockedToUnit: z.boolean().nullish(),
+      // S653 (Nic): sites this guest asked NOT to have ("they didn't like the
+      // spot they were in last year"). Ids, never numbers — numbers repeat
+      // across parks. Must be at this unit's property (checked below).
+      avoidedUnitIds: z.array(z.string().uuid()).max(50).nullish(),
       // S652: email the guest a deposit link and hold the site for them until
       // they pay. See the deposit block below for what "hold" means here.
       sendDepositLink: z.boolean().nullish(),
@@ -1644,6 +1659,12 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // that is itself only a hold may not — two unpaid holds on one site is just
     // a double booking with extra steps.
     const takingMoney = !wantsDeposit && !wantsRegister
+    // S653: the avoided list is a body-supplied set of ids — kept to this
+    // property, and the site being booked cannot be one of them.
+    const avoided = await scopedAvoidedUnits(body.avoidedUnitIds ?? [], unit.property_id)
+    if (avoided.includes(unit.id)) {
+      throw new AppError(409, `${unit.unit_number} is on this guest's avoid list — pick another site`)
+    }
     const conflict = await findStayConflict(unit.id, {
       checkIn: body.checkIn, checkOut: body.checkOut, ignoreUnpaidHolds: takingMoney,
     })
@@ -1692,13 +1713,13 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
         (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
          lease_type, check_in, check_out, nights, nightly_rate, weekly_rate,
          total_amount, platform_fee, notes, source, required_site_layout, required_amp_service,
-         locked_to_unit, status, hold_expires_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NULL) RETURNING *`,
+         locked_to_unit, status, hold_expires_at, avoided_unit_ids)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NULL,$21::uuid[]) RETURNING *`,
         [unit.id, unit.landlord_id, body.tenantId ?? null, body.guestName ?? null, body.guestEmail ?? null,
          body.guestPhone ?? null, body.leaseType, body.checkIn, body.checkOut, nights,
          body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
          total, platformFee, body.notes ?? null, body.source ?? 'direct', body.requiredSiteLayout ?? 'none', body.requiredAmpService ?? 'none',
-         body.lockedToUnit === true, bookingStatus])).rows[0]
+         body.lockedToUnit === true, bookingStatus, avoided])).rows[0]
       await bookingClient.query('COMMIT')
     } catch (e) {
       await bookingClient.query('ROLLBACK').catch(() => {})
@@ -1925,6 +1946,9 @@ unitsRouter.get('/:id/bookings', requirePerm(
 unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reservation'), async (req, res, next) => {
   try {
     const { status, notes, checkIn, checkOut, unitId, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, lockedToUnit } = req.body
+    // S653: an avoid list on an edit replaces the whole list (null/absent = unchanged).
+    const avoidedIn: string[] | null = Array.isArray(req.body.avoidedUnitIds)
+      ? req.body.avoidedUnitIds.filter((x: any) => typeof x === 'string').slice(0, 50) : null
     if (requiredSiteLayout != null && !RV_SITE_LAYOUTS.includes(requiredSiteLayout)) {
       throw new AppError(400, `Invalid requiredSiteLayout '${requiredSiteLayout}'`)
     }
@@ -1957,6 +1981,11 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       // Moving to another unit: the destination property must also be in scope.
       if (unitId && unitId !== booking.unit_id) {
         await assertPropertyInScope(req.user, targetUnit.property_id)
+        // S653: never onto a site they asked not to have.
+        const avoidNow = avoidedIn ?? (booking.avoided_unit_ids ?? [])
+        if (avoidNow.includes(unitId)) {
+          throw new AppError(409, `${targetUnit.unit_number} is on this guest's avoid list — pick another site`)
+        }
       }
 
       // Shared predicate (services/unitAvailability): bookings + active
@@ -1997,7 +2026,8 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
              ORDER BY unit_number`, [targetUnit.property_id, booking.unit_id])
           const compatible = candidates.filter((c: any) =>
             !isSiteLayoutMismatch(booking.required_site_layout, c.rv_site_layout) &&
-            !isAmpServiceMismatch(booking.required_amp_service, c.rv_amp_service))
+            !isAmpServiceMismatch(booking.required_amp_service, c.rv_amp_service) &&
+            !(booking.avoided_unit_ids ?? []).includes(c.id))   // S653
           const ranked = await rankUnitsBestFit(
             compatible.map((c: any) => c.id),
             { checkIn: newCheckIn, checkOut: newCheckOut })
@@ -2076,6 +2106,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           required_site_layout=COALESCE($13,required_site_layout),
           required_amp_service=COALESCE($14,required_amp_service),
           locked_to_unit=COALESCE($15,locked_to_unit),
+          avoided_unit_ids=COALESCE($16::uuid[],avoided_unit_ids),
           -- S652: stamp WHEN it was cancelled, once. Nights are exempt from
           -- GAM's fee only when this lands before arrival, so the moment has to
           -- be recorded at the moment — updated_at moves for every later edit
@@ -2090,7 +2121,8 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
        guestName ?? null, guestEmail ?? null, guestPhone ?? null,
        // Reprice zeroes the fee too (S526: reservations carry no platform fee).
        newTotal, newTotal != null ? 0 : null, requiredSiteLayout ?? null, requiredAmpService ?? null,
-       typeof lockedToUnit === 'boolean' ? lockedToUnit : null])
+       typeof lockedToUnit === 'boolean' ? lockedToUnit : null,
+       avoidedIn ? await scopedAvoidedUnits(avoidedIn, (targetUnit ?? await queryOne<any>('SELECT property_id FROM units WHERE id=$1', [booking.unit_id]))!.property_id) : null])
 
     // S526: an extension can push the stay over the lease threshold (30d, or
     // 7d in weekly-lease mode) — re-check on every edit. Best-effort.

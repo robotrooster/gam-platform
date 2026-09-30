@@ -308,7 +308,7 @@ export function SchedulePage() {
   const [newResvOpen, setNewResvOpen] = useState(false)
   const [detailBooking, setDetailBooking] = useState<any>(null)
   // Edit mode for an existing reservation (the detail panel). null = view-only.
-  const [editForm, setEditForm] = useState<{guestName:string; guestEmail:string; guestPhone:string; checkIn:string; checkOut:string; unitId:string; notes:string; requiredSiteLayout:string; requiredAmpService:string} | null>(null)
+  const [editForm, setEditForm] = useState<{guestName:string; guestEmail:string; guestPhone:string; checkIn:string; checkOut:string; unitId:string; notes:string; requiredSiteLayout:string; requiredAmpService:string; avoid:string} | null>(null)
   const [editError, setEditError] = useState('')
   const [resvError, setResvError] = useState('')
   const [resvFirst, setResvFirst] = useState('')
@@ -317,6 +317,10 @@ export function SchedulePage() {
   // pull-through) + electrical service (30/50 amp). When set, mismatched units
   // are flagged (warn, not blocked).
   const [resvLayout, setResvLayout] = useState<string>('none')
+  // S653 (Nic): "they didn't like the spot they were in last year... an
+  // avoidance type situation." Typed as site numbers the way the customer says
+  // them; matched to units at the property the stay lands on.
+  const [resvAvoid, setResvAvoid] = useState('')
   // S652: the counter's flow is a conversation, so the screen only reveals the
   // next thing once the previous one is settled — availability after dates,
   // names after a site. None of it is persisted; backing out drops all three.
@@ -693,7 +697,7 @@ export function SchedulePage() {
   // database on the way here, so there is nothing to unwind — only screen state
   // to drop, and all of it goes.
   const closeNewResv = () => {
-    setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none')
+    setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none'); setResvAvoid('')
     setShowAvail(false); setPickedUnit(null); setLockSite(false); setPayMode('link')
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
   }
@@ -722,6 +726,8 @@ export function SchedulePage() {
       requiredAmpService: resvAmp,
       // S652: movable unless the counter promised them that exact space.
       lockedToUnit: lockSite,
+      // S653: the sites they asked not to have, at the property this stay is at.
+      avoidedUnitIds: avoidedIdsAt(u.propertyId),
       // Nic's two exits. A deposit link is right for somebody who rang in
       // February about March, and absurd for a man standing at the desk with
       // his rig idling outside — he pays at the till, three feet away.
@@ -844,6 +850,12 @@ export function SchedulePage() {
         notes: vars.form.notes.trim() || null,
         requiredSiteLayout: vars.form.requiredSiteLayout,
         requiredAmpService: vars.form.requiredAmpService,
+        // S653: typed numbers → ids at the stay's property; [] clears the list.
+        avoidedUnitIds: (() => {
+          const toks = vars.form.avoid.split(/[,;\n]|\band\b/i).map(t => t.trim().toLowerCase().replace(/\s+/g, '')).filter(Boolean)
+          const propId = units.find((u:any)=>u.id===vars.form.unitId)?.propertyId
+          return units.filter((u:any)=>u.propertyId===propId && toks.includes(String(u.unitNumber||'').toLowerCase().replace(/\s+/g,''))).map((u:any)=>u.id)
+        })(),
       }),
     {
       onSuccess: (resp:any) => {
@@ -864,6 +876,7 @@ export function SchedulePage() {
           unitId: b?.unitId ?? prev.unitId,
           unitNumber: units.find((u:any)=>u.id===(b?.unitId))?.unitNumber ?? prev.unitNumber,
           notes: b?.notes ?? prev.notes,
+          avoidedUnitIds: b?.avoidedUnitIds ?? prev.avoidedUnitIds,
         } : prev)
         setEditForm(null); setEditError('')
       },
@@ -880,6 +893,7 @@ export function SchedulePage() {
       checkIn: dayOnly(d.checkIn), checkOut: dayOnly(d.checkOut), unitId: d.unitId, notes: d.notes || '',
       requiredSiteLayout: d.requiredSiteLayout || 'none',
       requiredAmpService: d.requiredAmpService || 'none',
+      avoid: (d.avoidedUnitIds || []).map((id:string)=>unitNumberOf(id)).filter(Boolean).join(', '),
     })
   }
 
@@ -1105,11 +1119,16 @@ export function SchedulePage() {
   }
   const blockingBookings = (u: any) => bookings.filter((b: any) =>
     b.unitId === u.id && b.status !== 'cancelled' && overlapsStay(b))
+  // S653: "RV 12, RV 14" → the units at any listed property whose number
+  // matches. Ids are resolved per property at submit time (numbers repeat).
+  const avoidTokens = resvAvoid.split(/[,;\n]|\band\b/i).map(t => t.trim().toLowerCase().replace(/\s+/g, '')).filter(Boolean)
+  const isAvoided = (u: any) => avoidTokens.includes(String(u.unitNumber || '').toLowerCase().replace(/\s+/g, ''))
+  const avoidedIdsAt = (propertyId: string) => units.filter((u: any) => u.propertyId === propertyId && isAvoided(u)).map((u: any) => u.id)
   const freeUnits = !datesValid ? [] : units.filter((u: any) =>
-    bookableFor(u) && blockingBookings(u).length === 0)
+    bookableFor(u) && blockingBookings(u).length === 0 && !isAvoided(u))
   // Blocked ONLY by holds nobody has paid for.
   const heldUnpaidUnits = !datesValid ? [] : units.filter((u: any) => {
-    if (!bookableFor(u)) return false
+    if (!bookableFor(u) || isAvoided(u)) return false
     const blockers = blockingBookings(u)
     return blockers.length > 0
       && blockers.every((b: any) => b.status === 'tentative' && !b.depositPaidAt)
@@ -2396,6 +2415,8 @@ export function SchedulePage() {
                     </div>
                   </div>
                   {editReasons.length>0 && <div style={{fontSize:'.7rem',color:'var(--amber)'}}>⚠ Unit {eu?.unitNumber}: {editReasons.join('; ')}. You can still save.</div>}
+                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Sites to avoid</div>
+                    <input className="form-input" style={{width:'100%'}} placeholder="e.g. RV 12, RV 14" value={editForm!.avoid} onChange={e=>setEditForm(s=>s&&({...s,avoid:e.target.value}))} /></div>
                   <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
                     <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Check-in</div><input className="form-input" type="date" style={{width:'100%'}} value={editForm!.checkIn} onChange={e=>setEditForm(s=>s&&({...s,checkIn:e.target.value}))} /></div>
                     <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Check-out</div><input className="form-input" type="date" style={{width:'100%'}} value={editForm!.checkOut} onChange={e=>setEditForm(s=>s&&({...s,checkOut:e.target.value}))} /></div>
@@ -2436,6 +2457,7 @@ export function SchedulePage() {
                   </div></>
                 )}
                 <div style={{color:'var(--text-3)'}}>Status</div><div>{humanize(d.status)}</div>
+                {!isLease && (d.avoidedUnitIds||[]).length>0 && <><div style={{color:'var(--text-3)'}}>Avoids</div><div>{(d.avoidedUnitIds as string[]).map(id=>unitNumberOf(id)).filter(Boolean).join(', ')}</div></>}
                 {d.notes && <><div style={{color:'var(--text-3)'}}>Notes</div><div>{d.notes}</div></>}
               </div>
               {isLease ? (
@@ -2540,6 +2562,19 @@ export function SchedulePage() {
                       {RV_AMP_SERVICES.filter(a=>a!=='both').map(a=><option key={a} value={a}>{a==='none'?'Any service':RV_AMP_SERVICE_LABEL[a]}</option>)}
                     </select>
                   </div>
+                </div>
+
+                <div style={{marginTop:10}}>
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Sites to avoid (optional)</div>
+                  <input className="form-input" style={{width:'100%'}} placeholder="e.g. RV 12, RV 14 — spots they don't want again"
+                    value={resvAvoid} onChange={e=>{ setResvAvoid(e.target.value); setPickedUnit(null) }} />
+                  {avoidTokens.length>0 && (
+                    <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:4}}>
+                      {(() => { const hit = units.filter(isAvoided); return hit.length
+                        ? `Left out: ${Array.from(new Set(hit.map((u:any)=>u.unitNumber))).join(', ')}`
+                        : 'No site by that number here yet — check the spelling' })()}
+                    </div>
+                  )}
                 </div>
 
                 <button className="btn btn-primary" style={{width:'100%',marginTop:12}}
