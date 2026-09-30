@@ -797,6 +797,7 @@ export const UNIT_CLONE_COPIED = [
   // tenants. (Status itself still resets to vacant; this is a fact about the
   // household preserved, not an occupancy state carried over.)
   'owner_household_size',
+  'owner_occupant_name', 'owner_occupant_phone', 'owner_occupant_email',
   // S613: the propane tank is bolted to the space, and retire-and-replace is
   // that same space under a new number. Left uncopied, the replacement would
   // drop off the Record Delivery form and the next fill would have nowhere to
@@ -1294,6 +1295,11 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
       lotRentAmount:   z.number().min(0).optional(),
       // S609: household size for an OWNER-OCCUPIED unit — see the migration.
       ownerHouseholdSize: z.number().int().min(1).max(30).optional(),
+      // S653 (Nic): who is in an owner-use space, and how to reach them. Contact
+      // only — no lease, no portal, nothing billed to this person.
+      ownerOccupantName:  z.string().max(120).nullable().optional(),
+      ownerOccupantPhone: z.string().max(40).nullable().optional(),
+      ownerOccupantEmail: z.string().max(200).nullable().optional(),
       // S613 (Nic): does this space have a propane tank to fill. Set in the same
       // place as its submeters and flat charges — "all those things should be
       // selectable in the same spot even though it's not always a meter."
@@ -1402,13 +1408,20 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
         is_bookable=$18, lease_types_allowed=$19::text[], floor_level=$21,
         living_areas=$22, features=$23::jsonb,
         owner_household_size=COALESCE($24, owner_household_size),
-        has_propane_tank=COALESCE($25, has_propane_tank), updated_at=NOW()
+        has_propane_tank=COALESCE($25, has_propane_tank),
+        owner_occupant_name  = CASE WHEN $26::boolean THEN $27 ELSE owner_occupant_name END,
+        owner_occupant_phone = CASE WHEN $28::boolean THEN $29 ELSE owner_occupant_phone END,
+        owner_occupant_email = CASE WHEN $30::boolean THEN $31 ELSE owner_occupant_email END,
+        updated_at=NOW()
       WHERE id=$20 RETURNING *`,
       [unitType, bedrooms, bathrooms, sqft, rentAmount, securityDeposit, dwellingOwnership,
        isMultiLevel, isAdaAccessible, occupancyMode, rvLayout, rvAmp, storageSize,
        lotRentAmount, nightlyRate, weeklyRate, monthlyRate, isBookable, leaseTypesAllowed,
        req.params.id, floorLevel, livingAreas, JSON.stringify(features),
-       body.ownerHouseholdSize ?? null, body.hasPropaneTank ?? null])
+       body.ownerHouseholdSize ?? null, body.hasPropaneTank ?? null,
+       body.ownerOccupantName !== undefined, body.ownerOccupantName?.trim() || null,
+       body.ownerOccupantPhone !== undefined, body.ownerOccupantPhone?.trim() || null,
+       body.ownerOccupantEmail !== undefined, body.ownerOccupantEmail?.trim() || null])
 
     // S636 (Nic, DIRECTIVE): THE OTHER DIRECTION OF THE SAME RULE.
     //

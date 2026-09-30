@@ -21,9 +21,9 @@ import { Phone, Check, AlertTriangle, Users } from 'lucide-react'
  * modal to open and dismiss while a resident waits.
  */
 type Row = {
-  tenantId: string
+  tenantId: string | null          // S653: null = an owner-use space's occupant
   tenantFirst: string; tenantLast: string; tenantPhone: string | null
-  unitNumber: string | null; propertyName: string | null
+  unitNumber: string | null; propertyName: string | null; propertyId?: string | null
   contactId: string | null
   contactName: string | null
   contactPhone: string | null
@@ -87,7 +87,7 @@ export function EmergencyContactsPanel() {
 
   const missing = (rows as Row[]).filter(r => !r.contactPhone).length
 
-  const draft = (r: Row) => edit[r.tenantId] ?? {
+  const draft = (r: Row) => edit[r.tenantId ?? ''] ?? {
     name: r.contactName ?? '', phone: r.contactPhone ?? '', rel: r.contactRelationship ?? '',
   }
   const setDraft = (id: string, patch: any) =>
@@ -132,6 +132,23 @@ export function EmergencyContactsPanel() {
             </thead>
             <tbody>
               {list.map(r => {
+                // S653: an owner-use space — the occupant IS the contact; nothing to edit.
+                if (!r.tenantId) {
+                  return (
+                    <tr key={`owner:${r.propertyId}:${r.unitNumber}`}>
+                      <td>
+                        <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>{r.tenantFirst}</div>
+                        <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>owner-use space</div>
+                      </td>
+                      <td className="mono">{r.unitNumber ?? '—'}</td>
+                      <td colSpan={3} style={{ fontSize: '.8rem', color: 'var(--text-2)' }}>
+                        {r.tenantPhone ? <a href={`tel:${r.tenantPhone}`} style={{ color: 'var(--text-1)' }}>{formatPhone(r.tenantPhone)}</a> : 'No phone on file — add it on the space'}
+                      </td>
+                      <td />
+                    </tr>
+                  )
+                }
+                const tenantId = r.tenantId as string
                 const d = draft(r)
                 const state = LABEL[rank(r)]
                 const dirty = d.name !== (r.contactName ?? '')
@@ -149,7 +166,7 @@ export function EmergencyContactsPanel() {
                     <td>
                       <input className="input" style={{ minWidth: 160 }} value={d.name}
                         placeholder="Who should we call?"
-                        onChange={e => setDraft(r.tenantId, { name: e.target.value })} />
+                        onChange={e => setDraft(tenantId, { name: e.target.value })} />
                       {/* What the lease actually said, when it is not simply the
                           name — "Wife", "NA", a number with nobody attached.
                           The desk can see the question was asked and answered
@@ -170,7 +187,7 @@ export function EmergencyContactsPanel() {
                     <td>
                       <input className="input" style={{ minWidth: 140 }} value={d.phone}
                         placeholder="(520) 555-0142"
-                        onChange={e => setDraft(r.tenantId, { phone: e.target.value })} />
+                        onChange={e => setDraft(tenantId, { phone: e.target.value })} />
                       {/* S640: somebody already in the system with this name and
                           a number on file. Offered, never applied — a wrong
                           number here gets dialed on the worst day of
@@ -178,7 +195,7 @@ export function EmergencyContactsPanel() {
                       {!d.phone && r.suggestion && (
                         <button type="button" className="btn btn-ghost btn-sm"
                           style={{ marginTop: 4, padding: '2px 6px', fontSize: '.7rem' }}
-                          onClick={() => setDraft(r.tenantId, { phone: r.suggestion!.phone })}>
+                          onClick={() => setDraft(tenantId, { phone: r.suggestion!.phone })}>
                           <Phone size={11} /> use {formatPhone(r.suggestion.phone)}
                           <span style={{ color: 'var(--text-3)' }}> — {r.suggestion.context}</span>
                         </button>
@@ -187,18 +204,18 @@ export function EmergencyContactsPanel() {
                     <td>
                       <input className="input" style={{ maxWidth: 120 }} value={d.rel}
                         placeholder="Daughter"
-                        onChange={e => setDraft(r.tenantId, { rel: e.target.value })} />
+                        onChange={e => setDraft(tenantId, { rel: e.target.value })} />
                     </td>
                     <td style={{ whiteSpace: 'nowrap' }}>
                       {dirty ? (
                         <button className="btn btn-primary btn-sm" disabled={save.isLoading}
                           onClick={() => save.mutate({
-                            tenantId: r.tenantId, name: d.name, phone: d.phone, relationship: d.rel,
+                            tenantId, name: d.name, phone: d.phone, relationship: d.rel,
                           })}>Save</button>
                       ) : r.contactPhone ? (
                         <button className="btn btn-ghost btn-sm" disabled={confirm.isLoading}
                           title="Still current — nothing to change"
-                          onClick={() => confirm.mutate(r.tenantId)}>
+                          onClick={() => confirm.mutate(tenantId)}>
                           <Check size={12} /> Still good
                         </button>
                       ) : null}

@@ -113,6 +113,9 @@ export function UnitDetailPage() {
       securityDeposit: unit.securityDeposit != null ? String(unit.securityDeposit) : '',
       dwellingOwnership: unit.dwellingOwnership || 'tenant',
       ownerHouseholdSize: String(unit.ownerHouseholdSize ?? 1),
+      ownerOccupantName: unit.ownerOccupantName || '',
+      ownerOccupantPhone: unit.ownerOccupantPhone || '',
+      ownerOccupantEmail: unit.ownerOccupantEmail || '',
       isMultiLevel: !!unit.isMultiLevel,
       isAdaAccessible: !!unit.isAdaAccessible,
       floorLevel: unit.floorLevel || '',
@@ -141,6 +144,9 @@ export function UnitDetailPage() {
       securityDeposit: num(f.securityDeposit),
       dwellingOwnership: f.dwellingOwnership,
       ownerHouseholdSize: Math.max(1, Number(f.ownerHouseholdSize) || 1),
+      ownerOccupantName: f.ownerOccupantName?.trim() || null,
+      ownerOccupantPhone: f.ownerOccupantPhone?.trim() || null,
+      ownerOccupantEmail: f.ownerOccupantEmail?.trim() || null,
       isMultiLevel: f.isMultiLevel,
       isAdaAccessible: f.isAdaAccessible,
       floorLevel: f.floorLevel || null,
@@ -343,14 +349,28 @@ export function UnitDetailPage() {
                       so a headcount utility split has nobody to count — this is
                       what it weighs the unit by, and weighing it is what keeps the
                       owner's own usage off the tenants' bills. */}
-                  {unit.status === 'owner_use' && (
+                  {unit.status === 'owner_use' && (<>
                     <div className="data-row"><span className="data-key">People living here</span>
                       <input {...inpS} type="number" min={1} max={30}
                         style={{ ...inpS.style, maxWidth: 90 }}
                         value={editForm.ownerHouseholdSize}
                         onChange={e => set('ownerHouseholdSize', e.target.value)} />
                     </div>
-                  )}
+                    {/* S653 (Nic): who is actually in an owner-use space, for
+                        contact. No lease, no portal, nothing billed to them. */}
+                    <div className="data-row"><span className="data-key">Occupant</span>
+                      <input {...inpS} placeholder="Name" value={editForm.ownerOccupantName}
+                        onChange={e => set('ownerOccupantName', e.target.value)} />
+                    </div>
+                    <div className="data-row"><span className="data-key">Occupant phone</span>
+                      <input {...inpS} placeholder="Phone" value={editForm.ownerOccupantPhone}
+                        onChange={e => set('ownerOccupantPhone', e.target.value)} />
+                    </div>
+                    <div className="data-row"><span className="data-key">Occupant email</span>
+                      <input {...inpS} type="email" placeholder="Email" value={editForm.ownerOccupantEmail}
+                        onChange={e => set('ownerOccupantEmail', e.target.value)} />
+                    </div>
+                  </>)}
                   {isInterior && <>
                     <div className="data-row"><span className="data-key">Multi-level</span>
                       <select {...selS} value={editForm.isMultiLevel ? 'yes' : 'no'} onChange={e => set('isMultiLevel', e.target.value === 'yes')}>
@@ -501,6 +521,13 @@ export function UnitDetailPage() {
                 {/* S629: no "set by <subtype>" — the unit owns this number. */}
                 <span className="data-val mono">{fmt(unit.rentAmount)}/mo</span>
               </div>
+              {unit.status === 'owner_use' && (
+                <div className="data-row"><span className="data-key">Occupant</span><span className="data-val">
+                  {unit.ownerOccupantName || <span style={{ color: 'var(--text-3)' }}>— (edit to add who lives here)</span>}
+                  {unit.ownerOccupantPhone && <> · <a href={`tel:${unit.ownerOccupantPhone}`}>{unit.ownerOccupantPhone}</a></>}
+                  {unit.ownerOccupantEmail && <> · <a href={`mailto:${unit.ownerOccupantEmail}`}>{unit.ownerOccupantEmail}</a></>}
+                </span></div>
+              )}
               <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
               {UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] && <>
                 <div className="data-row"><span className="data-key">Bedrooms</span><span className="data-val">{unit.bedrooms}</span></div>

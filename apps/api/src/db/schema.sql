@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict nuSS312v5h5hU6SEMDTKKEloFo6QdsinX8Bb2wfnjGKUrAGQN7RPmmiwB1Vo6ce
+\restrict n2NWefcy66blz7yrHLgdgSruvg6fOnyubpxJmzWzQKltfEK62m3d0R9t7ieP4cf
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -10791,6 +10791,9 @@ CREATE TABLE public.units (
     has_propane_tank boolean DEFAULT false NOT NULL,
     building text,
     display_label text,
+    owner_occupant_name text,
+    owner_occupant_phone text,
+    owner_occupant_email text,
     CONSTRAINT units_building_not_blank CHECK (((building IS NULL) OR (btrim(building) <> ''::text))),
     CONSTRAINT units_dwelling_ownership_check CHECK ((dwelling_ownership = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT units_floor_level_check CHECK (((floor_level IS NULL) OR (floor_level = ANY (ARRAY['ground_floor'::text, 'upper_floor'::text, 'basement'::text, 'multi_floor'::text])))),
@@ -10879,6 +10882,13 @@ COMMENT ON COLUMN public.units.building IS 'S641: the building within the proper
 --
 
 COMMENT ON COLUMN public.units.display_label IS 'S652: what the park calls this space — "Lot 1", "Space 7". Printed on leases and shown to residents; NULL prints unit_number. NEVER used to decide what a space is or what may be put on it — unit_type does that.';
+
+
+--
+-- Name: COLUMN units.owner_occupant_name; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.units.owner_occupant_name IS 'S653: who lives in an owner-use space (contact only; read when status = owner_use).';
 
 
 --
@@ -28310,5 +28320,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict nuSS312v5h5hU6SEMDTKKEloFo6QdsinX8Bb2wfnjGKUrAGQN7RPmmiwB1Vo6ce
+\unrestrict n2NWefcy66blz7yrHLgdgSruvg6fOnyubpxJmzWzQKltfEK62m3d0R9t7ieP4cf
 

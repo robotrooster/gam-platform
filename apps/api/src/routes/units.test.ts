@@ -694,3 +694,32 @@ describe('pending_invite_count sees both invite flows', () => {
     expect(unit.pending_invite_count ?? unit.pendingInviteCount).toBe(1)
   })
 })
+
+// S653 (Nic): "on the space for mobile home three that I marked as owner use,
+// there's no way to put an occupant name in there just for contact information."
+describe('S653 owner-use occupant', () => {
+  it('stores who is in an owner-use space and lists them on the emergency roster', async () => {
+    const { seedLandlord, seedProperty, seedUnit } = await import('../test/dbHelpers')
+    const jwt = (await import('jsonwebtoken')).default
+    const c = await db.connect()
+    let landlordId = '', userId = '', unitId = ''
+    try {
+      await c.query('BEGIN')
+      const ll = await seedLandlord(c); landlordId = ll.landlordId; userId = ll.userId
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      unitId = await seedUnit(c, { propertyId, landlordId })
+      await c.query(`UPDATE units SET status='owner_use', unit_number='MH 03' WHERE id=$1`, [unitId])
+      await c.query('COMMIT')
+    } finally { c.release() }
+    const token = jwt.sign({ userId, role: 'landlord', email: 'x@t.dev', landlordIds: [landlordId], permissions: {} }, process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(buildApp()).patch(`/api/units/${unitId}/details`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ ownerOccupantName: 'Grandpa Rhoades', ownerOccupantPhone: '520-555-0100', ownerOccupantEmail: ' gp@example.com ' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const u = (await db.query(`SELECT owner_occupant_name, owner_occupant_phone, owner_occupant_email FROM units WHERE id=$1`, [unitId])).rows[0]
+    expect(u).toEqual({ owner_occupant_name: 'Grandpa Rhoades', owner_occupant_phone: '520-555-0100', owner_occupant_email: 'gp@example.com' })
+    const { emergencyContactRoster } = await import('../services/emergencyContacts')
+    const roster = await emergencyContactRoster({ landlordIds: [landlordId], propertyIds: null })
+    expect(roster.some((r: any) => r.tenant_id === null && r.tenant_first === 'Grandpa Rhoades' && r.unit_number === 'MH 03' && r.tenant_phone === '520-555-0100')).toBe(true)
+  })
+})

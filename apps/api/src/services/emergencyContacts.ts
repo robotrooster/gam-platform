@@ -223,7 +223,23 @@ export async function emergencyContactRoster(args: {
      ) ec ON TRUE
      WHERE p.landlord_id = ANY($1::uuid[])
        AND ($2::uuid[] IS NULL OR p.id = ANY($2::uuid[]))
-     ORDER BY p.name, un.unit_number`,
+     UNION ALL
+     -- S653 (Nic): an owner-use space has no lease and no roster, but somebody
+     -- is in it. They are on this list by their own name and number so the
+     -- desk can reach them; there is no separate emergency contact to keep.
+     SELECT NULL::uuid AS tenant_id,
+            un.owner_occupant_name AS tenant_first, '' AS tenant_last,
+            un.owner_occupant_phone AS tenant_phone,
+            un.unit_number, p.name AS property_name, p.id AS property_id,
+            NULL::uuid AS contact_id, NULL::text AS contact_name, NULL::text AS contact_phone,
+            'owner-use space' AS contact_relationship, NULL::text AS contact_raw,
+            'owner_use'::text AS contact_source, NULL::timestamptz AS contact_confirmed_at,
+            0 AS shared_with_count
+       FROM units un JOIN properties p ON p.id = un.property_id
+      WHERE un.status = 'owner_use' AND un.retired_at IS NULL AND un.owner_occupant_name IS NOT NULL
+        AND p.landlord_id = ANY($1::uuid[])
+        AND ($2::uuid[] IS NULL OR p.id = ANY($2::uuid[]))
+     ORDER BY property_name, unit_number`,
     [args.landlordIds, args.propertyIds],
   )
 }
