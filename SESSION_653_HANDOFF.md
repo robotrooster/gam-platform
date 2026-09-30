@@ -1,0 +1,180 @@
+# SESSION 653 HANDOFF — written 2026-09-30 (last business day of September)
+
+**READ THIS FIRST, THEN READ THE CODE.** This file is a map, not the territory. Every
+claim below about how something works was true when written, but handoffs drift and
+have been wrong before. Before acting on any statement here, open the file it points
+at and confirm. If the code disagrees with this document, the code is right.
+
+Previous handoff: `SESSION_652_HANDOFF.md` (very long; deploys 69–93 of that session
+are appended at its end and are the recent history).
+
+## State of production at handoff
+
+- Deploy 92 is live (all portals in sync). Deploy 93b was running when this was
+  written: it carries the pay-link **Adjust** editor (`PATCH /pos/pay-links/:id`),
+  cashier-cart adjustments when settling a pay link at the register, Tenants-page
+  invites drafting the lease at invite, and the agent-guard declaration for the new
+  route. **Check `git log -1` and `launchctl print gui/$UID/com.gam.api` — if 93b did
+  not finish, `bash ~/gam/deploy.sh` from a clean tree.** Deploy 93 (first attempt)
+  failed only on the actionGap guard; fixed in 93b.
+- `gam` is production. Tests only with `DB_NAME=gam_test`. Demo DB `gam_demo` is
+  migrated to `20260929150000` (it must be migrated separately — see memory).
+- October 1 invoices generate at 7am Phoenix on 2026-10-01. Mountain View's
+  September reading round is completed: 26 electric bills + the Alvarados' RV 33
+  bill (650 kWh, $136.50) + Dakota Lane's corrected RV 18 bill (481 kWh, $101.01)
+  all `billed`, riding those invoices.
+
+## What was decided / built this session (2026-09-29 → 09-30)
+
+Verify each in code; file names are where to look.
+
+1. **Utilities table** (`routes/utility.ts /recovery`): paid / covered by work trade /
+   still owed; pay-link and register utility lines count as billed back. Propane at
+   the pump excluded.
+2. **Propane delivery** (`routes/propane.ts`, `UtilityMetersPage.tsx`): gallons only at
+   the property's set rate; supplier invoice optional (margin only).
+3. **Mountain View RV 54–73** exist (out of order, "New site — being built out"),
+   back-in, 30 & 50 amp, $589/$269/$49, deposit $200, electric submeters with
+   baseline 0 dated 2026-09-30. Nic: read EVERY meter every round — never exclude
+   out-of-order sites.
+4. **Out-of-order history** (`services/outOfOrder.ts`, master schedule
+   `outOfOrderHistory`, Reports → By Property "Site downtime"). Button flips to
+   "put back in service".
+5. **Master schedule**: site column sits BESIDE the timeline (two boxes), not
+   sticky over it (`SchedulePage.tsx`, `vScrollRef` / `scrollContainerRef`).
+   Memory: gam-schedule-column-beside-not-over.
+6. **Tenant-date billing** (`jobs/tenantDateBilling.test.ts` is the rehearsal):
+   invite asks an existing resident's own due day
+   (`pending_tenant_intents.rent_due_day`); morning notice
+   `promptTenantDateMeterReads`; invoice hold uses rounds BEFORE the invoice month;
+   own-day residents' first bill = first occurrence of their day on/after the day
+   the property was added (`existingTenancyFirstDue`, anchor
+   `properties.onboarding_started_at`), NOT floored by first_billing_cycle; the 1st
+   keeps S631.
+7. **Meter reading list**: "Fix" reopens a line saved this sitting. The **blind
+   verification walk is gone** — a flagged read waits in "Readings to double-check"
+   (one window); the last one settled completes the run (`finishReadingPhase`,
+   `settleFlaggedOnRun`). `utility_reading_double_checks` is history only.
+8. **A space move bills the old space** (`services/unitMove.ts` → `billMoveOutRead`
+   on the closing read, before the lease changes unit).
+9. **Pay links = open tickets**: `GET /pos/tickets` lists open one-time links
+   (`kind: 'pay_link'`); `POST /pos/transactions` with `payLinkId` settles one at
+   the register (cart as the cashier left it; empty cart = link as sent); link
+   marked paid inside the sale. Open tickets and links on `/balances` → Front Desk
+   and outstanding list. `PATCH /pos/pay-links/:id` adjusts an open link (deploy 93b).
+   A PAID link is fixed: shortfall = new charge, surplus = credit.
+10. **Front Desk**: Tenants-page unit invites now write the unit-bound
+    `pending_tenant_intents` row (returning residents were invisible). Invoice
+    notices skip settled/void invoices.
+11. **Data corrections at Mountain View (September)**: Razo = RV 27 (pay link
+    $752.17 = site $589 + Aug 387 kWh + Sept 390 kWh; he leaves after Oct 1 — add
+    the extra days + a final RV 27 read to the link, then settle Friday); Scott Duffy
+    RV 30 = open register ticket $22.47; RV 37 read marked `billed_off_platform`;
+    RV 05/16 ignored; Alvarados corrected onto RV 33 from 2026-09-16 (RV 34 vacant,
+    its 2 kWh Sept bill voided); RV 43's Sept 30 read corrected 18462 → 18234 (typo;
+    meter unchanged since August). Donald Hamp: check recorded 9/29, lease active,
+    signature outstanding, now on the Front Desk. Dakota Lane is a man (he/him).
+12. **Email**: support@ is a Cloudflare forward to nic@golddoor.io. Replies go out as
+    nic@ until Nic's partner enables "Allow per-user outbound gateways" in the
+    golddoor.io Workspace admin; then Gmail "Send mail as" over Resend SMTP
+    (smtp.resend.com:587, user `resend`, a NEW Resend key). Free route chosen.
+13. **Card reader** (Mountain View, order 0001): shipped, arriving Oct 7–8. Nic enters
+    the tracking link and Shipped on Admin → Reader Orders; serial when it arrives.
+
+## NEXT — what Nic asked for, in his words (verbatim, 2026-09-30)
+
+> When you say build the, they're leaving on, on the lease with a date, I don't want
+> it physically on the document. Nobody's going to know when they sign the document
+> when they're leaving. That's the whole problem. They're going to come in and say,
+> hey, I'm pulling out Saturday with like maybe three or four days notice, if that. We
+> need the front desk to be able to mark it as, hey, they're leaving then. When we get
+> the final meter read, we can um, initiate uh, the final bill cycle. far as a
+> preferred spot on a wait list, um, that's yeah. So it's some people want it, some
+> people don't. Some people don't care as long as they get a spot in the park, and
+> they'll figure it out later. And other people will take the 30 and want to be on a
+> wait list for a 50. So I don't know. While we're in the middle of upgrading, I don't
+> know if that's worth doing because when we mark 50s as available after the first
+> section is done, we have to empty out the next section of the park that we're going
+> to work on, regardless of who wants the 50 or not. Because we have to dig up a whole
+> row at a time. So I I would argue that a preferred spot on a wait list is not as
+> important as just the wait list itself. Um, uh, let's see. When a vacating date is
+> recorded, the first waitlister whose date fits gets the claim. Only once the
+> resident has actually checked out. Never off the intention alone. Yes, that is good
+> for the waitlist, but it needs to be not for preferred spot because we like just
+> because a spot opens up we may be moving people internally like somebody internal
+> is going to get first priority to move versus just bringing somebody in from the
+> outside i don't know it's different people may operate differently but i always try
+> to not leave people stuck in the least ideal spots and bring new people into the
+> better spots. Um, just my philosophy to keep my existing people happy. Um, yeah,
+> let's build a thing where we can avoid spots. Um, start building it all when the
+> deploy is done. We may need to write a session handoff for context. We're at 94%, so
+> let's maybe do that so we can clear. Put my whole notes here in a in the handoff as
+> well. And then make sure we only trust the code, never whatever the handoff says,
+> because the handoff's usually like to make up one or two things that aren't real.
+
+And from the same conversation, earlier:
+
+> Okay, I thought we had the meter reads set up where they could be edited in the
+> field. [built: Fix]
+> ...
+> I want the system to draft a lease automatically if they just randomly extend...
+> People are so fucking indecisive with RV spaces. So maybe we won't do that. Maybe it
+> won't be automatic. I'll just invite them if that flow happens. [decision: NOT
+> automatic; invite from the Tenants page]
+> ...
+> How far out does the calendar block it? [answer verified in code: a lease with no
+> end date blocks the site indefinitely; no reservation can be placed behind it]
+> ...
+> the customers that aren't here need to for sure not see a space number until the
+> morning they get here. [already the rule: `revealTodaysSites` in jobs/scheduler.ts,
+> 6:30am local on arrival day; `site_reveal_sent_at` pins the booking]
+> ...
+> having an avoided spot. I had somebody they want a spot for the week of Thanksgiving,
+> but they didn't like the spot they were in last year... if there's a way to have a
+> preference, not only on a ideal site, but on a avoidance type situation.
+
+### Build list (in this order)
+
+1. **"They're leaving on…" — a FRONT DESK mark, not on the document.**
+   - Where: the Front Desk page and the lease's row on the Leases page. Permission:
+     front desk staff (`front_desk.view` / `utility.read_meters`-tier), not just the
+     landlord.
+   - Data: a vacating date on the lease (NOT a lease term; NOT on any e-sign
+     document). Suggest `leases.vacating_on date` + who/when marked. Migration +
+     `npm run migrate && npm run db:dump-schema`.
+   - Effect: until that date nothing changes. From that date the space is open on
+     the master schedule and for reservations (the packer and `findStayConflict`
+     must treat the lease as ending on `vacating_on`). On the day: the final meter
+     read (the front desk's "Meter reads due" list already handles departures —
+     `getReadsDue` in `services/utilityReadingRuns.ts`) → final bill cycle:
+     rent through that day + last electric → `generateFinalUtilityInvoice` /
+     deposit return. Check how `lease_units_in_window`, the master schedule query
+     (`routes/units.ts /schedule/master`), and `scheduleCompression.ts` read lease
+     end dates — they must all honor `vacating_on` as the end.
+   - No 30-day notice enforcement. It records what the resident said.
+2. **Avoided sites on a reservation.** Alongside the existing requirements
+   (`required_site_layout`, `required_amp_service`, `locked_to_unit`) add a list of
+   units the guest must NOT be placed on. Honor it in `scheduleCompression.ts`
+   (`rankUnitsBestFit` and the relocation path), in the staff booking form
+   (`SchedulePage.tsx` new-reservation modal) and the booking site if it lets a
+   guest pick. Show it on the reservation detail.
+3. **Waitlist — simple, property-level, dates only.** The existing waitlist
+   (`unit_booking_waitlists`, `services/propertyBooking.ts`) is per-site with a
+   1-hour claim on cancellation. Nic wants: a park-level list ("a spot, any spot,
+   for these dates"); when a space actually frees up (a resident CHECKED OUT — never
+   on the vacating intention), the landlord/desk is prompted and decides: move an
+   existing resident into the better spot first, or offer the vacated spot to the
+   first waitlister whose dates fit. Do NOT auto-claim by kind of space; do NOT build
+   a preferred-spot waitlist (the park is being dug up a row at a time). Design
+   the prompt-and-choose flow and confirm it with Nic before building the auto
+   offer.
+
+### Standing rules that bit this session (all in memory too)
+- Utilities bill in ARREARS: September usage goes on October 1. Never suggest waiting.
+- Ask before building a new mechanism; design choices and money are Nic's calls.
+- Fix what you find; never over-claim; verify in the deployed build; a cosmetic bug
+  you cannot reproduce gets a structural fix, not a "probably".
+- Never repeat "waiting on you" items at the end of every batch.
+- Talk plain; Nic is not a coder. American spelling.
+- Every deploy: `bash ~/gam/deploy.sh` (full suite, ~8 min), then commit + push +
+  append to the handoff. Don't edit code while a deploy is building.
