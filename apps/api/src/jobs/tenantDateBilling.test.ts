@@ -23,7 +23,7 @@ import { promptTenantDateMeterReads } from '../services/utilityReadingRuns'
 
 beforeEach(async () => { await cleanupAllSchema() })
 
-async function seedSite(opts: { startDate: string; rentDueDay: number; existing?: boolean; firstCycle?: string }) {
+async function seedSite(opts: { startDate: string; rentDueDay: number; existing?: boolean; firstCycle?: string; propertyAdded?: string }) {
   const c = await getClient()
   try {
     await c.query('BEGIN')
@@ -37,6 +37,9 @@ async function seedSite(opts: { startDate: string; rentDueDay: number; existing?
       `UPDATE leases SET rent_due_day = $2, needs_review = false, is_existing_tenancy = $3 WHERE id = $1`,
       [leaseId, opts.rentDueDay, !!opts.existing])
     if (opts.firstCycle) await c.query(`UPDATE properties SET first_billing_cycle = $2 WHERE id = $1`, [propertyId, opts.firstCycle])
+    // The day the property was added to GAM — the lease's start unless said.
+    await c.query(`UPDATE properties SET onboarding_started_at = ($2::date || 'T12:00:00')::timestamptz WHERE id = $1`,
+      [propertyId, opts.propertyAdded ?? opts.startDate])
     const { rows: [m] } = await c.query<any>(
       `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, rate_per_unit, digits)
        VALUES ($1, 'electric', 'E', 'submeter', 0, 0.21, 5) RETURNING id`, [propertyId])
@@ -121,18 +124,33 @@ describe('a tenant due late in the month', () => {
 
 // Gap 1. A resident who was already living there, and already due on the 15th.
 describe('an onboarding resident with their own due day', () => {
-  // Nic: "It's gonna bill the first time that the due date happens once
-  // they're onboarded."
-  it('first bill is the first time their day comes round after signing', () => {
-    expect(existingTenancyFirstDue('2026-10-05', '2026-10-01', 15)).toBe('2026-10-15')   // signed the 5th, due the 15th
-    expect(existingTenancyFirstDue('2026-10-12', '2026-10-01', 20)).toBe('2026-10-20')   // Nic's example
-    expect(existingTenancyFirstDue('2026-10-20', '2026-10-01', 20)).toBe('2026-10-20')   // signed on the day
-    expect(existingTenancyFirstDue('2026-10-25', '2026-10-01', 20)).toBe('2026-11-20')   // signed after it → next time
-    expect(existingTenancyFirstDue('2026-10-20', null, 15)).toBe('2026-11-15')
-    expect(existingTenancyFirstDue('2026-09-20', '2026-10-01', 23)).toBe('2026-10-23')   // never before the first billing month
-    // the 1st is exactly what it always was
-    expect(existingTenancyFirstDue('2026-10-05', '2026-10-01', 1)).toBe('2026-10-01')
-    expect(existingTenancyFirstDue('2026-09-20', '2026-10-01', 1)).toBe('2026-10-01')
+  // Nic: "we're only going to bill going forward from the day the property was
+  // added... if I onboard the 15th and choose October 1st as the first billing
+  // cycle... somebody on the 20th would be billed before the 1st of the month."
+  it('first bill is the first time their day comes round after the property was added', () => {
+    // Nic's example: park added Sept 15, first cycle Oct 1, resident due the 20th → Sept 20
+    expect(existingTenancyFirstDue('2026-09-15', '2026-10-01', 20, '2026-09-15')).toBe('2026-09-20')
+    // signed later than the park was added: still the park's date that counts
+    expect(existingTenancyFirstDue('2026-09-25', '2026-10-01', 20, '2026-09-15')).toBe('2026-09-20')
+    // park added after their day this month → next month
+    expect(existingTenancyFirstDue('2026-09-25', '2026-10-01', 20, '2026-09-22')).toBe('2026-10-20')
+    expect(existingTenancyFirstDue('2026-10-12', '2026-10-01', 20, '2026-10-12')).toBe('2026-10-20')
+    expect(existingTenancyFirstDue('2026-10-20', null, 20, '2026-10-20')).toBe('2026-10-20')    // added on the day
+    // nothing known about the park's date → the signing date stands in
+    expect(existingTenancyFirstDue('2026-10-25', null, 20)).toBe('2026-11-20')
+    // the 1st is exactly what it always was: the first billing cycle
+    expect(existingTenancyFirstDue('2026-09-15', '2026-10-01', 1, '2026-09-15')).toBe('2026-10-01')
+    expect(existingTenancyFirstDue('2026-10-05', '2026-10-01', 1, '2026-09-15')).toBe('2026-10-01')
+  })
+
+  it("Nic's example end to end: added Sept 15, first cycle Oct 1, due the 20th → Sept 20, then monthly", async () => {
+    const f = await seedSite({ startDate: '2026-09-15', rentDueDay: 20, existing: true, firstCycle: '2026-10-01', propertyAdded: '2026-09-15' })
+    await backfill({ from: '2026-09-01', to: '2026-11-30', leaseId: f.leaseId })
+    expect((await charges(f.leaseId)).filter(c => c.type === 'rent')).toEqual([
+      { d: '2026-09-20', type: 'rent', a: 600 },
+      { d: '2026-10-20', type: 'rent', a: 600 },
+      { d: '2026-11-20', type: 'rent', a: 600 },
+    ])
   })
 
   it('signed before their day: nothing at signing, the nightly run bills it on the day, then monthly', async () => {
@@ -145,16 +163,15 @@ describe('an onboarding resident with their own due day', () => {
     ])
   })
 
-  it('signed after their day: the day that has passed is not billed; the next one is, once', async () => {
-    // Signed the 20th two months ago, due the 15th → first bill is LAST month's
-    // 15th (already past, so signing makes it), never the 15th of the month
-    // they signed in. Two months back so the dates are in the past whatever
-    // day this runs.
+  it('signed after their day: billed for the day that passed since the park was added, and never twice', async () => {
+    // Park added the 10th two months ago; resident due the 15th signed on the
+    // 20th → their first bill is that month's 15th (already past when they
+    // signed, so signing makes it). Two months back so every date is in the
+    // past whatever day this runs.
     const start = new Date(); start.setUTCDate(20); start.setUTCMonth(start.getUTCMonth() - 2)
     const startIso = start.toISOString().slice(0, 10)
-    const first = new Date(); first.setUTCDate(15); first.setUTCMonth(first.getUTCMonth() - 1)
-    const firstIso = first.toISOString().slice(0, 10)
-    const f = await seedSite({ startDate: startIso, rentDueDay: 15, existing: true, firstCycle: startIso.slice(0, 8) + '01' })
+    const firstIso = startIso.slice(0, 8) + '15'
+    const f = await seedSite({ startDate: startIso, rentDueDay: 15, existing: true, firstCycle: startIso.slice(0, 8) + '01', propertyAdded: startIso.slice(0, 8) + '10' })
     const r = await genMoveIn({
       lease_id: f.leaseId, unit_id: f.unitId, tenant_id: f.tenantId,
       landlord_id: f.landlordId, rent_amount: 600, start_date: startIso,

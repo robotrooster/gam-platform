@@ -39,6 +39,7 @@ interface ActiveLease {
   // invoice is late-fee exempt however long they took to sign.
   is_existing_tenancy?: boolean
   first_billing_cycle?: string | null
+  property_added_on?: string | null
   // S648: the landlord's answer for this property. Only TRUE waives.
   onboarding_late_fee_waiver?: boolean
   tenant_id: string | null
@@ -238,6 +239,8 @@ const ACTIVE_LEASE_SELECT = `
            -- the DUE month. Country Acres was set to October; this job billed
            -- September on the 23rd and the late-fee job followed.
            to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
+           to_char((COALESCE(p.onboarding_started_at, p.created_at)
+                    AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on,
            l.move_in_first_month_rent::text AS move_in_first_month_rent,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
@@ -310,9 +313,16 @@ async function runGeneration(
     // The floor is on the invoice's DUE month, not on what was consumed: the
     // October 1 invoice still carries September's water and electric, because
     // utilities bill in arrears and ride whichever invoice comes next.
+    //
+    // S652 (Nic): EXCEPT a resident billed on their own day, whose floor is the
+    // day the property was added: "if I onboard the 15th... and I choose
+    // October 1st as the first billing cycle... somebody's on the 20th... they
+    // would be billed before the 1st of the month." Their floor is applied
+    // below, as their first due date.
+    const ownDay = lease.is_existing_tenancy && (Number(lease.rent_due_day) || 1) !== 1
     const floor = lease.first_billing_cycle ? lease.first_billing_cycle.slice(0, 7) + '-01' : null
     const candidateDueDates = dueDatesInRange(windowStart, windowEnd, lease.rent_due_day)
-      .filter(d => !floor || d >= floor)
+      .filter(d => ownDay || !floor || d >= floor)
     if (candidateDueDates.length === 0) continue
 
     // The move-in invoice (moveInBundle, dated lease.start_date) prorates rent
@@ -338,7 +348,7 @@ async function runGeneration(
       // the 1st does, skipped that bill entirely: a month of rent never
       // invoiced. Anything already invoiced is left alone by the (lease, due
       // date) check.
-      const firstDue = existingTenancyFirstDue(lease.start_date, lease.first_billing_cycle ?? null, dueDay)
+      const firstDue = existingTenancyFirstDue(lease.start_date, lease.first_billing_cycle ?? null, dueDay, lease.property_added_on ?? null)
       dueDates = candidateDueDates.filter(d => d >= firstDue)
     } else if (lease.is_existing_tenancy || dueDay === 1) {
       dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
@@ -1282,6 +1292,8 @@ export async function backfillInvoices(opts: BackfillOpts): Promise<InvoiceGenRe
            -- the DUE month. Country Acres was set to October; this job billed
            -- September on the 23rd and the late-fee job followed.
            to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
+           to_char((COALESCE(p.onboarding_started_at, p.created_at)
+                    AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on,
            l.move_in_first_month_rent::text AS move_in_first_month_rent,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,

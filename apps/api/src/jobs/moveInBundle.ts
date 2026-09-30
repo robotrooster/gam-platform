@@ -162,31 +162,31 @@ export function existingTenancyCycle(
  * S652 (Nic): "they let their due date be whenever they come in." The DATE of an
  * existing tenancy's first invoice, for a resident with their OWN due day.
  *
- * Nic: "if the due date is about to happen — say you're onboarding the 10th to
- * the 15th, and the tenant's due date is the 20th — it's not gonna wait till the
- * next cycle. It's gonna bill the first time that the due date happens once
- * they're onboarded." So: the first time their day comes round ON or AFTER the
- * day they signed, and never before the property's first billing month.
+ * Nic: "we're only going to bill going forward from the day the property was
+ * added... if I onboard the 15th of the month and I choose October 1st as the
+ * first billing cycle... if somebody's on the 20th or 25th, that is occurring
+ * after the onboarding of the 15th, and so they would be billed before the 1st
+ * of the month." So: the first time their day comes round on or after the day
+ * the property was added to GAM. Not the signing date — a resident who signs
+ * on the 25th at a park added on the 15th is billed for the 20th, the way a
+ * resident on the 1st who signed on the 23rd was billed for the 1st. And not
+ * the first billing cycle, which is the rule for the 1st.
  *
- * Due on the 1st keeps the S631 rule — the 1st of the cycle month, which may
- * already be past. That was Nic's decision for the 1st ("an existing tenant
- * knows when rent is due") and every park onboarded so far billed that way.
+ * Due on the 1st keeps the S631 rule — the 1st of the cycle month named by
+ * the property's first billing cycle, which may already be past.
  */
 export function existingTenancyFirstDue(
   startDate: string,
   firstBillingCycle: string | null,
   dueDay: number | null | undefined,
+  propertyAddedOn?: string | null,
 ): string {
   const day = Math.min(Math.max(Math.trunc(Number(dueDay)) || 1, 1), 28)
   if (day === 1) return existingTenancyCycle(startDate, firstBillingCycle)
   assertIsoDate(startDate, 'existingTenancyFirstDue')
-  const dd = String(day).padStart(2, '0')
-  // The first occurrence of their day on or after signing.
-  let due = startDate.slice(0, 8) + dd
-  if (due < startDate) due = nextDueDateAfter(startDate, day)
-  // Never before the property's first billing month.
-  const floor = firstBillingCycle ? String(firstBillingCycle).slice(0, 8) + dd : null
-  return floor && due < floor ? floor : due
+  const anchor = propertyAddedOn && ISO_DATE.test(propertyAddedOn) ? propertyAddedOn.slice(0, 10) : startDate
+  const due = anchor.slice(0, 8) + String(day).padStart(2, '0')
+  return due >= anchor ? due : nextDueDateAfter(anchor, day)
 }
 
 export async function generateMoveInInvoice(
@@ -237,6 +237,7 @@ export async function generateMoveInInvoice(
     onboarding_late_fee_waiver: boolean
     move_in_first_month_rent: string | null; move_in_proration: string | null
     rent_due_day: number
+    property_added_on: string | null
   }>(
     `SELECT l.lease_source, to_char(l.end_date, 'YYYY-MM-DD') AS end_date,
             COALESCE(l.is_existing_tenancy, false) AS is_existing_tenancy,
@@ -244,7 +245,10 @@ export async function generateMoveInInvoice(
             COALESCE(p.onboarding_late_fee_waiver, false) AS onboarding_late_fee_waiver,
             l.move_in_first_month_rent::text AS move_in_first_month_rent,
             l.move_in_proration::text AS move_in_proration,
-            COALESCE(l.rent_due_day, 1) AS rent_due_day
+            COALESCE(l.rent_due_day, 1) AS rent_due_day,
+            -- S652: the day the property was added to GAM, in its own time zone.
+            to_char((COALESCE(p.onboarding_started_at, p.created_at)
+                     AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on
        FROM leases l
        JOIN units u ON u.id = l.unit_id
        JOIN properties p ON p.id = u.property_id
@@ -276,7 +280,7 @@ export async function generateMoveInInvoice(
   // S652: the first time the resident's own due day comes round after signing
   // — the 1st of the cycle only when the 1st is their day.
   const invoiceDueDate = leaseMeta?.is_existing_tenancy
-    ? existingTenancyFirstDue(inputs.start_date, leaseMeta.first_billing_cycle, leaseMeta.rent_due_day)
+    ? existingTenancyFirstDue(inputs.start_date, leaseMeta.first_billing_cycle, leaseMeta.rent_due_day, leaseMeta.property_added_on)
     : inputs.start_date
 
   // S652 (Nic): "We are not in October. There shouldn't be open bills at all."
