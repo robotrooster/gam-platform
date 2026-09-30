@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict OWAQi4AjxC82J3zL79Dn4Zt6sNTYcuHcTxvMKq9WpdUeDkzUyFpmduIdFg0V9ht
+\restrict HBvNa7IUxm7BYaAJoRskOrLAW5mh2BRojb2PuORW8gBsv0dVkxH8CeDli6BksB1
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5967,6 +5967,10 @@ CREATE TABLE public.leases (
     unit_moved_on date,
     move_in_first_month_rent numeric(10,2),
     move_in_proration numeric(10,2),
+    move_out_notice_at timestamp with time zone,
+    move_out_notice_by uuid,
+    move_out_notice_note text,
+    move_out_notice_prev_end_date date,
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
     CONSTRAINT leases_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
@@ -6003,6 +6007,20 @@ COMMENT ON COLUMN public.leases.landlord_renewal_alerted_at IS 'S628: when the l
 --
 
 COMMENT ON COLUMN public.leases.is_existing_tenancy IS 'S631: this lease papers a tenancy that already existed when the landlord joined GAM, rather than a new move-in. Suppresses move-in rent proration — the first rent invoice is the next full cycle.';
+
+
+--
+-- Name: COLUMN leases.move_out_notice_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.leases.move_out_notice_at IS 'S653: when the front desk recorded that the resident said they are leaving. end_date is the day they said. NULL = no notice on file.';
+
+
+--
+-- Name: COLUMN leases.move_out_notice_prev_end_date; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.leases.move_out_notice_prev_end_date IS 'S653: what end_date was before the notice (NULL for month-to-month), restored if the notice is called off.';
 
 
 --
@@ -24609,6 +24627,14 @@ ALTER TABLE ONLY public.leases
 
 
 --
+-- Name: leases leases_move_out_notice_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.leases
+    ADD CONSTRAINT leases_move_out_notice_by_fkey FOREIGN KEY (move_out_notice_by) REFERENCES public.users(id);
+
+
+--
 -- Name: leases leases_source_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -28132,5 +28158,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict OWAQi4AjxC82J3zL79Dn4Zt6sNTYcuHcTxvMKq9WpdUeDkzUyFpmduIdFg0V9ht
+\unrestrict HBvNa7IUxm7BYaAJoRskOrLAW5mh2BRojb2PuORW8gBsv0dVkxH8CeDli6BksB1
 

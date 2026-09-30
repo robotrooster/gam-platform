@@ -37,7 +37,11 @@ const monthLabel = (cycle: any) => new Date(String(cycle).slice(0, 10) + 'T00:00
 export function ReadingWalkModal({ run, onClose, api }: { run: any; mode?: 'read' | 'verify'; onClose: () => void; api: WalkApi }) {
   const { data: meters = [], isLoading } = useQuery<any[]>(
     ['run-meters', run.id],
-    () => api.get(`/utility/reading-runs/${run.id}/meters`))
+    () => api.get(`/utility/reading-runs/${run.id}/meters`),
+    // S653: always fresh on open. The portal caches queries for five minutes and
+    // does not refetch on mount, so a walk reopened after a save showed the list
+    // from before it.
+    { staleTime: 0, refetchOnMount: 'always' })
   const [summary, setSummary] = useState<any | null>(null)
   const hasMeters = (meters as any[]).length > 0
 
@@ -160,7 +164,12 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
     : filter === 'submeters' ? !r.isMaster
     : r.utilityType === filter)
 
-  const usageOptional = (m: any) => m.rubsBasis === 'bill_amount' && !m.hasSubmeteredUnits
+  // S634/S653 (Nic): a master priced from the bill never needs a usage figure —
+  // "the actual usage on the master meter is irrelevant." The RUBS units divide
+  // the WHOLE bill; submetered units bill their own gallons. (This list still
+  // demanded a usage total when submetered units sat on the line — so Oak
+  // Park's Main master silently would not save with the bill alone.)
+  const usageOptional = (m: any) => m.rubsBasis === 'bill_amount'
   const readOk = (m: any, v: string) => m.billingMethod === 'submeter'
     ? new RegExp(`^\\d{${m.digits}}$`).test(v)
     : usageOptional(m) ? (v === '' || /^[0-9]+$/.test(v)) : /^[0-9]+$/.test(v)
@@ -171,8 +180,16 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
     const v = values[m.meterId] ?? ''
     const b = bills[m.meterId] ?? ''
     if (savingIds.has(m.meterId)) return
-    if (!readOk(m, v) || !billOk(m, b)) return
-    if (v === '' && !usageOptional(m)) return
+    // S653: say WHY a line did not save. A silent return looked like a save.
+    if (v === '' && b === '') return                         // nothing typed yet
+    if (!readOk(m, v) || (v === '' && !usageOptional(m))) {
+      setRowErr(prev => ({ ...prev, [m.meterId]: m.isMaster ? 'Enter the usage total as a whole number.' : `Enter all ${m.digits} digits as the meter shows them.` }))
+      return
+    }
+    if (!billOk(m, b)) {
+      setRowErr(prev => ({ ...prev, [m.meterId]: 'Enter the bill total in dollars, e.g. 94.01.' }))
+      return
+    }
     if (photoMissing(m)) { setRowErr(prev => ({ ...prev, [m.meterId]: 'This property requires a photo of the meter face — take it first.' })); return }
     setSavingIds(prev => new Set(prev).add(m.meterId))
     setRowErr(prev => ({ ...prev, [m.meterId]: '' }))
@@ -190,7 +207,10 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
       setFixingIds(prev => { const n = new Set(prev); n.delete(m.meterId); return n })
       // S631: keep the count on the page behind honest as each line lands —
       // two people work this list at once, and a stale number reads as a lost save.
+      // S653 (Nic): the LIST too — reopened within five minutes it showed the
+      // cached "27 read" from before the save, wanting a meter already in.
       qc.invalidateQueries(['reading-runs'])
+      qc.invalidateQueries(['run-meters', run.id])
       // The last meter tips the run into its verification phase — surface that
       // rather than leaving somebody staring at a full list wondering.
       if (r?.data?.run?.status === 'double_check') onDone({ kind: 'flagged', flagged: r.data.flagged ?? 0 })
@@ -266,7 +286,9 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
                 </div>
                 <div style={{ fontSize:'.68rem', color:'var(--text-3)' }}>
                   {UTILITY_ICONS[m.utilityType]} {m.utilityType}
-                  {m.isMaster ? ' · master — total used this cycle, off the bill' : ` · ${m.digits}-digit read`}
+                  {m.isMaster
+                    ? (m.rubsBasis === 'bill_amount' ? ' · master — enter the bill total; usage not needed' : ' · master — total used this cycle, off the bill')
+                    : ` · ${m.digits}-digit read`}
                 </div>
                 {/* S648 (Nic): read the last business day before this tenant's due date. */}
                 {m.notYet && (
@@ -302,7 +324,7 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
                   // is gone entirely next time the window opens. S652: Fix (above)
                   // reopens a line you saved in this sitting.
                   disabled={isDone || m.notYet}
-                  placeholder={isDone ? 'recorded' : m.notYet ? 'not yet' : m.isMaster ? 'usage' : '0'.repeat(m.digits)}
+                  placeholder={isDone ? 'recorded' : m.notYet ? 'not yet' : m.isMaster ? (m.rubsBasis === 'bill_amount' ? 'usage (optional)' : 'usage') : '0'.repeat(m.digits)}
                   value={values[m.meterId] ?? ''}
                   onChange={e => setValues(prev => ({ ...prev,
                     [m.meterId]: e.target.value.replace(/\D/g, '').slice(0, m.billingMethod === 'submeter' ? m.digits : 12) }))}
