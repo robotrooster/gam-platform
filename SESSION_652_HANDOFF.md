@@ -1117,3 +1117,7 @@ Nic is onboarding a park that lets "their due date be whenever they come in." Th
 Nic: "It's gonna bill the first time that the due date happens once they're onboarded." `existingTenancyFirstDue` = first occurrence of the due day on/after the signing date, floored to the property's first billing month. The 1st keeps S631 (cycle month's 1st, may be past) — Nic has NOT said whether the 1st should follow the new rule; asked.
 
 Month end: rounds opened 7am for MV (73 meters incl. 20 new), Oak Park (49), Country Acres (13). RV 54–73 have baseline 0 reads dated 2026-09-30. Open question to Nic: exclude out-of-order sites from the reading list, or staff enter 0.
+
+## Deploy 87 (2026-09-30) — own-day residents anchor to the day the property was added
+
+Nic: "we're only going to bill going forward from the day the property was added." `existingTenancyFirstDue(start, fbc, dueDay, propertyAddedOn)` — first occurrence of the day on/after `properties.onboarding_started_at` (fallback created_at, property tz); not the signing date; not floored by first_billing_cycle (the nightly floor is skipped for existing tenancies with a day ≠ 1). The 1st keeps S631. Every meter stays in every round; out-of-order sites are never excluded.
