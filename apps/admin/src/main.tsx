@@ -24,7 +24,7 @@ import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
   Scale, SlidersHorizontal, BookOpen, Lightbulb, Landmark, Mail, Send,
-  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon,
+  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck,
 } from 'lucide-react'
 import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
@@ -306,6 +306,7 @@ function Layout(){
           {!isSuperAdmin&&<NavLink to="/onboarding" className={({isActive})=>`ni${isActive?' active':''}`}><Rocket size={15}/> Onboarding</NavLink>}
           <NavLink to="/landlords" className={({isActive})=>`ni${isActive?' active':''}`}><Building2 size={15}/> Landlords</NavLink>
           <NavLink to="/tenants" className={({isActive})=>`ni${isActive?' active':''}`}><Users size={15}/> Tenants</NavLink>
+          {isSuperAdmin&&<NavLink to="/screenings" className={({isActive})=>`ni${isActive?' active':''}`}><ShieldCheck size={15}/> Screenings</NavLink>}
           {isSuperAdmin&&<NavLink to="/flexpay-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Zap size={15}/> FlexPay Requests</NavLink>}
           {isSuperAdmin&&<NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}><ClipboardList size={15}/> Property Reviews</NavLink>}
           {isSuperAdmin&&<NavLink to="/feature-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Lightbulb size={15}/> Feature Requests</NavLink>}
@@ -1592,6 +1593,110 @@ function Landlords(){
 }
 
 // ── UNITS ─────────────────────────────────────────────────────
+// ── S653 (Nic): THE PLATFORM'S SCREENING DATABASE ────────────────────────────
+// "I want a full database of everybody that the platform ever does background
+// checks on system-wide for the admin portal." Every check under every
+// landlord, read-only. The decision is the landlord's and is made on their page.
+const SCREEN_STATUS_CLASS: Record<string,string> = {
+  approved:'bg2', denied:'br', pending:'ba', awaiting_applicant:'ba', submitted:'bb',
+  processing:'bb', complete:'bg2', failed:'br', cancelled:'bmu', expired:'bmu',
+}
+const SCREEN_STATUS_LABEL: Record<string,string> = {
+  approved:'Approved', denied:'Denied', pending:'Pending', awaiting_applicant:'Awaiting applicant', submitted:'Submitted',
+  processing:'Processing', complete:'Report in', failed:'Failed', cancelled:'Cancelled', expired:'Expired',
+}
+function Screenings(){
+  const{user}=useAuth()
+  const[q,setQ]=React.useState('')
+  const[status,setStatus]=React.useState('')
+  const[landlordId,setLandlordId]=React.useState('')
+  const[offset,setOffset]=React.useState(0)
+  const limit=200
+  const params=new URLSearchParams({limit:String(limit),offset:String(offset)})
+  if(q.trim())params.set('q',q.trim()); if(status)params.set('status',status); if(landlordId)params.set('landlordId',landlordId)
+  const{data,isLoading}=useQuery<any>(['admin-screenings',q,status,landlordId,offset],()=>get('/admin/screenings?'+params.toString()),{enabled:!!user,keepPreviousData:true,refetchOnWindowFocus:false})
+  const rows:any[]=data?.rows||[]; const total:number=data?.total||0
+  const byStatus:Record<string,number>=Object.fromEntries((data?.byStatus||[]).map((r:any)=>[r.status,r.c]))
+  const[sel,setSel]=React.useState<any>(null)
+  const money=(n:any)=>n==null?'—':'$'+Number(n).toFixed(2)
+  const day=(d:any)=>d?new Date(d).toLocaleDateString():'—'
+  return(
+    <div>
+      <div className="ph"><div><h1 className="pt">Screenings</h1><p className="ps">{total.toLocaleString()} background check{total===1?'':'s'} across every landlord</p></div></div>
+      <div className="card" style={{padding:'10px 12px',marginBottom:12,display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+        <input type="text" placeholder="Applicant, email, property, landlord…" value={q} onChange={e=>{setQ(e.target.value);setOffset(0)}} style={{flex:1,minWidth:220}}/>
+        <select value={status} onChange={e=>{setStatus(e.target.value);setOffset(0)}}>
+          <option value="">Every status</option>
+          {Object.keys(SCREEN_STATUS_LABEL).map(k=><option key={k} value={k}>{SCREEN_STATUS_LABEL[k]}{byStatus[k]?` (${byStatus[k]})`:''}</option>)}
+        </select>
+        <select value={landlordId} onChange={e=>{setLandlordId(e.target.value);setOffset(0)}}>
+          <option value="">Every landlord</option>
+          {(data?.landlords||[]).map((l:any)=><option key={l.id} value={l.id}>{l.name} ({l.checks})</option>)}
+        </select>
+      </div>
+      <div className="grid2" style={{gap:16,alignItems:'start'}}>
+        <div className="card" style={{padding:0}}>
+          {isLoading&&!data?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
+            <table className="tbl">
+              <thead><tr><th>Applicant</th><th>Landlord · Property</th><th>Started</th><th>Verdict</th><th>Status</th><th>Fee</th></tr></thead>
+              <tbody>
+                {rows.length?rows.map((r:any)=>(
+                  <tr key={r.id} style={{cursor:'pointer',background:sel?.id===r.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSel(r)}>
+                    <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.firstName} {r.lastName}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.email}</div></td>
+                    <td style={{fontSize:'.72rem'}}><div>{r.landlordName||'—'}</div><div style={{color:'var(--t3)'}}>{r.propertyName||'—'}{r.unitNumber?` · ${r.unitNumber}`:''}</div></td>
+                    <td className="mono" style={{fontSize:'.72rem'}}>{day(r.createdAt)}</td>
+                    <td><span className={`badge ${r.providerResult==='clear'?'bg2':r.providerResult==='consider'?'ba':'bmu'}`}>{r.providerResult==='clear'?'Clear':r.providerResult==='consider'?'Consider':'Not back'}</span></td>
+                    <td><span className={`badge ${SCREEN_STATUS_CLASS[r.status]||'bmu'}`}>{SCREEN_STATUS_LABEL[r.status]||r.status}</span>{r.status==='approved'&&r.housed&&<span className="badge bmu" style={{marginLeft:4}}>Housed</span>}</td>
+                    <td className="mono" style={{fontSize:'.72rem'}}>{money(r.amountCharged)}{r.refundedAt?<span style={{color:'var(--amber)'}}> refunded</span>:''}</td>
+                  </tr>
+                )):<tr><td colSpan={6} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No screenings match.</td></tr>}
+              </tbody>
+            </table>
+          )}
+          {total>limit&&(
+            <div style={{display:'flex',gap:8,alignItems:'center',padding:'10px 12px',borderTop:'1px solid var(--b0)',fontSize:'.72rem',color:'var(--t3)'}}>
+              <span>{offset+1}–{Math.min(offset+limit,total)} of {total}</span>
+              <button className="btn bsm" disabled={offset===0} onClick={()=>setOffset(Math.max(0,offset-limit))}>← Newer</button>
+              <button className="btn bsm" disabled={offset+limit>=total} onClick={()=>setOffset(offset+limit)}>Older →</button>
+            </div>
+          )}
+        </div>
+        <div>
+          {!sel&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select a screening to see its record</div>}
+          {sel&&(
+            <div className="card">
+              <div style={{marginBottom:14,paddingBottom:12,borderBottom:'1px solid var(--b0)'}}>
+                <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>{sel.firstName} {sel.lastName}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{sel.email}{sel.phone?` · ${sel.phone}`:''}</div>
+                <div style={{marginTop:8,display:'flex',gap:6,flexWrap:'wrap'}}>
+                  <span className={`badge ${SCREEN_STATUS_CLASS[sel.status]||'bmu'}`}>{SCREEN_STATUS_LABEL[sel.status]||sel.status}</span>
+                  <span className={`badge ${sel.providerResult==='clear'?'bg2':sel.providerResult==='consider'?'ba':'bmu'}`}>{sel.providerName||'provider'}: {sel.providerResult||'not back'}</span>
+                  {sel.housed&&<span className="badge bmu">Housed</span>}
+                </div>
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'6px 14px',fontSize:'.78rem'}}>
+                <div style={{color:'var(--t3)'}}>Landlord</div><div>{sel.landlordName||'—'}<div style={{fontSize:'.68rem',color:'var(--t3)'}}>{sel.landlordEmail}</div></div>
+                <div style={{color:'var(--t3)'}}>Property</div><div>{sel.propertyName||'—'}{sel.unitNumber?` · ${sel.unitNumber}`:''}</div>
+                <div style={{color:'var(--t3)'}}>Started</div><div>{day(sel.createdAt)}</div>
+                <div style={{color:'var(--t3)'}}>Report in</div><div>{day(sel.webhookReceivedAt)}</div>
+                <div style={{color:'var(--t3)'}}>Decided</div><div>{day(sel.decidedAt)}{sel.decidedByName?.trim()?` by ${sel.decidedByName}`:''}</div>
+                {sel.decisionNotes&&<><div style={{color:'var(--t3)'}}>Notes</div><div>{sel.decisionNotes}</div></>}
+                <div style={{color:'var(--t3)'}}>Expires</div><div>{day(sel.expiresAt)}</div>
+                <div style={{color:'var(--t3)'}}>Wanted</div><div>{sel.desiredMoveIn?`move in ${day(sel.desiredMoveIn)}`:'—'}{sel.desiredMonthToMonth?' · month to month':sel.desiredTermMonths?` · ${sel.desiredTermMonths} months`:''}</div>
+                <div style={{color:'var(--t3)'}}>Intake score</div><div>{sel.riskLevel?`${sel.riskLevel}${sel.riskScore!=null?` · ${sel.riskScore}`:''}`:'—'}</div>
+                <div style={{color:'var(--t3)'}}>Applicant paid</div><div className="mono">{money(sel.amountCharged)}{sel.refundedAt?` · refunded ${day(sel.refundedAt)}`:''}</div>
+                <div style={{color:'var(--t3)'}}>GAM net</div><div className="mono">{money(sel.platformNet)}</div>
+                <div style={{color:'var(--t3)'}}>Provider ref</div><div className="mono" style={{fontSize:'.68rem'}}>{sel.providerRef||'—'}</div>
+              </div>
+              <div style={{marginTop:14,fontSize:'.68rem',color:'var(--t3)'}}>The report itself stays with the landlord who ordered it; this is the platform's record of the screening and its decision.</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function Units(){
   const{user}=useAuth()
   const{data:units=[],isLoading}=useQuery<any[]>('units',()=>get('/units'),{enabled:!!user,refetchOnWindowFocus:false})
@@ -4043,6 +4148,7 @@ function App(){
           <Route path="onboarding"    element={<AdminOnboardingOverview/>}/>
           <Route path="landlords"     element={<Landlords/>}/>
           <Route path="tenants"       element={<Tenants/>}/>
+          <Route path="screenings"    element={<SuperAdminGuard><Screenings/></SuperAdminGuard>}/>
           <Route path="flexpay-requests" element={<SuperAdminGuard><FlexPayRequests/></SuperAdminGuard>}/>
           <Route path="property-reviews" element={<SuperAdminGuard><PropertyReviews/></SuperAdminGuard>}/>
           <Route path="feature-requests" element={<SuperAdminGuard><FeatureRequests/></SuperAdminGuard>}/>

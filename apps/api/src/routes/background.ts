@@ -848,7 +848,24 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
         -- page and the binding the code exists to create was invisible.
         -- The unit still wins when there is one; bc.property_id is what a
         -- scan (and a pool intake) actually carries.
-        COALESCE(p.name, bcp.name) AS property_name
+        COALESCE(p.name, bcp.name) AS property_name,
+        -- S653 (Nic): "the main background checks page is only showing people
+        -- that need attention." Housed = a lease (or a live lease packet) now
+        -- exists for this applicant under this landlord — the screening did its
+        -- job. Computed here, once, so every screen sorts the same way.
+        EXISTS (
+          SELECT 1 FROM lease_tenants lt
+            JOIN leases l ON l.id = lt.lease_id
+            JOIN tenants t ON t.id = lt.tenant_id
+           WHERE t.user_id = bc.user_id AND l.landlord_id = bc.landlord_id
+             AND l.status IN ('pending', 'active')
+          UNION ALL
+          SELECT 1 FROM pending_tenant_intents pti
+            JOIN tenants t ON t.id = pti.tenant_id
+            JOIN lease_documents d ON d.id = pti.draft_document_id
+           WHERE t.user_id = bc.user_id AND pti.landlord_id = bc.landlord_id
+             AND pti.cancelled_at IS NULL AND d.status <> 'voided'
+        ) AS housed
       FROM background_checks bc
       JOIN users u ON u.id = bc.user_id
       LEFT JOIN units un ON un.id = bc.unit_id
@@ -883,6 +900,14 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
     // It was also assembled as Checkr's cost PLUS GAM's $5 margin, which puts
     // the platform's markup on a customer's screen. Nothing landlord-facing
     // breaks GAM's costs out that way.
+    // S653: which list a row belongs on. 'past' is settled — denied, expired,
+    // cancelled, failed, or approved AND housed. Everything else still needs
+    // somebody to do something: the applicant to finish, the landlord to
+    // decide, or a space to be picked and a lease drafted.
+    for (const c of checks) {
+      c.bucket = (['denied', 'expired', 'cancelled', 'failed'].includes(c.status) || (c.status === 'approved' && c.housed))
+        ? 'past' : 'attention'
+    }
     res.json({ success: true, data: checks })
   } catch (e) { next(e) }
 })

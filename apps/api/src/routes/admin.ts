@@ -1537,6 +1537,76 @@ export const tenantsListHandler = async (req: any, res: any, next: any) => {
 }
 adminRouter.get('/tenants', tenantsListHandler)
 
+// ── S653 (Nic): THE PLATFORM'S SCREENING DATABASE ────────────────────────────
+//
+//   "I want a full database of everybody that the platform ever does
+//    background checks on system-wide for the admin portal."
+//
+// Every check ever run, under every landlord, in one place. Read-only: the
+// decision belongs to the landlord (the FCRA "user" of the report) and is made
+// on their own page; this is the platform's record of it. Filters are server-
+// side so the list stays fast at any size. The report itself is never inlined
+// here — only the provider's verdict — the full report stays behind the
+// landlord's own review page.
+adminRouter.get('/screenings', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const q = z.object({
+      q:          z.string().max(120).optional(),
+      status:     z.string().max(40).optional(),
+      landlordId: z.string().uuid().optional(),
+      limit:      z.coerce.number().int().min(1).max(500).default(200),
+      offset:     z.coerce.number().int().min(0).default(0),
+    }).parse(req.query)
+    const term = (q.q ?? '').trim().toLowerCase()
+    const where = `
+      WHERE ($1 = '' OR lower(concat(bc.first_name, ' ', bc.last_name)) LIKE '%' || $1 || '%'
+             OR lower(u.email) LIKE '%' || $1 || '%'
+             OR lower(COALESCE(p.name, bcp.name, '')) LIKE '%' || $1 || '%'
+             OR lower(COALESCE(ll.business_name, '')) LIKE '%' || $1 || '%'
+             OR lower(COALESCE(lu.email, '')) LIKE '%' || $1 || '%')
+        AND ($2::text IS NULL OR bc.status = $2)
+        AND ($3::uuid IS NULL OR bc.landlord_id = $3)`
+    const from = `
+      FROM background_checks bc
+      JOIN users u ON u.id = bc.user_id
+      LEFT JOIN landlords ll ON ll.id = bc.landlord_id
+      LEFT JOIN users lu ON lu.id = ll.user_id
+      LEFT JOIN units un ON un.id = bc.unit_id
+      LEFT JOIN properties p ON p.id = un.property_id
+      LEFT JOIN properties bcp ON bcp.id = bc.property_id
+      LEFT JOIN users du ON du.id = bc.decided_by`
+    const params = [term, q.status ?? null, q.landlordId ?? null]
+    const [total] = await query<{ c: number }>(`SELECT COUNT(*)::int AS c ${from} ${where}`, params)
+    const byStatus = await query<{ status: string; c: number }>(
+      `SELECT bc.status, COUNT(*)::int AS c ${from} ${where.replace("AND ($2::text IS NULL OR bc.status = $2)", "AND ($2::text IS NULL OR TRUE)")} GROUP BY bc.status`, params)
+    const rows = await query<any>(`
+      SELECT bc.id, bc.status, bc.first_name, bc.last_name, u.email, u.phone,
+             bc.created_at, bc.webhook_received_at, bc.decided_at, bc.expires_at,
+             bc.decision_notes, bc.provider_name, bc.provider_ref,
+             bc.report_summary ->> 'result' AS provider_result,
+             bc.risk_level, bc.risk_score,
+             bc.amount_charged, bc.platform_net, bc.refunded_at,
+             bc.desired_move_in, bc.desired_term_months, bc.desired_month_to_month,
+             bc.landlord_id, COALESCE(ll.business_name, lu.email) AS landlord_name, lu.email AS landlord_email,
+             COALESCE(p.id, bcp.id) AS property_id, COALESCE(p.name, bcp.name) AS property_name,
+             un.unit_number, un.id AS unit_id,
+             concat(du.first_name, ' ', du.last_name) AS decided_by_name,
+             EXISTS (
+               SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id JOIN tenants t ON t.id = lt.tenant_id
+                WHERE t.user_id = bc.user_id AND l.landlord_id = bc.landlord_id AND l.status IN ('pending','active')
+             ) AS housed
+      ${from} ${where}
+      ORDER BY bc.created_at DESC
+      LIMIT $4 OFFSET $5`, [...params, q.limit, q.offset])
+    const landlords = await query<any>(`
+      SELECT ll.id, COALESCE(ll.business_name, lu.email) AS name, COUNT(bc.id)::int AS checks
+        FROM landlords ll JOIN users lu ON lu.id = ll.user_id
+        JOIN background_checks bc ON bc.landlord_id = ll.id
+       GROUP BY ll.id, lu.email ORDER BY 2`)
+    res.json({ success: true, data: { rows, total: total.c, byStatus, landlords, limit: q.limit, offset: q.offset } })
+  } catch (e) { next(e) }
+})
+
 // ── PROJECTED PLATFORM INCOME ─────────────────────────────────
 /**
  * S650 (Nic): "I want to see somewhere where our subscription to the platform

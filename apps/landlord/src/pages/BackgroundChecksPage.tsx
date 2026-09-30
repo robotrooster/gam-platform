@@ -24,11 +24,32 @@ export function BackgroundChecksPage() {
   const { data: checks = [], isLoading, refetch } = useQuery<any[]>('background-checks', () => apiGet('/background'))
   const [selected, setSelected] = useState<any | null>(null)
   const [denyFlow, setDenyFlow] = useState<{ checkId: string; cra: Cra | null; savedTemplate: string | null } | null>(null)
+  // S653 (Nic): "the main background checks page is only showing people that
+  // need attention." The API says which list a row is on (bucket); denied,
+  // housed, expired and cancelled sit behind the Past tab, searchable.
+  const [tab, setTab] = useState<'attention' | 'past'>('attention')
+  const [q, setQ] = useState('')
+  const term = q.trim().toLowerCase()
+  const attention = (checks as any[]).filter(c => c.bucket !== 'past')
+  const past = (checks as any[]).filter(c => c.bucket === 'past')
+  const shown = (tab === 'attention' ? attention : past).filter(c => !term ||
+    [c.firstName, c.lastName, c.email, c.unitNumber, c.propertyName].some(v => String(v ?? '').toLowerCase().includes(term)))
 
   return (
     <div>
       <div className="page-header">
-        <div><h1 className="page-title">Background Checks</h1><p className="page-subtitle">Applicant screening results</p></div>
+        <div><h1 className="page-title">Background Checks</h1><p className="page-subtitle">
+          {attention.length} need{attention.length === 1 ? 's' : ''} attention · {past.length} past
+        </p></div>
+      </div>
+      <div className="filter-bar" style={{display:'flex',gap:6,alignItems:'center',marginBottom:12}}>
+        <button type="button" className={`btn btn-sm ${tab === 'attention' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab('attention')}>
+          Needs attention ({attention.length})
+        </button>
+        <button type="button" className={`btn btn-sm ${tab === 'past' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab('past')}>
+          Past ({past.length})
+        </button>
+        <input className="input" style={{marginLeft:'auto',maxWidth:280}} placeholder="Name, email, space…" value={q} onChange={e => setQ(e.target.value)} />
       </div>
       <div className="card" style={{padding:0,overflowX:'auto'}}>
         {isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (
@@ -43,7 +64,7 @@ export function BackgroundChecksPage() {
                 gets the column and the intake score is named for what it is. */}
             <thead><tr><th>Applicant</th><th>Started</th><th>Screening</th><th>Intake score</th><th>Status</th><th></th></tr></thead>
             <tbody>
-              {checks.length ? checks.map((c: any) => (
+              {shown.length ? shown.map((c: any) => (
                 <tr key={c.id} onClick={() => setSelected(c)} style={{cursor:'pointer'}}>
                   <td style={{fontWeight:500}}>{[c.firstName, c.lastName].filter(Boolean).join(' ') || '—'}</td>
                   <td className="mono">{c.createdAt ? new Date(c.createdAt).toLocaleDateString() : '—'}</td>
@@ -62,11 +83,17 @@ export function BackgroundChecksPage() {
                       ? <span className={`badge ${c.riskLevel === 'low' ? 'badge-green' : c.riskLevel === 'medium' ? 'badge-amber' : 'badge-red'}`} title="GAM's intake plausibility score from the application form — NOT the background check result">{c.riskLevel}{c.riskScore != null ? ` · ${c.riskScore}` : ''}</span>
                       : <span style={{color:'var(--text-3)'}}>—</span>}
                   </td>
-                  <td><span className={`badge ${STATUS_MAP[c.status] || 'badge-muted'}`}>{humanize(c.status) || '—'}</span></td>
+                  <td>
+                    <span className={`badge ${STATUS_MAP[c.status] || 'badge-muted'}`}>{humanize(c.status) || '—'}</span>
+                    {c.status === 'approved' && c.housed && <span className="badge badge-muted" style={{marginLeft:4}} title="A lease exists for them">Housed</span>}
+                    {c.status === 'approved' && !c.housed && <span className="badge badge-gold" style={{marginLeft:4}} title="Approved — pick a space and draft the lease">Needs a lease</span>}
+                  </td>
                   <td style={{textAlign:'right',color:'var(--text-3)',fontSize:'.8rem'}}>Review →</td>
                 </tr>
               )) : (
-                <tr><td colSpan={5} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No background checks yet.</td></tr>
+                <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>
+                  {term ? 'Nobody matches that.' : tab === 'attention' ? 'Nobody needs anything from you right now.' : 'Nothing here yet.'}
+                </td></tr>
               )}
             </tbody>
           </table>
