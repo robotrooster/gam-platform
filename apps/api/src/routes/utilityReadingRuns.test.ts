@@ -322,6 +322,62 @@ describe('verification phase', () => {
     expect(flagged.body.data).toHaveLength(0)
   })
 
+  // S652 (Nic): "I just reviewed seven meters and then there's a verification
+  // walk that showed up with another seven meters. I don't want both windows
+  // happening." The landlord's review IS the re-check.
+  it('a landlord review of a flagged read closes its entry on the walk; the last one finishes the run', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const run = await openRun(app, f)
+    await mainWalk(app, f, run, 7000, 560) // leased meter flagged (6,000 kWh); vacant padded onto the list
+    const flagged = await request(app)
+      .get(`/api/utility/readings/flagged?propertyId=${f.propertyAId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(flagged.body.data).toHaveLength(1)
+
+    // Landlord corrects it from the review queue — a slipped digit, 7000 was 1700.
+    const resolved = await request(app)
+      .post(`/api/utility/readings/${flagged.body.data[0].id}/resolve-review`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ correctedValue: 1700 })
+    expect(resolved.status).toBe(200)
+    const dcs = await db.query<any>(
+      `SELECT meter_id, second_value, outcome FROM utility_reading_double_checks WHERE run_id = $1 ORDER BY meter_id`, [run.id])
+    const leased = dcs.rows.find(r => r.meter_id === f.meterLeased)
+    expect(Number(leased.second_value)).toBe(1700)
+    expect(leased.outcome).toBe('replaced')
+    // The walk now only wants the padding meter — not the one already reviewed.
+    const list = await request(app)
+      .get(`/api/utility/reading-runs/${run.id}/double-checks`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(list.body.data.filter((d: any) => !d.is_read).map((d: any) => d.meter_id)).toEqual([f.meterVacant])
+
+    // The last re-read on the walk finishes the run, billing from the corrected value.
+    const done = await enterDC(app, f, run.id, f.meterVacant, 561)
+    expect(done.body.data.run.status).toBe('completed')
+    const bills = await db.query(`SELECT usage_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
+    expect(Number(bills.rows[0].usage_amount)).toBe(700)   // 1700 − 1000
+  })
+
+  it('when the review settles the LAST entry on the walk, the run finishes from the review', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const run = await openRun(app, f)
+    await mainWalk(app, f, run, 7000, 560)
+    await enterDC(app, f, run.id, f.meterVacant, 561)     // the padding meter is re-read on the walk
+    const flagged = await request(app)
+      .get(`/api/utility/readings/flagged?propertyId=${f.propertyAId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    const resolved = await request(app)
+      .post(`/api/utility/readings/${flagged.body.data[0].id}/resolve-review`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({})                                            // confirmed correct
+    expect(resolved.status).toBe(200)
+    expect(resolved.body.data.run.status).toBe('completed')
+    const r = await db.query(`SELECT status FROM utility_reading_runs WHERE id = $1`, [run.id])
+    expect(r.rows[0].status).toBe('completed')
+  })
+
   it('re-read-confirmed implausible low value escalates to the landlord (rollover vs swap)', async () => {
     const app = buildApp()
     const f = await seed()

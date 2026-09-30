@@ -487,7 +487,7 @@ export async function enterDoubleCheck(runId: string, meterId: string, secondVal
 }
 
 /** S652: every read is in — the landlord approves before anything goes out. */
-async function tellLandlordBillsAreReady(runId: string) {
+export async function tellLandlordBillsAreReady(runId: string) {
   const r = await queryOne<any>(
     `SELECT r.id, r.property_id, r.billing_cycle_month, p.name, p.landlord_id, u.id AS user_id, u.email
        FROM utility_reading_runs r JOIN properties p ON p.id = r.property_id

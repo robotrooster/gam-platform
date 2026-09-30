@@ -1856,10 +1856,51 @@ utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'
          + (body.rollover ? ' (rollover)' : ''),
        !!body.rollover])
 
+    // S652 (Nic): "I just reviewed seven meters and then there's a verification
+    // walk that showed up with another seven meters. I don't want both windows
+    // happening." They were the SAME seven: a flagged read sits in the
+    // landlord's review queue AND on the run's blind re-read list, and
+    // settling it in one never told the other. Reviewing it here IS the
+    // re-check — the walk's entry closes with the landlord's answer, and when
+    // nothing is left on the list the run finishes, exactly as it does when
+    // the last re-read is typed on the walk.
+    let walkRun: any = null
+    const dc = await queryOne<any>(
+      `SELECT dc.id, dc.run_id, dc.first_value
+         FROM utility_reading_double_checks dc
+         JOIN utility_reading_runs r ON r.id = dc.run_id
+        WHERE dc.meter_id = $1 AND r.billing_cycle_month = $2 AND dc.second_value IS NULL
+          AND r.status = 'double_check'`,
+      [reading.meter_id, reading.billing_cycle_month])
+    if (dc) {
+      const finalValue = Number(updated.reading_value)
+      await query(
+        `UPDATE utility_reading_double_checks
+            SET second_value = $2, outcome = $3, entered_by_user_id = $4, entered_at = NOW()
+          WHERE id = $1`,
+        [dc.id, finalValue, finalValue === Number(dc.first_value) ? 'verified' : 'replaced', req.user!.userId])
+      // A bill built on the superseded value, not yet on an invoice, is stale.
+      if (finalValue !== Number(dc.first_value)) {
+        await query(
+          `DELETE FROM utility_bills WHERE meter_id = $1 AND billing_cycle_month = $2 AND payment_id IS NULL`,
+          [reading.meter_id, reading.billing_cycle_month])
+      }
+      const left = await queryOne<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM utility_reading_double_checks WHERE run_id = $1 AND second_value IS NULL`,
+        [dc.run_id])
+      if (left && left.n === 0) {
+        walkRun = await completeReadingRun(dc.run_id, req.user!.userId)
+        if (!walkRun || walkRun.status !== 'completed') {
+          const { tellLandlordBillsAreReady } = await import('../services/utilityReadingRuns')
+          await tellLandlordBillsAreReady(dc.run_id)
+        }
+      }
+    }
+
     // If this cycle's run already completed, the flagged meter was
     // skipped by the engine (negative usage) — re-run it now.
     let billsCreated = 0
-    const run = await queryOne<any>(
+    const run = walkRun?.status === 'completed' ? null : await queryOne<any>(
       `SELECT * FROM utility_reading_runs
         WHERE property_id = $1 AND billing_cycle_month = $2 AND status = 'completed'`,
       [reading.property_id, reading.billing_cycle_month])
@@ -1876,7 +1917,7 @@ utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'
           [reading.meter_id, reading.billing_cycle_month])
       }
     }
-    res.json({ success: true, data: { reading: updated, billsCreated } })
+    res.json({ success: true, data: { reading: updated, billsCreated, run: walkRun } })
   } catch (e) { next(e) }
 })
 
