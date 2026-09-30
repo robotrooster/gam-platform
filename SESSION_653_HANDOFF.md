@@ -220,3 +220,45 @@ And from the same conversation, earlier:
 - RV 24 water (Oak Park): Nic will fix September's $14.50 RUBS share after he
   gets the original submeter readings.
 - Next: avoided sites on reservations (build list #2), then the waitlist design.
+
+## Deploys 98–100 (2026-09-30, late afternoon)
+
+- **98** — Avoided sites on reservations (`unit_bookings.avoided_unit_ids`,
+  migration `20260930203000`; packer/relocation/create/edit guards; counter
+  form "Sites to avoid", detail "Avoids").
+- **99** — Approval = the signing packet (`services/householdPacketDraft.ts`,
+  used by `routes/background.ts` `/decision` + `/draft-lease` and by the
+  marketplace `properties/applications/:id/onboard`). The bare-lease drafter
+  and the LeaseFormModal edit window are GONE; `?open=` shows the read-only
+  details, which carries "Confirm — looks right" for needs-review imports.
+  Month-to-month drafts write `end_date='-'`. Demo/internal accounts never
+  reach `platform_revenue_ledger`. Robert Housley (RV 14, Mountain View)
+  signed by Nic: $589/mo MTM from 9/30, page 8 first month $539 / proration
+  $0 / deposit $0 — INV-2026-00045 $539 due 9/30, Oct 1 rent skipped
+  (paid at move-in), $589 from Nov 1.
+- **100** — (a) Screening lists: landlord page = Needs attention / Past
+  (`bucket` + `housed` from `GET /background`); admin **Screenings** database
+  (`GET /admin/screenings`, super-admin). (b) Money-box tags: template field
+  `money_kind` fee/deposit/prepaid (editor "This money is"); `lease_fees.money_kind`;
+  deposit boxes billed `type='deposit'` (held, returned by depositReturn —
+  `otherHeld`), prepaid boxes `revenue_owner='held'` and a payments TRIGGER
+  (`trg_prepaid_fee_follows_payment`) banks them as `lease_prepaid_credits` on
+  settlement; invoice/receipt use the box's printed label. (c) Monthly draw:
+  `leases.prepaid_monthly_draw` + `lease_prepaid_credit_draws`; cap read by
+  `prepaidDrawAvailable` in the invoice run, Pay Now (which now also SPENDS
+  prepaid after cash — that was a gap) and the desk (held share via
+  `held_payout_items` 'prepaid_draw'); `PATCH /leases/:id/prepaid-draw`;
+  Leases page "Credit draw per month…"; tenant Payments card says it.
+  (d) Owner-use occupant name/phone/email on units (details PATCH), on the
+  desk emergency roster. (e) Bill emails headline the real amount (open lines
+  − prepaid draw − account credit; covered lines struck through).
+- Ledger cleanup (data, not code): the August phantom $10 minimums, their two
+  reversals and the +$50 "correction" were all DELETED (Nic: demo money must
+  not exist), the fake August accrual for pool-intake removed, running
+  balance recomputed. Books: Aug $9.01, Sep $130 + $74.19 + $10.
+- Memory: `feedback-batch-deploys-on-nics-word` — no deploy per change; ship
+  when Nic says.
+- NEXT: waitlist design (build list #3) — awaiting Nic's answer on the
+  prompt-and-choose shape; RV 24 Oak Park September water share once Nic has
+  the original submeter readings; Razo's link Friday (extra days + final RV 27
+  read).
