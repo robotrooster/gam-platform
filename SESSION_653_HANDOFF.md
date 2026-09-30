@@ -178,3 +178,19 @@ And from the same conversation, earlier:
 - Talk plain; Nic is not a coder. American spelling.
 - Every deploy: `bash ~/gam/deploy.sh` (full suite, ~8 min), then commit + push +
   append to the handoff. Don't edit code while a deploy is building.
+
+## Deploy 94 (2026-09-30, ~1:15pm) — Oak Park water masters + RV 24 submeter
+
+- Nic's emergency: the Main master (bill_amount, has submetered units under it)
+  silently refused to save with only a bill total, and the reopened list showed
+  a 5-minute-old cached copy ("28/29" vs "27/29"). `MeterWalk.tsx`: a
+  bill_amount master takes the bill total only (usage optional); the list
+  refetches after every save (staleTime 0, refetchOnMount always); a line that
+  cannot save now says why under the line. September run at Oak Park is
+  completed (Main $94.01 → 13 units, Back Row $58 → 4 units).
+- RV 24 water submeter created (meter 70983c7e…), RV 24 removed from the Back
+  Row master. Baseline read still to be entered by Nic on the meters page.
+  September's Back Row split still carries RV 24 at $14.50 — Nic's call
+  whether to redo as a 3-way split before the Oct 1 invoices.
+- Migration `20260930170000_lease_move_out_notice.sql` committed (columns for
+  the "they're leaving on…" front-desk mark; code not built yet).
