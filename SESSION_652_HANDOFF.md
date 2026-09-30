@@ -1146,3 +1146,11 @@ Email: support@ is a Cloudflare forward; Nic replies from nic@golddoor.io until 
 - Mountain View Sept vacant-spot electric: Razo = RV 27 (link now $752.17: site + Aug 387 kWh + Sept 390 kWh); Scott Duffy RV 30 = open ticket $22.47 (107 kWh); RV 37 read marked billed_off_platform; RV 05/16 ignored; RV 33 (650 kWh) vs RV 34 (2 kWh, Alvarado lease) — Nic checking physically; RV 43 (228 kWh, nobody) — Nic checking.
 - Razo leaves after Oct 1: final read on RV 27 + prorated days to be added to his link before settling Friday.
 - Dakota Lane is a man (he/him).
+
+## Deploy 93 (2026-09-30) — pay-link adjust; invite drafts at once
+
+- `PATCH /pos/pay-links/:id` edits an OPEN one-time link (lines, discount, label); closes any open Stripe checkout at the old amount (`expirePayLinkCheckoutSession`, platform account). BalancesPage → link → **Adjust**.
+- Settling a pay link at the register charges the cashier's CART as sent (adjustments included; empty cart = link as sent); stay lines are plain amounts.
+- `/tenants/invite` (unit invite) now drafts the lease immediately via `autoDraftLeasesForUnit`, like the onboarding page.
+- Data: Alvarados corrected to RV 33 from 2026-09-16 (lease, history, document, units; leases triggers were disabled for the one UPDATE so it did not record as a move); RV 34 Sept 2 kWh bill voided; RV 33 Sept 650 kWh $136.50 billed (`scripts/oneoff/billRv33Sept.ts`) for the Oct 1 invoice. RV 43 Sept 30 read corrected 18462 → 18234 (Nic re-read; meter unchanged since August; the "usage" was a typo).
+- Rule from Nic: utilities bill in ARREARS — September usage goes on October 1, never later; a paid link is fixed (shortfall = new charge, surplus = credit). Short-stay returning guests are reservations and never touch the returning-resident allowance.
