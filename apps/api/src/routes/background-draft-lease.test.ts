@@ -165,3 +165,47 @@ describe('POST /api/background/:id/draft-lease', () => {
     expect(m.rows[0].c).toBe(1)
   })
 })
+
+// S653 (Nic): "When we approve somebody for a background check, it doesn't
+// automatically draft up a lease for me to sign... that should start another
+// workflow." Approval IS the workflow now.
+describe('PATCH /api/background/:id/decision — approval drafts the lease', () => {
+  it('approving a screening that named a space drafts its lease in the same click', async () => {
+    const fx = await seedFixture({ withUnit: true, term: 6, status: 'complete' })
+    const res = await request(buildApp())
+      .patch(`/api/background/${fx.checkId}/decision`)
+      .set('Authorization', `Bearer ${llToken(fx.landlordUserId, fx.landlordId)}`)
+      .send({ decision: 'approved' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.needsUnit).toBe(false)
+    const leaseId = res.body.data.lease?.leaseId
+    expect(leaseId).toBeTruthy()
+    const l = (await db.query<any>('SELECT unit_id, status FROM leases WHERE id=$1', [leaseId])).rows[0]
+    expect(l).toMatchObject({ unit_id: fx.unitId, status: 'pending' })
+    const bc = (await db.query<any>('SELECT status FROM background_checks WHERE id=$1', [fx.checkId])).rows[0]
+    expect(bc.status).toBe('approved')
+  })
+
+  it('a walk-up with no space named is approved and told to pick one', async () => {
+    const fx = await seedFixture({ withUnit: false, term: 6, status: 'complete' })
+    const res = await request(buildApp())
+      .patch(`/api/background/${fx.checkId}/decision`)
+      .set('Authorization', `Bearer ${llToken(fx.landlordUserId, fx.landlordId)}`)
+      .send({ decision: 'approved' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.needsUnit).toBe(true)
+    expect(res.body.data.lease).toBeNull()
+    expect((await db.query('SELECT 1 FROM leases')).rows).toHaveLength(0)
+  })
+
+  it('a denial drafts nothing', async () => {
+    const fx = await seedFixture({ withUnit: true, term: 6, status: 'complete' })
+    const res = await request(buildApp())
+      .patch(`/api/background/${fx.checkId}/decision`)
+      .set('Authorization', `Bearer ${llToken(fx.landlordUserId, fx.landlordId)}`)
+      .send({ decision: 'denied' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.lease).toBeNull()
+    expect((await db.query('SELECT 1 FROM leases')).rows).toHaveLength(0)
+  })
+})

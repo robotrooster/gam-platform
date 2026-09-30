@@ -119,7 +119,11 @@ function ReviewModal({ check, onClose, onDecided }: {
   // of the code. The park IS known, so the choice is between ITS vacant units
   // and nothing else: unit numbers repeat across parks, and a cross-property
   // list here would let one wrong click file a lease at another property.
-  const needsUnit = check.status === 'approved' && !check.unitId
+  // S653: after an approval in THIS modal the prop is stale (the list has not
+  // refetched yet), so the approved state is tracked here too.
+  const [approvedNow, setApprovedNow] = useState(false)
+  const isApproved = check.status === 'approved' || approvedNow
+  const needsUnit = isApproved && !check.unitId
   const { data: vacants = [] } = useQuery<any[]>(
     ['vacant-units', check.propertyId],
     () => apiGet(`/units?propertyId=${check.propertyId}`),
@@ -147,7 +151,23 @@ function ReviewModal({ check, onClose, onDecided }: {
     try {
       const res: any = await apiPatch(`/background/${check.id}/decision`, { decision })
       if (decision === 'approved') {
-        toast('Applicant approved.')
+        // S653 (Nic): "When we approve somebody... it doesn't automatically draft
+        // up a lease for me to sign." Now it does: the approval drafted it, so
+        // go straight to it. A walk-up with no space named stays here to pick one.
+        const leaseId = res?.lease?.leaseId
+        if (leaseId) {
+          toast('Approved — lease drafted. Review the terms, then send it for signing.')
+          onDecided(null)
+          window.location.href = `/leases?open=${leaseId}`
+          return
+        }
+        if (res?.needsUnit) {
+          toast('Approved. Which space are they taking?')
+          setApprovedNow(true)
+          setBusy('')
+          return
+        }
+        toast.error(res?.draftError ? `Approved, but the lease could not be drafted: ${res.draftError}` : 'Approved.')
         onDecided(null)
       } else {
         toast('Applicant denied. Send them an adverse-action notice.')
@@ -299,7 +319,7 @@ function ReviewModal({ check, onClose, onDecided }: {
         </div>
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onClose} disabled={!!busy}>Close</button>
-          {check.status === 'approved' && (
+          {isApproved && (
             <>
               {needsUnit && (
                 <select className="input" style={{maxWidth:220}} value={pickedUnit} onChange={e => setPickedUnit(e.target.value)}>
@@ -316,7 +336,7 @@ function ReviewModal({ check, onClose, onDecided }: {
               </button>
             </>
           )}
-          {decidable && (
+          {decidable && !approvedNow && (
             <>
               <button className="btn" style={{background:'var(--danger,#dc2626)',color:'#fff',borderColor:'var(--danger,#dc2626)'}} onClick={() => decide('denied')} disabled={!!busy}>
                 {busy === 'denied' ? 'Denying…' : 'Deny'}

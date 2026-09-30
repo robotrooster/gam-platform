@@ -913,6 +913,57 @@ backgroundRouter.get('/:id', requireAuth, requirePerm('tenants.run_background_ch
 // lease drafter — it files the screening as an application and hands it to the
 // one that has existed since S593, so both public doors converge on the same
 // Master Schedule and the same review flow.
+// S653 (Nic): "When we approve somebody for a background check, it doesn't
+// automatically draft up a lease for me to sign... that should start another
+// workflow." Approval now calls this directly (see /decision); the route below
+// stays for the walk-up whose screening named no space, and as the retry.
+async function draftLeaseForApprovedCheck(check: any, scope: string[], bodyUnitId: string | null) {
+  // The unit may come from the check (a QR scan or a landlord-sent link that
+  // named a space) or from the landlord picking one now for a walk-up. Either
+  // way it has to belong to a company this account can read — a body-supplied
+  // id is never trusted on its own.
+  const unitId = check.unit_id || bodyUnitId || null
+  if (!unitId) throw new AppError(400, 'Pick a unit for this applicant first')
+  const unit = await queryOne<any>(
+    `SELECT u.id, u.unit_number, p.landlord_id
+       FROM units u JOIN properties p ON p.id = u.property_id
+      WHERE u.id = $1`,
+    [unitId],
+  )
+  if (!unit || !scope.includes(unit.landlord_id)) throw new AppError(404, 'Unit not found')
+
+  const applicant = await queryOne<any>(
+    'SELECT email, phone FROM users WHERE id=$1', [check.user_id])
+
+  // One application per screening — the unique index is the real guard, this
+  // just means a second click returns the first draft instead of an error.
+  let app = await queryOne<any>(
+    'SELECT id FROM unit_applications WHERE background_check_id=$1', [check.id])
+  if (!app) {
+    app = await queryOne<any>(
+      `INSERT INTO unit_applications
+         (unit_id, landlord_id, property_id, applicant_user_id, background_check_id,
+          first_name, last_name, email, phone,
+          move_in_date, monthly_income, desired_term_months, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'approved')
+       ON CONFLICT (background_check_id) WHERE background_check_id IS NOT NULL DO NOTHING
+       RETURNING id`,
+      [
+        unit.id, unit.landlord_id, check.property_id || null, check.user_id, check.id,
+        check.first_name, check.last_name, applicant?.email || '', applicant?.phone || null,
+        check.desired_move_in || null, check.monthly_income || null,
+        check.desired_month_to_month ? null : (check.desired_term_months || null),
+      ],
+    ) || await queryOne<any>(
+      'SELECT id FROM unit_applications WHERE background_check_id=$1', [check.id])
+  }
+  if (!app) throw new AppError(500, 'Could not file the application')
+
+  const result = await draftLeaseFromApplication(app.id)
+  if (!result.leaseId) throw new AppError(400, `Could not draft a lease (${result.reason || 'unknown'})`)
+  return { leaseId: result.leaseId, applicationId: app.id, drafted: result.drafted }
+}
+
 backgroundRouter.post('/:id/draft-lease', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
     const scope = landlordScopeIds(req.user!)
@@ -924,51 +975,7 @@ backgroundRouter.post('/:id/draft-lease', requireAuth, requirePerm('tenants.run_
     if (check.status !== 'approved') {
       throw new AppError(400, 'Approve the screening before drafting a lease')
     }
-
-    // The unit may come from the check (a QR scan or a landlord-sent link that
-    // named a space) or from the landlord picking one now for a walk-up. Either
-    // way it has to belong to a company this account can read — a body-supplied
-    // id is never trusted on its own.
-    const unitId = check.unit_id || req.body?.unitId || null
-    if (!unitId) throw new AppError(400, 'Pick a unit for this applicant first')
-    const unit = await queryOne<any>(
-      `SELECT u.id, u.unit_number, p.landlord_id
-         FROM units u JOIN properties p ON p.id = u.property_id
-        WHERE u.id = $1`,
-      [unitId],
-    )
-    if (!unit || !scope.includes(unit.landlord_id)) throw new AppError(404, 'Unit not found')
-
-    const applicant = await queryOne<any>(
-      'SELECT email, phone FROM users WHERE id=$1', [check.user_id])
-
-    // One application per screening — the unique index is the real guard, this
-    // just means a second click returns the first draft instead of an error.
-    let app = await queryOne<any>(
-      'SELECT id FROM unit_applications WHERE background_check_id=$1', [check.id])
-    if (!app) {
-      app = await queryOne<any>(
-        `INSERT INTO unit_applications
-           (unit_id, landlord_id, property_id, applicant_user_id, background_check_id,
-            first_name, last_name, email, phone,
-            move_in_date, monthly_income, desired_term_months, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'approved')
-         ON CONFLICT (background_check_id) WHERE background_check_id IS NOT NULL DO NOTHING
-         RETURNING id`,
-        [
-          unit.id, unit.landlord_id, check.property_id || null, check.user_id, check.id,
-          check.first_name, check.last_name, applicant?.email || '', applicant?.phone || null,
-          check.desired_move_in || null, check.monthly_income || null,
-          check.desired_month_to_month ? null : (check.desired_term_months || null),
-        ],
-      ) || await queryOne<any>(
-        'SELECT id FROM unit_applications WHERE background_check_id=$1', [check.id])
-    }
-    if (!app) throw new AppError(500, 'Could not file the application')
-
-    const result = await draftLeaseFromApplication(app.id)
-    if (!result.leaseId) throw new AppError(400, `Could not draft a lease (${result.reason || 'unknown'})`)
-    res.json({ success: true, data: { leaseId: result.leaseId, applicationId: app.id, drafted: result.drafted } })
+    res.json({ success: true, data: await draftLeaseForApprovedCheck(check, scope, req.body?.unitId || null) })
   } catch (e) { next(e) }
 })
 
@@ -1051,7 +1058,24 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
       } catch (e) { logger.error({ err: e }, '[ADVERSE ACTION PREP]') }
     }
 
-    res.json({ success: true, data: { decision, adverseAction } })
+    // S653 (Nic): approval IS the start of the lease. A screening that named a
+    // space drafts its lease here, in the same click, and the landlord lands on
+    // it to review and sign. A walk-up that named no space is told so — the
+    // client asks which space and calls /draft-lease. Drafting is best-effort:
+    // the approval itself is recorded above whatever happens here.
+    let lease: { leaseId: string; applicationId: string; drafted: boolean } | null = null
+    let draftError: string | null = null
+    if (decision === 'approved' && check.unit_id) {
+      try {
+        lease = await draftLeaseForApprovedCheck({ ...check, status: 'approved' }, landlordScopeIds(req.user!), null)
+      } catch (e: any) {
+        draftError = e?.message || 'Could not draft a lease'
+        logger.error({ err: e, checkId: check.id }, '[background] approval could not draft the lease')
+      }
+    }
+    const needsUnit = decision === 'approved' && !check.unit_id
+
+    res.json({ success: true, data: { decision, adverseAction, lease, draftError, needsUnit } })
   } catch (e) { next(e) }
 })
 
