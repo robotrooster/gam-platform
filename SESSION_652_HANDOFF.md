@@ -1135,3 +1135,14 @@ Nic: "get rid of the clean meters random blind reread. Just flag the ones that n
 Mountain View Sept: 7 vacant spots with electric used and nobody billed (RV 05, 16, 27, 30, 33, 37, 43 — 1,808 kWh, $379.68). Reported to Nic; no action taken.
 
 Email: support@ is a Cloudflare forward; Nic replies from nic@golddoor.io until the partner enables "Allow per-user outbound gateways" (Nic will chase him). Free send-as route chosen over a paid mailbox.
+
+## Deploys 91–92 (2026-09-30) — move billing; pay links as tickets; Front Desk fixes
+
+- **Move bills the old space** (`unitMove.ts`): closing reads are inserted and billed via `billMoveOutRead` BEFORE the lease changes unit. Dakota Lane's RV 18 September bill corrected by hand to 481 kWh / $101.01 (was 0). Test in unitMove.test.ts.
+- **Pay links on the register's open list** (`GET /pos/tickets` unions open one-time links, `kind: 'pay_link'`); `POST /pos/transactions` takes `payLinkId` — the link's items/discount are charged (stay lines as plain amounts), link marked paid inside the sale transaction, `pos_transactions.pay_link_id` set. POSPage (both apps, byte-identical) has `payLinkId` state; picker shows a PAY LINK badge.
+- **Front Desk / outstanding**: `/balances` now includes open register tickets (`ticket_id`, `ticket`); FrontDeskPage words pay-link and ticket rows; BalancesPage renders ticket rows with a breakdown.
+- **Tenants-page unit invite** now writes the unit-bound `pending_tenant_intents` row (was waiver-only → invisible on Front Desk). Donald Hamp's row inserted by hand (draft doc + resolved lease).
+- **Invoice notice** skips settled/void invoices (Donald was emailed "$137.43 due" the morning after paying by check).
+- Mountain View Sept vacant-spot electric: Razo = RV 27 (link now $752.17: site + Aug 387 kWh + Sept 390 kWh); Scott Duffy RV 30 = open ticket $22.47 (107 kWh); RV 37 read marked billed_off_platform; RV 05/16 ignored; RV 33 (650 kWh) vs RV 34 (2 kWh, Alvarado lease) — Nic checking physically; RV 43 (228 kWh, nobody) — Nic checking.
+- Razo leaves after Oct 1: final read on RV 27 + prorated days to be added to his link before settling Friday.
+- Dakota Lane is a man (he/him).
