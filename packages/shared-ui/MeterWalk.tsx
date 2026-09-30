@@ -337,6 +337,11 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
   const [bills, setBills] = useState<Record<string, string>>({})
   const [savedIds, setSavedIds] = useState<Set<string>>(new Set())
   const [savingIds, setSavingIds] = useState<Set<string>>(new Set())
+  // S652 (Nic): "if you accidentally have a typo, once I go to the next line, I
+  // can't go back to the previous line." A line you saved in this sitting can be
+  // reopened with Fix; saving again replaces your own read (the server lets the
+  // same person correct their own work — somebody else's is still refused).
+  const [fixingIds, setFixingIds] = useState<Set<string>>(new Set())
   const [rowErr, setRowErr] = useState<Record<string, string>>({})
   const [filter, setFilter] = useState<string>('all')
   const inputs = useRef<(HTMLInputElement | null)[]>([])
@@ -422,6 +427,7 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
       const r: any = await api.post(`/utility/reading-runs/${run.id}/meters/${m.meterId}/reading`,
         { readingValue: Number(v || 0), ...(photoUrl ? { photoUrl } : {}), ...(m.rubsBasis === 'bill_amount' ? { billAmount: Number(b) } : {}) })
       setSavedIds(prev => new Set(prev).add(m.meterId))
+      setFixingIds(prev => { const n = new Set(prev); n.delete(m.meterId); return n })
       // S631: keep the count on the page behind honest as each line lands —
       // two people work this list at once, and a stale number reads as a lost save.
       qc.invalidateQueries(['reading-runs'])
@@ -474,8 +480,13 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
 
       <div style={{ maxHeight:'52vh', overflowY:'auto', margin:'0 -4px', padding:'0 4px' }}>
         {shown.map((m, i) => {
-          const isDone = done(m)
+          const fixing = fixingIds.has(m.meterId)
+          const isDone = done(m) && !fixing
           const saving = savingIds.has(m.meterId)
+          const startFix = () => {
+            setFixingIds(prev => new Set(prev).add(m.meterId))
+            setTimeout(() => { inputs.current[i]?.focus(); inputs.current[i]?.select() }, 0)
+          }
           return (
             <div key={m.meterId} style={{ display:'grid', gridTemplateColumns:'1fr 150px',
               gap:10, alignItems:'center', padding:'7px 0',
@@ -484,6 +495,13 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
                 <div style={{ fontSize:'.84rem', fontWeight:600, color:'var(--text-0)',
                   overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
                   {isDone && <span style={{ color:'var(--green)' }}>✓ </span>}{m.title}
+                  {isDone && savedIds.has(m.meterId) && (
+                    <button type="button" onClick={startFix}
+                      style={{ marginLeft:8, fontSize:'.68rem', fontWeight:700, color:'var(--gold)', background:'none', border:'none', padding:0, cursor:'pointer' }}>
+                      Fix
+                    </button>
+                  )}
+                  {fixing && <span style={{ marginLeft:8, fontSize:'.68rem', color:'var(--gold)' }}>fixing — Enter saves</span>}
                 </div>
                 <div style={{ fontSize:'.68rem', color:'var(--text-3)' }}>
                   {UTILITY_ICONS[m.utilityType]} {m.utilityType}
@@ -520,7 +538,8 @@ function ReadingListForm({ run, meters, onDone, onClose, api }: {
                   maxLength={m.billingMethod === 'submeter' ? m.digits : 12}
                   // S631: once it is in, it is in. Locking the field is what stops
                   // a stray keystroke on a row you already finished — and this row
-                  // is gone entirely next time the window opens.
+                  // is gone entirely next time the window opens. S652: Fix (above)
+                  // reopens a line you saved in this sitting.
                   disabled={isDone || m.notYet}
                   placeholder={isDone ? 'recorded' : m.notYet ? 'not yet' : m.isMaster ? 'usage' : '0'.repeat(m.digits)}
                   value={values[m.meterId] ?? ''}
