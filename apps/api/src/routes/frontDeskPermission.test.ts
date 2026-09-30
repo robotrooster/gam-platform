@@ -76,8 +76,12 @@ describe('S640 front-desk permissions', () => {
     expect(keys).toContain('front_desk.view')
     const group = PERMISSION_CATALOG.find(g => g.category === 'front_desk')
     expect(group).toBeTruthy()
-    // Exactly one key: this role is meant to be one switch, not a panel.
-    expect(group!.sections.flatMap(s => s.items)).toHaveLength(1)
+    // Two switches, both things said across a counter: the read-only list and
+    // (S653) writing down the day a resident says they are leaving. Nothing
+    // else belongs here — a desk role is meant to be a couple of switches,
+    // not a panel.
+    expect(group!.sections.flatMap(s => s.items).map(i => i.key).sort())
+      .toEqual(['front_desk.mark_leaving', 'front_desk.view'])
   })
 
   it('reads the to-do list with front_desk.view alone — no tenants.create needed', async () => {

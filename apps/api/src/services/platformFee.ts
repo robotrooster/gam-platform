@@ -140,7 +140,16 @@ export async function platformFeesByProperty(
          FROM leases l JOIN units u ON u.id = l.unit_id
         WHERE u.property_id = p.id AND l.status='active'
           AND l.start_date <= (m.month + INTERVAL '1 month' - INTERVAL '1 day')
-          AND (l.end_date IS NULL OR l.end_date >= m.month)) AS long_term,
+          AND (l.end_date IS NULL OR l.end_date >= m.month))
+      -- S653 (Nic): "me marking mobile home three at Mountain View as owner
+      -- use... doesn't change the billing on the dashboard." The accrual job
+      -- (services/billableUnits) counts an owner-occupied space — no lease by
+      -- design, but full, and billed — and this estimate did not, so any month
+      -- not yet billed was quoted $2 short per owner-use space. Same rule here:
+      -- "We charge for anything occupied, no matter the status."
+      + (SELECT COUNT(*)::int FROM units ou
+          WHERE ou.property_id = p.id AND ou.status = 'owner_use' AND ou.retired_at IS NULL
+            AND m.month >= date_trunc('month', CURRENT_DATE)) AS long_term,
       -- S614 (Nic): a space this landlord bills utilities for is an OCCUPIED
       -- UNIT — "it is technically a unit, so it needs to be billed at two
       -- dollars." Occupied by THIS landlord because of the utilities.
