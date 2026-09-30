@@ -3402,27 +3402,6 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
-    id: 'submit_meter_double_check',
-    audience: 'landlord', method: 'POST',
-    path: '/api/utility/reading-runs/:runId/double-checks/:meterId',
-    pathParams: ['runId', 'meterId'],
-    description:
-      'Submit a second, independent reading for a meter the system asked to have checked. Use when ' +
-      'somebody has gone back out and read it again.\n' +
-      'Take the number they give you and send it. Do NOT tell them the first reading, do not tell ' +
-      'them what would resolve the flag, and do not suggest a value — a second read that was told ' +
-      'what to say is not a second read. If they ask what the first one was, say you cannot give ' +
-      'them that and explain why in one line: the point is two independent looks.',
-    params: {
-      runId: { type: 'string', description: 'The reading run, from a lookup.' },
-      meterId: { type: 'string', description: 'The meter being re-read, from a lookup.' },
-      readingValue: { type: 'integer', description: 'The number on the dial, read again.' },
-      billAmount: { type: 'number', description: 'The provider\u2019s dollar charge, for a RUBS master priced from the actual bill.' },
-    },
-    required: ['runId', 'meterId', 'readingValue'],
-    confirmFirst: true,
-  },
-  {
     id: 'record_special_meter_read',
     audience: 'landlord', method: 'POST', path: '/api/utility/meters/:meterId/reads',
     pathParams: ['meterId'],

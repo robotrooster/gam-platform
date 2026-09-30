@@ -35,7 +35,7 @@
  * bills next cycle.
  */
 
-import { METER_DOUBLE_CHECK_MIN, METER_DOUBLE_CHECK_TOLERANCE, METER_USAGE_ALERT_THRESHOLDS, meterReadingModulus } from '@gam/shared'
+import { METER_USAGE_ALERT_THRESHOLDS, meterReadingModulus } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { generateBillsForProperty } from './utilityBilling'
 import { createNotification } from './notifications'
@@ -327,163 +327,95 @@ export async function getRunMeters(runId: string) {
   })
 }
 
-// ── Double-check verification phase (S533) ───────────────────────────
-// The reader finishes the whole walk uninterrupted; back at the office
-// the system generates a blind re-read list: every suspicious submeter
-// plus RANDOM clean ones so the list always has METER_DOUBLE_CHECK_MIN
-// entries and the reader can't tell which are the suspects. Billing
-// does NOT wait for this phase (S534) — clean original reads bill on
-// each lease's invoice date regardless; the re-read corrects the stored
-// value only while its bill hasn't reached an invoice.
+// ── Flagged reads (S652) ─────────────────────────────────────────────
+//
+// S533 built a blind VERIFICATION WALK here: every suspect plus random clean
+// meters, re-read by staff so they couldn't tell which the system doubted.
+// Nic, S652: "I don't know why there's two windows in the first place... get
+// rid of the clean meters random blind reread. Just flag the ones that need
+// flagging, with limited to one window."
+//
+// So: when the last meter is read, a run with nothing flagged completes on the
+// spot. One with flagged reads waits — status 'double_check', kept for the
+// history it already carries — for the landlord to settle them in the ONE
+// window, "Readings to double-check". The last one settled completes the run.
 
-/** Flip a fully-read run into its verification phase and build the list. */
-export async function startDoubleCheckPhase(runId: string) {
-  const run = await queryOne<any>(
-    `SELECT * FROM utility_reading_runs WHERE id = $1`, [runId])
+/** Flagged reads still open on this run's cycle (submeters and masters alike). */
+export async function countFlaggedOnRun(runId: string): Promise<number> {
+  const row = await queryOne<{ n: number }>(
+    `SELECT COUNT(*)::int AS n
+       FROM utility_reading_runs r
+       JOIN utility_meters m ON m.property_id = r.property_id
+                            AND m.billing_method IN ('submeter','rubs')
+                            AND (r.utility_type IS NULL OR m.utility_type = r.utility_type)
+       JOIN utility_meter_readings rd ON rd.meter_id = m.id
+                                     AND rd.billing_cycle_month = r.billing_cycle_month
+                                     AND rd.reason = 'monthly_cycle' AND rd.needs_review
+      WHERE r.id = $1`, [runId])
+  return row?.n ?? 0
+}
+
+/**
+ * The last meter is read. Nothing flagged → the run completes now (or, for a
+ * company that reviews its bills, the landlord is told they are ready).
+ * Something flagged → the run waits on the review queue, and the landlord is
+ * told what is waiting, once.
+ */
+export async function finishReadingPhase(runId: string, userId: string) {
+  const run = await queryOne<any>(`SELECT * FROM utility_reading_runs WHERE id = $1`, [runId])
   if (!run || run.status !== 'open') return run
-
-  const suspects = await query<{ meter_id: string; reading_value: string }>(
-    `SELECT rd.meter_id, rd.reading_value
-       FROM utility_meter_readings rd
-       JOIN utility_meters m ON m.id = rd.meter_id
-      WHERE m.property_id = $1 AND m.billing_method = 'submeter'
-        AND rd.billing_cycle_month = $2 AND rd.reason = 'monthly_cycle' AND rd.needs_review
-        AND ($3::text IS NULL OR m.utility_type = $3)`,
-    [run.property_id, run.billing_cycle_month, run.utility_type])
-  const pads = await query<{ meter_id: string; reading_value: string }>(
-    `SELECT rd.meter_id, rd.reading_value
-       FROM utility_meter_readings rd
-       JOIN utility_meters m ON m.id = rd.meter_id
-      WHERE m.property_id = $1 AND m.billing_method = 'submeter'
-        AND rd.billing_cycle_month = $2 AND rd.reason = 'monthly_cycle' AND NOT rd.needs_review
-        AND ($4::text IS NULL OR m.utility_type = $4)
-      ORDER BY random()
-      LIMIT $3`,
-    [run.property_id, run.billing_cycle_month,
-     Math.max(0, METER_DOUBLE_CHECK_MIN - suspects.length), run.utility_type])
-
-  for (const row of [...suspects.map(s => ({ ...s, sus: true })), ...pads.map(p => ({ ...p, sus: false }))]) {
-    await query(
-      `INSERT INTO utility_reading_double_checks (run_id, meter_id, first_value, is_suspicious)
-       VALUES ($1, $2, $3, $4) ON CONFLICT (run_id, meter_id) DO NOTHING`,
-      [runId, row.meter_id, row.reading_value, row.sus])
+  const flagged = await countFlaggedOnRun(runId)
+  if (flagged === 0) {
+    const done = await completeReadingRun(runId, userId)
+    if (!done || done.status !== 'completed') await tellLandlordBillsAreReady(runId)
+    return done
   }
-  return queryOne<any>(
-    `UPDATE utility_reading_runs SET status = 'double_check' WHERE id = $1 RETURNING *`,
-    [runId])
+  const waiting = await queryOne<any>(
+    `UPDATE utility_reading_runs SET status = 'double_check' WHERE id = $1 RETURNING *`, [runId])
+  await tellLandlordReadsNeedReview(runId, flagged)
+  return waiting
 }
 
 /**
- * Blind verification payload — the same shape the main walk consumes.
- * Deliberately NO first values and NO suspicion markers: the re-reader
- * must not know which entries the system doubts.
+ * A flagged read was settled from the review queue. If that was the last one
+ * on a run that is waiting, the run completes — the same moment the walk's
+ * last re-read used to bring.
  */
-export async function getDoubleChecks(runId: string) {
-  return query<any>(
-    `SELECT dc.meter_id, m.label, m.utility_type, m.billing_method, m.digits,
-            u.id AS unit_id, u.unit_number,
-            (dc.second_value IS NOT NULL) AS is_read
-       FROM utility_reading_double_checks dc
-       JOIN utility_meters m ON m.id = dc.meter_id
-       LEFT JOIN utility_meter_units mu ON mu.meter_id = m.id
-       LEFT JOIN units u ON u.id = mu.unit_id
-      WHERE dc.run_id = $1
-      ORDER BY u.unit_number NULLS LAST, m.utility_type, m.label`,
-    [runId])
-}
-
-/**
- * Record a re-read and reconcile automatically:
- *   - within METER_DOUBLE_CHECK_TOLERANCE of the first read → the meter
- *     just moved between reads; the FIRST read stands for billing and
- *     the drift bills next cycle ('verified').
- *   - bigger difference → the deliberate re-read replaces the original
- *     ('replaced'), and a high usage it confirms simply bills — the
- *     re-read IS the verification.
- *   - the one unresolvable case: the effective value sits below the
- *     previous reading with an implausible wrap — rollover vs meter
- *     swap is a money decision, so it stays flagged for the landlord
- *     ('escalated') and that meter doesn't bill until resolved.
- * Completes the run (bills generate + finalize) after the last entry.
- */
-export async function enterDoubleCheck(runId: string, meterId: string, secondValue: number, userId: string) {
-  const dc = await queryOne<any>(
-    `SELECT dc.*, m.digits, m.utility_type
-       FROM utility_reading_double_checks dc
-       JOIN utility_meters m ON m.id = dc.meter_id
-      WHERE dc.run_id = $1 AND dc.meter_id = $2`, [runId, meterId])
-  if (!dc) return null
+export async function settleFlaggedOnRun(propertyId: string, cycleMonth: string, userId: string) {
   const run = await queryOne<any>(
-    `SELECT * FROM utility_reading_runs WHERE id = $1`, [runId])
+    `SELECT * FROM utility_reading_runs
+      WHERE property_id = $1 AND billing_cycle_month = $2 AND status = 'double_check'`,
+    [propertyId, cycleMonth])
+  if (!run) return null
+  if (await countFlaggedOnRun(run.id) > 0) return run
+  const done = await completeReadingRun(run.id, userId)
+  if (!done || done.status !== 'completed') await tellLandlordBillsAreReady(run.id)
+  return done
+}
 
-  // S534: bills can now exist BEFORE verification finishes — the invoice
-  // cron bills per-unit straight from original reads (Nic: an unfinished
-  // verification walk never holds billing). Once this cycle's bill is on
-  // an invoice (payment_id set) the reading is immutable: the FIRST read
-  // stands no matter the re-read, and any drift self-corrects next cycle
-  // because usage is always computed against the stored value. A bill
-  // not yet on an invoice is deleted when the re-read replaces the
-  // value, then regenerates from the corrected reading (run completion /
-  // invoice-time ensure both re-run the idempotent engine).
-  const bill = await queryOne<{ id: string; payment_id: string | null }>(
-    `SELECT id, payment_id FROM utility_bills
-      WHERE meter_id = $1 AND billing_cycle_month = $2
-      LIMIT 1`, [meterId, run.billing_cycle_month])
-  const billLocked = !!bill?.payment_id
-
-  const first = Number(dc.first_value)
-  const withinTol = billLocked || Math.abs(secondValue - first) <= METER_DOUBLE_CHECK_TOLERANCE
-  const effective = withinTol ? first : secondValue
-
-  // Point-in-time prior (S559): the read immediately before THIS cycle's
-  // read by time (excluding the cycle read itself), which may be a mid-month
-  // turnover/reference read that reset the baseline.
-  const prior = await queryOne<{ reading_value: string }>(
-    `SELECT reading_value FROM utility_meter_readings
-      WHERE meter_id = $1
-        AND NOT (billing_cycle_month = $2 AND reason = 'monthly_cycle')
-      ORDER BY reading_date DESC, created_at DESC LIMIT 1`,
-    [meterId, run.billing_cycle_month])
-
-  let isRollover = false
-  let needsReview = false
-  if (prior && effective < Number(prior.reading_value)) {
-    const modulus = meterReadingModulus(dc.digits)
-    const wrap = (modulus - Number(prior.reading_value)) + effective
-    if (wrap < modulus / 2) isRollover = true
-    else needsReview = true
-  }
-  const outcome = needsReview ? 'escalated' : (withinTol ? 'verified' : 'replaced')
-
-  if (!billLocked) {
-    await query(
-      `UPDATE utility_meter_readings
-          SET reading_value = $3, needs_review = $4, is_rollover = $5, review_note = $6
-        WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle'`,
-      [meterId, run.billing_cycle_month, effective, needsReview, isRollover,
-       needsReview ? 'Re-read confirmed a value below the previous reading — rollover or meter swap?' : null])
-    // An un-invoiced bill built on the superseded value is stale — drop
-    // it so the engine regenerates from the corrected reading.
-    if (bill && effective !== first) {
-      await query(
-        `DELETE FROM utility_bills WHERE id = $1 AND payment_id IS NULL`, [bill.id])
-    }
-  }
-  const updated = await queryOne<any>(
-    `UPDATE utility_reading_double_checks
-        SET second_value = $2, outcome = $3, entered_by_user_id = $4, entered_at = NOW()
-      WHERE id = $1 RETURNING *`,
-    [dc.id, secondValue, outcome, userId])
-
-  const remaining = await queryOne<{ n: number }>(
-    `SELECT COUNT(*)::int AS n FROM utility_reading_double_checks
-      WHERE run_id = $1 AND second_value IS NULL`, [runId])
-  let finishedRun = null
-  if (remaining && remaining.n === 0) {
-    finishedRun = await completeReadingRun(runId, userId)
-    if (!finishedRun || finishedRun.status !== 'completed') await tellLandlordBillsAreReady(runId)
-  }
-  return { doubleCheck: updated, run: finishedRun ?? run, remaining: remaining?.n ?? 0 }
+async function tellLandlordReadsNeedReview(runId: string, flagged: number) {
+  const r = await queryOne<any>(
+    `SELECT r.id, r.property_id, r.billing_cycle_month, p.name, p.landlord_id, u.id AS user_id, u.email
+       FROM utility_reading_runs r JOIN properties p ON p.id = r.property_id
+       JOIN landlords l ON l.id = p.landlord_id JOIN users u ON u.id = l.user_id
+      WHERE r.id = $1`, [runId])
+  if (!r) return
+  const month = new Date(String(r.billing_cycle_month).slice(0, 10) + 'T00:00:00Z')
+    .toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
+  const body = `Every meter at ${r.name} is read for ${month}, and ${flagged} reading${flagged === 1 ? ' looks' : 's look'} off — ` +
+    `below the last read, or unusually high. Check ${flagged === 1 ? 'it' : 'them'} under "Readings to double-check" and correct or confirm. ` +
+    `The month's bills go out when the last one is settled; until then only those units' invoices wait.`
+  await createNotification({
+    userId: r.user_id, landlordId: r.landlord_id,
+    type: 'utility_reads_need_review',
+    title: `${flagged} meter reading${flagged === 1 ? '' : 's'} to double-check — ${r.name}`,
+    body,
+    data: { runId: r.id, propertyId: r.property_id, flagged },
+    actionUrl: `/utilities?propertyId=${r.property_id}`,
+    sendEmail: true, emailTo: r.email,
+    emailSubject: `${flagged} meter reading${flagged === 1 ? '' : 's'} to double-check — ${r.name} (${month})`,
+    emailHtml: body,
+  }).catch(() => {})
 }
 
 /** S652: every read is in — the landlord approves before anything goes out. */
@@ -507,14 +439,6 @@ export async function tellLandlordBillsAreReady(runId: string) {
     emailSubject: `Utility bills ready to review — ${r.name} (${month})`,
     emailHtml: `${month}'s meter readings for <b>${r.name}</b> are all in. Open the Utilities page, review the bills, and approve them to send.`,
   }).catch(() => {})
-}
-
-/** Escalations left on a run's cycle — surfaced in the completion summary. */
-export async function countEscalations(runId: string): Promise<number> {
-  const row = await queryOne<{ n: number }>(
-    `SELECT COUNT(*)::int AS n FROM utility_reading_double_checks
-      WHERE run_id = $1 AND outcome = 'escalated'`, [runId])
-  return row?.n ?? 0
 }
 
 /**

@@ -232,16 +232,18 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
           {openRun ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
               <div style={{ flex: 1, minWidth: 200, fontSize: '.82rem', color: 'var(--text-1)' }}>
-                <b>{openRun.status === 'double_check' ? 'Verification walk' : 'Readings due'}</b>
+                <b>{openRun.status === 'double_check' ? 'All meters read' : 'Readings due'}</b>
                 <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 2 }}>
                   {openRun.status === 'double_check'
-                    ? `${openRun.dcDone ?? 0} of ${openRun.dcTotal ?? 0} re-checks entered.`
+                    ? 'A few readings are with the landlord to double-check. Nothing more to read.'
                     : `${openRun.metersRead ?? 0} of ${openRun.metersTotal ?? 0} meters read.`}
                 </div>
               </div>
-              <button className="btn btn-primary btn-sm" onClick={() => setWalkRun(openRun)}>
-                {openRun.status === 'double_check' ? 'Verify' : (openRun.metersRead > 0 ? 'Continue reading' : 'Start reading')}
-              </button>
+              {openRun.status !== 'double_check' && (
+                <button className="btn btn-primary btn-sm" onClick={() => setWalkRun(openRun)}>
+                  {openRun.metersRead > 0 ? 'Continue reading' : 'Start reading'}
+                </button>
+              )}
             </div>
           ) : (
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
@@ -253,7 +255,7 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
         </div>
       )}
       {walkRun && (
-        <ReadingWalkModal run={walkRun} mode={walkRun.status === 'double_check' ? 'verify' : 'read'} api={api}
+        <ReadingWalkModal run={walkRun} api={api}
           onClose={() => { setWalkRun(null); qc.invalidateQueries(['wt-reading-runs', propertyIdForRuns]) }} />
       )}
 

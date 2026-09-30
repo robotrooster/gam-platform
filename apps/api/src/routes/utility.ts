@@ -47,10 +47,9 @@ import {
   getRunMeters,
   completeReadingRun,
   isRunFullyRead,
-  startDoubleCheckPhase,
-  getDoubleChecks,
-  enterDoubleCheck,
-  countEscalations,
+  finishReadingPhase,
+  settleFlaggedOnRun,
+  countFlaggedOnRun,
   getReadsDue,
 } from '../services/utilityReadingRuns'
 
@@ -1327,10 +1326,15 @@ utilityRouter.get('/reading-runs', requireMeterReader, async (req, res, next) =>
                   AND rd.reason = 'monthly_cycle'
                 WHERE m.property_id = r.property_id
                   AND m.billing_method IN ('submeter','rubs')) AS meters_read,
-              (SELECT COUNT(*)::int FROM utility_reading_double_checks dc
-                WHERE dc.run_id = r.id) AS dc_total,
-              (SELECT COUNT(*)::int FROM utility_reading_double_checks dc
-                WHERE dc.run_id = r.id AND dc.second_value IS NOT NULL) AS dc_done
+              -- S652: reads flagged for the landlord's review this cycle — the
+              -- one thing a fully-read run can still be waiting on.
+              (SELECT COUNT(*)::int FROM utility_meters m
+                 JOIN utility_meter_readings rd
+                   ON rd.meter_id = m.id AND rd.billing_cycle_month = r.billing_cycle_month
+                  AND rd.reason = 'monthly_cycle' AND rd.needs_review
+                WHERE m.property_id = r.property_id
+                  AND m.billing_method IN ('submeter','rubs')
+                  AND (r.utility_type IS NULL OR m.utility_type = r.utility_type)) AS flagged_count
          FROM utility_reading_runs r
         WHERE r.property_id = $1
         ORDER BY (r.status IN ('open','double_check')) DESC, r.billing_cycle_month DESC
@@ -1609,59 +1613,21 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requireMeterRead
       [meter.id, body.readingValue, run.billing_cycle_month, req.user!.userId,
        needsReview, reviewNote, isRollover, isDollarMaster ? body.billAmount : null, body.photoUrl ?? null])
 
-    // When the last meter is read, the run moves to its VERIFICATION
-    // phase (S533) — the system builds the blind double-check list and
-    // billing waits for it. No mid-walk interruptions ever.
+    // S652 (Nic): the last meter read finishes the run — unless something is
+    // flagged, in which case it waits on the landlord's ONE review window.
+    // No mid-walk interruptions ever.
     let updatedRun = null
     if (await isRunFullyRead(run.id)) {
-      updatedRun = await startDoubleCheckPhase(run.id)
+      updatedRun = await finishReadingPhase(run.id, req.user!.userId)
     }
-    // Response deliberately excludes reading_value/needs_review — the
-    // walk client needs only confirmation + run state (+ the size of
-    // the freshly generated verification list for the summary screen).
-    const dcTotal = updatedRun?.status === 'double_check'
-      ? (await getDoubleChecks(run.id)).length : 0
-    res.status(201).json({ success: true, data: { reading, run: updatedRun ?? run, dcTotal } })
-  } catch (e) { next(e) }
-})
-
-// ── DOUBLE-CHECK VERIFICATION (blind re-read walk) ───────────
-utilityRouter.get('/reading-runs/:id/double-checks', requireMeterReader, async (req, res, next) => {
-  try {
-    const run = await queryOne<any>(
-      `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
-    if (!run) throw new AppError(404, 'Reading run not found')
-    await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
-    res.json({ success: true, data: await getDoubleChecks(req.params.id) })
-  } catch (e) { next(e) }
-})
-
-utilityRouter.post('/reading-runs/:id/double-checks/:meterId', requireMeterReader, async (req, res, next) => {
-  try {
-    const body = z.object({
-      readingValue: z.number().int().min(0),
-      // S607: a RUBS master on the bill_amount basis also carries the utility
-      // provider's dollar charge for the cycle. Ignored on every other meter.
-      billAmount: z.number().min(0).max(10_000_000).optional(),
-    }).parse(req.body)
-    const run = await queryOne<any>(
-      `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
-    if (!run) throw new AppError(404, 'Reading run not found')
-    await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
-    if (run.status !== 'double_check') throw new AppError(409, 'Run is not in its verification phase')
-    const meter = await queryOne<any>(
-      `SELECT * FROM utility_meters WHERE id = $1 AND property_id = $2`,
-      [req.params.meterId, run.property_id])
-    if (!meter) throw new AppError(404, 'Meter not found on this run')
-    if (body.readingValue >= meterReadingModulus(meter.digits)) {
-      throw new AppError(400, `Reading exceeds this meter's ${meter.digits}-digit capacity`)
-    }
-    const result = await enterDoubleCheck(run.id, meter.id, body.readingValue, req.user!.userId)
-    if (!result) throw new AppError(404, 'Meter is not on this run\'s verification list')
-    // Blind on the way out too: no values, no outcome — just run state
-    // (+ escalation count once completed, for the landlord-facing summary).
-    const escalated = result.run?.status === 'completed' ? await countEscalations(run.id) : 0
-    res.status(201).json({ success: true, data: { run: result.run, escalated } })
+    // Response deliberately excludes reading_value/needs_review — the walk
+    // client needs only confirmation + run state (+ how many reads the
+    // landlord has to look at, for the summary screen; never which ones).
+    const flagged = updatedRun?.status === 'double_check' ? await countFlaggedOnRun(run.id) : 0
+    // Fully read, nothing flagged, and the company reviews its bills first:
+    // the run stays open until the landlord approves.
+    const awaitingApproval = !!updatedRun && updatedRun.status === 'open'
+    res.status(201).json({ success: true, data: { reading, run: updatedRun ?? run, flagged, awaitingApproval } })
   } catch (e) { next(e) }
 })
 
@@ -1856,51 +1822,25 @@ utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'
          + (body.rollover ? ' (rollover)' : ''),
        !!body.rollover])
 
-    // S652 (Nic): "I just reviewed seven meters and then there's a verification
-    // walk that showed up with another seven meters. I don't want both windows
-    // happening." They were the SAME seven: a flagged read sits in the
-    // landlord's review queue AND on the run's blind re-read list, and
-    // settling it in one never told the other. Reviewing it here IS the
-    // re-check — the walk's entry closes with the landlord's answer, and when
-    // nothing is left on the list the run finishes, exactly as it does when
-    // the last re-read is typed on the walk.
-    let walkRun: any = null
-    const dc = await queryOne<any>(
-      `SELECT dc.id, dc.run_id, dc.first_value
-         FROM utility_reading_double_checks dc
-         JOIN utility_reading_runs r ON r.id = dc.run_id
-        WHERE dc.meter_id = $1 AND r.billing_cycle_month = $2 AND dc.second_value IS NULL
-          AND r.status = 'double_check'`,
-      [reading.meter_id, reading.billing_cycle_month])
-    if (dc) {
-      const finalValue = Number(updated.reading_value)
+    // S652 (Nic): "get rid of the clean meters random blind reread. Just flag
+    // the ones that need flagging, with limited to one window." This IS that
+    // window. A bill built on the superseded value and not yet on an invoice
+    // is stale; and if this was the last flagged read on a waiting run, the
+    // run completes here.
+    if (body.correctedValue != null && Number(reading.reading_value) !== body.correctedValue) {
       await query(
-        `UPDATE utility_reading_double_checks
-            SET second_value = $2, outcome = $3, entered_by_user_id = $4, entered_at = NOW()
-          WHERE id = $1`,
-        [dc.id, finalValue, finalValue === Number(dc.first_value) ? 'verified' : 'replaced', req.user!.userId])
-      // A bill built on the superseded value, not yet on an invoice, is stale.
-      if (finalValue !== Number(dc.first_value)) {
-        await query(
-          `DELETE FROM utility_bills WHERE meter_id = $1 AND billing_cycle_month = $2 AND payment_id IS NULL`,
-          [reading.meter_id, reading.billing_cycle_month])
-      }
-      const left = await queryOne<{ n: number }>(
-        `SELECT COUNT(*)::int AS n FROM utility_reading_double_checks WHERE run_id = $1 AND second_value IS NULL`,
-        [dc.run_id])
-      if (left && left.n === 0) {
-        walkRun = await completeReadingRun(dc.run_id, req.user!.userId)
-        if (!walkRun || walkRun.status !== 'completed') {
-          const { tellLandlordBillsAreReady } = await import('../services/utilityReadingRuns')
-          await tellLandlordBillsAreReady(dc.run_id)
-        }
-      }
+        `DELETE FROM utility_bills WHERE meter_id = $1 AND billing_cycle_month = $2 AND payment_id IS NULL`,
+        [reading.meter_id, reading.billing_cycle_month])
     }
+    const cycleIso = reading.billing_cycle_month instanceof Date
+      ? `${reading.billing_cycle_month.getFullYear()}-${String(reading.billing_cycle_month.getMonth() + 1).padStart(2, '0')}-${String(reading.billing_cycle_month.getDate()).padStart(2, '0')}`
+      : String(reading.billing_cycle_month).slice(0, 10)
+    const walkRun = await settleFlaggedOnRun(reading.property_id, cycleIso, req.user!.userId)
 
     // If this cycle's run already completed, the flagged meter was
     // skipped by the engine (negative usage) — re-run it now.
     let billsCreated = 0
-    const run = walkRun?.status === 'completed' ? null : await queryOne<any>(
+    const run = walkRun ? null : await queryOne<any>(
       `SELECT * FROM utility_reading_runs
         WHERE property_id = $1 AND billing_cycle_month = $2 AND status = 'completed'`,
       [reading.property_id, reading.billing_cycle_month])
@@ -1964,8 +1904,7 @@ utilityRouter.post('/reading-runs/:id/approve', requirePerm('properties.edit'), 
     // A reading still flagged as a possible typo bills nothing and holds only
     // its own unit's invoice (S534) — it never holds the park (Nic).
     const done = await completeReadingRun(run.id, req.user!.userId, { approve: true })
-    const { countEscalations } = await import('../services/utilityReadingRuns')
-    res.json({ success: true, data: { ...done, escalated: await countEscalations(run.id) } })
+    res.json({ success: true, data: { ...done, flagged: await countFlaggedOnRun(run.id) } })
   } catch (e) { next(e) }
 })
 

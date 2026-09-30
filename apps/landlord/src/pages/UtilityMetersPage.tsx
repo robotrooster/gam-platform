@@ -252,21 +252,26 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
               <ClipboardList size={28} style={{ color:'var(--gold)', flexShrink:0 }}/>
               <div style={{ flex:1, minWidth:220 }}>
                 <div style={{ fontWeight:700 }}>
-                  {openRun.status === 'double_check' ? 'Verification walk' : 'Meter readings due'} — {monthLabel(openRun.billingCycleMonth)}
+                  {openRun.status === 'double_check' ? 'Readings waiting on your double-check' : 'Meter readings due'} — {monthLabel(openRun.billingCycleMonth)}
                 </div>
                 <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginTop:2 }}>
+                  {/* S652 (Nic): one window. Every meter is read; what is left is the
+                      flagged reads in the card below, and the last one settled sends
+                      the month's bills. */}
                   {openRun.status === 'double_check'
-                    ? `${openRun.dcDone} of ${openRun.dcTotal} re-checks entered. Units with reads already bill on their invoice date — re-checks just verify them.`
+                    ? (canReview
+                        ? `Every meter is read. ${openRun.flaggedCount} reading${openRun.flaggedCount === 1 ? ' looks' : 's look'} off — settle ${openRun.flaggedCount === 1 ? 'it' : 'them'} in "Readings to double-check" below and the month's bills go out.`
+                        : `Every meter is read. ${openRun.flaggedCount} reading${openRun.flaggedCount === 1 ? ' is' : 's are'} with the landlord to double-check; the month's bills go out when ${openRun.flaggedCount === 1 ? "it's" : "they're"} settled.`)
                     : needsOpening.count > 0
                       ? `${openRun.metersRead} of ${openRun.metersTotal} meters read — but ${needsOpening.count} have no opening read yet, so those will record a number and bill nothing. Set those first.`
                       : `${openRun.metersRead} of ${openRun.metersTotal} meters read. Each unit bills on its tenant's next invoice as soon as its meters are read — an unread meter holds only that unit's invoice.`}
                 </div>
               </div>
-              <button className="btn btn-primary" onClick={()=>setWalkRun(openRun)}>
-                {openRun.status === 'double_check'
-                  ? (openRun.dcDone > 0 ? 'Continue verification' : 'Start verification')
-                  : (openRun.metersRead > 0 ? 'Continue reading' : 'Start reading')} <ChevronRight size={14}/>
-              </button>
+              {openRun.status !== 'double_check' && (
+                <button className="btn btn-primary" onClick={()=>setWalkRun(openRun)}>
+                  {openRun.metersRead > 0 ? 'Continue reading' : 'Start reading'} <ChevronRight size={14}/>
+                </button>
+              )}
               {canReview && (openRun.status === 'double_check' || openRun.metersRead > 0) && (
                 <button className="btn btn-primary btn-sm" onClick={() => setReviewRunId(openRun.id)}>
                   {openRun.needsApproval ? 'Review bills & approve' : 'Review bills'}
@@ -439,7 +444,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
 
       {reviewRunId && <ReviewBillsModal runId={reviewRunId} onClose={() => setReviewRunId(null)} onDone={invalidate} />}
       {walkRun && (
-        <ReadingWalkModal run={walkRun} mode={walkRun.status === 'double_check' ? 'verify' : 'read'} api={walkApi} onClose={()=>{ setWalkRun(null); invalidate() }} />
+        <ReadingWalkModal run={walkRun} api={walkApi} onClose={()=>{ setWalkRun(null); invalidate() }} />
       )}
       {historyOpen && propertyId && (
         <ReadingHistoryModal propertyId={propertyId} propertyName={thisProperty?.name || ''} onDownload={downloadReads} onClose={() => setHistoryOpen(false)} />

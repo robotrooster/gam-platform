@@ -53,14 +53,18 @@ export function MeterReadingsPage() {
       {openRun ? (
         <div className="card" style={{ padding: 18, marginBottom: 16 }}>
           <div style={{ fontWeight: 700, marginBottom: 4 }}>
-            {openRun.status === 'double_check' ? 'Verification walk' : 'Meter readings due'} — {monthLabel(openRun.billingCycleMonth)}
+            {openRun.status === 'double_check' ? 'All meters read' : 'Meter readings due'} — {monthLabel(openRun.billingCycleMonth)}
           </div>
           <div style={{ fontSize: '.82rem', color: 'var(--t2)', marginBottom: 12 }}>
-            {Number(openRun.metersRead ?? 0)} of {Number(openRun.metersTotal ?? 0)} read. Enter each meter exactly as its face shows it — nothing previous is shown on purpose.
+            {openRun.status === 'double_check'
+              ? 'Every meter is in. A few readings are with the landlord to double-check; nothing more to read this month.'
+              : <>{Number(openRun.metersRead ?? 0)} of {Number(openRun.metersTotal ?? 0)} read. Enter each meter exactly as its face shows it — nothing previous is shown on purpose.</>}
           </div>
-          <button className="btn btn-primary" onClick={() => setWalkRun(openRun)}>
-            {openRun.status === 'double_check' ? 'Start verification' : (Number(openRun.metersRead ?? 0) > 0 ? 'Continue reading' : 'Start reading')} <ChevronRight size={14} />
-          </button>
+          {openRun.status !== 'double_check' && (
+            <button className="btn btn-primary" onClick={() => setWalkRun(openRun)}>
+              {Number(openRun.metersRead ?? 0) > 0 ? 'Continue reading' : 'Start reading'} <ChevronRight size={14} />
+            </button>
+          )}
         </div>
       ) : (
         <div className="card" style={{ padding: 18, marginBottom: 16 }}>
@@ -87,7 +91,7 @@ export function MeterReadingsPage() {
       )}
 
       {walkRun && (
-        <ReadingWalkModal run={walkRun} mode={walkRun.status === 'double_check' ? 'verify' : 'read'} api={walkApi}
+        <ReadingWalkModal run={walkRun} api={walkApi}
           onClose={() => { setWalkRun(null); qc.invalidateQueries(['reading-runs', propertyId]) }} />
       )}
     </div>

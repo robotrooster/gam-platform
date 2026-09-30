@@ -116,24 +116,24 @@ const enterReading = (app: express.Express, f: Fixture, runId: string, meterId: 
     .set('Authorization', `Bearer ${f.tokenA}`)
     .send({ readingValue: value })
 
-const enterDC = (app: express.Express, f: Fixture, runId: string, meterId: string, value: number) =>
+// S652 (Nic): the ONE window — the landlord's "Readings to double-check".
+const flaggedList = (app: express.Express, f: Fixture) =>
   request(app)
-    .post(`/api/utility/reading-runs/${runId}/double-checks/${meterId}`)
+    .get(`/api/utility/readings/flagged?propertyId=${f.propertyAId}`)
     .set('Authorization', `Bearer ${f.tokenA}`)
-    .send({ readingValue: value })
-
-const getDCs = (app: express.Express, f: Fixture, runId: string) =>
+const resolveFlagged = (app: express.Express, f: Fixture, readingId: string, body: any = {}) =>
   request(app)
-    .get(`/api/utility/reading-runs/${runId}/double-checks`)
+    .post(`/api/utility/readings/${readingId}/resolve-review`)
     .set('Authorization', `Bearer ${f.tokenA}`)
+    .send(body)
 
-/** Run the main walk with both fixture meters, landing in double_check. */
+/** Read both fixture meters. A clean walk completes the run on the last read;
+ *  a flagged one leaves it waiting ('double_check') on the review window. */
 async function mainWalk(app: express.Express, f: Fixture, run: any, leasedVal: number, vacantVal: number) {
   const r1 = await enterReading(app, f, run.id, f.meterLeased, leasedVal)
   expect(r1.status).toBe(201)
   const r2 = await enterReading(app, f, run.id, f.meterVacant, vacantVal)
   expect(r2.status).toBe(201)
-  expect(r2.body.data.run.status).toBe('double_check')
   return r2.body.data
 }
 
@@ -230,216 +230,129 @@ describe('blind entry', () => {
   })
 })
 
-describe('verification phase', () => {
-  it('main-walk completion builds the blind list (all meters when fewer than the minimum) — no bills yet', async () => {
+// S652 (Nic): "get rid of the clean meters random blind reread. Just flag the
+// ones that need flagging, with limited to one window." No verification walk:
+// the last read completes a clean run; a flagged read waits on the landlord's
+// review queue, and the last one settled completes it.
+describe('flagged reads — one window', () => {
+  it('a clean walk completes on the last read and bills from the reads', async () => {
     const app = buildApp()
     const f = await seed()
     const run = await openRun(app, f)
     const done = await mainWalk(app, f, run, 1250, 560)
-    expect(done.dcTotal).toBe(2) // only 2 submeters exist — both listed
-    const dcs = await getDCs(app, f, run.id)
-    expect(dcs.body.data).toHaveLength(2)
-    // Blind: no first values, no suspicion markers.
-    expect(JSON.stringify(dcs.body.data)).not.toMatch(/first_value|is_suspicious|reading_value/)
-    const bills = await db.query(`SELECT id FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
-    expect(bills.rows).toHaveLength(0)
-  })
-
-  it('re-read within 1-2 units: the FIRST read stands for billing; drift bills next cycle', async () => {
-    const app = buildApp()
-    const f = await seed()
-    const run = await openRun(app, f)
-    await mainWalk(app, f, run, 1250, 560)
-    await enterDC(app, f, run.id, f.meterLeased, 1252) // meter moved 2 between reads
-    const done = await enterDC(app, f, run.id, f.meterVacant, 561)
-    expect(done.body.data.run.status).toBe('completed')
-    // Billed from 1250, NOT 1252: usage 250 × $0.14 = $35.00.
+    expect(done.run.status).toBe('completed')
+    expect(done.flagged).toBe(0)
+    // Billed from 1250: usage 250 × $0.14 = $35.00.
     const bills = await db.query(
-      `SELECT usage_amount, charge_amount, status FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
+      `SELECT usage_amount, charge_amount, status, reading_start, reading_end FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
     expect(bills.rows).toHaveLength(1)
     expect(Number(bills.rows[0].usage_amount)).toBe(250)
     expect(Number(bills.rows[0].charge_amount)).toBeCloseTo(35.0, 2)
     expect(bills.rows[0].status).toBe('billed')
-    const reading = await db.query(
-      `SELECT reading_value FROM utility_meter_readings WHERE meter_id = $1 AND billing_cycle_month = $2`,
-      [f.meterLeased, CYCLE])
-    expect(Number(reading.rows[0].reading_value)).toBe(1250) // second read silently ignored
-    // Tenant-invoice transparency: bill snapshots begin/end reads.
-    const snap = await db.query(
-      `SELECT reading_start, reading_end FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
-    expect(Number(snap.rows[0].reading_start)).toBe(1000)
-    expect(Number(snap.rows[0].reading_end)).toBe(1250)
+    expect(Number(bills.rows[0].reading_start)).toBe(1000)
+    expect(Number(bills.rows[0].reading_end)).toBe(1250)
+    expect((await flaggedList(app, f)).body.data).toHaveLength(0)
   })
 
-  it('re-read beyond tolerance replaces the original and bills from the re-read', async () => {
+  it('a suspicious read waits on the review window — the reader is told how many, never which', async () => {
     const app = buildApp()
     const f = await seed()
     const run = await openRun(app, f)
-    await mainWalk(app, f, run, 1250, 560)
-    await enterDC(app, f, run.id, f.meterLeased, 1400) // 150 off — re-read wins
-    await enterDC(app, f, run.id, f.meterVacant, 561)
-    const bills = await db.query(
-      `SELECT usage_amount, charge_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
-    expect(Number(bills.rows[0].usage_amount)).toBe(400)
-    expect(Number(bills.rows[0].charge_amount)).toBeCloseTo(56.0, 2)
+    const done = await mainWalk(app, f, run, 7000, 560) // 6,000 kWh — over the 5,000 threshold
+    expect(done.run.status).toBe('double_check')
+    expect(done.flagged).toBe(1)
+    expect(JSON.stringify(done)).not.toMatch(/needs_review|review_note|reading_value/)
+    const bills = await db.query(`SELECT id FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
+    expect(bills.rows).toHaveLength(0)
+    // The landlord was told once what is waiting.
+    const n = await db.query(`SELECT title FROM notifications WHERE type = 'utility_reads_need_review'`)
+    expect(n.rows).toHaveLength(1)
+    expect(n.rows[0].title).toMatch(/^1 meter reading to double-check/)
+    // The one window: the flagged list shows it, with the values the landlord needs.
+    const flagged = await flaggedList(app, f)
+    expect(flagged.body.data).toHaveLength(1)
+    expect(Number(flagged.body.data[0].reading_value)).toBe(7000)
   })
 
-  it('rollover flows through untouched: 999822 → 000138 re-read 000139 bills 316 automatically', async () => {
+  it('confirming the flagged read completes the run and bills from it', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const run = await openRun(app, f)
+    await mainWalk(app, f, run, 7000, 560)
+    const flagged = await flaggedList(app, f)
+    const resolved = await resolveFlagged(app, f, flagged.body.data[0].id, {})
+    expect(resolved.status).toBe(200)
+    expect(resolved.body.data.run.status).toBe('completed')
+    const bills = await db.query(
+      `SELECT usage_amount, charge_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
+    expect(Number(bills.rows[0].usage_amount)).toBe(6000)
+    expect(Number(bills.rows[0].charge_amount)).toBeCloseTo(840.0, 2)
+    expect((await flaggedList(app, f)).body.data).toHaveLength(0)
+  })
+
+  it('correcting the flagged read completes the run and bills from the corrected value', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const run = await openRun(app, f)
+    await mainWalk(app, f, run, 7000, 560)
+    const flagged = await flaggedList(app, f)
+    const resolved = await resolveFlagged(app, f, flagged.body.data[0].id, { correctedValue: 1700 }) // slipped digit
+    expect(resolved.status).toBe(200)
+    expect(resolved.body.data.run.status).toBe('completed')
+    const bills = await db.query(`SELECT usage_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
+    expect(Number(bills.rows[0].usage_amount)).toBe(700)   // 1700 − 1000
+  })
+
+  it('two flagged reads: the run waits until the LAST one is settled', async () => {
+    const app = buildApp()
+    const f = await seed()
+    await db.query(
+      `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+       VALUES ($1, 'electric', TRUE) ON CONFLICT DO NOTHING`, [f.leaseAId])
+    const run = await openRun(app, f)
+    const done = await mainWalk(app, f, run, 7000, 7000) // both over the threshold
+    expect(done.run.status).toBe('double_check')
+    expect(done.flagged).toBe(2)
+    const flagged = await flaggedList(app, f)
+    expect(flagged.body.data).toHaveLength(2)
+    const first = await resolveFlagged(app, f, flagged.body.data[0].id, {})
+    expect(first.body.data.run.status).toBe('double_check')          // one still open
+    const second = await resolveFlagged(app, f, flagged.body.data[1].id, {})
+    expect(second.body.data.run.status).toBe('completed')
+  })
+
+  it('rollover flows through untouched: 999822 → 000138 bills 316 with nothing flagged', async () => {
     const app = buildApp()
     const f = await seed()
     await db.query(
       `UPDATE utility_meter_readings SET reading_value = 999822
         WHERE meter_id = $1 AND billing_cycle_month = '2026-06-01'`, [f.meterLeased])
     const run = await openRun(app, f)
-    await mainWalk(app, f, run, 138, 560)
-    await enterDC(app, f, run.id, f.meterLeased, 139) // within tolerance — 138 stands
-    const done = await enterDC(app, f, run.id, f.meterVacant, 561)
-    expect(done.body.data.run.status).toBe('completed')
-    expect(done.body.data.escalated).toBe(0)
+    const done = await mainWalk(app, f, run, 138, 560)
+    expect(done.run.status).toBe('completed')
     const bills = await db.query(
       `SELECT usage_amount, charge_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
     expect(Number(bills.rows[0].usage_amount)).toBe(316) // (1,000,000 − 999822) + 138
     expect(Number(bills.rows[0].charge_amount)).toBeCloseTo(44.24, 2)
   })
 
-  it('suspicious-high usage verified by the re-read bills with no landlord involvement', async () => {
-    const app = buildApp()
-    const f = await seed()
-    const run = await openRun(app, f)
-    await mainWalk(app, f, run, 7000, 560) // 6,000 kWh — over the 5,000 threshold, silently flagged
-    await enterDC(app, f, run.id, f.meterLeased, 7001) // re-read confirms
-    const done = await enterDC(app, f, run.id, f.meterVacant, 561)
-    expect(done.body.data.run.status).toBe('completed')
-    expect(done.body.data.run.bills_created).toBe(1)
-    const bills = await db.query(
-      `SELECT usage_amount, charge_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
-    expect(Number(bills.rows[0].usage_amount)).toBe(6000)
-    expect(Number(bills.rows[0].charge_amount)).toBeCloseTo(840.0, 2)
-    // Landlord queue stays EMPTY — the re-read was the verification.
-    const flagged = await request(app)
-      .get(`/api/utility/readings/flagged?propertyId=${f.propertyAId}`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-    expect(flagged.body.data).toHaveLength(0)
-  })
-
-  // S652 (Nic): "I just reviewed seven meters and then there's a verification
-  // walk that showed up with another seven meters. I don't want both windows
-  // happening." The landlord's review IS the re-check.
-  it('a landlord review of a flagged read closes its entry on the walk; the last one finishes the run', async () => {
-    const app = buildApp()
-    const f = await seed()
-    const run = await openRun(app, f)
-    await mainWalk(app, f, run, 7000, 560) // leased meter flagged (6,000 kWh); vacant padded onto the list
-    const flagged = await request(app)
-      .get(`/api/utility/readings/flagged?propertyId=${f.propertyAId}`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-    expect(flagged.body.data).toHaveLength(1)
-
-    // Landlord corrects it from the review queue — a slipped digit, 7000 was 1700.
-    const resolved = await request(app)
-      .post(`/api/utility/readings/${flagged.body.data[0].id}/resolve-review`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ correctedValue: 1700 })
-    expect(resolved.status).toBe(200)
-    const dcs = await db.query<any>(
-      `SELECT meter_id, second_value, outcome FROM utility_reading_double_checks WHERE run_id = $1 ORDER BY meter_id`, [run.id])
-    const leased = dcs.rows.find(r => r.meter_id === f.meterLeased)
-    expect(Number(leased.second_value)).toBe(1700)
-    expect(leased.outcome).toBe('replaced')
-    // The walk now only wants the padding meter — not the one already reviewed.
-    const list = await request(app)
-      .get(`/api/utility/reading-runs/${run.id}/double-checks`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-    expect(list.body.data.filter((d: any) => !d.is_read).map((d: any) => d.meter_id)).toEqual([f.meterVacant])
-
-    // The last re-read on the walk finishes the run, billing from the corrected value.
-    const done = await enterDC(app, f, run.id, f.meterVacant, 561)
-    expect(done.body.data.run.status).toBe('completed')
-    const bills = await db.query(`SELECT usage_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
-    expect(Number(bills.rows[0].usage_amount)).toBe(700)   // 1700 − 1000
-  })
-
-  it('when the review settles the LAST entry on the walk, the run finishes from the review', async () => {
-    const app = buildApp()
-    const f = await seed()
-    const run = await openRun(app, f)
-    await mainWalk(app, f, run, 7000, 560)
-    await enterDC(app, f, run.id, f.meterVacant, 561)     // the padding meter is re-read on the walk
-    const flagged = await request(app)
-      .get(`/api/utility/readings/flagged?propertyId=${f.propertyAId}`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-    const resolved = await request(app)
-      .post(`/api/utility/readings/${flagged.body.data[0].id}/resolve-review`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({})                                            // confirmed correct
-    expect(resolved.status).toBe(200)
-    expect(resolved.body.data.run.status).toBe('completed')
-    const r = await db.query(`SELECT status FROM utility_reading_runs WHERE id = $1`, [run.id])
-    expect(r.rows[0].status).toBe('completed')
-  })
-
-  it('re-read-confirmed implausible low value escalates to the landlord (rollover vs swap)', async () => {
+  it('an implausible low value is flagged for the landlord (rollover vs swap); confirmed, nothing bills', async () => {
     const app = buildApp()
     const f = await seed()
     await db.query(
       `UPDATE utility_meter_readings SET reading_value = 500000
         WHERE meter_id = $1 AND billing_cycle_month = '2026-06-01'`, [f.meterLeased])
     const run = await openRun(app, f)
-    await mainWalk(app, f, run, 50, 560) // wrap 500050 ≥ half range → suspect
-    await enterDC(app, f, run.id, f.meterLeased, 51) // re-read confirms the low value
-    const done = await enterDC(app, f, run.id, f.meterVacant, 561)
-    expect(done.body.data.run.status).toBe('completed')
-    expect(done.body.data.escalated).toBe(1)
-    expect(done.body.data.run.bills_created).toBe(0) // escalated meter held from billing
-
-    const flagged = await request(app)
-      .get(`/api/utility/readings/flagged?propertyId=${f.propertyAId}`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
+    const done = await mainWalk(app, f, run, 50, 560) // wrap 500050 ≥ half range → flagged
+    expect(done.run.status).toBe('double_check')
+    const flagged = await flaggedList(app, f)
     expect(flagged.body.data).toHaveLength(1)
-    expect(flagged.body.data[0].review_note).toMatch(/rollover or meter swap/)
-    // Landlord: meter was swapped → nothing bills this cycle.
-    const resolved = await request(app)
-      .post(`/api/utility/readings/${flagged.body.data[0].id}/resolve-review`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({})
+    expect(flagged.body.data[0].review_note).toMatch(/below the previous reading/)
+    // Landlord: the meter was swapped → confirm; nothing bills this cycle.
+    const resolved = await resolveFlagged(app, f, flagged.body.data[0].id, {})
     expect(resolved.status).toBe(200)
-    expect(resolved.body.data.billsCreated).toBe(0)
-  })
-
-  it('list pads with random clean meters to the 6 minimum and always includes the suspects', async () => {
-    const app = buildApp()
-    const f = await seed()
-    // 6 more submeters (8 total) on their own units, all with baselines.
-    const c = await db.connect()
-    try {
-      await c.query('BEGIN')
-      for (let i = 0; i < 6; i++) {
-        const u = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId })
-        const m = await seedUtilityMeter(c, { propertyId: f.propertyAId, utilityType: 'electric', billingMethod: 'submeter' })
-        await c.query(`UPDATE utility_meters SET rate_per_unit = 0.14 WHERE id = $1`, [m])
-        await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [m, u])
-        await c.query(
-          `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id)
-           VALUES ($1, '2026-06-30', 1000, '2026-06-01', $2)`, [m, f.landlordAUserId])
-      }
-      await c.query('COMMIT')
-    } finally { c.release() }
-
-    const run = await openRun(app, f)
-    const meters = await request(app)
-      .get(`/api/utility/reading-runs/${run.id}/meters`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-    // Main walk: leased meter suspicious (6,000 kWh), everything else normal.
-    let last: any = null
-    for (const m of meters.body.data) {
-      const value = m.meter_id === f.meterLeased ? 7000 : 1100
-      const r = await enterReading(app, f, run.id, m.meter_id, value)
-      last = r.body.data
-    }
-    expect(last.run.status).toBe('double_check')
-    expect(last.dcTotal).toBe(6) // 1 suspect + 5 random pads
-    const dcs = await getDCs(app, f, run.id)
-    expect(dcs.body.data.map((d: any) => d.meter_id)).toContain(f.meterLeased)
+    expect(resolved.body.data.run.status).toBe('completed')
+    expect(resolved.body.data.run.bills_created).toBe(0)
   })
 
   it('per-meter digits drive the wrap: a 4-digit meter rolls 9822 → 0138 = 316', async () => {
@@ -452,19 +365,21 @@ describe('verification phase', () => {
     const run = await openRun(app, f)
     const over = await enterReading(app, f, run.id, f.meterLeased, 10000)
     expect(over.status).toBe(400) // over 4-digit capacity
-    await mainWalk(app, f, run, 138, 560)
-    await enterDC(app, f, run.id, f.meterLeased, 138)
-    await enterDC(app, f, run.id, f.meterVacant, 561)
+    const done = await mainWalk(app, f, run, 138, 560)
+    expect(done.run.status).toBe('completed')
     const bills = await db.query(
       `SELECT usage_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
     expect(Number(bills.rows[0].usage_amount)).toBe(316)
   })
 
-  it('escape hatch: /complete force-bills the clean meters from either phase', async () => {
+  it('escape hatch: /complete force-bills the clean meters while a flagged one waits', async () => {
     const app = buildApp()
     const f = await seed()
+    await db.query(
+      `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+       VALUES ($1, 'electric', TRUE) ON CONFLICT DO NOTHING`, [f.leaseAId])
     const run = await openRun(app, f)
-    await mainWalk(app, f, run, 1250, 560) // now in double_check, no re-reads entered
+    await mainWalk(app, f, run, 1250, 7000) // vacant meter flagged; leased clean
     const done = await request(app)
       .post(`/api/utility/reading-runs/${run.id}/complete`)
       .set('Authorization', `Bearer ${f.tokenA}`)
@@ -495,10 +410,8 @@ describe('verification phase', () => {
        VALUES ($1, 'water', 2), ($1, 'sewer', 4)`, [f.propertyAId])
 
     const run = await openRun(app, f)
-    await mainWalk(app, f, run, 1250, 560) // water usage 250 gal
-    await enterDC(app, f, run.id, f.meterLeased, 1250)
-    const done = await enterDC(app, f, run.id, f.meterVacant, 560)
-    expect(done.body.data.run.status).toBe('completed')
+    const done = await mainWalk(app, f, run, 1250, 560) // water usage 250 gal
+    expect(done.run.status).toBe('completed')
 
     // ONE bill: 250 × (0.008 + 0.006) = $3.50.
     // Tax = 250×0.008×2% + 250×0.006×4% = 0.04 + 0.06 = $0.10.
@@ -510,14 +423,6 @@ describe('verification phase', () => {
     expect(Number(bills.rows[0].charge_amount)).toBeCloseTo(3.5, 2)
     expect(Number(bills.rows[0].tax_amount)).toBeCloseTo(0.1, 2)
     expect(Number(bills.rows[0].sewer_rate_per_unit)).toBeCloseTo(0.006, 4)
-  })
-
-  it('double-check entries are refused outside the verification phase', async () => {
-    const app = buildApp()
-    const f = await seed()
-    const run = await openRun(app, f)
-    const early = await enterDC(app, f, run.id, f.meterLeased, 1250)
-    expect(early.status).toBe(409) // still 'open'
   })
 })
 
@@ -543,7 +448,7 @@ describe('S534 per-unit billing on the lease invoice date', () => {
     expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(0) // held
 
     const r = await enterReading(app, f, run.id, f.meterLeased, 1250)
-    expect(r.body.data.run.status).toBe('double_check') // verification NOT done
+    expect(r.body.data.run.status).toBe('completed')   // S652: clean walk completes on the last read
 
     await generateInvoices(AUG)
     const inv = await invoiceFor(f.leaseAId)
@@ -599,8 +504,8 @@ describe('S534 per-unit billing on the lease invoice date', () => {
     await generateInvoices(AUG)
     expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(0) // held — rent goes nowhere either
 
-    await enterDC(app, f, run.id, f.meterLeased, 7001) // re-read confirms → flag resolves
-    await enterDC(app, f, run.id, f.meterVacant, 561)
+    const flagged = await flaggedList(app, f)
+    await resolveFlagged(app, f, flagged.body.data[0].id, {})   // landlord confirms → flag resolves
 
     await generateInvoices(AUG)
     const inv = await invoiceFor(f.leaseAId)
@@ -608,32 +513,20 @@ describe('S534 per-unit billing on the lease invoice date', () => {
     expect(Number(inv.rows[0].subtotal_utilities)).toBeCloseTo(840.0, 2) // 6,000 × 0.14
   })
 
-  it('once the bill is on an invoice the reading is immutable — a big-diff re-read cannot replace it', async () => {
+  it('a clean run bills on the invoice date, and a later correction from the landlord regenerates an un-invoiced bill only', async () => {
     const app = buildApp()
     const f = await seed()
     const run = await openRun(app, f)
     await mainWalk(app, f, run, 1250, 560)
 
-    await generateInvoices(AUG) // bills + invoices from the original reads
+    await generateInvoices(AUG) // bills + invoices from the reads
     expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(1)
-
-    const dc = await enterDC(app, f, run.id, f.meterLeased, 1400) // would normally replace
-    expect(dc.status).toBe(201)
-    await enterDC(app, f, run.id, f.meterVacant, 561)
-
-    const reading = await db.query(
-      `SELECT reading_value FROM utility_meter_readings WHERE meter_id = $1 AND billing_cycle_month = $2`,
-      [f.meterLeased, CYCLE])
-    expect(Number(reading.rows[0].reading_value)).toBe(1250) // first read stands; drift bills next cycle
     const bill = await db.query(
-      `SELECT usage_amount FROM utility_bills WHERE meter_id = $1 AND billing_cycle_month = $2`,
+      `SELECT usage_amount, payment_id FROM utility_bills WHERE meter_id = $1 AND billing_cycle_month = $2`,
       [f.meterLeased, CYCLE])
     expect(bill.rows).toHaveLength(1)
     expect(Number(bill.rows[0].usage_amount)).toBe(250)
-    const outcome = await db.query(
-      `SELECT outcome FROM utility_reading_double_checks WHERE run_id = $1 AND meter_id = $2`,
-      [run.id, f.meterLeased])
-    expect(outcome.rows[0].outcome).toBe('verified')
+    expect(bill.rows[0].payment_id).not.toBeNull()   // on the invoice: this bill is settled history
   })
 })
 
@@ -1916,10 +1809,8 @@ describe('S652 — review utility bills before billing', () => {
     const app = buildApp()
     const f = await seed()
     const run = await openRun(app, f)
-    await mainWalk(app, f, run, 1250, 560)
-    await enterDC(app, f, run.id, f.meterLeased, 1250)
-    const done = await enterDC(app, f, run.id, f.meterVacant, 560)
-    expect(done.body.data.run.status).toBe('completed')
+    const done = await mainWalk(app, f, run, 1250, 560)
+    expect(done.run.status).toBe('completed')
     expect((await db.query(`SELECT status FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])).rows[0].status).toBe('billed')
   })
 

@@ -360,7 +360,7 @@ const LANDLORD_ENTRY: AgentProfile = {
     'give_entry_notice', 'record_entry',
     // S628: the reading round, addenda, handing a property over, and the
     // onboarding transition.
-    'record_reading_in_run', 'submit_meter_double_check', 'record_special_meter_read',
+    'record_reading_in_run', 'record_special_meter_read',
     'correct_meter_reading', 'resolve_reading_review', 'unassign_unit_from_meter',
     'remove_utility_meter', 'draft_add_tenant_addendum', 'draft_remove_tenant_addendum',
     'draft_work_trade_addendum', 'auto_place_template_fields', 'add_witness',
@@ -478,7 +478,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'give_entry_notice', 'record_entry',
     // S628: the reading round, addenda, handing a property over, and the
     // onboarding transition.
-    'record_reading_in_run', 'submit_meter_double_check', 'record_special_meter_read',
+    'record_reading_in_run', 'record_special_meter_read',
     'correct_meter_reading', 'resolve_reading_review', 'unassign_unit_from_meter',
     'remove_utility_meter', 'draft_add_tenant_addendum', 'draft_remove_tenant_addendum',
     'draft_work_trade_addendum', 'auto_place_template_fields', 'add_witness',
