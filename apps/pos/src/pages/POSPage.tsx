@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, Fragment } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ClipboardEvent as ReactClipboardEvent } from 'react'
 import { useAuth } from '../context/AuthContext'
 import {
@@ -28,7 +28,10 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 const pct = (n: any) => n != null ? `${(Number(n)*100).toFixed(2)}%` : '—'
 
 const STATUS_MAP: Record<string,string> = { completed:'badge-green', voided:'badge-red', refunded:'badge-amber', partial_refund:'badge-amber' }
-const METHOD_MAP: Record<string,string> = { cash:'badge-green', card:'badge-blue', charge:'badge-amber' }
+// S653 (Nic): "flag the history different for pay links vs terminal reader."
+// The API says HOW a card arrived (tender); payment_method alone says only 'card'.
+const METHOD_MAP: Record<string,string> = { cash:'badge-green', card:'badge-blue', card_reader:'badge-blue', pay_link:'badge-gold', card_on_file:'badge-blue', charge:'badge-amber' }
+const TENDER_LABEL: Record<string,string> = { cash:'Cash', card:'Card', card_reader:'Card reader', pay_link:'Pay link (paid online)', card_on_file:'Card on file', charge:'Charge account' }
 // S512 LAUNCH: the "charge" (FlexCharge) tender is hidden at launch with the
 // rest of the Flex Suite. The button is filtered out of the register picker so
 // a clerk can only ring cash/card; all charge code stays for post-launch.
@@ -111,6 +114,7 @@ export function POSPage() {
   const [receipt, setReceipt] = useState<any>(null)
   const [appliedDiscount, setAppliedDiscount] = useState<any>(null)
   const [discountCode, setDiscountCode] = useState('')
+  const [openTx,setOpenTx]=useState<string|null>(null)   // S653: history row expanded to its lines
   const [refundModal, setRefundModal] = useState<{show:boolean; tx:any}>({show:false,tx:null})
   const [refundAmt, setRefundAmt] = useState('')
   const [refundReason, setRefundReason] = useState('')
@@ -1142,12 +1146,16 @@ export function POSPage() {
             <table className="data-table">
               <thead><tr><th>Date</th><th>Items</th><th>Subtotal</th><th>Total</th><th>Method</th><th>Status</th><th>Actions</th></tr></thead>
               <tbody>
-                {(txns as any[]).length?(txns as any[]).map((t:any)=>(<tr key={t.id}>
+                {(txns as any[]).length?(txns as any[]).map((t:any)=>(<Fragment key={t.id}><tr style={{cursor:'pointer'}} onClick={()=>setOpenTx(o=>o===t.id?null:t.id)} title="Click to see what was sold">
                   <td className="mono">{new Date(t.createdAt).toLocaleDateString()}</td>
-                  <td style={{color:'var(--text-3)',fontSize:'.82rem'}}>{t.itemCount} items</td>
+                  <td style={{color:'var(--text-3)',fontSize:'.82rem'}}>
+                    {/* S653 (Nic): "it isn't clickable" — the lines open under the row. */}
+                    {(t.items||[]).length===1 ? `${t.items[0].name} ×${Number(t.items[0].qty)}` : `${t.itemCount} items`}
+                    <span style={{marginLeft:6,color:'var(--text-3)'}}>{openTx===t.id?'▾':'▸'}</span>
+                  </td>
                   <td className="mono">{fmt(t.subtotal)}</td>
                   <td className="mono" style={{fontWeight:600}}>{fmt(t.total)}</td>
-                  <td><span className={"badge "+(METHOD_MAP[t.paymentMethod]||'badge-muted')}>{humanize(t.paymentMethod)}</span></td>
+                  <td><span className={"badge "+(METHOD_MAP[t.tender||t.paymentMethod]||'badge-muted')}>{TENDER_LABEL[t.tender||t.paymentMethod]||humanize(t.tender||t.paymentMethod)}</span></td>
                   <td><span className={"badge "+(STATUS_MAP[t.status]||'badge-muted')}>{t.status||'completed'}</span></td>
                   {/* S652 (Nic): refund and void are their own permissions
                       (pos.refund / pos.void) — a cashier with Sales history
@@ -1159,7 +1167,23 @@ export function POSPage() {
                   </div>)}
                   {t.status==='refunded'&&<span style={{fontSize:'.75rem',color:'var(--text-3)'}}>-{fmt(t.refundAmount)}</span>}
                   </td>
-                </tr>)):<tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No transactions yet.</td></tr>}
+                </tr>
+                {openTx===t.id&&(<tr><td colSpan={7} style={{background:'var(--bg-2)',padding:'8px 16px 12px'}}>
+                  <div style={{display:'grid',gap:4,fontSize:'.8rem'}}>
+                    {(t.items||[]).map((it:any,i:number)=>(<div key={i} style={{display:'flex',justifyContent:'space-between',gap:12}}>
+                      <span>{it.name} <span style={{color:'var(--text-3)'}}>×{Number(it.qty)} @ {fmt(it.price)}</span></span>
+                      <span className="mono">{fmt(it.subtotal)}</span>
+                    </div>))}
+                    {Number(t.discountAmount)>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--text-3)'}}><span>Discount{t.discountReason?` — ${t.discountReason}`:''}</span><span className="mono">-{fmt(t.discountAmount)}</span></div>}
+                    {Number(t.taxAmount)>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--text-3)'}}><span>Tax</span><span className="mono">{fmt(t.taxAmount)}</span></div>}
+                    {Number(t.surcharge)>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--text-3)'}}><span>Card fee</span><span className="mono">{fmt(t.surcharge)}</span></div>}
+                    <div style={{display:'flex',justifyContent:'space-between',color:'var(--text-3)'}}>
+                      <span>{TENDER_LABEL[t.tender||t.paymentMethod]||humanize(t.paymentMethod)}{t.tenantName?` · ${t.tenantName}`:''} · {new Date(t.createdAt).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</span>
+                      <span className="mono" style={{fontWeight:700,color:'var(--text-0)'}}>{fmt(t.total)}</span>
+                    </div>
+                  </div>
+                </td></tr>)}
+                </Fragment>)):<tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No transactions yet.</td></tr>}
               </tbody>
             </table>
           )}

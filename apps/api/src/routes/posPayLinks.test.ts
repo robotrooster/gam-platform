@@ -164,6 +164,7 @@ describe('when it is paid', () => {
     const tx = (await db.query(`SELECT * FROM pos_transactions WHERE pay_link_id = $1`, [link.id])).rows
     expect(tx).toHaveLength(1)
     expect(tx[0].payment_method).toBe('card')
+    expect(tx[0].paid_online).toBe(true)   // S653: history shows it as a pay link, not the reader
     expect(Number(tx[0].total)).toBe(charged)
     expect(Number(tx[0].surcharge)).toBe(fee)
     // The landlord is owed the link total, paid in the weekly batch.

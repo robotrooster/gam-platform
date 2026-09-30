@@ -10,6 +10,7 @@ import { toast, appConfirm } from '../components/dialogs'
 import { LeaseFormModal } from './LeaseFormModal'
 import { LeaseOverviewModal } from './LeaseOverviewModal'
 import { RenewalDecisionModal } from './RenewalDecisionModal'
+import { LeavingModal, type LeavingLease } from '../components/LeavingModal'
 import { usePerms } from '../lib/permissions'
 
 const fmt = (n: any) => n != null
@@ -52,6 +53,8 @@ export function LeasesPage() {
   // carries.
   const [chargeLease, setChargeLease] = useState<any | null>(null)
   const [moveLease, setMoveLease] = useState<any | null>(null)
+  // S653: "they're leaving on…" — a desk mark, never on the document.
+  const [leavingLease, setLeavingLease] = useState<LeavingLease | null>(null)
   // S581: money add-on / notice modal (recurring charge or rent change that
   // reaches billing on a landlord-set date).
   const [addonLease, setAddonLease] = useState<any | null>(null)
@@ -429,6 +432,11 @@ export function LeasesPage() {
                       {l.isHibernating && (
                         <span className="badge badge-amber" title="Seasonally paused — no rent billed, deposit held, spot bookable off-season" style={{ marginLeft: 4 }}>Hibernating</span>
                       )}
+                      {l.status === 'active' && l.moveOutNoticeAt && l.endDate && (
+                        <span className="badge badge-gold" title={l.moveOutNoticeNote ? `They said: ${l.moveOutNoticeNote}` : 'Written down at the front desk'} style={{ marginLeft: 4 }}>
+                          Leaving {new Date(l.endDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                        </span>
+                      )}
                     </td>
                     <td onClick={e => e.stopPropagation()}>
                       {/* S652 (Nic): "this page just feels like it has too much
@@ -470,8 +478,13 @@ export function LeasesPage() {
                             ] : []),
                           ]} />
                         )}
-                        {(can('leases.edit') || can('leases.deposit_return')) && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
+                        {(can('leases.edit') || can('leases.deposit_return') || can('front_desk.mark_leaving')) && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
                           <RowMenu label={<><ArrowRight size={12} /> Change</>} items={[
+                            ...((can('leases.edit') || can('front_desk.mark_leaving')) && l.status === 'active' ? [
+                              l.moveOutNoticeAt
+                                ? { label: 'Leaving date — change or call off', hint: `On file: ${new Date(l.endDate).toLocaleDateString()}`, onClick: () => setLeavingLease(toLeaving(l, tenantName)) }
+                                : { label: 'They\'re leaving on…', hint: 'Write down the day they said; the final read and move-out follow', onClick: () => setLeavingLease(toLeaving(l, tenantName)) },
+                            ] : []),
                             ...(can('leases.edit') && l.status === 'active' ? [
                               { label: 'Move to another space', hint: 'Same lease, same rent, same terms', onClick: () => setMoveLease(l) },
                             ] : []),
@@ -535,6 +548,9 @@ export function LeasesPage() {
           lease={moveLease}
           onClose={() => setMoveLease(null)}
         />
+      )}
+      {leavingLease && (
+        <LeavingModal lease={leavingLease} onClose={() => setLeavingLease(null)} />
       )}
       {chargeLease && (
         <OneOffChargeModal
@@ -1336,6 +1352,16 @@ function SendAddendumModal({ lease, onClose }: { lease: any; onClose: () => void
       </div>
     </div>
   )
+}
+
+// S653: what the leaving-on modal needs from a leases-table row.
+function toLeaving(l: any, tenantName: string): LeavingLease {
+  return {
+    leaseId: l.id, unitNumber: l.unitNumber, propertyName: l.propertyName, names: tenantName === '—' ? '' : tenantName,
+    startDate: l.startDate, endDate: l.endDate ? String(l.endDate).slice(0, 10) : null,
+    moveOutNoticeAt: l.moveOutNoticeAt ?? null, moveOutNoticeNote: l.moveOutNoticeNote ?? null,
+    moveOutNoticePrevEndDate: l.moveOutNoticePrevEndDate ? String(l.moveOutNoticePrevEndDate).slice(0, 10) : null,
+  }
 }
 
 // A small menu button for the leases table: one button, a list of actions.

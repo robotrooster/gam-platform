@@ -653,6 +653,7 @@ export async function finalizePayLink(session: {
       subtotal: Number(link.subtotal), taxAmount: Number(link.tax_amount), surcharge: customerFee,
       total: charged, platformFee: fee, stripePaymentIntentId: session.payment_intent,
       payoutOwed: held,
+      paidOnline: true,   // S653: paid by the customer on the link, not at the counter
       discountAmount: Number(link.discount_amount), discountReason: null,
       items: link.items,
     })

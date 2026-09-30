@@ -21,9 +21,11 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch } from '../lib/api'
+import { usePerms } from '../lib/permissions'
+import { LeavingModal, type LeavingLease } from '../components/LeavingModal'
 import { EmergencyContactsPanel } from './EmergencyContactsPanel'
 import { SearchBox } from '../components/ListControls'
-import { Phone, Mail, Search } from 'lucide-react'
+import { Phone, Mail, Search, CalendarX } from 'lucide-react'
 
 type Balance = {
   tenantId: string
@@ -319,7 +321,19 @@ export function FrontDeskPage() {
   // to say to the person standing in front of you. It also means one permission
   // switch covers both, which is the rule for this role — the fewer things there
   // are to get wrong, the wider the pool of people who can do it.
-  const [tab, setTab] = useState<'calls' | 'emergency'>('calls')
+  // ── S653 (Nic): MOVE-OUTS LIVE HERE TOO ────────────────────────────────────
+  //
+  // "They're going to come in and say, hey, I'm pulling out Saturday with like
+  // maybe three or four days notice, if that. We need the front desk to be able
+  // to mark it as, hey, they're leaving then."
+  //
+  // Same job as the call list — the person is standing at the counter — so it
+  // is a tab here, gated on its own key (front_desk.mark_leaving). Somebody
+  // holding only that key lands on it directly.
+  const { can } = usePerms()
+  const canMarkLeaving = can('front_desk.mark_leaving') || can('leases.edit')
+  const canSeeCalls = can('front_desk.view') || can('tenants.create')
+  const [tab, setTab] = useState<'calls' | 'moveouts' | 'emergency'>(canSeeCalls ? 'calls' : 'moveouts')
 
   return (
     <div>
@@ -346,13 +360,19 @@ export function FrontDeskPage() {
           className={`btn btn-sm ${tab === 'calls' ? 'btn-primary' : 'btn-ghost'}`}>
           Call list{toCall > 0 ? ` (${toCall})` : ''}
         </button>
+        {canMarkLeaving && (
+          <button type="button" onClick={() => setTab('moveouts')}
+            className={`btn btn-sm ${tab === 'moveouts' ? 'btn-primary' : 'btn-ghost'}`}>
+            Move-outs
+          </button>
+        )}
         <button type="button" onClick={() => setTab('emergency')}
           className={`btn btn-sm ${tab === 'emergency' ? 'btn-primary' : 'btn-ghost'}`}>
           Emergency contacts
         </button>
       </div>
 
-      {tab === 'emergency' ? <EmergencyContactsPanel /> : (
+      {tab === 'emergency' ? <EmergencyContactsPanel /> : tab === 'moveouts' ? <MoveOutsPanel /> : (
       <>
       <div className="filter-bar">
         <SearchBox value={q} onChange={setQ} placeholder="Name, email, phone or unit…" />
@@ -496,5 +516,97 @@ export function FrontDeskPage() {
       </>
       )}
     </div>
+  )
+}
+
+// ── S653: the Move-outs tab ───────────────────────────────────────────────────
+// Find the household (name, email, phone or space), tap the day they said.
+// Whoever already has a day on file sits at the top so the desk can see who is
+// going this week — and call it off when somebody changes their mind.
+const sayShort = (s: string) => {
+  const [y, m, d] = s.split('-').map(Number)
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })
+}
+
+function MoveOutsPanel() {
+  const [q, setQ] = useState('')
+  const [pick, setPick] = useState<LeavingLease | null>(null)
+  const query = q.trim()
+  const { data: rows = [], isLoading } = useQuery<any[]>(
+    ['desk-residents', query],
+    () => apiGet<any[]>(`/leases/desk/residents${query ? `?q=${encodeURIComponent(query)}` : ''}`),
+    { refetchOnWindowFocus: true, keepPreviousData: true })
+
+  const leaving = rows.filter(r => r.moveOutNoticeAt)
+  const staying = rows.filter(r => !r.moveOutNoticeAt)
+  const toLease = (r: any): LeavingLease => ({
+    leaseId: r.leaseId, unitNumber: r.unitNumber, propertyName: r.propertyName, names: r.names || r.email,
+    startDate: r.startDate, endDate: r.endDate, moveOutNoticeAt: r.moveOutNoticeAt,
+    moveOutNoticeNote: r.moveOutNoticeNote, moveOutNoticePrevEndDate: r.moveOutNoticePrevEndDate, markedBy: r.markedBy,
+  })
+
+  const Row = ({ r }: { r: any }) => (
+    <div style={{ display: 'flex', gap: 14, alignItems: 'center', padding: '10px 0', borderTop: '1px solid var(--border-0)' }}>
+      <div style={{ minWidth: 170 }}>
+        <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>{r.names || r.email}</div>
+        <div style={{ fontSize: '.76rem', color: 'var(--text-3)' }}>{r.unitNumber} · {r.propertyName}</div>
+      </div>
+      <div style={{ minWidth: 150, fontSize: '.78rem' }}>
+        {r.phone && <div><a href={`tel:${r.phone}`} style={{ color: 'var(--text-1)', display: 'flex', alignItems: 'center', gap: 5 }}><Phone size={12} /> {r.phone}</a></div>}
+        {r.email && <div><a href={`mailto:${r.email}`} style={{ color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 5, wordBreak: 'break-all' }}><Mail size={12} /> {r.email}</a></div>}
+      </div>
+      <div style={{ flex: 1, fontSize: '.82rem', color: 'var(--text-1)' }}>
+        {r.moveOutNoticeAt ? (
+          <>
+            <span style={{ fontWeight: 800, color: 'var(--gold)' }}>Leaving {sayShort(r.endDate)}</span>
+            {r.moveOutNoticeNote && <span style={{ color: 'var(--text-3)' }}> · “{r.moveOutNoticeNote}”</span>}
+          </>
+        ) : r.endDate ? (
+          <span style={{ color: 'var(--text-3)' }}>Lease runs to {sayShort(r.endDate)}</span>
+        ) : (
+          <span style={{ color: 'var(--text-3)' }}>Month to month</span>
+        )}
+      </div>
+      <button type="button" className={`btn btn-sm ${r.moveOutNoticeAt ? 'btn-ghost' : 'btn-primary'}`} onClick={() => setPick(toLease(r))}>
+        {r.moveOutNoticeAt ? 'Change / call off' : 'Leaving on…'}
+      </button>
+    </div>
+  )
+
+  return (
+    <>
+      <div className="filter-bar">
+        <SearchBox value={q} onChange={setQ} placeholder="Who's leaving? Name, email, phone or space…" />
+      </div>
+      {isLoading && rows.length === 0 ? (
+        <div className="card"><div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)' }}>Loading…</div></div>
+      ) : rows.length === 0 ? (
+        <div className="empty-state" style={{ padding: 48 }}>
+          <CalendarX size={40} />
+          <h3>Nobody found</h3>
+          <p>{query ? 'No one on a space matches that.' : 'Nobody is on a space right now.'}</p>
+        </div>
+      ) : (
+        <div className="card" style={{ padding: '0 16px 12px' }}>
+          {leaving.length > 0 && (
+            <>
+              <div style={{ padding: '12px 0 4px', fontSize: '.72rem', fontWeight: 700, color: 'var(--gold)', textTransform: 'uppercase', letterSpacing: '.04em' }}>
+                Leaving ({leaving.length})
+              </div>
+              {leaving.map(r => <Row key={r.leaseId} r={r} />)}
+            </>
+          )}
+          {staying.length > 0 && (
+            <>
+              <div style={{ padding: '12px 0 4px', fontSize: '.72rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.04em' }}>
+                On a space ({staying.length})
+              </div>
+              {staying.map(r => <Row key={r.leaseId} r={r} />)}
+            </>
+          )}
+        </div>
+      )}
+      {pick && <LeavingModal lease={pick} onClose={() => setPick(null)} />}
+    </>
   )
 }

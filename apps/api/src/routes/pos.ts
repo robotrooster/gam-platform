@@ -1987,7 +1987,15 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
     const txns = await query<any>(`
       SELECT t.*,
         u.first_name || ' ' || u.last_name AS tenant_name,
-        (SELECT COUNT(*) FROM pos_transaction_items WHERE transaction_id=t.id) as item_count
+        (SELECT COUNT(*) FROM pos_transaction_items WHERE transaction_id=t.id) as item_count,
+        -- S653 (Nic): "flag the history different for pay links vs terminal
+        -- reader." payment_method says card either way; how the card was
+        -- presented is the fact the counter wants to see.
+        CASE WHEN t.payment_method = 'card' AND t.paid_online THEN 'pay_link'
+             WHEN t.payment_method = 'card' THEN 'card_reader'
+             ELSE t.payment_method END AS tender,
+        (SELECT json_agg(json_build_object('name', i.item_name, 'qty', i.qty, 'price', i.unit_price, 'subtotal', i.subtotal) ORDER BY i.created_at)
+           FROM pos_transaction_items i WHERE i.transaction_id = t.id) AS items
       FROM pos_transactions t
       LEFT JOIN tenants tn ON tn.id = t.tenant_id
       LEFT JOIN users u ON u.id = tn.user_id

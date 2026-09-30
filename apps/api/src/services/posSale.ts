@@ -29,6 +29,8 @@ export interface PosSaleInput {
   // S648: set when a card sale landed on GAM's platform account — what GAM owes
   // the landlord for it (total less the card fee), paid in the weekly batch.
   payoutOwed?: number
+  // S653: the customer paid this on an emailed link, not at the counter.
+  paidOnline?: boolean
   items: Array<{ id?: string | null; name: string; cat?: string; category?: string; qty: number; price: number; tax?: number; tax_rate?: number }>
   /** S650: the taxes charged, by name — "Lodging tax $3.11", not one "Tax" line. */
   taxBreakdown?: { name: string; rate: number; amount: number }[] | null
@@ -55,12 +57,13 @@ export function cardPayoutOwed(s: Pick<PosSaleInput, 'paymentMethod' | 'stripePa
  */
 export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promise<{ tx: any; needsPO: any[] }> {
   const txRes = await client.query(`INSERT INTO pos_transactions
-    (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason,tax_breakdown)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb) RETURNING *`,
+    (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason,tax_breakdown,paid_online)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17) RETURNING *`,
     [s.landlordId, s.tenantId || null, s.posCustomerId || null, s.cashierId,
      s.paymentMethod, s.subtotal, s.taxAmount, s.surcharge, s.total, s.changeGiven || 0, s.platformFee || 0,
      s.stripePaymentIntentId || null, s.propertyId || null, s.discountAmount || 0, s.discountReason || null,
-     s.taxBreakdown && s.taxBreakdown.length ? JSON.stringify(s.taxBreakdown) : null])
+     s.taxBreakdown && s.taxBreakdown.length ? JSON.stringify(s.taxBreakdown) : null,
+     s.paidOnline === true])
   const tx = txRes.rows[0]
   const needsPO: any[] = []
   // S648: a card sale's money is GAM's to hold until the weekly payout.

@@ -345,6 +345,24 @@ leasesRouter.get('/', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// S653 (Nic): leaving-on mark — the keys that may write it (see the routes further down).
+const LEAVING_PERMS = ['front_desk.mark_leaving', 'leases.edit'] as const
+// S653: registered ABOVE '/:id' — Express matches in order, and 'desk' is not an id.
+/** GET /api/leases/desk/residents?q= — who is on a space right now, for the desk. */
+leasesRouter.get('/desk/residents', requirePerm(...LEAVING_PERMS), async (req: any, res, next) => {
+  try {
+    const q = typeof req.query.q === 'string' ? req.query.q.slice(0, 80) : ''
+    const { getScopedPropertyIds } = await import('../middleware/auth')
+    const { listResidentsForDesk } = await import('../services/moveOutNotice')
+    const rows = await listResidentsForDesk({
+      landlordIds: landlordScopeIds(req.user!),
+      propertyIds: await getScopedPropertyIds(req.user),
+      q,
+    })
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
 // ─────────────────────────────────────────────────────────────
 // GET ONE LEASE
 // ─────────────────────────────────────────────────────────────
@@ -1962,6 +1980,56 @@ leasesRouter.post('/:id/move', requirePerm('leases.edit'), async (req: any, res,
       reads: body.reads,
     })
     res.json({ success: true, data: result })
+  } catch (e) { next(e) }
+})
+
+// ── S653 (Nic): "THEY'RE LEAVING ON…" — a front-desk mark, not a document ──
+//
+// "They're going to come in and say, hey, I'm pulling out Saturday with like
+// maybe three or four days notice, if that. We need the front desk to be able
+// to mark it as, hey, they're leaving then. When we get the final meter read,
+// we can initiate the final bill cycle." And: "I don't want it physically on
+// the document."
+//
+// The mark sets the lease's end date (see services/moveOutNotice.ts for what
+// that sets in motion). Gated on its own key so the desk can hold it without
+// being handed lease editing; a landlord and anyone with leases.edit hold it
+// too. A team member is further held to the parks they work at.
+
+async function leaseInScope(req: any, leaseId: string) {
+  const { loadLeaseForNotice } = await import('../services/moveOutNotice')
+  const lease = await loadLeaseForNotice(leaseId)
+  if (!lease) throw new AppError(404, 'Lease not found')
+  if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+  const { getScopedPropertyIds } = await import('../middleware/auth')
+  const scoped = await getScopedPropertyIds(req.user)
+  if (scoped && !scoped.includes(lease.property_id)) throw new AppError(403, 'That resident is at a property you do not work at')
+  return lease
+}
+
+/** POST /api/leases/:id/leaving { on, note? } — record the day they said. */
+leasesRouter.post('/:id/leaving', requirePerm(...LEAVING_PERMS), async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      on:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      note: z.string().max(500).nullable().optional(),
+    }).parse(req.body)
+    await leaseInScope(req, req.params.id)
+    const { recordMoveOutNotice } = await import('../services/moveOutNotice')
+    const lease = await recordMoveOutNotice({
+      leaseId: req.params.id, on: body.on, note: body.note ?? null, byUserId: req.user!.userId,
+    })
+    res.json({ success: true, data: lease })
+  } catch (e) { next(e) }
+})
+
+/** DELETE /api/leases/:id/leaving — they changed their mind; back to the lease as it was. */
+leasesRouter.delete('/:id/leaving', requirePerm(...LEAVING_PERMS), async (req: any, res, next) => {
+  try {
+    await leaseInScope(req, req.params.id)
+    const { cancelMoveOutNotice } = await import('../services/moveOutNotice')
+    const lease = await cancelMoveOutNotice({ leaseId: req.params.id, byUserId: req.user!.userId })
+    res.json({ success: true, data: lease })
   } catch (e) { next(e) }
 })
 

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict HBvNa7IUxm7BYaAJoRskOrLAW5mh2BRojb2PuORW8gBsv0dVkxH8CeDli6BksB1
+\restrict ddd6lPHNiz1fw9yDVWAhzhoPd613XwtgprSm7hmmiZ25khWCbu0FbweSZT50Uxn
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7805,9 +7805,17 @@ CREATE TABLE public.pos_transactions (
     pay_link_id uuid,
     tax_breakdown jsonb,
     open_ticket_id uuid,
+    paid_online boolean DEFAULT false NOT NULL,
     CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'card_on_file'::text, 'charge'::text]))),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
+
+
+--
+-- Name: COLUMN pos_transactions.paid_online; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_transactions.paid_online IS 'S653: the customer paid this themselves on an emailed pay link. A card sale without it was run on the reader at the counter.';
 
 
 --
@@ -28158,5 +28166,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict HBvNa7IUxm7BYaAJoRskOrLAW5mh2BRojb2PuORW8gBsv0dVkxH8CeDli6BksB1
+\unrestrict ddd6lPHNiz1fw9yDVWAhzhoPd613XwtgprSm7hmmiZ25khWCbu0FbweSZT50Uxn
 

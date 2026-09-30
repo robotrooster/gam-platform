@@ -1823,6 +1823,8 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     category: 'front_desk', label: 'Front Desk',
     sections: [{ label: 'Access', items: [
       { key: 'front_desk.view', label: 'Front desk to-do list', hint: 'read-only: who to call, what phase, what they owe — plus re-send an invite' },
+      // S653 (Nic): the desk writes down the day a resident says they are leaving.
+      { key: 'front_desk.mark_leaving', label: 'Mark a resident as leaving', hint: 'sets the day they said; the final meter read and move-out follow from it' },
     ]}],
   },
   {
