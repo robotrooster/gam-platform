@@ -239,9 +239,12 @@ describe('S652: the money page agrees with itself', () => {
   it('reports recurring revenue as the bill that actually went out', async () => {
     // Nic: "The recurring revenue is showing only $120 per month off of the
     // subscription fees." September billed $130.
+    // S653 (Nic): "$171.75 when our price is $2 per unit" — the ACH spread
+    // rode along. The card is the subscription bill; processing is not in it.
     await ledger([
       { type: 'platform_fee_subscription', amount: 10,  monthsAgo: 1 },
       { type: 'platform_fee_subscription', amount: 130, monthsAgo: 0 },
+      { type: 'banking_spread',            amount: 41.75, monthsAgo: 0 },
     ])
     const all = await request(buildApp())
       .get('/api/admin/income/composition/all')

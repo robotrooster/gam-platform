@@ -1758,7 +1758,12 @@ async function currentPlatformRunRate(): Promise<number> {
 
 const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recurring: boolean }> = [
   { key: 'platform_unit',      label: 'Platform Fees',       types: ['platform_fee_subscription'], recurring: true },
-  { key: 'processing',         label: 'Processing / ACH',    types: ['banking_spread'],            recurring: true },
+  // S653 (Nic): "why are we showing $171.75 when our price is $2 per unit that's
+  // occupied?" The processing spread rides every rent payment, but it is not
+  // the subscription — the card that says "recurring" is read as the $2/unit
+  // bill, and it was quietly adding $41.75 of ACH margin to it. Processing
+  // stays in every pie; it just does not pose as subscription revenue.
+  { key: 'processing',         label: 'Processing / ACH',    types: ['banking_spread'],            recurring: false },
   { key: 'background_checks',  label: 'Background Checks',   types: ['screening_margin'],          recurring: false },
   { key: 'placement',          label: 'Placement Fees',      types: ['placement_fee_share'],       recurring: false },
   { key: 'instant_withdrawal', label: 'Instant Withdrawals', types: ['manual_withdrawal_fee'],     recurring: false },

@@ -1258,13 +1258,13 @@ function Overview(){
                 <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Recurring Revenue</div>
                 <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(recurringMonthly)}</div>
                 <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>
-                  {recurringMonth?`billed ${recurringMonth} · recurring only`:'per month · recurring only'}
+                  {recurringMonth?`platform fees billed ${recurringMonth} · $2 per occupied space`:'platform fees per month · $2 per occupied space'}
                 </div>
               </div>
               <div style={{textAlign:'right'}}>
                 <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Annual Run Rate</div>
                 <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{formatCurrency(recurringAnnual)}</div>
-                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · recurring × 12</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · platform fees × 12</div>
               </div>
             </div>
             {/* Income composition — a wall of pies, one per time window */}
