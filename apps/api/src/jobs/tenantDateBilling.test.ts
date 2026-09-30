@@ -121,10 +121,15 @@ describe('a tenant due late in the month', () => {
 
 // Gap 1. A resident who was already living there, and already due on the 15th.
 describe('an onboarding resident with their own due day', () => {
-  it('first bill lands on THEIR day of the first billing month, not the 1st', () => {
-    expect(existingTenancyFirstDue('2026-10-05', '2026-10-01', 15)).toBe('2026-10-15')
-    expect(existingTenancyFirstDue('2026-09-20', '2026-10-01', 23)).toBe('2026-10-23')
-    expect(existingTenancyFirstDue('2026-10-20', null, 15)).toBe('2026-10-15')
+  // Nic: "It's gonna bill the first time that the due date happens once
+  // they're onboarded."
+  it('first bill is the first time their day comes round after signing', () => {
+    expect(existingTenancyFirstDue('2026-10-05', '2026-10-01', 15)).toBe('2026-10-15')   // signed the 5th, due the 15th
+    expect(existingTenancyFirstDue('2026-10-12', '2026-10-01', 20)).toBe('2026-10-20')   // Nic's example
+    expect(existingTenancyFirstDue('2026-10-20', '2026-10-01', 20)).toBe('2026-10-20')   // signed on the day
+    expect(existingTenancyFirstDue('2026-10-25', '2026-10-01', 20)).toBe('2026-11-20')   // signed after it → next time
+    expect(existingTenancyFirstDue('2026-10-20', null, 15)).toBe('2026-11-15')
+    expect(existingTenancyFirstDue('2026-09-20', '2026-10-01', 23)).toBe('2026-10-23')   // never before the first billing month
     // the 1st is exactly what it always was
     expect(existingTenancyFirstDue('2026-10-05', '2026-10-01', 1)).toBe('2026-10-01')
     expect(existingTenancyFirstDue('2026-09-20', '2026-10-01', 1)).toBe('2026-10-01')
@@ -140,21 +145,26 @@ describe('an onboarding resident with their own due day', () => {
     ])
   })
 
-  it('signed after their day: billed at signing, dated their day, and never twice', async () => {
-    const start = new Date(); start.setUTCDate(20); start.setUTCMonth(start.getUTCMonth() - 1)
-    const startIso = start.toISOString().slice(0, 10)          // the 20th of last month
-    const ym = startIso.slice(0, 7)
-    const f = await seedSite({ startDate: startIso, rentDueDay: 15, existing: true, firstCycle: `${ym}-01` })
+  it('signed after their day: the day that has passed is not billed; the next one is, once', async () => {
+    // Signed the 20th two months ago, due the 15th → first bill is LAST month's
+    // 15th (already past, so signing makes it), never the 15th of the month
+    // they signed in. Two months back so the dates are in the past whatever
+    // day this runs.
+    const start = new Date(); start.setUTCDate(20); start.setUTCMonth(start.getUTCMonth() - 2)
+    const startIso = start.toISOString().slice(0, 10)
+    const first = new Date(); first.setUTCDate(15); first.setUTCMonth(first.getUTCMonth() - 1)
+    const firstIso = first.toISOString().slice(0, 10)
+    const f = await seedSite({ startDate: startIso, rentDueDay: 15, existing: true, firstCycle: startIso.slice(0, 8) + '01' })
     const r = await genMoveIn({
       lease_id: f.leaseId, unit_id: f.unitId, tenant_id: f.tenantId,
       landlord_id: f.landlordId, rent_amount: 600, start_date: startIso,
     } as any)
     expect(r.invoiceCreated).toBe(true)
-    const next = new Date(`${ym}-15T00:00:00Z`); next.setUTCMonth(next.getUTCMonth() + 1)
+    const next = new Date(`${firstIso}T00:00:00Z`); next.setUTCMonth(next.getUTCMonth() + 1)
     const nextIso = next.toISOString().slice(0, 10)
     await backfill({ from: startIso, to: nextIso, leaseId: f.leaseId })
     expect((await charges(f.leaseId)).filter(c => c.type === 'rent')).toEqual([
-      { d: `${ym}-15`, type: 'rent', a: 600 },
+      { d: firstIso, type: 'rent', a: 600 },
       { d: nextIso, type: 'rent', a: 600 },
     ])
   })

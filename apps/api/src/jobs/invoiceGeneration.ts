@@ -332,12 +332,12 @@ async function runGeneration(
     let dueDates: string[]
     if (lease.is_existing_tenancy && dueDay !== 1) {
       // S652 (Nic): an onboarding resident on their own due day. Their first
-      // bill is that day of their first cycle month. Signed after it, the
-      // move-in invoice made it (and it sits before the lease start, outside
-      // this window). Signed BEFORE it, nothing was made at signing — this run
-      // makes it when the day arrives. Skipping the start month, as the 1st
-      // does, skipped that bill entirely: a month of rent never invoiced.
-      // Anything already invoiced is left alone by the (lease, due date) check.
+      // bill is the first time that day comes round after signing (or the day
+      // itself, if they signed on it — the move-in invoice makes that one).
+      // This run makes it when the day arrives. Skipping the start month, as
+      // the 1st does, skipped that bill entirely: a month of rent never
+      // invoiced. Anything already invoiced is left alone by the (lease, due
+      // date) check.
       const firstDue = existingTenancyFirstDue(lease.start_date, lease.first_billing_cycle ?? null, dueDay)
       dueDates = candidateDueDates.filter(d => d >= firstDue)
     } else if (lease.is_existing_tenancy || dueDay === 1) {

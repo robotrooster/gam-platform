@@ -160,25 +160,33 @@ export function existingTenancyCycle(
 
 /**
  * S652 (Nic): "they let their due date be whenever they come in." The DATE of an
- * existing tenancy's first invoice: the resident's own due day, in the cycle
- * month existingTenancyCycle() names.
+ * existing tenancy's first invoice, for a resident with their OWN due day.
  *
- * The cycle was always a month; the date was always assumed to be its 1st. For
- * a resident due on the 15th that put their first bill two weeks early — late
- * fees counting from a day their rent was never due — and, when they signed
- * before the 15th, the nightly run skipped the month altogether because it
- * belonged to "the move-in invoice" that was never made.
+ * Nic: "if the due date is about to happen — say you're onboarding the 10th to
+ * the 15th, and the tenant's due date is the 20th — it's not gonna wait till the
+ * next cycle. It's gonna bill the first time that the due date happens once
+ * they're onboarded." So: the first time their day comes round ON or AFTER the
+ * day they signed, and never before the property's first billing month.
  *
- * Due on the 1st, this is exactly existingTenancyCycle().
+ * Due on the 1st keeps the S631 rule — the 1st of the cycle month, which may
+ * already be past. That was Nic's decision for the 1st ("an existing tenant
+ * knows when rent is due") and every park onboarded so far billed that way.
  */
 export function existingTenancyFirstDue(
   startDate: string,
   firstBillingCycle: string | null,
   dueDay: number | null | undefined,
 ): string {
-  const cycle = existingTenancyCycle(startDate, firstBillingCycle)
   const day = Math.min(Math.max(Math.trunc(Number(dueDay)) || 1, 1), 28)
-  return cycle.slice(0, 8) + String(day).padStart(2, '0')
+  if (day === 1) return existingTenancyCycle(startDate, firstBillingCycle)
+  assertIsoDate(startDate, 'existingTenancyFirstDue')
+  const dd = String(day).padStart(2, '0')
+  // The first occurrence of their day on or after signing.
+  let due = startDate.slice(0, 8) + dd
+  if (due < startDate) due = nextDueDateAfter(startDate, day)
+  // Never before the property's first billing month.
+  const floor = firstBillingCycle ? String(firstBillingCycle).slice(0, 8) + dd : null
+  return floor && due < floor ? floor : due
 }
 
 export async function generateMoveInInvoice(
@@ -265,8 +273,8 @@ export async function generateMoveInInvoice(
   // already be past, because an existing tenant knows when rent is due. Nic:
   // "For existing tenants, the anticipation of due date and bill pay and all
   // that stuff is known. It's an existing tenancy. Late fees are there."
-  // S652: on the resident's OWN due day of that cycle — the 1st only when that
-  // is their day.
+  // S652: the first time the resident's own due day comes round after signing
+  // — the 1st of the cycle only when the 1st is their day.
   const invoiceDueDate = leaseMeta?.is_existing_tenancy
     ? existingTenancyFirstDue(inputs.start_date, leaseMeta.first_billing_cycle, leaseMeta.rent_due_day)
     : inputs.start_date
