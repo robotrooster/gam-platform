@@ -1111,3 +1111,9 @@ Nic is onboarding a park that lets "their due date be whenever they come in." Th
 **Waiting on Nic:** confirm "first bill = their day in the property's first billing month."
 **Read, not tested:** late fees and Flex products on tenant dates.
 **Demo DB** migrated to 20260929150000.
+
+## Deploy 86 (2026-09-30) — first-bill rule for residents on their own due day
+
+Nic: "It's gonna bill the first time that the due date happens once they're onboarded." `existingTenancyFirstDue` = first occurrence of the due day on/after the signing date, floored to the property's first billing month. The 1st keeps S631 (cycle month's 1st, may be past) — Nic has NOT said whether the 1st should follow the new rule; asked.
+
+Month end: rounds opened 7am for MV (73 meters incl. 20 new), Oak Park (49), Country Acres (13). RV 54–73 have baseline 0 reads dated 2026-09-30. Open question to Nic: exclude out-of-order sites from the reading list, or staff enter 0.
