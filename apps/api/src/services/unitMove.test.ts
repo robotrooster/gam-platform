@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant } from '../test/dbHelpers'
 import { moveLeaseToUnit, leaseUnitsInWindow } from './unitMove'
 
 beforeEach(async () => { await cleanupAllSchema() })
@@ -175,6 +175,38 @@ describe('moving a resident to another space', () => {
 // the first part of the month for that first site and for the later half of the
 // month start and end for the later site, and show them as line items."
 describe('billing a month with a move in it', () => {
+  // S652 (Nic): "make sure that Dakota Lane was billed properly." The closing
+  // read was recorded and never billed; her old space billed 0 kWh for the
+  // month and the 481 kWh she used there went nowhere.
+  it('bills the resident for the old space up to the closing read, on the move month', async () => {
+    const w = await world({ withMeters: true })
+    const c = await db.connect()
+    let tenantId: string
+    try { tenantId = await seedTenant(c) } finally { c.release() }
+    await db.query(`INSERT INTO lease_tenants (lease_id, tenant_id, role, status) VALUES ($1,$2,'primary','active')`, [w.leaseId, tenantId])
+    await db.query(`INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible) VALUES ($1,'electric',true)`, [w.leaseId])
+    await db.query(`UPDATE utility_meters SET rate_per_unit = 0.21`)
+    const meters = await db.query<{ id: string; label: string }>(`SELECT id, label FROM utility_meters ORDER BY label`)
+    const [m12, m23] = meters.rows
+    // the month-end read before the move: 4000 on June 1 (May's cycle)
+    await db.query(
+      `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
+       VALUES ($1, '2026-06-01', 4000, '2026-05-01', $2, 'monthly_cycle')`, [m12.id, w.userId])
+
+    await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15', actorUserId: w.userId,
+      reads: [{ meterId: m12.id, value: 4210 }, { meterId: m23.id, value: 118 }] })
+
+    const bills = await db.query<any>(
+      `SELECT unit_id, lease_id, usage_amount, charge_amount, reading_start, reading_end, to_char(billing_cycle_month,'YYYY-MM-DD') AS cycle
+         FROM utility_bills`)
+    expect(bills.rows).toHaveLength(1)
+    expect(bills.rows[0]).toMatchObject({ unit_id: w.shady, lease_id: w.leaseId, cycle: '2026-06-01' })
+    expect(Number(bills.rows[0].usage_amount)).toBe(210)          // 4210 − 4000
+    expect(Number(bills.rows[0].charge_amount)).toBeCloseTo(44.10, 2)
+    expect(Number(bills.rows[0].reading_start)).toBe(4000)
+    expect(Number(bills.rows[0].reading_end)).toBe(4210)
+  })
+
   it('attributes the OLD spot’s usage to the resident who was there', async () => {
     const w = await world()
     await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15' })

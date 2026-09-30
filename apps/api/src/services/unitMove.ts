@@ -20,6 +20,7 @@
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
+import { billMoveOutRead } from './utilityBilling'
 
 export interface MoveResult {
   leaseId: string
@@ -136,6 +137,27 @@ export async function moveLeaseToUnit(params: {
     }
   }
 
+  // S652 (Nic): "make sure that Dakota Lane was billed properly." She was not:
+  // the closing read on the space she left was recorded but never BILLED, so
+  // the month-end read found nothing between it and itself and billed her old
+  // space 0 kWh — the 481 kWh she used there before the move went nowhere. The
+  // closing read is a move-out read for that space and bills as one: last read
+  // → closing read, to her, on the cycle the move falls in. It is taken BEFORE
+  // the lease changes spaces so the bill still finds her on the old one.
+  const closingBills: string[] = []
+  for (const m of needed.filter(x => x.kind === 'closing')) {
+    const read = await queryOne<{ id: string }>(
+      `INSERT INTO utility_meter_readings
+         (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason, reason_note)
+       VALUES ($1, $2, $3, date_trunc('month', $2::date)::date, $4, 'other', $5)
+       RETURNING id`,
+      [m.meter_id, params.movedOn, given.get(m.meter_id), params.actorUserId ?? null,
+       `Closing read — resident moved out on ${params.movedOn}`])
+    const billed = await billMoveOutRead(m.meter_id, read!.id)
+    if (billed.billed) closingBills.push(m.meter_id)
+    else logger.info({ leaseId: params.leaseId, meterId: m.meter_id, reason: billed.reason }, '[unit-move] closing read not billed')
+  }
+
   // One statement so the trigger sees the move date and the unit change
   // together — a separate UPDATE would stamp today and silently misdate the
   // seam the whole feature exists to place.
@@ -168,22 +190,21 @@ export async function moveLeaseToUnit(params: {
   // only LISTED its meters; a move now refuses without both readings, so there
   // is nothing left to chase and nobody is emailed.
 
-  // The readings, dated the move: the closing number seams the old space's
-  // month, the opening number is the baseline the new space's next cycle
-  // subtracts from.
-  for (const m of needed) {
+  // The opening number, dated the move, is the baseline the new space's next
+  // cycle subtracts from. (The closing reads went in above, and billed.)
+  for (const m of needed.filter(x => x.kind === 'opening')) {
     await query(
       `INSERT INTO utility_meter_readings
          (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason, reason_note)
-       VALUES ($1, $2, $3, date_trunc('month', $2::date)::date, $4, $5, $6)`,
+       VALUES ($1, $2, $3, date_trunc('month', $2::date)::date, $4, 'baseline', $5)`,
       [m.meter_id, params.movedOn, given.get(m.meter_id), params.actorUserId ?? null,
-       m.kind === 'opening' ? 'baseline' : 'other',
-       m.kind === 'opening' ? `Opening read — resident moved in on ${params.movedOn}` : `Closing read — resident moved out on ${params.movedOn}`])
+       `Opening read — resident moved in on ${params.movedOn}`])
   }
 
   logger.info({
     leaseId: params.leaseId, fromUnitId, toUnitId: params.toUnitId,
     movedOn: params.movedOn, closing: closing.length, opening: opening.length, readsRecorded: needed.length,
+    closingBilled: closingBills.length,
   }, '[unit-move] resident moved spaces')
 
   return {
