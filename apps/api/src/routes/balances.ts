@@ -151,6 +151,43 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
         pay_link: { label: l.label, items: l.items },
       })
     }
+    // S652 (Nic): "Open tickets should reflect as items to do in the front desk
+    // list as well, so they don't get forgotten." A register ticket written up
+    // and not yet settled — a delivery, or somebody who left before their last
+    // electric was rung — is money out, and it belongs on the same list.
+    const tickets = await query<any>(`
+      SELECT t.id, t.items, t.note, t.property_id, p.name AS property_name,
+             to_char(t.created_at, 'YYYY-MM-DD') AS written_on,
+             t.tenant_id, t.pos_customer_id,
+             COALESCE(tu.first_name, c.first_name) AS first_name,
+             COALESCE(tu.last_name,  c.last_name)  AS last_name,
+             COALESCE(tu.email, c.email) AS email,
+             COALESCE(tu.phone, c.phone) AS phone,
+             (SELECT SUM((i->>'qty')::numeric * (i->>'price')::numeric * (1 + COALESCE((i->>'tax')::numeric, 0)))
+                FROM jsonb_array_elements(t.items) i)::float AS total
+        FROM pos_open_tickets t
+        JOIN properties p ON p.id = t.property_id
+        LEFT JOIN tenants tn ON tn.id = t.tenant_id
+        LEFT JOIN users tu ON tu.id = tn.user_id
+        LEFT JOIN pos_customers c ON c.id = t.pos_customer_id
+       WHERE t.landlord_id = ANY($1::uuid[]) AND t.status = 'open'
+         AND ($2::uuid[] IS NULL OR t.property_id = ANY($2::uuid[]))`, [landlordIds, scopedIds])
+    for (const t of tickets) {
+      if (!(Number(t.total) > 0)) continue
+      out.push({
+        tenant_id: t.tenant_id ?? null,
+        ticket_id: t.id,
+        first_name: t.first_name || 'Register', last_name: t.last_name || 'ticket',
+        phone: t.phone ?? null, email: t.email ?? null,
+        unit_number: null,
+        property_id: t.property_id, property_ids: [t.property_id], property_name: t.property_name,
+        balance: Number(t.total).toFixed(2),
+        credit_on_account: 0,
+        open_invoices: 1,
+        oldest_due_date: t.written_on,
+        ticket: { note: t.note, items: t.items },
+      })
+    }
     out.sort((a, b) => Number(b.balance) - Number(a.balance))
     res.json({ success: true, data: out })
   } catch (e) { next(e) }

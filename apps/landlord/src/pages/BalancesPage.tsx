@@ -11,6 +11,9 @@ interface Owed {
   // S649: an open emailed pay link (someone with no lease, or a one-off bill)
   payLinkId?: string | null
   payLink?: { label: string; items: Array<{ name: string; qty: number; price: number }> } | null
+  // S652: a register ticket nobody has settled yet.
+  ticketId?: string | null
+  ticket?: { note: string | null; items: Array<{ name: string; qty: number; price: number }> } | null
   firstName: string | null
   lastName: string | null
   phone: string | null
@@ -26,6 +29,25 @@ interface Owed {
   // their credit (spent once, oldest bill first).
   spaces?: Array<{ leaseId: string | null; unitNumber: string | null; propertyId: string | null
     propertyName: string | null; balance: number; creditApplied: number; openInvoices: number }>
+}
+
+// S652 (Nic): a register ticket still open — settled at the register, from its
+// "open tickets & pay links" list.
+function TicketBreakdown({ ticket }: { ticket?: Owed['ticket'] }) {
+  return (
+    <div style={{ padding: '10px 16px 14px 32px' }}>
+      {ticket?.note && <div style={{ fontSize: '.8rem', color: 'var(--text-2)', marginBottom: 6 }}>{ticket.note}</div>}
+      {(ticket?.items || []).map((it, i) => (
+        <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.8rem', maxWidth: 420 }}>
+          <span>{it.name}{Number(it.qty) !== 1 ? ` × ${it.qty}` : ''}</span>
+          <span className="mono">{fmt(Number(it.price) * Number(it.qty))}</span>
+        </div>
+      ))}
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>
+        Settle it at the register: open the register, tap &ldquo;open tickets &amp; pay links&rdquo;, pick this one, take the payment.
+      </div>
+    </div>
+  )
 }
 
 // S649: what an open pay link is for, with the two ways to chase it.
@@ -229,7 +251,7 @@ export function BalancesPage() {
               {shown.map(r => {
                 const od = daysOverdue(r.oldestDueDate)
                 const name = [r.firstName, r.lastName].filter(Boolean).join(' ') || 'Tenant'
-                const rowKey = r.payLinkId || r.tenantId || ''
+                const rowKey = r.payLinkId || r.ticketId || r.tenantId || ''
 
                 const isOpen = openRow === rowKey
                 return (
@@ -253,14 +275,14 @@ export function BalancesPage() {
                           </div>
                         ))
                       ) : (
-                        <>{r.payLinkId ? 'Pay link' : r.unitNumber ? `Unit ${r.unitNumber}` : '—'}</>
+                        <>{r.payLinkId ? 'Pay link' : r.ticketId ? 'Register ticket' : r.unitNumber ? `Unit ${r.unitNumber}` : '—'}</>
                       )}
                       {r.propertyName && <span style={{ color: 'var(--text-3)' }}> · {r.propertyName}</span>}
                     </td>
                     <td style={{ textAlign: 'right', fontWeight: 600, color: 'var(--gold)' }}>
                       {fmt(Number(r.balance))}
                       <div style={{ fontSize: '.68rem', color: 'var(--text-3)', fontWeight: 400 }}>
-                        {r.payLinkId ? 'emailed pay link' : `${r.openInvoices} invoice${r.openInvoices === 1 ? '' : 's'}`}
+                        {r.payLinkId ? 'emailed pay link' : r.ticketId ? 'open register ticket' : `${r.openInvoices} invoice${r.openInvoices === 1 ? '' : 's'}`}
                       </div>
                     </td>
                     <td style={{ fontSize: '.82rem' }}>
@@ -282,7 +304,9 @@ export function BalancesPage() {
                       <td colSpan={5} style={{ padding: 0, background: 'rgba(255,255,255,.015)' }}>
                         {r.payLinkId
                           ? <PayLinkBreakdown id={r.payLinkId} link={r.payLink} />
-                          : <InvoiceBreakdown tenantId={r.tenantId!} />}
+                          : r.ticketId
+                            ? <TicketBreakdown ticket={r.ticket} />
+                            : <InvoiceBreakdown tenantId={r.tenantId!} />}
                       </td>
                     </tr>
                   )}

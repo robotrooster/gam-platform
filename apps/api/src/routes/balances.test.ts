@@ -248,4 +248,25 @@ describe('open pay links are outstanding', () => {
     rows = (await get()).body.data
     expect(rows.find((r: any) => r.pay_link_id === link)).toBeUndefined()
   })
+
+  // S652 (Nic): "Open tickets should reflect as items to do in the front desk
+  // list as well, so they don't get forgotten."
+  it('lists an open register ticket as its own line, and drops it once settled', async () => {
+    const f = await seedOwedTenant()
+    const prop = (await db.query<{ property_id: string }>(`SELECT property_id FROM units WHERE id = $1`, [f.unitId])).rows[0].property_id
+    const t = (await db.query<{ id: string }>(
+      `INSERT INTO pos_open_tickets (landlord_id, property_id, created_by, tenant_id, items, note)
+       VALUES ($1, $2, $3, $4, $5::jsonb, 'September electric on RV 30') RETURNING id`,
+      [f.landlordId, prop, f.userId, f.tenantId, JSON.stringify([{ name: 'Electric (per kWh)', qty: 107, price: 0.21, tax: 0 }])])).rows[0].id
+    const get = () => request(buildApp()).get('/api/balances').set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    let rows = (await get()).body.data
+    const row = rows.find((r: any) => r.ticket_id === t)
+    expect(row).toMatchObject({ tenant_id: f.tenantId, balance: '22.47' })
+    expect(row.ticket.note).toBe('September electric on RV 30')
+    // The tenant's own ledger line is untouched by it.
+    expect(Number(rows.find((r: any) => r.tenant_id === f.tenantId && !r.ticket_id).balance)).toBe(616.40)
+    await db.query(`UPDATE pos_open_tickets SET status = 'settled', settled_at = NOW() WHERE id = $1`, [t])
+    rows = (await get()).body.data
+    expect(rows.find((r: any) => r.ticket_id === t)).toBeUndefined()
+  })
 })

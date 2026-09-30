@@ -94,6 +94,10 @@ export async function sendPendingInvoiceNotices(
       LEFT JOIN tenants t ON t.id = i.tenant_id
       LEFT JOIN users tu  ON tu.id = t.user_id
      WHERE i.sent_at IS NULL
+       -- S652 (Nic): Donald Hamp paid his first bill by check the day it was
+       -- made, and the next morning's pass mailed him "$137.43 due". A bill
+       -- that is already settled (or voided) is never announced as due.
+       AND i.status NOT IN ('settled', 'void')
        AND ($3::uuid IS NULL OR i.id = $3::uuid)
        AND ($3::uuid IS NOT NULL OR i.due_date >= CURRENT_DATE - ($1::int || ' days')::interval)
        AND ($2::text IS NULL OR p.timezone = $2::text)

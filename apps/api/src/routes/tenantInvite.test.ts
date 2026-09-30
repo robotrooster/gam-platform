@@ -128,7 +128,10 @@ describe('POST /api/tenants/invite — what it actually does', () => {
     expect(u.long_dated).toBe(true)
   })
 
-  it('a unit-bound invite records a pending lease draft and NO intent', async () => {
+  // S652 (Nic): "he's not showing up in the front desk page as having a task to
+  // complete." The unit-bound intent IS the desk's work item; without it a
+  // resident invited from the Tenants page was invisible there.
+  it('a unit-bound invite records a pending lease draft AND the unit-bound intent the Front Desk lists', async () => {
     const { token, unitId } = await seed()
     await post(buildApp(), token, { email: 'a@b.test', firstName: 'Al', unitId })
 
@@ -137,8 +140,10 @@ describe('POST /api/tenants/invite — what it actually does', () => {
     expect(drafts).toHaveLength(1)
     expect(Number(drafts[0].household_order)).toBe(0)
 
-    const intents = (await db.query(`SELECT id FROM pending_tenant_intents`)).rows
-    expect(intents).toHaveLength(0)
+    const intents = (await db.query(`SELECT unit_id, resolved_at, cancelled_at FROM pending_tenant_intents`)).rows
+    expect(intents).toHaveLength(1)
+    expect(intents[0].unit_id).toBe(unitId)
+    expect(intents[0].resolved_at).toBeNull()
   })
 
   it('household order follows who was invited first', async () => {

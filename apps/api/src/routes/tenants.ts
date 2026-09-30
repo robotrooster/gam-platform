@@ -1913,6 +1913,21 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
       })
     }
 
+    // S652 (Nic): "he's not showing up in the front desk page as having a task
+    // to complete." Donald Hamp was invited to RV 47 as a returning resident
+    // through THIS route, which wrote his screening waiver (an audit row the
+    // Front Desk deliberately hides) and nothing else — so the desk had no
+    // work item for him at all. An invite to a UNIT is the work item; it gets
+    // the same unit-bound row the onboarding page's invite writes.
+    if (unitId && tenantId) {
+      await query(
+        `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, property_id)
+         VALUES ($1, $2, 'not_uploaded', $3, $4)
+         ON CONFLICT (tenant_id, unit_id) WHERE cancelled_at IS NULL AND unit_id IS NOT NULL
+         DO UPDATE SET resolved_at = NULL, accepted_at = NULL, draft_document_id = NULL, updated_at = NOW()`,
+        [inviteLandlordId, tenantId, unitId, inviterPropertyId ?? null])
+    }
+
     if (propertyId && !unitId && tenantId) {
       await query(
         `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id)

@@ -95,6 +95,16 @@ describe('invoice notices', () => {
     expect(rows[0].sent_at).not.toBeNull()
   })
 
+  // S652 (Nic): Donald Hamp paid by check the day his bill was made; the next
+  // morning's pass mailed him "$137.43 due".
+  it('a bill paid before it was announced is never announced as due', async () => {
+    const { invoiceId } = await seedInvoice()
+    await db.query(`UPDATE invoices SET status = 'settled' WHERE id = $1`, [invoiceId])
+    const r = await sendPendingInvoiceNotices()
+    expect(r.sent).toBe(0)
+    expect(resendSendMock).not.toHaveBeenCalled()
+  })
+
   it('is idempotent — a second pass sends nothing', async () => {
     await seedInvoice()
     expect((await sendPendingInvoiceNotices()).sent).toBe(1)

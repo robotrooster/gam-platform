@@ -102,6 +102,9 @@ export function POSPage() {
   // when it is rung, by the same server path as every other sale.
   const [ticketsOpen, setTicketsOpen] = useState(false)
   const [openTicketId, setOpenTicketId] = useState<string | null>(null)
+  // S652 (Nic): an emailed pay link being settled here, in person. The link
+  // is the bill; the server charges its lines and marks it paid.
+  const [payLinkId, setPayLinkId] = useState<string | null>(null)
   const [dismissedSessions, setDismissedSessions] = useState<Set<string>>(new Set())
   const [cashGiven, setCashGiven] = useState('')
   const [filterCat, setFilterCat] = useState('all')
@@ -213,7 +216,7 @@ export function POSPage() {
     {
       onSuccess: () => {
         qc.invalidateQueries('pos-tickets')
-        setCart([]); setTenantId(''); setPosCustomerId('')
+        setCart([]); setTenantId(''); setPosCustomerId(''); setOpenTicketId(null); setPayLinkId(null)
         toast('Held for delivery')
       },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not hold that for delivery'),
@@ -535,6 +538,7 @@ export function POSPage() {
       // S652: the ticket this sale settles, claimed inside the sale's own
       // transaction so two drivers cannot both charge the same tank.
       openTicketId,
+      payLinkId,
       // S651: present only when a stay is in the cart. The server derives the
       // dates from the item and its quantity; this is the part only the
       // cashier knows.
@@ -557,7 +561,7 @@ export function POSPage() {
       }
       setClientSessionId(null)
       setCart([]); setCashGiven(''); setTenantId(''); setPosCustomerId(''); setAppliedDiscount(null); setStay(null)
-      setOpenTicketId(null); qc.invalidateQueries('pos-tickets')
+      setOpenTicketId(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets')
       qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
       qc.invalidateQueries(['pos-sessions-open', registerProperty])
     },
@@ -948,7 +952,7 @@ export function POSPage() {
                   })
                   qc.invalidateQueries(['pos-sessions-open', registerProperty])
                 }
-                setClientSessionId(null); setCart([])
+                setClientSessionId(null); setCart([]); setOpenTicketId(null); setPayLinkId(null)
               }} style={{background:'none',border:'none',color:'var(--text-3)',cursor:'pointer',fontSize:'.75rem'}}>Clear</button>}
             </div>
             {cart.length===0?(<div style={{color:'var(--text-3)',fontSize:'.85rem',padding:'24px 0',textAlign:'center'}}>No items added</div>):(
@@ -987,12 +991,14 @@ export function POSPage() {
             </div>
             {/* S652: what is still out for delivery. The driver opens one and it
                 fills the cart — same cart, same tenders, same server path. */}
-            {(tickets.data?.length || openTicketId) && (
+            {(tickets.data?.length || openTicketId || payLinkId) && (
               <button className="btn btn-ghost btn-sm" style={{width:'100%',marginBottom:8,textAlign:'left'}}
                       onClick={()=>setTicketsOpen(true)}>
                 {openTicketId
                   ? 'Settling a ticket · tap to change'
-                  : `${tickets.data?.length} ticket${tickets.data?.length === 1 ? '' : 's'} out for delivery`}
+                  : payLinkId
+                    ? 'Settling an emailed pay link · tap to change'
+                    : `${tickets.data?.length} open ticket${tickets.data?.length === 1 ? '' : 's'} & pay link${tickets.data?.length === 1 ? '' : 's'}`}
               </button>)}
             <div style={{marginBottom:10}}>
               <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:5}}>Payment method</div>
@@ -1104,12 +1110,12 @@ export function POSPage() {
                 product actually out and payment needs to be rendered right then
                 instead of chasing somebody down later." */}
             <button className="btn btn-ghost" style={{width:'100%',marginTop:8}}
-              disabled={cart.length===0 || !registerProperty || (!tenantId && !posCustomerId) || !!openTicketId
+              disabled={cart.length===0 || !registerProperty || (!tenantId && !posCustomerId) || !!openTicketId || !!payLinkId
                         || writeTicketMut.isLoading}
               onClick={()=>writeTicketMut.mutate()}>
               {writeTicketMut.isLoading ? 'Writing it up…' : 'Hold for delivery'}
             </button>
-            {cart.length>0 && !openTicketId && !tenantId && !posCustomerId &&
+            {cart.length>0 && !openTicketId && !payLinkId && !tenantId && !posCustomerId &&
               <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:4}}>
                 Pick who it is for to hold it for delivery.
               </div>}
@@ -1121,7 +1127,7 @@ export function POSPage() {
                 total={discountedSubtotal + taxAmount}
                 customerPaysFee={!absorbsCardFee}
                 onClose={()=>setPayLinkOpen(false)}
-                onSent={()=>{ setPayLinkOpen(false); setCart([]); setAppliedDiscount(null) }}
+                onSent={()=>{ setPayLinkOpen(false); setCart([]); setAppliedDiscount(null); setOpenTicketId(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets') }}
               />
             )}
           </div>
@@ -1840,19 +1846,20 @@ export function POSPage() {
       {ticketsOpen&&(<div className="modal-overlay" onClick={()=>setTicketsOpen(false)}>
         <div className="modal" style={{maxWidth:460}} onClick={e=>e.stopPropagation()}>
           <div className="modal-header">
-            <span className="modal-title">Out for delivery</span>
+            <span className="modal-title">Open tickets &amp; pay links</span>
             <button className="btn btn-ghost btn-sm" onClick={()=>setTicketsOpen(false)}>✕</button>
           </div>
           <div style={{padding:'4px 24px 24px',display:'grid',gap:8}}>
-            {!tickets.data?.length && <div style={{fontSize:'.8rem',color:'var(--text-3)'}}>Nothing is out.</div>}
+            {!tickets.data?.length && <div style={{fontSize:'.8rem',color:'var(--text-3)'}}>Nothing is out — no tickets, no unpaid pay links.</div>}
             {(tickets.data ?? []).map((t:any)=>(
               <div key={t.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,
                                       padding:'11px 14px',background:'var(--bg-2)',
-                                      border:`1px solid ${openTicketId===t.id?'var(--gold)':'var(--border-1)'}`,
+                                      border:`1px solid ${(openTicketId===t.id||payLinkId===t.id)?'var(--gold)':'var(--border-1)'}`,
                                       borderRadius:10}}>
                 <div>
                   <div style={{fontWeight:700,fontSize:'.88rem'}}>
                     {t.customerName || (t.bookingId ? 'Reservation' : 'Customer')}
+                    {t.kind==='pay_link' && <span style={{marginLeft:8,fontSize:'.66rem',fontWeight:700,color:'var(--gold)',border:'1px solid var(--gold)',borderRadius:10,padding:'1px 7px'}}>PAY LINK</span>}
                   </div>
                   <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>
                     {(t.items||[]).map((i:any)=>`${i.qty} × ${i.name||'item'}`).join(', ')}
@@ -1872,7 +1879,10 @@ export function POSPage() {
                   if (t.tenantId) { setTenantId(t.tenantId); setPosCustomerId('') }
                   else if (t.posCustomerId) { setPosCustomerId(t.posCustomerId); setTenantId('') }
                   else { setPosCustomerId(''); setTenantId('') }
-                  setOpenTicketId(t.id); setTicketsOpen(false)
+                  // S652: a pay link settles as a pay link, a ticket as a ticket.
+                  if (t.kind==='pay_link') { setPayLinkId(t.id); setOpenTicketId(null) }
+                  else { setOpenTicketId(t.id); setPayLinkId(null) }
+                  setTicketsOpen(false)
                 }}>Settle</button>
               </div>
             ))}

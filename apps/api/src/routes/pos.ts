@@ -824,7 +824,24 @@ posRouter.get('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, ne
         WHERE t.property_id = $1 AND t.landlord_id = $2 AND t.status = 'open'
         ORDER BY t.created_at`,
       [propertyId, posLandlordId(req)])
-    res.json({ success: true, data: rows })
+    // S652 (Nic): "put the pay links as an open ticket as well. That way they
+    // can be resolved in person when somebody comes in." An emailed link that
+    // has not been paid is money still out, exactly like a ticket — so it is on
+    // this list, and settling it here pays the link.
+    const links = await query<any>(
+      `SELECT l.id, l.property_id, l.landlord_id, l.items, l.total, l.discount_amount, l.label,
+              l.tenant_id, l.pos_customer_id, l.booking_id, l.customer_name, l.created_at,
+              'Emailed pay link — sent ' || to_char(l.created_at, 'Mon DD') AS note
+         FROM pos_pay_links l
+        WHERE l.property_id = $1 AND l.landlord_id = $2
+          AND l.kind = 'one_time' AND l.status = 'open'
+          AND (l.expires_at IS NULL OR l.expires_at > NOW())
+        ORDER BY l.created_at`,
+      [propertyId, posLandlordId(req)])
+    res.json({ success: true, data: [
+      ...rows.map((t: any) => ({ ...t, kind: 'ticket' })),
+      ...links.map((l: any) => ({ ...l, kind: 'pay_link', pay_link_id: l.id, status: 'open' })),
+    ] })
   } catch (e) { next(e) }
 })
 
@@ -868,11 +885,25 @@ posRouter.get('/card-on-file', requirePerm('pos.ring_sale'), async (req: any, re
 
 posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const { items, paymentMethod, tenantId, posCustomerId, propertyId, surcharge, changeGiven, stripePaymentIntentId, discountAmount, discountReason, openTicketId,
+    let { items, discountAmount } = req.body
+    const { paymentMethod, tenantId, posCustomerId, propertyId, surcharge, changeGiven, stripePaymentIntentId, discountReason, openTicketId,
+            // S652 (Nic): an emailed pay link settled in person, from the
+            // "out for delivery" list. The link is the bill: its lines, its
+            // prices and its discount are charged, whatever the cart sent.
+            payLinkId,
             // S651: present only when the cart contains a stay — the site, the
             // arrival date and who it is for. Everything else about the stay is
             // derived from the item and its quantity.
             stay } = req.body
+    let payLink: any = null
+    if (payLinkId) {
+      payLink = await queryOne<any>(
+        `SELECT * FROM pos_pay_links WHERE id = $1 AND landlord_id = $2`, [payLinkId, posLandlordId(req)])
+      if (!payLink) throw new AppError(404, 'No such pay link')
+      if (payLink.status !== 'open') throw new AppError(409, 'That pay link has already been paid or closed.')
+      items = payLink.items
+      discountAmount = Number(payLink.discount_amount) || 0
+    }
     if (!Array.isArray(items) || items.length === 0) {
       throw new AppError(400, 'items array required')
     }
@@ -962,7 +993,9 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       ticketBookingId = t?.booking_id ?? null
     }
 
-    const stayLines = await resolveStayLines(posLandlordId(req), items,
+    // A pay link's stay was arranged when the link was made; its line is a
+    // plain amount here, not a booking to place.
+    const stayLines = payLink ? [] : await resolveStayLines(posLandlordId(req), items,
       stay?.unitId ?? (ticketBookingId
         ? (await queryOne<{ unit_id: string }>(
             `SELECT unit_id FROM unit_bookings WHERE id = $1`, [ticketBookingId]))?.unit_id ?? null
@@ -1122,6 +1155,16 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
             `UPDATE pos_transactions SET open_ticket_id = $2 WHERE id = $1`, [tx.id, openTicketId])
           await client.query(
             `UPDATE pos_open_tickets SET settled_transaction_id = $2 WHERE id = $1`, [openTicketId, tx.id])
+        }
+        // S652: the link is paid — in person, at the register. Claimed inside
+        // the same transaction so a card paid online a second later is refused
+        // by the link's status, not charged twice.
+        if (payLink) {
+          const claimed = await client.query(
+            `UPDATE pos_pay_links SET status = 'paid', paid_at = NOW(), pos_transaction_id = $2, updated_at = NOW()
+              WHERE id = $1 AND status = 'open' RETURNING id`, [payLink.id, tx.id])
+          if (!claimed.rows.length) throw new AppError(409, 'That pay link was paid a moment ago.')
+          await client.query(`UPDATE pos_transactions SET pay_link_id = $2 WHERE id = $1`, [tx.id, payLink.id])
         }
       } catch (e: any) {
         // UNIQUE on pos_transactions_stripe_pi_uniq — same PI already

@@ -37,6 +37,12 @@ type Balance = {
   creditOnAccount: string
   oldestDueDate: string | null
   openInvoices: number
+  // S652: money owed outside a rent ledger — an emailed pay link, or a
+  // register ticket somebody walked away from. Settled at the register.
+  payLinkId?: string | null
+  payLink?: { label: string; items: any[] } | null
+  ticketId?: string | null
+  ticket?: { note: string | null; items: any[] } | null
 }
 
 type Row = {
@@ -168,6 +174,23 @@ function classifyBalance(b: Balance): { phase: PhaseId; say: string } | null {
   const creditLine = credit > 0
     ? ` Their ${money(credit)} credit is already taken off this figure.`
     : ''
+  // S652 (Nic): "put the pay links as an open ticket as well. That way they can
+  // be resolved in person when somebody comes in." Both are settled at the
+  // register, from its open list — never a rent payment.
+  if (b.payLinkId) {
+    return {
+      phase: overdue ? 'overdue' : 'due',
+      say: `${first} owes ${money(owed)} on an emailed pay link${when ? ` sent ${when}` : ''}. `
+         + 'They can pay the link, or settle it here: Register → open tickets & pay links.',
+    }
+  }
+  if (b.ticketId) {
+    return {
+      phase: overdue ? 'overdue' : 'due',
+      say: `${first} owes ${money(owed)} on a register ticket${when ? ` from ${when}` : ''}`
+         + `${b.ticket?.note ? ` — ${b.ticket.note}` : ''}. Settle it at the register from its open list.`,
+    }
+  }
   // Rent is pay-in-full platform-wide, so a part payment is not an option the
   // desk can offer — saying so here stops them promising one at the counter.
   return {
@@ -229,7 +252,7 @@ export function FrontDeskPage() {
       const c = classifyBalance(b)
       if (!c) return []
       return [{
-        key: `bal:${b.tenantId}`, r: null, b, ...c,
+        key: `bal:${b.payLinkId ?? b.ticketId ?? b.tenantId}`, r: null, b, ...c,
         name: `${b.firstName ?? ''} ${b.lastName ?? ''}`.trim() || b.email,
         email: b.email, phone: b.phone, unit: b.unitNumber, property: b.propertyName,
       }]

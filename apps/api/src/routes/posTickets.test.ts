@@ -315,3 +315,51 @@ describe('a stay on a pay link', () => {
     expect(await query('SELECT 1 FROM unit_bookings')).toHaveLength(2)
   })
 })
+
+// S652 (Nic): "put the pay links as an open ticket as well. That way they can
+// be resolved in person when somebody comes in."
+describe('an emailed pay link on the open list', () => {
+  const mkLink = async (f: any) => (await query<{ id: string }>(
+    `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_name, customer_email)
+     VALUES (md5(random()::text) || md5(random()::text), $1, $2,
+             (SELECT user_id FROM landlords WHERE id = $1), 'one_time', '2 items', $3::jsonb, 649.72, 649.72, 'Andres Razo', 'razo@example.com')
+     RETURNING id`,
+    [f.landlordId, f.propertyId, JSON.stringify([
+      { id: f.stayItemId, cat: 'Stays', name: 'RV site — nightly', qty: 1, price: 589, tax: 0 },
+      { id: f.itemId, cat: 'Fuel', name: 'Propane (per gal)', qty: 18.4, price: 3.30, tax: 0 },
+    ])]))[0].id
+
+  it('is listed beside the tickets, marked as a pay link', async () => {
+    const f = await seed()
+    await writeTicket(f)
+    const link = await mkLink(f)
+    const res = await request(buildApp()).get(`/api/pos/tickets?propertyId=${f.propertyId}`).set('Authorization', `Bearer ${f.token}`)
+    expect(res.status).toBe(200)
+    const kinds = res.body.data.map((r: any) => r.kind).sort()
+    expect(kinds).toEqual(['pay_link', 'ticket'])
+    const row = res.body.data.find((r: any) => r.kind === 'pay_link')
+    expect(row).toMatchObject({ id: link, customerName: 'Andres Razo' })
+    expect(row.note).toMatch(/Emailed pay link/)
+  })
+
+  it('settled at the register, the link is paid and the sale points at it — even with a stay line on it', async () => {
+    const f = await seed()
+    const link = await mkLink(f)
+    const res = await request(buildApp()).post('/api/pos/transactions').set('Authorization', `Bearer ${f.token}`)
+      .send({ items: [{ id: f.itemId, name: 'anything — the link is the bill', qty: 1, price: 1 }],
+              paymentMethod: 'cash', propertyId: f.propertyId, payLinkId: link })
+    expect(res.status, JSON.stringify(res.body)).toBe(201)
+    expect(Number(res.body.data.total)).toBeCloseTo(649.72, 2)
+    const [l] = await query<any>(`SELECT status, pos_transaction_id FROM pos_pay_links WHERE id = $1`, [link])
+    expect(l.status).toBe('paid')
+    expect(l.pos_transaction_id).toBe(res.body.data.id)
+    const [tx] = await query<any>(`SELECT pay_link_id FROM pos_transactions`)
+    expect(tx.pay_link_id).toBe(link)
+    // Gone from the open list, and it cannot be settled twice.
+    const list = await request(buildApp()).get(`/api/pos/tickets?propertyId=${f.propertyId}`).set('Authorization', `Bearer ${f.token}`)
+    expect(list.body.data).toHaveLength(0)
+    const again = await request(buildApp()).post('/api/pos/transactions').set('Authorization', `Bearer ${f.token}`)
+      .send({ items: [{ id: f.itemId, qty: 1, price: 1 }], paymentMethod: 'cash', propertyId: f.propertyId, payLinkId: link })
+    expect(again.status).toBe(409)
+  })
+})
