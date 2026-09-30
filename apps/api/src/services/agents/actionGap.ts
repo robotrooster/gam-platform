@@ -50,6 +50,11 @@ const DELIBERATE = new Map(Object.entries({
     'emails an existing charge again. Done from the open-links list at the register, next to the address it goes to.',
   'posPayLinks POST /:id/cancel':
     'closes a link somebody may be about to pay. Done from the open-links list, where the desk can see whether it has already been paid.',
+  // S652: adjusting an open link (a final meter read, extra days stayed) changes
+  // what a person is about to be charged. Done from the outstanding list with
+  // the lines on screen, never from a spoken figure.
+  'posPayLinks PATCH /:id':
+    'changes the lines and total of an unpaid link. Done from the outstanding list with every line on screen; a misheard number is a real charge.',
   // ── S652: posting a check that arrived before its bill ────────────────────
   'payments POST /post-payment':
     'writes down cash, a check or a money order handed over at the office and banks what is beyond the open balance as paid ahead. Done at the desk with the check in hand — the amount, the check number and the date come off the paper, and a misheard figure is money the books say arrived and did not. The agent records a payment against an open charge (record_cash_payment); money ahead of any bill is the desk\'s to post.',
