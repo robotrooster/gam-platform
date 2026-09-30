@@ -161,3 +161,37 @@ describe('invoice notices', () => {
     expect((await sendPendingInvoiceNotices({ timezone: TZ })).sent).toBe(1)
   })
 })
+
+// S653 (Nic): "most people are going to see that email, think they owe $900 or
+// whatever... they just saw the headline on the email." The headline is the
+// number they will actually be asked for.
+describe('the headline is what they will actually pay', () => {
+  it('nets the paid-ahead money this month may use — capped by their monthly draw', async () => {
+    const f = await seedInvoice({ rent: 589 })
+    const leaseId = (await db.query(`SELECT lease_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0].lease_id
+    await db.query(`INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining) VALUES ($1,$2,2000,2000)`, [leaseId, f.tenantId])
+    await db.query(`UPDATE leases SET prepaid_monthly_draw = 200 WHERE id=$1`, [leaseId])
+    const r = await sendPendingInvoiceNotices()
+    expect(r.sent).toBe(1)
+    const mail = lastSend()
+    expect(mail.subject).toContain('$389.00')            // 589 − 200
+    expect(mail.html).toContain('Your paid-ahead credit')
+    expect(mail.html).toContain('$200.00')
+  })
+
+  it('a line already covered when the bill was made is listed as covered, not due', async () => {
+    const f = await seedInvoice({ rent: 589 })
+    // a $60 water line the invoice run settled from paid-ahead credit
+    const inv = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
+    await db.query(
+      `INSERT INTO payments (landlord_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id, notes)
+       VALUES ($1,$2,$3,'utility',60,'settled','UTILITY',CURRENT_DATE,$4,'Water — covered by prepaid credit (paid ahead)')`,
+      [inv.landlord_id, inv.unit_id, inv.lease_id, f.invoiceId])
+    await db.query(`UPDATE invoices SET total_amount = 649 WHERE id=$1`, [f.invoiceId])
+    const r = await sendPendingInvoiceNotices()
+    expect(r.sent).toBe(1)
+    const mail = lastSend()
+    expect(mail.subject).toContain('$589.00')            // the water is not owed
+    expect(mail.html).toContain('covered (paid-ahead credit)')
+  })
+})

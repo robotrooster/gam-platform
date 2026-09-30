@@ -6688,7 +6688,8 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
     try {
       const tenantId = z.string().uuid().parse(req.params.tenantId)
       const rows = await query<any>(`
-        SELECT p.id, p.type, p.amount::float AS amount, p.notes, p.landlord_id,
+        SELECT p.id, p.type, p.amount::float AS amount, p.notes, p.landlord_id, p.lease_id,
+               to_char(p.due_date, 'YYYY-MM-DD') AS due_date,
                to_char(p.due_date, 'Mon D, YYYY') AS due_label,
                u.email, u.first_name,
                TRIM(CONCAT_WS(' ', u.first_name, u.last_name)) AS tenant_name,
@@ -6720,8 +6721,19 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
         `SELECT COALESCE(SUM(amount_remaining), 0)::text AS credit
            FROM tenant_credits
           WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0`, [tenantId])
-      const creditApplied = Math.min(Number(creditRow?.credit ?? 0), gross)
-      const total = Math.round((gross - creditApplied) * 100) / 100
+      // S653 (Nic): the headline is what they will actually be asked for —
+      // paid-ahead money this month may use (capped by their monthly draw)
+      // comes off too, exactly as it does when they pay.
+      let prepaidApplied = 0
+      const leaseIdForDraw = rows.find((r: any) => r.lease_id)?.lease_id ?? null
+      if (leaseIdForDraw) {
+        const { prepaidDrawAvailable } = await import('../services/prepaidRelease')
+        const { db } = await import('../db')
+        const month = String(rows[0].due_date ?? new Date().toISOString()).slice(0, 7) + '-01'
+        prepaidApplied = Math.min(gross, (await prepaidDrawAvailable(db as any, leaseIdForDraw, month)).available)
+      }
+      const creditApplied = Math.min(Number(creditRow?.credit ?? 0), Math.max(0, gross - prepaidApplied))
+      const total = Math.round((gross - prepaidApplied - creditApplied) * 100) / 100
       if (total <= 0) {
         return res.json({ success: true, data: { sent: false,
           reason: 'Their credit on account covers everything owed.' } })
@@ -6739,7 +6751,7 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
         tenantName: rows[0].first_name || rows[0].tenant_name || 'there',
         unitLabel,
         total,
-        creditApplied,
+        creditApplied: Math.round((creditApplied + prepaidApplied) * 100) / 100,
         lines: rows.map((r: any) => ({ label: label(r), amount: Number(r.amount), dueDate: r.due_label })),
         portalUrl: `${(process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com').replace(/\/$/, '')}/payments`,
         landlordName: rows[0].landlord_name,

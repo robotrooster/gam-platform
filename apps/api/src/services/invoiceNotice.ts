@@ -117,12 +117,21 @@ export async function sendPendingInvoiceNotices(
       // Charge lines come from the payment rows this invoice created. Work-trade
       // suspended rows are excluded from the list and shown as one credit line:
       // they are real charges that nobody owes.
-      const lines = await query<{ type: string; notes: string | null; amount: string }>(
-        `SELECT type, notes, amount::text
+      const lines = await query<{ type: string; notes: string | null; amount: string; status: string; lease_id: string | null }>(
+        `SELECT type, notes, amount::text, status, lease_id
            FROM payments
           WHERE invoice_id = $1 AND work_trade_suspended_at IS NULL
           ORDER BY CASE type WHEN 'rent' THEN 0 WHEN 'deposit' THEN 1 ELSE 2 END, created_at`,
         [inv.id])
+      // S653 (Nic): "most people are going to see that email, think they owe
+      // $900 or whatever... they just saw the headline." The headline is what
+      // they will actually be asked for: what is still OPEN on this bill, less
+      // the paid-ahead money this month may use, less any credit on account.
+      // A line already settled — covered by paid-ahead credit when the bill
+      // was made, or a check that beat the email — is shown as covered, not due.
+      const paidAlready = Math.round(lines
+        .filter(l => l.status === 'settled' || l.status === 'processing')
+        .reduce((s, l) => s + Number(l.amount), 0) * 100) / 100
 
       // S648 (Nic): "every dollar should only be counted once." Every invoice
       // email used to claim the person's WHOLE credit, so two bills in one run
@@ -145,13 +154,25 @@ export async function sendPendingInvoiceNotices(
         [inv.tenant_id, inv.landlord_id, inv.id]) : []
 
       const invoiceTotal = Number(inv.total_amount)
+      const openNow = Math.round(Math.max(0, invoiceTotal - paidAlready) * 100) / 100
+      // S653: the paid-ahead money this bill's month may still use (capped by
+      // the resident's monthly draw, if they set one). It is netted when they
+      // pay, so the headline nets it now.
+      const leaseId = lines.find(l => l.lease_id)?.lease_id ?? null
+      let prepaidApplied = 0
+      if (leaseId && openNow > 0) {
+        const { prepaidDrawAvailable } = await import('./prepaidRelease')
+        const { db } = await import('../db')
+        const month = inv.due_date.slice(0, 7) + '-01'
+        prepaidApplied = Math.min(openNow, (await prepaidDrawAvailable(db as any, leaseId, month)).available)
+      }
       const creditApplied = pool.length
-        ? Math.min(Math.max(0, invoiceTotal), allocateCredits(
+        ? Math.min(Math.max(0, openNow - prepaidApplied), allocateCredits(
             pool.map(c => ({ leaseId: c.lease_id, amount: Number(c.amount) })),
             openBills.map(b => ({ key: b.id, leaseId: b.lease_id, total: Number(b.open), earliestDue: b.due })),
           ).applied[inv.id] ?? 0)
         : 0
-      const total = Math.round((invoiceTotal - creditApplied) * 100) / 100
+      const total = Math.round((openNow - prepaidApplied - creditApplied) * 100) / 100
 
       await emailInvoiceReady(inv.tenant_email, {
         tenantName: inv.tenant_first_name || 'there',
@@ -160,8 +181,13 @@ export async function sendPendingInvoiceNotices(
         invoiceNumber: inv.invoice_number,
         dueDateLabel: inv.due_label,
         total,
-        lines: lines.map(l => ({ label: labelFor(l), amount: Number(l.amount) })),
+        lines: lines.map(l => ({
+          label: labelFor(l), amount: Number(l.amount),
+          covered: l.status === 'settled' || l.status === 'processing',
+          coveredHow: (l.notes ?? '').includes('prepaid credit') ? 'paid-ahead credit' : 'already paid',
+        })),
         workTradeCredit: Number(inv.work_trade_credit_amount) || 0,
+        prepaidApplied,
         creditApplied,
         portalUrl: portalLink('tenant', 'payments'),
         landlordName: inv.landlord_name || undefined,

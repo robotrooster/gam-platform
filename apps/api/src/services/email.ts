@@ -2580,9 +2580,12 @@ export async function emailInvoiceReady(
     invoiceNumber: string
     dueDateLabel: string
     total: number
-    lines: Array<{ label: string; amount: number }>
+    /** S653: a covered line was settled before this email (paid-ahead credit, a check) — listed, not owed. */
+    lines: Array<{ label: string; amount: number; covered?: boolean; coveredHow?: string }>
     /** Work traded off this cycle — owed by nobody, but it belongs on the bill. */
     workTradeCredit?: number
+    /** S653: paid-ahead money this month will use, already netted out of `total`. */
+    prepaidApplied?: number
     /** Credit on account, already netted out of `total`. */
     creditApplied?: number
     portalUrl?: string
@@ -2594,8 +2597,8 @@ export async function emailInvoiceReady(
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
 
   const rows = args.lines.map(l =>
-    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#b8c4d8;margin-bottom:5px">
-       <span>${escapeHtml(l.label)}</span><span>${money(l.amount)}</span>
+    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:${l.covered ? '#7a8aaa' : '#b8c4d8'};margin-bottom:5px">
+       <span>${escapeHtml(l.label)}${l.covered ? ` <span style="font-size:.72rem;color:#5fbf7f">&mdash; covered (${escapeHtml(l.coveredHow || 'already paid')})</span>` : ''}</span><span style="${l.covered ? 'text-decoration:line-through' : ''}">${money(l.amount)}</span>
      </div>`).join('')
 
   const deduction = (label: string, amount: number) =>
@@ -2622,6 +2625,7 @@ export async function emailInvoiceReady(
          <div style="font-size:.72rem;color:#7a8aaa;margin-bottom:10px">Invoice ${escapeHtml(args.invoiceNumber)} &middot; due ${escapeHtml(args.dueDateLabel)}</div>
          ${rows}` +
       (args.workTradeCredit && args.workTradeCredit > 0 ? deduction('Work trade', args.workTradeCredit) : '') +
+      (args.prepaidApplied && args.prepaidApplied > 0 ? deduction('Your paid-ahead credit', args.prepaidApplied) : '') +
       (args.creditApplied && args.creditApplied > 0 ? deduction('Credit on your account', args.creditApplied) : '') +
       `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
                      border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
