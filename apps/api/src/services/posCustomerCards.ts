@@ -105,6 +105,10 @@ export const RECEIPT_EMAIL_PROMPT = {
   title: 'Email a receipt?',
   description: 'Type your email for a copy, or skip.',
 }
+export const NAME_PROMPT = {
+  title: 'Your name?',
+  description: 'For your receipt and your purchase history here. Skip if you prefer.',
+}
 
 /**
  * Put the questions on the reader's own screen: Save this card? (Yes / No
@@ -112,51 +116,79 @@ export const RECEIPT_EMAIL_PROMPT = {
  * reader that cannot prompt simply does not. Stripe's own form: the choices
  * carry an `id` and `text`; the answer comes back as the chosen id.
  */
-export async function startSaveCardPrompt(stripeReaderId: string, opts: { askEmail?: boolean } = {}): Promise<boolean> {
+export interface PromptAsks { askSave: boolean; askName: boolean; askEmail: boolean }
+
+/**
+ * Only what is missing is asked: keep the card (when the tap produced a
+ * reusable one), a name (when the card carried none — phone wallets never
+ * do), an email for the receipt (when we have none). Nothing missing, nothing
+ * asked. Returns false when there was nothing to ask or the reader refused.
+ */
+export async function startSaveCardPrompt(stripeReaderId: string, asks: PromptAsks): Promise<boolean> {
+  if (!asks.askSave && !asks.askName && !asks.askEmail) return false
   try {
-    const form: Record<string, string> = {
-      'inputs[0][type]': 'selection',
-      'inputs[0][required]': 'true',
-      'inputs[0][custom_text][title]': SAVE_CARD_PROMPT.title,
-      'inputs[0][custom_text][description]': SAVE_CARD_PROMPT.description,
-      'inputs[0][selection][choices][0][style]': 'primary',
-      'inputs[0][selection][choices][0][id]': 'yes',
-      'inputs[0][selection][choices][0][text]': 'Yes',
-      'inputs[0][selection][choices][1][style]': 'secondary',
-      'inputs[0][selection][choices][1][id]': 'no',
-      'inputs[0][selection][choices][1][text]': 'No thanks',
+    const form: Record<string, string> = {}
+    let i = 0
+    if (asks.askSave) {
+      form[`inputs[${i}][type]`] = 'selection'
+      form[`inputs[${i}][required]`] = 'true'
+      form[`inputs[${i}][custom_text][title]`] = SAVE_CARD_PROMPT.title
+      form[`inputs[${i}][custom_text][description]`] = SAVE_CARD_PROMPT.description
+      form[`inputs[${i}][selection][choices][0][style]`] = 'primary'
+      form[`inputs[${i}][selection][choices][0][id]`] = 'yes'
+      form[`inputs[${i}][selection][choices][0][text]`] = 'Yes'
+      form[`inputs[${i}][selection][choices][1][style]`] = 'secondary'
+      form[`inputs[${i}][selection][choices][1][id]`] = 'no'
+      form[`inputs[${i}][selection][choices][1][text]`] = 'No thanks'
+      i++
     }
-    if (opts.askEmail !== false) {
-      form['inputs[1][type]'] = 'email'
-      form['inputs[1][required]'] = 'false'
-      form['inputs[1][custom_text][title]'] = RECEIPT_EMAIL_PROMPT.title
-      form['inputs[1][custom_text][description]'] = RECEIPT_EMAIL_PROMPT.description
-      form['inputs[1][custom_text][skip_button]'] = 'No receipt'
+    if (asks.askName) {
+      form[`inputs[${i}][type]`] = 'text'
+      form[`inputs[${i}][required]`] = 'false'
+      form[`inputs[${i}][custom_text][title]`] = NAME_PROMPT.title
+      form[`inputs[${i}][custom_text][description]`] = NAME_PROMPT.description
+      form[`inputs[${i}][custom_text][skip_button]`] = 'Skip'
+      i++
+    }
+    if (asks.askEmail) {
+      form[`inputs[${i}][type]`] = 'email'
+      form[`inputs[${i}][required]`] = 'false'
+      form[`inputs[${i}][custom_text][title]`] = RECEIPT_EMAIL_PROMPT.title
+      form[`inputs[${i}][custom_text][description]`] = RECEIPT_EMAIL_PROMPT.description
+      form[`inputs[${i}][custom_text][skip_button]`] = 'No receipt'
+      i++
     }
     await stripeForm('POST', `/v1/terminal/readers/${stripeReaderId}/collect_inputs`, form)
     return true
   } catch (e) {
-    logger.warn({ err: e, stripeReaderId }, '[reader] save-card prompt could not start')
+    logger.warn({ err: e, stripeReaderId }, '[reader] prompt could not start')
     return false
   }
 }
 
 export type SaveCardAnswer =
   | { answered: false }
-  | { answered: true; yes: boolean; email: string | null; reason?: string }
+  | { answered: true; yes: boolean | null; name: string | null; email: string | null; reason?: string }
 
 /** What the customer pressed, if anything yet. A screen left alone for two minutes fails the prompt. */
 export async function readSaveCardAnswer(stripeReaderId: string): Promise<SaveCardAnswer> {
   const reader: any = await stripeForm('GET', `/v1/terminal/readers/${stripeReaderId}`)
   const action = reader?.action
-  if (!action || action.type !== 'collect_inputs') return { answered: true, yes: false, email: null, reason: 'nothing on the reader' }
+  if (!action || action.type !== 'collect_inputs') return { answered: true, yes: null, name: null, email: null, reason: 'nothing on the reader' }
   if (action.status === 'in_progress') return { answered: false }
-  if (action.status !== 'succeeded') return { answered: true, yes: false, email: null, reason: action.failure_message || String(action.status) }
+  if (action.status !== 'succeeded') return { answered: true, yes: null, name: null, email: null, reason: action.failure_message || String(action.status) }
   const inputs: any[] = action.collect_inputs?.inputs ?? []
-  const choice = inputs.find(i => i.type === 'selection')?.selection
+  const choice = inputs.find(i => i.type === 'selection')
+  const nameIn = inputs.find(i => i.type === 'text')
   const emailIn = inputs.find(i => i.type === 'email')
   const email = emailIn && !emailIn.skipped && typeof emailIn.email?.value === 'string' ? emailIn.email.value.trim().toLowerCase() : null
-  return { answered: true, yes: String(choice?.id ?? choice?.text ?? '').toLowerCase() === 'yes', email: email && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) ? email : null }
+  const name = nameIn && !nameIn.skipped && typeof nameIn.text?.value === 'string' ? nameIn.text.value.replace(/\s+/g, ' ').trim().slice(0, 80) : null
+  return {
+    answered: true,
+    yes: choice ? String(choice.selection?.id ?? choice.selection?.text ?? '').toLowerCase() === 'yes' : null,
+    name: name || null,
+    email: email && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) ? email : null,
+  }
 }
 
 /** Keep the card: attach the tap's reusable card to the customer's Stripe record and make it their card on file. */
@@ -178,6 +210,9 @@ export async function saveCardForCustomer(opts: { landlordId: string; customerId
   }
   await stripe.paymentMethods.attach(opts.generatedCard, { customer: stripeCustomerId })
   await stripe.customers.update(stripeCustomerId, { invoice_settings: { default_payment_method: opts.generatedCard } })
+  // The Yes IS the consent: the kept card may be shown to them next time.
+  await stripeForm('POST', `/v1/payment_methods/${opts.generatedCard}`, { allow_redisplay: 'always' }).catch((e: unknown) =>
+    logger.warn({ err: e, paymentMethod: opts.generatedCard }, '[reader] allow_redisplay'))
   await query(
     `UPDATE pos_customer_cards SET stripe_payment_method_id = $1, saved_at = NOW()
       WHERE landlord_id = $2 AND fingerprint = $3`,

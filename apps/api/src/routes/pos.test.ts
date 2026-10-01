@@ -394,7 +394,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
       .set('Authorization', `Bearer ${twoCompanies}`)
       .send({ stripeReaderId: 'tmr_second_company' })
     expect(ok.status).toBe(200)
-    expect(processPaymentIntentOnReaderMock).toHaveBeenCalledWith({ stripeReaderId: 'tmr_second_company', paymentIntentId: 'pi_second' })
+    expect(processPaymentIntentOnReaderMock).toHaveBeenCalledWith({ stripeReaderId: 'tmr_second_company', paymentIntentId: 'pi_second', allowRedisplay: true })
 
     // The first company's reader cannot run the second company's sale.
     await db.query(`INSERT INTO pos_terminal_readers (landlord_id, property_id, stripe_reader_id, nickname, status, registered_at)
@@ -474,8 +474,9 @@ describe('POST /api/pos/transactions — happy paths', () => {
               stripePaymentIntentId: 'pi_jane_1', stripeReaderId })
     expect(res.status, JSON.stringify(res.body)).toBe(201)
     const c = res.body.data.customer
-    expect(c).toMatchObject({ firstName: 'Jane', lastName: 'Doe', last4: '4242', brand: 'visa', isNew: true, priorPurchases: 0, cardSaved: false, prompting: true, readerId: stripeReaderId })
-    expect(startSaveCardPromptMock).toHaveBeenCalledWith(stripeReaderId)
+    expect(c).toMatchObject({ firstName: 'Jane', lastName: 'Doe', last4: '4242', brand: 'visa', isNew: true, priorPurchases: 0, cardSaved: false, cardKeepable: true, prompting: true, readerId: stripeReaderId })
+    // The card carried a name, so only the card question and the receipt email are asked.
+    expect(startSaveCardPromptMock).toHaveBeenCalledWith(stripeReaderId, { askSave: true, askName: false, askEmail: true })
     const row = await db.query<any>(`SELECT first_name, last_name, email, created_from FROM pos_customers WHERE id = $1`, [c.id])
     expect(row.rows[0]).toEqual({ first_name: 'Jane', last_name: 'Doe', email: null, created_from: 'card_reader' })
     const card = await db.query<any>(`SELECT fingerprint, cardholder_name, stripe_payment_method_id FROM pos_customer_cards WHERE pos_customer_id = $1`, [c.id])
@@ -492,7 +493,16 @@ describe('POST /api/pos/transactions — happy paths', () => {
       .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Propane', qty: 1, price: 25 }], paymentMethod: 'card',
               stripePaymentIntentId: 'pi_jane_2', stripeReaderId })
     expect(again.status).toBe(201)
-    expect(again.body.data.customer).toMatchObject({ id: c.id, isNew: false, priorPurchases: 1, cardSaved: true, prompting: false })
+    expect(again.body.data.customer).toMatchObject({ id: c.id, isNew: false, priorPurchases: 1, cardSaved: true })
+    // Kept already, and the email on file now: nothing left to ask.
+    await db.query(`UPDATE pos_customers SET email = 'jane@example.com' WHERE id = $1`, [c.id])
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 25, taxAmount: 0, lines: [{ itemId, lineSubtotal: 25, lineTax: 0 }] })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce(tapped(f, 'pi_jane_2b', withCardFee(25)) as any)
+    startSaveCardPromptMock.mockClear()
+    const third = await request(buildApp()).post('/api/pos/transactions').set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Propane', qty: 1, price: 25 }], paymentMethod: 'card', stripePaymentIntentId: 'pi_jane_2b', stripeReaderId })
+    expect(third.status).toBe(201)
+    expect(third.body.data.customer.prompting).toBe(false)
     expect(startSaveCardPromptMock).not.toHaveBeenCalled()
     expect((await db.query(`SELECT COUNT(*)::int AS n FROM pos_customers WHERE landlord_id = $1`, [f.landlordId])).rows[0].n).toBe(1)
 
@@ -500,21 +510,43 @@ describe('POST /api/pos/transactions — happy paths', () => {
     const hist = await request(buildApp()).get(`/api/pos/transactions?propertyId=${f.propertyId}&posCustomerId=${c.id}`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(hist.status).toBe(200)
-    expect(hist.body.data).toHaveLength(2)
+    expect(hist.body.data).toHaveLength(3)
     expect(hist.body.data[0].customer_name).toBe('Jane Doe')
   })
 
-  it('a sale the cashier assigned to a customer keeps that customer; a name-less card still becomes one', async () => {
+  // Nic's live test: Apple Pay — no name on the card, nothing reusable. The
+  // customer is still made from the card, and the reader asks for a name and
+  // an email instead of the card question.
+  it('a phone-wallet tap (no name, nothing reusable) still becomes a customer and is asked for name + email', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
+    const { stripeReaderId } = await seedTerminalReader(f)
     const itemId = await seedPosItem(f, { sellPrice: 10, stockQty: 999 })
     calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 10, taxAmount: 0, lines: [{ itemId, lineSubtotal: 10, lineTax: 0 }] })
-    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce(tapped(f, 'pi_anon', withCardFee(10), { cardholder_name: null, fingerprint: 'fp_anon', generated_card: null }) as any)
+    retrieveTerminalPaymentIntentMock.mockResolvedValue(tapped(f, 'pi_wallet', withCardFee(10), { cardholder_name: null, fingerprint: 'fp_wallet', generated_card: null, wallet: { type: 'apple_pay' } }) as any)
     const res = await request(buildApp()).post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 1, price: 10 }], paymentMethod: 'card', stripePaymentIntentId: 'pi_anon' })
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 1, price: 10 }], paymentMethod: 'card', stripePaymentIntentId: 'pi_wallet', stripeReaderId })
     expect(res.status).toBe(201)
-    expect(res.body.data.customer).toMatchObject({ firstName: 'Card', lastName: 'Customer', isNew: true, prompting: false })
-    expect(startSaveCardPromptMock).not.toHaveBeenCalled()   // nothing reusable came with the tap, and no reader was named
+    expect(res.body.data.customer).toMatchObject({ firstName: 'Card', lastName: 'Customer', isNew: true, cardKeepable: false, prompting: true, asks: { askSave: false, askName: true, askEmail: true } })
+    expect(startSaveCardPromptMock).toHaveBeenCalledWith(stripeReaderId, { askSave: false, askName: true, askEmail: true })
+    // They type their name and an email: the record is theirs now, the receipt goes out, nothing is "kept".
+    readSaveCardAnswerMock.mockResolvedValueOnce({ answered: true, yes: null, name: 'Nic Rhoades', email: 'nic@example.com' })
+    const ans = await request(buildApp()).get(`/api/pos/terminal/readers/${stripeReaderId}/save-card-answer?transactionId=${res.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(ans.body.data).toEqual({ answered: true, saved: false, reason: null, receiptSentTo: 'nic@example.com', nameSet: 'Nic Rhoades' })
+    expect(saveCardForCustomerMock).not.toHaveBeenCalled()
+    const row = await db.query<any>(`SELECT first_name, last_name, email FROM pos_customers WHERE id = $1`, [res.body.data.customer.id])
+    expect(row.rows[0]).toEqual({ first_name: 'Nic', last_name: 'Rhoades', email: 'nic@example.com' })
+    // Without a reader named, nothing is asked at all (a fresh tap of the same phone).
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 10, taxAmount: 0, lines: [{ itemId, lineSubtotal: 10, lineTax: 0 }] })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce(tapped(f, 'pi_wallet_2', withCardFee(10), { cardholder_name: null, fingerprint: 'fp_wallet', generated_card: null, wallet: { type: 'apple_pay' } }) as any)
+    startSaveCardPromptMock.mockClear()
+    const quiet = await request(buildApp()).post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 1, price: 10 }], paymentMethod: 'card', stripePaymentIntentId: 'pi_wallet_2' })
+    expect(quiet.status).toBe(201)
+    expect(quiet.body.data.customer.prompting).toBe(false)
+    expect(startSaveCardPromptMock).not.toHaveBeenCalled()
   })
 
   it('the reader\'s Yes keeps the card; No or nothing keeps nothing; a stranger\'s reader is 404', async () => {
@@ -532,12 +564,12 @@ describe('POST /api/pos/transactions — happy paths', () => {
     const ask = (reader = stripeReaderId, token = f.landlordToken) => request(buildApp())
       .get(`/api/pos/terminal/readers/${reader}/save-card-answer?transactionId=${txId}`).set('Authorization', `Bearer ${token}`)
     expect((await ask()).body.data).toEqual({ answered: false })
-    readSaveCardAnswerMock.mockResolvedValueOnce({ answered: true, yes: false, email: null })
-    expect((await ask()).body.data).toMatchObject({ answered: true, saved: false, receiptSentTo: null })
+    readSaveCardAnswerMock.mockResolvedValueOnce({ answered: true, yes: false, name: null, email: null })
+    expect((await ask()).body.data).toMatchObject({ answered: true, saved: false, receiptSentTo: null, nameSet: null })
     expect(saveCardForCustomerMock).not.toHaveBeenCalled()
     // Yes, and an email typed on the reader: the card is kept, the receipt goes out, the email is theirs now.
-    readSaveCardAnswerMock.mockResolvedValueOnce({ answered: true, yes: true, email: 'jane@example.com' })
-    expect((await ask()).body.data).toEqual({ answered: true, saved: true, reason: null, receiptSentTo: 'jane@example.com' })
+    readSaveCardAnswerMock.mockResolvedValueOnce({ answered: true, yes: true, name: null, email: 'jane@example.com' })
+    expect((await ask()).body.data).toEqual({ answered: true, saved: true, reason: null, receiptSentTo: 'jane@example.com', nameSet: null })
     expect(saveCardForCustomerMock).toHaveBeenCalledWith(expect.objectContaining({ customerId: sale.body.data.customer.id, generatedCard: 'pm_gen_jane', fingerprint: 'fp_jane_visa' }))
     expect(emailPosReceiptMock).toHaveBeenCalledWith('jane@example.com', expect.any(String), expect.any(String), withCardFee(25) / 100, expect.any(Buffer), expect.anything())
     expect((await db.query<any>(`SELECT email FROM pos_customers WHERE id = $1`, [sale.body.data.customer.id])).rows[0].email).toBe('jane@example.com')

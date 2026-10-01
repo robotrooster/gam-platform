@@ -1309,16 +1309,25 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         const c = await queryOne<any>(`SELECT id, first_name, last_name, email FROM pos_customers WHERE id = $1`, [saleCustomerId])
         const prior = await queryOne<{ n: string }>(
           `SELECT COUNT(*)::text AS n FROM pos_transactions WHERE pos_customer_id = $1 AND id <> $2`, [saleCustomerId, tx.id])
+        // Only what is missing is asked on the reader: keep the card (when the
+        // tap yielded a reusable one), a name (phone wallets carry none), an
+        // email for the receipt.
+        const asks = {
+          askSave:  !!(cardCustomer && cardIdentity?.generatedCard && !cardCustomer.cardSaved),
+          askName:  !!(cardCustomer && c && c.first_name === 'Card' && c.last_name === 'Customer'),
+          askEmail: !!(cardCustomer && c && !c.email),
+        }
         let prompting = false
-        if (cardCustomer && cardIdentity?.generatedCard && !cardCustomer.cardSaved && saleReaderId
+        if (saleReaderId && (asks.askSave || asks.askName || asks.askEmail)
             && await assertReaderBelongsToLandlord(posLandlordId(req), saleReaderId)) {
-          prompting = await startSaveCardPrompt(saleReaderId)
+          prompting = await startSaveCardPrompt(saleReaderId, asks)
         }
         customerOut = c ? {
           id: c.id, firstName: c.first_name, lastName: c.last_name, email: c.email,
           last4: cardIdentity?.last4 ?? null, brand: cardIdentity?.brand ?? null,
           isNew: cardCustomer?.isNew ?? false, priorPurchases: Number(prior?.n ?? 0),
-          cardSaved: cardCustomer?.cardSaved ?? false, prompting, readerId: prompting ? saleReaderId : null,
+          cardSaved: cardCustomer?.cardSaved ?? false, cardKeepable: !!cardIdentity?.generatedCard,
+          prompting, asks: prompting ? asks : null, readerId: prompting ? saleReaderId : null,
         } : null
       }
       res.status(201).json({ success: true, data: { ...tx, stayBooking, customer: customerOut } })
@@ -2541,7 +2550,7 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
       if (quoted.surcharge > 0) lines.push({ description: 'Card processing fee', amountCents: Math.round(quoted.surcharge * 100), quantity: 1 })
       await showCartOnReader({ stripeReaderId, lines, taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents: intent.amount })
     }
-    const reader = await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId })
+    const reader = await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId, allowRedisplay: true })
     res.json({
       success: true,
       data: {
@@ -2620,6 +2629,18 @@ posRouter.get('/terminal/readers/:stripeReaderId/save-card-answer', requirePerm(
     const answer = await readSaveCardAnswer(stripeReaderId)
     if (!answer.answered) return res.json({ success: true, data: { answered: false } })
     let saved = false, reason: string | null = answer.reason ?? null
+    // A name typed on the reader replaces the placeholder a name-less tap left.
+    let nameSet: string | null = null
+    if (answer.name) {
+      const cur = await queryOne<{ first_name: string; last_name: string }>(`SELECT first_name, last_name FROM pos_customers WHERE id = $1`, [tx.pos_customer_id])
+      if (cur && cur.first_name === 'Card' && cur.last_name === 'Customer') {
+        const parts = answer.name.split(' ')
+        const first = parts.length > 1 ? parts.slice(0, -1).join(' ') : parts[0]
+        const last = parts.length > 1 ? parts[parts.length - 1] : ''
+        await query(`UPDATE pos_customers SET first_name = $1, last_name = $2, updated_at = NOW() WHERE id = $3`, [first, last, tx.pos_customer_id])
+        nameSet = answer.name
+      }
+    }
     if (answer.yes) {
       const pi = await retrieveTerminalPaymentIntentWithCharge({ paymentIntentId: tx.stripe_payment_intent_id })
       const card = cardIdentityFromIntent(pi)
@@ -2633,7 +2654,7 @@ posRouter.get('/terminal/readers/:stripeReaderId/save-card-answer', requirePerm(
     if (answer.email) {
       receiptSentTo = await emailReceiptForSale(tx.id, answer.email, [reader.landlord_id])
     }
-    res.json({ success: true, data: { answered: true, saved, reason, receiptSentTo } })
+    res.json({ success: true, data: { answered: true, saved, reason, receiptSentTo, nameSet } })
   } catch (e) { next(e) }
 })
 

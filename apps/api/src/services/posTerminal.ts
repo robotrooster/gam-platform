@@ -193,6 +193,12 @@ export async function createCardPresentPaymentIntent(opts: {
   }
   const stripe = getStripe()
   return stripe.paymentIntents.create({
+    // S654 (Nic): the customer base. Stripe only produces the reusable
+    // `generated_card` from a tap when the intent asked for it (verified on
+    // the first live tap: none without this). Nothing is KEPT unless the
+    // customer presses Yes on the reader afterward — this only makes Yes
+    // possible. Register sales only; the desk (tenants) never saves cards.
+    setup_future_usage:   'off_session',
     amount:               opts.amountCents,
     currency:             opts.currency ?? 'usd',
     payment_method_types: ['card_present'],
@@ -264,8 +270,20 @@ export async function createRentReaderPaymentIntent(opts: {
 export async function processPaymentIntentOnReader(opts: {
   stripeReaderId:           string
   paymentIntentId:          string
+  // S654: the register passes this so the tap yields a reusable card. Stripe
+  // requires API 2024-09-30+ for the parameter; the SDK is pinned older, so
+  // the one call names its version. The card is kept only on the customer's
+  // Yes (an attach) — this flag alone saves nothing.
+  allowRedisplay?:          boolean
 }): Promise<Stripe.Terminal.Reader> {
   const stripe = getStripe()
+  if (opts.allowRedisplay) {
+    return stripe.terminal.readers.processPaymentIntent(
+      opts.stripeReaderId,
+      { payment_intent: opts.paymentIntentId, process_config: { allow_redisplay: 'always' } } as any,
+      { apiVersion: '2024-09-30.acacia' } as any,
+    )
+  }
   const reader = await stripe.terminal.readers.processPaymentIntent(
     opts.stripeReaderId,
     { payment_intent: opts.paymentIntentId },

@@ -309,12 +309,24 @@ None is the default. They should not be merged in any way." (memory
   purchases" + History (history filters by customer, names the customer).
   "+ New customer" at the register for cash people; a picked customer rides on
   every sale.
-- **To confirm on the first live tap:** that `latest_charge.payment_method_details
-  .card_present.generated_card` is present on a plain register charge (Stripe's
-  page recommends `setup_future_usage` at intent creation; if the live charge
-  shows none, set it on register intents and update `allow_redisplay` on Yes).
-  And that `collect_inputs` is accepted on the S710 under the account's API
-  version (the prompt is best-effort: a reader that cannot prompt just doesn't).
+- **First live tap (Nic, Apple Pay, $0.91, pi_3ULsHnDNEru9AEpK1xM6I1Sp):**
+  `generated_card: None`, `cardholder_name: None` — Stripe produced no reusable
+  card because the intent never asked for one, and wallets carry no name. The
+  customer was still created from the card (visa ····9767, "Card Customer")
+  and no prompt ran (nothing to keep). Fixed: register intents now carry
+  `setup_future_usage: 'off_session'` and the register's reader call passes
+  `process_config.allow_redisplay=always` under API 2024-09-30.acacia (the
+  SDK is pinned to 2023-10-16; the one call names its version). Nothing is
+  KEPT without the customer's Yes (an attach + `allow_redisplay` update over
+  REST). The reader now asks only for what the tap lacked: keep the card
+  (when reusable), a name (wallets never carry one), an email (when none);
+  a typed name replaces the "Card Customer" placeholder. The account's
+  default API version is 2026-01-28.clover, so the REST calls (collect_inputs,
+  payment_methods update) are current.
+- **Still to confirm on the next live taps:** a PHYSICAL card tap shows
+  `generated_card` + the printed name; an Apple Pay tap with the flag now
+  yields a generated_card (Stripe: wallets can be saved, `allow_redisplay=
+  limited`); and that the S710 displays the `collect_inputs` prompt.
 
 ## Still open
 

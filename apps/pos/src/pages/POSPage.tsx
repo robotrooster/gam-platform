@@ -894,6 +894,11 @@ export function POSPage() {
           if (a.answered) {
             setSaveCard(a.saved ? 'saved' : 'declined')
             if (a.receiptSentTo) { setReceiptSent(a.receiptSentTo); setReceiptEmail(a.receiptSentTo) }
+            if (a.nameSet) {
+              const parts = String(a.nameSet).split(' ')
+              setReceipt((r: any) => r ? { ...r, customer: { ...r.customer, firstName: parts.length > 1 ? parts.slice(0, -1).join(' ') : parts[0], lastName: parts.length > 1 ? parts[parts.length - 1] : '' } } : r)
+              qc.invalidateQueries('pos-customers')
+            }
             return
           }
         } catch { /* keep watching */ }
@@ -948,11 +953,15 @@ export function POSPage() {
                 </span>
                 <button className="btn btn-ghost btn-sm" onClick={()=>{ setHistoryCustomer({ id: receipt.customer.id, name: `${receipt.customer.firstName} ${receipt.customer.lastName}`.trim() }); setReceipt(null); setTab('history') }}>History</button>
               </div>
-              {saveCard==='asking' && <div style={{color:'var(--text-2)',marginTop:6}}>Asking on the reader whether to keep the card, and for a receipt email…</div>}
+              {saveCard==='asking' && <div style={{color:'var(--text-2)',marginTop:6}}>
+                Asking on the reader{[receipt.customer.asks?.askSave&&'whether to keep the card', receipt.customer.asks?.askName&&'for a name', receipt.customer.asks?.askEmail&&'for a receipt email'].filter(Boolean).map((x,i,a)=>(i===0?' ':i===a.length-1?' and ':', ')+x).join('')}…
+              </div>}
               {saveCard==='saved' && <div style={{color:'var(--green)',marginTop:6}}>Card kept for next time — it shows under On file.</div>}
-              {saveCard==='declined' && <div style={{color:'var(--text-3)',marginTop:6}}>Card not kept.</div>}
-              {saveCard==='timeout' && <div style={{color:'var(--text-3)',marginTop:6}}>No answer on the reader — card not kept.</div>}
+              {saveCard==='declined' && receipt.customer.asks?.askSave && <div style={{color:'var(--text-3)',marginTop:6}}>Card not kept.</div>}
+              {saveCard==='declined' && !receipt.customer.asks?.askSave && <div style={{color:'var(--text-3)',marginTop:6}}>Done on the reader.</div>}
+              {saveCard==='timeout' && <div style={{color:'var(--text-3)',marginTop:6}}>No answer on the reader.</div>}
               {receipt.customer.cardSaved && saveCard==null && <div style={{color:'var(--text-3)',marginTop:6}}>Card already on file.</div>}
+              {!receipt.customer.cardSaved && !receipt.customer.cardKeepable && receipt.customer.last4 && saveCard==null && <div style={{color:'var(--text-3)',marginTop:6}}>A phone-wallet tap can't be kept on file.</div>}
             </div>
           )}
           <div style={{textAlign:'left',marginBottom:14}}>
