@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict iAEQzrHHc0ft3IK0k4rZopcDeFd1FMSxwXgMunXHQNLmIMGojFHBVHhRpOxnYeD
+\restrict APaiX1lv2RSg22XcSmrQo44sImL4aA2hyXDKqoTX1UnXYzLzRfgLKkYfgq1hSSM
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7335,6 +7335,25 @@ COMMENT ON COLUMN public.pos_categories.property_id IS 'Property this category a
 
 
 --
+-- Name: pos_customer_cards; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_customer_cards (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    pos_customer_id uuid NOT NULL,
+    fingerprint text NOT NULL,
+    brand text,
+    last4 text,
+    cardholder_name text,
+    stripe_payment_method_id text,
+    saved_at timestamp with time zone,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: pos_customer_invitations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -7363,7 +7382,7 @@ CREATE TABLE public.pos_customers (
     landlord_id uuid NOT NULL,
     first_name text NOT NULL,
     last_name text NOT NULL,
-    email text NOT NULL,
+    email text,
     phone text,
     stripe_customer_id text,
     ach_verified boolean DEFAULT false NOT NULL,
@@ -7371,7 +7390,9 @@ CREATE TABLE public.pos_customers (
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    archived_at timestamp with time zone
+    archived_at timestamp with time zone,
+    created_from text DEFAULT 'manual'::text NOT NULL,
+    CONSTRAINT pos_customers_created_from_check CHECK ((created_from = ANY (ARRAY['manual'::text, 'card_reader'::text])))
 );
 
 
@@ -13910,6 +13931,22 @@ ALTER TABLE ONLY public.pos_categories
 
 
 --
+-- Name: pos_customer_cards pos_customer_cards_landlord_id_fingerprint_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customer_cards
+    ADD CONSTRAINT pos_customer_cards_landlord_id_fingerprint_key UNIQUE (landlord_id, fingerprint);
+
+
+--
+-- Name: pos_customer_cards pos_customer_cards_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customer_cards
+    ADD CONSTRAINT pos_customer_cards_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: pos_customer_invitations pos_customer_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -19821,6 +19858,13 @@ CREATE UNIQUE INDEX pm_property_invitations_token_unique ON public.pm_property_i
 --
 
 CREATE UNIQUE INDEX pm_property_invitations_unique_pending ON public.pm_property_invitations USING btree (pm_company_id, property_id) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: pos_customer_cards_customer_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_customer_cards_customer_idx ON public.pos_customer_cards USING btree (pos_customer_id);
 
 
 --
@@ -25744,6 +25788,22 @@ ALTER TABLE ONLY public.pos_categories
 
 
 --
+-- Name: pos_customer_cards pos_customer_cards_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customer_cards
+    ADD CONSTRAINT pos_customer_cards_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: pos_customer_cards pos_customer_cards_pos_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customer_cards
+    ADD CONSTRAINT pos_customer_cards_pos_customer_id_fkey FOREIGN KEY (pos_customer_id) REFERENCES public.pos_customers(id);
+
+
+--
 -- Name: pos_customer_invitations pos_customer_invitations_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -28347,5 +28407,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict iAEQzrHHc0ft3IK0k4rZopcDeFd1FMSxwXgMunXHQNLmIMGojFHBVHhRpOxnYeD
+\unrestrict APaiX1lv2RSg22XcSmrQo44sImL4aA2hyXDKqoTX1UnXYzLzRfgLKkYfgq1hSSM
 

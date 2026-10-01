@@ -12,7 +12,10 @@ const {
   createRentReaderPaymentIntentMock, processPaymentIntentOnReaderMock,
   retrieveTerminalPaymentIntentMock, captureTerminalPaymentIntentMock, cancelTerminalPaymentIntentMock,
   paymentIntentsUpdateMock, readersCancelActionMock, paymentIntentsCaptureMock, paymentIntentsRetrieveMock, paymentIntentsCancelMock,
+  showCartOnReaderMock, cancelReaderActionMock,
 } = vi.hoisted(() => ({
+  showCartOnReaderMock:              vi.fn(async () => undefined),
+  cancelReaderActionMock:            vi.fn(async () => undefined),
   createRentReaderPaymentIntentMock: vi.fn(async (o: any) => ({ id: 'pi_reader_1', status: 'requires_payment_method', amount: o.amountCents, metadata: {} })),
   processPaymentIntentOnReaderMock:  vi.fn(async () => ({ id: 'tmr_1', action: { status: 'in_progress' } })),
   retrieveTerminalPaymentIntentMock: vi.fn(async () => ({ id: 'pi_reader_1', status: 'requires_payment_method', amount: 0, metadata: {} })),
@@ -30,6 +33,8 @@ vi.mock('../services/posTerminal', () => ({
   retrieveTerminalPaymentIntent: retrieveTerminalPaymentIntentMock,
   captureTerminalPaymentIntent:  captureTerminalPaymentIntentMock,
   cancelTerminalPaymentIntent:   cancelTerminalPaymentIntentMock,
+  cancelReaderAction:            cancelReaderActionMock,
+  showCartOnReader:              showCartOnReaderMock,
 }))
 vi.mock('../lib/stripe', () => ({
   getStripe: () => ({
@@ -132,6 +137,13 @@ describe('S654 card on the counter reader', () => {
       amountCents: Math.round(TOTAL * 100), tenantId: f.tenantId, anchorPaymentId: f.rentId,
     }))
     expect(processPaymentIntentOnReaderMock).toHaveBeenCalledWith({ stripeReaderId: 'tmr_1', paymentIntentId: 'pi_reader_1' })
+    // S654 (Nic): the reader shows whose balance, each charge by name, the fee, the total.
+    const cart: any = (showCartOnReaderMock.mock.calls as any[])[0][0]
+    expect(cart.stripeReaderId).toBe('tmr_1')
+    expect(cart.lines.map((l: any) => l.description)).toEqual([expect.stringMatching(/^Rent — .+/), 'Water meter 100 → 150', 'Card processing fee'])
+    expect(cart.lines.map((l: any) => l.amountCents)).toEqual([46000, 2247, Math.round(FEE * 100)])
+    expect(cart.totalCents).toBe(Math.round(TOTAL * 100))
+    expect(res.body.data.lineItems).toHaveLength(2)
     // The ledger is untouched until the card is approved.
     const { rows } = await db.query(`SELECT status, stripe_payment_intent_id FROM payments WHERE invoice_id=$1`, [f.invoiceId])
     expect(rows.every((r: any) => r.status === 'pending' && r.stripe_payment_intent_id === null)).toBe(true)
@@ -189,7 +201,9 @@ describe('S654 card on the counter reader', () => {
     const q = await request(buildApp()).get(`/api/payments/${f.rentId}/reader/quote`).set('Authorization', `Bearer ${f.token}`)
     expect(q.status).toBe(200)
     const fee = processingFeeFor({ amount: 382.47, paymentMethod: 'card' })
-    expect(q.body.data).toEqual({ outstanding: 482.47, creditApplied: 100, balance: 382.47, cardFee: fee, total: Math.round((382.47 + fee) * 100) / 100 })
+    expect(q.body.data).toMatchObject({ outstanding: 482.47, creditApplied: 100, balance: 382.47, cardFee: fee, total: Math.round((382.47 + fee) * 100) / 100 })
+    // The reader shows what the CARD pays: the credit clears the rest after allocation.
+    expect(q.body.data.lineItems.map((l: any) => l.amountCents)).toEqual([38247])
     const res = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
       .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1' })
     expect(res.status).toBe(201)
@@ -301,6 +315,49 @@ describe('S654 card on the counter reader', () => {
       landlordIds: [other.landlordId], permissions: {} }, SECRET, { expiresIn: '1h' })
     const res2 = await request(buildApp()).get(`/api/payments/reader/intents/pi_reader_1`).set('Authorization', `Bearer ${strangerToken}`)
     expect(res2.status).toBe(404)
+  })
+
+  // S654 (Nic): "I don't want it to void the charge." A timed-out charge is
+  // cleared off the reader and sent AGAIN, as long as the balance hasn't moved.
+  it('clear-reader keeps the charge; resend puts the same charge back when the balance is unchanged', async () => {
+    const f = await fixture()
+    retrieveTerminalPaymentIntentMock.mockResolvedValue({
+      id: 'pi_reader_1', status: 'requires_payment_method', amount: Math.round(TOTAL * 100),
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId },
+    } as any)
+    const cleared = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/clear-reader`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1' })
+    expect(cleared.status).toBe(200)
+    expect(cancelReaderActionMock).toHaveBeenCalledWith('tmr_1')
+    expect(cancelTerminalPaymentIntentMock).not.toHaveBeenCalled()
+    const again = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/resend`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1' })
+    expect(again.status, JSON.stringify(again.body)).toBe(200)
+    expect(again.body.data.total).toBe(TOTAL)
+    expect(processPaymentIntentOnReaderMock).toHaveBeenCalledWith({ stripeReaderId: 'tmr_1', paymentIntentId: 'pi_reader_1' })
+    expect(showCartOnReaderMock).toHaveBeenCalled()
+    expect(createRentReaderPaymentIntentMock).not.toHaveBeenCalled()   // the same charge, not a new one
+  })
+
+  it('resend refuses a moved balance and an already-approved card', async () => {
+    const f = await fixture()
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_reader_1', status: 'requires_payment_method', amount: Math.round(TOTAL * 100) - 100,
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId },
+    } as any)
+    const moved = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/resend`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1' })
+    expect(moved.status).toBe(409)
+    expect(String(moved.body.error)).toMatch(/balance changed/i)
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_reader_1', status: 'requires_capture', amount: Math.round(TOTAL * 100),
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId },
+    } as any)
+    const approved = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/resend`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1' })
+    expect(approved.status).toBe(409)
+    expect(String(approved.body.error)).toMatch(/already approved/i)
+    expect(processPaymentIntentOnReaderMock).not.toHaveBeenCalled()
   })
 
   it('the history says how it was paid', async () => {

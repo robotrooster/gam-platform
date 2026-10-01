@@ -3,7 +3,7 @@ import { useUrlTab } from '../lib/useUrlTab'
 import type { KeyboardEvent as ReactKeyboardEvent, ClipboardEvent as ReactClipboardEvent } from 'react'
 import { useAuth } from '../context/AuthContext'
 import {
-  discoverReaders, connectReader, collectCardPayment, cancelCurrentPayment,
+  discoverReaders, connectReader, collectCardPayment, cancelCurrentPayment, clearReaderPrompt,
   createTerminalIntent, processIntentOnReader, pollPiUntilTerminal,
   cancelTerminalIntent,
   listRegisteredReaders, registerNewReader, archiveRegisteredReader,
@@ -114,6 +114,14 @@ export function POSPage() {
   const [cashGiven, setCashGiven] = useState('')
   const [filterCat, setFilterCat] = useState('all')
   const [receipt, setReceipt] = useState<any>(null)
+  // S654 (Nic): the customer base. After a card sale the reader asks the
+  // customer (their own screen, their own finger) whether to keep the card and
+  // for a receipt email; the register watches for the answer.
+  const [saveCard, setSaveCard] = useState<'asking' | 'saved' | 'declined' | 'timeout' | null>(null)
+  const [receiptEmail, setReceiptEmail] = useState('')
+  const [receiptSent, setReceiptSent] = useState<string | null>(null)
+  const [historyCustomer, setHistoryCustomer] = useState<{ id: string; name: string } | null>(null)
+  const [newCustomer, setNewCustomer] = useState<{ open: boolean; firstName: string; lastName: string; email: string; phone: string }>({ open: false, firstName: '', lastName: '', email: '', phone: '' })
   const [appliedDiscount, setAppliedDiscount] = useState<any>(null)
   const [discountCode, setDiscountCode] = useState('')
   const [openTx,setOpenTx]=useState<string|null>(null)   // S653: history row expanded to its lines
@@ -128,6 +136,14 @@ export function POSPage() {
   const [readers, setReaders] = useState<any[]>([])  // Bluetooth-discovered SDK readers
   const [activeReader, setActiveReader] = useState<ActiveReader | null>(null)
   const [terminalStatus, setTerminalStatus] = useState<'idle'|'discovering'|'connecting'|'collecting'|'capturing'|'error'>('idle')
+  // S654 (Nic): "I don't want it to void the charge… revert back to the cart so
+  // they can try again." A card charge the reader timed out on (or declined)
+  // stays open with the cart; Charge sends it again. It is voided only when the
+  // cart is cleared or changed.
+  const [pendingIntent, setPendingIntent] = useState<{ id: string; readerId: string } | null>(null)
+  const abandonPendingIntent = () => {
+    if (pendingIntent) { cancelTerminalIntent(pendingIntent.id).catch(() => {}); setPendingIntent(null) }
+  }
   const [terminalError, setTerminalError] = useState('')
   // S243: cart-level property — the PI is stamped with this and the
   // smart-reader selector filters to readers registered under it.
@@ -223,7 +239,7 @@ export function POSPage() {
     {
       onSuccess: () => {
         qc.invalidateQueries('pos-tickets')
-        setCart([]); setTenantId(''); setPosCustomerId(''); setOpenTicketId(null); setPayLinkId(null)
+        abandonPendingIntent(); setCart([]); setTenantId(''); setPosCustomerId(''); setOpenTicketId(null); setPayLinkId(null)
         toast('Held for delivery')
       },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not hold that for delivery'),
@@ -236,7 +252,7 @@ export function POSPage() {
   )
   const { data: taxRates = [] } = useQuery<any[]>(['pos-tax-rates', registerProperty], () => apiGet(`/pos/tax-rates${propQ}`), { enabled: tab==='taxes'||tab==='register' })
   const { data: discounts = [] } = useQuery<any[]>(['pos-discounts', registerProperty], () => apiGet(`/pos/discounts${propQ}`), { enabled: tab==='discounts'||tab==='register' })
-  const { data: txns = [], isLoading: txLoading } = useQuery<any[]>(['pos-transactions', registerProperty], () => apiGet(`/pos/transactions${propQ}`), { enabled: tab==='history' })
+  const { data: txns = [], isLoading: txLoading } = useQuery<any[]>(['pos-transactions', registerProperty, historyCustomer?.id ?? null], () => apiGet(`/pos/transactions${propQ}${historyCustomer ? `${propQ ? '&' : '?'}posCustomerId=${historyCustomer.id}` : ''}`), { enabled: tab==='history' })
   const { data: vendors = [] } = useQuery<any[]>(['pos-vendors', registerProperty], () => apiGet(`/pos/vendors?propertyId=${registerProperty}`), { enabled: !!registerProperty && (tab==='vendors'||tab==='orders') })
   const { data: purchaseOrders = [] } = useQuery<any[]>(['pos-purchase-orders', registerProperty], () => apiGet(`/pos/purchase-orders${propQ}`), { enabled: tab==='orders' })
   const { data: inventoryLog = [] } = useQuery<any[]>(['pos-inventory-log', registerProperty], () => apiGet(`/pos/inventory-log${propQ}`), { enabled: tab==='inventory' })
@@ -549,7 +565,11 @@ export function POSPage() {
       tenantId: tenantId||null,
       // S652: a card on file belongs to a PERSON, so the sale has to say which
       // one — the same tenant-or-customer pair a charge sale sends.
-      posCustomerId: (method==='charge'||method==='card_on_file') ? (posCustomerId||null) : null,
+      // S654 (Nic): "for cash people we can add them as a customer" — a picked
+      // customer rides on every sale, not only charge-account ones.
+      posCustomerId: posCustomerId||null,
+      // S654: the reader the card was tapped on, so it can ask about keeping the card.
+      stripeReaderId: method==='card' && activeReader?.type==='smart' ? activeReader.stripeReaderId : null,
       // Always send the register's property (not just for FlexCharge) so every
       // sale is tied to a property — required for cashier property-lock scoping.
       propertyId: registerProperty || null,
@@ -567,6 +587,8 @@ export function POSPage() {
     }),
     { onSuccess: async (res:any) => {
       setReceipt({ ...res.data, cartItems:cart, subtotal, discountAmt, taxAmount, surcharge, total, changeDue, method })
+      setReceiptSent(null); setReceiptEmail(res.data?.customer?.email || '')
+      setSaveCard(res.data?.customer?.prompting ? 'asking' : null)
       // S263/S264: link the live session to this transaction via the
       // queue. FIFO order guarantees the OPEN_SESSION + ADD_ITEMs have
       // already drained by the time the cashier reached checkout (those
@@ -581,7 +603,7 @@ export function POSPage() {
         })
       }
       setClientSessionId(null)
-      setCart([]); setCashGiven(''); setTenantId(''); setPosCustomerId(''); setAppliedDiscount(null); setStay(null)
+      abandonPendingIntent(); setCart([]); setCashGiven(''); setTenantId(''); setPosCustomerId(''); setAppliedDiscount(null); setStay(null)
       setOpenTicketId(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets')
       qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
       qc.invalidateQueries(['pos-sessions-open', registerProperty])
@@ -745,19 +767,30 @@ export function POSPage() {
       // the card is captured (money taken, no sale).
       // S648: the server prices the reader charge from the cart itself, card
       // fee included — the register no longer sends an amount.
-      const intent = await createTerminalIntent({
-        items: cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax })),
-        discountAmount: discountAmt,
-        propertyId:  registerProperty,
-        description: 'GAM POS sale',
-      })
+      const cartLines = cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
+      let intent: { id: string; clientSecret: string } | null = null
+      // S654: a charge the reader timed out on is sent again as-is. The server
+      // re-prices the cart and refuses a changed one, in which case the old
+      // charge is voided and a fresh one minted.
+      if (pendingIntent && activeReader.type === 'smart' && pendingIntent.readerId === activeReader.stripeReaderId) {
+        try {
+          await processIntentOnReader({ paymentIntentId: pendingIntent.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: discountAmt })
+          intent = { id: pendingIntent.id, clientSecret: '' }
+        } catch {
+          await cancelTerminalIntent(pendingIntent.id).catch(() => {})
+          setPendingIntent(null)
+        }
+      }
+      if (!intent) {
+        const fresh = await createTerminalIntent({ items: cartLines, discountAmount: discountAmt, propertyId: registerProperty, description: 'GAM POS sale' })
+        intent = fresh
+        if (activeReader.type === 'smart') {
+          await processIntentOnReader({ paymentIntentId: fresh.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: discountAmt })
+        }
+      }
       piId = intent.id
 
       if (activeReader.type === 'smart') {
-        await processIntentOnReader({
-          paymentIntentId: intent.id,
-          stripeReaderId:  activeReader.stripeReaderId,
-        })
         await pollPiUntilTerminal(intent.id)
       } else {
         await collectCardPayment(intent.clientSecret)
@@ -766,16 +799,26 @@ export function POSPage() {
       // S648: recording the sale captures the card, in one server step.
       setTerminalStatus('capturing')
       await checkoutMut.mutateAsync(intent.id)
+      setPendingIntent(null)
       setTerminalStatus('idle')
     } catch (e: any) {
-      setTerminalError(e?.response?.data?.error?.message || e?.message || 'Charge failed')
-      setTerminalStatus('error')
+      const raw = e?.response?.data?.error
+      const msg: string = (typeof raw === 'string' ? raw : raw?.message) || e?.message || 'Charge failed'
       if (activeReader.type === 'bluetooth') {
         await cancelCurrentPayment().catch(() => {})
+        if (piId) await cancelTerminalIntent(piId).catch(() => {})
+        setTerminalError(msg)
+      } else if (piId) {
+        // S654 (Nic): clear the reader's "tap or insert"; keep the charge and the cart.
+        await clearReaderPrompt(piId, activeReader.stripeReaderId).catch(() => {})
+        setPendingIntent({ id: piId, readerId: activeReader.stripeReaderId })
+        setTerminalError(/timed out/i.test(msg)
+          ? 'No card was presented. The cart is still here — tap Charge again when they are ready.'
+          : `${msg} — the cart is still here; tap Charge to try again.`)
+      } else {
+        setTerminalError(msg)
       }
-      if (piId) {
-        await cancelTerminalIntent(piId).catch(() => {})
-      }
+      setTerminalStatus('error')
     }
   }
 
@@ -838,6 +881,39 @@ export function POSPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visibleTabKeys])
 
+  // S654: watch the reader for the customer's answer (two minutes, Stripe's own prompt timeout).
+  useEffect(() => {
+    if (saveCard !== 'asking' || !receipt?.customer?.readerId || !receipt?.id) return
+    let stop = false
+    const deadline = Date.now() + 125_000
+    const tick = async () => {
+      while (!stop && Date.now() < deadline) {
+        try {
+          const a: any = await apiGet<any>(`/pos/terminal/readers/${receipt.customer.readerId}/save-card-answer?transactionId=${receipt.id}`)
+          if (stop) return
+          if (a.answered) {
+            setSaveCard(a.saved ? 'saved' : 'declined')
+            if (a.receiptSentTo) { setReceiptSent(a.receiptSentTo); setReceiptEmail(a.receiptSentTo) }
+            return
+          }
+        } catch { /* keep watching */ }
+        await new Promise(r => setTimeout(r, 2000))
+      }
+      if (!stop) setSaveCard('timeout')
+    }
+    void tick()
+    return () => { stop = true }
+  }, [saveCard, receipt?.id])   // eslint-disable-line react-hooks/exhaustive-deps
+  const emailReceiptMut = useMutation(
+    () => apiPost(`/pos/transactions/${receipt?.id}/email-receipt`, { email: receiptEmail.trim() }),
+    { onSuccess: (r: any) => { setReceiptSent(r.data.sentTo); qc.invalidateQueries('pos-customers') },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'The receipt could not be sent') })
+  const createCustomerMut = useMutation(
+    () => apiPost('/landlords/pos-customers', { firstName: newCustomer.firstName.trim(), lastName: newCustomer.lastName.trim(),
+      email: newCustomer.email.trim() || null, phone: newCustomer.phone.trim() || null, propertyId: registerProperty }),
+    { onSuccess: (r: any) => { qc.invalidateQueries('pos-customers'); setPosCustomerId(r.data?.id || ''); setTenantId(''); setNewCustomer({ open: false, firstName: '', lastName: '', email: '', phone: '' }) },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'The customer could not be added') })
+
   if (receipt) return (
     <div>
       <div className="page-header"><div><h1 className="page-title">Point of Sale</h1></div></div>
@@ -861,7 +937,36 @@ export function POSPage() {
             </div>
             {receipt.method==='cash'&&receipt.changeDue>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--green)',fontWeight:600}}><span>Change Due</span><span>{fmt(receipt.changeDue)}</span></div>}
           </div>
-          <button className="btn btn-primary" style={{width:'100%'}} onClick={()=>setReceipt(null)}>New Sale</button>
+          {receipt.customer && (
+            <div style={{textAlign:'left',border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 12px',marginBottom:12,fontSize:'.82rem'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+                <span>
+                  <span style={{color:'var(--text-3)'}}>Customer </span>
+                  <strong>{receipt.customer.firstName} {receipt.customer.lastName}</strong>
+                  {receipt.customer.last4 && <span style={{color:'var(--text-3)'}}> · card ending {receipt.customer.last4}</span>}
+                  <span style={{color:'var(--text-3)'}}> · {receipt.customer.isNew ? 'new customer' : `${receipt.customer.priorPurchases} previous purchase${receipt.customer.priorPurchases===1?'':'s'}`}</span>
+                </span>
+                <button className="btn btn-ghost btn-sm" onClick={()=>{ setHistoryCustomer({ id: receipt.customer.id, name: `${receipt.customer.firstName} ${receipt.customer.lastName}`.trim() }); setReceipt(null); setTab('history') }}>History</button>
+              </div>
+              {saveCard==='asking' && <div style={{color:'var(--text-2)',marginTop:6}}>Asking on the reader whether to keep the card, and for a receipt email…</div>}
+              {saveCard==='saved' && <div style={{color:'var(--green)',marginTop:6}}>Card kept for next time — it shows under On file.</div>}
+              {saveCard==='declined' && <div style={{color:'var(--text-3)',marginTop:6}}>Card not kept.</div>}
+              {saveCard==='timeout' && <div style={{color:'var(--text-3)',marginTop:6}}>No answer on the reader — card not kept.</div>}
+              {receipt.customer.cardSaved && saveCard==null && <div style={{color:'var(--text-3)',marginTop:6}}>Card already on file.</div>}
+            </div>
+          )}
+          <div style={{textAlign:'left',marginBottom:14}}>
+            <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Email a copy of the receipt</div>
+            {receiptSent ? (
+              <div style={{fontSize:'.82rem',color:'var(--green)'}}>Receipt sent to {receiptSent}</div>
+            ) : (
+              <div style={{display:'flex',gap:6}}>
+                <input className="form-input" type="email" placeholder="name@example.com" value={receiptEmail} onChange={e=>setReceiptEmail(e.target.value)} style={{flex:1}} />
+                <button className="btn btn-primary btn-sm" disabled={!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(receiptEmail.trim())||emailReceiptMut.isLoading} onClick={()=>emailReceiptMut.mutate()}>{emailReceiptMut.isLoading?'Sending…':'Send'}</button>
+              </div>
+            )}
+          </div>
+          <button className="btn btn-primary" style={{width:'100%'}} onClick={()=>{ setReceipt(null); setSaveCard(null) }}>New Sale</button>
         </div>
       </div>
     </div>
@@ -973,7 +1078,7 @@ export function POSPage() {
                   })
                   qc.invalidateQueries(['pos-sessions-open', registerProperty])
                 }
-                setClientSessionId(null); setCart([]); setOpenTicketId(null); setPayLinkId(null)
+                setClientSessionId(null); abandonPendingIntent(); setCart([]); setOpenTicketId(null); setPayLinkId(null)
               }} style={{background:'none',border:'none',color:'var(--text-3)',cursor:'pointer',fontSize:'.75rem'}}>Clear</button>}
             </div>
             {cart.length===0?(<div style={{color:'var(--text-3)',fontSize:'.85rem',padding:'24px 0',textAlign:'center'}}>No items added</div>):(
@@ -1050,13 +1155,32 @@ export function POSPage() {
                   merged. Which id gets sent is carried by the option's
                   prefix; the two ids stay mutually exclusive. */}
               <select className="form-select" value={tenantId?`t:${tenantId}`:posCustomerId?`c:${posCustomerId}`:''} onChange={e=>{ const v=e.target.value; if(v.startsWith('t:')){ setTenantId(v.slice(2)); setPosCustomerId('') } else if(v.startsWith('c:')){ setPosCustomerId(v.slice(2)); setTenantId('') } else { setTenantId(''); setPosCustomerId('') } }} style={{width:'100%'}}>
-                <option value="">Select customer...</option>
+                <option value="">Select customer... (optional for cash)</option>
                 {[
                   ...(tenants as any[]).map((t:any)=>({ key:`t:${t.id}`, label:`${t.firstName} ${t.lastName}`.trim() })),
                   ...(posCustomers as any[]).map((c:any)=>({ key:`c:${c.id}`, label:(`${c.firstName} ${c.lastName}`.trim())+(c.email?` — ${c.email}`:'') })),
                 ].sort((a,b)=>a.label.localeCompare(b.label)).map(o=><option key={o.key} value={o.key}>{o.label}</option>)}
               </select>
               {method==='charge'&&chargeBlocked&&<div style={{fontSize:'.72rem',color:'var(--red)'}}>Cart has non-charge-eligible items</div>}
+              {/* S654 (Nic): "for cash people we can add them as a customer." */}
+              {!newCustomer.open ? (
+                <button type="button" className="btn btn-ghost btn-sm" style={{marginTop:4}} onClick={()=>setNewCustomer(n=>({ ...n, open:true }))}>+ New customer</button>
+              ) : (
+                <div style={{display:'grid',gap:6,marginTop:6,padding:'8px 10px',border:'1px solid var(--border-1)',borderRadius:8}}>
+                  <div style={{display:'flex',gap:6}}>
+                    <input className="form-input" placeholder="First name" value={newCustomer.firstName} onChange={e=>setNewCustomer(n=>({ ...n, firstName:e.target.value }))} />
+                    <input className="form-input" placeholder="Last name" value={newCustomer.lastName} onChange={e=>setNewCustomer(n=>({ ...n, lastName:e.target.value }))} />
+                  </div>
+                  <div style={{display:'flex',gap:6}}>
+                    <input className="form-input" type="email" placeholder="Email (optional)" value={newCustomer.email} onChange={e=>setNewCustomer(n=>({ ...n, email:e.target.value }))} />
+                    <input className="form-input" placeholder="Phone (optional)" value={newCustomer.phone} onChange={e=>setNewCustomer(n=>({ ...n, phone:e.target.value }))} />
+                  </div>
+                  <div style={{display:'flex',gap:6}}>
+                    <button type="button" className="btn btn-primary btn-sm" disabled={!newCustomer.firstName.trim()||createCustomerMut.isLoading} onClick={()=>createCustomerMut.mutate()}>{createCustomerMut.isLoading?'Adding…':'Add customer'}</button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={()=>setNewCustomer({ open:false, firstName:'', lastName:'', email:'', phone:'' })}>Cancel</button>
+                  </div>
+                </div>
+              )}
               {method==='card_on_file'&&(
                 cardOnFile.isFetching
                   ? <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Checking for a card…</div>
@@ -1148,7 +1272,7 @@ export function POSPage() {
                 total={discountedSubtotal + taxAmount}
                 customerPaysFee={!absorbsCardFee}
                 onClose={()=>setPayLinkOpen(false)}
-                onSent={()=>{ setPayLinkOpen(false); setCart([]); setAppliedDiscount(null); setOpenTicketId(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets') }}
+                onSent={()=>{ setPayLinkOpen(false); abandonPendingIntent(); setCart([]); setAppliedDiscount(null); setOpenTicketId(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets') }}
               />
             )}
           </div>
@@ -1157,7 +1281,14 @@ export function POSPage() {
 
       {tab==='paylinks' && <PayLinksTab propertyId={registerProperty} />}
 
-      {tab==='history' && !!registerProperty && (
+      {tab==='history' && !!registerProperty && (<>
+        {historyCustomer && (
+          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,fontSize:'.8rem'}}>
+            <span style={{color:'var(--text-3)'}}>Showing purchases by</span><strong>{historyCustomer.name}</strong>
+            <button className="btn btn-ghost btn-sm" onClick={()=>setHistoryCustomer(null)}>Show everyone</button>
+          </div>
+        )}
+        
         <div className="card" style={{padding:0}}>
           {txLoading?<div style={{padding:32,textAlign:'center',color:'var(--text-3)'}}>Loading...</div>:(
             <table className="data-table">
@@ -1195,7 +1326,7 @@ export function POSPage() {
                     {Number(t.taxAmount)>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--text-3)'}}><span>Tax</span><span className="mono">{fmt(t.taxAmount)}</span></div>}
                     {Number(t.surcharge)>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--text-3)'}}><span>Card fee</span><span className="mono">{fmt(t.surcharge)}</span></div>}
                     <div style={{display:'flex',justifyContent:'space-between',color:'var(--text-3)'}}>
-                      <span>{TENDER_LABEL[t.tender||t.paymentMethod]||humanize(t.paymentMethod)}{t.tenantName?` · ${t.tenantName}`:''} · {new Date(t.createdAt).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</span>
+                      <span>{TENDER_LABEL[t.tender||t.paymentMethod]||humanize(t.paymentMethod)}{t.tenantName?` · ${t.tenantName}`:t.customerName?` · ${t.customerName}`:''} · {new Date(t.createdAt).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</span>
                       <span className="mono" style={{fontWeight:700,color:'var(--text-0)'}}>{fmt(t.total)}</span>
                     </div>
                   </div>
@@ -1205,7 +1336,7 @@ export function POSPage() {
             </table>
           )}
         </div>
-      )}
+      </>)}
 
       {tab==='items' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>

@@ -366,6 +366,7 @@ export async function cleanupAllSchema(): Promise<void> {
   // landlords; no children to cascade.
   await db.query(`DELETE FROM pos_terminal_readers`)
   await db.query(`DELETE FROM pos_customer_invitations`)
+  await db.query(`DELETE FROM pos_customer_cards`)   // S654: cards → customers
   await db.query(`DELETE FROM pos_customers`)
   // S348: maintenance-portal tables — all FK landlords with RESTRICT.
   // purchase_requests FKs maintenance_requests via work_order_id (already

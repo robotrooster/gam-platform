@@ -73,7 +73,7 @@ interface PendingInvoice {
 }
 
 /** The same plain-English labeling the landlord's balance reminder uses. */
-function labelFor(row: { type: string; notes: string | null }): string {
+export function labelFor(row: { type: string; notes: string | null }): string {
   const note = String(row.notes ?? '').split(' — ')[0].trim()
   if (row.type === 'rent') return 'Rent'
   if (row.type === 'utility') return note || 'Utilities'

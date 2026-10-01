@@ -582,7 +582,7 @@ function CheckoutModal({
         while (Date.now() < deadline) {
           await new Promise(r => setTimeout(r, 1600))
           if (chargeAbortRef.current) {
-            await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, {}).catch(() => {})
+            await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, { stripeReaderId: readerId }).catch(() => {})
             setCharging(null); setSubmitting(false); return
           }
           const st = await apiGet<any>(`/business-pos/terminal/payment-intents/${piId}`)
@@ -597,10 +597,10 @@ function CheckoutModal({
             setErr('Payment was canceled at the reader'); setCharging(null); setSubmitting(false); return
           }
         }
-        await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, {}).catch(() => {})
+        await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, { stripeReaderId: readerId }).catch(() => {})
         setErr('Reader timed out — no card was presented'); setCharging(null); setSubmitting(false)
       } catch (e: any) {
-        if (piId) await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, {}).catch(() => {})
+        if (piId) await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, { stripeReaderId: readerId }).catch(() => {})
         setErr(e?.response?.data?.error || 'Card charge failed'); setCharging(null); setSubmitting(false)
       }
       return

@@ -1390,10 +1390,8 @@ paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment')
 // exactly like Pay Now (2a). The card fee is the customer's at the same rate as
 // online (3). Nothing is booked until the reader has approved the card — a
 // decline or a walk-away leaves the ledger untouched.
-import {
-  createRentReaderPaymentIntent, processPaymentIntentOnReader,
-  retrieveTerminalPaymentIntent, cancelTerminalPaymentIntent,
-} from '../services/posTerminal'
+import { createRentReaderPaymentIntent, processPaymentIntentOnReader, retrieveTerminalPaymentIntent, cancelTerminalPaymentIntent, showCartOnReader, cancelReaderAction } from '../services/posTerminal'
+import { labelFor } from '../services/invoiceNotice'
 
 async function readerAnchor(req: any, paymentId: string) {
   const pmt = await queryOne<any>(
@@ -1439,8 +1437,65 @@ paymentsRouter.post('/:id/reader/charge', requirePerm('take_payment'), async (re
       amountCents: Math.round(quote.total * 100),
       cardFeeCents: Math.round(quote.cardFee * 100),
     })
-    await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId: intent.id })
+    await sendToReader(pmt, quote, intent.id, stripeReaderId)
     res.status(201).json({ success: true, data: { paymentIntentId: intent.id, ...quote } })
+  } catch (e) { next(e) }
+})
+
+// S654 (Nic): "will it show somebody's name on this screen?" — the first line
+// carries the resident and the space; then each charge by name; then the fee;
+// then the reader asks for the card.
+async function sendToReader(pmt: any, quote: Awaited<ReturnType<typeof readerQuote>>, paymentIntentId: string, stripeReaderId: string) {
+  const who = await queryOne<{ first_name: string | null; last_name: string | null; unit_number: string | null }>(
+    `SELECT u.first_name, u.last_name, un.unit_number
+       FROM payments p JOIN tenants t ON t.id = p.tenant_id JOIN users u ON u.id = t.user_id JOIN units un ON un.id = p.unit_id
+      WHERE p.id = $1`, [pmt.id])
+  const name = who ? `${who.first_name ?? ''} ${who.last_name ?? ''}`.trim() : ''
+  const lines = quote.lineItems.map((l, i) => i === 0 && name
+    ? { ...l, description: `${l.description} — ${name}${who?.unit_number ? ` (${who.unit_number})` : ''}` }
+    : l)
+  if (quote.cardFee > 0) lines.push({ description: 'Card processing fee', amountCents: Math.round(quote.cardFee * 100), quantity: 1 })
+  await showCartOnReader({ stripeReaderId, lines, taxCents: 0, totalCents: Math.round(quote.total * 100) })
+  await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId })
+}
+
+// S654 (Nic): "I don't want it to void the charge… revert back so they can try
+// again." A charge the reader timed out on, or a card it declined, is still
+// open: clear the reader, and send the SAME charge again when they are back —
+// provided the balance has not moved (a moved balance means start again).
+paymentsRouter.post('/reader/intents/:pi/clear-reader', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const { stripeReaderId } = z.object({ stripeReaderId: z.string().min(1) }).parse(req.body)
+    const pi = await ownReaderIntent(req, req.params.pi)
+    const reader = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_terminal_readers WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+      [pi.metadata?.gam_landlord_id, stripeReaderId])
+    if (!reader) throw new AppError(404, 'That reader is not paired to this company')
+    await cancelReaderAction(stripeReaderId)
+    res.json({ success: true, data: { cleared: true } })
+  } catch (e) { next(e) }
+})
+
+paymentsRouter.post('/reader/intents/:pi/resend', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const { stripeReaderId } = z.object({ stripeReaderId: z.string().min(1) }).parse(req.body)
+    const pi = await ownReaderIntent(req, req.params.pi)
+    if (pi.status !== 'requires_payment_method') {
+      throw new AppError(409, pi.status === 'requires_capture' || pi.status === 'succeeded'
+        ? 'The card was already approved — record it.'
+        : `This charge cannot be sent again (${pi.status}). Start again.`)
+    }
+    const pmt = await readerAnchor(req, String(pi.metadata?.gam_anchor_payment_id))
+    const reader = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_terminal_readers WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+      [pmt.landlord_id, stripeReaderId])
+    if (!reader) throw new AppError(404, 'That reader is not paired to this company')
+    const quote = await readerQuote(pmt)
+    if (Math.round(quote.total * 100) !== pi.amount) {
+      throw new AppError(409, 'The balance changed since this charge was created — start again.')
+    }
+    await sendToReader(pmt, quote, pi.id, stripeReaderId)
+    res.json({ success: true, data: { paymentIntentId: pi.id, ...quote } })
   } catch (e) { next(e) }
 })
 
@@ -1455,12 +1510,22 @@ async function readerQuote(pmt: any) {
     amount: 0, chargeEverything: true, dryRun: true,
     paymentMethodType: 'card_present', source: 'front_desk_reader',
   })
+  // S654 (Nic): the reader shows what the money is for — each charge by name.
+  const ids = (q.lines ?? []).map(l => l.payment_id)
+  const rows = ids.length ? await query<{ id: string; type: string; notes: string | null }>(
+    `SELECT id, type, notes FROM payments WHERE id = ANY($1)`, [ids]) : []
+  const byId = new Map(rows.map(r => [r.id, r]))
+  const lineItems = (q.lines ?? []).map(l => ({
+    description: labelFor(byId.get(l.payment_id) ?? { type: 'charge', notes: null }),
+    amountCents: Math.round(l.amount_applied * 100), quantity: 1,
+  }))
   return {
     outstanding: q.outstanding ?? 0,
     creditApplied: q.creditNetted ?? 0,
     balance: Math.round((q.chargeAmount - q.processingFee) * 100) / 100,
     cardFee: q.processingFee,
     total: q.chargeAmount,
+    lineItems,
   }
 }
 

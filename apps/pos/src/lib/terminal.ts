@@ -101,10 +101,14 @@ export async function createTerminalIntent(args: {
 export async function processIntentOnReader(args: {
   paymentIntentId: string
   stripeReaderId:  string
+  // S654: the cart, so the reader can show the lines, tax, fee and total
+  // before it asks for the card. The server re-prices it; a changed cart is refused.
+  items?: any[]
+  discountAmount?: number
 }): Promise<{ readerId: string; action: any }> {
   const res = await apiPost(
     `/pos/terminal/payment-intents/${args.paymentIntentId}/process`,
-    { stripeReaderId: args.stripeReaderId },
+    { stripeReaderId: args.stripeReaderId, items: args.items, discountAmount: args.discountAmount },
   )
   return res.data
 }
@@ -118,9 +122,16 @@ export async function captureTerminalIntent(
 
 export async function cancelTerminalIntent(
   paymentIntentId: string,
+  // S654: the reader to clear ("tap or insert" stays on screen otherwise).
+  stripeReaderId?: string,
 ): Promise<{ id: string; status: string }> {
-  const res = await apiPost(`/pos/terminal/payment-intents/${paymentIntentId}/cancel`)
+  const res = await apiPost(`/pos/terminal/payment-intents/${paymentIntentId}/cancel`, stripeReaderId ? { stripeReaderId } : {})
   return res.data
+}
+
+/** S654: clear the reader's prompt WITHOUT voiding the charge — the cart stays and Charge sends it again. */
+export async function clearReaderPrompt(paymentIntentId: string, stripeReaderId: string): Promise<void> {
+  await apiPost(`/pos/terminal/payment-intents/${paymentIntentId}/clear-reader`, { stripeReaderId })
 }
 
 export interface PiStatus {
@@ -146,7 +157,7 @@ export async function pollPiUntilTerminal(
   paymentIntentId: string,
   opts: { timeoutMs?: number; intervalMs?: number } = {},
 ): Promise<PiStatus> {
-  const timeoutMs  = opts.timeoutMs  ?? 60_000  // 60s default — customer-walk-up time
+  const timeoutMs  = opts.timeoutMs  ?? 180_000  // S654: three minutes — a card dug out of a wallet at the counter; then the reader is cleared
   const intervalMs = opts.intervalMs ?? 2_000
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {

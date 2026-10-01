@@ -276,6 +276,46 @@ None is the default. They should not be merged in any way." (memory
   chosen (the server answers "choose which company" — fine, but the button
   could disable). Admin/business/pm-company portals untouched.
 
+## Night: the reader's screen, the charge that survives, the customer base
+
+- **Reader screen (Nic): name + breakdown.** Before the reader asks for the
+  card it shows a cart: at the desk "Rent — Selene Arvizu (RV 39)", each
+  charge by name, "Card processing fee", total; at the register each item
+  with quantity, tax, card fee, total. Server-priced (`showCartOnReader` in
+  posTerminal.ts; the register's /process re-prices the cart and refuses a
+  changed one with 409).
+- **Timeout keeps the charge (Nic: "I don't want it to void the charge").**
+  A timed-out / declined / canceled prompt is CLEARED off the reader
+  (`cancelReaderAction`, via `/clear-reader` routes); the charge and the cart
+  stay; "Charge" / "Send again" puts the same charge back (`/resend` at the
+  desk re-checks the balance; the register's /process re-checks the cart).
+  Voided only when the cart changes or the sale is abandoned. Wait is 3 min.
+  Live: Nic's stuck "$4.19 — tap or insert" was cleared by hand (cancel_action)
+  while this shipped.
+- **Customer base from the card (Nic's answers).** The CARD is the customer
+  (Stripe fingerprint; `pos_customer_cards`, migration 20261001150000; email
+  on pos_customers now nullable; `created_from`). The printed name is the
+  record (`nameFromCard`). After a card sale the READER asks — the customer's
+  own screen, their own finger — "Save this card for next time?" (Yes / No
+  thanks) and, optionally, an email for the receipt (Stripe `collect_inputs`,
+  called over REST because SDK 14.25 predates it). Yes attaches the tap's
+  `generated_card` (no second authorization — verified in Stripe's docs:
+  "A successful card_present payment returns a reusable card PaymentMethod in
+  the generated_card attribute"; only the SetupIntent "save without charging"
+  path would cost one). A typed email becomes the customer's and the receipt
+  goes out (`emailReceiptForSale`; the clerk can also send it from the receipt
+  panel). Second card = separate record (Nic: leave them separate). Receipt
+  panel: "Customer: Jane Doe · card ending 4242 · new customer / N previous
+  purchases" + History (history filters by customer, names the customer).
+  "+ New customer" at the register for cash people; a picked customer rides on
+  every sale.
+- **To confirm on the first live tap:** that `latest_charge.payment_method_details
+  .card_present.generated_card` is present on a plain register charge (Stripe's
+  page recommends `setup_future_usage` at intent creation; if the live charge
+  shows none, set it on register intents and update `allow_redisplay` on Yes).
+  And that `collect_inputs` is accepted on the S710 under the account's API
+  version (the prompt is best-effort: a reader that cannot prompt just doesn't).
+
 ## Still open
 
 - **Lots 22 and 24 are marked OUT OF SERVICE** (9/30, by the run's stuck-meter

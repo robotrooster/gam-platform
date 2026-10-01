@@ -26,6 +26,7 @@
 
 import { getStripe } from '../lib/stripe'
 import { query, queryOne } from '../db'
+import { logger } from '../lib/logger'
 import { AppError } from '../middleware/errorHandler'
 import type Stripe from 'stripe'
 
@@ -319,6 +320,14 @@ export async function retrieveTerminalPaymentIntent(opts: {
   return stripe.paymentIntents.retrieve(opts.paymentIntentId)
 }
 
+/** S654: the same, with the charge expanded — the card's fingerprint, printed name, last4 and reusable card ride on it. */
+export async function retrieveTerminalPaymentIntentWithCharge(opts: {
+  paymentIntentId:          string
+}): Promise<Stripe.PaymentIntent> {
+  const stripe = getStripe()
+  return stripe.paymentIntents.retrieve(opts.paymentIntentId, { expand: ['latest_charge'] })
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // S536 (Nic): BUSINESS-scope Terminal — the POS portal is the front
 // counter for businesses too, and "swiping the card or tap completes
@@ -467,4 +476,47 @@ export async function captureBusinessPI(paymentIntentId: string): Promise<Stripe
 }
 export async function cancelBusinessPI(paymentIntentId: string): Promise<Stripe.PaymentIntent> {
   return getStripe().paymentIntents.cancel(paymentIntentId)
+}
+
+/**
+ * S654 (Nic, live): "the screen is still showing tap or insert" after the
+ * register gave up. Canceling the PaymentIntent does not clear the reader; the
+ * reader's own in-progress action must be canceled too. Best-effort: a reader
+ * with nothing in progress answers with an error we do not care about.
+ */
+export async function cancelReaderAction(stripeReaderId: string): Promise<void> {
+  try {
+    await getStripe().terminal.readers.cancelAction(stripeReaderId)
+  } catch (e) {
+    logger.warn({ err: e, stripeReaderId }, '[terminal] cancelAction')
+  }
+}
+
+export interface ReaderCartLine { description: string; amountCents: number; quantity: number }
+
+/**
+ * S654 (Nic): "it'd be nice to see on the screen a little bit of a breakdown."
+ * The reader shows the lines, the tax, the card fee and the total before it
+ * asks for the card. Best-effort — a display that fails never stops a sale.
+ */
+export async function showCartOnReader(opts: {
+  stripeReaderId: string; lines: ReaderCartLine[]; taxCents: number; totalCents: number
+}): Promise<void> {
+  try {
+    await getStripe().terminal.readers.setReaderDisplay(opts.stripeReaderId, {
+      type: 'cart',
+      cart: {
+        currency: 'usd',
+        line_items: opts.lines.slice(0, 40).map(l => ({
+          description: String(l.description).slice(0, 60),
+          amount:      Math.max(0, Math.round(l.amountCents)),
+          quantity:    Math.max(1, Math.round(l.quantity)),
+        })),
+        tax:   Math.max(0, Math.round(opts.taxCents)),
+        total: Math.max(0, Math.round(opts.totalCents)),
+      },
+    })
+  } catch (e) {
+    logger.warn({ err: e, stripeReaderId: opts.stripeReaderId }, '[terminal] setReaderDisplay')
+  }
 }

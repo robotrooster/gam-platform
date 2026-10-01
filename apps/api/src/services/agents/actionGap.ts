@@ -50,6 +50,16 @@ const DELIBERATE = new Map(Object.entries({
     'books and captures a card the reader has approved — the second half of the same on-screen flow, nothing to say out loud.',
   'payments POST /reader/intents/:pi/cancel':
     'clears the reader\'s screen and releases the hold on a card — the escape hatch of the same on-screen flow.',
+  'payments POST /reader/intents/:pi/clear-reader':
+    'takes the prompt off the reader without voiding the charge — the same on-screen flow\'s "they stepped away" button.',
+  'payments POST /reader/intents/:pi/resend':
+    'puts a kept charge back on the reader when the customer is back — the same on-screen flow.',
+  'pos POST /terminal/payment-intents/:id/clear-reader':
+    'takes a sale\'s prompt off the register\'s reader without voiding the charge. Part of ringing a card sale at the register, where the reader and the cart are on screen.',
+  'pos POST /terminal/readers/:stripeReaderId/cancel-action':
+    'takes whatever is on a reader\'s screen off it. A register-side control for the reader at the counter.',
+  'pos POST /transactions/:id/email-receipt':
+    'emails a receipt for a sale the register just rang up, to an address typed at the counter — a misheard address sends someone\'s purchase to a stranger.',
   // ── S648: register pay links ──────────────────────────────────────────────
   // A pay link is a register cart sent as a card charge to someone's inbox. The
   // amount is whatever the desk rang up, and the email goes to an address typed

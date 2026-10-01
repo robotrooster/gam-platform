@@ -8,15 +8,11 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { calculateCartTax, computeCartTotals, aggregateCartTotals, effectiveItemTaxes } from '../services/posTax'
-import {
-  createConnectionToken, registerReader, listReaders, archiveReader,
-  createCardPresentPaymentIntent, processPaymentIntentOnReader,
-  captureTerminalPaymentIntent, cancelTerminalPaymentIntent,
-  retrieveTerminalPaymentIntent,
-} from '../services/posTerminal'
+import { createConnectionToken, registerReader, listReaders, archiveReader, createCardPresentPaymentIntent, processPaymentIntentOnReader, captureTerminalPaymentIntent, cancelTerminalPaymentIntent, retrieveTerminalPaymentIntent, cancelReaderAction, showCartOnReader, retrieveTerminalPaymentIntentWithCharge } from '../services/posTerminal'
 import crypto from 'crypto'
 import { logger } from '../lib/logger'
 import { resolveLandlordTarget, ownsLandlord, landlordScopeIds } from '../lib/landlordScope'
+import { cardIdentityFromIntent, findOrCreateCustomerForCard, startSaveCardPrompt, readSaveCardAnswer, saveCardForCustomer, type CardIdentity, type CardCustomer } from '../services/posCustomerCards'
 
 export const posRouter = Router()
 posRouter.use(requireAuth)
@@ -1077,6 +1073,12 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // S648 (Nic): every card dollar goes through GAM — a card sale is only
     // ever one the reader charged on GAM's account.
     let captureOnCommit: string | null = null
+    // S654 (Nic): a card at the register builds the customer base. The sale's
+    // customer is whoever the cashier picked; failing that, the card's own.
+    const saleReaderId: string | null = typeof req.body?.stripeReaderId === 'string' ? req.body.stripeReaderId : null
+    let saleCustomerId: string | null = posCustomerId || null
+    let cardIdentity: CardIdentity | null = null
+    let cardCustomer: CardCustomer | null = null
     if (paymentMethod === 'card' && !stripePaymentIntentId) {
       throw new AppError(400, 'Card sales go through the card reader')
     }
@@ -1114,7 +1116,8 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       cardOnFileLabel = [card.brand, card.last4].filter(Boolean).join(' ••••') || null
     }
     if (paymentMethod === 'card' && stripePaymentIntentId) {
-      const intent = await retrieveTerminalPaymentIntent({ paymentIntentId: stripePaymentIntentId })
+      const intent = await retrieveTerminalPaymentIntentWithCharge({ paymentIntentId: stripePaymentIntentId })
+      cardIdentity = cardIdentityFromIntent(intent)
       if (intent.metadata?.gam_purpose !== 'pos_terminal') {
         throw new AppError(400, 'PaymentIntent is not a POS terminal sale')
       }
@@ -1149,6 +1152,12 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     try {
       await client.query('BEGIN')
       txnOpen = true
+      // S654 (Nic): the CARD is the customer — same card next time, same
+      // person and their history; the printed name is the record's name.
+      if (cardIdentity && !tenantId && !saleCustomerId) {
+        cardCustomer = await findOrCreateCustomerForCard(client, { landlordId: posLandlordId(req), card: cardIdentity })
+        saleCustomerId = cardCustomer.customerId
+      }
 
       // S652: a ticket is CLAIMED inside the sale's own transaction, and only
       // if it is still open. Two drivers opening the same ticket on two phones
@@ -1170,7 +1179,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         // a sale exactly the way the counter does.
         const sale = await insertPosSale(client, {
           landlordId: posLandlordId(req), propertyId: propertyId || null, cashierId: req.user!.userId,
-          paymentMethod, tenantId, posCustomerId, subtotal, taxAmount, surcharge: surchargeAmt, total,
+          paymentMethod, tenantId, posCustomerId: saleCustomerId, subtotal, taxAmount, surcharge: surchargeAmt, total,
           changeGiven, platformFee, stripePaymentIntentId: stripePaymentIntentId ?? cardOnFileIntentId,
           discountAmount: discountAmt, discountReason,
           ...(paymentMethod === 'card' || paymentMethod === 'card_on_file'
@@ -1291,7 +1300,28 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
 
       // S651: hand the booking back so the register can print it on the
       // receipt and show the cashier which site and dates they just sold.
-      res.status(201).json({ success: true, data: { ...tx, stayBooking } })
+      // S654 (Nic): after the payment the reader asks the customer — on its own
+      // screen, by their own finger — whether to keep the card for next time.
+      // One tap, one authorization: the reusable card came with the payment;
+      // keeping it is an attach, not a second charge.
+      let customerOut: any = null
+      if (saleCustomerId) {
+        const c = await queryOne<any>(`SELECT id, first_name, last_name, email FROM pos_customers WHERE id = $1`, [saleCustomerId])
+        const prior = await queryOne<{ n: string }>(
+          `SELECT COUNT(*)::text AS n FROM pos_transactions WHERE pos_customer_id = $1 AND id <> $2`, [saleCustomerId, tx.id])
+        let prompting = false
+        if (cardCustomer && cardIdentity?.generatedCard && !cardCustomer.cardSaved && saleReaderId
+            && await assertReaderBelongsToLandlord(posLandlordId(req), saleReaderId)) {
+          prompting = await startSaveCardPrompt(saleReaderId)
+        }
+        customerOut = c ? {
+          id: c.id, firstName: c.first_name, lastName: c.last_name, email: c.email,
+          last4: cardIdentity?.last4 ?? null, brand: cardIdentity?.brand ?? null,
+          isNew: cardCustomer?.isNew ?? false, priorPurchases: Number(prior?.n ?? 0),
+          cardSaved: cardCustomer?.cardSaved ?? false, prompting, readerId: prompting ? saleReaderId : null,
+        } : null
+      }
+      res.status(201).json({ success: true, data: { ...tx, stayBooking, customer: customerOut } })
     } catch (e) {
       if (txnOpen) await client.query('ROLLBACK').catch(() => {})
       throw e
@@ -2007,9 +2037,13 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
     const txProp = req.query.propertyId ? String(req.query.propertyId) : null
     const txParams: any[] = [posLandlordId(req)]
     const txPropFilter = txProp ? `AND t.property_id = $${txParams.push(txProp)}` : ''
+    // S654 (Nic): a customer's purchase history — the receipt panel links here.
+    const txCust = req.query.posCustomerId ? String(req.query.posCustomerId) : null
+    const txCustFilter = txCust ? `AND t.pos_customer_id = $${txParams.push(txCust)}` : ''
     const txns = await query<any>(`
       SELECT t.*,
         u.first_name || ' ' || u.last_name AS tenant_name,
+        NULLIF(TRIM(pc.first_name || ' ' || pc.last_name), '') AS customer_name,
         (SELECT COUNT(*) FROM pos_transaction_items WHERE transaction_id=t.id) as item_count,
         -- S653 (Nic): "flag the history different for pay links vs terminal
         -- reader." payment_method says card either way; how the card was
@@ -2027,7 +2061,8 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
       FROM pos_transactions t
       LEFT JOIN tenants tn ON tn.id = t.tenant_id
       LEFT JOIN users u ON u.id = tn.user_id
-      WHERE t.landlord_id=$1 ${txPropFilter}
+      LEFT JOIN pos_customers pc ON pc.id = t.pos_customer_id
+      WHERE t.landlord_id=$1 ${txPropFilter} ${txCustFilter}
       ORDER BY t.created_at DESC LIMIT 100`, txParams)
     res.json({ success: true, data: txns })
   } catch (e) { next(e) }
@@ -2486,9 +2521,26 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
     const { stripeReaderId } = req.body
     if (!stripeReaderId) throw new AppError(400, 'stripeReaderId is required')
 
-    const { landlordId } = await ownTerminalIntent(req, paymentIntentId)
+    const { landlordId, propertyId, intent } = await ownTerminalIntent(req, paymentIntentId)
     const ownerRow = await assertReaderBelongsToLandlord(landlordId, stripeReaderId)
     if (!ownerRow) throw new AppError(404, 'That reader is not paired to the company this sale belongs to')
+    // S654 (Nic): "it'd be nice to see a little bit of a breakdown." The reader
+    // shows the lines, tax, card fee and total before it asks for the card —
+    // priced by the server from the same cart (a changed cart is refused),
+    // never from figures the register typed.
+    const { items, discountAmount } = req.body
+    if (Array.isArray(items) && items.length) {
+      const quoted = await serverCartTotals(landlordId, items, 'card', discountAmount, undefined, propertyId)
+      if (Math.round(quoted.total * 100) !== intent.amount) {
+        throw new AppError(409, 'The cart changed since this card charge was created — start the charge again.')
+      }
+      const lines = items.filter((it: any) => Number(it.qty) > 0).map((it: any) => ({
+        description: `${String(it.name ?? 'Item')}${Number(it.qty) > 1 ? ` ×${Number(it.qty)}` : ''}`,
+        amountCents: Math.round(Number(it.qty) * Number(it.price) * 100), quantity: 1,
+      }))
+      if (quoted.surcharge > 0) lines.push({ description: 'Card processing fee', amountCents: Math.round(quoted.surcharge * 100), quantity: 1 })
+      await showCartOnReader({ stripeReaderId, lines, taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents: intent.amount })
+    }
     const reader = await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId })
     res.json({
       success: true,
@@ -2518,11 +2570,137 @@ posRouter.post('/terminal/payment-intents/:id/capture', requirePerm('pos.ring_sa
 posRouter.post('/terminal/payment-intents/:id/cancel', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const paymentIntentId = req.params.id
-    await ownTerminalIntent(req, paymentIntentId)
+    const { landlordId } = await ownTerminalIntent(req, paymentIntentId)
+    // S654 (Nic, live): "the screen is still showing tap or insert." Canceling
+    // the charge does not clear the reader; its own action is canceled too —
+    // for a reader paired to this company only.
+    const readerId = typeof req.body?.stripeReaderId === 'string' ? req.body.stripeReaderId : null
+    if (readerId && await assertReaderBelongsToLandlord(landlordId, readerId)) await cancelReaderAction(readerId)
     const intent = await cancelTerminalPaymentIntent({ paymentIntentId })
     res.json({ success: true, data: { id: intent.id, status: intent.status } })
   } catch (e) { next(e) }
 })
+
+// S654 (Nic): "I don't want it to void the charge. I want it to revert back
+// to the cart so they can try again." A reader that timed out, declined, or was
+// canceled is CLEARED; the charge and the cart stay, and the register sends
+// the same charge again when the customer is back. /cancel (the void) is for
+// a sale that is abandoned or whose cart changed.
+posRouter.post('/terminal/payment-intents/:id/clear-reader', requirePerm('pos.ring_sale'), async (req, res, next) => {
+  try {
+    const { landlordId } = await ownTerminalIntent(req, req.params.id)
+    const readerId = typeof req.body?.stripeReaderId === 'string' ? req.body.stripeReaderId : ''
+    if (!readerId || !(await assertReaderBelongsToLandlord(landlordId, readerId))) {
+      throw new AppError(404, 'That reader is not paired to the company this sale belongs to')
+    }
+    await cancelReaderAction(readerId)
+    res.json({ success: true, data: { cleared: true } })
+  } catch (e) { next(e) }
+})
+
+// S654 (Nic): the customer's answer on the reader — "Save this card for next
+// time?" — and the clerk's way to take the question back off the screen.
+async function ownedReaderByStripeId(req: any, stripeReaderId: string): Promise<{ landlord_id: string }> {
+  const reader = await queryOne<{ landlord_id: string }>(
+    `SELECT landlord_id FROM pos_terminal_readers
+      WHERE stripe_reader_id = $1 AND landlord_id = ANY($2::uuid[]) AND status = 'active'`,
+    [stripeReaderId, landlordScopeIds(req.user)])
+  if (!reader) throw new AppError(404, 'Reader not found')
+  return reader
+}
+
+posRouter.get('/terminal/readers/:stripeReaderId/save-card-answer', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const stripeReaderId = String(req.params.stripeReaderId)
+    const reader = await ownedReaderByStripeId(req, stripeReaderId)
+    const tx = await queryOne<any>(
+      `SELECT id, pos_customer_id, stripe_payment_intent_id FROM pos_transactions WHERE id = $1 AND landlord_id = $2`,
+      [String(req.query.transactionId ?? ''), reader.landlord_id])
+    if (!tx || !tx.pos_customer_id || !tx.stripe_payment_intent_id) throw new AppError(404, 'Sale not found')
+    const answer = await readSaveCardAnswer(stripeReaderId)
+    if (!answer.answered) return res.json({ success: true, data: { answered: false } })
+    let saved = false, reason: string | null = answer.reason ?? null
+    if (answer.yes) {
+      const pi = await retrieveTerminalPaymentIntentWithCharge({ paymentIntentId: tx.stripe_payment_intent_id })
+      const card = cardIdentityFromIntent(pi)
+      if (card?.generatedCard) {
+        await saveCardForCustomer({ landlordId: reader.landlord_id, customerId: tx.pos_customer_id, generatedCard: card.generatedCard, fingerprint: card.fingerprint })
+        saved = true
+      } else reason = 'the card could not be kept'
+    }
+    // An email typed on the reader is the customer's: kept when we had none, and the receipt goes out.
+    let receiptSentTo: string | null = null
+    if (answer.email) {
+      receiptSentTo = await emailReceiptForSale(tx.id, answer.email, [reader.landlord_id])
+    }
+    res.json({ success: true, data: { answered: true, saved, reason, receiptSentTo } })
+  } catch (e) { next(e) }
+})
+
+posRouter.post('/terminal/readers/:stripeReaderId/cancel-action', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const stripeReaderId = String(req.params.stripeReaderId)
+    await ownedReaderByStripeId(req, stripeReaderId)
+    await cancelReaderAction(stripeReaderId)
+    res.json({ success: true, data: { cleared: true } })
+  } catch (e) { next(e) }
+})
+
+// S654 (Nic): "most people… are going to provide their email for an email copy
+// of the receipt." The receipt carries the customer's name; the email given
+// becomes the customer's when we had none.
+posRouter.post('/transactions/:id/email-receipt', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const email = String(req.body?.email ?? '').trim().toLowerCase()
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new AppError(400, 'Enter a valid email address')
+    const sentTo = await emailReceiptForSale(String(req.params.id), email, landlordScopeIds(req.user))
+    res.json({ success: true, data: { sentTo } })
+  } catch (e) { next(e) }
+})
+
+async function emailReceiptForSale(transactionId: string, email: string, landlordIds: string[]): Promise<string> {
+  {
+    const tx = await queryOne<any>(
+      `SELECT t.*, p.name AS property_name, p.street1, p.street2, p.city, p.state, p.zip, l.business_name,
+              pc.first_name AS c_first, pc.last_name AS c_last, pc.email AS c_email, pc.phone AS c_phone,
+              u.first_name AS t_first, u.last_name AS t_last, u.email AS t_email
+         FROM pos_transactions t
+         JOIN landlords l ON l.id = t.landlord_id
+         LEFT JOIN properties p ON p.id = t.property_id
+         LEFT JOIN pos_customers pc ON pc.id = t.pos_customer_id
+         LEFT JOIN tenants tn ON tn.id = t.tenant_id
+         LEFT JOIN users u ON u.id = tn.user_id
+        WHERE t.id = $1 AND t.landlord_id = ANY($2::uuid[])`,
+      [transactionId, landlordIds])
+    if (!tx) throw new AppError(404, 'Sale not found')
+    const items = await query<any>(
+      `SELECT item_name, qty, unit_price, subtotal FROM pos_transaction_items WHERE transaction_id = $1 ORDER BY created_at`, [tx.id])
+    const lines = items.map(l => ({ description: String(l.item_name), quantity: Number(l.qty), unitPrice: Number(l.unit_price), lineTotal: Number(l.subtotal) }))
+    if (Number(tx.surcharge) > 0) lines.push({ description: 'Card processing fee', quantity: 1, unitPrice: Number(tx.surcharge), lineTotal: Number(tx.surcharge) })
+    const receiptNumber = String(tx.id).slice(0, 8).toUpperCase()
+    const { renderPosReceiptPdf } = await import('../services/businessPdf')
+    const buffer = await renderPosReceiptPdf({
+      business: { name: tx.property_name || tx.business_name || 'Register', email: null, phone: null,
+                  street1: tx.street1 ?? null, street2: tx.street2 ?? null, city: tx.city ?? null, state: tx.state ?? null, zip: tx.zip ?? null },
+      customer: (tx.c_first || tx.t_first) ? {
+        firstName: tx.c_first ?? tx.t_first, lastName: tx.c_last ?? tx.t_last, companyName: null,
+        email: tx.c_email ?? tx.t_email ?? email, phone: tx.c_phone ?? null, street1: null, city: null, state: null, zip: null,
+      } : null,
+      receiptNumber, createdAt: tx.created_at, status: String(tx.status), paymentMethod: String(tx.payment_method),
+      amountTendered: null, changeDue: Number(tx.change_given) > 0 ? Number(tx.change_given) : null, refundReason: null,
+      lines,
+      subtotal: Math.round((Number(tx.subtotal) + Number(tx.surcharge || 0)) * 100) / 100,
+      discountAmount: Number(tx.discount_amount || 0), taxAmount: Number(tx.tax_amount || 0), tipAmount: 0, totalAmount: Number(tx.total),
+    } as any)
+    const { emailPosReceipt } = await import('../services/email')
+    await emailPosReceipt(email, tx.property_name || tx.business_name || 'GAM', receiptNumber, Number(tx.total), buffer,
+      { relatedEntityType: 'pos_transaction', relatedEntityId: tx.id } as any)
+    if (tx.pos_customer_id && !tx.c_email) {
+      await query(`UPDATE pos_customers SET email = $1, updated_at = NOW() WHERE id = $2`, [email, tx.pos_customer_id])
+    }
+    return email
+  }
+}
 
 // ── S263: POS sessions (server-of-record cart state) ──────────────────────
 //

@@ -402,6 +402,9 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, onDone }: {
   const [err, setErr] = useState<string | null>(null)
   const attempt = useRef(0)
   const livePi = useRef<string | null>(null)
+  // S654 (Nic): a timed-out or declined charge is kept, not voided — "Send
+  // again" puts the same charge back on the reader when they are ready.
+  const [canResend, setCanResend] = useState(false)
   const readerRef = useRef(readerId); readerRef.current = readerId
   useEffect(() => () => {
     attempt.current++
@@ -415,12 +418,26 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, onDone }: {
     setErr(null); setStage('sending')
     let piId: string | null = null
     try {
-      const r: any = await apiPost(`/payments/${anchor.id}/reader/charge`, { stripeReaderId: readerId })
-      piId = r.data.paymentIntentId
+      let resent = false
+      if (canResend && livePi.current) {
+        try {
+          const again: any = await apiPost(`/payments/reader/intents/${livePi.current}/resend`, { stripeReaderId: readerId })
+          piId = again.data.paymentIntentId; resent = true
+        } catch (e: any) {
+          const m = String(e?.response?.data?.error || '')
+          if (/already approved/i.test(m)) { piId = livePi.current; resent = true }   // the tap landed after all — record it
+          else { apiPost(`/payments/reader/intents/${livePi.current}/cancel`, { stripeReaderId: readerId }).catch(() => {}); livePi.current = null }
+        }
+      }
+      if (!resent) {
+        const r: any = await apiPost(`/payments/${anchor.id}/reader/charge`, { stripeReaderId: readerId })
+        piId = r.data.paymentIntentId
+      }
+      setCanResend(false)
       if (!live()) { apiPost(`/payments/reader/intents/${piId}/cancel`, { stripeReaderId: readerId }).catch(() => {}); return }
       livePi.current = piId
       setStage('waiting')
-      const deadline = Date.now() + 90_000
+      const deadline = Date.now() + 180_000   // S654: three minutes at the counter, then the reader is cleared
       let st: any = null
       while (Date.now() < deadline) {
         st = await apiGet<any>(`/payments/reader/intents/${piId}`)
@@ -442,16 +459,24 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, onDone }: {
       onDone(Number(result.data.total ?? quote?.total ?? 0))
     } catch (e: any) {
       if (!live()) return
-      setErr(e?.response?.data?.error || e?.message || 'The reader did not complete the payment')
+      const msg = e?.response?.data?.error || e?.message || 'The reader did not complete the payment'
       setStage('idle')
-      if (piId) { livePi.current = null; await apiPost(`/payments/reader/intents/${piId}/cancel`, { stripeReaderId: readerId }).catch(() => {}) }
+      if (piId) {
+        // S654 (Nic): clear the reader; keep the charge. "Send again" resends it.
+        await apiPost(`/payments/reader/intents/${piId}/clear-reader`, { stripeReaderId: readerId }).catch(() => {})
+        livePi.current = piId; setCanResend(true)
+        setErr(/timed out/i.test(msg) ? 'No card was presented. Send it to the reader again when they are ready.' : `${msg} — send again to try another card.`)
+      } else {
+        setErr(msg)
+      }
     }
   }
   const cancel = async () => {
     attempt.current++
-    const pi = livePi.current; livePi.current = null
-    if (pi) await apiPost(`/payments/reader/intents/${pi}/cancel`, { stripeReaderId: readerId }).catch(() => {})
-    setStage('idle'); setErr('Canceled.')
+    const pi = livePi.current
+    if (pi) await apiPost(`/payments/reader/intents/${pi}/clear-reader`, { stripeReaderId: readerId }).catch(() => {})
+    setCanResend(!!pi)
+    setStage('idle'); setErr(pi ? 'Cleared from the reader. Send again when they are ready.' : 'Canceled.')
   }
   const busy = stage === 'sending' || stage === 'waiting' || stage === 'capturing'
   return (
@@ -482,7 +507,7 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, onDone }: {
           <button className="btn btn-ghost" style={{ width: '100%' }} disabled={stage === 'capturing'} onClick={cancel}>Cancel on the reader</button>
         ) : stage !== 'done' && (
           <button className="btn btn-primary" style={{ width: '100%' }} disabled={!quote || !readerId} onClick={send}>
-            Send {quote ? fmt(Number(quote.total)) : ''} to the reader
+            {canResend ? 'Send again to the reader' : `Send ${quote ? fmt(Number(quote.total)) : ''} to the reader`}
           </button>
         )}
       </div>

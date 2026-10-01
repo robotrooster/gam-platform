@@ -629,6 +629,13 @@ businessPosRouter.post('/terminal/payment-intents/:id/cancel', requireAuth, asyn
     const { retrieveBusinessPI, cancelBusinessPI } = await import('../services/posTerminal')
     const intent = await retrieveBusinessPI(req.params.id)
     if (intent.metadata?.gam_business_id !== businessId) throw new AppError(404, 'Payment not found')
+    // S654: clear the reader's "tap or insert" too — a reader of this business only.
+    const readerId = typeof req.body?.stripeReaderId === 'string' ? req.body.stripeReaderId : null
+    if (readerId) {
+      const own = await queryOne<{ id: string }>(
+        `SELECT id FROM business_terminal_readers WHERE business_id = $1 AND stripe_reader_id = $2`, [businessId, readerId])
+      if (own) { const { cancelReaderAction } = await import('../services/posTerminal'); await cancelReaderAction(readerId) }
+    }
     const canceled = await cancelBusinessPI(intent.id)
     res.json({ success: true, data: { id: canceled.id, status: canceled.status } })
   } catch (e) { next(e) }
