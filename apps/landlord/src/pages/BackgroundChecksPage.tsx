@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery } from 'react-query'
 import { humanize } from '@gam/shared'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
@@ -27,7 +28,7 @@ export function BackgroundChecksPage() {
   // S653 (Nic): "the main background checks page is only showing people that
   // need attention." The API says which list a row is on (bucket); denied,
   // housed, expired and cancelled sit behind the Past tab, searchable.
-  const [tab, setTab] = useState<'attention' | 'past'>('attention')
+  const [tab, setTab] = useUrlTab('tab', 'attention', ['attention','past'] as const)
   const [q, setQ] = useState('')
   const term = q.trim().toLowerCase()
   const attention = (checks as any[]).filter(c => c.bucket !== 'past')

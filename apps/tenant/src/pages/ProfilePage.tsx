@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { User, Check, AlertCircle } from 'lucide-react'
 import { isCriticalNotificationType } from '@gam/shared'
@@ -21,7 +22,7 @@ const NOTIF_TYPES = [
 
 export function ProfilePage() {
   const qc = useQueryClient()
-  const [tab, setTab]     = useState<'profile'|'notifications'|'security'|'customize'>('profile')
+  const [tab, setTab]     = useUrlTab('tab', 'profile', ['profile','notifications','security','customize'] as const)
   const [saved, setSaved] = useState('')
   const [bio, setBio]           = useState('')
   const [accent, setAccent]     = useState('#c9a227')

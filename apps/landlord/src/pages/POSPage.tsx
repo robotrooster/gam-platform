@@ -1,4 +1,5 @@
 import { useState, useEffect, Fragment } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import type { KeyboardEvent as ReactKeyboardEvent, ClipboardEvent as ReactClipboardEvent } from 'react'
 import { useAuth } from '../context/AuthContext'
 import {
@@ -66,7 +67,7 @@ const nonNeg = { min: 0, onKeyDown: blockNeg, onPaste: blockNegPaste }
 export function POSPage() {
   const qc = useQueryClient()
   const [payLinkOpen, setPayLinkOpen] = useState(false)
-  const [tab, setTab] = useState<'register'|'history'|'paylinks'|'items'|'categories'|'taxes'|'discounts'|'vendors'|'orders'|'inventory'|'readers'>('register')
+  const [tab, setTab] = useUrlTab('tab', 'register', ['register','history','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
 
   const [cart, setCart] = useState<CartItem[]>([])
   // S651: the site + dates + guest for a stay in the cart. Held here rather

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict JWqPkBBiJMNFkh4fphTp6ASO517WME8KYDhniU28fC2mUoahJ4CFwaKVarrmdYQ
+\restrict Mx2sFUgc69UOEaO1kguqa0wmCFHzdmFnUMh7zOWBY3YOfoLka5QYmrDGtLlCFRz
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -919,21 +919,22 @@ DECLARE
   credit      numeric;
 BEGIN
   IF target_unit IS NULL THEN RETURN COALESCE(NEW, OLD); END IF;
-
   SELECT COALESCE(SUM(p.amount), 0) INTO owed
     FROM payments p
+    JOIN units u ON u.id = p.unit_id
+    JOIN properties pr ON pr.id = u.property_id
+    LEFT JOIN leases l ON l.id = p.lease_id
    WHERE p.unit_id = target_unit
      AND p.type = 'rent'
      AND p.status IN ('pending', 'failed')
      AND p.work_trade_suspended_at IS NULL
-     AND p.due_date <= NOW() - INTERVAL '5 days';
-
+     AND (NOW() AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date
+           > p.due_date + COALESCE(l.late_fee_grace_days, pr.late_fee_grace_days, 5);
   SELECT COALESCE(SUM(c.amount_remaining), 0) INTO credit
     FROM tenant_credits c
     JOIN lease_tenants lt ON lt.tenant_id = c.tenant_id AND lt.status = 'active'
     JOIN leases l ON l.id = lt.lease_id AND l.unit_id = target_unit AND l.status = 'active'
    WHERE c.status = 'active' AND c.amount_remaining > 0;
-
   IF owed - credit > 0 THEN
     UPDATE units SET status = 'delinquent', updated_at = NOW()
      WHERE id = target_unit AND status = 'active';
@@ -941,7 +942,6 @@ BEGIN
     UPDATE units SET status = 'active', updated_at = NOW()
      WHERE id = target_unit AND status = 'delinquent';
   END IF;
-
   RETURN COALESCE(NEW, OLD);
 END $$;
 
@@ -28337,5 +28337,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict JWqPkBBiJMNFkh4fphTp6ASO517WME8KYDhniU28fC2mUoahJ4CFwaKVarrmdYQ
+\unrestrict Mx2sFUgc69UOEaO1kguqa0wmCFHzdmFnUMh7zOWBY3YOfoLka5QYmrDGtLlCFRz
 

@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useMemo, useLayoutEffect } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
@@ -276,7 +277,7 @@ export function SchedulePage() {
   const qc = useQueryClient()
   const { can } = usePerms()
   const today = new Date().toISOString().split('T')[0]
-  const [view, setView] = useState<'timeline'|'list'|'units'|'history'|'reservations'|'requests'|'booking_page'>('timeline')
+  const [view, setView] = useUrlTab('view', 'timeline', ['timeline','list','units','history','reservations','requests','booking_page'] as const)
   // Perpetual calendar (S576): the window starts ~1 month back, ~5 months
   // forward, but the forward horizon EXTENDS on demand — infinite forward
   // scroll appends days as you near the right edge, and the Jump-to-date

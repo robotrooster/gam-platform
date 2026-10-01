@@ -19,6 +19,7 @@
 // phases are ordered by who is genuinely blocked. Nobody at a counter should
 // have to work out which of three screens holds today's phone calls.
 import { useState } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch } from '../lib/api'
 import { usePerms } from '../lib/permissions'
@@ -333,7 +334,7 @@ export function FrontDeskPage() {
   const { can } = usePerms()
   const canMarkLeaving = can('front_desk.mark_leaving') || can('leases.edit')
   const canSeeCalls = can('front_desk.view') || can('tenants.create')
-  const [tab, setTab] = useState<'calls' | 'moveouts' | 'emergency'>(canSeeCalls ? 'calls' : 'moveouts')
+  const [tab, setTab] = useUrlTab<'calls' | 'moveouts' | 'emergency'>('tab', canSeeCalls ? 'calls' : 'moveouts', ['calls','moveouts','emergency'])
 
   return (
     <div>

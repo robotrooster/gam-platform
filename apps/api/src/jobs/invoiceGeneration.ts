@@ -912,7 +912,8 @@ async function runGeneration(
         const startedAfter20th = DateTime
           .fromISO(lease.start_date, { zone: lease.property_tz }).day > 20
         const priorInvoice = await client.query<{ n: string }>(
-          `SELECT COUNT(*)::text AS n FROM invoices WHERE lease_id = $1 AND due_date < $2::date`,
+          // S654: a voided history invoice is not a prior bill (see lateFees.ts).
+          `SELECT COUNT(*)::text AS n FROM invoices WHERE lease_id = $1 AND due_date < $2::date AND status <> 'void'`,
           [lease.id, dueDate])
         // ── S639 (Nic): THE WAIVER FOLLOWS THE PERSON, NOT THE CALENDAR ─────
         //

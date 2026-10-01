@@ -33,6 +33,8 @@ interface DashStats {
   delinquentUnitsAccruingLateFees?: number
   /** S641: units owing ANYTHING, propane installments aside. What the card means. */
   unitsOwing?: number
+  /** S654: of those, open charges past their lease's grace period — delinquent. */
+  unitsPastGrace?: number
   totalUnits: number
   occupancyRate: number
   leasesExpiring30d: number
@@ -192,15 +194,30 @@ export function DashboardPage() {
         // banner now counts anyone owing anything, and /units?status=delinquent
         // would show two of the three — a card that disagrees with the page it
         // opens is the bug this whole pass has been about.
+        // S654 (Nic): "until a unit is actually delinquent past its grace
+        // period, I would really love for that to say outstanding units… flag a
+        // difference between outstanding and delinquent based on when the grace
+        // period ends." Outstanding = owes anything; delinquent = a charge still
+        // open after its grace period. The late-fee line is only said when a fee
+        // will actually be charged — the API reads each lease's own terms.
         <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/balances')}>
           <Clock size={16} />
-          <strong>{stats!.unitsOwing ?? stats!.delinquentUnits} delinquent unit{(stats!.unitsOwing ?? stats!.delinquentUnits) === 1 ? '' : 's'}</strong> — In cure window.{' '}
-          {/* S640 (Nic): "that's a false flag... onboarding tenants are exempt
-              from late fees." Not one of the six was accruing anything. Read
-              the state instead of asserting the consequence. */}
-          {(stats?.delinquentUnitsAccruingLateFees ?? 0) === 0
-            ? 'No late fees — first bill after onboarding is waived.'
-            : `Late fees accruing on ${stats!.delinquentUnitsAccruingLateFees} of them.`}
+          {(() => {
+            const owing = stats!.unitsOwing ?? stats!.delinquentUnits ?? 0
+            const past = stats?.unitsPastGrace ?? 0
+            const accruing = stats?.delinquentUnitsAccruingLateFees ?? 0
+            return (
+              <>
+                <strong>{owing} unit{owing === 1 ? '' : 's'} with an outstanding balance</strong>
+                {past > 0
+                  ? <> — <strong>{past} delinquent</strong> (past the grace period).{' '}</>
+                  : <> — none past the grace period yet.{' '}</>}
+                {accruing > 0
+                  ? `Late fees accruing on ${accruing}.`
+                  : past > 0 ? 'No late fees accruing.' : ''}
+              </>
+            )
+          })()}
           <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
         </div>
       )}

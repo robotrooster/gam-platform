@@ -981,19 +981,55 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
            SELECT 1 FROM v_installment_payments ip WHERE ip.payment_id = p.id)
          AND ($2::uuid IS NULL OR u.property_id = $2)`, [scopeIds, propertyFilter])
 
+    // ── S654 (Nic): OUTSTANDING IS NOT DELINQUENT ───────────────────────────
+    //
+    //   "Until a unit is actually delinquent past its grace period, I would
+    //    really love for that to say outstanding units… flag a difference
+    //    between outstanding and delinquent based on when the grace period
+    //    ends." And on the old "late fees accruing on 7": "make sure that's
+    //    accurate because I don't want it to say things that might be
+    //    misleading."
+    //
+    // It was not accurate. It counted a unit as accruing when ANY open invoice
+    // on it was not exempt — so seven residents whose waived September bill was
+    // past due were counted because their October bill (due today, not exempt)
+    // sat beside it. And every lease at both parks carries a $0 late fee, which
+    // "IS NULL" let through. Three honest numbers now, all read off open charge
+    // rows with each lease's own grace period, in the property's own day:
+    //   units_owing       — anybody who owes anything (the card's headline)
+    //   units_past_grace  — a charge still open after due date + grace
+    //   accruing_units    — past grace AND a fee will actually be charged: the
+    //                       lease's fee is on and more than $0, the invoice is
+    //                       not exempt, and the onboarding first-bill waiver
+    //                       does not apply (the same test the late-fee engine
+    //                       makes, voided history invoices excluded).
     const [delinq] = await query<any>(`
-      SELECT COUNT(DISTINCT u.id) FILTER (WHERE NOT (
-               i.late_fee_exempt
-               OR (l.is_existing_tenancy = true
-                   AND NOT EXISTS (SELECT 1 FROM invoices ip
-                                    WHERE ip.lease_id = l.id AND ip.due_date < i.due_date))
-               OR COALESCE(l.late_fee_enabled, false) = false
-               OR l.late_fee_initial_amount IS NULL))::int AS accruing_units
-        FROM units u
-        JOIN invoices i ON i.unit_id = u.id AND i.status IN ('pending', 'partial')
-        LEFT JOIN leases l ON l.id = i.lease_id
-       WHERE u.landlord_id = ANY($1) AND u.status = 'delinquent'
-         AND ($2::uuid IS NULL OR u.property_id = $2)`, [scopeIds, propertyFilter])
+      WITH open_rows AS (
+        SELECT p.unit_id, i.id AS invoice_id,
+               ((NOW() AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date
+                  > p.due_date + COALESCE(l.late_fee_grace_days, pr.late_fee_grace_days, 5)) AS past_grace,
+               (COALESCE(l.late_fee_enabled, false)
+                 AND COALESCE(l.late_fee_initial_amount, 0) > 0
+                 AND NOT COALESCE(i.late_fee_exempt, false)
+                 AND NOT (COALESCE(l.is_existing_tenancy, false)
+                          AND COALESCE(pr.onboarding_late_fee_waiver, false)
+                          AND NOT EXISTS (SELECT 1 FROM invoices ip
+                                           WHERE ip.lease_id = l.id AND ip.due_date < i.due_date
+                                             AND ip.status <> 'void'))) AS fee_reaches
+          FROM payments p
+          JOIN units u ON u.id = p.unit_id
+          JOIN properties pr ON pr.id = u.property_id
+          LEFT JOIN invoices i ON i.id = p.invoice_id
+          LEFT JOIN leases l ON l.id = p.lease_id
+         WHERE u.landlord_id = ANY($1)
+           AND p.status IN ('pending', 'failed')
+           AND p.work_trade_suspended_at IS NULL
+           AND COALESCE(p.entry_description, '') <> 'LATEFEE'
+           AND NOT EXISTS (SELECT 1 FROM v_installment_payments ip WHERE ip.payment_id = p.id)
+           AND ($2::uuid IS NULL OR u.property_id = $2))
+      SELECT COUNT(DISTINCT unit_id) FILTER (WHERE past_grace)::int AS past_grace_units,
+             COUNT(DISTINCT unit_id) FILTER (WHERE past_grace AND fee_reaches)::int AS accruing_units
+        FROM open_rows`, [scopeIds, propertyFilter])
 
     // Leases expiring soon — active leases whose end_date falls inside the next
     // 30 / 60 days. Drives the renewal-action KPI. Scoped by leases.landlord_id.
@@ -1046,6 +1082,8 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       // one the job will actually fire on.
       next_payout_date: nextPayoutDateUtc(),
       delinquent_units_accruing_late_fees: delinq?.accruing_units||0,
+      // S654: open charges past their lease's grace period — what "delinquent" means.
+      units_past_grace: delinq?.past_grace_units||0,
       // S641: units owing ANYTHING, which is what the card means by delinquent.
       units_owing: owing?.units_owing||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
       // S605: surfaced so the dashboard can say "no rent can move yet" instead

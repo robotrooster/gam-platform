@@ -5,6 +5,7 @@
 // picks scope (a unit, or the property split/common across units); auto-suggest
 // only pre-fills from what this landlord chose for the same merchant before.
 import { useMemo, useState, useEffect } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { loadStripe } from '@stripe/stripe-js'
@@ -59,7 +60,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   // and out of that bank account." The log opens on everything, newest first —
   // GAM's payouts landing included, labeled as matched so nothing is booked
   // twice. The buttons are filters over it, not separate pages.
-  const [view, setView] = useState<'all' | 'needs_review' | 'categorized' | 'ignored'>('all')
+  const [view, setView] = useUrlTab('view', 'all', ['all','needs_review','categorized','ignored'] as const)
 
   // S629 (Nic): "a property selector or entity selector, to view the
   // transaction logs and stuff specific to that entity." The feed was pinned

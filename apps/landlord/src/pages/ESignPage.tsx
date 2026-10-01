@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { Fragment, useState, useRef, useCallback, useEffect } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import SigningPackagesPanel from './SigningPackagesPanel'
 import TemplateLibrarySection from './TemplateLibrarySection'
 import TemplateSleeves, { type Sleeve } from './TemplateSleeves'
@@ -1687,7 +1688,7 @@ export function ESignPage() {
   const navigate = useNavigate()
   const qc = useQueryClient()
   const { can } = usePerms()
-  const [tab, setTab]           = useState<'documents'|'templates'|'packages'|'government'>('documents')
+  const [tab, setTab]           = useUrlTab('tab', 'documents', ['documents','templates','packages','government'] as const)
   const [editTemplate, setEditTemplate] = useState<any>(null)
   const [showSend, setShowSend] = useState(false)
   const [showStandalone, setShowStandalone] = useState(false)

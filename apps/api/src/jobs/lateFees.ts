@@ -155,8 +155,11 @@ function qualifyingInvoicesSql(rowFilter: string): string {
         AND NOT (
           COALESCE(l.is_existing_tenancy, FALSE)
           AND COALESCE(p.onboarding_late_fee_waiver, FALSE)
+          -- S654: a VOIDED history invoice (Country Acres' "billed before GAM"
+          -- rows) is not a prior bill; counting it defeated the waiver for ten
+          -- of twelve residents.
           AND NOT EXISTS (SELECT 1 FROM invoices ip
-                           WHERE ip.lease_id = l.id AND ip.due_date < i.due_date)
+                           WHERE ip.lease_id = l.id AND ip.due_date < i.due_date AND ip.status <> 'void')
         )
         AND COALESCE(l.late_fee_enabled, sa.late_fee_enabled) = true
         AND COALESCE(l.late_fee_initial_amount, sa.late_fee_initial_amount) IS NOT NULL

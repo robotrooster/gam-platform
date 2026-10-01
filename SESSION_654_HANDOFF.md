@@ -147,6 +147,42 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
   alphabetical by last name inside; folder line shows count and total. A person
   at two properties appears under each with only what they owe there.
 
+- **Dashboard banner: outstanding ≠ delinquent** (Nic). Was "51 delinquent
+  units — late fees accruing on 7". Neither was true: 51 = anyone owing
+  anything (all due today), and the 7 were waived September bills counted
+  because their October bill sat beside them; every lease at both parks carries
+  a $0 late fee. Now three live numbers off open charge rows with each lease's
+  own grace period (`routes/landlords.ts`): `units_owing`, `units_past_grace`,
+  `delinquent_units_accruing_late_fees` (past grace AND fee on AND > $0 AND not
+  exempt AND no first-bill waiver). Banner: "N units with an outstanding
+  balance — M delinquent (past the grace period). Late fees accruing on K." /
+  "none past the grace period yet". Migration `20261001120000`: the
+  `units.status='delinquent'` trigger now uses the lease's grace days instead
+  of a fixed five. `lateFees.ts` + the generator's first-bill check exclude
+  VOID history invoices (Country Acres had ten). Tests:
+  `dashboardPropertyFilter.test.ts` +2.
+- **Reload keeps the sub-tab** (Nic, clarified: pages with in-page tabs —
+  GoldSign → Documents, Master Schedule → Timeline — snapped back to the
+  default tab on reload because the tab was component state). New
+  `apps/landlord/src/lib/useUrlTab.ts` keeps the tab in the address
+  (`?view=history`, replaceState, default writes nothing, bad value → default),
+  the way PropertyDetailPage already did. Converted: SchedulePage (view),
+  ESignPage (tab), POSPage (tab), MaintenancePage (view), FrontDeskPage (tab),
+  BankPage (tab), BankFeedPage (view), BackgroundChecksPage (tab). Verified in
+  the dev build: Master Schedule → History → reload → still History. Modal and
+  form modes (lease agreement/notice, sign type/upload, invite screen mode)
+  deliberately left as state. The Financials hub tabs were never affected —
+  they are routes.
+- **Work trade switches, for the record:** "Trusted — no hours" on the Work
+  Trade page = `tracks_hours=false` (what all nine of Nic's agreements are:
+  nothing logged, nothing approved, month closes covered). A TRACKED agreement
+  is monitored by default (landlord approves hours); its `trusted` flag (S652)
+  makes logged hours count immediately and lets the person check off others'
+  jobs. Field permissions (Read meters…) are separate and per agreement.
+- **Both of Nic's parks have late_fee_initial_amount = $0 on every active
+  lease** (Mountain View 43, Oak Park 24). Late fees cannot accrue there until
+  the leases carry an amount. Flagged to Nic, not changed.
+
 ## Still open
 
 - **Lots 22 and 24 are marked OUT OF SERVICE** (9/30, by the run's stuck-meter

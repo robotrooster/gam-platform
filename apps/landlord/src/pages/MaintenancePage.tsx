@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { humanize, MAINTENANCE_PRIORITIES, MAINTENANCE_PRIORITY_LABEL, MAINTENANCE_CATEGORY_LABEL } from '@gam/shared'
@@ -411,7 +412,7 @@ export function MaintenancePage({ embeddedPropertyId }: { embeddedPropertyId?: s
   const [filterStatus, setFilterStatus] = useState('all')
   const [filterPriority, setFilterPriority] = useState('all')
   const [showCostBreakdown, setShowCostBreakdown] = useState(false)
-  const [view, setView] = useState<'work' | 'entry' | 'outage'>('work')
+  const [view, setView] = useUrlTab('view', 'work', ['work','entry','outage'] as const)
   const { can } = usePerms()
 
   const { data: requests = [], isLoading } = useQuery<any[]>(

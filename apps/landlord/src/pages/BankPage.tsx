@@ -14,6 +14,7 @@
 // The backends are untouched — this composes the two existing page bodies in
 // `embedded` mode, so all the working logic stays where it was.
 import { BankReconciliationPage } from './BankReconciliationPage'
+import { useUrlTab } from '../lib/useUrlTab'
 import { BankFeedPage } from './BankFeedPage'
 import { useState } from 'react'
 import { DepositMatchPanel, CashPositionPanel } from './DepositMatchPanel'
@@ -25,7 +26,7 @@ import { EntityPicker } from '../components/EntityPicker'
 // check, and underneath it the deposits that may be a tenant's rent — a
 // matching job, not something to wade through on the way to the balance.
 export function BankPage() {
-  const [tab, setTab] = useState<'feed' | 'reconcile'>('feed')
+  const [tab, setTab] = useUrlTab('tab', 'feed', ['feed','reconcile'] as const)
   const [entityId, setEntityId] = useState('')
   return (
     <div>

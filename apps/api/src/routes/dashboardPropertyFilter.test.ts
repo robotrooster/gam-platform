@@ -103,3 +103,54 @@ describe('GET /landlords/me/dashboard?propertyId=', () => {
     expect(res.body.data.total_units).toBe(3)
   })
 })
+
+// S654 (Nic): "until a unit is actually delinquent past its grace period, I
+// would really love for that to say outstanding units… flag a difference
+// between outstanding and delinquent based on when the grace period ends."
+// And of the old "late fees accruing on 7": "make sure that's accurate."
+describe('S654 outstanding vs delinquent vs accruing', () => {
+  async function unitOwing(opts: { daysPastDue: number; graceDays: number; fee: number; exempt?: boolean }) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { rows: [{ landlord_id }] } = await c.query(`SELECT landlord_id FROM properties WHERE id=$1`, [propA])
+      const unitId = await seedUnit(c, { propertyId: propA, landlordId: landlord_id })
+      await c.query(`UPDATE units SET status='active' WHERE id=$1`, [unitId])
+      const { rows: [lease] } = await c.query<{ id: string }>(
+        `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date,
+                             late_fee_enabled, late_fee_initial_amount, late_fee_initial_type, late_fee_grace_days)
+         VALUES ($1,$2,500,'month_to_month','active', CURRENT_DATE - 60, true, $3, 'flat', $4) RETURNING id`,
+        [unitId, landlord_id, opts.fee, opts.graceDays])
+      const { rows: [inv] } = await c.query<{ id: string }>(
+        `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, late_fee_exempt)
+         VALUES ($1,$2,$3,$4, CURRENT_DATE - $5::int, 500, 500, 'pending', $6) RETURNING id`,
+        [landlord_id, lease.id, unitId, `INV-${randomUUID().slice(0, 8)}`, opts.daysPastDue, !!opts.exempt])
+      await c.query(
+        `INSERT INTO payments (invoice_id, unit_id, lease_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,'rent',500,'pending', CURRENT_DATE - $5::int, 'RENT')`,
+        [inv.id, unitId, lease.id, landlord_id, opts.daysPastDue])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('counts owing, past-grace, and fee-will-be-charged separately', async () => {
+    await unitOwing({ daysPastDue: 0,  graceDays: 5, fee: 50 })              // due today: outstanding only
+    await unitOwing({ daysPastDue: 10, graceDays: 5, fee: 0 })               // past grace, $0 fee: delinquent, no fee
+    await unitOwing({ daysPastDue: 10, graceDays: 5, fee: 50, exempt: true }) // past grace, waived: delinquent, no fee
+    await unitOwing({ daysPastDue: 10, graceDays: 5, fee: 50 })              // past grace, real fee: accruing
+    await unitOwing({ daysPastDue: 3,  graceDays: 5, fee: 50 })              // inside grace: outstanding only
+    const res = await dash()
+    expect(res.status).toBe(200)
+    expect(res.body.data.units_owing).toBe(5)
+    expect(res.body.data.units_past_grace).toBe(3)
+    expect(res.body.data.delinquent_units_accruing_late_fees).toBe(1)
+  })
+
+  it('a longer grace period keeps a unit outstanding, not delinquent', async () => {
+    await unitOwing({ daysPastDue: 10, graceDays: 15, fee: 50 })
+    const res = await dash()
+    expect(res.body.data.units_owing).toBe(1)
+    expect(res.body.data.units_past_grace).toBe(0)
+    expect(res.body.data.delinquent_units_accruing_late_fees).toBe(0)
+  })
+})
