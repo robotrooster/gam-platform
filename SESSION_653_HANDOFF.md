@@ -262,3 +262,40 @@ And from the same conversation, earlier:
   prompt-and-choose shape; RV 24 Oak Park September water share once Nic has
   the original submeter readings; Razo's link Friday (extra days + final RV 27
   read).
+
+## End of day 2026-09-30 — undeployed work + Country Acres September water
+
+**UNDEPLOYED (commit f7952e0 and earlier on main, pushed):**
+- Screenings good for a YEAR: `SCREENING_VALID_MONTHS = 12` in shared — the
+  three `expires_at` stamps (`routes/background.ts` ×2, `services/backgroundApplyUpdate.ts`)
+  and the 3 AM expiry sweep. The six months was GAM's own freshness rule from
+  June (commit 7c37ffb), never Checkr's or legal. Live rows already extended:
+  Anastacio Erreguin → 2027-09-10, Robert Housley → 2027-09-30.
+- "Not moving in for now" on an approved applicant: `background_checks.parked_at
+  / parked_note` (migration `20260930240000`), `POST /background/:id/park` +
+  `/unpark` (declared in actionGap), review-window buttons, Past-tab tag.
+  Parked = still approved, off Needs attention; "They're back" reverses it.
+  → ship with `bash ~/gam/deploy.sh` when Nic says.
+
+**Country Acres (Mattoon) September water — DONE in prod (data, no code):**
+- Meters re-set to what the readers see: digits 5 / multiplier 100 (Lot 17:
+  digits 6 / multiplier 10) = 10^(7 − face digits) gallons per unit; the
+  July/Aug placeholder reads converted to face integers (same math). Nic:
+  "August numbers are the baseline" — NOT deleted.
+- Reads entered in run d92343a2… (Lots 1,6,11,15,17,21,22,24,28,29,30; Lot 8
+  at its base value = 0 usage; Lot 18 = a BASELINE read 9442 dated 9/30, no
+  bill — its prior value was a placeholder). Run completed: 9 bills, $862.95
+  at $0.0165/gal. Big ones to eyeball: Lot 17 19,800 gal ($326.70), Lot 21
+  10,000 gal ($165.00).
+- Oct 1 dry run for the landlord: 11 invoices, 8 utility lines; Mike Boyd
+  (MH 15) already had INV-2026-00016 from his 9/25 signing, so his $18.15 was
+  attached by hand (`attachStrandedUtilityBill`) → $468.15. All 9 water bills
+  land on Oct 1.
+- Landlord `billing_grace_until` 2026-10-01: the Oct 1 sweep stamps them live
+  and October's platform fee bills their 12 spaces.
+
+**Still open:** waitlist design (build list #3; prompt-and-choose shape
+proposed, awaiting Nic); RV 24 Oak Park September water share (Nic will bring
+the original submeter readings); Razo Friday (add days + final RV 27 read to
+his link before settling); MH 03 occupant details (Nic enters on the unit
+page once deploy 101 ships… the occupant fields are LIVE already in 100).
