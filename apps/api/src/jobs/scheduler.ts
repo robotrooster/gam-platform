@@ -1162,7 +1162,7 @@ async function pruneOperationalLogs() {
   }
 }
 
-// ── BACKGROUND CHECK EXPIRY (6-month freshness window) ──────
+// ── BACKGROUND CHECK EXPIRY (SCREENING_VALID_MONTHS freshness window; S653: a year) ──
 // Daily at 3 AM. Flips bgc.status -> 'expired' for completed/approved rows
 // past expires_at. Cascades to tenants.background_check_status,
 // application_pool.status, and in-flight pool_match_requests.status.

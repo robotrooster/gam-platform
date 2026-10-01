@@ -3996,6 +3996,14 @@ function makeFeeRowSpec(tag: FeeType): FeeRowSpec {
 // Every money box defaults from its tag name; the landlord may change it per
 // template. The signed lease records the choice on lease_fees.money_kind, and
 // the engine bills, holds, applies and returns by THAT — never by the name.
+// ── S653 (Nic): HOW LONG A SCREENING STAYS GOOD ─────────────────────────────
+// "background checks should be good for a year." One number, read by every
+// place that stamps expires_at and by the nightly expiry sweep. It is GAM's own
+// freshness rule — Checkr attaches no validity window to a report, and no
+// statute does either. Was 6 months, hard-coded three times.
+export const SCREENING_VALID_MONTHS = 12
+export const SCREENING_VALID_INTERVAL_SQL = `INTERVAL '${SCREENING_VALID_MONTHS} months'`
+
 export const MONEY_KINDS = ['fee', 'deposit', 'prepaid'] as const
 export type MoneyKind = typeof MONEY_KINDS[number]
 export const MONEY_KIND_LABEL: Record<MoneyKind, string> = {

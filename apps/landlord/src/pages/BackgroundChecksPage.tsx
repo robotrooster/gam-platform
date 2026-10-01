@@ -86,7 +86,8 @@ export function BackgroundChecksPage() {
                   <td>
                     <span className={`badge ${STATUS_MAP[c.status] || 'badge-muted'}`}>{humanize(c.status) || '—'}</span>
                     {c.status === 'approved' && c.housed && <span className="badge badge-muted" style={{marginLeft:4}} title="A lease exists for them">Housed</span>}
-                    {c.status === 'approved' && !c.housed && <span className="badge badge-gold" style={{marginLeft:4}} title="Approved — pick a space and draft the lease">Needs a lease</span>}
+                    {c.status === 'approved' && !c.housed && c.parkedAt && <span className="badge badge-muted" style={{marginLeft:4}} title={c.parkedNote || 'Set aside — not moving in for now'}>Not moving in for now</span>}
+                    {c.status === 'approved' && !c.housed && !c.parkedAt && <span className="badge badge-gold" style={{marginLeft:4}} title="Approved — pick a space and draft the lease">Needs a lease</span>}
                   </td>
                   <td style={{textAlign:'right',color:'var(--text-3)',fontSize:'.8rem'}}>Review →</td>
                 </tr>
@@ -220,6 +221,22 @@ function ReviewModal({ check, onClose, onDecided }: {
     } catch (e: any) {
       toast.error(e?.response?.data?.error || 'Could not record the decision.')
       setBusy('')
+    }
+  }
+
+  // S653 (Nic): "keep them approved but mark them as dormant for now." The
+  // approval stands; they leave the to-do list until they turn up again.
+  const [parkNote, setParkNote] = useState('')
+  const [parking, setParking] = useState(false)
+  const park = async (dir: 'park' | 'unpark') => {
+    setParking(true)
+    try {
+      await apiPost(`/background/${check.id}/${dir}`, dir === 'park' ? { note: parkNote.trim() || null } : {})
+      toast(dir === 'park' ? 'Set aside — still approved, off the to-do list.' : 'Back on the to-do list.')
+      onDecided(null)
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || 'Could not save that.')
+      setParking(false)
     }
   }
 
@@ -359,6 +376,22 @@ function ReviewModal({ check, onClose, onDecided }: {
         </div>
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onClose} disabled={!!busy}>Close</button>
+          {isApproved && !check.housed && (
+            check.parkedAt ? (
+              <button className="btn btn-ghost" onClick={() => park('unpark')} disabled={parking}
+                title={check.parkedNote ? `Set aside: ${check.parkedNote}` : 'Set aside — not moving in for now'}>
+                {parking ? '…' : 'They\'re back'}
+              </button>
+            ) : (
+              <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                <input className="input" style={{maxWidth:200}} placeholder="Why? (optional)" value={parkNote} onChange={e => setParkNote(e.target.value)} />
+                <button className="btn btn-ghost" onClick={() => park('park')} disabled={parking}
+                  title="Keeps the approval; takes them off Needs attention until they turn up again">
+                  {parking ? '…' : 'Not moving in for now'}
+                </button>
+              </div>
+            )
+          )}
           {isApproved && (
             <>
               {needsUnit && (

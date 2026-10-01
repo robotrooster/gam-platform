@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict n2NWefcy66blz7yrHLgdgSruvg6fOnyubpxJmzWzQKltfEK62m3d0R9t7ieP4cf
+\restrict iJOENUkgz2SQrC8do0BBt7l8PFsKPr9Ub06b1C0z77wBLfmJPwbmgtCnCG2lyMz
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -1617,6 +1617,8 @@ CREATE TABLE public.background_checks (
     desired_move_in date,
     desired_term_months integer,
     desired_month_to_month boolean DEFAULT false NOT NULL,
+    parked_at timestamp with time zone,
+    parked_note text,
     CONSTRAINT background_checks_risk_level_check CHECK (((risk_level IS NULL) OR (risk_level = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text, 'very_high'::text])))),
     CONSTRAINT background_checks_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'awaiting_applicant'::text, 'submitted'::text, 'processing'::text, 'complete'::text, 'failed'::text, 'cancelled'::text, 'approved'::text, 'denied'::text, 'expired'::text]))),
     CONSTRAINT background_checks_term_sane CHECK (((desired_term_months IS NULL) OR ((desired_term_months > 0) AND (desired_term_months <= 120))))
@@ -1642,6 +1644,13 @@ COMMENT ON COLUMN public.background_checks.desired_move_in IS 'S639: when the ap
 --
 
 COMMENT ON COLUMN public.background_checks.desired_term_months IS 'S639: how many months they want. NULL with desired_month_to_month = true means month-to-month.';
+
+
+--
+-- Name: COLUMN background_checks.parked_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.background_checks.parked_at IS 'S653: an approved applicant set aside — not moving in for now. Approval and expiry unchanged; off the needs-attention list until un-parked.';
 
 
 --
@@ -28320,5 +28329,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict n2NWefcy66blz7yrHLgdgSruvg6fOnyubpxJmzWzQKltfEK62m3d0R9t7ieP4cf
+\unrestrict iJOENUkgz2SQrC8do0BBt7l8PFsKPr9Ub06b1C0z77wBLfmJPwbmgtCnCG2lyMz
 

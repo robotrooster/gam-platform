@@ -11,7 +11,7 @@ import { findStayConflict } from '../services/unitAvailability'
 import { getProvider } from '../services/backgroundProvider'
 import { getPoolIntakeShell, isPoolIntakeLandlord } from '../services/poolIntake'
 import { landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
-import { PROCESSING_FEES } from '@gam/shared'
+import { PROCESSING_FEES, SCREENING_VALID_INTERVAL_SQL } from '@gam/shared'
 import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
@@ -838,6 +838,7 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
         bc.risk_score, bc.risk_level, bc.risk_flags,
         bc.provider_name, bc.provider_ref, bc.report_summary,
         bc.desired_move_in, bc.desired_term_months, bc.desired_month_to_month,
+        bc.parked_at, bc.parked_note,
         COALESCE(un.property_id, bc.property_id) AS property_id,
         u.email, u.phone,
         un.unit_number, un.id AS unit_id, un.rent_amount AS unit_rent,
@@ -905,7 +906,10 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
     // somebody to do something: the applicant to finish, the landlord to
     // decide, or a space to be picked and a lease drafted.
     for (const c of checks) {
-      c.bucket = (['denied', 'expired', 'cancelled', 'failed'].includes(c.status) || (c.status === 'approved' && c.housed))
+      // S653: an approved applicant the landlord set aside ("not moving in for
+      // now") is past too — still approved, just not a to-do.
+      c.bucket = (['denied', 'expired', 'cancelled', 'failed'].includes(c.status)
+          || (c.status === 'approved' && (c.housed || c.parked_at)))
         ? 'past' : 'attention'
     }
     res.json({ success: true, data: checks })
@@ -994,8 +998,41 @@ backgroundRouter.post('/:id/draft-lease', requireAuth, requirePerm('tenants.run_
   } catch (e) { next(e) }
 })
 
+// ── S653 (Nic): NOT MOVING IN FOR NOW ────────────────────────
+//
+//   "for background checks that were approved that opted not to sign a lease
+//    ... keep them approved but mark them as dormant for now... so this last
+//    one for Anastacio does not just forever say that it needs attention."
+//
+// Park = the approval stands (expires_at untouched), the row leaves the
+// needs-attention list. Un-park brings it back. Drafting a lease from a parked
+// check still works — a space picked is a space picked.
+backgroundRouter.post('/:id/park', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : null
+    const check = await queryOne<any>(
+      'SELECT id, status FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)])
+    if (!check) throw new AppError(404, 'Not found')
+    if (check.status !== 'approved') throw new AppError(409, 'Only an approved applicant can be set aside — decide first')
+    await query(`UPDATE background_checks SET parked_at = NOW(), parked_note = $2, updated_at = NOW() WHERE id = $1`, [check.id, note || null])
+    res.json({ success: true, data: { id: check.id, parked: true } })
+  } catch (e) { next(e) }
+})
+
+backgroundRouter.post('/:id/unpark', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    const check = await queryOne<any>(
+      'SELECT id FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)])
+    if (!check) throw new AppError(404, 'Not found')
+    await query(`UPDATE background_checks SET parked_at = NULL, parked_note = NULL, updated_at = NOW() WHERE id = $1`, [check.id])
+    res.json({ success: true, data: { id: check.id, parked: false } })
+  } catch (e) { next(e) }
+})
+
 // ── LANDLORD: DECIDE ─────────────────────────────────────────
-// Approval sets expires_at (6mo from now). Denial may create pool entry.
+// Approval sets expires_at (SCREENING_VALID_MONTHS from now). Denial may create pool entry.
 // Approval flips any existing pool entry to inactive — tenant is housed.
 backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
@@ -1013,7 +1050,7 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
     }
 
     const expiresClause = decision === 'approved'
-      ? ", expires_at = NOW() + INTERVAL '6 months'"
+      ? `, expires_at = NOW() + ${SCREENING_VALID_INTERVAL_SQL}`
       : ''
     await query(
       `UPDATE background_checks SET status=$1, decision_notes=$2, decided_at=NOW(), decided_by=$3${expiresClause} WHERE id=$4`,
@@ -1433,7 +1470,7 @@ backgroundRouter.post('/dev-mock-webhook', requireAuth, requireAdmin, async (req
       [update.providerRef]
     )
     if (!check) throw new AppError(404, 'Unknown provider_ref')
-    const expiresClause = update.status === 'complete' ? ", expires_at = NOW() + INTERVAL '6 months'" : ''
+    const expiresClause = update.status === 'complete' ? `, expires_at = NOW() + ${SCREENING_VALID_INTERVAL_SQL}` : ''
     await query(`
       UPDATE background_checks
       SET status=$1, report_summary=$2, failure_reason=$3, webhook_received_at=NOW()${expiresClause}

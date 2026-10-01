@@ -1582,7 +1582,7 @@ adminRouter.get('/screenings', requireSuperAdmin, async (req, res, next) => {
     const rows = await query<any>(`
       SELECT bc.id, bc.status, bc.first_name, bc.last_name, u.email, u.phone,
              bc.created_at, bc.webhook_received_at, bc.decided_at, bc.expires_at,
-             bc.decision_notes, bc.provider_name, bc.provider_ref,
+             bc.decision_notes, bc.provider_name, bc.provider_ref, bc.parked_at, bc.parked_note,
              bc.report_summary ->> 'result' AS provider_result,
              bc.risk_level, bc.risk_score,
              bc.amount_charged, bc.platform_net, bc.refunded_at,

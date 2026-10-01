@@ -9,6 +9,7 @@
  */
 import type { BackgroundProvider, BackgroundProviderWebhookUpdate } from './backgroundProvider'
 import { query, queryOne } from '../db'
+import { SCREENING_VALID_INTERVAL_SQL } from '@gam/shared'
 import { archiveProviderPayload } from './backgroundReportArchive'
 import { isPoolIntakeLandlord } from './poolIntake'
 import { logger } from '../lib/logger'
@@ -41,7 +42,7 @@ export async function applyProviderUpdate(args: {
   }
 
   const expiresClause = update.status === 'complete'
-    ? ", expires_at = NOW() + INTERVAL '6 months'"
+    ? `, expires_at = NOW() + ${SCREENING_VALID_INTERVAL_SQL}`
     : ''
   // COALESCE keeps an existing summary when this event carries none — Checkr
   // Tenant sends summary-less progress events (applicant.visited,

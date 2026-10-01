@@ -159,11 +159,11 @@ describe('POST /api/background/webhook/checkr — Tenant events', () => {
       result:    'consider',
       products:  { criminal_history: 'consider', credit_report: 'clear' },
     })
-    // 6 calendar months out (Postgres INTERVAL '6 months' — 181..185 days
-    // depending on the months crossed).
+    // S653 (Nic): "background checks should be good for a year." A calendar
+    // year out (365..366 days).
     const days = (new Date(row.expires_at).getTime() - Date.now()) / 86400000
-    expect(days).toBeGreaterThan(175)
-    expect(days).toBeLessThan(190)
+    expect(days).toBeGreaterThan(360)
+    expect(days).toBeLessThan(370)
   })
 
   it('order.applicant.completed → processing, no expires, existing summary preserved', async () => {

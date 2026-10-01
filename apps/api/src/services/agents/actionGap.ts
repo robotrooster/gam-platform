@@ -74,6 +74,11 @@ const DELIBERATE = new Map(Object.entries({
   // ── S653: how much paid-ahead credit a month may use ───────────────────────
   'leases PATCH /:id/prepaid-draw':
     'sets how much of a resident\'s paid-ahead money each month\'s bill may use — a number that changes what they are asked to pay every month from here on. Set on the lease with the credit balance on screen, by the landlord or the desk, when the resident asks for it.',
+  // ── S653: an approved applicant set aside ──────────────────────────────────
+  'background POST /:id/park':
+    'marks an approved applicant as not moving in for now, taking them off the screening to-do list. A judgment the landlord makes looking at the person\'s record; nothing a conversation should do on its own.',
+  'background POST /:id/unpark':
+    'puts a set-aside applicant back on the to-do list. Same screen, same judgment.',
   // ── S641: the filing cabinet ───────────────────────────────────────────────
   'documents PUT /:id/properties':
     'pins a document to the properties it applies to. The mistake this guards against is exactly a mis-pin — Nic: "assigned parking spots in one place and that gets sent to a property that doesn\'t have that, and then it\'s just generating confusion" — and property names spoken aloud is where that mistake happens. Ticked on a screen that lists every park.',

@@ -135,3 +135,49 @@ describe("the platform's screening database", () => {
       .set('Authorization', `Bearer ${sign(w.ll.userId, 'landlord', { landlordIds: [w.ll.landlordId] })}`)).status).toBe(403)
   })
 })
+
+// S653 (Nic): "keep them approved but mark them as dormant for now... so this
+// last one for Anastacio does not just forever say that it needs attention."
+describe('an approved applicant set aside', () => {
+  it('leaves the to-do list while parked, still approved, and comes back on un-park', async () => {
+    const w = await world()
+    const token = sign(w.ll.userId, 'landlord', { landlordIds: [w.ll.landlordId] })
+    const park = await request(buildApp()).post(`/api/background/${w.ids.approvedNoLease}/park`)
+      .set('Authorization', `Bearer ${token}`).send({ note: 'went back to Oregon for the winter' })
+    expect(park.status).toBe(200)
+    let list = (await request(buildApp()).get('/api/background').set('Authorization', `Bearer ${token}`)).body.data
+    let row = list.find((c: any) => c.id === w.ids.approvedNoLease)
+    expect(row.status).toBe('approved')
+    expect(row.bucket).toBe('past')
+    expect(row.parked_note).toBe('went back to Oregon for the winter')
+
+    const back = await request(buildApp()).post(`/api/background/${w.ids.approvedNoLease}/unpark`).set('Authorization', `Bearer ${token}`)
+    expect(back.status).toBe(200)
+    list = (await request(buildApp()).get('/api/background').set('Authorization', `Bearer ${token}`)).body.data
+    row = list.find((c: any) => c.id === w.ids.approvedNoLease)
+    expect(row.bucket).toBe('attention')
+    expect(row.parked_at).toBeNull()
+  })
+
+  it('only an approved applicant can be set aside', async () => {
+    const w = await world()
+    const token = sign(w.ll.userId, 'landlord', { landlordIds: [w.ll.landlordId] })
+    expect((await request(buildApp()).post(`/api/background/${w.ids.undecided}/park`).set('Authorization', `Bearer ${token}`)).status).toBe(409)
+    expect((await request(buildApp()).post(`/api/background/${w.ids.stranger}/park`).set('Authorization', `Bearer ${token}`)).status).toBe(404)
+  })
+})
+
+// S653 (Nic): "background checks should be good for a year." Not six months —
+// that was GAM's own number, not Checkr's.
+describe('how long an approval stays good', () => {
+  it('stamps a year from the decision', async () => {
+    const w = await world()
+    const token = sign(w.ll.userId, 'landlord', { landlordIds: [w.ll.landlordId] })
+    const res = await request(buildApp()).patch(`/api/background/${w.ids.undecided}/decision`)
+      .set('Authorization', `Bearer ${token}`).send({ decision: 'approved' })
+    expect(res.status).toBe(200)
+    const r = (await db.query(`SELECT (expires_at::date - CURRENT_DATE) AS days FROM background_checks WHERE id=$1`, [w.ids.undecided])).rows[0]
+    expect(Number(r.days)).toBeGreaterThanOrEqual(364)
+    expect(Number(r.days)).toBeLessThanOrEqual(366)
+  })
+})
