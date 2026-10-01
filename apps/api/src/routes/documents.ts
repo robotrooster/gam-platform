@@ -7,7 +7,7 @@ import { z } from 'zod'
 import { DOCUMENT_CATEGORIES, REFERENCE_DOCUMENT_CATEGORIES } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
-import { landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
+import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { streamStoredFile } from '../lib/fileServe'
 
@@ -274,7 +274,7 @@ documentsRouter.post('/', requirePerm('documents.upload', 'documents.post_photo'
     const landlordId = photoLandlordId
       ?? (meta.unitId
         ? await landlordIdForUnit(req.user!, meta.unitId, query)
-        : resolveLandlordTarget(req.user!, req.body?.landlordId, 'document'))
+        : await landlordForRequest(req, 'document'))
     // Body-supplied property ids are ownership-checked before use: a pin must
     // never reach a property this account does not hold.
     const pinIds = [...new Set([

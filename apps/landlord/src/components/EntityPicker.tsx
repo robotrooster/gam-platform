@@ -40,7 +40,10 @@ export function EntityPicker({ value, onChange, label = 'Company', note }: {
   // queries with an empty entity and shows a blank feed that looks like "no
   // transactions" rather than "nothing selected yet".
   useEffect(() => {
-    if (!value && entities.length) onChange(entities[0].id)
+    // S654 (Nic, DIRECTIVE): "None is the default." One company needs no
+    // choosing; two or more start on "Choose a company" — the first in the
+    // list is not a default.
+    if (!value && entities.length === 1) onChange(entities[0].id)
   }, [entities, value, onChange])
 
   if (entities.length < 2) return null
@@ -50,6 +53,7 @@ export function EntityPicker({ value, onChange, label = 'Company', note }: {
       <label className="form-label" style={{ margin: 0, fontSize: '.72rem' }}>{label}</label>
       <select className="input" style={{ width: 'auto', minWidth: 240 }}
               value={value} onChange={e => onChange(e.target.value)}>
+        <option value="">Choose a company…</option>
         {entities.map(en => (
           <option key={en.id} value={en.id}>
             {en.businessName || 'Unnamed company'}

@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue } from '@gam/shared'
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { apiPost, apiGet } from '../lib/api'
 import { useQueryClient } from 'react-query'
@@ -74,19 +74,39 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setToken(null); setUser(null)
   }, [])
 
+  // S654 (Nic): "your most recent deploy signed me out of the landlord portal."
+  // A session was a fixed 7-day pass from the last password sign-in and nothing
+  // renewed it. Renew a pass older than a day on load and whenever the portal
+  // comes back into view, so a session ends only after seven idle days.
+  const renewSession = useCallback(async () => {
+    const current = localStorage.getItem('gam_token')
+    if (!sessionRenewalDue(current)) return
+    try {
+      const r = await apiPost<{ token: string }>('/auth/refresh')
+      localStorage.setItem('gam_token', r.data.token)
+      setToken(r.data.token)
+    } catch (e) { if (isAuthRejection(e)) logout() }
+  }, [logout])
+
   const refresh = useCallback(async () => {
     try {
       const me = await fetchAuthMeWithRetry(() => apiGet<AuthUser>('/auth/me'))
       setUser(me)
+      await renewSession()
     } catch (e) {
       // S540: only a real auth rejection ends the session. API
       // restarts / network blips keep the token; next load recovers.
       if (isAuthRejection(e)) logout()
     }
     finally { setLoading(false) }
-  }, [logout])
+  }, [logout, renewSession])
 
   useEffect(() => { token ? refresh() : setLoading(false) }, [token, refresh])
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') renewSession() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [renewSession])
 
   // Post-credentials login. Returns a discriminated result so LoginPage
   // can pivot into the TOTP second step when 2FA is enabled on the

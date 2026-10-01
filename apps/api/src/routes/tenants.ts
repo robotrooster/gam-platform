@@ -154,7 +154,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // than deleted — see the ALREADY_ACCEPTED branch above. The expiry is
       // cleared so an accepted invite never also reports as timed out.
       await client.query(
-        `UPDATE users SET password_hash=$1,
+        `UPDATE users SET password_hash=$1, sessions_valid_from=NOW(),
                           tenant_invite_accepted_at=NOW(),
                           tenant_invite_expires_at=NULL,
                           email_verified=TRUE,
@@ -1803,10 +1803,14 @@ tenantsRouter.post('/flexcredit/inquiry', async (req, res, next) => {
 tenantsRouter.get('/payments', async (req, res, next) => {
   try {
     const payments = await query<any>(`
-      SELECT p.*, u.unit_number, pr.name AS property_name
+      SELECT p.*, u.unit_number, pr.name AS property_name,
+             -- S654: how it was paid, for the history's "Paid by" column.
+             COALESCE(p.manual_method, rm.payment_method) AS paid_by
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
+      LEFT JOIN tenant_remittances rm ON p.stripe_payment_intent_id IS NOT NULL
+                                     AND rm.stripe_payment_intent_id = p.stripe_payment_intent_id
       WHERE p.tenant_id = $1
       ORDER BY p.due_date DESC LIMIT 24`, [req.user!.profileId!])
     res.json({ success: true, data: payments })
@@ -2376,7 +2380,8 @@ tenantsRouter.patch('/password', requireAuth, async (req, res, next) => {
     const valid = await bcrypt.compare(currentPassword, user.password_hash)
     if (!valid) throw new AppError(401, 'Incorrect current password')
     const hash = await bcrypt.hash(newPassword, 10)
-    await query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, req.user!.userId])
+    // S654: a password change ends every other session (passes minted before now).
+    await query('UPDATE users SET password_hash=$1, sessions_valid_from=NOW() WHERE id=$2', [hash, req.user!.userId])
     res.json({ success: true })
   } catch (e) { next(e) }
 })

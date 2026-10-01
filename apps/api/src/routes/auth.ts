@@ -13,7 +13,7 @@ import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import { signTotpSessionToken, signTotpEnrollToken } from './totp'
 import { MANDATORY_TOTP_ROLES } from '../lib/totp'
-import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
+import { signEmailOtpSessionToken, issueEmailOtp, verifyEmailFactorToken } from './emailOtp'
 
 // S80: scope-table dispatch for login / refresh JWT claims. Replaced the
 // pre-S80 team_members LEFT JOIN. Role-keyed lookup against the right
@@ -155,6 +155,9 @@ const loginSchema = z.object({
   // S650: the portal the sign-in came from. Only the staff consoles change
   // anything — see the staff gate in /login.
   portal:   z.enum(['admin', 'admin_ops']).optional(),
+  // S654: the bill email's Pay now link vouches for the inbox — see
+  // signEmailFactorToken. Optional; a stale or foreign one means the usual code.
+  emailFactor: z.string().max(4000).optional(),
 })
 
 function signToken(payload: object) {
@@ -370,10 +373,21 @@ const LOGIN_FAIL_LIMIT = 5
 const LOGIN_LOCK_MINUTES = 15
 
 // POST /api/auth/login
-authRouter.post('/login', async (req, res, next) => {
-  try {
-    const { email, password, portal } = loginSchema.parse(req.body)
-    const user = await queryOne<any>(
+// S654: a password change ends every other session. Sessions renew while in
+// use now, so a stolen signed-in device would otherwise keep renewing forever;
+// a pass minted before the change is refused here and at /auth/me (which every
+// portal calls on load), so the device is out at its next load.
+function assertPassPostdatesPasswordChange(pass: any, sessionsValidFrom: string | Date | null | undefined) {
+  if (!sessionsValidFrom || typeof pass?.iat !== 'number') return
+  if (pass.iat * 1000 < new Date(sessionsValidFrom).getTime()) {
+    throw new AppError(401, 'Your password was changed. Please sign in again.')
+  }
+}
+
+// S654: one loader for a session's user row. The password sign-in and the
+// session renewal (/refresh) must see the same account the same way.
+async function loadUserForSession(by: 'email' | 'id', value: string): Promise<any> {
+  return queryOne<any>(
       `SELECT u.*,
               COALESCE(t.id, b.id) AS profile_id,
               b.id                 AS business_id
@@ -390,8 +404,88 @@ authRouter.post('/login', async (req, res, next) => {
        LEFT JOIN businesses b ON b.owner_user_id = u.id AND b.status = 'active'
        -- S639: case-insensitive. An address is the same address whatever a
        -- phone keyboard capitalized on the way in.
-       WHERE lower(u.email) = lower($1)`, [email]
-    )
+       WHERE ${by === 'email' ? 'lower(u.email) = lower($1)' : 'u.id = $1'}`, [value]
+  )
+}
+
+// S654: the claims a session carries, built from the database for THIS user.
+// Shared by the password sign-in and by /refresh, so a renewed session is
+// rebuilt from what is true now — a company added since, a scope pulled since —
+// never copied forward from the old pass.
+async function sessionClaimsFor(user: any) {
+  const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper','business_staff'].includes(user.role)
+  const scope = isWorkerRole ? await getScopeForUser(user.id, user.role) : null
+  if (isWorkerRole && !scope) {
+    const msg = user.role === 'business_staff'
+      ? 'Your account has been deactivated. Contact your business owner.'
+      : 'Your account has been deactivated. Contact your landlord.'
+    throw new AppError(403, msg)
+  }
+  // ── S633: A LANDLORD SESSION CARRIES NO ENTITY ──────────────────────────
+  //
+  // Nic (DIRECTIVE, verbatim): "Account ownership is no correlation to a
+  // specific entity. Entities own properties. The account owns the entities.
+  // When I'm logged into my account, I can invite any fucking person to any
+  // fucking property I own without switching a goddamn thing." And: "I don't
+  // want it to say fucking Oak Park ID when I sign into my login."
+  //
+  // `profileId` used to be resolved to ONE `landlords` row here — whichever
+  // entity `active_landlord_id` named, or an arbitrary one when it was null.
+  // Around 269 landlord call sites then read that id as "the landlord", so a
+  // person who owns two companies was only ever half signed in. It did not
+  // fail loudly: it returned an empty list. That is how a meter list at his
+  // own park came back with zero rows, how a billing-cycle card could not
+  // reach his second company, and how an invite refused a unit he owns.
+  //
+  // For a landlord it is now NULL, deliberately and permanently. Nulling it is
+  // the point of the change, not a side effect: any scoping site still reading
+  // it now fails where it can be seen and fixed, instead of silently answering
+  // for one company. An account is not an entity, so its session does not name
+  // one.
+  //
+  // Every other role is untouched — a tenant's profileId is their tenant row,
+  // a business owner's is their business, a team worker's scope arrives as
+  // landlordId. Those are genuinely one-to-one and stay exactly as they were.
+  const profileId = user.role === 'landlord'
+    ? null
+    : (user.profile_id || scope?.landlordId || scope?.businessId || null)
+
+  // S553/S633: EVERY entity this account owns — the whole of a landlord's
+  // identity now. Unions membership rows with founding ownership, because an
+  // account that predates `landlord_members` has a company it owns with no
+  // member row, and dropping profileId must not drop that company with it.
+  const landlordIds = user.role === 'landlord'
+    ? await query<{ landlord_id: string }>(
+        `SELECT landlord_id FROM landlord_members WHERE user_id = $1
+         UNION
+         SELECT id           FROM landlords        WHERE user_id = $1`, [user.id]
+      ).then((rows) => rows.map((r) => r.landlord_id))
+    : null
+  // S453: businessId carries either the owner's business (from JOIN) or
+  // the staff member's scoped business (from getScopeForUser). null for
+  // any non-business role.
+  const businessId = user.role === 'business_owner'
+    ? (user.business_id || null)
+    : (scope?.businessId || null)
+  const staffRole = user.role === 'business_staff'
+    ? (scope?.staffRole || null)
+    : null
+  const claims = {
+    userId: user.id, role: user.role, email: user.email,
+    profileId,
+    landlordId: scope?.landlordId || null,
+    landlordIds,
+    businessId,
+    staffRole,
+    permissions: scope?.permissions || null,
+  }
+  return { scope, profileId, landlordIds, businessId, staffRole, claims }
+}
+
+authRouter.post('/login', async (req, res, next) => {
+  try {
+    const { email, password, portal, emailFactor } = loginSchema.parse(req.body)
+    const user = await loadUserForSession('email', email)
     if (!user) throw new AppError(401, 'Invalid credentials')
 
     // S280: lockout gate — BEFORE bcrypt.compare. Even with the
@@ -477,63 +571,7 @@ authRouter.post('/login', async (req, res, next) => {
     // S453: business_staff joins the worker list and goes through the
     // same gate. business_owner is NOT a worker — its business_id comes
     // off the JOIN's `business_id` column directly.
-    const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper','business_staff'].includes(user.role)
-    const scope = isWorkerRole ? await getScopeForUser(user.id, user.role) : null
-    if (isWorkerRole && !scope) {
-      const msg = user.role === 'business_staff'
-        ? 'Your account has been deactivated. Contact your business owner.'
-        : 'Your account has been deactivated. Contact your landlord.'
-      throw new AppError(403, msg)
-    }
-    // ── S633: A LANDLORD SESSION CARRIES NO ENTITY ──────────────────────────
-    //
-    // Nic (DIRECTIVE, verbatim): "Account ownership is no correlation to a
-    // specific entity. Entities own properties. The account owns the entities.
-    // When I'm logged into my account, I can invite any fucking person to any
-    // fucking property I own without switching a goddamn thing." And: "I don't
-    // want it to say fucking Oak Park ID when I sign into my login."
-    //
-    // `profileId` used to be resolved to ONE `landlords` row here — whichever
-    // entity `active_landlord_id` named, or an arbitrary one when it was null.
-    // Around 269 landlord call sites then read that id as "the landlord", so a
-    // person who owns two companies was only ever half signed in. It did not
-    // fail loudly: it returned an empty list. That is how a meter list at his
-    // own park came back with zero rows, how a billing-cycle card could not
-    // reach his second company, and how an invite refused a unit he owns.
-    //
-    // For a landlord it is now NULL, deliberately and permanently. Nulling it is
-    // the point of the change, not a side effect: any scoping site still reading
-    // it now fails where it can be seen and fixed, instead of silently answering
-    // for one company. An account is not an entity, so its session does not name
-    // one.
-    //
-    // Every other role is untouched — a tenant's profileId is their tenant row,
-    // a business owner's is their business, a team worker's scope arrives as
-    // landlordId. Those are genuinely one-to-one and stay exactly as they were.
-    const profileId = user.role === 'landlord'
-      ? null
-      : (user.profile_id || scope?.landlordId || scope?.businessId || null)
-
-    // S553/S633: EVERY entity this account owns — the whole of a landlord's
-    // identity now. Unions membership rows with founding ownership, because an
-    // account that predates `landlord_members` has a company it owns with no
-    // member row, and dropping profileId must not drop that company with it.
-    const landlordIds = user.role === 'landlord'
-      ? await query<{ landlord_id: string }>(
-          `SELECT landlord_id FROM landlord_members WHERE user_id = $1
-           UNION
-           SELECT id           FROM landlords        WHERE user_id = $1`, [user.id]
-        ).then((rows) => rows.map((r) => r.landlord_id))
-      : null
-    // S453: businessId carries either the owner's business (from JOIN) or
-    // the staff member's scoped business (from getScopeForUser). null for
-    // any non-business role.
-    const businessId = user.role === 'business_owner'
-      ? (user.business_id || null)
-      : (scope?.businessId || null)
-    const staffRole = user.role === 'business_staff'
-      ? (scope?.staffRole || null)
-      : null
+    const { scope, profileId, landlordIds, businessId, staffRole, claims } = await sessionClaimsFor(user)
 
     // S288: TOTP gate. If the user has 2FA enabled, don't issue the
     // full session JWT yet — mint a short-lived totp_session that
@@ -572,7 +610,20 @@ authRouter.post('/login', async (req, res, next) => {
       await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
       user.email_2fa_enabled = true
     }
-    if (user.email_2fa_enabled) {
+    // S654 (Nic): a sign-in that came through the bill's own emailed link has
+    // already shown the inbox — the thing the emailed code exists to prove. The
+    // link must vouch for THIS account (someone else's bill proves nothing about
+    // you); anything stale or foreign simply means the usual code. The password
+    // was still required above, so both factors are present either way.
+    const vouched = emailFactor ? verifyEmailFactorToken(emailFactor) : null
+    const inboxShown = !!vouched && vouched.userId === user.id
+      && vouched.email.toLowerCase() === String(user.email).toLowerCase()
+    if (inboxShown && user.email_verified !== true) {
+      await query(
+        `UPDATE users SET email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, NOW()), updated_at = NOW() WHERE id = $1`,
+        [user.id])
+    }
+    if (user.email_2fa_enabled && !inboxShown) {
       const emailOtpSession = signEmailOtpSessionToken({
         userId:      user.id,
         role:        user.role,
@@ -597,15 +648,6 @@ authRouter.post('/login', async (req, res, next) => {
     // server-side — not just by the client honoring mustEnrollTotp. S565: email
     // 2FA also satisfies the mandatory requirement, so it exempts from enroll.
     const mustEnroll = MANDATORY_TOTP_ROLES.has(user.role) && !user.totp_enabled && !user.email_2fa_enabled
-    const claims = {
-      userId: user.id, role: user.role, email: user.email,
-      profileId,
-      landlordId: scope?.landlordId || null,
-      landlordIds,
-      businessId,
-      staffRole,
-      permissions: scope?.permissions || null,
-    }
     const token = mustEnroll ? signTotpEnrollToken(claims) : signToken(claims)
     res.json({
       success: true,
@@ -642,7 +684,7 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
   try {
     const user = await queryOne<any>(
       `SELECT u.id, u.email, u.role, u.first_name, u.last_name, u.phone,
-         u.totp_enabled, u.email_2fa_enabled,
+         u.totp_enabled, u.email_2fa_enabled, u.sessions_valid_from,
          -- S630: so the account screen can show a change awaiting confirmation
          -- rather than looking like the request was lost.
          u.pending_email,
@@ -729,6 +771,7 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
        WHERE u.id = $1`, [req.user!.userId]
     )
     if (!user) throw new AppError(404, 'User not found')
+    assertPassPostdatesPasswordChange(req.user, user.sessions_valid_from)
 
     const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper','business_staff'].includes(user.role)
     const scope = isWorkerRole ? await getScopeForUser(user.id, user.role) : null
@@ -779,14 +822,28 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
 })
 
 // POST /api/auth/refresh
-authRouter.post('/refresh', requireAuth, (req, res) => {
-  // req.user comes back from jwt.verify with iat+exp set; jwt.sign refuses
-  // to re-mint a token when expiresIn is supplied AND the payload already
-  // carries an exp. Strip both before re-signing so signToken's '7d' TTL
-  // is the only one in play.
-  const { iat, exp, ...claims } = req.user as any
-  const token = signToken(claims)
-  res.json({ success: true, data: { token } })
+//
+// S654 (Nic, live): "your most recent deploy signed me out of the landlord
+// portal." It was not the deploy. A session was a 7-day pass minted at the
+// password step and nothing ever renewed it, so every account was thrown out
+// on the seventh day whatever it was doing — his sign-in history is a login
+// every few days, and the deploy's reload merely surfaced the dead pass. The
+// portals now renew a pass that is more than a day old while it is in use
+// (sessionRenewalDue in @gam/shared), so a session ends only after seven IDLE
+// days. The renewed pass is rebuilt from the database, not copied from the old
+// one: a worker whose scope was pulled is out at the next renewal, a company
+// the account was added to shows up at the next renewal.
+authRouter.post('/refresh', requireAuth, async (req, res, next) => {
+  try {
+    const user = await loadUserForSession('id', req.user!.userId)
+    if (!user) throw new AppError(401, 'Invalid or expired token')
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      throw new AppError(401, 'Account temporarily locked.')
+    }
+    assertPassPostdatesPasswordChange(req.user, user.sessions_valid_from)
+    const { claims } = await sessionClaimsFor(user)
+    res.json({ success: true, data: { token: signToken(claims) } })
+  } catch (e) { next(e) }
 })
 
 // PATCH /api/auth/me — update user profile
@@ -1070,6 +1127,7 @@ authRouter.post('/reset-password', async (req, res, next) => {
     await query(
       `UPDATE users
           SET password_hash = $1,
+              sessions_valid_from = NOW(),   -- S654: every pass minted before this is dead
               reset_token = NULL,
               reset_token_expires = NULL,
               failed_login_count = 0,

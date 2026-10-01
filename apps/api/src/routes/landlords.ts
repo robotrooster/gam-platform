@@ -6,7 +6,7 @@ import { canAccessLandlordResource, canViewLandlordFinances, canManageLandlordRe
 import { AppError } from '../middleware/errorHandler'
 // S633 — the account is not an entity. Reads span every company the account
 // owns; writes name their target and are authorized against it.
-import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, isEntityMember } from '../lib/landlordScope'
+import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, isEntityMember } from '../lib/landlordScope'
 // S640: the dashboard shows the date the payout ENGINE will fire, never its own guess.
 import { nextPayoutDateUtc } from '../jobs/autoPayouts'
 // S642: one definition of rent collected this month, shared with Reports and admin.
@@ -218,7 +218,7 @@ landlordsRouter.post('/pos-customers', requireAuth, requireLandlord, async (req,
     // one gets it silently; an account that owns several is asked, because
     // filing a customer under the wrong company is unwound by hand.
     const row = await createPosCustomer({
-      landlordId: resolveLandlordTarget(req.user!, req.body?.landlordId, 'customer'),
+      landlordId: await landlordForRequest(req, 'customer'),
       firstName, lastName, email, phone, notes,
     })
     res.status(201).json({ success: true, data: row })
@@ -571,7 +571,7 @@ landlordsRouter.get('/:id', async (req, res, next) => {
     // ?landlordId= when it owns several. Returning an arbitrary one is what
     // made this endpoint show Oak Park's details on a Mountain View screen.
     const id = req.params.id === 'me'
-      ? resolveLandlordTarget(req.user!, req.query.landlordId as string | undefined, 'company')
+      ? await landlordForRequest(req, 'company')
       : req.params.id
     // S70: replaced inline check with canAccessLandlordResource. Pre-S70
     // excluded team-role users (PM/onsite/maintenance) from viewing the
@@ -1263,7 +1263,7 @@ landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async
     const achPayer: 'landlord' | 'tenant' = coverTenantAch === true ? 'landlord' : 'tenant'
     // S633: onboarding is completed FOR a company — the signature is that
     // company's agreement. Named explicitly, or the account's only one.
-    const settingsLandlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')
+    const settingsLandlordId = await landlordForRequest(req, 'company')
 
     await query(`
       UPDATE landlords SET
@@ -1305,7 +1305,7 @@ landlordsRouter.patch('/me', requireAuth, requirePerm('settings.maintenance_appr
     const reviewUtilityBills = typeof req.body?.reviewUtilityBills === 'boolean' ? req.body.reviewUtilityBills : null
     // S633: these are a COMPANY's details — its legal name, its EIN, its
     // approval thresholds. The account names which one it is editing.
-    const settingsLandlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')
+    const settingsLandlordId = await landlordForRequest(req, 'company')
     // Sentinel value 'CLEAR' on the months-rent field nulls it out
     // (no policy on file). Otherwise COALESCE preserves prior value
     // when the field is absent.
@@ -1357,7 +1357,7 @@ landlordsRouter.get('/me/deposit-interest-overrides', requireLandlord, async (re
          FROM landlord_deposit_interest_rate_overrides
         WHERE landlord_id = $1
         ORDER BY effective_year DESC, state_code ASC`,
-      [resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')],
+      [await landlordForRequest(req, 'company')],
     )
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
@@ -1402,7 +1402,7 @@ landlordsRouter.put('/me/deposit-interest-overrides', requireLandlord, async (re
                  annual_rate_pct::text AS annual_rate_pct,
                  source_notes`,
       [
-        resolveLandlordTarget(req.user!, req.body?.landlordId, 'company'),
+        await landlordForRequest(req, 'company'),
         body.stateCode,
         body.effectiveYear,
         body.annualRatePct,
@@ -1425,7 +1425,7 @@ landlordsRouter.delete('/me/deposit-interest-overrides/:state/:year',
       await query(
         `DELETE FROM landlord_deposit_interest_rate_overrides
           WHERE landlord_id = $1 AND state_code = $2 AND effective_year = $3`,
-        [resolveLandlordTarget(req.user!, req.body?.landlordId, 'company'), stateCode, year],
+        [await landlordForRequest(req, 'company'), stateCode, year],
       )
       res.json({ success: true })
     } catch (e) { next(e) }
@@ -2844,7 +2844,7 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
     // company, silently when it owns one.
     const landlordId = unitId
       ? await landlordIdForUnit(req.user!, String(unitId), query)
-      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'invite')
+      : await landlordForRequest(req, 'invite')
 
     // Cross-landlord conflict — same rule as /onboard-tenant. If this email is
     // already an active tenant of a DIFFERENT landlord, refuse.
@@ -3037,7 +3037,7 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit-pending', requirePerm('tena
     // session sat on, which would have filed Mountain View's residents into Oak
     // Park's books on a single wrong click, with nothing on screen naming the
     // company the rows were going to.
-    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
+    const landlordId = await landlordForRequest(req, 'import')
 
     type RowResult = {
       rowIndex: number
@@ -3899,7 +3899,7 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
     // session sat on, which would have filed Mountain View's residents into Oak
     // Park's books on a single wrong click, with nothing on screen naming the
     // company the rows were going to.
-    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
+    const landlordId = await landlordForRequest(req, 'import')
 
     // Pre-load existing properties + units for this landlord so we can
     // find-or-create idempotently. Property match is on lower(name) +
@@ -4214,7 +4214,7 @@ landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('propertie
     // session sat on, which would have filed Mountain View's residents into Oak
     // Park's books on a single wrong click, with nothing on screen naming the
     // company the rows were going to.
-    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
+    const landlordId = await landlordForRequest(req, 'import')
 
     for (const row of rows as PropertyCsvRow[]) {
       const blockers = (row.issues || []).filter(i => i.severity === 'block')
@@ -4506,7 +4506,7 @@ landlordsRouter.post('/me/onboard-tenants-csv/validate', requirePerm('tenants.cr
     // session sat on, which would have filed Mountain View's residents into Oak
     // Park's books on a single wrong click, with nothing on screen naming the
     // company the rows were going to.
-    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
+    const landlordId = await landlordForRequest(req, 'import')
 
     const units = await query<any>(
       `SELECT u.id, u.unit_number, u.property_id, p.name AS property_name
@@ -4820,7 +4820,7 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
     // session sat on, which would have filed Mountain View's residents into Oak
     // Park's books on a single wrong click, with nothing on screen naming the
     // company the rows were going to.
-    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
+    const landlordId = await landlordForRequest(req, 'import')
 
     // Defense in depth: re-resolve unit ownership and check no blockers remain.
     const unitIds = Array.from(new Set((rows as CsvRow[]).map(r => r.resolvedUnitId).filter(Boolean) as string[]))
@@ -5254,7 +5254,7 @@ landlordsRouter.post('/me/onboard-payment-history-csv/validate', requirePerm('te
     // session sat on, which would have filed Mountain View's residents into Oak
     // Park's books on a single wrong click, with nothing on screen naming the
     // company the rows were going to.
-    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
+    const landlordId = await landlordForRequest(req, 'import')
 
     // Pre-load every active-lease tenant in the landlord's portfolio.
     // S29X-round-3: this used to load only the emails referenced in
@@ -5514,7 +5514,7 @@ landlordsRouter.post('/me/onboard-payment-history-csv/commit', requirePerm('paym
     // session sat on, which would have filed Mountain View's residents into Oak
     // Park's books on a single wrong click, with nothing on screen naming the
     // company the rows were going to.
-    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
+    const landlordId = await landlordForRequest(req, 'import')
 
     // Defense in depth: every row must have resolved IDs and zero blockers.
     for (const row of rows as PaymentCsvRow[]) {
@@ -5938,7 +5938,7 @@ landlordsRouter.get('/me/otp/visibility', requireAuth, requireLandlord, async (r
 landlordsRouter.get('/me/otp/eligible-tenants', requireAuth, requireLandlord, async (req, res, next) => {
   try {
     const { isOtpVisibleForLandlord, getQualificationStatus } = await import('../services/otp')
-    const otpLandlordId = resolveLandlordTarget(req.user!, req.query.landlordId as string | undefined ?? req.body?.landlordId, 'company')
+    const otpLandlordId = await landlordForRequest(req, 'company')
     const visible = await isOtpVisibleForLandlord(otpLandlordId)
     if (!visible) throw new AppError(403, 'OTP not enabled')
 
@@ -5970,7 +5970,7 @@ landlordsRouter.post('/me/otp/tenants/:tenantId/enable', requireAuth, requireLan
     const { enableOtpForTenant } = await import('../services/otp')
     const result = await enableOtpForTenant({
       tenantId: req.params.tenantId,
-      landlordId: resolveLandlordTarget(req.user!, req.body?.landlordId, 'company'),
+      landlordId: await landlordForRequest(req, 'company'),
       enabledByUserId: req.user!.userId,
     })
     if (!result.ok) throw new AppError(400, result.reason)
@@ -5983,7 +5983,7 @@ landlordsRouter.post('/me/otp/tenants/:tenantId/disable', requireAuth, requireLa
   try {
     const reason = (req.body?.reason as string | undefined) || 'landlord_initiated'
     const { disableOtpForTenant, isOtpVisibleForLandlord } = await import('../services/otp')
-    const otpLandlordId = resolveLandlordTarget(req.user!, req.query.landlordId as string | undefined ?? req.body?.landlordId, 'company')
+    const otpLandlordId = await landlordForRequest(req, 'company')
     const visible = await isOtpVisibleForLandlord(otpLandlordId)
     if (!visible) throw new AppError(403, 'OTP not enabled')
     await disableOtpForTenant({
@@ -5999,7 +5999,7 @@ landlordsRouter.post('/me/otp/tenants/:tenantId/disable', requireAuth, requireLa
 landlordsRouter.get('/me/otp/advances', requireAuth, requireLandlord, async (req, res, next) => {
   try {
     const { isOtpVisibleForLandlord } = await import('../services/otp')
-    const otpLandlordId = resolveLandlordTarget(req.user!, req.query.landlordId as string | undefined ?? req.body?.landlordId, 'company')
+    const otpLandlordId = await landlordForRequest(req, 'company')
     const visible = await isOtpVisibleForLandlord(otpLandlordId)
     if (!visible) throw new AppError(403, 'OTP not enabled')
 
@@ -6052,7 +6052,7 @@ landlordsRouter.patch('/me/default-pm-company', requirePerm('settings.default_pm
     const updated = await queryOne(
       `UPDATE landlords SET default_pm_company_id=$1 WHERE id=$2
        RETURNING id, default_pm_company_id`,
-      [body.pmCompanyId, resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')]
+      [body.pmCompanyId, await landlordForRequest(req, 'company')]
     )
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }

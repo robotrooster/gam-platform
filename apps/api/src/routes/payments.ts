@@ -144,6 +144,8 @@ paymentsRouter.get('/', async (req, res, next) => {
     const payments = await query<any>(`
       SELECT p.*, u.unit_number, pr.name AS property_name,
         tu.first_name AS tenant_first, tu.last_name AS tenant_last,
+        -- S654: how it was paid, for the history's "Paid by" column.
+        COALESCE(p.manual_method, rm.payment_method) AS paid_by,
         -- S568: is this the FIRST open rent charge of a lease while the LANDLORD
         -- is still inside their onboarding reconciliation window? If so the
         -- landlord may mark it paid off-platform (old-system autopay overlap),
@@ -175,6 +177,8 @@ paymentsRouter.get('/', async (req, res, next) => {
                      AND tc.amount_remaining > 0 AND tc.landlord_id = p.landlord_id), '[]'::jsonb)
           AS credit_pool
       FROM payments p
+      LEFT JOIN tenant_remittances rm ON p.stripe_payment_intent_id IS NOT NULL
+                                     AND rm.stripe_payment_intent_id = p.stripe_payment_intent_id
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
       LEFT JOIN landlords ld ON ld.id = p.landlord_id
@@ -1364,4 +1368,180 @@ paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment')
   } finally {
     client.release()
   }
+})
+
+// ── S654 (Nic): A CARD ON THE COUNTER READER, FOR A LEASE BALANCE ────────────
+//
+//   "It needs to be both. It's going to be for the point of sale, ringing up
+//    propane transactions. It's also going to be somebody stops by to pay their
+//    rent because maybe they couldn't log in online and they don't know how
+//    much they owe."
+//
+// Four calls, same shape the register uses for a sale:
+//   GET  /:id/reader/readers          — the readers paired at this charge's property
+//   POST /:id/reader/charge           — quote the balance + card fee, create the
+//                                       (held) intent, push it to the reader
+//   GET  /reader/intents/:pi          — poll while the customer taps
+//   POST /reader/intents/:pi/capture  — book it like an online card payment,
+//                                       then capture; the webhook settles
+//   POST /reader/intents/:pi/cancel   — the customer walked, or the desk changed its mind
+//
+// Money: the intent lands on GAM's Stripe balance and rides Tuesday's payout,
+// exactly like Pay Now (2a). The card fee is the customer's at the same rate as
+// online (3). Nothing is booked until the reader has approved the card — a
+// decline or a walk-away leaves the ledger untouched.
+import {
+  createRentReaderPaymentIntent, processPaymentIntentOnReader,
+  retrieveTerminalPaymentIntent, cancelTerminalPaymentIntent,
+} from '../services/posTerminal'
+
+async function readerAnchor(req: any, paymentId: string) {
+  const pmt = await queryOne<any>(
+    `SELECT p.id, p.landlord_id, p.tenant_id, p.lease_id, p.status, p.work_trade_suspended_at,
+            u.property_id, inv.service_agreement_id
+       FROM payments p
+       JOIN units u ON u.id = p.unit_id
+       LEFT JOIN invoices inv ON inv.id = p.invoice_id
+      WHERE p.id = $1`, [paymentId])
+  if (!pmt) throw new AppError(404, 'Payment not found')
+  if (!canManageLandlordResource(req.user, pmt.landlord_id)) throw new AppError(403, 'Forbidden')
+  if (!pmt.tenant_id) throw new AppError(409, 'This charge has no resident to take a card from')
+  if (pmt.work_trade_suspended_at) throw new AppError(409, 'This charge is covered by work trade and settles at month close')
+  if (pmt.status !== 'pending' && pmt.status !== 'failed') throw new AppError(409, `This charge is not open (status: ${pmt.status})`)
+  return pmt
+}
+
+paymentsRouter.get('/:id/reader/readers', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const pmt = await readerAnchor(req, req.params.id)
+    const readers = await query<any>(
+      `SELECT id, stripe_reader_id, nickname FROM pos_terminal_readers
+        WHERE landlord_id = $1 AND property_id = $2 AND status = 'active'
+        ORDER BY nickname`, [pmt.landlord_id, pmt.property_id])
+    res.json({ success: true, data: readers })
+  } catch (e) { next(e) }
+})
+
+paymentsRouter.post('/:id/reader/charge', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const { stripeReaderId } = z.object({ stripeReaderId: z.string().min(1) }).parse(req.body)
+    const pmt = await readerAnchor(req, req.params.id)
+    const reader = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_terminal_readers
+        WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+      [pmt.landlord_id, stripeReaderId])
+    if (!reader) throw new AppError(404, 'That reader is not paired to this company')
+
+    const quote = await readerQuote(pmt)
+    const intent = await createRentReaderPaymentIntent({
+      landlordId: pmt.landlord_id, propertyId: pmt.property_id, tenantId: pmt.tenant_id,
+      anchorPaymentId: pmt.id,
+      amountCents: Math.round(quote.total * 100),
+      cardFeeCents: Math.round(quote.cardFee * 100),
+    })
+    await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId: intent.id })
+    res.status(201).json({ success: true, data: { paymentIntentId: intent.id, ...quote } })
+  } catch (e) { next(e) }
+})
+
+// S654: the figure the desk shows is the SERVER's — the same arithmetic that
+// prices the online card payment, credit on the account netted, the property's
+// fee rule honored — never a client-side recomputation.
+async function readerQuote(pmt: any) {
+  const q = await chargeLeaseBalance({
+    tenantId: pmt.tenant_id,
+    leaseId: pmt.lease_id ?? undefined,
+    serviceAgreementId: pmt.lease_id ? undefined : (pmt.service_agreement_id ?? undefined),
+    amount: 0, chargeEverything: true, dryRun: true,
+    paymentMethodType: 'card_present', source: 'front_desk_reader',
+  })
+  return {
+    outstanding: q.outstanding ?? 0,
+    creditApplied: q.creditNetted ?? 0,
+    balance: Math.round((q.chargeAmount - q.processingFee) * 100) / 100,
+    cardFee: q.processingFee,
+    total: q.chargeAmount,
+  }
+}
+
+paymentsRouter.get('/:id/reader/quote', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const pmt = await readerAnchor(req, req.params.id)
+    res.json({ success: true, data: await readerQuote(pmt) })
+  } catch (e) { next(e) }
+})
+
+async function ownReaderIntent(req: any, paymentIntentId: string) {
+  const pi = await retrieveTerminalPaymentIntent({ paymentIntentId })
+  const purpose = pi.metadata?.gam_purpose
+  if ((purpose !== 'rent_terminal_pending' && purpose !== 'rent_terminal')
+      || !canManageLandlordResource(req.user, pi.metadata?.gam_landlord_id)) {
+    throw new AppError(404, 'Card charge not found')
+  }
+  return pi
+}
+
+paymentsRouter.get('/reader/intents/:pi', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const pi = await ownReaderIntent(req, req.params.pi)
+    res.json({ success: true, data: {
+      id: pi.id, status: pi.status, amount: pi.amount,
+      lastPaymentError: pi.last_payment_error?.message ?? null,
+    } })
+  } catch (e) { next(e) }
+})
+
+paymentsRouter.post('/reader/intents/:pi/capture', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const pi = await ownReaderIntent(req, req.params.pi)
+    if (pi.status === 'succeeded') {
+      // Already booked and captured (a double click, a retried request).
+      return res.json({ success: true, data: { paymentIntentId: pi.id, status: pi.status, alreadyBooked: true } })
+    }
+    if (pi.status !== 'requires_capture') {
+      throw new AppError(409, pi.status === 'canceled' ? 'This charge was canceled' : 'The reader has not approved the card yet')
+    }
+    // Status, not the metadata label, decides: a 'rent_terminal' intent still at
+    // requires_capture is a capture that failed and was rolled back — it may be
+    // tried again or canceled, never treated as booked.
+    const pmt = await readerAnchor(req, String(pi.metadata?.gam_anchor_payment_id))
+    // Book it exactly as a portal card payment is booked — rows to processing,
+    // remittance, credits, the intent's metadata rewritten to the rent shape —
+    // and capture inside that same transaction, so payment_intent.succeeded
+    // settles the rows down the one path every card payment takes and a failed
+    // capture leaves nothing behind.
+    const booked = await chargeLeaseBalance({
+      tenantId: pmt.tenant_id,
+      leaseId: pmt.lease_id ?? undefined,
+      serviceAgreementId: pmt.lease_id ? undefined : (pmt.service_agreement_id ?? undefined),
+      amount: 0, chargeEverything: true,
+      paymentMethodType: 'card_present', source: 'front_desk_reader',
+      existingIntent: { id: pi.id, amountCents: pi.amount, capture: true },
+    })
+    res.json({ success: true, data: {
+      paymentIntentId: pi.id, remittanceId: booked.remittanceId,
+      total: booked.chargeAmount, cardFee: booked.processingFee, status: 'captured',
+    } })
+  } catch (e) { next(e) }
+})
+
+paymentsRouter.post('/reader/intents/:pi/cancel', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const pi = await ownReaderIntent(req, req.params.pi)
+    if (pi.status === 'succeeded') throw new AppError(409, 'This charge is already booked')
+    const bodyReaderId = typeof req.body?.stripeReaderId === 'string' ? req.body.stripeReaderId : null
+    // Only a reader paired to the company this charge belongs to — a body-supplied
+    // id is never trusted on its own.
+    const reader = bodyReaderId ? await queryOne<{ stripe_reader_id: string }>(
+      `SELECT stripe_reader_id FROM pos_terminal_readers
+        WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+      [pi.metadata?.gam_landlord_id, bodyReaderId]) : null
+    if (reader) {
+      // Clear the prompt off the reader's screen; the intent cancel below is
+      // what matters for the money.
+      await getStripe().terminal.readers.cancelAction(reader.stripe_reader_id).catch(() => {})
+    }
+    const canceled = pi.status === 'canceled' ? pi : await cancelTerminalPaymentIntent({ paymentIntentId: pi.id })
+    res.json({ success: true, data: { paymentIntentId: canceled.id, status: canceled.status } })
+  } catch (e) { next(e) }
 })

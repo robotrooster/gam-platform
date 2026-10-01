@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
+import { isAuthRejection, sessionRenewalDue, fetchAuthMeWithRetry, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -177,7 +177,7 @@ interface AuthUser { id:string;email:string;role:string;firstName:string;lastNam
 // into the TOTP second step when the backend gates on 2FA.
 type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:string } | { kind:'email_otp_required'; emailOtpSession:string }
 type SignupInput = { firstName:string;lastName:string;email:string;password:string;acceptedTerms:boolean;landlordId?:string|null;unitId?:string|null }
-interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string)=>Promise<LoginResult>;signup:(input:SignupInput)=>Promise<{emailOtpSession:string}>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>;resendEmailOtp:(emailOtpSession:string)=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
+interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string,emailFactor?:string|null)=>Promise<LoginResult>;signup:(input:SignupInput)=>Promise<{emailOtpSession:string}>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>;resendEmailOtp:(emailOtpSession:string)=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
 const Ctx = React.createContext<AuthCtx>(null!)
 const useAuth = () => useContext(Ctx)
 
@@ -212,16 +212,33 @@ function AuthProvider({children}:{children:React.ReactNode}) {
     catch(e){ if (isAuthRejection(e)) logout() }  // S540: transient failures keep the token
     finally{ setLoading(false) }
   },[logout])
+  // S654 (Nic): a session was a fixed 7-day pass from the last password sign-in,
+  // never renewed — people were thrown out on the seventh day mid-task. Renew a
+  // pass older than a day on load and whenever the app comes back into view
+  // (the phone's return from the mail app), so a session ends only after seven
+  // idle days. See sessionRenewalDue.
+  const renewSession = useCallback(async()=>{
+    const current = localStorage.getItem('gam_tenant_token')
+    if(!sessionRenewalDue(current)) return
+    try{ const r = await post<{token:string}>('/auth/refresh'); localStorage.setItem('gam_tenant_token', r.data.token); setToken(r.data.token) }
+    catch(e){ if (isAuthRejection(e)) logout() }
+  },[logout])
   useEffect(()=>{
     if(!token){setLoading(false);return}
-    fetchAuthMeWithRetry(() => get<AuthUser>('/auth/me')).then(u=>setUser(u)).catch(e=>{ if (isAuthRejection(e)) logout() }).finally(()=>setLoading(false))
-  },[token,logout])
+    fetchAuthMeWithRetry(() => get<AuthUser>('/auth/me')).then(u=>{ setUser(u); return renewSession() }).catch(e=>{ if (isAuthRejection(e)) logout() }).finally(()=>setLoading(false))
+  },[token,logout,renewSession])
+  useEffect(()=>{
+    const onVisible = ()=>{ if(document.visibilityState==='visible') renewSession() }
+    document.addEventListener('visibilitychange', onVisible)
+    return ()=>document.removeEventListener('visibilitychange', onVisible)
+  },[renewSession])
   // S289: post-credentials login. Returns a discriminated result so
   // LoginPage can pivot into the TOTP second step when 2FA is enabled
   // on the account. Doesn't set user state until the full JWT lands —
   // a totp_session JWT is not a valid auth token.
-  const login = async(email:string,password:string):Promise<LoginResult>=>{
-    const res=await post<any>('/auth/login',{email,password})
+  const login = async(email:string,password:string,emailFactor?:string|null):Promise<LoginResult>=>{
+    // S654: emailFactor is the bill link's proof of the inbox — see LoginPage.
+    const res=await post<any>('/auth/login',{email,password,...(emailFactor?{emailFactor}:{})})
     const data=res.data!
     if(data.requiresTotp){ return { kind:'totp_required', totpSession:data.totpSession as string } }
     // S571: tenants with ACH set up get email-code 2FA (like admin).
@@ -1637,14 +1654,22 @@ import { PaymentsPage as PaymentsPageImpl } from './pages/PaymentsPage'
 // as the page holding it in memory. Cleared as soon as the code is accepted or
 // the step is abandoned.
 function usePendingOtpSession(key: string): [string | null, (v: string | null) => void] {
+  // S654 (Nic): "they go back out to get the two-factor authentication code,
+  // [and] it boots them out." sessionStorage is PER TAB: a resident who reads
+  // the code in their mail app and comes back through the bill email's link
+  // lands in a NEW tab with no pending session, so the code screen is gone and
+  // they are back at the password form. localStorage is shared by every tab on
+  // this origin, so whichever tab they come back in resumes the code step. The
+  // pending token is useless without the emailed code and expires in 15 minutes,
+  // so leaving it in localStorage gives nothing away.
   const [v, setV] = useState<string | null>(() => {
-    try { return sessionStorage.getItem(key) } catch { return null }
+    try { return localStorage.getItem(key) ?? sessionStorage.getItem(key) } catch { return null }
   })
   const set = (next: string | null) => {
     setV(next)
     try {
-      if (next) sessionStorage.setItem(key, next)
-      else sessionStorage.removeItem(key)
+      if (next) localStorage.setItem(key, next)
+      else { localStorage.removeItem(key); sessionStorage.removeItem(key) }
     } catch { /* private mode — behaves exactly as before */ }
   }
   return [v, set]
@@ -4554,7 +4579,23 @@ function DocumentsPage() {
 
 // ── LOGIN ─────────────────────────────────────────────────────
 function LoginPage() {
-  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp } = useAuth(); const navigate = useNavigate()
+  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, token:signedIn, loading:authLoading } = useAuth(); const navigate = useNavigate()
+  // S654 (Nic): the bill's Pay now link arrives as /login?ef=…&to=/payments —
+  // `ef` is proof of the inbox (signEmailFactorToken on the API) so the
+  // password alone finishes the sign-in; `to` is where to land. Read once and
+  // taken off the address bar. A bounce from a signed-out page (ToSignIn)
+  // passes its own destination in router state.
+  const [entry] = useState(()=>{
+    try{
+      const q = new URLSearchParams(window.location.search)
+      const ef = q.get('ef'); const to = q.get('to')
+      if(ef||to) window.history.replaceState(null,'',window.location.pathname)
+      return { ef: ef||null, to: safeLanding(to) }
+    }catch{ return { ef:null, to:null } }
+  })
+  const location = useLocation()
+  const landing = entry.to || safeLanding((location.state as any)?.to) || '/home'
+  useEffect(()=>{ if(signedIn && !authLoading) navigate(landing,{replace:true}) },[signedIn,authLoading])  // already signed in on this device
   const [err, setErr] = useState(''); const [loading, setLoading] = useState(false)
   const [totpSession, setTotpSession] = useState<string|null>(null)
   const [emailOtpSession, setEmailOtpSession] = usePendingOtpSession('gam.otp.tenant.login')
@@ -4564,17 +4605,17 @@ function LoginPage() {
   const onSubmit = async(d:{email:string;password:string})=>{
     setLoading(true);setErr('')
     try{
-      const r = await login(d.email,d.password)
+      const r = await login(d.email,d.password,entry.ef)
       if(r.kind==='totp_required'){setTotpSession(r.totpSession);setCode('')}
       else if(r.kind==='email_otp_required'){setEmailOtpSession(r.emailOtpSession);setCode('');setResent(false)}
-      else navigate('/home')
+      else navigate(landing)
     }
     catch(e:any){setErr(e.response?.data?.error||'Login failed')}
     finally{setLoading(false)}
   }
   const onEmailOtpSubmit = async(e:React.FormEvent)=>{
     e.preventDefault();setLoading(true);setErr('')
-    try{ await loginWithEmailOtp(emailOtpSession!,code.trim()); setEmailOtpSession(null); navigate('/home') }
+    try{ await loginWithEmailOtp(emailOtpSession!,code.trim()); setEmailOtpSession(null); navigate(landing) }
     catch(ex:any){
       const msg=ex.response?.data?.error||'Invalid code.'
       setErr(msg)
@@ -4589,7 +4630,7 @@ function LoginPage() {
   }
   const onTotpSubmit = async(e:React.FormEvent)=>{
     e.preventDefault();setLoading(true);setErr('')
-    try{ await loginWithTotp(totpSession!,code.trim()); navigate('/home') }
+    try{ await loginWithTotp(totpSession!,code.trim()); navigate(landing) }
     catch(ex:any){
       const msg=ex.response?.data?.error||'Invalid code.'
       setErr(msg)
@@ -4800,6 +4841,21 @@ function VersionWatch() {
 // Fixed for the class at the router. unlockScrollIfStandalone re-checks the
 // DOM for the shell on every navigation and is a no-op inside it, so signed-in
 // pages keep their own scrolling exactly as before.
+// S654: where a sign-in may land. ONLY a path on this portal: one leading
+// slash and never a second slash or a backslash after it, because the router
+// treats "//evil.example/x" as an absolute URL and would carry a freshly
+// signed-in resident off to another site. Anything else falls back to Home.
+function safeLanding(p: unknown): string | null {
+  return typeof p === 'string' && /^\/(?![\/\\])[A-Za-z0-9\-_\/?=&%.]*$/.test(p) ? p : null
+}
+
+// S654: a signed-out visit to a real page (the bill's Pay now link, a bookmark)
+// signs in and then lands THERE, not on Home.
+function ToSignIn() {
+  const loc = useLocation()
+  return <Navigate to="/login" replace state={{ to: loc.pathname + loc.search }} />
+}
+
 function ScrollUnlock() {
   const location = useLocation()
   useEffect(() => unlockScrollIfStandalone(), [location.pathname])
@@ -4834,7 +4890,7 @@ function App() {
             they are being asked to sign. The authenticated route below stays
             for signing from inside the portal. */}
         <Route path="/sign/:documentId" element={<SignPage />} />
-        <Route path="/" element={token ? <Layout /> : <Navigate to="/login" replace />}>
+        <Route path="/" element={token ? <Layout /> : <ToSignIn />}>
           <Route index element={<DefaultPage />} />
           <Route path="notifications"    element={<TenantNotificationsPage />} />
           <Route path="home"             element={<HomePage />} />

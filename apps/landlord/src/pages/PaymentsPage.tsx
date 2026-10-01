@@ -1,7 +1,7 @@
-import { Fragment, useState } from 'react'
+import { Fragment, useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
+import { humanize, paidByLabel, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
          type ManualPaymentMethod,
          TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL } from '@gam/shared'
 import { api, apiGet, apiPost } from '../lib/api'
@@ -101,6 +101,17 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
   const [err, setErr] = useState<string | null>(null)
 
   const due = Number(group.total)
+
+  // ── S654 (Nic): A CARD ON THE COUNTER READER ────────────────────────────
+  //
+  //   "Somebody stops by to pay their rent because maybe they couldn't log in
+  //    online and they don't know how much they owe." Same button row as cash,
+  //    check and money order; same money path as paying online (GAM's
+  //    balance, Tuesday payout, the card fee on the customer at the same rate).
+  const [viaReader, setViaReader] = useState(false)
+  const [readerId, setReaderId] = useState<string>('')
+  // Per-lease totals as each tap completes (a household with two spaces taps twice).
+  const [tapped, setTapped] = useState<Record<string, number>>({})
   const cash = method === 'cash'
   const paid = Number(tendered.replace(/[^\d.]/g, '')) || 0
   // Change is the arithmetic nobody should be doing in their head with a queue
@@ -130,6 +141,32 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
   // A check or money order is identified by its number — that number IS the
   // receipt if the payment is ever questioned, so it is required, not optional.
   const needsNumber = method === 'check' || method === 'money_order'
+  const { data: readers = [], isLoading: readersLoading, error: readersError } = useQuery<any[]>(
+    ['reader-readers', anchor?.id],
+    () => apiGet<any[]>(`/payments/${anchor.id}/reader/readers`),
+    { enabled: viaReader && !!anchor })
+  useEffect(() => {
+    if (viaReader && !readerId && readers.length === 1) setReaderId(readers[0].stripeReaderId)
+  }, [viaReader, readers, readerId])
+  // One block per lease: the reader takes one lease at a time (its own fee and
+  // receipt, S581), so a household renting two spaces taps once per space.
+  const readerBlocks: Array<{ key: string; anchor: any; label: string | null }> = (() => {
+    const leaseIds: string[] = Array.isArray(group.leaseIds) ? group.leaseIds : []
+    if (leaseIds.length > 1) {
+      return leaseIds.map((id: string) => {
+        const a = group.charges.find((c: any) => c.leaseId === id && c.type === 'rent') ?? group.charges.find((c: any) => c.leaseId === id)
+        return a ? { key: id, anchor: a, label: a.unitNumber ? `Unit ${a.unitNumber}` : null } : null
+      }).filter(Boolean) as any
+    }
+    return anchor ? [{ key: anchor.id, anchor, label: null }] : []
+  })()
+  const allTapped = readerBlocks.length > 0 && readerBlocks.every(b => tapped[b.key] != null)
+  useEffect(() => {
+    if (!allTapped) return
+    const sum = Object.values(tapped).reduce((a, b) => a + b, 0)
+    const name = `${group.tenantFirst ?? ''} ${group.tenantLast ?? ''}`.trim()
+    onRecorded(`Took ${fmt(sum)} by card on the reader from ${name}`)
+  }, [allTapped])  // eslint-disable-line react-hooks/exhaustive-deps
   const numberLabel = method === 'check' ? 'Check number' : 'Money order number'
   const ready = !!anchor && entered && !short
     && (!needsNumber || reference.trim().length > 0)
@@ -206,13 +243,16 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
           display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 12,
         }}>
           {MANUAL_PAYMENT_METHODS.map(m => (
-            <button key={m} onClick={() => { setMethod(m); setReference(''); setTendered('') }}
-              className={`btn btn-sm ${method === m ? 'btn-primary' : 'btn-ghost'}`}
+            <button key={m} onClick={() => { setMethod(m); setViaReader(false); setReference(''); setTendered('') }}
+              className={`btn btn-sm ${!viaReader && method === m ? 'btn-primary' : 'btn-ghost'}`}
               style={{ width: '100%' }}>{MANUAL_PAYMENT_METHOD_LABELS[m]}</button>
           ))}
+          <button onClick={() => { setViaReader(true); setReference(''); setTendered('') }}
+            className={`btn btn-sm ${viaReader ? 'btn-primary' : 'btn-ghost'}`}
+            style={{ width: '100%' }}>Card on the reader</button>
         </div>
 
-        <>
+        {!viaReader && (<>
           <div style={{ marginBottom: 12 }}>
             <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>
               {cash ? 'Cash received' : method === 'check' ? 'Check amount' : 'Money order amount'}
@@ -285,22 +325,166 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
                 onChange={e => setReference(e.target.value)} style={{ width: '100%', marginTop: 4 }} />
             </div>
           )}
-        </>
+        </>)}
+
+        {viaReader && (
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ fontSize: '.75rem', color: 'var(--text-3)', display: 'block' }}>Reader</label>
+            {readersLoading ? (
+              <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginTop: 4 }}>Looking for readers at this property…</div>
+            ) : readersError ? (
+              <div style={{ fontSize: '.76rem', color: 'var(--red)', marginTop: 4 }}>
+                {(readersError as any)?.response?.data?.error || 'Could not load the readers for this property.'}
+              </div>
+            ) : readers.length === 0 ? (
+              <div style={{ fontSize: '.76rem', color: 'var(--red)', marginTop: 4 }}>
+                No reader is paired at this property. Pair one under Point of Sale → Readers.
+              </div>
+            ) : readers.length === 1 ? (
+              <div style={{ fontSize: '.85rem', fontWeight: 600, marginTop: 4 }}>{readers[0].nickname}</div>
+            ) : (
+              <select className="form-input" value={readerId} onChange={e => setReaderId(e.target.value)}
+                style={{ width: '100%', marginTop: 4 }}>
+                <option value="">Choose a reader…</option>
+                {readers.map((r: any) => <option key={r.stripeReaderId} value={r.stripeReaderId}>{r.nickname}</option>)}
+              </select>
+            )}
+            {readerId && readerBlocks.map(b => (
+              <ReaderLeaseBlock key={b.key} anchor={b.anchor} label={b.label} readerId={readerId}
+                done={tapped[b.key] != null}
+                onDone={total => setTapped(prev => ({ ...prev, [b.key]: total }))} />
+            ))}
+          </div>
+        )}
 
         {err && <div className="alert alert-warning" style={{ fontSize: '.8rem', marginBottom: 10 }}>{err}</div>}
 
         <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
-          Settles all {group.charges.length} charge{group.charges.length === 1 ? '' : 's'} in full.
-          You already hold the funds, so GAM disburses nothing. No fee.
+          {viaReader ? (
+            <>Settles all {group.charges.length} charge{group.charges.length === 1 ? '' : 's'} in full.
+              The money lands on GAM&apos;s balance and reaches you in the next payout, like any card
+              payment; the card fee is the customer&apos;s.</>
+          ) : (
+            <>Settles all {group.charges.length} charge{group.charges.length === 1 ? '' : 's'} in full.
+              You already hold the funds, so GAM disburses nothing. No fee.</>
+          )}
         </div>
 
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn btn-primary" style={{ flex: 1 }} disabled={!ready || mut.isLoading}
-            onClick={() => mut.mutate()}>
-            {mut.isLoading ? 'Recording…' : `Record ${fmt(due)}`}
-          </button>
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          {!viaReader && (
+            <button className="btn btn-primary" style={{ flex: 1 }} disabled={!ready || mut.isLoading}
+              onClick={() => mut.mutate()}>
+              {mut.isLoading ? 'Recording…' : `Record ${fmt(due)}`}
+            </button>
+          )}
+          <button className="btn btn-ghost" style={viaReader ? { flex: 1 } : undefined} onClick={onClose}>{viaReader ? 'Close' : 'Cancel'}</button>
         </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * S654: one lease's card-on-the-reader flow. The figure is the SERVER's quote
+ * (the online card arithmetic, credit on the account netted, the property's
+ * fee rule honored). Every await checks it is still the current attempt, so a
+ * cancel-then-resend never has two flows fighting over one screen; closing the
+ * window mid-flow clears the reader and releases the hold.
+ */
+function ReaderLeaseBlock({ anchor, label, readerId, done, onDone }: {
+  anchor: any; label: string | null; readerId: string; done: boolean; onDone: (total: number) => void
+}) {
+  const { data: quote, isLoading: quoting, error: quoteError } = useQuery<any>(
+    ['reader-quote', anchor.id],
+    () => apiGet<any>(`/payments/${anchor.id}/reader/quote`),
+    { staleTime: 0, retry: false })
+  const [stage, setStage] = useState<'idle' | 'sending' | 'waiting' | 'capturing' | 'done'>(done ? 'done' : 'idle')
+  const [err, setErr] = useState<string | null>(null)
+  const attempt = useRef(0)
+  const livePi = useRef<string | null>(null)
+  const readerRef = useRef(readerId); readerRef.current = readerId
+  useEffect(() => () => {
+    attempt.current++
+    const pi = livePi.current; livePi.current = null
+    if (pi) apiPost(`/payments/reader/intents/${pi}/cancel`, { stripeReaderId: readerRef.current }).catch(() => {})
+  }, [])
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+  const send = async () => {
+    const mine = ++attempt.current
+    const live = () => attempt.current === mine
+    setErr(null); setStage('sending')
+    let piId: string | null = null
+    try {
+      const r: any = await apiPost(`/payments/${anchor.id}/reader/charge`, { stripeReaderId: readerId })
+      piId = r.data.paymentIntentId
+      if (!live()) { apiPost(`/payments/reader/intents/${piId}/cancel`, { stripeReaderId: readerId }).catch(() => {}); return }
+      livePi.current = piId
+      setStage('waiting')
+      const deadline = Date.now() + 90_000
+      let st: any = null
+      while (Date.now() < deadline) {
+        st = await apiGet<any>(`/payments/reader/intents/${piId}`)
+        if (!live()) return
+        if (st.lastPaymentError) throw new Error(st.lastPaymentError)
+        if (st.status === 'requires_capture' || st.status === 'succeeded') break
+        if (st.status === 'canceled') throw new Error('Canceled on the reader')
+        await sleep(2000)
+        if (!live()) return
+      }
+      if (!st || (st.status !== 'requires_capture' && st.status !== 'succeeded')) {
+        throw new Error('The reader timed out waiting for the card')
+      }
+      setStage('capturing')
+      const result: any = await apiPost(`/payments/reader/intents/${piId}/capture`, {})
+      livePi.current = null
+      if (!live()) return
+      setStage('done')
+      onDone(Number(result.data.total ?? quote?.total ?? 0))
+    } catch (e: any) {
+      if (!live()) return
+      setErr(e?.response?.data?.error || e?.message || 'The reader did not complete the payment')
+      setStage('idle')
+      if (piId) { livePi.current = null; await apiPost(`/payments/reader/intents/${piId}/cancel`, { stripeReaderId: readerId }).catch(() => {}) }
+    }
+  }
+  const cancel = async () => {
+    attempt.current++
+    const pi = livePi.current; livePi.current = null
+    if (pi) await apiPost(`/payments/reader/intents/${pi}/cancel`, { stripeReaderId: readerId }).catch(() => {})
+    setStage('idle'); setErr('Canceled.')
+  }
+  const busy = stage === 'sending' || stage === 'waiting' || stage === 'capturing'
+  return (
+    <div style={{ marginTop: 12, padding: '10px 12px', border: '1px solid var(--border-1)', borderRadius: 8 }}>
+      {label && <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 4 }}>{label}</div>}
+      {quoting ? (
+        <div style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>Working out the total…</div>
+      ) : quoteError ? (
+        <div style={{ fontSize: '.78rem', color: 'var(--red)' }}>{(quoteError as any)?.response?.data?.error || 'Could not work out the total.'}</div>
+      ) : quote ? (
+        <>
+          <div style={{ fontSize: '.95rem', fontWeight: 800, color: 'var(--gold)' }}>{fmt(Number(quote.total))} on the card</div>
+          <div style={{ fontSize: '.76rem', color: 'var(--text-2)', marginTop: 2, lineHeight: 1.5 }}>
+            {Number(quote.creditApplied) > 0 && <>{fmt(Number(quote.outstanding))} owed − {fmt(Number(quote.creditApplied))} credit on the account = </>}
+            {fmt(Number(quote.balance))} balance + {fmt(Number(quote.cardFee))} card fee — the same rate as paying online. The reader shows this total.
+          </div>
+        </>
+      ) : null}
+      {busy && (
+        <div style={{ fontSize: '.8rem', color: 'var(--text-1)', marginTop: 8 }}>
+          {stage === 'sending' ? 'Sending to the reader…' : stage === 'waiting' ? 'Waiting for the card on the reader…' : 'Card approved — recording…'}
+        </div>
+      )}
+      {stage === 'done' && <div style={{ fontSize: '.8rem', color: 'var(--green, #3fb950)', marginTop: 8 }}>Taken.</div>}
+      {err && <div style={{ fontSize: '.76rem', color: 'var(--red)', marginTop: 6 }}>{err}</div>}
+      <div style={{ marginTop: 10 }}>
+        {busy ? (
+          <button className="btn btn-ghost" style={{ width: '100%' }} disabled={stage === 'capturing'} onClick={cancel}>Cancel on the reader</button>
+        ) : stage !== 'done' && (
+          <button className="btn btn-primary" style={{ width: '100%' }} disabled={!quote || !readerId} onClick={send}>
+            Send {quote ? fmt(Number(quote.total)) : ''} to the reader
+          </button>
+        )}
       </div>
     </div>
   )
@@ -429,6 +613,7 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
           )}
           {row('Type', humanize(p.type))}
           {row('Entry Description', p.entryDescription, { mono: true })}
+          {paidByLabel(p.paidBy, p.paymentChannel) && row('Paid by', paidByLabel(p.paidBy, p.paymentChannel))}
           {row('Due Date', p.dueDate ? new Date(p.dueDate).toLocaleDateString() : null, { mono: true })}
           {row('Processed', p.processedAt ? new Date(p.processedAt).toLocaleString() : null, { mono: true })}
           {row('Settled', p.settledAt ? new Date(p.settledAt).toLocaleString() : null, { mono: true })}
@@ -1117,6 +1302,7 @@ export function PaymentsPage() {
                 <th>Description</th>
                 <th>Amount</th>
                 <th>Status</th>
+                <th>Paid by</th>
                 <th>Return</th>
               </tr>
             </thead>
@@ -1162,6 +1348,10 @@ export function PaymentsPage() {
                     {partial && (
                       <span className="badge badge-amber" style={{ marginLeft: 6 }}>partial</span>
                     )}
+                  </td>
+                  {/* S654 (Nic): online and in person are different facts about a card. */}
+                  <td style={{ fontSize: '.76rem', color: 'var(--text-2)', whiteSpace: 'nowrap' }}>
+                    {paidByLabel(p.paidBy, p.paymentChannel) ?? '—'}
                   </td>
                   <td>
                     {p.returnCode

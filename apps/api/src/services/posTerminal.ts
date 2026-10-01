@@ -208,6 +208,46 @@ export async function createCardPresentPaymentIntent(opts: {
 }
 
 /**
+ * S654 (Nic): "somebody stops by to pay their rent… it needs to be both" — the
+ * counter reader takes a lease balance, not only a register sale.
+ *
+ * The intent is born HELD ('rent_terminal_pending', ignored by the webhook) so
+ * a declined or abandoned tap touches nothing. When the reader approves, the
+ * capture route runs the same accounting as an online card payment, rewrites
+ * the purpose to 'rent_terminal', and only then captures — so
+ * payment_intent.succeeded settles the rows exactly as it does for Pay Now.
+ */
+export async function createRentReaderPaymentIntent(opts: {
+  landlordId:       string
+  propertyId:       string
+  tenantId:         string
+  anchorPaymentId:  string
+  amountCents:      number       // balance + card fee, in cents
+  cardFeeCents:     number
+  description?:     string
+}): Promise<Stripe.PaymentIntent> {
+  if (!Number.isInteger(opts.amountCents) || opts.amountCents <= 0) {
+    throw new AppError(400, 'amountCents must be a positive integer')
+  }
+  const stripe = getStripe()
+  return stripe.paymentIntents.create({
+    amount:               opts.amountCents,
+    currency:             'usd',
+    payment_method_types: ['card_present'],
+    capture_method:       'manual',
+    description:          opts.description ?? 'Balance - Gold Asset Management',
+    metadata: {
+      gam_purpose:           'rent_terminal_pending',
+      gam_landlord_id:       opts.landlordId,
+      gam_property_id:       opts.propertyId,
+      gam_tenant_id:         opts.tenantId,
+      gam_anchor_payment_id: opts.anchorPaymentId,
+      gam_card_fee_cents:    String(Math.max(0, Math.round(opts.cardFeeCents))),
+    },
+  })
+}
+
+/**
  * Push a created PaymentIntent to a physical reader (server-driven
  * flow). The reader prompts the customer (tap / insert / swipe);
  * Stripe transitions the PI to `requires_capture` on successful auth

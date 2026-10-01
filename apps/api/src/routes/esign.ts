@@ -58,7 +58,7 @@ import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType }
 import { activateHomeSaleContract } from '../services/homeSale'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 import { landlordSigningContact } from '../services/landlordSigningContact'
-import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, fileUnderCompany } from '../lib/landlordScope'
+import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, fileUnderCompany } from '../lib/landlordScope'
 
 export const esignRouter = Router()
 
@@ -3023,7 +3023,7 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
     // standalone form), the account names the company.
     const docLandlordId = finalUnitId
       ? await landlordIdForUnit(req.user!, finalUnitId, query)
-      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'document')
+      : await landlordForRequest(req, 'document')
 
     // S535: templates are per unit type and may be property-locked —
     // refuse incompatible pairings (NULLs fit everything).
@@ -3903,7 +3903,7 @@ esignRouter.post('/documents/addendum-terms/batch', requireAuth, requirePerm('le
     // "landlord_all" has to mean one named company — an account that owns two
     // would otherwise paper both companies' residents from one click. Named
     // explicitly, or the account's only company when it has one.
-    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'addendum batch')
+    const landlordId = await landlordForRequest(req, 'addendum batch')
     const landlordUserId = req.user!.userId
 
     // 2. Template ownership

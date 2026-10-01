@@ -38,6 +38,18 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── S654: a card on the counter reader ────────────────────────────────────
+  // The person holding the card is standing at the desk and the clerk is
+  // watching the reader's screen. A misheard name sends someone else's balance
+  // to the reader; the flow lives in the record-a-payment window with the
+  // balance, the card fee and the reader's name on screen. The agent still
+  // records a cash, check or money-order payment (record_cash_payment).
+  'payments POST /:id/reader/charge':
+    'sends a resident\'s balance to the physical card reader on the counter. Done from the record-a-payment window with the balance and the reader on screen; a misheard name is someone else\'s balance on the reader.',
+  'payments POST /reader/intents/:pi/capture':
+    'books and captures a card the reader has approved — the second half of the same on-screen flow, nothing to say out loud.',
+  'payments POST /reader/intents/:pi/cancel':
+    'clears the reader\'s screen and releases the hold on a card — the escape hatch of the same on-screen flow.',
   // ── S648: register pay links ──────────────────────────────────────────────
   // A pay link is a register cart sent as a card charge to someone's inbox. The
   // amount is whatever the desk rang up, and the email goes to an address typed

@@ -221,3 +221,34 @@ emailOtpRouter.get('/status', requireAuth, async (req, res, next) => {
     })
   } catch (e) { next(e) }
 })
+
+/**
+ * S654 (Nic): "if there's a way that the … invoice link email can contain a
+ * bypass where they can just get on and pay their bill."
+ *
+ * The emailed code proves one thing: the person holds the inbox. Opening a
+ * link that arrived in that same inbox proves the same thing. So the bill's
+ * Pay now link carries this token, and a sign-in that presents it needs only
+ * the password — both factors, and no leaving the app to go read a code (which
+ * is where phones were losing people). It is bound to one account, lives for
+ * a billing cycle, and does nothing on its own: without the password it is a
+ * link to the sign-in page. It never stands in for an authenticator app.
+ */
+const EMAIL_FACTOR_TTL = '35d'
+
+export function signEmailFactorToken(claims: { userId: string; email: string }): string {
+  return jwt.sign(
+    { userId: claims.userId, email: claims.email, purpose: 'email_factor' },
+    process.env.JWT_SECRET!,
+    { expiresIn: EMAIL_FACTOR_TTL },
+  )
+}
+
+/** The account an email-factor token vouches for; null when it is not one (expired, forged, or some other kind of token). */
+export function verifyEmailFactorToken(token: string): { userId: string; email: string } | null {
+  try {
+    const p = jwt.verify(token, process.env.JWT_SECRET!) as any
+    if (!p || p.purpose !== 'email_factor' || !p.userId || !p.email) return null
+    return { userId: String(p.userId), email: String(p.email) }
+  } catch { return null }
+}

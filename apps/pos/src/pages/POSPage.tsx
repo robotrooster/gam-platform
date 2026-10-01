@@ -31,8 +31,9 @@ const pct = (n: any) => n != null ? `${(Number(n)*100).toFixed(2)}%` : '—'
 const STATUS_MAP: Record<string,string> = { completed:'badge-green', voided:'badge-red', refunded:'badge-amber', partial_refund:'badge-amber' }
 // S653 (Nic): "flag the history different for pay links vs terminal reader."
 // The API says HOW a card arrived (tender); payment_method alone says only 'card'.
-const METHOD_MAP: Record<string,string> = { cash:'badge-green', card:'badge-blue', card_reader:'badge-blue', pay_link:'badge-gold', card_on_file:'badge-blue', charge:'badge-amber' }
-const TENDER_LABEL: Record<string,string> = { cash:'Cash', card:'Card', card_reader:'Card reader', pay_link:'Pay link (paid online)', card_on_file:'Card on file', charge:'Charge account' }
+const METHOD_MAP: Record<string,string> = { cash:'badge-green', card:'badge-blue', card_reader:'badge-blue', pay_link:'badge-gold', pay_link_in_person_cash:'badge-gold', pay_link_in_person_card:'badge-gold', card_on_file:'badge-blue', charge:'badge-amber' }
+// S654 (Nic): online and in person are different facts about the same card.
+const TENDER_LABEL: Record<string,string> = { cash:'Cash', card:'Card · online', card_reader:'Card · in person', pay_link:'Pay link · online', pay_link_in_person_cash:'Pay link · in person (cash)', pay_link_in_person_card:'Pay link · in person (card)', card_on_file:'Card on file', charge:'Charge account' }
 // S512 LAUNCH: the "charge" (FlexCharge) tender is hidden at launch with the
 // rest of the Flex Suite. The button is filtered out of the register picker so
 // a clerk can only ring cash/card; all charge code stays for post-launch.
@@ -173,11 +174,12 @@ export function POSPage() {
   const propQ = registerProperty ? `?propertyId=${registerProperty}` : ''
   const { data: items = [] } = useQuery<any[]>(['pos-items', registerProperty], () => apiGet(`/pos/items${propQ}`))
   // POS #1: business-level default margin → drives item auto-pricing.
-  const { data: posSettings } = useQuery<any>('pos-settings', () => apiGet<any>('/pos/settings'))
+  // S654 (Nic): no default company — every register call names the property.
+  const { data: posSettings } = useQuery<any>(['pos-settings', registerProperty], () => apiGet<any>(`/pos/settings?propertyId=${registerProperty}`), { enabled: !!registerProperty })
   const defaultMarginPct: number | null = posSettings?.defaultMarginPct ?? null
   const [marginEdit, setMarginEdit] = useState('')
   const saveMarginMut = useMutation(
-    (v: string) => apiPatch('/pos/settings', { defaultMarginPct: v === '' ? null : Number(v) }),
+    (v: string) => apiPatch('/pos/settings', { propertyId: registerProperty, defaultMarginPct: v === '' ? null : Number(v) }),
     { onSuccess: () => qc.invalidateQueries('pos-settings') }
   )
   // S218: pos_categories from the API replaces the old hardcoded
@@ -229,13 +231,13 @@ export function POSPage() {
   )
   const cardOnFile = useQuery<any>(
     ['pos-card-on-file', tenantId, posCustomerId],
-    () => apiGet(`/pos/card-on-file?${tenantId?`tenantId=${tenantId}`:`posCustomerId=${posCustomerId}`}`),
+    () => apiGet(`/pos/card-on-file?propertyId=${registerProperty}&${tenantId?`tenantId=${tenantId}`:`posCustomerId=${posCustomerId}`}`),
     { enabled: method==='card_on_file' && !!(tenantId||posCustomerId), retry: false },
   )
   const { data: taxRates = [] } = useQuery<any[]>(['pos-tax-rates', registerProperty], () => apiGet(`/pos/tax-rates${propQ}`), { enabled: tab==='taxes'||tab==='register' })
   const { data: discounts = [] } = useQuery<any[]>(['pos-discounts', registerProperty], () => apiGet(`/pos/discounts${propQ}`), { enabled: tab==='discounts'||tab==='register' })
   const { data: txns = [], isLoading: txLoading } = useQuery<any[]>(['pos-transactions', registerProperty], () => apiGet(`/pos/transactions${propQ}`), { enabled: tab==='history' })
-  const { data: vendors = [] } = useQuery<any[]>('pos-vendors', () => apiGet('/pos/vendors'), { enabled: tab==='vendors'||tab==='orders' })
+  const { data: vendors = [] } = useQuery<any[]>(['pos-vendors', registerProperty], () => apiGet(`/pos/vendors?propertyId=${registerProperty}`), { enabled: !!registerProperty && (tab==='vendors'||tab==='orders') })
   const { data: purchaseOrders = [] } = useQuery<any[]>(['pos-purchase-orders', registerProperty], () => apiGet(`/pos/purchase-orders${propQ}`), { enabled: tab==='orders' })
   const { data: inventoryLog = [] } = useQuery<any[]>(['pos-inventory-log', registerProperty], () => apiGet(`/pos/inventory-log${propQ}`), { enabled: tab==='inventory' })
   const { data: lowStock = [] } = useQuery<any[]>(['pos-low-stock', registerProperty], () => apiGet(`/pos/low-stock${propQ}`), { enabled: tab==='inventory' })
@@ -248,6 +250,20 @@ export function POSPage() {
     () => listRegisteredReaders(registerProperty || undefined),
     { enabled: (tab==='register' && !!registerProperty) || tab==='readers' },
   )
+  // S654 (Nic): "selecting the reader — that should not pop up unless any
+  // account has more than one reader." One registered reader at the property
+  // IS the reader: it is chosen on its own, and the chooser appears only when
+  // there is a choice to make. A reader chosen for another property is let go
+  // when the register moves.
+  useEffect(() => {
+    if (tab !== 'register' || !registerProperty) return
+    const smart = registeredReaders as RegisteredReader[]
+    const stillHere = activeReader?.type === 'bluetooth'
+      || (activeReader?.type === 'smart' && smart.some(r => r.stripeReaderId === activeReader.stripeReaderId))
+    if (stillHere) return
+    if (smart.length === 1) setActiveReader({ type: 'smart', stripeReaderId: smart[0].stripeReaderId, nickname: smart[0].nickname })
+    else if (activeReader) setActiveReader(null)
+  }, [registeredReaders, registerProperty, tab])  // eslint-disable-line react-hooks/exhaustive-deps
 
   const categories = ['all', ...Array.from(new Set((items as any[]).map((i:any) => i.category)))]
   // S218 / S220: property-aware category filter for dropdown surfaces.
@@ -621,7 +637,7 @@ export function POSPage() {
   }
   const updateItemMut = useMutation((data:any) => apiPatch(`/pos/items/${editItem.id}`, data), { onSuccess: () => { qc.invalidateQueries('pos-items'); setEditItem(null) } })
 
-  const createVendorMut = useMutation(() => apiPost('/pos/vendors', { ...newVendor, leadTimeDays:Number(newVendor.leadTimeDays) }), { onSuccess: () => { qc.invalidateQueries('pos-vendors'); setNewVendor({ name:'', contactName:'', email:'', phone:'', address:'', leadTimeDays:'3', notes:'' }) } })
+  const createVendorMut = useMutation(() => apiPost('/pos/vendors', { propertyId: registerProperty, ...newVendor, leadTimeDays:Number(newVendor.leadTimeDays) }), { onSuccess: () => { qc.invalidateQueries('pos-vendors'); setNewVendor({ name:'', contactName:'', email:'', phone:'', address:'', leadTimeDays:'3', notes:'' }) } })
   const updateVendorMut = useMutation((data:any) => apiPatch(`/pos/vendors/${editVendor.id}`, data), { onSuccess: () => { qc.invalidateQueries('pos-vendors'); setEditVendor(null) } })
 
   const createPOMut = useMutation(() => apiPost('/pos/purchase-orders', { ...newPO, items: poItems, propertyId: registerProperty }), { onSuccess: () => { qc.invalidateQueries('pos-purchase-orders'); setNewPO({ vendorId:'', notes:'', expectedDate:'' }); setPoItems([]) } })

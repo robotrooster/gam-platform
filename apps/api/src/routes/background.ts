@@ -10,7 +10,7 @@ import { calculateRiskScore } from '../services/riskScore'
 import { findStayConflict } from '../services/unitAvailability'
 import { getProvider } from '../services/backgroundProvider'
 import { getPoolIntakeShell, isPoolIntakeLandlord } from '../services/poolIntake'
-import { landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
+import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
 import { PROCESSING_FEES, SCREENING_VALID_INTERVAL_SQL } from '@gam/shared'
 import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
 import { query, queryOne } from '../db'
@@ -1650,7 +1650,7 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
     // message goes to a real person and cannot be unsent.
     const landlordId = unitId
       ? await landlordIdForUnit(req.user!, String(unitId), query)
-      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'outreach')
+      : await landlordForRequest(req, 'outreach')
 
     const existing = await queryOne<any>(
       'SELECT id FROM pool_match_requests WHERE pool_entry_id=$1 AND landlord_id=$2',

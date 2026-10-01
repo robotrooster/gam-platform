@@ -52,6 +52,7 @@ vi.mock('../services/email', async (importOriginal) => {
 
 import { db } from '../db'
 import { authRouter, mintAndSendVerifyEmail } from './auth'
+import { signEmailFactorToken, signEmailOtpSessionToken } from './emailOtp'
 import { errorHandler } from '../middleware/errorHandler'
 import { cleanupAllSchema, seedLandlord, seedTenant } from '../test/dbHelpers'
 
@@ -455,22 +456,143 @@ describe('GET /api/auth/me', () => {
 // ═══════════════════════════════════════════════════════════════
 
 describe('POST /api/auth/refresh', () => {
-  it('happy: returns a new token signed with same claims', async () => {
-    const userId = randomUUID()
-    const claims = { userId, role: 'landlord', email: 'r@test.dev', profileId: randomUUID() }
-    const token = jwt.sign(claims, process.env.JWT_SECRET!, { expiresIn: '1h' })
+  // S654 (Nic): "your most recent deploy signed me out." A session was a fixed
+  // 7-day pass; the portals now renew it while in use. The renewed pass is
+  // REBUILT from the database — a company the account was added to since the
+  // old pass shows up on it, instead of never.
+  it('happy: renews the pass from the database, not from the old claims', async () => {
+    const hash = await bcrypt.hash('super-strong-password-12!', 12)
+    const { rows: [u] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, $2, 'landlord', 'Re', 'New', TRUE) RETURNING id`, [`refresh-${randomUUID()}@example.com`, hash])
+    const { rows: [l1] } = await db.query<{ id: string }>(`INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [u.id])
+    const old = jwt.sign({ userId: u.id, role: 'landlord', email: 'r@test.dev', profileId: null, landlordIds: [l1.id] },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    // Added to a second company AFTER the old pass was minted.
+    const c = await db.connect()
+    let l2 = ''
+    try {
+      await c.query('BEGIN'); l2 = (await seedLandlord(c)).landlordId
+      await c.query(`INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1, $2, 'owner')`, [l2, u.id])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const res = await request(buildApp())
+      .post('/api/auth/refresh').set('Authorization', `Bearer ${old}`).send({})
+    expect(res.status).toBe(200)
+    const decoded = jwt.decode(res.body.data.token) as any
+    expect(decoded.userId).toBe(u.id)
+    expect(decoded.role).toBe('landlord')
+    expect(decoded.purpose).toBeUndefined()
+    expect([...decoded.landlordIds].sort()).toEqual([l1.id, l2].sort())
+    expect(decoded.exp - decoded.iat).toBe(7 * 24 * 3600)
+  })
+
+  it('a pass minted before a password change is refused at /me and cannot renew', async () => {
+    const hash = await bcrypt.hash('super-strong-password-12!', 12)
+    const { rows: [u] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, $2, 'tenant', 'Re', 'Set', TRUE) RETURNING id`, [`reset-${randomUUID()}@example.com`, hash])
+    await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [u.id])
+    const before = jwt.sign({ userId: u.id, role: 'tenant', email: 'x@test.dev', profileId: null, iat: Math.floor(Date.now() / 1000) - 120 },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    await db.query(`UPDATE users SET sessions_valid_from = NOW() WHERE id = $1`, [u.id])   // what every password write does
+    const me = await request(buildApp()).get('/api/auth/me').set('Authorization', `Bearer ${before}`)
+    expect(me.status).toBe(401)
+    const r = await request(buildApp()).post('/api/auth/refresh').set('Authorization', `Bearer ${before}`).send({})
+    expect(r.status).toBe(401)
+    const after = jwt.sign({ userId: u.id, role: 'tenant', email: 'x@test.dev', profileId: null, iat: Math.floor(Date.now() / 1000) + 5 },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    expect((await request(buildApp()).get('/api/auth/me').set('Authorization', `Bearer ${after}`)).status).toBe(200)
+  })
+
+  it('an account that no longer exists cannot renew', async () => {
+    const token = jwt.sign({ userId: randomUUID(), role: 'landlord', email: 'gone@test.dev', profileId: null },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
     const res = await request(buildApp())
       .post('/api/auth/refresh').set('Authorization', `Bearer ${token}`).send({})
-    expect(res.status).toBe(200)
-    expect(res.body.data.token).toEqual(expect.any(String))
-    const decoded = jwt.decode(res.body.data.token) as any
-    expect(decoded.userId).toBe(userId)
-    expect(decoded.role).toBe('landlord')
+    expect(res.status).toBe(401)
   })
 
   it('no auth → 401', async () => {
     const res = await request(buildApp()).post('/api/auth/refresh').send({})
     expect(res.status).toBe(401)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S654: the bill email's link as the email step
+// ═══════════════════════════════════════════════════════════════
+//
+// Nic: "if there's a way that the … invoice link email can contain a bypass
+// where they can just get on and pay their bill." Opening the link proves the
+// inbox — the thing the emailed code proves — so the password alone finishes
+// the sign-in. Both factors, no app-switching on a phone.
+
+describe('POST /api/auth/login with the bill link (emailFactor)', () => {
+  async function seedTenantUser(): Promise<{ userId: string; email: string }> {
+    const email = `ef-${randomUUID()}@example.com`
+    const hash = await bcrypt.hash('super-strong-password-12!', 12)
+    const { rows: [u] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified, email_2fa_enabled)
+       VALUES ($1, $2, 'tenant', 'Pay', 'Er', TRUE, TRUE) RETURNING id`, [email, hash])
+    await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [u.id])
+    return { userId: u.id, email }
+  }
+
+  it('password + the account\'s own bill link = signed in, no code', async () => {
+    const t = await seedTenantUser()
+    const res = await request(buildApp()).post('/api/auth/login')
+      .send({ email: t.email, password: 'super-strong-password-12!', emailFactor: signEmailFactorToken({ userId: t.userId, email: t.email }) })
+    expect(res.status).toBe(200)
+    expect(res.body.data.requiresEmailOtp).toBeUndefined()
+    expect(res.body.data.token).toEqual(expect.any(String))
+    const decoded = jwt.decode(res.body.data.token) as any
+    expect(decoded.userId).toBe(t.userId)
+    expect(decoded.purpose).toBeUndefined()
+    // No code was minted or mailed — the link was the inbox proof.
+    expect((await db.query(`SELECT 1 FROM login_email_otps WHERE user_id = $1`, [t.userId])).rowCount).toBe(0)
+  })
+
+  it('the wrong password is still the wrong password, link or no link', async () => {
+    const t = await seedTenantUser()
+    const res = await request(buildApp()).post('/api/auth/login')
+      .send({ email: t.email, password: 'nope', emailFactor: signEmailFactorToken({ userId: t.userId, email: t.email }) })
+    expect(res.status).toBe(401)
+  })
+
+  it('someone else\'s bill link proves nothing about you — the code is asked for', async () => {
+    const me = await seedTenantUser()
+    const other = await seedTenantUser()
+    const res = await request(buildApp()).post('/api/auth/login')
+      .send({ email: me.email, password: 'super-strong-password-12!', emailFactor: signEmailFactorToken({ userId: other.userId, email: other.email }) })
+    expect(res.status).toBe(200)
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(res.body.data.token).toBeUndefined()
+  })
+
+  it('an expired link, or a pending-code token passed off as one, means the code', async () => {
+    const t = await seedTenantUser()
+    const expired = jwt.sign({ userId: t.userId, email: t.email, purpose: 'email_factor' }, process.env.JWT_SECRET!, { expiresIn: -10 })
+    const r1 = await request(buildApp()).post('/api/auth/login')
+      .send({ email: t.email, password: 'super-strong-password-12!', emailFactor: expired })
+    expect(r1.body.data.requiresEmailOtp).toBe(true)
+    const pending = signEmailOtpSessionToken({ userId: t.userId, role: 'tenant', email: t.email, profileId: null })
+    const r2 = await request(buildApp()).post('/api/auth/login')
+      .send({ email: t.email, password: 'super-strong-password-12!', emailFactor: pending })
+    expect(r2.body.data.requiresEmailOtp).toBe(true)
+    const r3 = await request(buildApp()).post('/api/auth/login')
+      .send({ email: t.email, password: 'super-strong-password-12!', emailFactor: 'garbage' })
+    expect(r3.body.data.requiresEmailOtp).toBe(true)
+  })
+
+  it('an authenticator app is never replaced by the link', async () => {
+    const t = await seedTenantUser()
+    await db.query(`UPDATE users SET totp_enabled = TRUE, totp_secret = 'JBSWY3DPEHPK3PXP' WHERE id = $1`, [t.userId])
+    const res = await request(buildApp()).post('/api/auth/login')
+      .send({ email: t.email, password: 'super-strong-password-12!', emailFactor: signEmailFactorToken({ userId: t.userId, email: t.email }) })
+    expect(res.status).toBe(200)
+    expect(res.body.data.requiresTotp).toBe(true)
+    expect(res.body.data.token).toBeUndefined()
   })
 })
 

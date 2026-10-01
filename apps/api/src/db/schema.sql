@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Mx2sFUgc69UOEaO1kguqa0wmCFHzdmFnUMh7zOWBY3YOfoLka5QYmrDGtLlCFRz
+\restrict iAEQzrHHc0ft3IK0k4rZopcDeFd1FMSxwXgMunXHQNLmIMGojFHBVHhRpOxnYeD
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6566,9 +6566,11 @@ CREATE TABLE public.payments (
     home_sale_installment_id uuid,
     revenue_owner text DEFAULT 'landlord'::text NOT NULL,
     work_trade_suspended_at timestamp with time zone,
+    payment_channel text,
     CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text, 'HOMEPMT'::text, 'FCPAYDOWN'::text, 'DECLINEFEE'::text, 'BALANCE'::text, 'OTHERFEE'::text]))),
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
     CONSTRAINT payments_manual_method_check CHECK (((manual_method IS NULL) OR (manual_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'prior_arrangement'::text])))),
+    CONSTRAINT payments_payment_channel_check CHECK (((payment_channel IS NULL) OR (payment_channel = ANY (ARRAY['online'::text, 'in_person'::text])))),
     CONSTRAINT payments_retry_count_check CHECK (((retry_count >= 0) AND (retry_count <= 2))),
     CONSTRAINT payments_revenue_owner_check CHECK ((revenue_owner = ANY (ARRAY['landlord'::text, 'gam'::text, 'held'::text]))),
     CONSTRAINT payments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text, 'returned'::text, 'paid_via_deposit'::text]))),
@@ -6630,6 +6632,13 @@ COMMENT ON COLUMN public.payments.revenue_owner IS 'S609: whose money this charg
 --
 
 COMMENT ON COLUMN public.payments.work_trade_suspended_at IS 'S634: set while a work-trade agreement covers this charge for a month still being worked. A suspended row is NOT owed — it is excluded from invoices.total_amount and from outstanding balances. Month-close settlement clears it, leaving 0 (hours met) or the prorated lapse.';
+
+
+--
+-- Name: COLUMN payments.payment_channel; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.payment_channel IS 'S654: online (portal / autopay / emailed link) or in_person (card on the counter reader); NULL for cash, check, money order.';
 
 
 --
@@ -11022,6 +11031,7 @@ CREATE TABLE public.users (
     font_style text,
     tenant_invite_accepted_at timestamp with time zone,
     tenant_invite_sent_at timestamp with time zone,
+    sessions_valid_from timestamp with time zone,
     CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text, 'landlord'::text, 'tenant'::text, 'bookkeeper'::text, 'property_manager'::text, 'onsite_manager'::text, 'maintenance'::text, 'business_owner'::text, 'business_staff'::text, 'fitness_user'::text, 'contact'::text, 'portfolio_manager'::text])))
 );
 
@@ -28337,5 +28347,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Mx2sFUgc69UOEaO1kguqa0wmCFHzdmFnUMh7zOWBY3YOfoLka5QYmrDGtLlCFRz
+\unrestrict iAEQzrHHc0ft3IK0k4rZopcDeFd1FMSxwXgMunXHQNLmIMGojFHBVHhRpOxnYeD
 

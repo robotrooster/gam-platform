@@ -121,8 +121,15 @@ describe('S640 team invites survive the account/entity split', () => {
     const askRes = await request(buildApp())
       .post('/api/scopes/bookkeeper/invite').set('Authorization', `Bearer ${two.token}`)
       .send({ email: 'books2@example.com', scope: { accessLevel: 'read_only' } })
-    // S652 (Nic): the account is never asked which company it is — with none
-    // named, the invite lands on the company the account founded.
-    expect(askRes.status, JSON.stringify(askRes.body)).toBe(201)
+    // S654 (Nic, DIRECTIVE): no default company — with none named and nothing
+    // to derive one from, the invite is ASKED which company, never filed under
+    // "the one the account founded". Naming it (or a property in the scope)
+    // is what the form sends.
+    expect(askRes.status, JSON.stringify(askRes.body)).toBe(400)
+    expect(String(askRes.body?.error)).toMatch(/more than one company/i)
+    const namedRes = await request(buildApp())
+      .post('/api/scopes/bookkeeper/invite').set('Authorization', `Bearer ${two.token}`)
+      .send({ email: 'books3@example.com', landlordId: two.landlordIds[0], scope: { accessLevel: 'read_only' } })
+    expect(namedRes.status, JSON.stringify(namedRes.body)).toBe(201)
   })
 })

@@ -14,7 +14,10 @@ import { createNotification } from '../services/notifications'
 import { confirmBookingDeposit } from '../services/propertyBooking'
 
 // S648: charges GAM takes for someone other than a tenant paying rent.
-const HELD_PURPOSES = new Set(['pos_terminal', 'pos_pay_link', 'booking_deposit', 'business_invoice', 'business_pos_terminal'])
+// S654: 'rent_terminal_pending' is a counter reader waiting for a tap; the
+// capture route rewrites its purpose to 'rent_terminal' and stamps the rows
+// BEFORE capturing, so payment_intent.succeeded settles it like any card.
+const HELD_PURPOSES = new Set(['pos_terminal', 'pos_pay_link', 'booking_deposit', 'business_invoice', 'business_pos_terminal', 'rent_terminal_pending'])
 import { applyTenantSupersedence, type PostCommitTransfer } from '../services/supersedence'
 import { activateBillingForSettledRent } from '../services/billingActivation'
 import {
@@ -1498,7 +1501,9 @@ async function resolveCharge(stripe: Stripe, pi: Stripe.PaymentIntent): Promise<
 function extractPaymentMethod(charge: Stripe.Charge | null | undefined): PaymentMethod | null {
   const type = charge?.payment_method_details?.type
   if (type === 'us_bank_account') return 'ach'
-  if (type === 'card') return 'card'
+  // S654: a card tapped on the counter reader (card_present / interac_present)
+  // is still a card — same rate row, same fee payer, same settlement path.
+  if (type === 'card' || type === 'card_present' || type === 'interac_present') return 'card'
   return null
 }
 

@@ -55,11 +55,12 @@ import { applyCreditsToOpenCharges } from './creditApplication'
 import { prepaidDrawAvailable, billingMonthOfInvoice, consumePrepaidCreditForInvoice } from './prepaidRelease'
 import { allocateOldestFirst } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
+import { logger } from '../lib/logger'
 import { computePlatformCut, createRentPlatformCharge } from './stripeConnect'
 import { createAdminNotification } from './adminNotifications'
 import { computeTenantGamOutstandingTotal } from './supersedence'
 
-export const CHARGE_SOURCES = ['portal', 'autopay'] as const
+export const CHARGE_SOURCES = ['portal', 'autopay', 'front_desk_reader'] as const
 export type ChargeSource = typeof CHARGE_SOURCES[number]
 
 export interface ChargeLeaseBalanceInput {
@@ -74,10 +75,18 @@ export interface ChargeLeaseBalanceInput {
   serviceAgreementId?: string
   /** What the tenant chose to pay. >= the outstanding balance; the excess is banked. */
   amount:            number
-  paymentMethodId:   string
-  paymentMethodType: 'ach' | 'card'
+  /** S654: absent for a card tapped on the counter reader — the reader is the method. */
+  paymentMethodId?:  string
+  paymentMethodType: 'ach' | 'card' | 'card_present'
   /** 'portal' = a human pressed Pay. 'autopay' = the scheduled runner. */
   source:            ChargeSource
+  /** S654: charge everything owed on the scope — the counter never part-pays. `amount` is ignored. */
+  chargeEverything?: boolean
+  /** S654: compute the quote (what the payer is charged, fee included) and write nothing. */
+  dryRun?:           boolean
+  /** S654: the reader already holds an authorization for exactly `amountCents`;
+   *  book against it instead of creating a charge. 409 if the balance moved. */
+  existingIntent?: { id: string; amountCents: number; capture?: boolean }
 }
 
 export interface ChargeLeaseBalanceResult {
@@ -89,7 +98,14 @@ export interface ChargeLeaseBalanceResult {
   /** Dollars banked as prepaid credit for future months. */
   payAhead:            number
   platformCutAmount: number
+  /** S654: what the payer is actually charged — the balance plus the fee they bear. */
+  chargeAmount:        number
+  /** S654: the processing fee on top (0 when the landlord covers it). */
+  processingFee:       number
   lines:               { payment_id: string; amount_applied: number }[]
+  // S654: dry-run quote only — the gross balance and the credit the quote netted.
+  outstanding?:  number
+  creditNetted?: number
 }
 
 /** The rows a lease balance is made of, oldest first, with the context every
@@ -251,7 +267,8 @@ export const chargeLeaseBalanceSchema = z.object({
 export async function chargeLeaseBalance(
   input: ChargeLeaseBalanceInput,
 ): Promise<ChargeLeaseBalanceResult> {
-  const { tenantId, leaseId, serviceAgreementId, amount, paymentMethodId, paymentMethodType } = input
+  const { tenantId, leaseId, serviceAgreementId, paymentMethodId, paymentMethodType } = input
+  let amount = input.amount
   if (!leaseId && !serviceAgreementId) {
     throw new AppError(400, 'A balance needs either a lease or a service agreement to settle.')
   }
@@ -269,7 +286,7 @@ export async function chargeLeaseBalance(
     if (ctx.payment_block) {
       throw new AppError(409, 'This unit is in eviction mode — payments to the landlord are paused. Accepting one could reset the eviction timeline. Contact the landlord.')
     }
-    if (!ctx.stripe_customer_id) {
+    if (!ctx.stripe_customer_id && paymentMethodType !== 'card_present') {
       throw new AppError(409, 'Tenant has no Stripe customer — complete ACH setup first')
     }
 
@@ -329,6 +346,15 @@ export async function chargeLeaseBalance(
       : `${String(ctx.due_date).slice(0, 7)}-01`
     const prepaidPart = leaseId ? (await prepaidDrawAvailable(client, leaseId, payMonth)).available : 0
     const creditAvailable = Math.round((Number(creditRow.rows[0]?.credit ?? 0) + prepaidPart) * 100) / 100
+    // S654: the counter takes what is OWED — the balance less the credit on the
+    // account, the same figure the portal and the desk show — whatever the
+    // caller typed. The credit then clears the remainder after allocation,
+    // exactly as it does for a portal card payment.
+    const creditNetted = input.chargeEverything ? Math.min(creditAvailable, totalOutstanding) : 0
+    if (input.chargeEverything) {
+      amount = Math.round((totalOutstanding - creditNetted) * 100) / 100
+      if (amount < 0.005) throw new AppError(409, 'The credit on the account covers this balance — there is nothing to take on a card.')
+    }
 
     // The credit covers the lease's own charges first — those are what the
     // pay-in-full rule and the eviction clock run on. Never below zero: a credit
@@ -425,7 +451,7 @@ export async function chargeLeaseBalance(
     // Only a card needs the SDK here (issuing country for the non-US surcharge).
     // Building the client on the ACH path made every bank payment depend on it.
     let cardCountry: string | null = null
-    if (paymentMethodType === 'card') {
+    if (paymentMethodType === 'card' && paymentMethodId) {
       const pm = await getStripe().paymentMethods.retrieve(paymentMethodId)
       cardCountry = pm.card?.country ?? null
     }
@@ -434,9 +460,11 @@ export async function chargeLeaseBalance(
     // pay-ahead surplus included — Stripe charges us on every dollar it
     // processes and GAM never absorbs a banking fee. allocation.ts reads the
     // same total back off the remittance so its books match this exactly.
+    // S654: a card is a card — the counter reader prices like the portal (Nic:
+    // "cards anywhere are the same").
     const basePlatformCut = computePlatformCut({
       amount,
-      paymentMethod: paymentMethodType,
+      paymentMethod: paymentMethodType === 'ach' ? 'ach' : 'card',
       cardCountry,
     })
 
@@ -490,6 +518,16 @@ export async function chargeLeaseBalance(
     const tenantBorneOnTop = (tenantPaysProcessingFee ? basePlatformCut : 0) + passthroughAmount
     const chargeAmount = Math.round((amount + tenantBorneOnTop) * 100) / 100
 
+    if (input.dryRun) {
+      // S654: the quote the reader screen shows. Nothing written.
+      return {
+        remittanceId: '', paymentIntentId: '', status: 'quote',
+        appliedTotal, payAhead: plan.unapplied, platformCutAmount,
+        chargeAmount, processingFee: Math.round(tenantBorneOnTop * 100) / 100, lines: plan.lines,
+        outstanding: totalOutstanding, creditNetted,
+      }
+    }
+
     // Create the remittance BEFORE the Stripe call so the PI metadata can
     // carry its id; stamp the PI after.
     await client.query('BEGIN')
@@ -505,7 +543,7 @@ export async function chargeLeaseBalance(
           payment_method, gross_amount, processing_fee_amount)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
       [tenantId, ctx.lease_id, ctx.landlord_id, amount.toFixed(2),
-       appliedTotal.toFixed(2), plan.unapplied.toFixed(2), paymentMethodType,
+       appliedTotal.toFixed(2), plan.unapplied.toFixed(2), paymentMethodType === 'ach' ? 'ach' : 'card',
        chargeAmount.toFixed(2), tenantBorneOnTop.toFixed(2)])
     const remittanceId = rem.rows[0].id
 
@@ -543,28 +581,58 @@ export async function chargeLeaseBalance(
 
     // S560 money-flow rebuild (Phase 1): ALWAYS platform charge — money held by
     // GAM, batched to the landlord on the weekly run.
-    const intent = await createRentPlatformCharge({
-      amount: chargeAmount,
-      stripeCustomerId: ctx.stripe_customer_id,
-      paymentMethodId,
-      paymentMethodTypes: paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
-      entryDescription: 'BALANCE',
-      metadata: {
-        gam_remittance_id: remittanceId,
-        tenant_id: tenantId,
-        landlord_id: ctx.landlord_id,
-        gam_charge_source: input.source,
-      },
-    })
+    let intent: { id: string; status: string }
+    if (input.existingIntent) {
+      // S654: the counter reader already holds an authorization. It was created
+      // for the quote this same arithmetic produced moments ago; if the balance
+      // moved in between, nothing is booked and the desk starts over.
+      const want = Math.round(chargeAmount * 100)
+      if (want !== input.existingIntent.amountCents) {
+        throw new AppError(409,
+          `The balance changed since the reader was sent $${(input.existingIntent.amountCents / 100).toFixed(2)} — it is now $${chargeAmount.toFixed(2)}. Cancel on the reader and start again.`)
+      }
+      // Same metadata shape as a portal card charge, so payment_intent.succeeded
+      // settles these rows down the one path every card payment takes.
+      await getStripe().paymentIntents.update(input.existingIntent.id, {
+        description: 'BALANCE - Gold Asset Management',
+        metadata: {
+          gam_purpose: 'rent_terminal',
+          entry_description: 'BALANCE',
+          platform_held: 'true',
+          gam_remittance_id: remittanceId,
+          tenant_id: tenantId,
+          landlord_id: ctx.landlord_id,
+          gam_charge_source: input.source,
+        },
+      })
+      intent = { id: input.existingIntent.id, status: 'requires_capture' }
+    } else {
+      if (!paymentMethodId) throw new AppError(400, 'A saved payment method is required')
+      intent = await createRentPlatformCharge({
+        amount: chargeAmount,
+        stripeCustomerId: ctx.stripe_customer_id,
+        paymentMethodId,
+        paymentMethodTypes: paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
+        entryDescription: 'BALANCE',
+        metadata: {
+          gam_remittance_id: remittanceId,
+          tenant_id: tenantId,
+          landlord_id: ctx.landlord_id,
+          gam_charge_source: input.source,
+        },
+      })
+    }
 
     // Stamp the PI on every covered row — the standard webhook settle
     // path (allocation engine, credit ledger, propane, supersedence)
     // picks them ALL up by PI id, unchanged.
     await client.query(
       `UPDATE payments SET status = 'processing', stripe_payment_intent_id = $1,
-              platform_held = TRUE
+              platform_held = TRUE,
+              -- S654: how the card was presented, for the history.
+              payment_channel = $3
         WHERE id = ANY($2::uuid[])`,
-      [intent.id, fullyCoveredIds])
+      [intent.id, fullyCoveredIds, paymentMethodType === 'card_present' ? 'in_person' : 'online'])
     // S581: stamp the per-month sublease markup on each covered rent row so
     // allocation nets it out of the landlord's owner_share.
     if (subleasePerMonth > 0 && coveredRentIds.length > 0) {
@@ -605,6 +673,33 @@ export async function chargeLeaseBalance(
       await applyCreditsToOpenCharges(client, { leaseId, scope: 'lease' })
     }
 
+    if (input.existingIntent?.capture) {
+      // S654: the counter reader. Capture BEFORE the commit, so a capture that
+      // fails rolls every row back with it — nothing half-booked, no hold left
+      // hanging under a "booked" label. The intent is put back in its pending
+      // shape and released, and the desk simply starts again.
+      const piId = input.existingIntent.id
+      try {
+        await getStripe().paymentIntents.capture(piId)
+        intent = { id: piId, status: 'succeeded' }
+      } catch (captureErr) {
+        const live = await getStripe().paymentIntents.retrieve(piId).catch(() => null)
+        if (live && live.status === 'succeeded') {
+          // The capture landed and only the reply was lost. Keep the booking.
+          intent = { id: piId, status: 'succeeded' }
+        } else {
+          await getStripe().paymentIntents.update(piId, {
+            metadata: { gam_purpose: 'rent_terminal_pending', gam_remittance_id: '', entry_description: '', platform_held: '', gam_charge_source: '' },
+          }).catch(() => {})
+          if (live && live.status === 'requires_capture') {
+            await getStripe().paymentIntents.cancel(piId).catch(() => {})
+          }
+          logger.error({ err: captureErr, paymentIntentId: piId }, '[reader] capture failed — booking rolled back, hold released')
+          throw new AppError(502, 'The card could not be captured — nothing was recorded. Send it to the reader again.')
+        }
+      }
+    }
+
     await client.query('COMMIT')
 
     if (!landlordConnectReady) {
@@ -625,6 +720,8 @@ export async function chargeLeaseBalance(
       appliedTotal,
       payAhead: plan.unapplied,
       platformCutAmount,
+      chargeAmount,
+      processingFee: Math.round(tenantBorneOnTop * 100) / 100,
       lines: plan.lines,
     }
   } catch (e) {

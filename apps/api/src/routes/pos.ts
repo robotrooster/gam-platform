@@ -36,6 +36,20 @@ posRouter.use(async (req: any, _res, next) => {
         const row = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id = $1`, [pid])
         if (row && ownsLandlord(req.user, row.landlord_id)) req.posPropertyLandlordId = row.landlord_id
       }
+      // S654 (Nic, live): "the Resume and Discard buttons are not doing
+      // anything." A call that names a ROW and no property — /sessions/:id,
+      // /items/:id, /transactions/:id/void — had nothing to derive the company
+      // from and fell back on a default company Nic never wanted, so a Mountain
+      // View tab "did not exist". The row says which company it is: take it from
+      // there, for a company the caller may act on. No default remains anywhere.
+      if (!req.posPropertyLandlordId) {
+        const m = String(req.path).match(/^\/([a-z-]+(?:\/[a-z-]+)?)\/([0-9a-f-]{36})(?:\/|$)/i)
+        const table = m ? ROW_TABLE[m[1].toLowerCase()] : undefined
+        if (table) {
+          const row = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM ${table} WHERE id = $1`, [m![2]])
+          if (row && ownsLandlord(req.user, row.landlord_id)) req.posPropertyLandlordId = row.landlord_id
+        }
+      }
     }
     next()
   } catch (e) { next(e) }
@@ -60,6 +74,15 @@ posRouter.use(async (req: any, _res, next) => {
  * that sends `landlordId`. Until it has one, such an account gets a clear 400
  * naming the problem rather than a silently mis-filed sale.
  */
+// S654: which table a row-keyed register path names. Every one carries landlord_id.
+const ROW_TABLE: Record<string, string> = {
+  'categories': 'pos_categories', 'discounts': 'pos_discounts', 'items': 'pos_items',
+  'purchase-orders': 'pos_purchase_orders', 'reader-orders': 'pos_reader_orders', 'sessions': 'pos_sessions',
+  'tax-categories': 'pos_tax_categories', 'tax-rates': 'pos_tax_rates', 'tickets': 'pos_open_tickets',
+  'transactions': 'pos_transactions', 'vendors': 'pos_vendors', 'terminal/readers': 'pos_terminal_readers',
+  'customers': 'pos_customers', 'refunds': 'pos_refunds', 'pay-links': 'pos_pay_links',
+}
+
 function posLandlordId(req: any): string {
   return resolveLandlordTarget(req.user!, req.body?.landlordId ?? req.query?.landlordId ?? req.posPropertyLandlordId, 'register')
 }
@@ -1991,7 +2014,12 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
         -- S653 (Nic): "flag the history different for pay links vs terminal
         -- reader." payment_method says card either way; how the card was
         -- presented is the fact the counter wants to see.
-        CASE WHEN t.payment_method = 'card' AND t.paid_online THEN 'pay_link'
+        -- S654 (Nic): an emailed link settled at the counter is "Pay link · in
+        -- person", with how it was tendered; paid from the email it is online.
+        CASE WHEN t.pay_link_id IS NOT NULL AND t.paid_online THEN 'pay_link'
+             WHEN t.pay_link_id IS NOT NULL AND t.payment_method = 'cash' THEN 'pay_link_in_person_cash'
+             WHEN t.pay_link_id IS NOT NULL THEN 'pay_link_in_person_card'
+             WHEN t.payment_method = 'card' AND t.paid_online THEN 'pay_link'
              WHEN t.payment_method = 'card' THEN 'card_reader'
              ELSE t.payment_method END AS tender,
         (SELECT json_agg(json_build_object('name', i.item_name, 'qty', i.qty, 'price', i.unit_price, 'subtotal', i.subtotal) ORDER BY i.created_at)
@@ -2366,11 +2394,20 @@ posRouter.delete('/terminal/readers/:id', requirePerm('pos.manage_inventory'), a
 // S648: every register's PaymentIntents now live on ONE account (GAM's), so
 // the Connect account no longer fences a landlord off from another's charge —
 // the intent's own landlord stamp does, on every call that touches it.
-async function assertOwnTerminalIntent(landlordId: string, paymentIntentId: string): Promise<void> {
+// S654 (Nic, live, at the reader): "Reader not registered to landlord" — on his
+// own S710, at his own park. The process / capture / cancel calls name no
+// property, so posLandlordId() fell back to the account's HOME company, which
+// is not the company that owns Mountain View or its reader. An account is not
+// an entity (S633): the card charge itself says which company it belongs to.
+// These calls now take the company FROM THE INTENT and only check that the
+// caller may act for it. Nothing is guessed from the account.
+async function ownTerminalIntent(req: any, paymentIntentId: string): Promise<{ landlordId: string; propertyId: string | null; intent: any }> {
   const intent = await retrieveTerminalPaymentIntent({ paymentIntentId })
-  if (intent.metadata?.gam_purpose !== 'pos_terminal' || intent.metadata?.gam_landlord_id !== landlordId) {
+  const landlordId = intent.metadata?.gam_landlord_id
+  if (intent.metadata?.gam_purpose !== 'pos_terminal' || !landlordId || !ownsLandlord(req.user, landlordId)) {
     throw new AppError(404, 'Card charge not found')
   }
+  return { landlordId, propertyId: intent.metadata?.gam_property_id ?? null, intent }
 }
 
 function assertReaderBelongsToLandlord(landlordId: string, stripeReaderId: string) {
@@ -2426,10 +2463,7 @@ posRouter.post('/terminal/payment-intents', requirePerm('pos.ring_sale'), async 
 posRouter.get('/terminal/payment-intents/:id', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const paymentIntentId = req.params.id
-    const intent = await retrieveTerminalPaymentIntent({ paymentIntentId })
-    if (intent.metadata?.gam_landlord_id !== posLandlordId(req)) {
-      throw new AppError(403, 'PaymentIntent belongs to a different landlord')
-    }
+    const { intent } = await ownTerminalIntent(req, paymentIntentId)
     res.json({
       success: true,
       data: {
@@ -2452,10 +2486,9 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
     const { stripeReaderId } = req.body
     if (!stripeReaderId) throw new AppError(400, 'stripeReaderId is required')
 
-    const ownerRow = await assertReaderBelongsToLandlord(posLandlordId(req), stripeReaderId)
-    if (!ownerRow) throw new AppError(404, 'Reader not registered to this landlord')
-
-    await assertOwnTerminalIntent(posLandlordId(req), paymentIntentId)
+    const { landlordId } = await ownTerminalIntent(req, paymentIntentId)
+    const ownerRow = await assertReaderBelongsToLandlord(landlordId, stripeReaderId)
+    if (!ownerRow) throw new AppError(404, 'That reader is not paired to the company this sale belongs to')
     const reader = await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId })
     res.json({
       success: true,
@@ -2473,7 +2506,7 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
 posRouter.post('/terminal/payment-intents/:id/capture', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const paymentIntentId = req.params.id
-    await assertOwnTerminalIntent(posLandlordId(req), paymentIntentId)
+    await ownTerminalIntent(req, paymentIntentId)
     const intent = await captureTerminalPaymentIntent({ paymentIntentId })
     res.json({ success: true, data: { id: intent.id, status: intent.status, amount: intent.amount } })
   } catch (e) { next(e) }
@@ -2485,7 +2518,7 @@ posRouter.post('/terminal/payment-intents/:id/capture', requirePerm('pos.ring_sa
 posRouter.post('/terminal/payment-intents/:id/cancel', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const paymentIntentId = req.params.id
-    await assertOwnTerminalIntent(posLandlordId(req), paymentIntentId)
+    await ownTerminalIntent(req, paymentIntentId)
     const intent = await cancelTerminalPaymentIntent({ paymentIntentId })
     res.json({ success: true, data: { id: intent.id, status: intent.status } })
   } catch (e) { next(e) }

@@ -90,13 +90,15 @@ describe('landlord expenses', () => {
       .set('Authorization', `Bearer ${token}`)
     expect(foreign.status).toBe(403)
 
-    // S652 (Nic): the account is never asked which company it is. A write
-    // that names no company lands on the one the account founded.
+    // S654 (Nic, DIRECTIVE): no default company, ever. A write that names no
+    // company and nothing a company derives from is ASKED, never filed under
+    // "the one the account founded".
     const write = await request(buildApp()).post('/api/expenses').set('Authorization', `Bearer ${token}`)
       .send(mk({ category: 'repairs', amount: 50, description: 'Ambiguous' }))
-    expect(write.status, JSON.stringify(write.body)).toBe(200)
-    const filed = await db.query(`SELECT landlord_id FROM landlord_expenses WHERE description = 'Ambiguous'`)
-    expect(filed.rows[0].landlord_id).toBe(llA)
+    expect(write.status, JSON.stringify(write.body)).toBe(400)
+    expect(String(write.body?.error)).toMatch(/more than one company/i)
+    expect((await db.query(`SELECT 1 FROM landlord_expenses WHERE description = 'Ambiguous'`)).rowCount).toBe(0)
+    void llA
   })
 
   it('creates a unit-linked expense', async () => {

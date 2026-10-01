@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue } from '@gam/shared'
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { apiPost, apiGet } from '../lib/api'
 
@@ -79,19 +79,39 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setToken(null); setUser(null); setTerminalToken(null)
   }, [])
 
+  // S654 (Nic): "your most recent deploy signed me out of the landlord portal" — the register's session is the same kind of pass."
+  // A session was a fixed 7-day pass from the last password sign-in and nothing
+  // renewed it. Renew a pass older than a day on load and whenever the portal
+  // comes back into view, so a session ends only after seven idle days.
+  const renewSession = useCallback(async () => {
+    const current = localStorage.getItem('gam_token')
+    if (!sessionRenewalDue(current)) return
+    try {
+      const r = await apiPost<{ token: string }>('/auth/refresh')
+      localStorage.setItem('gam_token', r.data.token)
+      setToken(r.data.token)
+    } catch (e) { if (isAuthRejection(e)) logout() }
+  }, [logout])
+
   const refresh = useCallback(async () => {
     try {
       const me = await fetchAuthMeWithRetry(() => apiGet<AuthUser>('/auth/me'))
       setUser(me)
+      await renewSession()
     } catch (e) {
       // S540: only a real auth rejection ends the session. API
       // restarts / network blips keep the token; next load recovers.
       if (isAuthRejection(e)) logout()
     }
     finally { setLoading(false) }
-  }, [logout])
+  }, [logout, renewSession])
 
   useEffect(() => { token ? refresh() : setLoading(false) }, [token, refresh])
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') renewSession() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [renewSession])
 
   // Post-credentials login. Returns a discriminated result so LoginPage can
   // pivot into the second factor. Doesn't set token/user until the full JWT

@@ -330,6 +330,96 @@ describe('POST /api/pos/transactions — happy paths', () => {
     expect(it.stock_qty).toBeCloseTo(762.4, 3)
   })
 
+  // S654 (Nic, live, at the reader): "Reader not registered to landlord" on his
+  // own S710 at his own park. His account owns more than one company; the
+  // process call named no property, so the register guessed his HOME company.
+  // The card charge itself says which company it belongs to — that is the one.
+  it('an account with two companies can run its second company\'s reader', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const c = await db.connect()
+    let l2 = '', p2 = ''
+    try {
+      await c.query('BEGIN')
+      const other = await seedLandlord(c)
+      l2 = other.landlordId
+      p2 = await seedProperty(c, { landlordId: l2, ownerUserId: other.userId, managedByUserId: other.userId })
+      await c.query(`INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1, $2, 'owner')`, [l2, f.landlordUserId])
+      await c.query(`INSERT INTO pos_terminal_readers (landlord_id, property_id, stripe_reader_id, nickname, status, registered_at)
+                     VALUES ($1, $2, 'tmr_second_company', 'Counter S710', 'active', NOW())`, [l2, p2])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const twoCompanies = jwt.sign(
+      { userId: f.landlordUserId, role: 'landlord', email: 'll@test.dev', profileId: null,
+        landlordIds: [f.landlordId, l2], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    retrieveTerminalPaymentIntentMock.mockResolvedValue({
+      id: 'pi_second', status: 'requires_payment_method', amount: 1059,
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: l2, gam_property_id: p2 },
+    } as any)
+    const ok = await request(buildApp())
+      .post('/api/pos/terminal/payment-intents/pi_second/process')
+      .set('Authorization', `Bearer ${twoCompanies}`)
+      .send({ stripeReaderId: 'tmr_second_company' })
+    expect(ok.status).toBe(200)
+    expect(processPaymentIntentOnReaderMock).toHaveBeenCalledWith({ stripeReaderId: 'tmr_second_company', paymentIntentId: 'pi_second' })
+
+    // The first company's reader cannot run the second company's sale.
+    await db.query(`INSERT INTO pos_terminal_readers (landlord_id, property_id, stripe_reader_id, nickname, status, registered_at)
+                    VALUES ($1, $2, 'tmr_first_company', 'Other S710', 'active', NOW())`, [f.landlordId, f.propertyId])
+    const wrong = await request(buildApp())
+      .post('/api/pos/terminal/payment-intents/pi_second/process')
+      .set('Authorization', `Bearer ${twoCompanies}`)
+      .send({ stripeReaderId: 'tmr_first_company' })
+    expect(wrong.status).toBe(404)
+
+    // A stranger's account cannot see, run, capture, or void the charge at all.
+    const strangerFixture = await seedPosFixture()
+    for (const [method, path] of [['get', ''], ['post', '/process'], ['post', '/capture'], ['post', '/cancel']] as const) {
+      const r = await (request(buildApp()) as any)[method](`/api/pos/terminal/payment-intents/pi_second${path}`)
+        .set('Authorization', `Bearer ${strangerFixture.landlordToken}`).send({ stripeReaderId: 'tmr_second_company' })
+      expect(r.status).toBe(404)
+    }
+  })
+
+  // S654 (Nic, live): "Resume and Discard buttons are not doing anything." The
+  // open tab belonged to Mountain View; the account also owns Oak Park; the
+  // row-keyed calls named no property and guessed. The row names the company.
+  it('an account with two companies resumes and discards an open tab at its second company', async () => {
+    const f = await seedPosFixture()
+    const c = await db.connect()
+    let l2 = '', p2 = ''
+    try {
+      await c.query('BEGIN')
+      const other = await seedLandlord(c)
+      l2 = other.landlordId
+      p2 = await seedProperty(c, { landlordId: l2, ownerUserId: other.userId, managedByUserId: other.userId })
+      await c.query(`INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1, $2, 'owner')`, [l2, f.landlordUserId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const twoCompanies = jwt.sign(
+      { userId: f.landlordUserId, role: 'landlord', email: 'll@test.dev', profileId: null, landlordIds: [f.landlordId, l2], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const opened = await request(buildApp()).post('/api/pos/sessions')
+      .set('Authorization', `Bearer ${twoCompanies}`).send({ propertyId: p2 })
+    expect(opened.status).toBe(200)
+    const sid = opened.body.data.id
+    // No propertyId on any of these — the row says which company.
+    const got = await request(buildApp()).get(`/api/pos/sessions/${sid}`).set('Authorization', `Bearer ${twoCompanies}`)
+    expect(got.status).toBe(200)
+    const cat2 = (await db.query<{ id: string }>(
+      `INSERT INTO pos_categories (landlord_id, name, sort_order, is_active) VALUES ($1, 'Fuel', 1, TRUE) RETURNING id`, [l2])).rows[0].id
+    const item2 = await seedPosItem({ ...f, landlordId: l2, propertyId: p2, categoryId: cat2 }, { sellPrice: 3.3, stockQty: 99 })
+    const added = await request(buildApp()).post(`/api/pos/sessions/${sid}/items`)
+      .set('Authorization', `Bearer ${twoCompanies}`).send({ itemId: item2, itemName: 'Propane', unitPrice: 3.3, qty: 1, taxRate: 0 })
+    expect(added.status, JSON.stringify(added.body)).toBe(200)
+    const voided = await request(buildApp()).post(`/api/pos/sessions/${sid}/void`)
+      .set('Authorization', `Bearer ${twoCompanies}`).send({ reason: 'discarded_at_terminal_load' })
+    expect(voided.status).toBe(200)
+    // A stranger's account still cannot see it.
+    const stranger = await seedPosFixture()
+    expect((await request(buildApp()).get(`/api/pos/sessions/${sid}`).set('Authorization', `Bearer ${stranger.landlordToken}`)).status).toBe(404)
+  })
+
   it('card sale with valid terminal stripePaymentIntentId persists with PI stamp', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
     const itemId = await seedPosItem(f, { sellPrice: 25, stockQty: 999 })
@@ -2104,7 +2194,9 @@ describe('POST /api/pos/terminal/payment-intents', () => {
 })
 
 describe('GET /api/pos/terminal/payment-intents/:id', () => {
-  it('cross-landlord metadata → 403', async () => {
+  // S654: a charge that is not yours does not exist to you — 404, not a 403
+  // that confirms it is someone else's.
+  it('cross-landlord metadata → 404', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
     retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
       id: 'pi_other', status: 'succeeded', amount: 500,
@@ -2114,8 +2206,8 @@ describe('GET /api/pos/terminal/payment-intents/:id', () => {
     const res = await request(buildApp())
       .get('/api/pos/terminal/payment-intents/pi_other')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-    expect(res.status).toBe(403)
-    expect(res.body.error).toMatch(/different landlord/i)
+    expect(res.status).toBe(404)
+    expect(res.body.error).toMatch(/not found/i)
   })
 
   it('happy: returns id + status + amount + lastPaymentError', async () => {
@@ -2147,15 +2239,20 @@ describe('POST /api/pos/terminal/payment-intents/:id/process', () => {
     expect(processPaymentIntentOnReaderMock).not.toHaveBeenCalled()
   })
 
-  it('reader not owned by landlord → 404', async () => {
+  it('reader not paired to the sale\'s company → 404', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
-    // No reader seeded for this landlord
+    // S654: the company comes from the charge; the reader must be paired to it.
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_x', status: 'requires_payment_method', amount: 500,
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId, gam_property_id: f.propertyId },
+    } as any)
+    // No reader seeded for this company
     const res = await request(buildApp())
       .post('/api/pos/terminal/payment-intents/pi_x/process')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ stripeReaderId: 'tmr_ghost' })
     expect(res.status).toBe(404)
-    expect(res.body.error).toMatch(/Reader not registered/i)
+    expect(res.body.error).toMatch(/not paired/i)
     expect(processPaymentIntentOnReaderMock).not.toHaveBeenCalled()
   })
 
@@ -2280,10 +2377,12 @@ describe('S649 a two-company account uses the register by property', () => {
       { userId: f.landlordUserId, role: 'landlord', email: 'll@test.dev', profileId: null,
         landlordIds: [f.landlordId, secondLandlord], permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
-    // S652 (Nic): the account is never asked which company it is — with no
-    // property named, the register lists the founding company's items.
+    // S654 (Nic, DIRECTIVE): no default company. A list that names no property
+    // is ASKED which company — never answered with "the founding company's".
+    // The register always names its property (next call).
     const bare = await request(buildApp()).get('/api/pos/items').set('Authorization', `Bearer ${token}`)
-    expect(bare.status, JSON.stringify(bare.body)).toBe(200)
+    expect(bare.status, JSON.stringify(bare.body)).toBe(400)
+    expect(String(bare.body?.error)).toMatch(/more than one company/i)
     const res = await request(buildApp()).get(`/api/pos/items?propertyId=${f.propertyId}`).set('Authorization', `Bearer ${token}`)
     expect(res.status).toBe(200)
     expect(res.body.data.map((i: any) => i.id)).toContain(itemId)

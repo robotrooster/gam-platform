@@ -183,6 +183,99 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
   lease** (Mountain View 43, Oak Park 24). Late fees cannot accrue there until
   the leases carry an amount. Flagged to Nic, not changed.
 
+## Afternoon batch (built, tested, reviewed; one deploy)
+
+- **Front desk: every balance row opens its line items.** `BalanceBreakdowns.tsx`
+  (invoice lines incl. late fees, pay-link items, register-ticket items) is
+  shared by the Outstanding Balances folders and the Front Desk list ("▸ what's
+  on it"). Nic: "there's no line item breakdown — that's an important thing."
+- **Card on the counter reader (Nic's 7 answers, memory
+  `gam-counter-reader-design`).** Record-a-payment window: "Card on the reader"
+  shows balance + card fee (3.5% + $0.55, the online rate, the customer's),
+  sends the total to the S710, waits, books it like an online card payment but
+  `payment_channel='in_person'`, then captures; the normal webhook settles.
+  Routes `/payments/:id/reader/*` and `/payments/reader/intents/:pi/*`
+  (`routes/payments.ts`), `createRentReaderPaymentIntent` (posTerminal.ts),
+  `rentCharge.ts` `card_present` / `dryRun` / `existingIntent`. Capture failure
+  unwinds every row. 9 tests in `paymentsReader.test.ts`.
+- **Paid by, everywhere.** `payments.payment_channel` (migration
+  20261001130000, applied); `paidByLabel()` in shared; "Paid by" column on the
+  landlord history and the tenant history ("Card · online" / "Card · in
+  person" / "Pay link · in person (card|cash)" / Cash / Check / Bank).
+- **The reader is online.** tmr_GrjAfQuPEDIxcR, serial STR71Z1H614000756, at
+  Mountain View's Stripe location; Stripe registered it from the dashboard
+  purchase, so there was never a pairing code to enter. Only one S710 exists;
+  Oak Park gets none.
+- **Live bug at the reader: "Reader not registered to landlord."** The
+  register's process/capture/cancel/get took the company from Nic's account's
+  HOME company (resolveLandlordTarget fallback — the calls name no property).
+  Now the company comes FROM THE INTENT (`ownTerminalIntent` in pos.ts) and is
+  only checked against what the caller may act for; a stranger gets 404.
+  Also: one registered reader auto-selects (register and the payment window);
+  the chooser appears only with a choice to make.
+- **"Your deploy signed me out" — it was the 7-day pass.** Sessions were a fixed
+  7-day JWT from the last password login, never renewed (Nic's OTP history: a
+  login every few days). Landlord, tenant, POS portals now renew a pass older
+  than a day on load and when the tab comes back into view
+  (`sessionRenewalDue` in shared → `POST /auth/refresh`, which now REBUILDS
+  claims from the DB via `loadUserForSession`/`sessionClaimsFor`, shared with
+  /login). Admin, business, pm-company, admin-ops still carry the fixed pass.
+- **Phones "booting people out" at the 2FA code.** The pending code step was
+  per-tab (sessionStorage); coming back through the email opened a new tab.
+  Now localStorage (any tab resumes). And Nic chose **option 1** for the bypass:
+  the bill email's Pay now link is `/login?ef=<email-factor token>&to=/payments`
+  — opening it proves the inbox, so the password alone finishes sign-in; an
+  authenticator app is never bypassed; foreign/expired → the normal code
+  (`signEmailFactorToken` in emailOtp.ts, `payNowLink` in invoiceNotice.ts,
+  tenant LoginPage reads/strips `ef`/`to`, `ToSignIn` remembers the page a
+  signed-out visit was headed to). Reminders/late notices do NOT carry it yet
+  (Nic didn't answer that half).
+- **Adversarial review (26 agents, 4 lenses) before shipping: 17 confirmed, all
+  fixed.** Open redirect via `/login?to=//host` (now `safeLanding()`); session
+  renewal outliving a password reset (`users.sessions_valid_from`, migration
+  20261001140000, checked at /auth/me + /refresh); the webhook had no
+  `card_present` branch so a tapped card would never settle; the reader
+  charged the gross balance while the desk shows the net of credit (now netted,
+  409 when credit covers it); the desk quoted a client-side total (now
+  `GET /payments/:id/reader/quote`); a failed capture left rows + a hanging hold
+  under a "booked" label (capture now INSIDE the booking transaction, intent
+  reverted to pending and canceled); multi-lease households were half-charged
+  (one tap per lease); the cancel route trusted a body reader id; modal
+  lifecycle (unmount cancels, attempt token, loading/error states).
+- Tests: auth (64), pos (96), payments (89), paymentsReader (13), webhooks (28),
+  totp, invoiceNotice (+1), rentCharge, tenants, pos-parity — green.
+
+## Evening: NO DEFAULT COMPANY (Nic, DIRECTIVE — reverses S652)
+
+Nic at the register: "Resume and Discard buttons are not doing anything" — the
+open tab belonged to Mountain View, the row-keyed register calls named no
+property, and the S652 "home company" fallback answered Oak Park, so the
+server said "Session not found" (and 404'd adding items to the tab, and the
+reader "not registered"). Nic: "My account should not have a default company…
+None is the default. They should not be merged in any way." (memory
+`gam-no-default-company`).
+
+- `resolveLandlordTarget`: fallback removed; `homeLandlordId` gone from the
+  session (middleware/auth.ts). Explicit → property → unit → lease → ask.
+  New `landlordForRequest(req, what)` does that order; 25 route sites in
+  landlords/esign/background/documents now use it.
+- POS router middleware: the ROW the URL names (`ROW_TABLE`) says which company
+  when no property does. Register client sends propertyId on settings /
+  vendors / card-on-file.
+- Announcements with no property fan out to every company the account owns.
+- Pool outreach with no unit shows the company picker; Settings' PM-default
+  names the page's company.
+- `EntityPicker`: auto-fills only one company; two or more start on "Choose a
+  company…" (the first-in-list default is gone).
+- Tests updated from "lands on the founding company" to "asks" (expenses,
+  monthly P&L, team invite, register list); new register test: a two-company
+  account opens, lists, adds to, and voids a tab at its second company with
+  no property named.
+- NOT done: FlexChargePage POST /landlords/pos-customers (feature is off)
+  names no company; the CSV import pages let Validate run before a company is
+  chosen (the server answers "choose which company" — fine, but the button
+  could disable). Admin/business/pm-company portals untouched.
+
 ## Still open
 
 - **Lots 22 and 24 are marked OUT OF SERVICE** (9/30, by the run's stuck-meter

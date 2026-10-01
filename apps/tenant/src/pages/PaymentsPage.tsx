@@ -12,7 +12,7 @@
  */
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { formatCurrency, humanize, humanizeEntryDescription, chargeLabel, MANUAL_PAYMENT_FEE_SCOPE } from '@gam/shared'
+import { paidByLabel, formatCurrency, humanize, humanizeEntryDescription, chargeLabel, MANUAL_PAYMENT_FEE_SCOPE } from '@gam/shared'
 import { ReportBankDepositModal, ReportedDeposits } from '../components/ReportBankDeposit'
 import { apiGet } from '../lib/api'
 import { AutopaySection } from './AutopayCard'
@@ -35,6 +35,9 @@ interface Payment {
   // S607: the landlord's own wording for a charge they billed (e.g. "Parking
   // violation"). chargeLabel prefers it over the NACHA code.
   notes?:           string | null
+  // S654: how it was paid — cash/check/money order, bank, card online, card in person.
+  paidBy?:          string | null
+  paymentChannel?:  'online' | 'in_person' | null
 }
 
 // S539: per-line FIFO application breakdown ("where every dollar went")
@@ -565,7 +568,8 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                 <th>Type</th>
                 <th>Amount</th>
                 <th>Status</th>
-                <th>Method</th>
+                <th>Charge</th>
+                <th>Paid by</th>
               </tr>
             </thead>
             <tbody>
@@ -590,13 +594,16 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                       <td style={{ fontSize: '.75rem', color: 'var(--t3)' }}>
                         {chargeLabel(p.entryDescription, p.notes)}
                       </td>
+                      <td style={{ fontSize: '.75rem', color: 'var(--t2)', whiteSpace: 'nowrap' }}>
+                        {(p.status === 'settled' || p.status === 'processing') ? (paidByLabel(p.paidBy, p.paymentChannel) ?? '—') : '—'}
+                      </td>
 
                     </tr>
                   )
                 })
               ) : (
                 <tr>
-                  <td colSpan={5} style={{ textAlign: 'center', color: 'var(--t3)', padding: 32 }}>
+                  <td colSpan={6} style={{ textAlign: 'center', color: 'var(--t3)', padding: 32 }}>
                     No payment history yet.
                   </td>
                 </tr>

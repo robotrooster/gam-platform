@@ -5179,6 +5179,25 @@ export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
 // dispute window, and belongs on the register or a pay link rather than behind
 // a button meaning "this already happened somewhere else". Nic: "no reason for
 // them to come in to swipe the same card they can do from their house."
+// S654 (Nic): "show the difference between card online and card in person in
+// the transaction history." One label for how a settled charge was paid, read
+// off payments.manual_method (cash / check / money order / prior arrangement)
+// or the remittance's method (ach / card) plus payments.payment_channel.
+export function paidByLabel(
+  paidBy: string | null | undefined,
+  channel: 'online' | 'in_person' | string | null | undefined,
+): string | null {
+  switch (paidBy) {
+    case 'cash':              return 'Cash'
+    case 'check':             return 'Check'
+    case 'money_order':       return 'Money order'
+    case 'prior_arrangement': return 'Prior arrangement'
+    case 'ach':               return 'Bank (ACH)'
+    case 'card':              return channel === 'in_person' ? 'Card · in person' : 'Card · online'
+    default:                  return null
+  }
+}
+
 export const MANUAL_PAYMENT_METHODS = ['cash', 'check', 'money_order'] as const
 export type ManualPaymentMethod = typeof MANUAL_PAYMENT_METHODS[number]
 export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> = {
@@ -6691,6 +6710,29 @@ export function isAuthRejection(e: any): boolean {
 // Ride out short API restarts (~12s window at the defaults). Auth
 // rejections re-throw immediately; other errors retry, then re-throw
 // the last one so callers can decide (they should keep the token).
+/**
+ * S654 (Nic): "your most recent deploy signed me out." A session was a fixed
+ * 7-day pass from the last password sign-in, never renewed, so every account
+ * was thrown out on the seventh day mid-task. Each portal renews a pass that
+ * is more than a day old on load and whenever it comes back into view, so a
+ * session ends only after seven IDLE days. This reads the pass's own issue
+ * time (the JWT `iat`; no secret needed) and says whether renewal is due. A
+ * dead pass, or a pending/enrolment pass (it carries a `purpose`), is never
+ * renewed — those take the sign-in path.
+ */
+export function sessionRenewalDue(token: string | null | undefined, minAgeMs = 24 * 60 * 60 * 1000): boolean {
+  if (!token || typeof atob !== 'function') return false
+  try {
+    const part = token.split('.')[1]
+    if (!part) return false
+    const p = JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')))
+    if (!p || typeof p.iat !== 'number' || p.purpose) return false
+    const now = Date.now()
+    if (typeof p.exp === 'number' && p.exp * 1000 <= now) return false
+    return now - p.iat * 1000 > minAgeMs
+  } catch { return false }
+}
+
 export async function fetchAuthMeWithRetry<T>(
   fetchMe: () => Promise<T>,
   attempts = 5,

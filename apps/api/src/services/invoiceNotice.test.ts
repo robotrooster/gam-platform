@@ -16,6 +16,7 @@ vi.mock('resend', () => ({ Resend: class { emails = { send: resendSendMock } } }
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant } from '../test/dbHelpers'
 import { sendPendingInvoiceNotices } from './invoiceNotice'
+import { verifyEmailFactorToken } from '../routes/emailOtp'
 
 const TZ = 'America/Phoenix'
 
@@ -123,6 +124,20 @@ describe('invoice notices', () => {
     const r = await sendPendingInvoiceNotices()
     expect(r.sent).toBe(0)
     expect(resendSendMock).not.toHaveBeenCalled()
+  })
+
+  // S654 (Nic): the Pay now link signs the resident in with just their password.
+  it('the Pay now link vouches for the resident\'s inbox and lands on Payments', async () => {
+    const { tenantId } = await seedInvoice()
+    await sendPendingInvoiceNotices()
+    const html: string = lastSend().html
+    const m = html.match(/\/login\?ef=([^&"']+)&amp;to=([^"']+)|\/login\?ef=([^&"']+)&to=([^"']+)/)
+    expect(m).not.toBeNull()
+    const ef = decodeURIComponent(m![1] ?? m![3]); const to = decodeURIComponent(m![2] ?? m![4])
+    expect(to).toBe('/payments')
+    const { rows: [t] } = await db.query<{ user_id: string; email: string }>(
+      `SELECT t.user_id, u.email FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [tenantId])
+    expect(verifyEmailFactorToken(ef)).toEqual({ userId: t.user_id, email: t.email })
   })
 
   it('is idempotent — a second pass sends nothing', async () => {

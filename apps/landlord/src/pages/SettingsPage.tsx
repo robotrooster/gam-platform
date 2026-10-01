@@ -509,6 +509,7 @@ export function SettingsPage() {
               PM-company surface (PM Invitations not in the launch trio). */}
           {can('settings.default_pm_company') && !LAUNCH_HIDDEN.has('/pm-invitations') && (
             <DefaultPmCompanyCard
+              landlordId={companyId}
               currentDefaultId={me?.defaultPmCompanyId ?? null}
               onChange={() => qc.invalidateQueries('landlord-me')}
             />
@@ -567,10 +568,11 @@ function SecurityCard() {
 }
 
 function DefaultPmCompanyCard({
-  currentDefaultId, onChange,
+  landlordId, currentDefaultId, onChange,
 }: {
   currentDefaultId: string | null
   onChange: () => void
+  landlordId: string
 }) {
   const linkedQ = useQuery<LinkedPmCompany[]>(
     'linked-pm-companies',
@@ -579,7 +581,7 @@ function DefaultPmCompanyCard({
   const [pendingId, setPendingId] = useState<string>('')
 
   const setMut = useMutation(
-    (pmCompanyId: string | null) => apiPatch('/landlords/me/default-pm-company', { pmCompanyId }),
+    (pmCompanyId: string | null) => apiPatch('/landlords/me/default-pm-company', { pmCompanyId, landlordId }),
     { onSuccess: () => { setPendingId(''); onChange() } },
   )
 

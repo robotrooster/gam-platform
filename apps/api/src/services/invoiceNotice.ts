@@ -22,6 +22,18 @@ import { query, queryOne } from '../db'
 import { logger } from '../lib/logger'
 import { emailInvoiceReady } from './email'
 import { portalLink } from '../lib/portalUrls'
+import { signEmailFactorToken } from '../routes/emailOtp'
+
+// S654 (Nic): the Pay now link signs the resident in with just their password.
+// Opening it proves the inbox, which is what the emailed code was for — so no
+// leaving the app to go find a code, which is where phones were losing people.
+// Lands on Payments. A row with no portal account keeps the plain link.
+function payNowLink(inv: { tenant_user_id: string | null; tenant_email: string | null }): string {
+  if (!inv.tenant_user_id || !inv.tenant_email) return portalLink('tenant', 'payments')
+  const ef = signEmailFactorToken({ userId: inv.tenant_user_id, email: inv.tenant_email })
+  return portalLink('tenant', `login?ef=${encodeURIComponent(ef)}&to=${encodeURIComponent('/payments')}`)
+}
+
 
 /**
  * How recent an invoice has to be for us to announce it.
@@ -54,6 +66,7 @@ interface PendingInvoice {
   work_trade_agreement_id: string | null
   unit_number: string | null
   property_name: string | null
+  tenant_user_id: string | null
   tenant_email: string | null
   tenant_first_name: string | null
   landlord_name: string | null
@@ -87,6 +100,7 @@ export async function sendPendingInvoiceNotices(
            i.work_trade_credit_amount::text,
            i.work_trade_agreement_id,
            u.unit_number, p.name AS property_name,
+           tu.id         AS tenant_user_id,
            tu.email      AS tenant_email,
            tu.first_name AS tenant_first_name,
            COALESCE(NULLIF(l.business_name, ''), lu.first_name || ' ' || lu.last_name) AS landlord_name
@@ -207,7 +221,7 @@ export async function sendPendingInvoiceNotices(
         workTradeCredit: Number(inv.work_trade_credit_amount) || 0,
         prepaidApplied,
         creditApplied,
-        portalUrl: portalLink('tenant', 'payments'),
+        portalUrl: payNowLink(inv),
         landlordName: inv.landlord_name || undefined,
         updated: !!opts.updated,
       }, { landlordId: inv.landlord_id, tenantId: inv.tenant_id ?? undefined, invoiceId: inv.id })

@@ -27,6 +27,7 @@ import { LeavingModal, type LeavingLease } from '../components/LeavingModal'
 import { EmergencyContactsPanel } from './EmergencyContactsPanel'
 import { SearchBox } from '../components/ListControls'
 import { Phone, Mail, Search, CalendarX } from 'lucide-react'
+import { TicketBreakdown, PayLinkBreakdown, InvoiceBreakdown } from '../components/BalanceBreakdowns'
 
 type Balance = {
   tenantId: string
@@ -205,6 +206,11 @@ function classifyBalance(b: Balance): { phase: PhaseId; say: string } | null {
 
 export function FrontDeskPage() {
   const qc = useQueryClient()
+  // S654 (Nic): "it'd be nice if they were all clickable so the front desk
+  // could really see… what the electric is, any late fees." The amount opens
+  // the same line-item view the Balances page has: invoice lines, a pay link's
+  // items, or a register ticket's. One at a time — a counter looks one person up.
+  const [openKey, setOpenKey] = useState<string | null>(null)
   // ── S639 (Nic): "add a resend invite button so the front desk person can be
   // useful in case the old one happens to have expired or accidentally been
   // deleted or whatever. I don't want the front desk person held up on a
@@ -439,10 +445,12 @@ export function FrontDeskPage() {
                 <div style={{ padding: '0 16px 12px' }}>
                   {g.list.map(({ key, r, b, phase: ph, say, name, email, phone, unit }) => {
                     const meta = PHASES.find(p => p.id === ph)!
+                    const open = !!b && openKey === key
                     return (
-                      <div key={key} style={{
+                      <div key={key} style={{ borderTop: '1px solid var(--border-0)' }}>
+                      <div style={{
                         display: 'flex', gap: 14, alignItems: 'flex-start',
-                        padding: '11px 0', borderTop: '1px solid var(--border-0)',
+                        padding: '11px 0',
                       }}>
                         <div style={{ minWidth: 150 }}>
                           <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>{name}</div>
@@ -451,9 +459,16 @@ export function FrontDeskPage() {
                           </div>
                           {/* The amount, big enough to read across a counter. */}
                           {b && (
-                            <div style={{ fontSize: '1.05rem', fontWeight: 800, color: meta.tone, marginTop: 2 }}>
-                              {money(Number(b.balance || 0))}
-                            </div>
+                            <button type="button" onClick={() => setOpenKey(open ? null : key)}
+                              title={open ? 'Hide the charges' : 'See every charge behind this amount'}
+                              style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', textAlign: 'left' }}>
+                              <div style={{ fontSize: '1.05rem', fontWeight: 800, color: meta.tone, marginTop: 2 }}>
+                                {money(Number(b.balance || 0))}
+                              </div>
+                              <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                                {open ? '▾ hide the charges' : '▸ what\u2019s on it'}
+                              </div>
+                            </button>
                           )}
                         </div>
                         <div style={{ minWidth: 150, fontSize: '.78rem' }}>
@@ -505,6 +520,18 @@ export function FrontDeskPage() {
                             )}
                           </div>
                         )}
+                      </div>
+                      {open && b && (
+                        <div style={{ background: 'rgba(255,255,255,.015)', borderRadius: 8, marginBottom: 10 }}>
+                          {b.payLinkId
+                            ? <PayLinkBreakdown id={b.payLinkId} link={b.payLink as any} />
+                            : b.ticketId
+                              ? <TicketBreakdown ticket={b.ticket as any} />
+                              : b.tenantId
+                                ? <InvoiceBreakdown tenantId={b.tenantId} />
+                                : null}
+                        </div>
+                      )}
                       </div>
                     )
                   })}

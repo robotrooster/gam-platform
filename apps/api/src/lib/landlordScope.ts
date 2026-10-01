@@ -26,6 +26,7 @@
  * landlord's own book.
  */
 import type { AuthPayload } from '../middleware/auth'
+import { query } from '../db'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 
@@ -163,12 +164,16 @@ export function resolveLandlordTarget(
     return explicit
   }
   const owned = landlordScopeIds(user)
+  // Exactly one company is not a default: there is nothing to choose.
   if (owned.length === 1) return owned[0]
-  // S652 (Nic): an account on several companies is "logged in omnipresent" —
-  // never asked which one it is. A write with nothing to derive a company
-  // from lands on the company the account itself founded.
-  const home = (user as any).homeLandlordId as string | null | undefined
-  if (!mustName && home && owned.includes(home)) return home
+  // S654 (Nic, DIRECTIVE — reverses the S652 "home company"): "My account
+  // should not have a default company… The companies sit outside, set apart
+  // from the account… None is the default. They should not be merged in any
+  // way." A request that names nothing a company can be derived from — no
+  // company, no property, no row — is ASKED, never guessed. The old fallback
+  // filed Mountain View's register under Oak Park and told Nic his own open
+  // tab did not exist. Derivation order lives in landlordForRequest.
+  void mustName
   // 400, not 403, and deliberately: this is the long-standing "No landlord scope
   // on this user" contract that admins, tenants and unscoped callers have always
   // received from these endpoints. The refactor changes WHICH company a write
@@ -176,6 +181,34 @@ export function resolveLandlordTarget(
   if (owned.length === 0) throw new AppError(400, 'No landlord scope on this user')
   throw new AppError(400,
     `You own more than one company. Choose which one this ${what} belongs to.`)
+}
+
+/**
+ * S654: the company a request acts for, DERIVED from what the request names,
+ * in this order: an explicit company (landlordId / entityId), the property
+ * (propertyId), the unit (unitId), the lease (leaseId). Nothing named → the
+ * account's one company, or a 400 asking which — never a default. Every
+ * derivation is ownership-checked; nothing here widens what the account may
+ * touch.
+ */
+export async function landlordForRequest(req: any, what = 'record'): Promise<string> {
+  const u = req.user as AuthPayload
+  const pick = (...vals: unknown[]) => vals.find(v => typeof v === 'string' && v.trim() !== '') as string | undefined
+  const explicit = pick(req.body?.landlordId, req.query?.landlordId, req.body?.entityId, req.query?.entityId)
+  if (explicit) return resolveLandlordTarget(u, explicit, what)
+  const UUID = /^[0-9a-f-]{36}$/i
+  const propertyId = pick(req.body?.propertyId, req.query?.propertyId)
+  if (propertyId && UUID.test(propertyId)) return landlordIdForProperty(u, propertyId, query)
+  const unitId = pick(req.body?.unitId, req.query?.unitId)
+  if (unitId && UUID.test(unitId)) return landlordIdForUnit(u, unitId, query)
+  const leaseId = pick(req.body?.leaseId, req.query?.leaseId)
+  if (leaseId && UUID.test(leaseId)) {
+    const rows = await query<{ landlord_id: string }>(`SELECT landlord_id FROM leases WHERE id = $1`, [leaseId])
+    if (!rows.length) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(u, rows[0].landlord_id, [])) throw new AppError(403, 'That lease is not yours to act on.')
+    return rows[0].landlord_id
+  }
+  return resolveLandlordTarget(u, undefined, what)
 }
 
 /**

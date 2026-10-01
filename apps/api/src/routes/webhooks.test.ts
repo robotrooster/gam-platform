@@ -95,7 +95,7 @@ function buildApp() {
 
 interface PiEventOpts {
   paymentIntentId: string
-  paymentMethod?: 'us_bank_account' | 'card'
+  paymentMethod?: 'us_bank_account' | 'card' | 'card_present'
   chargeId?: string
   metadata?: Record<string, string>
 }
@@ -207,6 +207,36 @@ describe('POST /webhooks/stripe — signature handling', () => {
 })
 
 describe('POST /webhooks/stripe — payment_intent.succeeded rent', () => {
+  // S654: a card tapped on the counter reader arrives as `card_present`. It is
+  // a card — same rate row, same settlement — and must never roll back forever.
+  it('a counter-reader card (card_present) settles like any card', async () => {
+    const client = await getClient()
+    let paymentId: string
+    try {
+      const seedRes = await seedLandlord(client)
+      const tenantId = await seedTenant(client)
+      const propertyId = await seedProperty(client, { landlordId: seedRes.landlordId, ownerUserId: seedRes.userId, managedByUserId: seedRes.userId })
+      const unitId = await seedUnit(client, { propertyId, landlordId: seedRes.landlordId, rentAmount: 1000 })
+      await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
+      // Reference data the cleanup leaves alone: seed only if missing, tagged, removed below.
+      await client.query(
+        `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent, notes)
+         SELECT 'card', 0.55, 3.5, 0.26, 2.9, 's654-tapped-card-test'
+          WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'card' AND effective_until IS NULL)`)
+      paymentId = await seedRentPayment(client, {
+        unitId, tenantId, landlordId: seedRes.landlordId, amount: 1000, status: 'pending',
+        stripePaymentIntentId: 'pi_rent_tapped_1',
+      })
+    } finally { client.release() }
+    const res = await request(buildApp())
+      .post('/webhooks/stripe').set('Content-Type', 'application/json').set('stripe-signature', 't=1,v1=stub')
+      .send(buildPaymentIntentSucceeded({ paymentIntentId: 'pi_rent_tapped_1', paymentMethod: 'card_present', metadata: { gam_purpose: 'rent_terminal' } }))
+    expect(res.status).toBe(200)
+    const pay = await db.query<{ status: string }>(`SELECT status FROM payments WHERE id=$1`, [paymentId!])
+    expect(pay.rows[0].status).toBe('settled')
+    await db.query(`DELETE FROM platform_processing_rates WHERE notes = 's654-tapped-card-test'`)
+  })
+
   it('happy path: ACH rent settles → allocation runs → ledger rows written', async () => {
     const client = await getClient()
     let ownerUserId: string, landlordId: string, paymentId: string
