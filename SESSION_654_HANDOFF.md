@@ -86,10 +86,17 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
   total, what each space contributes, the fee for each way of paying (summed
   per lease, since each lease is still charged separately), a report-deposit
   button per space, ONE Pay. Per-lease cards render only when there is one.
-- **NOT done: no emails re-sent.** Eleven residents hold this morning's email
-  with a stale headline: the six Country Acres rent-to-own households (too
-  low), Curtis Clabough ($560.55 → $110.55), and the four Mountain View August
-  voids (too high). Re-send = reset `sent_at` on those invoices and run
+- **Country Acres water, one unit each (Nic, for Blu):** lots 18 Smith, 22
+  Street, 24 Whitfield had no water read to bill. Blu wants each billed one
+  unit = 1,000 gal = $16.50 at $0.0165/gal. `scripts/oct1_country_acres_water_estimates.ts`
+  wrote a September water bill per lot (estimated, no reading rows — meter
+  history untouched) onto the October invoice: MH 18 $466.50, MH 22 $541.50,
+  MH 24 $466.50. Lots 22/24 stay out of service until Curtis fixes them and
+  Blu clicks Mark repaired; the next real read bills real gallons.
+- **NOT done: no emails re-sent.** Fourteen residents hold this morning's email
+  with a stale headline: the six Country Acres rent-to-own households and the
+  three one-unit water lots (too low), Curtis Clabough ($560.55 → $110.55), and
+  the five Mountain View August voids (too high). Re-send = reset `sent_at` on those invoices and run
   `sendPendingInvoiceNotices({ invoiceId })` — only on Nic's word. Work-trade
   residents get nothing (directive).
 - Pre-existing calendar flakes fixed so the deploy gate passes on the 1st:
