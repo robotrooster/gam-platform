@@ -123,6 +123,30 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
   (+2), `routes/balances.test.ts` (+2), `routes/homeSale.test.ts` fixture
   (`occupies:false` for the standalone path).
 
+## Afternoon (Nic back)
+
+- **Updated-bill emails SENT** to the fourteen residents whose October bill
+  changed (`scripts/oct1_resend_updated_bills.ts`): subject "Updated bill: $X
+  due…", a line saying it replaces the morning's email. `emailInvoiceReady`
+  takes `updated`; `sendPendingInvoiceNotices({ invoiceId, updated: true })`.
+- **Disbursements: check money was headed to Nic's bank.** The prepaid-credit
+  release (S609) booked an `allocation_owner_share` for every row it settled,
+  including credits funded by CHECKS the landlord already has: Greek $460 (check
+  remittance), Niemeier $460, Renspurger $14.70, Rader $5.22 (landlord-entered
+  credits). Tuesday's batch would have paid Nic a second time out of GAM's
+  Stripe balance. `services/prepaidRelease.ts` now releases only dollars GAM
+  holds (remittance ach/card with a Stripe intent, or a platform-held source
+  payment); a check/landlord credit settles the row like recorded cash
+  (`platform_held=false`, note "collected by the landlord"). Data:
+  `scripts/oct1_prepaid_check_money_not_paid_out.ts` flipped the four rows and
+  removed their owner-share ledger rows. Next-payout card now: $539 (Robert
+  Housley RV 14, card) ready; Fierro/Cox ACH clearing. Tests: prepaidRelease
+  (+2; fixture now seeds an ACH remittance for the held case).
+- **Outstanding Balances page = property folders** (`BalancesPage.tsx`): one
+  folder per property, closed until opened, no property dropdown; people
+  alphabetical by last name inside; folder line shows count and total. A person
+  at two properties appears under each with only what they owe there.
+
 ## Still open
 
 - **Lots 22 and 24 are marked OUT OF SERVICE** (9/30, by the run's stuck-meter

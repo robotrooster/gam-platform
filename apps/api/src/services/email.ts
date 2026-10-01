@@ -2590,6 +2590,8 @@ export async function emailInvoiceReady(
     creditApplied?: number
     portalUrl?: string
     landlordName?: string
+    /** S654: the bill changed after it was announced — say so, so the earlier email is not the one they pay. */
+    updated?: boolean
   },
   ctx?: { landlordId?: string; tenantId?: string; invoiceId?: string },
 ): Promise<string | null> {
@@ -2610,13 +2612,17 @@ export async function emailInvoiceReady(
   // month was covered, and the commonest cause is work trade.
   const settled = args.total <= 0
 
+  const updated = !!args.updated && !settled
   return await send(to,
     settled
       ? `Your ${args.dueDateLabel} statement — nothing due for ${args.unitLabel}`
-      : `${money(args.total)} due ${args.dueDateLabel} — ${args.unitLabel}`,
+      : `${updated ? 'Updated bill: ' : ''}${money(args.total)} due ${args.dueDateLabel} — ${args.unitLabel}`,
     base(
-      h(settled ? 'Your statement' : 'Your bill is ready') +
+      h(settled ? 'Your statement' : updated ? 'Your bill was updated' : 'Your bill is ready') +
       p(`Hi ${escapeHtml(args.tenantName)},`) +
+      (updated
+        ? p(`Your bill for ${escapeHtml(args.unitLabel)} was corrected after this morning's email. This replaces it — please use these numbers.`)
+        : '') +
       p(settled
         ? `Here is your statement for ${escapeHtml(args.unitLabel)}. Nothing is owed this cycle.`
         : `<strong style="color:#eef1f8">${money(args.total)}</strong> is due on <strong style="color:#eef1f8">${escapeHtml(args.dueDateLabel)}</strong> for ${escapeHtml(args.unitLabel)}.`) +

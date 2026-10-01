@@ -1,7 +1,7 @@
 import { Fragment, useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
-import { PropertySelect } from '../components/ListControls'
 
 // Front-desk "who owes" view. Read-only list of tenants with an unpaid balance
 // + contact info, so a front-counter person knows who to call. Data from
@@ -230,64 +230,77 @@ export function BalancesPage() {
   // surface, not a report.
   const [openRow, setOpenRow] = useState<string | null>(null)
 
-  // S637 (Nic, DIRECTIVE): "The outstanding balance page on the financials tab
-  // does not let you sort by property. All pages that view information for more
-  // than one property need to be sortable by property."
+  // S654 (Nic): "It needs to be the same kind of setup as the leases page where
+  // each property is a folder and you can click to expand it… you don't select a
+  // property on this page. You just expand the property you want to see." And
+  // inside a folder, "alphabetical order for ease of access."
   //
-  // The payload has carried propertyId all along; nothing ever offered it as a
-  // control. Total follows the filter — a heading that keeps counting rows the
-  // table is no longer showing is worse than no total.
-  const [propertyId, setPropertyId] = useState('')
-  const propertyOptions = (rows as Owed[]).flatMap(r => (r.spaces?.length
-    ? r.spaces.map(x => ({ id: x.propertyId || '', name: x.propertyName || '' }))
-    : [{ id: r.propertyId || '', name: r.propertyName || '' }]))
-  // S648: filtered to one property, a person renting at two shows only what
-  // they owe HERE.
-  const shown = (rows as Owed[]).map(r => {
-    if (propertyId === '' || !r.spaces?.length) return r
-    const here = r.spaces.filter(x => x.propertyId === propertyId)
-    if (here.length === r.spaces.length) return r
-    return { ...r, spaces: here,
-      balance: here.reduce((t, x) => t + Number(x.balance), 0).toFixed(2),
-      openInvoices: here.reduce((t, x) => t + x.openInvoices, 0),
-      unitNumber: here.map(x => x.unitNumber).filter(Boolean).join(', '),
-      propertyName: here[0]?.propertyName ?? r.propertyName }
-  }).filter(r => propertyId === '' || (r.spaces?.length
-    ? r.spaces.length > 0 && Number(r.balance) > 0
-    : r.propertyId === propertyId))
+  // Same shape as the Leases page (S652): one folder per property, closed until
+  // opened, no dropdown — the folders ARE the filter. A person renting at two
+  // properties appears under each with only what they owe THERE (S648), and
+  // never has a credit counted twice: the per-space balances already carry it.
+  const [openProps, setOpenProps] = useState<Set<string>>(() => new Set())
+  const toggleProp = (id: string) => setOpenProps(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
 
-  const total = shown.reduce((s, r) => s + Number(r.balance), 0)
+  type Folder = { id: string; name: string; rows: Owed[] }
+  const folders = new Map<string, Folder>()
+  const put = (id: string, name: string, r: Owed) => {
+    const f = folders.get(id) ?? { id, name, rows: [] }
+    f.rows.push(r)
+    folders.set(id, f)
+  }
+  for (const r of rows as Owed[]) {
+    if (r.spaces?.length) {
+      const byProp = new Map<string, NonNullable<Owed['spaces']>>()
+      for (const x of r.spaces) {
+        const k = x.propertyId || ''
+        byProp.set(k, [...(byProp.get(k) ?? []), x])
+      }
+      for (const [pid, here] of byProp) {
+        const name = here[0]?.propertyName || r.propertyName || 'No property'
+        put(pid, name, here.length === r.spaces.length ? r : {
+          ...r, spaces: here,
+          balance: here.reduce((t, x) => t + Number(x.balance), 0).toFixed(2),
+          openInvoices: here.reduce((t, x) => t + x.openInvoices, 0),
+          unitNumber: here.map(x => x.unitNumber).filter(Boolean).join(', '),
+          propertyName: name,
+        })
+      }
+    } else {
+      put(r.propertyId || '', r.propertyName || 'No property', r)
+    }
+  }
+  const groups = [...folders.values()].sort((a, b) => a.name.localeCompare(b.name))
+  const sortKey = (r: Owed) => `${r.lastName || ''} ${r.firstName || ''}`.trim().toLowerCase() || '￿'
+  for (const g of groups) g.rows.sort((a, b) => sortKey(a).localeCompare(sortKey(b)))
+  // A single-property account has nothing to fold — its one folder starts open.
+  const singleFolder = groups.length === 1
+  const folderTotal = (g: Folder) => g.rows.reduce((s, r) => s + Number(r.balance), 0)
+
+  const total = (rows as Owed[]).reduce((s, r) => s + Number(r.balance), 0)
 
   return (
     <div>
       <div className="page-header">
         <div>
           <h1 className="page-title">Outstanding Balances</h1>
-          <p className="page-subtitle">Who owes, how to reach them — click a row for the charge breakdown</p>
+          <p className="page-subtitle">Who owes, how to reach them — open a property, then click a name for the charge breakdown</p>
         </div>
-        {shown.length > 0 && (
+        {rows.length > 0 && (
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>
-              Total owed{propertyId ? ' — this property' : ''}
+              Total owed
             </div>
             <div style={{ fontSize: '1.3rem', fontWeight: 700, color: 'var(--gold)' }}>{fmt(total)}</div>
           </div>
         )}
       </div>
 
-      {rows.length > 0 && (
-        <div className="filter-bar">
-          <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
-        </div>
-      )}
-
       {isLoading ? (
         <div className="card" style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
-      ) : shown.length === 0 ? (
+      ) : rows.length === 0 ? (
         <div className="card" style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>
-          {rows.length === 0
-            ? "🎉 No outstanding balances — everyone's current."
-            : 'Nobody owes anything at this property.'}
+          🎉 No outstanding balances — everyone's current.
         </div>
       ) : (
         <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
@@ -295,17 +308,34 @@ export function BalancesPage() {
             <thead>
               <tr>
                 <th>Tenant</th>
-                <th>Unit / Property</th>
+                <th>Unit</th>
                 <th style={{ textAlign: 'right' }}>Owed</th>
                 <th>Oldest Due</th>
                 <th>Contact</th>
               </tr>
             </thead>
             <tbody>
-              {shown.map(r => {
+              {groups.flatMap(g => {
+                const isOpen = singleFolder || openProps.has(g.id)
+                const folder = (
+                  <tr key={`folder-${g.id}`} onClick={() => toggleProp(g.id)} className="row-clickable"
+                      style={{ cursor: 'pointer', background: 'var(--bg-2)' }}>
+                    <td colSpan={5} style={{ fontWeight: 700, padding: '12px 16px' }}>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        {isOpen ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                        {g.name}
+                        <span style={{ fontWeight: 400, fontSize: '.78rem', color: 'var(--text-3)' }}>
+                          {g.rows.length} {g.rows.length === 1 ? 'person owes' : 'people owe'} · <span style={{ color: 'var(--gold)' }}>{fmt(folderTotal(g))}</span>
+                        </span>
+                      </span>
+                    </td>
+                  </tr>
+                )
+                if (!isOpen) return [folder]
+                return [folder, ...g.rows.map(r => {
                 const od = daysOverdue(r.oldestDueDate)
                 const name = [r.firstName, r.lastName].filter(Boolean).join(' ') || 'Tenant'
-                const rowKey = r.payLinkId || r.ticketId || r.tenantId || ''
+                const rowKey = `${g.id}:${r.payLinkId || r.ticketId || r.tenantId || ''}`
 
                 const isOpen = openRow === rowKey
                 return (
@@ -313,7 +343,7 @@ export function BalancesPage() {
                   <tr onClick={() => setOpenRow(isOpen ? null : rowKey)}
                       style={{ cursor: 'pointer' }}
                       title="See what makes up this balance">
-                    <td style={{ fontWeight: 500 }}>
+                    <td style={{ fontWeight: 500, paddingLeft: 32 }}>
                       <span style={{ color: 'var(--text-3)', marginRight: 6, fontSize: '.7rem' }}>{isOpen ? '▾' : '▸'}</span>
                       {name}
                     </td>
@@ -331,7 +361,6 @@ export function BalancesPage() {
                       ) : (
                         <>{r.payLinkId ? 'Pay link' : r.ticketId ? 'Register ticket' : r.unitNumber ? `Unit ${r.unitNumber}` : '—'}</>
                       )}
-                      {r.propertyName && <span style={{ color: 'var(--text-3)' }}> · {r.propertyName}</span>}
                     </td>
                     <td style={{ textAlign: 'right', fontWeight: 600, color: 'var(--gold)' }}>
                       {fmt(Number(r.balance))}
@@ -366,6 +395,7 @@ export function BalancesPage() {
                   )}
                   </Fragment>
                 )
+                })]
               })}
             </tbody>
           </table>

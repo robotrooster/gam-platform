@@ -60,11 +60,27 @@ async function makeInvoiceWithRent(f: Fixture, amount: number) {
   return { invoiceId: inv.rows[0].id, paymentId: pay.rows[0].id }
 }
 
-async function bankPrepaid(f: Fixture, amount: number) {
+/**
+ * S654: a credit is GAM's to release only when GAM holds the money. The default
+ * here is what the S609 directive describes — the tenant paid ahead through
+ * Stripe (a bank remittance) and the money sits on GAM's balance. `check`
+ * seeds the other case: the landlord deposited a check and typed the credit in.
+ */
+async function bankPrepaid(f: Fixture, amount: number, how: 'ach' | 'check' | 'none' = 'ach') {
+  let remittanceId: string | null = null
+  if (how !== 'none') {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances
+         (tenant_id, landlord_id, amount, applied_amount, unapplied_amount, status, payment_method,
+          stripe_payment_intent_id, processing_fee_amount)
+       VALUES ($1,$2,$3,$3,0,'settled',$4,$5,0) RETURNING id`,
+      [f.tenantId, f.landlordId, amount.toFixed(2), how, how === 'ach' ? `pi_test_${Math.random().toString(36).slice(2)}` : null])
+    remittanceId = r.rows[0].id
+  }
   await db.query(
-    `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
-     VALUES ($1,$2,$3,$3)`,
-    [f.leaseId, f.tenantId, amount.toFixed(2)])
+    `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, source_remittance_id)
+     VALUES ($1,$2,$3,$3,$4)`,
+    [f.leaseId, f.tenantId, amount.toFixed(2), remittanceId])
 }
 
 async function release(f: Fixture, invoiceId: string) {
@@ -185,6 +201,33 @@ describe('S609 prepaid release', () => {
       [f.leaseId])
     expect(Number(left.rows[0].remaining)).toBeCloseTo(400, 2)
     expect(await ownerShare(paymentId)).toBeCloseTo(0, 2)
+  })
+
+  // S654 (Nic): "Glenda Greek and Todd Niemeyer also paid by check… Mark
+  // Rensberger… he's not paid with card ever. Why is that saying that that's
+  // going to be dispersed to our account? That's a huge problem."
+  it('a check the landlord already deposited settles the month but releases nothing', async () => {
+    await bankPrepaid(f, 1000, 'check')
+    const { invoiceId, paymentId } = await makeInvoiceWithRent(f, 1000)
+    const r = await release(f, invoiceId)
+    expect(r.consumed).toBe(1000)
+    expect(r.rowsCovered).toBe(1)
+    expect(r.releasedToLandlord).toBe(0)
+    const { rows: [p] } = await db.query<any>(
+      `SELECT status, platform_held, notes FROM payments WHERE id=$1`, [paymentId])
+    expect(p.status).toBe('settled')
+    expect(p.platform_held).toBe(false)          // the landlord has the money already
+    expect(p.notes).toMatch(/collected by the landlord/)
+    expect(await ownerShare(paymentId)).toBeNull() // nothing for Tuesday's batch
+  })
+
+  it('a credit the landlord typed in with no payment behind it releases nothing either', async () => {
+    await bankPrepaid(f, 1000, 'none')
+    const { invoiceId, paymentId } = await makeInvoiceWithRent(f, 1000)
+    const r = await release(f, invoiceId)
+    expect(r.rowsCovered).toBe(1)
+    expect(r.releasedToLandlord).toBe(0)
+    expect(await ownerShare(paymentId)).toBeNull()
   })
 
   it('no prepaid credit is a clean no-op', async () => {

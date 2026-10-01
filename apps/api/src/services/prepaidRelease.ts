@@ -161,13 +161,44 @@ async function releaseInner(
   client: PoolClient,
   opts: { leaseId: string; invoiceId: string },
 ): Promise<PrepaidReleaseResult> {
-  const credits = await client.query<{ id: string; amount_remaining: string; source_remittance_id: string | null }>(
-    `SELECT id, amount_remaining::text, source_remittance_id
-       FROM lease_prepaid_credits
-      WHERE lease_id = $1 AND amount_remaining > 0
-      ORDER BY created_at ASC
-      FOR UPDATE`,
+  // S654 (Nic): "Glenda Greek and Todd Niemeyer also paid by check… Mark
+  // Rensberger… he's not paid with card ever. Why is that saying that that's
+  // going to be dispersed to our account?"
+  //
+  // A credit is only GAM's to hand over when GAM actually HOLDS the money: the
+  // tenant paid ahead through Stripe (a bank or card remittance), or the credit
+  // came from a platform-held payment. A check the landlord deposited, or a
+  // credit the landlord typed in, is money the landlord already has — the
+  // release still settles the month's rows, but it books nothing to the payout
+  // and leaves the row platform_held=false, exactly like a recorded cash
+  // payment. Four October releases did the opposite and would have paid the
+  // landlord a second time out of GAM's balance on Tuesday.
+  const credits = await client.query<{ id: string; amount_remaining: string; source_remittance_id: string | null; gam_held: boolean }>(
+    `SELECT c.id, c.amount_remaining::text, c.source_remittance_id,
+            ((r.payment_method IN ('ach','card') AND r.stripe_payment_intent_id IS NOT NULL)
+              OR COALESCE(sp.platform_held, false)) AS gam_held
+       FROM lease_prepaid_credits c
+       LEFT JOIN tenant_remittances r ON r.id = c.source_remittance_id
+       LEFT JOIN payments sp ON sp.id = c.source_payment_id
+      WHERE c.lease_id = $1 AND c.amount_remaining > 0
+      ORDER BY c.created_at ASC
+      FOR UPDATE OF c`,
     [opts.leaseId])
+  // The draw is oldest-credit-first (drawPrepaidCredit); walk the same order
+  // here so each row knows whether the dollars that paid it are GAM's to release.
+  const pool = credits.rows.map(c => ({ left: Number(c.amount_remaining), held: c.gam_held === true }))
+  const heldPortionOf = (amount: number): number => {
+    let need = Math.round(amount * 100) / 100
+    let held = 0
+    for (const c of pool) {
+      if (need <= 0.005) break
+      const take = Math.min(c.left, need)
+      c.left = Math.round((c.left - take) * 100) / 100
+      need = Math.round((need - take) * 100) / 100
+      if (c.held) held += take
+    }
+    return Math.round(held * 100) / 100
+  }
 
   // S653: the month's cap, if the resident asked for one. What this invoice
   // may use is the smaller of the credit on hand and the cap less what the
@@ -231,12 +262,23 @@ async function releaseInner(
     // it waits for next month's bill.
     if (rowAmt > available + 0.005) continue
 
+    // S654: only dollars GAM holds are released to the landlord. A row paid
+    // from a check or a landlord-entered credit settles like recorded cash.
+    const heldPart = heldPortionOf(rowAmt)
+    const release = landlordsMoney && heldPart >= rowAmt - 0.005
+    if (landlordsMoney && !release && heldPart > 0.005) {
+      logger.warn({ paymentId: row.id, rowAmt, heldPart, leaseId: opts.leaseId },
+        '[prepaid-release] row paid partly from GAM-held credit and partly from landlord-collected credit — nothing released; settle the held part by hand')
+    }
     await client.query(
       `UPDATE payments
           SET status='settled', settled_at=NOW(), platform_held = $2,
-              notes = COALESCE(notes || ' — ', '') || 'covered by prepaid credit (paid ahead)'
-        WHERE id = $1`, [row.id, landlordsMoney])
-    if (landlordsMoney) earned.push(row.id)
+              notes = COALESCE(notes || ' — ', '') || $3
+        WHERE id = $1`,
+      [row.id, release,
+       release ? 'covered by prepaid credit (paid ahead)'
+               : 'covered by prepaid credit (paid ahead, collected by the landlord)'])
+    if (release) earned.push(row.id)
     available -= rowAmt
     consumed += rowAmt
     rowsCovered++

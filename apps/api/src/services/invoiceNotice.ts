@@ -74,7 +74,7 @@ function labelFor(row: { type: string; notes: string | null }): string {
  * about. Idempotent: `sent_at` is stamped on success, so a re-run is a no-op.
  */
 export async function sendPendingInvoiceNotices(
-  opts: { withinDays?: number; timezone?: string; invoiceId?: string } = {},
+  opts: { withinDays?: number; timezone?: string; invoiceId?: string; updated?: boolean } = {},
 ): Promise<InvoiceNoticeResult> {
   const withinDays = opts.withinDays ?? DEFAULT_WITHIN_DAYS
   const result: InvoiceNoticeResult = { considered: 0, sent: 0, skippedNoEmail: 0, skippedCovered: 0, failed: 0 }
@@ -209,6 +209,7 @@ export async function sendPendingInvoiceNotices(
         creditApplied,
         portalUrl: portalLink('tenant', 'payments'),
         landlordName: inv.landlord_name || undefined,
+        updated: !!opts.updated,
       }, { landlordId: inv.landlord_id, tenantId: inv.tenant_id ?? undefined, invoiceId: inv.id })
 
       await query(`UPDATE invoices SET sent_at = NOW() WHERE id = $1`, [inv.id])
