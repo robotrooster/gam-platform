@@ -37,6 +37,8 @@ export interface InvoiceNoticeResult {
   considered: number
   sent: number
   skippedNoEmail: number
+  /** S654: work-trade months with nothing owed — told nothing, on purpose. */
+  skippedCovered: number
   failed: number
 }
 
@@ -49,6 +51,7 @@ interface PendingInvoice {
   due_label: string
   total_amount: string
   work_trade_credit_amount: string
+  work_trade_agreement_id: string | null
   unit_number: string | null
   property_name: string | null
   tenant_email: string | null
@@ -74,7 +77,7 @@ export async function sendPendingInvoiceNotices(
   opts: { withinDays?: number; timezone?: string; invoiceId?: string } = {},
 ): Promise<InvoiceNoticeResult> {
   const withinDays = opts.withinDays ?? DEFAULT_WITHIN_DAYS
-  const result: InvoiceNoticeResult = { considered: 0, sent: 0, skippedNoEmail: 0, failed: 0 }
+  const result: InvoiceNoticeResult = { considered: 0, sent: 0, skippedNoEmail: 0, skippedCovered: 0, failed: 0 }
 
   const pending = await query<PendingInvoice>(`
     SELECT i.id, i.landlord_id, i.tenant_id, i.invoice_number,
@@ -82,6 +85,7 @@ export async function sendPendingInvoiceNotices(
            to_char(i.due_date, 'FMMonth FMDD, YYYY') AS due_label,
            i.total_amount::text,
            i.work_trade_credit_amount::text,
+           i.work_trade_agreement_id,
            u.unit_number, p.name AS property_name,
            tu.email      AS tenant_email,
            tu.first_name AS tenant_first_name,
@@ -123,6 +127,17 @@ export async function sendPendingInvoiceNotices(
           WHERE invoice_id = $1 AND work_trade_suspended_at IS NULL
           ORDER BY CASE type WHEN 'rent' THEN 0 WHEN 'deposit' THEN 1 ELSE 2 END, created_at`,
         [inv.id])
+      // S654 (Nic): "Work trade people are on work trade. There's no bills going
+      // out to those people." A month the trade covers in full has nothing to
+      // announce — every line is suspended and the total is zero. Stamped as
+      // told so the next pass does not keep reconsidering it; a trade that
+      // leaves something owed (a utility the agreement does not cover) is a
+      // real bill and goes out with only the owed lines on it.
+      if (inv.work_trade_agreement_id && lines.length === 0) {
+        await query(`UPDATE invoices SET sent_at = NOW() WHERE id = $1`, [inv.id])
+        result.skippedCovered++
+        continue
+      }
       // S653 (Nic): "most people are going to see that email, think they owe
       // $900 or whatever... they just saw the headline." The headline is what
       // they will actually be asked for: what is still OPEN on this bill, less
@@ -145,9 +160,12 @@ export async function sendPendingInvoiceNotices(
         [inv.tenant_id, inv.landlord_id])
       const openBills = pool.length ? await query<{ id: string; lease_id: string | null; open: string; due: string }>(
         `SELECT i.id, i.lease_id, to_char(i.due_date, 'YYYY-MM-DD') AS due,
+                -- S654: a suspended work-trade line is already outside
+                -- total_amount (the S634 shape, every writer); netting it again
+                -- here drove these balances negative.
                 (i.total_amount - COALESCE((SELECT SUM(p.amount) FROM payments p
                    WHERE p.invoice_id = i.id
-                     AND (p.status IN ('settled','processing') OR p.work_trade_suspended_at IS NOT NULL)), 0))::text AS open
+                     AND p.status IN ('settled','processing')), 0))::text AS open
            FROM invoices i
           WHERE i.tenant_id = $1 AND i.landlord_id = $2
             AND (i.status IN ('pending','partial') OR i.id = $3)`,

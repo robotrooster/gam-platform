@@ -22,7 +22,15 @@ beforeEach(async () => {
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_homesale'
 })
 
-async function seed() {
+/**
+ * S654: a buyer who rents the space on an ACTIVE lease gets the installment on
+ * their rent invoice (jobs/invoiceGeneration — see workTradeMonthlyRun.test.ts);
+ * the standalone 4:20 job bills only a buyer with no lease here. The billing
+ * tests below exercise the standalone job, so they seed a buyer who once rented
+ * the space (the create guard still wants a lease of some status) but no
+ * longer does: `occupies: false` leaves the lease terminated.
+ */
+async function seed(opts: { occupies?: boolean } = {}) {
   const c = await db.connect()
   try {
     await c.query('BEGIN')
@@ -34,8 +42,9 @@ async function seed() {
     // is towed away rather than converted. The fixture is a park-owned home.
     const unitId = await seedUnit(c, { propertyId, landlordId, unitType: 'mobile_home' })
     await c.query(`UPDATE units SET dwelling_ownership = 'landlord' WHERE id = $1`, [unitId])
-    const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: 400 })
-    await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })   // the buyer occupies the space
+    const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: 400,
+      status: opts.occupies === false ? 'terminated' : 'active' })
+    await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })   // the buyer occupies the space (unless occupies:false)
     await c.query('COMMIT')
     const token = jwt.sign({ userId: llUser, role: 'landlord', email: 'll@t.dev', profileId: landlordId, permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
@@ -260,7 +269,7 @@ describe('GET /api/home-sales/unit/:unitId — tenant scoping', () => {
 
 describe('home-sale billing + payoff', () => {
   it('bills due installments as home_payment rows (idempotent) and stops at term', async () => {
-    const f = await seed()
+    const f = await seed({ occupies: false })   // S654: standalone = a buyer with no lease here
     // 3-month contract starting this month.
     await request(buildApp()).post('/api/home-sales').set('Authorization', `Bearer ${f.token}`)
       .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId,
@@ -281,7 +290,7 @@ describe('home-sale billing + payoff', () => {
   })
 
   it('the unique index blocks a duplicate home_payment for the same installment (idempotency backstop)', async () => {
-    const f = await seed()
+    const f = await seed({ occupies: false })
     await request(buildApp()).post('/api/home-sales').set('Authorization', `Bearer ${f.token}`)
       .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId,
               salePrice: 3000, downPayment: 0, annualInterestRate: 0, termMonths: 3, startMonth: '2000-01-01' })
@@ -306,7 +315,7 @@ describe('home-sale billing + payoff', () => {
   })
 
   it('marks paid_off and flips the unit to tenant-owned once all installments settle', async () => {
-    const f = await seed()
+    const f = await seed({ occupies: false })
     const create = await request(buildApp()).post('/api/home-sales').set('Authorization', `Bearer ${f.token}`)
       .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId,
               salePrice: 2000, downPayment: 0, annualInterestRate: 0, termMonths: 2, startMonth: '2000-01-01' })

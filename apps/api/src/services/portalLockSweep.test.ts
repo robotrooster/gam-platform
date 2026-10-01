@@ -38,9 +38,13 @@ async function billed(amounts: number[], opts: { agoHoursOfLast?: number } = {})
 
   for (let i = 0; i < amounts.length; i++) {
     const monthsBack = amounts.length - 1 - i
-    const at = monthsBack === 0 && opts.agoHoursOfLast != null
-      ? `NOW() - INTERVAL '${opts.agoHoursOfLast} hours'`
-      : `NOW() - INTERVAL '${monthsBack} months'`
+    // S654: older bills are anchored to the LATEST bill, not to NOW(). On the
+    // first two days of a month "NOW() - 49 hours" is still last month, so a
+    // two-cycle seed collapsed into one cycle and the rule never fired — the
+    // suite went red every 1st and 2nd for a reason that had nothing to do
+    // with the code.
+    const latest = opts.agoHoursOfLast != null ? `(NOW() - INTERVAL '${opts.agoHoursOfLast} hours')` : 'NOW()'
+    const at = monthsBack === 0 ? latest : `${latest} - INTERVAL '${monthsBack} months'`
     await query(
       `INSERT INTO landlord_gam_charges
          (landlord_id, kind, amount, collected_amount, source_type, created_at)

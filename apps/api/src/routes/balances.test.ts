@@ -270,3 +270,36 @@ describe('open pay links are outstanding', () => {
     expect(rows.find((r: any) => r.ticket_id === t)).toBeUndefined()
   })
 })
+
+// S654: a suspended work-trade line is written OUTSIDE total_amount (the S634
+// shape). Netting it again here drove RV 50 / RV 51 to -$589 and hid two
+// October bills behind their September.
+describe('S654 GET /api/balances — suspended lines are outside the total', () => {
+  it('a partly covered bill owes exactly its uncovered line, never less', async () => {
+    const f = await seedOwedTenant()                      // rent 440 + electric 176.40
+    await db.query(
+      `UPDATE payments SET work_trade_suspended_at = NOW(),
+              notes = 'Work trade — suspended while the hours are worked; settled at month close'
+        WHERE invoice_id=$1 AND type='rent'`, [f.invoiceId])
+    await db.query(`UPDATE invoices SET total_amount = 176.40 WHERE id=$1`, [f.invoiceId])
+
+    const res = await request(buildApp()).get('/api/balances')
+      .set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    expect(res.status).toBe(200)
+    const row = res.body.data.find((r: any) => r.tenant_id === f.tenantId || r.tenantId === f.tenantId)
+    expect(row).toBeTruthy()
+    expect(Number(row.balance)).toBe(176.40)
+  })
+
+  it('a fully covered month owes nothing — not a negative number', async () => {
+    const f = await seedOwedTenant()
+    await db.query(`UPDATE payments SET work_trade_suspended_at = NOW() WHERE invoice_id=$1`, [f.invoiceId])
+    await db.query(`UPDATE invoices SET total_amount = 0 WHERE id=$1`, [f.invoiceId])
+
+    const res = await request(buildApp()).get('/api/balances')
+      .set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    expect(res.status).toBe(200)
+    const row = res.body.data.find((r: any) => r.tenant_id === f.tenantId || r.tenantId === f.tenantId)
+    expect(!row || Number(row.balance) === 0).toBe(true)
+  })
+})

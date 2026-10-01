@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict iJOENUkgz2SQrC8do0BBt7l8PFsKPr9Ub06b1C0z77wBLfmJPwbmgtCnCG2lyMz
+\restrict JWqPkBBiJMNFkh4fphTp6ASO517WME8KYDhniU28fC2mUoahJ4CFwaKVarrmdYQ
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4752,6 +4752,7 @@ CREATE TABLE public.invoices (
     is_opening_balance boolean DEFAULT false NOT NULL,
     late_fee_exempt boolean DEFAULT false NOT NULL,
     service_agreement_id uuid,
+    subtotal_home_payments numeric(12,2) DEFAULT 0 NOT NULL,
     CONSTRAINT invoices_payer_source_check CHECK (((lease_id IS NOT NULL) <> (service_agreement_id IS NOT NULL))),
     CONSTRAINT invoices_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'partial'::text, 'settled'::text, 'void'::text]))),
     CONSTRAINT invoices_subtotal_deposits_check CHECK ((subtotal_deposits >= (0)::numeric)),
@@ -4783,6 +4784,13 @@ COMMENT ON COLUMN public.invoices.late_fee_exempt IS 'S605: the nightly late-fee
 --
 
 COMMENT ON COLUMN public.invoices.service_agreement_id IS 'S615: set when this invoice bills a space the landlord SERVICES but does not lease (cross-property utilities). Mutually exclusive with lease_id. Such an invoice carries utility rows only — there is no rent to charge.';
+
+
+--
+-- Name: COLUMN invoices.subtotal_home_payments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.invoices.subtotal_home_payments IS 'S654: home-sale installments riding this invoice (type=home_payment rows); gross, like the other subtotals.';
 
 
 --
@@ -28329,5 +28337,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict iJOENUkgz2SQrC8do0BBt7l8PFsKPr9Ub06b1C0z77wBLfmJPwbmgtCnCG2lyMz
+\unrestrict JWqPkBBiJMNFkh4fphTp6ASO517WME8KYDhniU28fC2mUoahJ4CFwaKVarrmdYQ
 

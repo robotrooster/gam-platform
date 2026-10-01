@@ -166,8 +166,10 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
                                            AND work_trade_suspended_at IS NOT NULL) AS traded
                 FROM payments WHERE invoice_id IS NOT NULL
                GROUP BY invoice_id`
+    // S654: suspended lines sit OUTSIDE total_amount (the S634 shape, every
+    // writer); subtracting `traded` again clamped a partly covered bill to $0.
     const OUTSTANDING_SUM =
-      `COALESCE(SUM(GREATEST(i.total_amount - COALESCE(p.paid, 0) - COALESCE(p.traded, 0), 0)), 0)::numeric AS amount`
+      `COALESCE(SUM(GREATEST(i.total_amount - COALESCE(p.paid, 0), 0)), 0)::numeric AS amount`
     const outstandingRow = isAdmin
       ? await queryOne<any>(`
           SELECT ${OUTSTANDING_SUM}

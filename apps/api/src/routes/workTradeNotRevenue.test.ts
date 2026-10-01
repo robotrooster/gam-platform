@@ -78,15 +78,16 @@ async function seed(opts: { coveredCharges?: string[] } = {}): Promise<Fx> {
        VALUES ($1,$2,$3, CURRENT_DATE - 40, 'active', 80, $4)`,
       [tradeUnit, trade.tenantId, landlordId, opts.coveredCharges ?? ['rent', 'water']])
 
-    // Two open invoices, one of each kind. The work-trade one issues GROSS and
-    // carries a suspended charge row — that is how the month is billed while it
-    // is still being worked (S624).
+    // Two open invoices, one of each kind. The work-trade one carries a
+    // suspended charge row at what the month is worth, OUTSIDE the total — that
+    // is how the month is billed while it is still being worked (S634/S654:
+    // every writer keeps this shape, so readers never net the row again).
     const inv = async (unitId: string, tenantId: string, leaseId: string, amt: number, suspended: boolean) => {
       const i = await c.query<{ id: string }>(
         `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date,
                                subtotal_rent, total_amount, status)
-         VALUES ($1,$2,$3,$4,$5, CURRENT_DATE - 5, $6, $6, 'pending') RETURNING id`,
-        [landlordId, tenantId, leaseId, unitId, `INV-${randomUUID().slice(0, 8)}`, amt])
+         VALUES ($1,$2,$3,$4,$5, CURRENT_DATE - 5, $6, $7, 'pending') RETURNING id`,
+        [landlordId, tenantId, leaseId, unitId, `INV-${randomUUID().slice(0, 8)}`, amt, suspended ? 0 : amt])
       await c.query(
         `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount,
                                status, due_date, entry_description, work_trade_suspended_at)

@@ -17,6 +17,7 @@ import { createAdminNotification } from '../services/adminNotifications'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 import { activeLinkForUnit } from '../services/crossPropertyLink'
+import { reconcileHomeSaleContract } from '../services/homeSale'
 import { existingTenancyFirstDue } from './moveInBundle'
 
 // ============================================================
@@ -62,6 +63,8 @@ interface InvoiceGenResult {
   rentsInserted: number
   feesInserted: number
   utilitiesInserted: number
+  /** S654: home-sale installments that rode a rent invoice this run. */
+  homePaymentsInserted: number
   leasesProcessed: number
 }
 
@@ -286,6 +289,7 @@ async function runGeneration(
   let rentsInserted = 0
   let feesInserted = 0
   let utilitiesInserted = 0
+  let homePaymentsInserted = 0
 
   for (const lease of leases) {
     const leaseStart = DateTime.fromISO(lease.start_date, { zone: lease.property_tz })
@@ -634,6 +638,52 @@ async function runGeneration(
         [lease.id, dueDate]
       )
 
+      // ── S654 (Nic): THE HOME PAYMENT RIDES THE RENT INVOICE ──────────────
+      //
+      //   "If the base space rent for the property is $450 everywhere, John
+      //    Sheptock's $200 trailer payment would make it $650."
+      //
+      // A park-financed home sale bills its installment each month. Until now
+      // that was a standalone charge written by a 4:20 AM job: it was real, it
+      // was owed, and nothing else could see it — the rent invoice made at 5:00
+      // left it out, so the bill email headlined $489.60 for a household that
+      // owed $589.60, the landlord's who-owes page omitted it, and the tenant's
+      // Pay page showed a second box with no lease on it. Every rent-to-own
+      // resident at Country Acres read as "the home payment was skipped."
+      //
+      // Same straggler semantics as a utility bill: anything due on or before
+      // this cycle rides it. The buyer must be THIS lease's primary (the
+      // contract names the tenant and the space). Charged at face value and
+      // kept out of the work-trade distribution — a purchase installment is not
+      // a cost of living there, and hours worked do not buy a trailer. The
+      // 4:20 job keeps billing standalone only for a buyer with no lease here
+      // (services/homeSale.ts). The property's first billing cycle is honored
+      // the same way that job honors it: earlier installments were paid outside
+      // GAM and are stamped so by that job, never billed here.
+      const homeInstallments = (sublease || !lease.tenant_id) ? [] : await query<{
+        id: string
+        amount: string
+        installment_number: number
+        installments_total: number
+        contract_id: string
+        landlord_id: string
+      }>(
+        `SELECT i.id, i.amount::text, i.installment_number, c.installments_total,
+                c.id AS contract_id, c.landlord_id
+           FROM home_sale_installments i
+           JOIN home_sale_contracts c ON c.id = i.contract_id
+          WHERE c.status = 'active'
+            AND c.unit_id = $1
+            AND c.tenant_id = $2
+            AND i.payment_id IS NULL
+            AND i.settled_off_platform_at IS NULL
+            AND i.billing_month <= date_trunc('month', $3::date)::date
+            AND ($4::date IS NULL OR i.billing_month >= date_trunc('month', $4::date)::date)
+          ORDER BY i.billing_month ASC, i.installment_number ASC`,
+        [lease.unit_id, lease.tenant_id, dueDate, lease.first_billing_cycle]
+      )
+      const touchedHomeContracts = new Set<string>()
+
       // S533: propane fill installments not yet billed whose cycle has
       // arrived. #1 billed immediately at the fill (payment_id set), so
       // this only picks up the split remainder. Same straggler semantics
@@ -668,6 +718,7 @@ async function runGeneration(
         rentsInserted++
         feesInserted += fees.length + oneOffCharges.length
         utilitiesInserted += utilityBills.length + propaneInstallments.length
+        homePaymentsInserted += homeInstallments.length
         continue
       }
 
@@ -799,6 +850,44 @@ async function runGeneration(
         const rowStatus = (net: number) => (wtActive && net === 0 ? 'settled' : 'pending')
         const rowNote   = (net: number) => (wtActive && net === 0 ? WT_NOTE : null)
 
+        // ── S654 (Nic): A COVERED LINE IS SUSPENDED HERE TOO ─────────────────
+        //
+        //   "Work trade people are on work trade. There's no bills going out to
+        //    those people."
+        //
+        // S634 made the MOVE-IN bill write a covered line suspended — real, at
+        // what the month is worth, and out of the amount due while the hours
+        // are worked. This run never did. So the first bill of every work-trade
+        // tenancy read right and the second one did not: October 1 went out to
+        // nine work-trade residents at three parks as "$460.00 due", their rent
+        // sat on the landlord's who-owes page, and the only thing that would
+        // ever have cleared it was a month close that has nothing to credit
+        // until somebody logs hours.
+        //
+        // Same rule as the move-in bill, read off the same covered_charges: a
+        // charge the agreement covers is written and suspended; one it does not
+        // cover is owed as usual. The settlement period opened below still
+        // prices the covered basis, and the month close (jobs/workTradeSettlement)
+        // is what lifts the suspension — settled in full, or the lapse billed.
+        // A converged row never qualifies (utilityCovered already says so), and
+        // a one-off charge never does.
+        const suspendRent      = !!wt && rentCovered && dist.rentNet > 0
+        const suspendFee       = (i: number) => !!wt && feeCovered[i] && dist.feeNets[i] > 0
+        const suspendUtility   = (i: number) => !!wt && utilityCovered[i] && dist.utilityNets[i] > 0
+        const suspendPropane   = (i: number) => !!wt && propaneCovered && (dist.propaneNets[i] ?? 0) > 0
+        const suspendedTotalNum = round2(
+          (suspendRent ? dist.rentNet : 0)
+          + dist.feeNets.reduce((s, n, i) => s + (suspendFee(i) ? n : 0), 0)
+          + dist.utilityNets.reduce((s, n, i) => s + (suspendUtility(i) ? n : 0), 0)
+          + dist.propaneNets.reduce((s, n, i) => s + (suspendPropane(i) ? n : 0), 0))
+        const WT_SUSPENDED_NOTE = 'Work trade — suspended while the hours are worked; settled at month close'
+        const suspendedAt = new Date().toISOString()
+        // The home payment is owed at face value whatever the trade covers.
+        const homeTotalNum = round2(homeInstallments.reduce((s, h) => s + Number(h.amount), 0))
+        // What the resident is asked for today. Subtotals stay gross; the
+        // suspended lines are still on the document at their full value.
+        const owedTotalNum = round2(netTotalNum - suspendedTotalNum + homeTotalNum)
+
         // Insert invoice — ON CONFLICT short-circuits whole cycle if already exists.
         // total_amount is NET of the work-trade credit; the credit + driving
         // agreement are stamped for audit + tenant/landlord display.
@@ -861,7 +950,7 @@ async function runGeneration(
              invoice_number, due_date,
              subtotal_rent, subtotal_fees, subtotal_utilities, total_amount,
              work_trade_credit_amount, work_trade_credit_hours, work_trade_agreement_id,
-             late_fee_exempt
+             late_fee_exempt, subtotal_home_payments
            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
              -- S623 (Nic): a work-trade tenant must not be fined while they are
              -- working off the month. "Why would they pay and then start working
@@ -875,15 +964,15 @@ async function runGeneration(
              -- from ITS OWN hours at month close, instead of from the previous
              -- month at generation — is a real billing change and is written up
              -- in the handoff rather than rushed in overnight.
-             $13::uuid IS NOT NULL OR $14::boolean)
+             $13::uuid IS NOT NULL OR $14::boolean, $15)
            ON CONFLICT (lease_id, due_date) DO NOTHING
            RETURNING id`,
           [
             lease.landlord_id, effectiveTenantId, lease.id, lease.unit_id,
             invoiceNumber, dueDate,
-            effectiveRentAmount, subtotalFeesStr, subtotalUtilitiesStr, netTotalNum.toFixed(2),
+            effectiveRentAmount, subtotalFeesStr, subtotalUtilitiesStr, owedTotalNum.toFixed(2),
             dist.creditApplied.toFixed(2), (wt ? wt.verifiedHours : 0).toFixed(2), wt ? wt.agreementId : null,
-            lateStartExempt,
+            lateStartExempt, homeTotalNum.toFixed(2),
           ]
         )
 
@@ -937,12 +1026,14 @@ async function runGeneration(
           `INSERT INTO payments (
              invoice_id, unit_id, lease_id, tenant_id, landlord_id,
              type, amount, status, due_date, entry_description, notes,
-             settled_at
+             settled_at, work_trade_suspended_at
            ) VALUES ($1, $2, $3, $4, $5, 'rent', $6, $8, $7, 'RENT', $9,
-             CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END)`,
+             CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END, $10)`,
           [
             invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
-            dist.rentNet.toFixed(2), dueDate, rowStatus(dist.rentNet), rowNote(dist.rentNet),
+            dist.rentNet.toFixed(2), dueDate, rowStatus(dist.rentNet),
+            suspendRent ? WT_SUSPENDED_NOTE : rowNote(dist.rentNet),
+            suspendRent ? suspendedAt : null,
           ]
         )
         rentsInserted++
@@ -959,12 +1050,14 @@ async function runGeneration(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
                type, amount, status, due_date, entry_description, lease_fee_id, notes,
-               settled_at
+               settled_at, work_trade_suspended_at
              ) VALUES ($1, $2, $3, $4, $5, 'fee', $6, $9, $7, 'SUBSCRIP', $8, $10,
-               CASE WHEN $9 = 'settled' THEN NOW() ELSE NULL END)`,
+               CASE WHEN $9 = 'settled' THEN NOW() ELSE NULL END, $11)`,
             [
               invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
-              net.toFixed(2), dueDate, fee.id, rowStatus(net), rowNote(net),
+              net.toFixed(2), dueDate, fee.id, rowStatus(net),
+              suspendFee(i) ? WT_SUSPENDED_NOTE : rowNote(net),
+              suspendFee(i) ? suspendedAt : null,
             ]
           )
           feesInserted++
@@ -1057,7 +1150,8 @@ async function runGeneration(
           const spotNote = movedMidCycle && (ub as any).bill_unit_number
             ? String((ub as any).bill_unit_number)
             : null
-          const combinedNote = [spotNote, readNote, rowNote(net)].filter(Boolean).join(' — ') || null
+          const combinedNote = [spotNote, readNote, suspendUtility(i) ? WT_SUSPENDED_NOTE : rowNote(net)]
+            .filter(Boolean).join(' — ') || null
           // S616 — THE DIVERSION. This row's landlord is the bill's own, not the
           // lease's. For every ordinary utility they are the same value and
           // nothing changes; on a converged invoice this is the line that sends
@@ -1087,9 +1181,9 @@ async function runGeneration(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
                type, amount, status, due_date, entry_description, notes,
-               settled_at
+               settled_at, work_trade_suspended_at
              ) VALUES ($1, $2, $3, $4, $5, 'utility', $6, $8, $7, 'UTILITY', $9,
-               CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END)
+               CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END, $10)
              RETURNING id`,
             [
               invoiceId,
@@ -1098,6 +1192,7 @@ async function runGeneration(
               effectiveTenantId,
               rowLandlordId,
               net.toFixed(2), dueDate, rowStatus(net), combinedNote,
+              suspendUtility(i) ? suspendedAt : null,
             ]
           )
           await client.query(
@@ -1122,8 +1217,9 @@ async function runGeneration(
           const propanePayment = await client.query<{ id: string }>(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-               type, amount, status, due_date, entry_description, notes
-             ) VALUES ($1, $2, $3, $4, $5, 'utility', $6, 'pending', $7, 'PROPANE', $8)
+               type, amount, status, due_date, entry_description, notes,
+               work_trade_suspended_at
+             ) VALUES ($1, $2, $3, $4, $5, 'utility', $6, 'pending', $7, 'PROPANE', $8, $9)
              RETURNING id`,
             [
               invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
@@ -1131,7 +1227,9 @@ async function runGeneration(
               propaneNet < Number(pi.amount)
                 ? `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count} (${
                     propaneNet === 0 ? 'covered in full by work trade' : `$${round2(Number(pi.amount) - propaneNet).toFixed(2)} covered by work trade`})`
-                : `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count}`,
+                : `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count}`
+                  + (suspendPropane(piIdx) ? ` — ${WT_SUSPENDED_NOTE}` : ''),
+              suspendPropane(piIdx) ? suspendedAt : null,
             ]
           )
           await client.query(
@@ -1139,6 +1237,34 @@ async function runGeneration(
             [propanePayment.rows[0].id, pi.id]
           )
           utilitiesInserted++
+        }
+
+        // S654: home-sale installments at face value, on this invoice. The
+        // partial-unique index on payments.home_sale_installment_id makes a
+        // race with the standalone job a no-op, so an installment bills once.
+        for (const h of homeInstallments) {
+          const hp = await client.query<{ id: string }>(
+            `INSERT INTO payments (
+               invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+               type, amount, status, due_date, entry_description, notes,
+               home_sale_installment_id
+             ) VALUES ($1, $2, $3, $4, $5, 'home_payment', $6, 'pending', $7, 'HOMEPMT', $8, $9)
+             ON CONFLICT (home_sale_installment_id) WHERE home_sale_installment_id IS NOT NULL DO NOTHING
+             RETURNING id`,
+            [
+              invoiceId, lease.unit_id, lease.id, effectiveTenantId, h.landlord_id,
+              Number(h.amount).toFixed(2), dueDate,
+              `Home payment ${h.installment_number} of ${h.installments_total}`,
+              h.id,
+            ]
+          )
+          if (hp.rows.length === 0) continue
+          await client.query(
+            `UPDATE home_sale_installments SET payment_id = $1 WHERE id = $2 AND payment_id IS NULL`,
+            [hp.rows[0].id, h.id]
+          )
+          touchedHomeContracts.add(h.contract_id)
+          homePaymentsInserted++
         }
 
         // S537 (Nic): consume prepaid credit — money the tenant paid ahead —
@@ -1193,6 +1319,13 @@ async function runGeneration(
 
         await client.query('COMMIT')
         invoicesInserted++
+
+        // S654: the contract's billed/paid counters, after the commit so a
+        // counter that fails to update never costs anyone their bill.
+        for (const cid of touchedHomeContracts) {
+          await reconcileHomeSaleContract(cid).catch(err =>
+            logger.error({ err, contractId: cid, invoiceId }, '[InvoiceGen] home-sale reconcile failed — invoice issued'))
+        }
       } catch (e) {
         // Per-lease isolation: a single malformed lease (e.g. a pre-existing
         // orphan rent payment for this cycle that collides with
@@ -1214,6 +1347,7 @@ async function runGeneration(
     rentsInserted,
     feesInserted,
     utilitiesInserted,
+    homePaymentsInserted,
     leasesProcessed: leases.length,
   }
 }
@@ -1326,7 +1460,7 @@ export function registerInvoiceEngine(): void {
       try {
         const r = await generateInvoicesForTimezone(tz)
         if (r.invoicesInserted > 0 || r.rentsInserted > 0 || r.feesInserted > 0) {
-          logger.info({ tz, invoices: r.invoicesInserted, rents: r.rentsInserted, fees: r.feesInserted }, '[InvoiceGen] invoices generated')
+          logger.info({ tz, invoices: r.invoicesInserted, rents: r.rentsInserted, fees: r.feesInserted, homePayments: r.homePaymentsInserted }, '[InvoiceGen] invoices generated')
         }
       } catch (e) {
         logger.error({ err: e, tz }, '[InvoiceGen] error')

@@ -161,6 +161,12 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
       // the amount box, not a ceiling — there is no cap on paying ahead.
       suggestedPayAhead?: number
       requiredNow?: number
+      // S654: what each way of paying costs on THIS lease, and the cash-fee
+      // flags — summed into the one card when there are two or more leases.
+      methodCosts?: { method: string; label: string; fee: number; total: number }[]
+      manualFeeCoveredByLandlord?: boolean
+      manualFeeFirstFree?: boolean
+      manualFeeAbsorbed?: number
     }[]
     rows: { id: string; amount: number; dueDate: string; type: string; entryDescription: string }[]
     // S616: what the payer owes on each utility service agreement — the same
@@ -400,40 +406,83 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
           initiate a cash payment through the portal (they hand cash to the
           landlord, who records it), so the tenant-facing banner was nonsensical. */}
 
-      {/* S581: "Pay all" — only with 2+ payable leases. One method, a separate
-          charge per lease. */}
-      {payable.length >= 2 && (
-        <div className="card" style={{ padding: 16, marginTop: 16, borderColor: 'var(--gold)' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
-            <div>
-              <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
-                All leases · {payable.length}
+      {/* S654 (Nic): ONE BUTTON. "They can't choose what they pay. They pay
+          everything that's owed." With two or more payable leases the page used
+          to offer a bare "Pay all" card above a Pay button per lease — three
+          buttons, and a resident reading the second card as "a previous
+          outstanding balance". Now there is one card in the same shape as a
+          single lease's: the whole balance, what each space contributes, the
+          fee for each way of paying it, and one Pay. Each lease is still charged
+          separately underneath (one clearing never depends on another), which
+          is why the fees are the sum of each lease's. */}
+      {payable.length >= 2 && (() => {
+        const r2 = (n: number) => Math.round(n * 100) / 100
+        const combined = {
+          methodCosts: ['ach', 'card', 'manual'].map((m) => {
+            const parts = payable.map((l) => (l.methodCosts ?? []).find((c: any) => c.method === m)).filter(Boolean) as any[]
+            return parts.length
+              ? { method: m, label: parts[0].label, fee: r2(parts.reduce((s, c) => s + Number(c.fee), 0)), total: r2(parts.reduce((s, c) => s + Number(c.total), 0)) }
+              : null
+          }).filter(Boolean),
+          manualFeeCoveredByLandlord: payable.every((l) => l.manualFeeCoveredByLandlord),
+          manualFeeFirstFree: payable.every((l) => l.manualFeeFirstFree),
+          manualFeeAbsorbed: r2(payable.reduce((s, l) => s + Number(l.manualFeeAbsorbed || 0), 0)),
+        }
+        const properties = [...new Set(payable.map((l) => l.propertyName))].join(' · ')
+        return (
+          <div className="card" style={{ padding: 16, marginTop: 16, borderColor: 'var(--gold)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+              <div style={{ flex: '1 1 320px' }}>
+                <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
+                  Outstanding balance — {properties}
+                </div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--t0)' }}>
+                  {formatCurrency(payableTotal)}
+                </div>
+                <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>
+                  Everything you owe, in one payment — oldest charges first. Each space is
+                  charged separately, so one clearing doesn&apos;t depend on the others.
+                </div>
+                <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--bd)' }}>
+                  <div style={{ fontSize: '.7rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
+                    What this covers
+                  </div>
+                  {payable.map((l) => (
+                    <div key={l.leaseId} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12, padding: '3px 0', fontSize: '.78rem' }}>
+                      <span style={{ color: 'var(--t2)' }}>Unit {l.unitNumber}</span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--t0)', whiteSpace: 'nowrap' }}>{formatCurrency(l.outstanding)}</span>
+                    </div>
+                  ))}
+                </div>
+                <WaysToPay lease={combined} reports={declaredDeposits} onWithdrawn={refetchAll} />
+                {payable.map((l) => (
+                  <button key={l.leaseId} className="btn-ghost"
+                    onClick={() => setReportDepositFor({ leaseId: l.leaseId, outstanding: l.outstanding })}
+                    style={{ width: '100%', marginTop: 8, fontSize: '.78rem', padding: '8px 12px' }}>
+                    I paid at the bank for Unit {l.unitNumber} — report a deposit
+                  </button>
+                ))}
               </div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--t0)' }}>
-                {formatCurrency(payableTotal)}
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
+                <button className="btn btn-p" onClick={openPayAll}>
+                  Pay {formatCurrency(payableTotal)}
+                </button>
               </div>
-              <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>
-                Pays every lease at once — each is charged separately, so one clearing
-                doesn&apos;t depend on the others.
-              </div>
-            </div>
-            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-              <button className="btn btn-p" onClick={openPayAll}>
-                Pay all {formatCurrency(payableTotal)}
-              </button>
             </div>
           </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* S537 → S581: the payment surface — one Pay card PER LEASE (each lease
-          is charged separately, in full). A single-lease tenant sees one card. */}
+          is charged separately, in full). A single-lease tenant sees one card.
+          S654: with two or more payable leases the one card above replaces
+          these — no per-lease Pay button, nothing to choose between. */}
       {leaseGroups.map((lg) => (
         lg.paymentBlocked ? (
           <div key={lg.leaseId} className="card" style={{ padding: 14, marginTop: 16, fontSize: '.8rem', color: 'var(--t1)' }}>
             Payments for {lg.propertyName} · Unit {lg.unitNumber} are currently paused. Contact your landlord.
           </div>
-        ) : lg.outstanding > 0 ? (
+        ) : payable.length >= 2 ? null : lg.outstanding > 0 ? (
           <div key={lg.leaseId} className="card" style={{ padding: 16, marginTop: 16 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
               <div>

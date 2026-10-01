@@ -36,6 +36,12 @@ async function seedInvoice(opts: {
   withTenant?: boolean
   workTradeCredit?: number
   suspendedRent?: boolean
+  /** S654: stamp the invoice with a live agreement (the monthly run does). */
+  workTradeAgreement?: boolean
+  /** S654: a utility line the trade does not cover — owed as usual. */
+  utilityOwed?: number
+  /** S654: the S634 total (what is owed today); default = rent − credit. */
+  total?: number
 } = {}) {
   const rent = opts.rent ?? 460
   const c = await db.connect()
@@ -61,7 +67,7 @@ async function seedInvoice(opts: {
        VALUES ($1,$2,$3,$4,$5,(NOW() AT TIME ZONE $6)::date - $7::int, $8, $9, 'pending', $10)
        RETURNING id`,
       [ll.landlordId, tenantId, leaseId, unitId, `INV-${Math.random().toString(36).slice(2, 10)}`,
-       TZ, opts.dueDaysAgo ?? 0, rent, rent - (opts.workTradeCredit ?? 0), opts.workTradeCredit ?? 0])
+       TZ, opts.dueDaysAgo ?? 0, rent, opts.total ?? (rent - (opts.workTradeCredit ?? 0)), opts.workTradeCredit ?? 0])
 
     await c.query(
       `INSERT INTO payments (landlord_id, unit_id, lease_id, type, amount, status,
@@ -69,6 +75,20 @@ async function seedInvoice(opts: {
        VALUES ($1,$2,$3,'rent',$4,'pending','RENT',(NOW() AT TIME ZONE $5)::date, $6, $7)`,
       [ll.landlordId, unitId, leaseId, rent, TZ, inv.rows[0].id,
        opts.suspendedRent ? new Date() : null])
+    if (opts.utilityOwed) {
+      await c.query(
+        `INSERT INTO payments (landlord_id, unit_id, lease_id, tenant_id, type, amount, status,
+                               entry_description, due_date, invoice_id, notes)
+         VALUES ($1,$2,$3,$4,'utility',$5,'pending','UTILITY',(NOW() AT TIME ZONE $6)::date, $7,
+                 'Water meter 03470 → 03537 · 6,700 gal')`,
+        [ll.landlordId, unitId, leaseId, tenantId, opts.utilityOwed, TZ, inv.rows[0].id])
+    }
+    if (opts.workTradeAgreement && tenantId) {
+      const a = await c.query<{ id: string }>(
+        `INSERT INTO work_trade_agreements (unit_id, tenant_id, landlord_id, start_date, status, monthly_hours_target)
+         VALUES ($1,$2,$3,'2026-01-01','active',80) RETURNING id`, [unitId, tenantId, ll.landlordId])
+      await c.query(`UPDATE invoices SET work_trade_agreement_id=$2 WHERE id=$1`, [inv.rows[0].id, a.rows[0].id])
+    }
 
     await c.query('COMMIT')
     return { invoiceId: inv.rows[0].id, tenantId, landlordId: ll.landlordId }
@@ -143,6 +163,31 @@ describe('invoice notices', () => {
 
   // Work trade is a real charge that nobody owes. It belongs on the bill as a
   // credit, never in the list of things to pay.
+  // S654 (Nic): "Work trade people are on work trade. There's no bills going
+  // out to those people." October 1 mailed nine of them "$460.00 due".
+  it('a month the trade covers in full is told nothing — and not reconsidered', async () => {
+    const { invoiceId } = await seedInvoice({ rent: 460, suspendedRent: true, workTradeAgreement: true, total: 0 })
+    const r = await sendPendingInvoiceNotices()
+    expect(r.sent).toBe(0)
+    expect(r.skippedCovered).toBe(1)
+    expect(resendSendMock).not.toHaveBeenCalled()
+    const { rows } = await db.query(`SELECT sent_at FROM invoices WHERE id=$1`, [invoiceId])
+    expect(rows[0].sent_at).not.toBeNull()
+    resendSendMock.mockClear()
+    expect((await sendPendingInvoiceNotices()).considered).toBe(0)
+  })
+
+  it('a trade that leaves a utility owed announces only the utility', async () => {
+    await seedInvoice({ rent: 450, suspendedRent: true, workTradeAgreement: true, utilityOwed: 110.55, total: 110.55 })
+    const r = await sendPendingInvoiceNotices()
+    expect(r.sent).toBe(1)
+    const mail = lastSend()
+    expect(mail.subject).toContain('$110.55')
+    expect(mail.html).toContain('6,700 gal')
+    expect(mail.html).not.toContain('>Rent<')
+    expect(mail.html).not.toContain('$450.00')
+  })
+
   it('work trade shows as a credit, and the traded charge is not listed as owed', async () => {
     await seedInvoice({ rent: 460, workTradeCredit: 460, suspendedRent: true })
     const r = await sendPendingInvoiceNotices()

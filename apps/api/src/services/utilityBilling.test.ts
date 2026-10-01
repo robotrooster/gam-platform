@@ -1275,7 +1275,11 @@ describe('S560 billMoveOutRead odometer rollover', () => {
     // Prior read, then the move-out read stamped to the CURRENT cycle — exactly
     // what the special-read route writes when someone unplugs and drives away.
     const cycle = new Date().toISOString().slice(0, 8) + '01'
-    await seedReadingAt(meterId, cycle, cycle, 1000, 'monthly_cycle', base.landlordUserId)
+    // S654: the prior read must be BEFORE the move-out read. Dated on the
+    // cycle's 1st, it equalled today's move-out read every 1st of the month
+    // and the suite went red for 'no prior read'.
+    const priorDay = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10)
+    await seedReadingAt(meterId, priorDay, cycle, 1000, 'monthly_cycle', base.landlordUserId)
     const { rows: [mo] } = await db.query<any>(
       `INSERT INTO utility_meter_readings
          (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
@@ -1312,7 +1316,11 @@ describe('S560 billMoveOutRead odometer rollover', () => {
     await setMeterRateBase(meterId, 1, 0)
 
     const cycle = new Date().toISOString().slice(0, 8) + '01'
-    await seedReadingAt(meterId, cycle, cycle, 1000, 'monthly_cycle', base.landlordUserId)
+    // S654: the prior read must be BEFORE the move-out read. Dated on the
+    // cycle's 1st, it equalled today's move-out read every 1st of the month
+    // and the suite went red for 'no prior read'.
+    const priorDay = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10)
+    await seedReadingAt(meterId, priorDay, cycle, 1000, 'monthly_cycle', base.landlordUserId)
     const mk = async (v: number) => (await db.query<any>(
       `INSERT INTO utility_meter_readings
          (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)

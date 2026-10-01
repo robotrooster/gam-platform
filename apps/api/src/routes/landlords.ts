@@ -915,8 +915,11 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // `traded` is reported alongside rather than thrown away: what the trades
     // are worth this month is a real number a landlord should be able to see.
     const [outstandingRow] = await query<any>(`
-      SELECT COALESCE(SUM(GREATEST(i.total_amount - COALESCE(p.paid, 0) - COALESCE(p.traded, 0), 0)), 0)::float AS outstanding,
-             COALESCE(SUM(LEAST(COALESCE(p.traded, 0), GREATEST(i.total_amount - COALESCE(p.paid, 0), 0))), 0)::float AS work_trade_suspended
+      -- S654: suspended lines sit OUTSIDE total_amount (the S634 shape, every
+      -- writer), so they are reported alongside and no longer subtracted — that
+      -- clamped a partly covered bill (rent traded, water owed) to $0 owed.
+      SELECT COALESCE(SUM(GREATEST(i.total_amount - COALESCE(p.paid, 0), 0)), 0)::float AS outstanding,
+             COALESCE(SUM(COALESCE(p.traded, 0)), 0)::float AS work_trade_suspended
         FROM invoices i
         LEFT JOIN (
           SELECT invoice_id,

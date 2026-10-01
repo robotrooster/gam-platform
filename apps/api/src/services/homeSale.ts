@@ -232,6 +232,15 @@ export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<nu
         AND i.payment_id IS NULL
         AND i.settled_off_platform_at IS NULL
         AND i.billing_month <= $1::date
+        -- S654 (Nic): a buyer who rents the space on an active lease gets the
+        -- installment ON their rent invoice (jobs/invoiceGeneration), so the
+        -- bill, the email and the who-owes page all carry it. Only a buyer
+        -- with no lease here — the investor who owns homes in parks he does
+        -- not own — is billed standalone.
+        AND NOT EXISTS (
+          SELECT 1 FROM leases l
+          JOIN v_lease_active_tenants v ON v.lease_id = l.id
+          WHERE l.unit_id = c.unit_id AND l.status = 'active' AND v.tenant_id = c.tenant_id)
       ORDER BY c.id, i.installment_number ASC`,
     [asOfMonth])
 

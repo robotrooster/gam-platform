@@ -52,9 +52,12 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
           FROM payments
          -- S637 (Nic): money in flight is not outstanding — an ACH debit sits
          -- 'processing' ~4 business days; a failure flips it back to owed.
-         -- S638 (Nic): work trade is not an outstanding balance — suspended
-         -- rows are netted; a month-close deficit bills unsuspended.
-         WHERE (status IN ('settled', 'processing') OR work_trade_suspended_at IS NOT NULL)
+         -- S638 (Nic): work trade is not an outstanding balance. S654: a
+         -- suspended line is written OUTSIDE total_amount by every bill writer
+         -- (the S634 shape), so it is not netted again here — doing so drove
+         -- RV 50 and RV 51 to -$589 and hid two October bills behind their
+         -- September. A month-close deficit bills unsuspended and lands here.
+         WHERE status IN ('settled', 'processing')
            AND invoice_id IS NOT NULL
          GROUP BY invoice_id
       ) pd ON pd.invoice_id = i.id
@@ -256,17 +259,16 @@ balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (r
          --    a suspended state, don't have it show on this table. Don't have it
          --    be part of these calculations."
          --
-         -- The invoice total DOES include suspended rows — RV 45 reads $776.11,
-         -- all of it suspended and none of it owed — so they have to be netted
-         -- here or the landlord is shown money nobody owes. (An earlier note
-         -- here claimed the totals already excluded them; that was read off an
-         -- older invoice and was wrong.)
+         -- S654: the invoice total EXCLUDES suspended rows — every writer
+         -- (move-in bill, monthly run, month close) keeps the S634 shape, and
+         -- the four pre-S634 invoices that still carried gross totals were
+         -- rebuilt. Netting them here as well produced negative balances.
          --
          -- A work-trade DEFICIT is different and still belongs on this list: at
          -- month close, hours that were not worked bill in cash as an ordinary
          -- charge with no suspension on it, so it lands here the moment it
          -- becomes real money.
-         WHERE (status IN ('settled', 'processing') OR work_trade_suspended_at IS NOT NULL)
+         WHERE status IN ('settled', 'processing')
            AND invoice_id IS NOT NULL
            GROUP BY invoice_id
         ) pd ON pd.invoice_id = i.id

@@ -159,14 +159,18 @@ describe('generateInvoices — opens a work-trade period, credits nothing', () =
             basis_amount::float AS basis, hours_applied::float AS applied, status
        FROM work_trade_settlements WHERE agreement_id=$1`, [agreementId])).rows
 
-  it('issues the invoice GROSS even when the tenant worked last month', async () => {
+  // S654 (Nic): "Work trade people are on work trade. There's no bills going out
+  // to those people." The line is written at what the month is worth and
+  // SUSPENDED — out of the amount due while the hours are worked — the way the
+  // move-in bill has done since S634. Last month's hours still buy nothing here.
+  it('writes the rent suspended and asks for nothing, even when the tenant worked last month', async () => {
     const s = await seedWorkTradeStack({ rentAmount: 1000, approvedHours: 40 })
     await generateInvoices(NOW)
     const { invoice, payments } = await invoiceFor(s.leaseId)
-    expect(invoice.subtotal_rent).toBe('1000.00')
+    expect(invoice.subtotal_rent).toBe('1000.00')        // what the month is worth
     // Last month's hours buy nothing here any more — they belonged to last month.
     expect(invoice.work_trade_credit_amount).toBe('0.00')
-    expect(invoice.total_amount).toBe('1000.00')
+    expect(invoice.total_amount).toBe('0.00')            // what is owed today
     // Still stamped with the agreement, which is what makes it late-fee exempt
     // while the tenant works the month off (S623).
     expect(invoice.work_trade_agreement_id).toBe(s.agreementId)
@@ -174,6 +178,7 @@ describe('generateInvoices — opens a work-trade period, credits nothing', () =
     const rent = payments.find(p => p.type === 'rent')
     expect(rent.amount).toBe('1000.00')
     expect(rent.status).toBe('pending')
+    expect(rent.notes).toMatch(/suspended/i)
   })
 
   it('opens one period priced from the covered basis', async () => {
@@ -196,9 +201,10 @@ describe('generateInvoices — opens a work-trade period, credits nothing', () =
     })
     await generateInvoices(NOW)
     const { invoice, payments } = await invoiceFor(s.leaseId)
-    expect(invoice.total_amount).toBe('1200.00')          // gross, nothing credited
+    expect(invoice.total_amount).toBe('0.00')             // rent AND fee covered → both suspended (S654)
     expect(payments.find(p => p.type === 'rent').amount).toBe('1000.00')
     expect(payments.find(p => p.type === 'fee').amount).toBe('200.00')
+    expect(payments.find(p => p.type === 'fee').notes).toMatch(/suspended/i)
     const [period] = await periodOf(s.agreementId)
     expect(period.basis).toBe(1200)                        // rent + the fee
     expect(period.rate).toBe(15)                           // $1200 ÷ 80
@@ -209,7 +215,7 @@ describe('generateInvoices — opens a work-trade period, credits nothing', () =
     await generateInvoices(NOW)
     const { invoice } = await invoiceFor(s.leaseId)
     expect(invoice.work_trade_credit_amount).toBe('0.00')
-    expect(invoice.total_amount).toBe('1000.00')
+    expect(invoice.total_amount).toBe('0.00')             // suspended, not credited (S654)
   })
 
   it('hours logged in the invoice’s OWN month still credit nothing here', async () => {
@@ -220,7 +226,7 @@ describe('generateInvoices — opens a work-trade period, credits nothing', () =
     await generateInvoices(NOW)
     const { invoice } = await invoiceFor(s.leaseId)
     expect(invoice.work_trade_credit_amount).toBe('0.00')
-    expect(invoice.total_amount).toBe('1000.00')
+    expect(invoice.total_amount).toBe('0.00')             // suspended, not credited (S654)
   })
 
   it('no agreement → no period opened, and no late-fee exemption', async () => {
