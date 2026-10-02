@@ -135,7 +135,12 @@ export interface PrepaidReleaseResult {
  */
 export async function consumePrepaidCreditForInvoice(
   client: PoolClient,
-  opts: { leaseId: string; invoiceId: string },
+  opts: {
+    leaseId: string; invoiceId: string
+    /** S654: settle only these rows — the pieces a payment cut for paid-ahead.
+     *  Omitted, every row the release may pay is open to it (invoice generation). */
+    rowIds?: string[]
+  },
 ): Promise<PrepaidReleaseResult> {
   const NONE: PrepaidReleaseResult = { consumed: 0, rowsCovered: 0, releasedToLandlord: 0 }
   await client.query('SAVEPOINT prepaid_release')
@@ -159,7 +164,7 @@ export async function consumePrepaidCreditForInvoice(
 
 async function releaseInner(
   client: PoolClient,
-  opts: { leaseId: string; invoiceId: string },
+  opts: { leaseId: string; invoiceId: string; rowIds?: string[] },
 ): Promise<PrepaidReleaseResult> {
   // S654 (Nic): "Glenda Greek and Todd Niemeyer also paid by check… Mark
   // Rensberger… he's not paid with card ever. Why is that saying that that's
@@ -220,12 +225,21 @@ async function releaseInner(
   const paymentMethod: PaymentMethod =
     methodRow.rows[0]?.payment_method === 'card' ? 'card' : 'ach'
 
+  // S654: only rows the release can pay out — this lease's own (a neighbor's
+  // utility on a shared bill is not), never a work-trade line (paid in hours),
+  // and only the types allocation hands the landlord. A home payment settled
+  // from GAM-held money here was never paid to the landlord. rentCharge's
+  // prepaidCanSettle plans against this same rule.
   const fresh = await client.query<{ id: string; amount: string; type: string; revenue_owner: string; unit_id: string | null }>(
     `SELECT id, amount::text, type, revenue_owner, unit_id FROM payments
       WHERE invoice_id = $1 AND status = 'pending'
+        AND lease_id = $2
+        AND work_trade_suspended_at IS NULL
+        AND type = ANY($3::text[])
+        AND ($4::uuid[] IS NULL OR id = ANY($4::uuid[]))
       ORDER BY due_date ASC, created_at ASC
       FOR UPDATE`,
-    [opts.invoiceId])
+    [opts.invoiceId, opts.leaseId, [...ALLOCATABLE_PAYMENT_TYPES], opts.rowIds ?? null])
 
   let consumed = 0
   let rowsCovered = 0

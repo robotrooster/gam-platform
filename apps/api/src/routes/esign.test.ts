@@ -2923,8 +2923,10 @@ async function seedSubleaseDoc(
 }
 
 describe('POST /sign/:documentId — sublease_agreement completion', () => {
-  it('happy path: sublease flips to active, doc URL stamped, landlord_consent_date set to today', async () => {
+  it("happy path: sublease flips to active, doc URL stamped, landlord_consent_date set to the property's today", async () => {
     const f = await seedFixture()
+    // S654: a zone far from the server's, so the database's day would differ.
+    await db.query(`UPDATE properties SET timezone = 'Pacific/Kiritimati' WHERE id = $1`, [f.propertyId])
     const masterLeaseId = await seedParentLease(f)
     const { documentId, subleaseId, sublessee } = await seedSubleaseDoc(f, {
       masterLeaseId,
@@ -2947,15 +2949,8 @@ describe('POST /sign/:documentId — sublease_agreement completion', () => {
           FROM subleases WHERE id = $1`, [subleaseId])
     expect(sub.rows[0].status).toBe('active')
     expect(sub.rows[0].sublease_document_url).toBe('/api/esign/files/sublease-base.pdf')
-    expect(sub.rows[0].landlord_consent_date).toBeTruthy()
-    // landlord_consent_date is set via CURRENT_DATE — pull "today"
-    // from the DB so the assertion uses the same timezone the column
-    // was stamped in (avoids a UTC-vs-local boundary flake when the
-    // local clock straddles UTC midnight; pre-S454 used `new Date()`).
-    const { rows: [{ today }] } = await db.query<{ today: string }>(
-      `SELECT CURRENT_DATE::text AS today`)
-    // S654: compared as text — a pg DATE comes back as local midnight.
-    expect(sub.rows[0].landlord_consent_date).toBe(today)
+    // S654: dated on the property's calendar, compared as text.
+    expect(sub.rows[0].landlord_consent_date).toBe(todayIn('Pacific/Kiritimati'))
 
     // Doc flips completed
     const doc = await db.query<{ status: string }>(
@@ -3353,6 +3348,66 @@ describe('S654 lease overlap on calendar days', () => {
       `SELECT start_date::text AS start_date, end_date::text AS end_date FROM leases WHERE unit_id = $1`, [f.unitId])
     expect(lease.rows).toEqual([{ start_date: '2026-01-01', end_date: null }])
   })
+
+  // S654: an unreadable start used to count as overlapping any open-ended
+  // lease; the calendar-day rewrite briefly let it through. It is refused.
+  it('an unreadable start date is refused at build', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ start_date: 'TBD' }),
+    })
+    await expect(buildLeaseFromDocument(documentId)).rejects.toThrow('The lease start date is not a date.')
+    const leases = await db.query(`SELECT id FROM leases WHERE unit_id = $1`, [f.unitId])
+    expect(leases.rows).toHaveLength(0)
+  })
+
+  it('an unreadable start date is refused at send', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedDoc(f)
+    await db.query(
+      `INSERT INTO lease_document_fields
+         (document_id, field_type, signer_role, lease_column, page, x, y, width, height, required, value)
+       VALUES ($1,'date','landlord','start_date',1,10,10,80,20,TRUE,'TBD')`, [documentId])
+    const res = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/send`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(409)
+    expect(res.body.error || res.body.message).toBe('Cannot send: The lease start date is not a date.')
+    expect(emailSigningRequestMock).not.toHaveBeenCalled()
+  })
+
+  // S654: '2/30/2027' read as '2027-02-30' passed send and sign, then the
+  // lease INSERT failed in Postgres after everyone had signed.
+  it('a start date that names no real day is refused at send', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedDoc(f)
+    await db.query(
+      `INSERT INTO lease_document_fields
+         (document_id, field_type, signer_role, lease_column, page, x, y, width, height, required, value)
+       VALUES ($1,'date','landlord','start_date',1,10,10,80,20,TRUE,'2/30/2027')`, [documentId])
+    const res = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/send`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(409)
+    expect(res.body.error || res.body.message).toBe('Cannot send: The lease start date is not a date.')
+    expect(emailSigningRequestMock).not.toHaveBeenCalled()
+  })
+
+  it('an end date that names no real day is refused at send', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedDoc(f)
+    await db.query(
+      `INSERT INTO lease_document_fields
+         (document_id, field_type, signer_role, lease_column, page, x, y, width, height, required, value)
+       VALUES ($1,'date','landlord','start_date',1,10,10,80,20,TRUE,'3/1/2027'),
+              ($1,'date','landlord','end_date',1,10,40,80,20,TRUE,'2/30/2028')`, [documentId])
+    const res = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/send`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(409)
+    expect(res.body.error || res.body.message).toBe('Cannot send: The lease end date is not a date.')
+    expect(emailSigningRequestMock).not.toHaveBeenCalled()
+  })
 })
 
 // S654: a move_in_day property dues each lease on its start day. The build
@@ -3370,6 +3425,184 @@ describe('S654 move-in-day due day reads the document date', () => {
       `SELECT rent_due_day FROM leases WHERE unit_id = $1`, [f.unitId])
     expect(lease.rows).toHaveLength(1)
     expect(Number(lease.rows[0].rent_due_day)).toBe(15)
+  })
+})
+
+// S654: document dates are M/D/YYYY. Page 8's proration read the start with
+// an ISO-only parser, so a new tenant moving in mid-month showed $0 proration
+// and full rent.
+describe('S654 page 8 proration reads a M/D/YYYY start', () => {
+  it('a new tenant starting 6/15/2027 on a property due the 1st prorates the half month', async () => {
+    const f = await seedFixture()
+    const tpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose, is_active)
+       VALUES ($1, 'Proration ' || gen_random_uuid(), 'lease', TRUE) RETURNING id`, [f.landlordId])
+    for (const col of ['start_date', 'rent_amount', 'move_in_first_month_rent', 'move_in_proration']) {
+      await db.query(
+        `INSERT INTO lease_template_fields
+           (template_id, field_type, signer_role, lease_column, page, x, y, width, height, required)
+         VALUES ($1,'text','landlord',$2,1,10,10,100,20,FALSE)`, [tpl.rows[0].id, col])
+    }
+    const client = await db.connect()
+    let documentId: string
+    try {
+      await client.query('BEGIN')
+      const doc = await createDocumentRecord(client as any, {
+        landlordId: f.landlordId, templateId: tpl.rows[0].id, unitId: f.unitId, leaseId: null,
+        title: 'New lease', basePdfUrl: null, documentType: 'original_lease',
+        targetLeaseTenantId: null, promoteLeaseTenantId: null,
+        signers: [
+          { userId: f.landlordUserId, role: 'landlord', name: 'L L', email: 'll@test.dev', orderIndex: 1 },
+          { userId: f.tenantUserId, role: 'primary', name: 'T T', email: f.tenantEmail, orderIndex: 2 },
+        ],
+        prefillValues: { start_date: '6/15/2027', rent_amount: '1000.00' },
+      } as any)
+      await client.query('COMMIT')
+      documentId = doc.id
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
+    const { rows } = await db.query<{ lease_column: string; value: string }>(
+      `SELECT lease_column, value FROM lease_document_fields WHERE document_id = $1`, [documentId])
+    const v = Object.fromEntries(rows.map(r => [r.lease_column, r.value]))
+    // 16 of June's 30 days on $1,000.
+    expect(v.move_in_proration).toBe('533.33')
+    expect(Number(v.move_in_proration)).toBeGreaterThan(0)
+  })
+})
+
+// S654: a renewal is not a move-in. The old lease's last bill already runs to
+// its next due date, so the renewal's page 8 owes no rent for that stretch and
+// the new lease's monthly bills carry on — each month billed once.
+describe('S654 a renewal bills the stretch the old lease already billed once', () => {
+  const PAGE_COLS = ['rent_amount', 'start_date', 'end_date', 'security_deposit',
+    'move_in_first_month_rent', 'move_in_proration', 'move_in_security_deposit', 'move_in_total_due']
+
+  async function seedOld(f: SeedFixture, o: { start: string; end: string; source?: string }) {
+    // The fixture property's late-fee policy needs late-fee boxes this form lacks.
+    await db.query(`UPDATE properties SET late_fee_enabled = FALSE WHERE id = $1`, [f.propertyId])
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const leaseId = await seedLease(client, {
+        unitId: f.unitId, landlordId: f.landlordId, status: 'active', startDate: o.start, rentAmount: 1000,
+      })
+      await client.query(
+        `UPDATE leases SET end_date = $2, rent_due_day = 1, lease_source = $3 WHERE id = $1`,
+        [leaseId, o.end, o.source ?? 'esigned'])
+      await seedLeaseTenant(client, { leaseId, tenantId: f.tenantId })
+      await client.query(
+        `INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing)
+         VALUES ($1, 'security_deposit', 500, TRUE, 'move_in')`, [leaseId])
+      await client.query('COMMIT')
+      return leaseId
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  }
+
+  async function draftRenewal(f: SeedFixture, oldLeaseId: string, extraCols: string[] = []) {
+    const tpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, base_pdf_url, page_count)
+       VALUES ($1, 'Renewal form', '/api/esign/files/renewal-form.pdf', 1) RETURNING id`, [f.landlordId])
+    for (const [i, col] of [...PAGE_COLS, ...extraCols].entries()) {
+      await db.query(
+        `INSERT INTO lease_template_fields
+           (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required)
+         VALUES ($1, 'text', 'landlord', $2, $2, 1, 72, $3, 140, 24, FALSE)`,
+        [tpl.rows[0].id, col, 100 + i * 30])
+    }
+    const res = await request(buildApp())
+      .post('/api/esign/documents/renewal')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseId: oldLeaseId, templateId: tpl.rows[0].id })
+    expect(res.status).toBe(201)
+    const { rows } = await db.query<{ lease_column: string; value: string | null }>(
+      `SELECT lease_column, value FROM lease_document_fields WHERE document_id = $1`, [res.body.data.id])
+    return { documentId: res.body.data.id as string, v: Object.fromEntries(rows.map(r => [r.lease_column, r.value])) }
+  }
+
+  /** Issue the renewal with the real move-in invoice, then bill June and July for both leases. */
+  async function issueAndBill(documentId: string, oldLeaseId: string) {
+    const real = await vi.importActual<typeof import('../jobs/moveInBundle')>('../jobs/moveInBundle')
+    generateMoveInInvoiceMock.mockImplementationOnce(real.generateMoveInInvoice as any)
+    const built = await buildLeaseFromDocument(documentId)
+    const { backfillInvoices } = await import('../jobs/invoiceGeneration')
+    for (const leaseId of [oldLeaseId, built.leaseId]) {
+      await backfillInvoices({ from: '2026-06-01', to: '2026-07-31', leaseId })
+    }
+    const rent = await db.query<{ lease_id: string; due_date: string; amount: string }>(
+      `SELECT lease_id, to_char(due_date, 'YYYY-MM-DD') AS due_date, amount::text AS amount
+         FROM payments WHERE type = 'rent' AND lease_id = ANY($1::uuid[])
+        ORDER BY due_date, lease_id`, [[oldLeaseId, built.leaseId]])
+    const moveIn = await db.query<{ total_amount: string }>(
+      `SELECT total_amount::text AS total_amount FROM invoices
+        WHERE lease_id = $1 AND due_date = (SELECT start_date FROM leases WHERE id = $1)`, [built.leaseId])
+    return { newLeaseId: built.leaseId, rent: rent.rows, moveInTotal: moveIn.rows[0]?.total_amount ?? null }
+  }
+
+  it('old lease due the 1st ending 6/14: page 8 owes no rent, June bills once and July once', async () => {
+    const f = await seedFixture()
+    const oldLeaseId = await seedOld(f, { start: '2025-06-15', end: '2026-06-14' })
+    const { documentId, v } = await draftRenewal(f, oldLeaseId)
+    expect(v.start_date).toBe('6/15/2026')
+    expect(v.move_in_first_month_rent).toBe('0.00')
+    expect(v.move_in_proration).toBe('0.00')
+    // The $500 deposit carries; nothing new is owed at signing.
+    expect(v.move_in_security_deposit).toBe('0.00')
+    expect(v.move_in_total_due).toBe('0.00')
+
+    const { newLeaseId, rent, moveInTotal } = await issueAndBill(documentId, oldLeaseId)
+    expect(rent).toEqual([
+      { lease_id: oldLeaseId, due_date: '2026-06-01', amount: '1000.00' },
+      { lease_id: newLeaseId, due_date: '2026-07-01', amount: '1000.00' },
+    ])
+    // Page 8's total is what the move-in bill charged.
+    expect(moveInTotal).toBe('0.00')
+  })
+
+  it('old lease ending 6/30: the renewal starts on the due day and owes its first month', async () => {
+    const f = await seedFixture()
+    const oldLeaseId = await seedOld(f, { start: '2025-07-01', end: '2026-06-30' })
+    const { documentId, v } = await draftRenewal(f, oldLeaseId)
+    expect(v.start_date).toBe('7/1/2026')
+    expect(v.move_in_first_month_rent).toBe('1000.00')
+    expect(v.move_in_proration).toBe('0.00')
+    expect(v.move_in_total_due).toBe('1000.00')
+
+    const { newLeaseId, rent, moveInTotal } = await issueAndBill(documentId, oldLeaseId)
+    expect(rent).toEqual([
+      { lease_id: oldLeaseId, due_date: '2026-06-01', amount: '1000.00' },
+      { lease_id: newLeaseId, due_date: '2026-07-01', amount: '1000.00' },
+    ])
+    expect(moveInTotal).toBe('1000.00')
+  })
+
+  // The property's fee list is for new residents. A renewal re-billed its
+  // move-in fee and added a pet deposit the tenant never had.
+  it("the property's move-in fees for new residents are not billed again on a renewal", async () => {
+    const f = await seedFixture()
+    await db.query(
+      `INSERT INTO property_fee_schedules (property_id, unit_type, fee_type, amount, is_refundable, due_timing) VALUES
+         ($1, 'apartment', 'move_in_fee', 50, FALSE, 'move_in'),
+         ($1, 'apartment', 'pet_deposit', 350, TRUE, 'move_in'),
+         ($1, 'apartment', 'trash_fee', 20, FALSE, 'monthly_ongoing')`, [f.propertyId])
+    const oldLeaseId = await seedOld(f, { start: '2025-06-15', end: '2026-06-14' })
+    const { v } = await draftRenewal(f, oldLeaseId, ['move_in_fee', 'pet_deposit', 'trash_fee'])
+    expect(v.move_in_fee).toBe('0.00')
+    expect(v.pet_deposit).toBe('0.00')
+    // A monthly fee the old lease never had is the landlord's to add.
+    expect(v.trash_fee ?? null).toBeNull()
+    expect(v.move_in_total_due).toBe('0.00')
+  })
+
+  it('a booking-drafted old lease bills only to its end date, so the stub is owed', async () => {
+    const f = await seedFixture()
+    const oldLeaseId = await seedOld(f, { start: '2025-06-15', end: '2026-06-14', source: 'booking_draft' })
+    const { v } = await draftRenewal(f, oldLeaseId)
+    // 16 of June's 30 days on $1,000.
+    expect(v.move_in_first_month_rent).toBe('0.00')
+    expect(v.move_in_proration).toBe('533.33')
   })
 })
 

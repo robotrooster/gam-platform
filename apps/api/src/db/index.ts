@@ -30,6 +30,11 @@ export const db = new Pool({
   max:      Number(process.env.DB_POOL_MAX) || 20,
   idleTimeoutMillis:    30000,
   connectionTimeoutMillis: 2000,
+  // S654: every session runs on Phoenix time. CURRENT_DATE, ::date casts and
+  // bare-date bounds (`settled_at < ($3::date + 1)`) read the session zone, so
+  // a database host set to UTC (the S641 DigitalOcean move) would end every
+  // day at 5 pm Phoenix. Pinned here, not left to the server's default.
+  options: '-c timezone=America/Phoenix',
   // Opt-in per-connection statement timeout (off by default) so a slow query
   // can't pin a pooled connection indefinitely under load.
   ...(Number(process.env.DB_STATEMENT_TIMEOUT_MS) > 0

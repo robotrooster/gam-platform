@@ -29,6 +29,7 @@ import { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 
 const UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'subleases')
 
@@ -58,6 +59,7 @@ interface SubleaseContext {
   sublessee_email:       string
   start_date:        string
   end_date:          string | null
+  property_timezone: string | null
   sub_monthly_amount: string
   master_share_amount: string
   notes:             string | null
@@ -78,6 +80,7 @@ async function loadSubleaseContext(subleaseId: string): Promise<SubleaseContext>
            ur_ee.email AS sublessee_email,
            s.start_date::text  AS start_date,
            s.end_date::text    AS end_date,
+           p.timezone          AS property_timezone,
            s.sub_monthly_amount::text   AS sub_monthly_amount,
            s.master_share_amount::text  AS master_share_amount,
            s.notes
@@ -128,14 +131,23 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
 
   // Property + dates block
   const moneyFmt = (n: string) => '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  const dateFmt  = (d: string | null) => d ? new Date(d).toLocaleDateString(undefined, { year:'numeric', month:'long', day:'numeric' }) : '(open-ended)'
+  // S654: a 'YYYY-MM-DD' calendar day printed as itself — never read at UTC
+  // midnight, which printed the day before on a Phoenix clock.
+  const dateFmt  = (d: string | null) => {
+    const m = d ? /^(\d{4})-(\d{2})-(\d{2})/.exec(d) : null
+    return m
+      ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]))
+          .toLocaleDateString('en-US', { timeZone: 'UTC', year: 'numeric', month: 'long', day: 'numeric' })
+      : '(open-ended)'
+  }
 
   const infoLines: Array<[string, string]> = [
     ['Property:',  ctx.property_name],
     ['Unit:',      ctx.unit_number],
     ['Term:',      `${dateFmt(ctx.start_date)} – ${dateFmt(ctx.end_date)}`],
     ['Sub rent:',  `${moneyFmt(ctx.sub_monthly_amount)} / month, paid by the Sublessee to GAM`],
-    ['Effective:', new Date().toLocaleDateString(undefined, { year:'numeric', month:'long', day:'numeric' })],
+    // S654: the property's today, the calendar the consent date is stored on.
+    ['Effective:', dateFmt(todayIn(ctx.property_timezone))],
   ]
   for (const [label, value] of infoLines) {
     page.drawText(label, { x: margin,       y, size: 10, font: helveticaBold, color: gray })
@@ -364,21 +376,27 @@ export async function executeSubleaseAgreementCompletion(
     const doc = docRes.rows[0]
     if (!doc) throw new Error(`Sublease document ${args.documentId} not found`)
 
-    const subRes = await client.query<{ id: string }>(
-      `SELECT id FROM subleases WHERE sublease_document_id = $1`,
+    const subRes = await client.query<{ id: string; timezone: string | null }>(
+      `SELECT s.id, p.timezone
+         FROM subleases s
+         LEFT JOIN leases l ON l.id = s.master_lease_id
+         LEFT JOIN units u ON u.id = l.unit_id
+         LEFT JOIN properties p ON p.id = u.property_id
+        WHERE s.sublease_document_id = $1`,
       [args.documentId],
     )
     const sublease = subRes.rows[0]
     if (!sublease) throw new Error(`Sublease for document ${args.documentId} not found`)
 
+    // S654: an undated consent takes the PROPERTY's today, not the database's.
     await client.query(
       `UPDATE subleases
           SET status                = 'active',
               sublease_document_url = $1,
-              landlord_consent_date = COALESCE(landlord_consent_date, CURRENT_DATE),
+              landlord_consent_date = COALESCE(landlord_consent_date, $3::date),
               updated_at            = NOW()
         WHERE id = $2`,
-      [doc.executed_pdf_url || doc.base_pdf_url, sublease.id],
+      [doc.executed_pdf_url || doc.base_pdf_url, sublease.id, todayIn(sublease.timezone)],
     )
 
     return { subleaseId: sublease.id, status: 'active' }

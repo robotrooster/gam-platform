@@ -29,9 +29,10 @@
 
 import { query, queryOne } from '../db'
 import { getStripe } from '../lib/stripe'
-import { chargeLeaseBalance, CREDIT_COVERS_BALANCE, type ChargeLeaseBalanceResult } from '../services/rentCharge'
+import { chargeLeaseBalance, CREDIT_COVERS_BALANCE, CREDIT_NOT_PLACEABLE, type ChargeLeaseBalanceResult } from '../services/rentCharge'
 import { AppError } from '../middleware/errorHandler'
 import { createNotification } from '../services/notifications'
+import { createAdminNotification } from '../services/adminNotifications'
 import { logger } from '../lib/logger'
 import { registerEngine } from './timezoneCronManager'
 
@@ -147,9 +148,12 @@ export async function runAutopayForTimezone(tz: string, now: Date = new Date()):
       // amount they can manage, through Pay Now.
       // S654: a work-trade suspended line is labor's to pay, not the bank's —
       // summed here it was pulled and then banked as paid-ahead.
+      // S654: the charge's own scope — a neighbor's utility on this lease's bill
+      // is paid with it (rentCharge.fetchOutstandingRows).
       const balance = await queryOne<{ total: string }>(
         `SELECT COALESCE(SUM(amount), 0)::text AS total FROM payments
-          WHERE lease_id = $1 AND tenant_id = $2
+          WHERE (lease_id = $1 OR invoice_id IN (SELECT id FROM invoices WHERE lease_id = $1))
+            AND tenant_id = $2
             AND type <> 'carried_balance'
             AND work_trade_suspended_at IS NULL
             AND ((status = 'pending' AND stripe_payment_intent_id IS NULL)
@@ -183,14 +187,43 @@ export async function runAutopayForTimezone(tz: string, now: Date = new Date()):
           source:            'autopay',
         })
       } catch (e) {
-        // Credit covers the whole bill: nothing to pull, and not a failure.
+        // Nothing due now (only arrears are open): nothing to pull, and not a failure.
         if (e instanceof AppError && e.statusCode === 409 && e.message.startsWith(CREDIT_COVERS_BALANCE)) {
           await nothingOwed(); continue
         }
+        // S654: the credit netted from the bill could not be laid on it, and
+        // nothing was charged. That is the office's to apply — never the bank's:
+        // no "check your account" notice and no count toward switching off.
+        if (e instanceof AppError && e.statusCode === 409 && e.message.startsWith(CREDIT_NOT_PLACEABLE)) {
+          result.skipped++
+          logger.warn({ leaseId: c.lease_id, err: e.message }, '[autopay] credit could not be applied — office matter, nothing pulled')
+          await createAdminNotification({
+            severity: 'warn',
+            category: 'autopay_credit_not_applied',
+            title: `Autopay pulled nothing: the credit on lease ${c.lease_id} could not be applied to the bill`,
+            body: 'The resident’s paid-ahead or account credit was taken off this month’s bill, but it could not be laid on the bill’s charges, so autopay charged nothing. Apply the credit to the bill by hand; the resident’s autopay is unchanged and nothing was counted against it.',
+            context: { lease_id: c.lease_id, tenant_id: c.tenant_id, autopay_id: c.autopay_id, cycle },
+          })
+          continue
+        }
         throw e
       }
-      // What the bank or card actually sees: the bill plus any fee the tenant bears.
-      const amount = charged.chargeAmount ?? Math.round((charged.appliedTotal + charged.payAhead) * 100) / 100
+      // S654: $10 paid ahead and a $450 credit on a $460 bill — the credits
+      // settled it and nothing was pulled. A success, and no notice to send.
+      if (charged.status === 'settled_by_credit') { await nothingOwed(); continue }
+
+      // S654: the rent this payment covers, and each fee on top named on its
+      // own — calling the bank total "rent" overstated the bill by the fee, and
+      // a platform fee the landlord passes on is not a processing fee.
+      const rent = Math.round((charged.appliedTotal + charged.payAhead) * 100) / 100
+      const fee = Math.round((charged.processingFee ?? 0) * 100) / 100
+      const platformFee = Math.round((charged.platformFeePassthrough ?? 0) * 100) / 100
+      const total = Math.round((charged.chargeAmount ?? rent + fee + platformFee) * 100) / 100
+      const feeItems = [
+        fee > 0.005 ? `a $${fee.toFixed(2)} processing fee` : null,
+        platformFee > 0.005 ? `a $${platformFee.toFixed(2)} platform fee` : null,
+      ].filter((x): x is string => !!x)
+      const list = (xs: string[]) => xs.length <= 2 ? xs.join(' and ') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`
 
       await query(
         `UPDATE tenant_autopay
@@ -203,8 +236,12 @@ export async function runAutopayForTimezone(tz: string, now: Date = new Date()):
       await notifyTenant(c.tenant_id, 'autopay',
         'Autopay submitted',
         method.type === 'ach'
-          ? `We've started your scheduled rent payment of $${amount.toFixed(2)}. Bank payments usually take 3–5 business days to clear.`
-          : `Your card was charged $${amount.toFixed(2)} for rent. A receipt is on its way.`)
+          ? `We've started your scheduled rent payment of $${rent.toFixed(2)}`
+            + (feeItems.length ? `, plus ${list(feeItems)} ($${total.toFixed(2)} in all)` : '')
+            + '. Bank payments usually take 3–5 business days to clear.'
+          : `Your card was charged $${total.toFixed(2)}`
+            + (feeItems.length ? ` — ${list([`$${rent.toFixed(2)} for rent`, ...feeItems])}` : ' for rent')
+            + '. A receipt is on its way.')
     } catch (e) {
       result.failed++
       await handleFailure(c, e)

@@ -34,7 +34,7 @@ vi.mock('./email', async (importOriginal) => {
   return { ...actual, sendNotificationEmail: sendNotificationEmailMock }
 })
 
-import { createNotification, notifyRentCollected } from './notifications'
+import { createNotification, notifyRentCollected, notifyAchRetryScheduled, notifyAchRetriesExhausted } from './notifications'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -327,5 +327,72 @@ describe('notifyRentCollected — S642: the figure is the money that arrived', (
       `SELECT body FROM notifications WHERE user_id = $1 AND type = 'rent_collected'`, [userId])
     expect(row.rows[0].body).toContain('$520.20')
     expect(row.rows[0].body).toContain('Electricity: $25.20')
+  })
+})
+
+// S654: one email per thing. The webhook called these once per landlord-side
+// contact, and each call also emailed the tenant: two contacts meant two
+// identical tenant emails, none meant none. The tenant's copy now goes once.
+describe('ACH retry notices — the tenant is told once per failed payment', () => {
+  async function setup(contacts: number) {
+    const tenant = await seedUser()
+    const { userId: ownerUserId } = await seedUser()
+    const landlordId = (await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [ownerUserId])).rows[0].id
+    const landlordRecipients: { userId: string; email: string }[] = []
+    for (let i = 0; i < contacts; i++) {
+      const u = await seedUser()
+      landlordRecipients.push({ userId: u.userId, email: u.email })
+    }
+    return { tenant, landlordId, landlordRecipients }
+  }
+
+  const sentTo = (type: string) => (sendNotificationEmailMock.mock.calls as any[][])
+    .map((c) => c[0] as any)
+    .filter((c) => c.notificationType === type)
+    .map((c) => c.to as string)
+
+  for (const contacts of [2, 0]) {
+    it(`retry scheduled with ${contacts} landlord contacts: one tenant email, one per contact`, async () => {
+      const { tenant, landlordId, landlordRecipients } = await setup(contacts)
+      await notifyAchRetryScheduled({
+        tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Test Tenant',
+        landlordId, landlordRecipients,
+        unitNumber: 'MH 25', propertyName: 'Oak Park', amount: 450,
+        reason: 'Insufficient funds', retryDate: '2026-10-04', retryAttempt: 1,
+      })
+      expect(sentTo('ach_retry_scheduled')).toEqual([tenant.email])
+      expect(sentTo('ach_retry_scheduled_info').sort()).toEqual(landlordRecipients.map((r) => r.email).sort())
+      const rows = await db.query(
+        `SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'ach_retry_scheduled'`, [tenant.userId])
+      expect(rows.rows).toHaveLength(1)
+    })
+
+    it(`retries exhausted with ${contacts} landlord contacts: one tenant email, one per contact`, async () => {
+      const { tenant, landlordId, landlordRecipients } = await setup(contacts)
+      await notifyAchRetriesExhausted({
+        paymentId: randomUUID(),
+        tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Test Tenant',
+        landlordId, landlordRecipients,
+        unitNumber: 'MH 25', propertyName: 'Oak Park', amount: 450, reason: 'Insufficient funds',
+      })
+      expect(sentTo('ach_retries_exhausted')).toEqual([tenant.email])
+      expect(sentTo('ach_retries_exhausted_landlord').sort()).toEqual(landlordRecipients.map((r) => r.email).sort())
+    })
+  }
+
+  it('the tenant\'s in-app data carries no landlord-side contact', async () => {
+    const { tenant, landlordId, landlordRecipients } = await setup(2)
+    await notifyAchRetryScheduled({
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Test Tenant',
+      landlordId, landlordRecipients,
+      unitNumber: 'MH 25', propertyName: 'Oak Park', amount: 450,
+      reason: 'Insufficient funds', retryDate: '2026-10-04', retryAttempt: 1,
+    })
+    const { rows } = await db.query<{ data: any }>(
+      `SELECT data FROM notifications WHERE user_id = $1 AND type = 'ach_retry_scheduled'`, [tenant.userId])
+    const text = JSON.stringify(rows[0].data)
+    for (const r of landlordRecipients) expect(text).not.toContain(r.email)
+    expect(rows[0].data.retryDate).toBe('2026-10-04')
   })
 })

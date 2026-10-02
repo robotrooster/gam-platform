@@ -126,21 +126,33 @@ export async function notifyRentReversed(o: { landlordUserId:string; landlordId:
 // retry-eligible NACHA code (R01 insufficient funds, R09 uncollected) and
 // retry_count < 2. Tenant gets the heads-up + retry date; landlord gets a
 // shorter info copy. Terminal-failure path is notifyAchRetriesExhausted.
+//
+// S654: one call per failed payment. The tenant's copy goes out once; each
+// landlord-side contact gets their own copy. Callers used to loop over the
+// landlord contacts and the tenant got one email per contact (none at all
+// when the property had no contact). Each audience's data carries only its
+// own fields.
 export async function notifyAchRetryScheduled(o: {
-  tenantUserId: string; tenantEmail: string; tenantPhone?: string; tenantName: string;
-  landlordUserId: string; landlordId: string; landlordEmail: string;
+  tenantUserId: string; tenantEmail: string; tenantName: string;
+  landlordId: string;
+  landlordRecipients: Array<{ userId: string; email: string }>;
   unitNumber: string; propertyName: string;
   amount: number; reason: string;          // human-readable description from ACH_RETURN_CONFIG
   retryDate: string;                       // ISO date string (YYYY-MM-DD)
   retryAttempt: 1 | 2;                     // which retry this is
 }) {
+  const shared = {
+    tenantName: o.tenantName, unitNumber: o.unitNumber, propertyName: o.propertyName,
+    amount: o.amount, reason: o.reason, retryDate: o.retryDate, retryAttempt: o.retryAttempt,
+  }
+
   // Tenant: actionable — tells them what failed, why, and when we'll try again
   await createNotification({
     userId: o.tenantUserId,
     type: 'ach_retry_scheduled',
     title: `Payment retry scheduled — ${o.retryDate}`,
     body: `Your $${o.amount.toFixed(2)} payment for Unit ${o.unitNumber} failed (${o.reason}). We'll automatically retry on ${o.retryDate}. Make sure your bank account has sufficient funds.`,
-    data: o,
+    data: { ...shared, tenantUserId: o.tenantUserId },
     sendEmail: true, emailTo: o.tenantEmail,
     emailSubject: `Payment retry scheduled — ${o.retryDate}`,
     emailHtml: emailTemplate(
@@ -152,20 +164,22 @@ export async function notifyAchRetryScheduled(o: {
     )
   })
 
-  // Landlord: shorter info-only copy
-  await createNotification({
-    userId: o.landlordUserId, landlordId: o.landlordId,
-    type: 'ach_retry_scheduled_info',
-    title: `${o.tenantName} payment retry — ${o.retryDate}`,
-    body: `${o.tenantName} (Unit ${o.unitNumber}) payment of $${o.amount.toFixed(2)} failed (${o.reason}). Auto-retry scheduled ${o.retryDate}.`,
-    data: o,
-    sendEmail: true, emailTo: o.landlordEmail,
-    emailSubject: `Tenant payment retry scheduled — Unit ${o.unitNumber}`,
-    emailHtml: emailTemplate(
-      `Tenant Payment Retry Scheduled`,
-      `<b>${o.tenantName}</b> payment of <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} failed (${o.reason}). GAM will automatically retry on <b>${o.retryDate}</b>. No action required.`
-    ),
-  })
+  // Landlord side: shorter info-only copy, one per contact
+  for (const r of o.landlordRecipients) {
+    await createNotification({
+      userId: r.userId, landlordId: o.landlordId,
+      type: 'ach_retry_scheduled_info',
+      title: `${o.tenantName} payment retry — ${o.retryDate}`,
+      body: `${o.tenantName} (Unit ${o.unitNumber}) payment of $${o.amount.toFixed(2)} failed (${o.reason}). Auto-retry scheduled ${o.retryDate}.`,
+      data: { ...shared, tenantUserId: o.tenantUserId, landlordId: o.landlordId },
+      sendEmail: true, emailTo: r.email,
+      emailSubject: `Tenant payment retry scheduled — Unit ${o.unitNumber}`,
+      emailHtml: emailTemplate(
+        `Tenant Payment Retry Scheduled`,
+        `<b>${o.tenantName}</b> payment of <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} failed (${o.reason}). GAM will automatically retry on <b>${o.retryDate}</b>. No action required.`
+      ),
+    })
+  }
 }
 
 // S125: ACH retry-cap-reached alert. Fires when the second retry also
@@ -173,20 +187,29 @@ export async function notifyAchRetryScheduled(o: {
 // Landlord + tenant both get notified the payment is permanently failed
 // and needs manual intervention; admin in-app notification flags the
 // payment for review.
+//
+// S654: same shape as notifyAchRetryScheduled — the tenant's copy once, then
+// one copy per landlord-side contact.
 export async function notifyAchRetriesExhausted(o: {
   paymentId: string;
-  tenantUserId: string; tenantEmail: string; tenantPhone?: string; tenantName: string;
-  landlordUserId: string; landlordId: string; landlordEmail: string; landlordPhone?: string;
+  tenantUserId: string; tenantEmail: string; tenantName: string;
+  landlordId: string;
+  landlordRecipients: Array<{ userId: string; email: string }>;
   unitNumber: string; propertyName: string;
   amount: number; reason: string;
 }) {
+  const shared = {
+    paymentId: o.paymentId, tenantName: o.tenantName, unitNumber: o.unitNumber,
+    propertyName: o.propertyName, amount: o.amount, reason: o.reason,
+  }
+
   // Tenant: action-required
   await createNotification({
     userId: o.tenantUserId,
     type: 'ach_retries_exhausted',
     title: `Payment cannot be retried — manual action required`,
     body: `Your $${o.amount.toFixed(2)} payment for Unit ${o.unitNumber} failed after multiple retry attempts (${o.reason}). Please update your payment method or contact your landlord directly.`,
-    data: o,
+    data: { ...shared, tenantUserId: o.tenantUserId },
     sendEmail: true, emailTo: o.tenantEmail,
     emailSubject: `Payment cannot be retried — Unit ${o.unitNumber}`,
     emailHtml: emailTemplate(
@@ -202,23 +225,25 @@ export async function notifyAchRetriesExhausted(o: {
     )
   })
 
-  // Landlord: action-required, urgent
-  await createNotification({
-    userId: o.landlordUserId, landlordId: o.landlordId,
-    type: 'ach_retries_exhausted_landlord',
-    title: `🚨 ${o.tenantName} payment failed permanently — Unit ${o.unitNumber}`,
-    body: `${o.tenantName} payment of $${o.amount.toFixed(2)} failed all retry attempts (${o.reason}). Manual intervention needed.`,
-    data: o,
-    sendEmail: true, emailTo: o.landlordEmail,
-    emailSubject: `🚨 Tenant payment failed permanently — Unit ${o.unitNumber}`,
-    emailHtml: emailTemplate(
-      `Tenant Payment Failed Permanently`,
-      `<div style="margin-bottom:14px;padding:10px 14px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);border-radius:8px;color:#ef4444;font-size:.85rem">⚠️ Manual intervention required</div>` +
-      `<p><b>${o.tenantName}</b> payment of <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} has failed all NACHA-permitted retry attempts.</p>` +
-      `<div style="margin:12px 0;padding:10px;background:#0a0f14;border-radius:6px;color:#b8c4d8">${o.reason}</div>` +
-      `<p>The tenant has been notified to update their payment method. You may also want to contact them directly.</p>`
-    )
-  })
+  // Landlord side: action-required, urgent, one per contact
+  for (const r of o.landlordRecipients) {
+    await createNotification({
+      userId: r.userId, landlordId: o.landlordId,
+      type: 'ach_retries_exhausted_landlord',
+      title: `🚨 ${o.tenantName} payment failed permanently — Unit ${o.unitNumber}`,
+      body: `${o.tenantName} payment of $${o.amount.toFixed(2)} failed all retry attempts (${o.reason}). Manual intervention needed.`,
+      data: { ...shared, tenantUserId: o.tenantUserId, landlordId: o.landlordId },
+      sendEmail: true, emailTo: r.email,
+      emailSubject: `🚨 Tenant payment failed permanently — Unit ${o.unitNumber}`,
+      emailHtml: emailTemplate(
+        `Tenant Payment Failed Permanently`,
+        `<div style="margin-bottom:14px;padding:10px 14px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);border-radius:8px;color:#ef4444;font-size:.85rem">⚠️ Manual intervention required</div>` +
+        `<p><b>${o.tenantName}</b> payment of <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} has failed all NACHA-permitted retry attempts.</p>` +
+        `<div style="margin:12px 0;padding:10px;background:#0a0f14;border-radius:6px;color:#b8c4d8">${o.reason}</div>` +
+        `<p>The tenant has been notified to update their payment method. You may also want to contact them directly.</p>`
+      )
+    })
+  }
 }
 
 // S175: Stripe Connect payout notifications. Replaces the pre-S113

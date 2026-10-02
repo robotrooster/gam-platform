@@ -484,6 +484,24 @@ describe('account-management senders', () => {
     expect(log.category).toBe('tenant_onboarded')
     expect(log.metadata).toEqual({ unit_label: 'Unit A1' })
   })
+
+  // S654: the name, address and unit come from a landlord's CSV file.
+  it('emailTenantOnboarded: every CSV-supplied value is escaped in the HTML', async () => {
+    await email.emailTenantOnboarded(
+      'tn-esc@mailer-test.co', '<img src=x onerror=alert(1)>', 'Dana "<b>Boss</b>"',
+      '1 <a href="https://evil.test">Main</a> St', 'Pines & Co <script>x()</script>\r\nBcc: x@evil.test',
+      'https://tenant.example.test/accept-invite?token=abc123')
+    const call = (resendSendMock.mock.calls[0] as any[])[0]
+    expect(call.html).not.toMatch(/<img|<script|<a href="https:\/\/evil|<b>Boss/)
+    expect(call.html).toContain('&lt;img src=x onerror=alert(1)&gt;')
+    expect(call.html).toContain('Dana &quot;&lt;b&gt;Boss&lt;/b&gt;&quot;')
+    expect(call.html).toContain('1 &lt;a href=&quot;https://evil.test&quot;&gt;Main&lt;/a&gt; St')
+    expect(call.html).toContain('Pines &amp; Co &lt;script&gt;x()&lt;/script&gt;')
+    // The link GAM built still works as a link.
+    expect(call.html).toContain('href="https://tenant.example.test/accept-invite?token=abc123"')
+    // One line of subject, whatever the file said.
+    expect(call.subject).not.toMatch(/[\r\n]/)
+  })
 })
 
 describe('emailFlexsuiteEnrollment', () => {

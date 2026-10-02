@@ -919,7 +919,6 @@ webhooksRouter.post('/stripe', async (req, res) => {
             amount:          string
             tenant_user_id:  string
             tenant_email:    string
-            tenant_phone:    string | null
             tenant_name:     string
             landlord_id_pk:  string
             property_id:     string
@@ -930,7 +929,6 @@ webhooksRouter.post('/stripe', async (req, res) => {
             SELECT p.id, p.amount,
                    t.user_id AS tenant_user_id,
                    tu.email  AS tenant_email,
-                   tu.phone  AS tenant_phone,
                    tu.first_name || ' ' || tu.last_name AS tenant_name,
                    l.id  AS landlord_id_pk,
                    pr.id AS property_id,
@@ -952,46 +950,42 @@ webhooksRouter.post('/stripe', async (req, res) => {
             const recipients = targets?.primaries ?? []
             const { notifyAchRetryScheduled, notifyAchRetriesExhausted } =
               await import('../services/notifications')
+            // S654: one call per failed payment — the tenant's copy goes out
+            // once, each landlord-side contact gets theirs. This used to loop
+            // the whole call per contact, so the tenant got one email per
+            // contact (none when the property had no contact).
+            const landlordRecipients = recipients.map((r) => ({ userId: r.user_id, email: r.email }))
             if (willRetry) {
               // S654: the retry day as the property's calendar reads it.
               // next_retry_at is NOW() + 3 days; formatting that instant in
               // UTC told a tenant who bounced after 5 pm Phoenix a day late.
               const retryDate = addDaysTo(todayIn(pctx.property_tz), 3)
-              for (const recipient of recipients) {
-                await notifyAchRetryScheduled({
-                  tenantUserId:    pctx.tenant_user_id,
-                  tenantEmail:     pctx.tenant_email,
-                  tenantPhone:     pctx.tenant_phone ?? undefined,
-                  tenantName:      pctx.tenant_name,
-                  landlordUserId:  recipient.user_id,
-                  landlordId:      pctx.landlord_id_pk,
-                  landlordEmail:   recipient.email,
-                  unitNumber:      pctx.unit_number,
-                  propertyName:    pctx.property_name,
-                  amount:          parseFloat(pctx.amount),
-                  reason:          reasonText,
-                  retryDate,
-                  retryAttempt:    (updatedRow.retry_count + 1) as 1 | 2,
-                })
-              }
+              await notifyAchRetryScheduled({
+                tenantUserId:    pctx.tenant_user_id,
+                tenantEmail:     pctx.tenant_email,
+                tenantName:      pctx.tenant_name,
+                landlordId:      pctx.landlord_id_pk,
+                landlordRecipients,
+                unitNumber:      pctx.unit_number,
+                propertyName:    pctx.property_name,
+                amount:          parseFloat(pctx.amount),
+                reason:          reasonText,
+                retryDate,
+                retryAttempt:    (updatedRow.retry_count + 1) as 1 | 2,
+              })
             } else {
-              for (const recipient of recipients) {
-                await notifyAchRetriesExhausted({
-                  paymentId:       pctx.id,
-                  tenantUserId:    pctx.tenant_user_id,
-                  tenantEmail:     pctx.tenant_email,
-                  tenantPhone:     pctx.tenant_phone ?? undefined,
-                  tenantName:      pctx.tenant_name,
-                  landlordUserId:  recipient.user_id,
-                  landlordId:      pctx.landlord_id_pk,
-                  landlordEmail:   recipient.email,
-                  landlordPhone:   recipient.phone ?? undefined,
-                  unitNumber:      pctx.unit_number,
-                  propertyName:    pctx.property_name,
-                  amount:          parseFloat(pctx.amount),
-                  reason:          reasonText,
-                })
-              }
+              await notifyAchRetriesExhausted({
+                paymentId:       pctx.id,
+                tenantUserId:    pctx.tenant_user_id,
+                tenantEmail:     pctx.tenant_email,
+                tenantName:      pctx.tenant_name,
+                landlordId:      pctx.landlord_id_pk,
+                landlordRecipients,
+                unitNumber:      pctx.unit_number,
+                propertyName:    pctx.property_name,
+                amount:          parseFloat(pctx.amount),
+                reason:          reasonText,
+              })
             }
           }
         } catch (e) {

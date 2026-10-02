@@ -10,6 +10,19 @@ import { landlordExpensesTotal } from './landlordExpenses'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 
+/**
+ * S654: the settled payment rows a landlord's P&L counts as income. Only the
+ * landlord's own money (revenue_owner 'landlord') — never GAM's fees ('gam':
+ * decline, return, manual-payment, opt-in products), never money GAM holds
+ * for the tenant ('held': paid-ahead rent, counted as rent when it is drawn
+ * down). Deposits are a held liability, reported apart as depositsHeld.
+ * The monthly P&L's payment list uses this same test, so rows and totals agree.
+ */
+const LANDLORD_INCOME_TYPES = ['rent', 'late_fee', 'fee', 'utility', 'home_payment'] as const
+export function landlordIncomeSql(alias: string): string {
+  return `${alias}.revenue_owner = 'landlord' AND ${alias}.type IN (${LANDLORD_INCOME_TYPES.map(t => `'${t}'`).join(', ')})`
+}
+
 export interface LandlordPL {
   gross: { rent: number; fees: number; utilities: number; homeSale: number; otherIncome: number; other: number; total: number }
   depositsHeld: number
@@ -32,16 +45,17 @@ export async function computeLandlordPL(
   // at the START of the 30th, so a bare-date end dropped the last day's money.
   // `< end::date + 1` takes the whole day, for a bare date and for monthRange's
   // '...T23:59:59-07:00' alike.
+  // S654: income is the landlord's own rows only (landlordIncomeSql); a GAM
+  // fee or held paid-ahead money carrying this landlord_id is not theirs.
   const inc = await queryOne<any>(`
     SELECT
-      COALESCE(SUM(amount) FILTER (WHERE type='rent'), 0)::float           AS rent,
-      COALESCE(SUM(amount) FILTER (WHERE type IN ('late_fee','fee')), 0)::float AS fees,
-      COALESCE(SUM(amount) FILTER (WHERE type='utility'), 0)::float        AS utilities,
-      COALESCE(SUM(amount) FILTER (WHERE type='home_payment'), 0)::float   AS home_sale,
-      COALESCE(SUM(amount) FILTER (WHERE type='deposit'), 0)::float        AS deposits
-      -- platform_fee / float_fee excluded: GAM revenue, not landlord income.
-    FROM payments
-   WHERE landlord_id = $1 AND status = 'settled' AND settled_at >= $2 AND settled_at < ($3::date + 1)`,
+      COALESCE(SUM(p.amount) FILTER (WHERE ${landlordIncomeSql('p')} AND p.type='rent'), 0)::float                 AS rent,
+      COALESCE(SUM(p.amount) FILTER (WHERE ${landlordIncomeSql('p')} AND p.type IN ('late_fee','fee')), 0)::float  AS fees,
+      COALESCE(SUM(p.amount) FILTER (WHERE ${landlordIncomeSql('p')} AND p.type='utility'), 0)::float              AS utilities,
+      COALESCE(SUM(p.amount) FILTER (WHERE ${landlordIncomeSql('p')} AND p.type='home_payment'), 0)::float         AS home_sale,
+      COALESCE(SUM(p.amount) FILTER (WHERE p.type='deposit' AND p.revenue_owner <> 'gam'), 0)::float               AS deposits
+    FROM payments p
+   WHERE p.landlord_id = $1 AND p.status = 'settled' AND p.settled_at >= $2 AND p.settled_at < ($3::date + 1)`,
     [landlordId, start, end])
 
   const rent = round2(+inc?.rent || 0)

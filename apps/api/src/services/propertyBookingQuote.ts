@@ -39,6 +39,8 @@ export interface PropertyRow {
   weekly_rate: string | null
   monthly_rate: string | null
   short_term_tax_rate: string | null
+  /** S654: the park's IANA zone — "today" for a stay is the park's today. */
+  timezone: string | null
 }
 
 /** Resolve a property by its public booking slug, 404 unless enabled. */
@@ -47,7 +49,7 @@ export async function resolveProperty(slug: string): Promise<PropertyRow> {
     `SELECT id, landlord_id, booking_slug, name, city, state, booking_intro, booking_about, booking_area, booking_deposit_pct,
             booking_monthly_deposit, booking_utilities_billed, booking_card_fee_payer,
             street1, zip, office_phone, office_email, office_hours,
-            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate
+            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate, timezone
        FROM properties
       WHERE booking_slug = $1 AND public_booking_enabled = TRUE`,
     [slug])
@@ -61,7 +63,7 @@ export async function resolvePropertyById(propertyId: string): Promise<PropertyR
     `SELECT id, landlord_id, booking_slug, name, city, state, booking_intro, booking_about, booking_area, booking_deposit_pct,
             booking_monthly_deposit, booking_utilities_billed, booking_card_fee_payer,
             street1, zip, office_phone, office_email, office_hours,
-            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate
+            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate, timezone
        FROM properties
       WHERE id = $1 AND public_booking_enabled = TRUE`,
     [propertyId])

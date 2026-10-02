@@ -6,6 +6,7 @@ import { DateTime } from 'luxon'
 import { query, queryOne, getClient } from '../db'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { AppError } from '../middleware/errorHandler'
+import { todayIn } from '../lib/timezone'
 import {
   computeStayTotal, bookStay, joinWaitlist, getWaitlistClaim, claimWaitlistSpot, UnitFullError,
 } from '../services/propertyBooking'
@@ -238,8 +239,9 @@ publicPropertyBookingRouter.post('/property/:slug/stay-link', publicWriteLimiter
         WHERE u.property_id = $1
           AND LOWER(b.guest_email) = LOWER($2)
           AND b.status IN ('confirmed', 'checked_in')
-          AND b.check_out >= CURRENT_DATE
-        ORDER BY b.check_in LIMIT 3`, [prop.id, b.email])
+          -- S654: still live on the park's calendar, not the database's.
+          AND b.check_out >= $3::date
+        ORDER BY b.check_in LIMIT 3`, [prop.id, b.email, todayIn(prop.timezone)])
     for (const s of stays) {
       const { issueBookingGuestToken } = await import('../services/bookingGuestTokens')
       const issued = await issueBookingGuestToken({ bookingId: s.id, landlordId: prop.landlord_id, delivery: 'email' })
@@ -388,7 +390,9 @@ publicPropertyBookingRouter.get('/property/:slug/availability', async (req, res,
     if (!ci.isValid || !co.isValid) throw new AppError(400, 'Invalid dates')
     const nights = Math.round(co.startOf('day').diff(ci.startOf('day'), 'days').days)
     if (nights <= 0) throw new AppError(400, 'Check-out must be after check-in')
-    if (ci < DateTime.now().startOf('day')) throw new AppError(400, 'Check-in is in the past')
+    // S654: "past" on the park's calendar, as quoteStay decides it — the server's
+    // clock refused a same-day check-in after 5 pm Phoenix.
+    if (ci.toISODate()! < todayIn(prop.timezone)) throw new AppError(400, 'Check-in is in the past')
 
     const units = await bookableUnits(prop.id)
 
@@ -540,7 +544,8 @@ publicPropertyBookingRouter.get('/property/:slug/claim/:token', async (req, res,
         propertyName: w.property_name,
         // W-20: no site number pre-check-in — the claim is for a site TYPE;
         // the actual site arrives the morning of check-in.
-        checkIn: w.check_in, checkOut: w.check_out,
+        // S654: calendar days as 'YYYY-MM-DD', not a pg DATE's local midnight.
+        checkIn: w.check_in_ymd, checkOut: w.check_out_ymd,
         guestName: w.guest_name,
         claimExpiresAt: w.claim_expires_at,
         expired,

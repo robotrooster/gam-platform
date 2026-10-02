@@ -61,6 +61,9 @@ tenantsRouter.get('/', requireAuth, async (req: any, res, next) => {
   } catch (e) { next(e) }
 })
 
+// S654: the only accounts an invite link may activate.
+const INVITE_ACCOUNT_ROLES: readonly string[] = ['tenant', 'contact']
+
 tenantsRouter.post('/accept-invite', async (req, res, next) => {
   try {
     const { token, password, phone, ssiSsdi, acceptedTerms } = req.body
@@ -108,6 +111,12 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
             AND (tenant_invite_expires_at IS NULL OR tenant_invite_expires_at > NOW())
           FOR UPDATE`,
         [token])).rows[0]
+
+      // S654: an invite link only sets up a resident's account, or an e-sign
+      // signer's contact account (S568 activates those here too). Any other
+      // login is an invalid link: a token that reached a landlord's or staff
+      // account must never set its password.
+      if (user && !INVITE_ACCOUNT_ROLES.includes(user.role)) user = undefined
 
       // ── S637: "ALREADY DONE" IS NOT "EXPIRED" ──────────────────────────
       //
@@ -354,8 +363,9 @@ tenantsRouter.get('/invite-info', async (req, res, next) => {
     const user = await queryOne<any>(
       `SELECT id, email, first_name, last_name FROM users
         WHERE tenant_invite_token = $1
-          AND (tenant_invite_expires_at IS NULL OR tenant_invite_expires_at > NOW())`,
-      [token as string])
+          AND (tenant_invite_expires_at IS NULL OR tenant_invite_expires_at > NOW())
+          AND role = ANY($2::text[])`,
+      [token as string, INVITE_ACCOUNT_ROLES])
     if (!user) return res.status(404).json({ success: false, error: 'Invalid or expired invite' })
 
     const unit = await queryOne<any>(`
@@ -1870,7 +1880,14 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
     const tempHash = '$2b$10$placeholder_invite_pending'
 
     // Create or find user
-    let user = await queryOne<any>('SELECT id FROM users WHERE email=$1', [email])
+    let user = await queryOne<any>('SELECT id, role FROM users WHERE email=$1', [email])
+    // S654: this route hands the activation link back to the inviter, so it
+    // may only ever land on a resident's account, never a landlord's, staff's
+    // or an e-sign contact's.
+    if (user && user.role !== 'tenant') {
+      return res.status(409).json({ success: false,
+        error: "This email belongs to a GAM account that isn't a resident's, so it can't be invited as a tenant. Use the resident's own email." })
+    }
     if (!user) {
       user = await queryOne<any>(`
         INSERT INTO users (email, password_hash, role, first_name, last_name, phone)

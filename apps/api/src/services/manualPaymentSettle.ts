@@ -303,7 +303,9 @@ export async function settleManualRentPayment(
                          THEN lease_id = (SELECT lease_id FROM payments WHERE id = $1)
                          ELSE tenant_id = (SELECT tenant_id FROM payments WHERE id = $1) END))
             ELSE id = $1 END
-    RETURNING id, tenant_id, lease_id, type, amount, due_date, settled_at`,
+    RETURNING id, tenant_id, lease_id, type, amount, due_date::text AS due_date, settled_at,
+              (SELECT pr.timezone FROM units u JOIN properties pr ON pr.id = u.property_id
+                WHERE u.id = payments.unit_id) AS property_tz`,
     [payment.id, method,
      `Recorded as manual ${method} payment${refNote}${provenance}`,
      input.settledAt, input.settleWholeBalance === true, input.settleHousehold === true])
@@ -321,8 +323,10 @@ export async function settleManualRentPayment(
       : null
     await emitPaymentSettledEvent(client, {
       tenantId: row.tenant_id, paymentId: row.id, paymentType: row.type,
-      amount: row.amount, dueDate: new Date(row.due_date), settledAt: new Date(row.settled_at),
-      graceDays: grace, stripePaymentIntentId: null,
+      // S654: the due day as 'YYYY-MM-DD' and the property's zone, as the
+      // webhook does, so the tier is read on the property's calendar.
+      amount: row.amount, dueDate: row.due_date, settledAt: new Date(row.settled_at),
+      graceDays: grace, stripePaymentIntentId: null, propertyTz: row.property_tz ?? null,
       attestationSource: 'landlord_self_reported_with_evidence',
       attestationEvidence: { manual_method: method, reference: input.reference ?? null },
     })

@@ -23,10 +23,7 @@ import { createRentPlatformCharge } from './stripeConnect'
 import { computeTenantGamOutstandingTotal } from './supersedence'
 import { isFeatureEnabled } from './systemFeatures'
 import { logger } from '../lib/logger'
-
-function firstOfMonth(d: Date): string {
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`
-}
+import { dateIn, monthStartOf } from '../lib/timezone'
 
 export interface FlexCreditChargeResult {
   cycle_month: string
@@ -37,7 +34,9 @@ export interface FlexCreditChargeResult {
 }
 
 export async function processFlexCreditFee(now: Date = new Date()): Promise<FlexCreditChargeResult> {
-  const cycle = firstOfMonth(now)
+  // S654: GAM's own monthly fee, so its month is Phoenix's, as the custody fee
+  // reads it. The UTC month is already next month after 5 pm on the last day.
+  const cycle = monthStartOf(dateIn(null, now))
   const out: FlexCreditChargeResult = {
     cycle_month: cycle, candidates_scanned: 0, charges_created: 0,
     charges_skipped_existing: 0, errors: 0,

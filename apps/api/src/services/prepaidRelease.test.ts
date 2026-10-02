@@ -321,3 +321,59 @@ describe('S609 whose money a charge is', () => {
     expect(await ownerShare(paymentId)).toBeNull()
   })
 })
+
+// ── S654: paid-ahead pays only what the release can hand the landlord ────────
+// A home payment is settled through the home-sale path, not this one — paid
+// from GAM-held money here, the landlord was never paid it. A work-trade line
+// is paid in hours. A neighbor's utility on a shared bill is not this lease's.
+describe('S654 the release passes over rows it cannot pay out', () => {
+  let f: Fixture
+  beforeAll(async () => {
+    await db.query(
+      `INSERT INTO platform_processing_rates
+         (payment_method, customer_facing_flat, customer_facing_percent,
+          stripe_cost_flat, stripe_cost_percent)
+       SELECT 'ach', 6, 0, 0, 0.5
+        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach')`)
+  })
+  beforeEach(async () => { await cleanupAllSchema(); f = await fixture() })
+
+  async function line(invoiceId: string, type: string, amount: number, extra: { lease?: string | null; landlord?: string; trade?: boolean } = {}) {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, work_trade_suspended_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending', CURRENT_DATE, $8, $9) RETURNING id`,
+      [invoiceId, f.unitId, extra.lease === undefined ? f.leaseId : extra.lease, f.tenantId, extra.landlord ?? f.landlordId,
+       type, amount.toFixed(2), type === 'home_payment' ? 'HOMEPMT' : 'UTILITY', extra.trade ? new Date() : null])
+    return r.rows[0].id
+  }
+
+  it('a home payment, a work-trade line and a neighbor’s utility stay open; the rent is paid', async () => {
+    await bankPrepaid(f, 2000)
+    const { invoiceId, paymentId } = await makeInvoiceWithRent(f, 1000)
+    const nb = await (async () => { const c = await db.connect(); try { return await seedLandlord(c) } finally { c.release() } })()
+    const home = await line(invoiceId, 'home_payment', 200)
+    const trade = await line(invoiceId, 'utility', 8, { trade: true })
+    const neighbor = await line(invoiceId, 'utility', 5, { lease: null, landlord: nb.landlordId })
+
+    const r = await release(f, invoiceId)
+    expect(r.consumed).toBeCloseTo(1000, 2)
+    expect(await ownerShare(paymentId)).toBeCloseTo(1000, 2)
+    const { rows } = await db.query(`SELECT id, status FROM payments WHERE id = ANY($1)`, [[home, trade, neighbor]])
+    expect(rows.every((x: any) => x.status === 'pending')).toBe(true)
+  })
+
+  it('held to named rows, it settles only those', async () => {
+    await bankPrepaid(f, 2000)
+    const { invoiceId, paymentId } = await makeInvoiceWithRent(f, 1000)
+    const water = await line(invoiceId, 'utility', 50)
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const r = await consumePrepaidCreditForInvoice(client, { leaseId: f.leaseId, invoiceId, rowIds: [water] })
+      await client.query('COMMIT')
+      expect(r.consumed).toBeCloseTo(50, 2)
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+    const { rows } = await db.query(`SELECT id, status FROM payments WHERE id = ANY($1) ORDER BY amount`, [[water, paymentId]])
+    expect(rows.map((x: any) => x.status)).toEqual(['settled', 'pending'])
+  })
+})

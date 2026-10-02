@@ -9,6 +9,7 @@
  *
  * Restamps a document's computed page 8 boxes from its own values:
  *   - move_in_security_deposit ← page 2 deposit (new tenant) / $0 (onboarding)
+ *     / on a renewal, only what rises above the deposit already held (S654)
  *   - onboarding only: first month ← the monthly rent, proration ← $0, and
  *     every move-in fee box ← $0 (Clay Simpson and Martin Alvarado were billed
  *     page 2's rent while page 8 said something else; for an existing
@@ -20,7 +21,8 @@
  * computed boxes are touched — nothing a signature already sits over changes.
  */
 import {
-  FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue,
+  FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue, defaultMoneyKind,
+  type FeeType,
 } from '@gam/shared'
 
 type Exec = { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> }
@@ -71,14 +73,43 @@ export async function restampMoveInBoxes(c: Exec, documentId: string): Promise<v
     }
   }
 
-  const deposit = moveInDepositMirror(first('security_deposit'), existing)
+  // S654: a renewal bills only what rises above the deposits the old lease
+  // already holds (the build's top-up rule, S534), so page 8 says the same.
+  const billed = await renewalBilledAmount(c, documentId)
+  const deposit = billed('security_deposit', moveInDepositMirror(first('security_deposit'), existing))
   await set('move_in_security_deposit', money(deposit))
 
   const total = moveInTotalDue({
     firstMonthRent: first('move_in_first_month_rent'),
     proration: first('move_in_proration'),
     depositMirror: deposit,
-    moveInFees: MOVE_IN_FEE_TAGS.filter(t => t !== 'other_fee').map(t => first(t)),
+    moveInFees: MOVE_IN_FEE_TAGS.filter(t => t !== 'other_fee').map(t => billed(t, moneyBoxValue(first(t)))),
   })
   await set('move_in_total_due', money(total))
+}
+
+/**
+ * S654: what a move-in box bills. On a renewal a refundable box (tagged
+ * deposit or prepaid, as the build reads it) bills the amount above what the
+ * old lease carries for that type, never below $0; anything else bills as typed.
+ */
+async function renewalBilledAmount(c: Exec, documentId: string): Promise<(tag: FeeType, amount: number) => number> {
+  const doc = (await c.query(
+    `SELECT renews_lease_id, template_id FROM lease_documents WHERE id = $1`, [documentId])).rows[0]
+  if (!doc?.renews_lease_id) return (_tag, amount) => amount
+  const carried: Record<string, number> = {}
+  for (const r of (await c.query(
+    `SELECT fee_type, SUM(amount)::text AS total FROM lease_fees
+      WHERE lease_id = $1 AND due_timing = 'move_in' AND is_refundable = TRUE
+      GROUP BY fee_type`, [doc.renews_lease_id])).rows) carried[r.fee_type] = Number(r.total) || 0
+  const kinds: Record<string, string> = {}
+  if (doc.template_id) {
+    for (const r of (await c.query(
+      `SELECT lease_column, money_kind FROM lease_template_fields
+        WHERE template_id = $1 AND money_kind IS NOT NULL AND lease_column IS NOT NULL`,
+      [doc.template_id])).rows) kinds[r.lease_column] = r.money_kind
+  }
+  return (tag, amount) => (kinds[tag] ?? defaultMoneyKind(tag)) === 'fee'
+    ? amount
+    : Math.max(0, Math.round((amount - (carried[tag] ?? 0)) * 100) / 100)
 }

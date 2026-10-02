@@ -73,3 +73,39 @@ describe('computeLandlordPL — the last day of the period counts (S654)', () =>
     expect(pl.expenses.maintenance).toBe(0)
   })
 })
+
+/**
+ * S654: every dollar counted once. Income is the landlord's own money only —
+ * a GAM fee carrying this landlord_id, and paid-ahead money GAM holds, are not.
+ */
+describe('computeLandlordPL — only the landlord\'s own money is income (S654)', () => {
+  async function settled(f: { landlordId: string; unitId: string; tenantId: string },
+    type: string, amount: number, owner: 'landlord' | 'gam' | 'held', settledAt: string) {
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at, revenue_owner)
+       VALUES ($1, $2, $3, $4, $5, 'settled', $8, '2026-09-01', $6::timestamptz, $7)`,
+      [f.unitId, f.tenantId, f.landlordId, type, amount, settledAt, owner,
+       ({ rent: 'RENT', deposit: 'DEPOSIT', late_fee: 'LATEFEE' } as Record<string, string>)[type] ?? 'OTHERFEE'])
+  }
+
+  it('$700 rent, a $6 GAM fee and a $500 held deposit → rent 700, fees 0, deposits held 500', async () => {
+    const f = await seed()
+    await settled(f, 'rent', 700, 'landlord', '2026-09-03T10:00:00-07:00')
+    await settled(f, 'fee', 6, 'gam', '2026-09-05T10:00:00-07:00')
+    await settled(f, 'deposit', 500, 'held', '2026-09-02T10:00:00-07:00')
+    const pl = await computeLandlordPL(f.landlordId, '2026-09-01', '2026-09-30', ['2026-09-01'])
+    expect(pl.gross.rent).toBe(700)
+    expect(pl.gross.fees).toBe(0)
+    expect(pl.gross.total).toBe(700)
+    expect(pl.depositsHeld).toBe(500)
+  })
+
+  it('a landlord fee counts; a held paid-ahead fee does not', async () => {
+    const f = await seed()
+    await settled(f, 'late_fee', 25, 'landlord', '2026-09-10T10:00:00-07:00')
+    await settled(f, 'fee', 700, 'held', '2026-09-11T10:00:00-07:00')
+    const pl = await computeLandlordPL(f.landlordId, '2026-09-01', '2026-09-30', ['2026-09-01'])
+    expect(pl.gross.fees).toBe(25)
+    expect(pl.depositsHeld).toBe(0)
+  })
+})

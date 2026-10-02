@@ -18,7 +18,7 @@
  *     `skipped` count.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 vi.mock('../services/supersedence', () => ({
   computeTenantGamOutstandingTotal: vi.fn(async () => 0),
@@ -1936,13 +1936,96 @@ describe('S654 balance-context nets paid-ahead credit first (MH 25)', () => {
       .set('Authorization', `Bearer ${f.tokenTenant1}`)
     expect(after.body.data.leases.find((l: any) => l.leaseId === f.lease1Id)).toBeUndefined()
   })
+
+  // S654: the figure the portal shows, the pay floor and what settles are one
+  // number — with both credits, and with paid-ahead reaching a second bill.
+  const payWhatItShows = async (f: Fixture) => {
+    await db.query(`UPDATE tenants SET stripe_customer_id = 'cus_mh25' WHERE id = $1`, [f.tenant1Id])
+    const lease = await ctx(f)
+    const res = await request(buildApp()).post('/api/payments/pay-balance')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+      .send({ amount: lease.requiredNow, paymentMethodId: 'pm_x', paymentMethodType: 'ach', leaseId: f.lease1Id })
+    expect(res.status).toBe(200)
+    const { rows: [l] } = await db.query<{ open: string; prepaid: string; credit: string }>(`
+      SELECT COALESCE(SUM(amount) FILTER (WHERE status IN ('pending','failed')), 0)::text AS open,
+             (SELECT COALESCE(SUM(amount_remaining), 0) FROM lease_prepaid_credits WHERE lease_id = $1)::text AS prepaid,
+             (SELECT COALESCE(SUM(amount_remaining), 0) FROM tenant_credits WHERE lease_id = $1)::text AS credit
+        FROM payments WHERE lease_id = $1`, [f.lease1Id])
+    return { lease, open: Number(l.open), prepaidLeft: Number(l.prepaid), creditLeft: Number(l.credit) }
+  }
+
+  it('$10 paid ahead and a $50 credit: shows $400, and paying $400 closes the bill', async () => {
+    const f = await seed()
+    await mh25(f)
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,50,50,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+    const r = await payWhatItShows(f)
+    expect(r.lease.requiredNow).toBeCloseTo(400, 2)
+    expect(r.lease.prepaidApplied).toBeCloseTo(10, 2)
+    expect(r.lease.creditApplied).toBeCloseTo(50, 2)
+    expect(r).toMatchObject({ open: 0, prepaidLeft: 0, creditLeft: 0 })
+  })
+
+  // S654: a neighbor's utility on this lease's bill is paid with it (S616), so
+  // it shows in this lease's figure — and this landlord's credit is never taken
+  // off it. The charge asked $40 while the screen said $0.
+  it('a neighbor’s utility rides with the lease it is billed on: a $480 credit shows $40, and paying $40 closes the bill', async () => {
+    const f = await seed()
+    const invoiceId = await mh25(f)
+    await db.query(`DELETE FROM lease_prepaid_credits WHERE lease_id = $1`, [f.lease1Id])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,NULL,$3,$4,'utility',40,'pending','2026-10-01','UTILITY')`,
+      [invoiceId, f.aUnitId, f.tenant1Id, f.bLid])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,480,480,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+    const all = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(all.body.data.leases).toHaveLength(1)
+    const r = await payWhatItShows(f)
+    expect(r.lease.grossOutstanding).toBeCloseTo(500, 2)
+    expect(r.lease.creditApplied).toBeCloseTo(460, 2)
+    expect(r.lease.requiredNow).toBeCloseTo(40, 2)
+    expect(r).toMatchObject({ open: 0, creditLeft: 20 })
+    const { rows: [n] } = await db.query(`SELECT status FROM payments WHERE landlord_id = $1`, [f.bLid])
+    expect(n.status).toBe('processing')
+  })
+
+  it('two open bills and $470 paid ahead: shows $450, and paying $450 closes both', async () => {
+    const f = await seed()
+    await mh25(f)
+    const { rows: [sept] } = await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
+                             due_date, subtotal_rent, total_amount, status)
+       VALUES ($1,$2,$3,$4,'INV-S654-SEPT','2026-09-01',460,460,'pending') RETURNING id`,
+      [f.aLid, f.tenant1Id, f.lease1Id, f.aUnitId])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'rent',460,'pending','2026-09-01','RENT')`,
+      [sept.id, f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid])
+    await db.query(`UPDATE lease_prepaid_credits SET amount_original = 470, amount_remaining = 470 WHERE lease_id = $1`, [f.lease1Id])
+    const r = await payWhatItShows(f)
+    expect(r.lease.grossOutstanding).toBeCloseTo(920, 2)
+    expect(r.lease.prepaidApplied).toBeCloseTo(470, 2)
+    expect(r.lease.requiredNow).toBeCloseTo(450, 2)
+    expect(r).toMatchObject({ open: 0, prepaidLeft: 0, creditLeft: 0 })
+  })
 })
 
 // S654: the date the desk types is the date that lands, on any host. A bare
 // 'YYYY-MM-DDT12:00:00' was read in the HOST's zone; noon UTC is the same
 // calendar day in every US zone.
 describe('S654 POST /post-payment — receivedAt keeps its calendar day', () => {
+  // The host clock is pinned far from UTC for this test, so it fails the old
+  // host-local parse on ANY machine — on a UTC host the bug was invisible.
+  let hostTz: string | undefined
+  beforeEach(() => { hostTz = process.env.TZ; process.env.TZ = 'Pacific/Kiritimati' })   // UTC+14
+  afterEach(() => { if (hostTz === undefined) delete process.env.TZ; else process.env.TZ = hostTz })
+
   it('a check received 2026-09-09 is dated 2026-09-09, noon UTC', async () => {
+    expect(new Date('2026-09-09T12:00:00').toISOString()).not.toBe('2026-09-09T12:00:00.000Z')
     const f = await seed()
     const token = sign({ userId: f.aUid, role: 'landlord', email: 'a@t.dev',
                          profileId: null, landlordIds: [f.aLid], permissions: {} })

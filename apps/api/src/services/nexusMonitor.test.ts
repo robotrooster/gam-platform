@@ -129,6 +129,17 @@ describe('nexus dashboard status logic', () => {
     expect(d.summary.crossed).toBe(0)
   })
 
+  // S654: registered_date is a DATE; node-pg handed back a Date whose
+  // slice(0, 10) read 'Wed Sep 30', not '2026-09-30'.
+  it('registeredDate comes back as the stored calendar day', async () => {
+    await seedThreshold('TX', 500000, null, 'revenue_only')
+    await db.query(
+      `INSERT INTO state_tax_registrations (state_code, registered, registered_date)
+       VALUES ('TX', TRUE, DATE '2026-09-30')`)
+    const d = await getNexusDashboard(YEAR)
+    expect(d.states.find((x) => x.stateCode === 'TX')!.registeredDate).toBe('2026-09-30')
+  })
+
   it('count_rule=and requires BOTH revenue and txn over threshold', async () => {
     await seedThreshold('NY', 500000, 100, 'and')
     await seedTally('NY', YEAR, 600000, 50)  // revenue over, txn under → NOT crossed

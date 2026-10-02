@@ -176,3 +176,58 @@ describe('S648 general credits', () => {
     } finally { c.release() }
   })
 })
+
+// ── S654: rows a credit must never settle ───────────────────────────────────
+// A work-trade line is paid in hours at month close; a neighbor's utility on a
+// shared bill belongs to another landlord. Neither is this credit's to clear —
+// at invoice generation (invoice scope) or anywhere on the lease (lease scope).
+describe('S654 a credit passes over work-trade lines and a neighbor’s utility', () => {
+  async function applyIn(leaseId: string, opts: { scope: 'invoice' | 'lease'; invoiceId?: string }) {
+    const { applyCreditsToOpenCharges } = await import('./creditApplication')
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const r = await applyCreditsToOpenCharges(c, { leaseId, ...opts })
+      await c.query('COMMIT')
+      return r
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('lease scope: an $8 work-trade line stays as it is', async () => {
+    const f = await seedLeaseWithCharges([])
+    const l = (await db.query(`SELECT unit_id, landlord_id FROM leases WHERE id=$1`, [f.leaseId])).rows[0]
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, work_trade_suspended_at)
+       VALUES ($1,$2,$3,$4,'utility',8,'pending','2026-09-01','UTILITY',NOW())`,
+      [l.unit_id, f.leaseId, f.tenantId, l.landlord_id])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,10,10,'goodwill')`, [l.landlord_id, f.tenantId, f.leaseId])
+    expect((await applyIn(f.leaseId, { scope: 'lease' })).applied).toBe(0)
+    expect(await openBalance(f.leaseId)).toBeCloseTo(8, 2)
+  })
+
+  it('invoice scope: neither the work-trade line nor the neighbor’s utility is touched', async () => {
+    const f = await seedLeaseWithCharges([])
+    const l = (await db.query(`SELECT unit_id, landlord_id FROM leases WHERE id=$1`, [f.leaseId])).rows[0]
+    const nb = await (async () => { const c = await db.connect(); try { return await seedLandlord(c) } finally { c.release() } })()
+    const { rows: [inv] } = await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status)
+       VALUES ($1,$2,$3,$4,'INV-S654-CA','2026-10-01',5,'pending') RETURNING id`,
+      [l.landlord_id, f.tenantId, f.leaseId, l.unit_id])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, work_trade_suspended_at)
+       VALUES ($1,$2,$3,$4,$5,'utility',8,'pending','2026-10-01','UTILITY',NOW())`,
+      [inv.id, l.unit_id, f.leaseId, f.tenantId, l.landlord_id])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,NULL,$3,$4,'utility',5,'pending','2026-10-01','UTILITY')`,
+      [inv.id, l.unit_id, f.tenantId, nb.landlordId])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,20,20,'goodwill')`, [l.landlord_id, f.tenantId, f.leaseId])
+    expect((await applyIn(f.leaseId, { scope: 'invoice', invoiceId: inv.id })).applied).toBe(0)
+    const { rows } = await db.query(`SELECT status FROM payments WHERE invoice_id = $1`, [inv.id])
+    expect(rows.map((r: any) => r.status)).toEqual(['pending', 'pending'])
+  })
+})

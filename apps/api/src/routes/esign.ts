@@ -27,6 +27,7 @@ import {
   FEE_TYPES,
   FEE_TYPE_META, MONEY_KINDS, isMoneyBoxColumn,
   moveInDefaults,
+  nextDueDateAfter,
   leaseDueDay,
   dueDayLabel,
   parseDueDay,
@@ -117,8 +118,12 @@ async function canTenantsSignNewLease(
     `SELECT u.unit_type, p.landlord_id FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
     [newUnitId])
   if (!newUnit) return { ok: false, reason: 'Unit not found' }
-  // No readable start: nothing to compare (the build refuses it elsewhere).
-  if (!bStart) return { ok: true }
+  // S654: an unreadable start is refused here, on send, sign and build alike.
+  if (!bStart) return { ok: false, reason: 'The lease start date is not a date.' }
+  // S654: so is an end date that names no real day (callers pass '-' as null).
+  if (!bEnd && typeof newEndDate === 'string' && newEndDate.trim() !== '') {
+    return { ok: false, reason: 'The lease end date is not a date.' }
+  }
   const newBucket = bucketFor(newUnit.unit_type)
 
   for (const tenantId of tenantIds) {
@@ -216,15 +221,19 @@ async function getDocumentTenantSigners(documentId: string): Promise<{
 /**
  * S654: the calendar day a lease date field names, as 'YYYY-MM-DD'. Document
  * dates are M/D/YYYY (S636) and older values can be ISO; anything else falls
- * back to the old local-time parse. Never read through UTC midnight.
+ * back to the old local-time parse. Never read through UTC midnight. A day
+ * that does not exist ('2/30/2027') is null, not a date Postgres refuses later.
  */
 function leaseFieldDate(raw: string | null | undefined): string | null {
   const t = String(raw ?? '').trim()
   if (!t) return null
-  const iso = /^(\d{4}-\d{2}-\d{2})/.exec(t)
-  if (iso) return iso[1]
-  const doc = documentDateToIso(t)
-  if (doc) return doc
+  const ymd = /^(\d{4}-\d{2}-\d{2})/.exec(t)?.[1] || documentDateToIso(t)
+  if (ymd) {
+    const [y, m, d] = ymd.split('-').map(Number)
+    const back = new Date(Date.UTC(y, m - 1, d))
+    return back.getUTCFullYear() === y && back.getUTCMonth() === m - 1 && back.getUTCDate() === d
+      ? ymd : null
+  }
   const d = new Date(t)
   if (Number.isNaN(d.getTime())) return null
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -652,8 +661,13 @@ export async function createDocumentRecord(client: any, opts: {
         //
         // other_fee is skipped: the property can list several, and a lease form
         // has one box, usually printed for something specific ("Guest fee").
+        //
+        // S654: a renewal is a sitting tenant too. Its deposits and fees carry
+        // from the old lease (POST /documents/renewal); the property's list for
+        // new residents re-billed its move-in fee and added deposits.
+        const sittingTenant = existingTenancy || !!opts.renewsLeaseId
         if (opts.documentType === 'original_lease') {
-          const schedule = existingTenancy ? [] : await client.query(
+          const schedule = sittingTenant ? [] : await client.query(
             `SELECT pfs.fee_type, pfs.amount
                FROM property_fee_schedules pfs
                JOIN units u ON u.property_id = pfs.property_id AND u.unit_type = pfs.unit_type
@@ -662,7 +676,7 @@ export async function createDocumentRecord(client: any, opts: {
           for (const r of schedule) {
             if (prefillValues[r.fee_type] == null) prefillValues[r.fee_type] = Number(r.amount).toFixed(2)
           }
-          if (existingTenancy) {
+          if (sittingTenant) {
             for (const tag of FEE_TYPES) {
               if (tag === 'security_deposit' || tag === 'other_fee') continue
               if (FEE_TYPE_META[tag].dueTiming !== 'move_in') continue
@@ -677,9 +691,28 @@ export async function createDocumentRecord(client: any, opts: {
             `SELECT p.move_in_collects_next_period AS on, p.rent_due_mode FROM units u
                JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [opts.unitId])
             .then((r: any) => r.rows[0])
+          // S654: a renewal is not a move-in. The old lease's last bill runs to
+          // its next due date, so a new term starting before that date owes no
+          // rent at signing and the new lease's monthly bills carry on. A start
+          // ON that date owes its first month, as below. A month-to-month old
+          // lease is still billing; a booking-drafted one bills only to its end
+          // date, so its stub is owed.
+          if (opts.renewsLeaseId) {
+            const old = await client.query(
+              `SELECT lease_source, to_char(end_date, 'YYYY-MM-DD') AS end_date, rent_due_day
+                 FROM leases WHERE id = $1`, [opts.renewsLeaseId]).then((r: any) => r.rows[0])
+            const startIso = leaseFieldDate(prefillValues.start_date)
+            const covered = !!old && old.lease_source !== 'booking_draft' && !!startIso
+              && (!old.end_date || startIso < nextDueDateAfter(old.end_date, parseDueDay(old.rent_due_day) ?? 1))
+            if (covered) {
+              if (prefillValues.move_in_first_month_rent == null) prefillValues.move_in_first_month_rent = '0.00'
+              if (prefillValues.move_in_proration == null) prefillValues.move_in_proration = '0.00'
+            }
+          }
           const d = moveInDefaults({
             rent: Number(prefillValues.rent_amount ?? ctx.rent_amount ?? 0),
-            startIso: prefillValues.start_date ?? null,
+            // S654: document dates are M/D/YYYY, which parseIso can't read.
+            startIso: leaseFieldDate(prefillValues.start_date),
             existingTenancy, collectsNextPeriod: prop?.on === true,
             dueDay: parseDueDay(prefillValues.rent_due_day) ?? 1,
             mode: existingTenancy ? 'fixed_day' : prop?.rent_due_mode,
@@ -1203,7 +1236,7 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     writableValues.push(intentRule?.invite_day != null ? Number(intentRule.invite_day) : leaseDueDay({
       mode: existingRule ? 'fixed_day' : (rule?.rent_due_mode ?? 'fixed_day'),
       propertyDay: rule?.rent_due_day ?? 1,
-      // S654: the field is M/D/YYYY; slicing it gave move_in_day leases a garbage day.
+      // S654: a M/D/YYYY start could not be read, so every move_in_day lease fell back to the 1st.
       startIso: leaseFieldDate(vals.start_date),
     }))
     paramIdx++

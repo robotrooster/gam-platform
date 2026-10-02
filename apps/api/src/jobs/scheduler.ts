@@ -1218,6 +1218,11 @@ async function processBackgroundCheckExpiry() {
 export function schedulerInit() {
   logger.info('⏰ Scheduler initialized')
 
+  // S654: daily crons run on Phoenix time, so each fires at the same local hour
+  // on any host (the API is moving to a UTC host, S641). Two exceptions, pinned
+  // to UTC on purpose: payout sync (4:10 UTC) and auto-payouts (1:00 UTC), because
+  // Stripe releases funds at 00:00 UTC (S617). Leave those two on UTC.
+
   // ── PAYMENT RECONCILIATION ──────────────────────────────────
   // S620. The ONLY path from 'processing' to 'settled' is the
   // payment_intent.succeeded webhook arriving. Miss it — endpoint down, Mac
@@ -1235,11 +1240,11 @@ export function schedulerInit() {
     } catch (err) {
       logger.error({ err }, '[reconcile] payment reconciliation failed')
     }
-  })
+  }, { timezone: 'America/Phoenix' })
 
   // ── LEASE EXPIRATION NOTICES ────────────────────────────────
   // Daily at 8am — notify landlord when lease approaches end_date
-  cron.schedule('0 8 * * *', checkLeaseExpiryNotices)
+  cron.schedule('0 8 * * *', checkLeaseExpiryNotices, { timezone: 'America/Phoenix' })
 
   // S652 (Nic): a card-reader request must never sit unseen. Every morning,
   // one email while anything is waiting on GAM; silent otherwise.
@@ -1432,7 +1437,7 @@ export function schedulerInit() {
     } catch (e) {
       logger.error({ err: e }, '[address-verify-sweep] fatal')
     }
-  })
+  }, { timezone: 'America/Phoenix' })
 
   // S581 (Nic): apply due scheduled money changes carried by signed terms
   // addendums — a base-rent change (e.g. AZ mobile-home space rent) or a new
@@ -1475,7 +1480,7 @@ export function schedulerInit() {
     } catch (e) {
       logger.error({ err: e }, '[invite-nudge] fatal')
     }
-  })
+  }, { timezone: 'America/Phoenix' })
 
   // S628 (Nic): renewal is TENANT-FIRST — ask the tenant at 60 days, tell the
   // landlord at 32. Nothing sent that question before; it waited on a landlord
@@ -1489,7 +1494,7 @@ export function schedulerInit() {
     } catch (e) {
       logger.error({ err: e }, '[renewal-ping] fatal')
     }
-  })
+  }, { timezone: 'America/Phoenix' })
 
   // S550 (Nic): daily growth snapshot — per-(state,city) + platform totals
   // (landlords/properties/units/occupancy/rent-roll). History starts the
@@ -1502,7 +1507,7 @@ export function schedulerInit() {
     } catch (e) {
       logger.error({ err: e }, '[growth-snapshot] fatal')
     }
-  })
+  }, { timezone: 'America/Phoenix' })
 
   cron.schedule('15 4 * * *', async () => {
     try {
@@ -1510,7 +1515,7 @@ export function schedulerInit() {
       const r = await processBusinessMonthlyFees()
       if (r.accrued || r.collected || r.failed) logger.info(r, '[business-fees]')
     } catch (e) { logger.error({ err: e }, '[business-fees] fatal') }
-  })
+  }, { timezone: 'America/Phoenix' })
 
   // S568 (Nic): financed home/RV sales. Daily bill any amortized home-sale
   // installment whose billing month has arrived (a standalone type='home_payment'
@@ -2331,9 +2336,8 @@ export function schedulerInit() {
   cron.schedule('0 15 * * *', async () => {
     try {
       const { isLastBusinessDayOfMonth, processMonthlyAdvance } = await import('../services/otp')
-      // S654: the helper reads UTC calendar fields, so hand it Phoenix's today
-      // at UTC noon — the UTC day is then Phoenix's day at any hour.
-      if (!isLastBusinessDayOfMonth(new Date(`${todayIn(null)}T12:00:00Z`))) return
+      // S654: Phoenix's calendar day.
+      if (!isLastBusinessDayOfMonth(todayIn(null))) return
       const result = await processMonthlyAdvance()
       logger.info(result, '[otp-advance]')
     } catch (e) {
@@ -2467,7 +2471,7 @@ export function schedulerInit() {
     }
   })
   // Background check 6-month freshness expiry. 3 AM daily, low-contention window.
-  cron.schedule('0 3 * * *', processBackgroundCheckExpiry)
+  cron.schedule('0 3 * * *', processBackgroundCheckExpiry, { timezone: 'America/Phoenix' })
 
   // S565: nightly economic-nexus tally. 3:20am, after the 3am low-contention
   // jobs. Sums GAM's own revenue by customer state (current + prior calendar
@@ -2479,7 +2483,7 @@ export function schedulerInit() {
       const { rows } = await recomputeNexusTally()
       logger.info(`[SCHEDULER] nexus tally recomputed — ${rows} state-year rows`)
     } catch (e) { logger.error({ err: e }, '[SCHEDULER] nexus tally') }
-  })
+  }, { timezone: 'America/Phoenix' })
 
   // ── LEASE END PROCESSOR ─────────────────────────────────────
   // Daily at 2am — activate signed pending leases whose start date arrived
@@ -2487,16 +2491,16 @@ export function schedulerInit() {
   cron.schedule('0 2 * * *', async () => {
     await activatePendingLeases()
     await processLeaseEnds()
-  })
+  }, { timezone: 'America/Phoenix' })
 
   // ── LOW STOCK CHECK ─────────────────────────────────────────
   // Daily at 9am — notify landlords of low-stock POS items
-  cron.schedule('0 9 * * *', checkLowStock)
+  cron.schedule('0 9 * * *', checkLowStock, { timezone: 'America/Phoenix' })
 
   // W-46: same 9am slot — business-supplies low stock + equipment
   // service-due reminders (both land on /inventory)
-  cron.schedule('0 9 * * *', checkPartsLowStock)
-  cron.schedule('0 9 * * *', checkServiceDue)
+  cron.schedule('0 9 * * *', checkPartsLowStock, { timezone: 'America/Phoenix' })
+  cron.schedule('0 9 * * *', checkServiceDue, { timezone: 'America/Phoenix' })
 
   // W-20 (S531): schedule self-compression — nightly at 3:30am (after the
   // 2am lease-end processor so handoffs/expiries settle first). The site
@@ -2515,7 +2519,7 @@ export function schedulerInit() {
         await alertStaysOnOutOfOrderSites(p.property_id)
       }
     } catch (e) { logger.error({ err: e }, '[SCHEDULER] schedule compression') }
-  })
+  }, { timezone: 'America/Phoenix' })
   cron.schedule('*/15 * * * *', revealTodaysSites)
 
   // W-44 (S531): hourly private-event sweep — announce paid events,
@@ -2608,7 +2612,8 @@ export function schedulerInit() {
   // noise without losing functionality.
 
   // ── LATE PAYMENT DETECTION ──────────────────────────────────
-  // Run daily at 7am — detect failed/missing ACH pulls
+  // Run daily at 7am Phoenix — detect failed/missing ACH pulls. S654: pinned
+  // to Phoenix; unpinned it ran at the host's 7am (midnight Phoenix on UTC).
   cron.schedule('0 7 * * *', async () => {
     try {
       // Rent due 5+ days ago that hasn't settled. S654: these rows only mark
@@ -2702,7 +2707,7 @@ export function schedulerInit() {
         logger.info(`[Scheduler] ${overdue.length} overdue payment(s) processed`)
       }
     } catch (e) { logger.error({ err: e }, '[Scheduler] Late payment detection error') }
-  })
+  }, { timezone: 'America/Phoenix' })
 
   // S86: removed two more stub crons —
   //
@@ -2741,7 +2746,7 @@ export function schedulerInit() {
         logger.error({ zero_tolerance_count: stats.zero_tolerance }, '[NACHA ZERO-TOLERANCE] zero-tolerance returns this month — manual review required')
       }
     } catch (e) { logger.error({ err: e }, '[Scheduler] NACHA monitoring error') }
-  })
+  }, { timezone: 'America/Phoenix' })
 
 
   // S86: FlexPay + FlexCharge pull crons removed — see deletion-rationale
@@ -2823,7 +2828,7 @@ export function schedulerInit() {
     } catch (e) {
       logger.error({ err: e }, '[recurring-cron] sweep crashed')
     }
-  })
+  }, { timezone: 'America/Phoenix' })
 }
 
 

@@ -1217,14 +1217,18 @@ export async function emailTenantOnboarded(
   activationUrl: string,
   ctx?: { landlordId?: string; tenantId?: string }
 ) {
-  await send(to, `${landlordName} added you to GAM for ${unitLabel}`,
+  // S654: names, address and unit come from a landlord's CSV, so every one is
+  // escaped before it goes into the HTML (and kept to one line in the subject).
+  const esc = (v: unknown) => escapeHtml(String(v ?? ''))
+  const subject = `${landlordName} added you to GAM for ${unitLabel}`.replace(/[\r\n]+/g, ' ')
+  await send(to, subject,
     base(
       h('Welcome to GAM') +
-      p(`Hi ${tenantName},`) +
-      p(`Your landlord <strong style="color:#eef1f8">${landlordName}</strong> has added you to GAM, the platform they use to manage your tenancy.`) +
+      p(`Hi ${esc(tenantName)},`) +
+      p(`Your landlord <strong style="color:#eef1f8">${esc(landlordName)}</strong> has added you to GAM, the platform they use to manage your tenancy.`) +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
-        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${propertyAddress}</div>
-        <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${esc(propertyAddress)}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${esc(unitLabel)}</div>
       </div>` +
       p('Click below to activate your account and set a password. There is no application or background check required — your landlord has already onboarded you.') +
       btnWithLink('Activate Your Account', activationUrl) +

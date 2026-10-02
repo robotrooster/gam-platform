@@ -79,6 +79,7 @@ vi.mock('stripe', () => {
 import Stripe from 'stripe'
 import { webhooksRouter } from './webhooks'
 import { emitPaymentSettledEvent, emitPaymentFailedEvent } from '../services/creditLedgerEmitters'
+import { sendNotificationEmail } from '../services/email'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema,
@@ -87,6 +88,7 @@ import {
   seedAllocationRule, seedRentPayment,
   seedLease, seedLeaseTenant,
   seedUtilityMeter, seedUtilityBill, seedUtilityPayment,
+  seedUserBankAccount, seedPmCompany,
 } from '../test/dbHelpers'
 
 const stripeMocks: {
@@ -843,6 +845,72 @@ describe('POST /webhooks/stripe — payment_intent.payment_failed', () => {
       [paymentId]
     )
     expect(pay.rows[0].status).toBe('pending')
+  })
+
+  // S654: one email per thing. The tenant's retry / retries-exhausted email
+  // was sent from inside the per-landlord-contact loop: two contacts sent the
+  // tenant two identical emails, no contact sent none.
+  describe('ACH retry notices: the tenant is told once, whatever the landlord contact count', () => {
+    async function seedWithContacts(paymentIntentId: string, contacts: number, retryCount = 0) {
+      const client = await getClient()
+      try {
+        const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+        const tenantId = await seedTenant(client)
+        const propertyId = await seedProperty(client, { landlordId, ownerUserId, managedByUserId: ownerUserId })
+        const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+        // A PM company manages the property: its active staff are the
+        // landlord-side contacts (0, 1 or many).
+        const bankAccountId = await seedUserBankAccount(client, { userId: ownerUserId })
+        const pmCompanyId = await seedPmCompany(client, { bankAccountId })
+        await client.query(`UPDATE properties SET pm_company_id = $2 WHERE id = $1`, [propertyId, pmCompanyId])
+        const staffEmails: string[] = []
+        for (let i = 0; i < contacts; i++) {
+          const email = `pm-staff-${i}-${paymentIntentId}@test.dev`
+          const staffUserId = await seedManager(client, { email })
+          await client.query(
+            `INSERT INTO pm_staff (pm_company_id, user_id, role, status) VALUES ($1, $2, 'staff', 'active')`,
+            [pmCompanyId, staffUserId])
+          staffEmails.push(email)
+        }
+        const paymentId = await seedRentPayment(client, {
+          unitId, tenantId, landlordId, amount: 1000, status: 'pending', stripePaymentIntentId: paymentIntentId,
+        })
+        if (retryCount) await client.query(`UPDATE payments SET retry_count = $2 WHERE id = $1`, [paymentId, retryCount])
+        const tenantEmail = (await client.query<{ email: string }>(
+          `SELECT u.email FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [tenantId])).rows[0].email
+        return { tenantEmail, staffEmails }
+      } finally { client.release() }
+    }
+
+    function emailsOfType(type: string): string[] {
+      return vi.mocked(sendNotificationEmail).mock.calls
+        .filter((c) => c[0].notificationType === type)
+        .map((c) => c[0].to)
+    }
+
+    beforeEach(() => { vi.mocked(sendNotificationEmail).mockClear() })
+
+    for (const contacts of [2, 0]) {
+      it(`retry scheduled, ${contacts} landlord contacts → tenant gets exactly one email`, async () => {
+        const pi = `pi_ach_once_retry_${contacts}`
+        const { tenantEmail, staffEmails } = await seedWithContacts(pi, contacts)
+        const res = await postEvent(buildPaymentIntentFailed({ paymentIntentId: pi, returnCode: 'R01' }))
+        expect(res.status).toBe(200)
+
+        expect(emailsOfType('ach_retry_scheduled')).toEqual([tenantEmail])
+        expect(emailsOfType('ach_retry_scheduled_info').sort()).toEqual([...staffEmails].sort())
+      })
+
+      it(`retries exhausted, ${contacts} landlord contacts → tenant gets exactly one email`, async () => {
+        const pi = `pi_ach_once_exhausted_${contacts}`
+        const { tenantEmail, staffEmails } = await seedWithContacts(pi, contacts, 2)
+        const res = await postEvent(buildPaymentIntentFailed({ paymentIntentId: pi, returnCode: 'R01' }))
+        expect(res.status).toBe(200)
+
+        expect(emailsOfType('ach_retries_exhausted')).toEqual([tenantEmail])
+        expect(emailsOfType('ach_retries_exhausted_landlord').sort()).toEqual([...staffEmails].sort())
+      })
+    }
   })
 
   it('unknown PI id: webhook returns 200 with no side effects', async () => {

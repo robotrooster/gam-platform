@@ -44,7 +44,7 @@ vi.mock('../services/stripeConnect', async (importOriginal) => {
 
 import { runAutopayForTimezone, isPullDayToday, AUTOPAY_DISARM_AFTER_FAILURES } from './autopayRunner'
 import { AppError } from '../middleware/errorHandler'
-import { CREDIT_COVERS_BALANCE } from '../services/rentCharge'
+import { CREDIT_COVERS_BALANCE, CREDIT_NOT_PLACEABLE } from '../services/rentCharge'
 
 const TZ = 'America/Phoenix'
 
@@ -332,6 +332,163 @@ describe('S609 autopay runner', () => {
     const credit = await db.query<{ r: string }>(
       `SELECT amount_remaining::text AS r FROM lease_prepaid_credits WHERE lease_id = $1`, [f.leaseId])
     expect(Number(credit.rows[0].r)).toBe(0)
+  })
+
+  // S654: the same $460 bill with BOTH credits — $10 paid ahead and a $50
+  // landlord credit. Autopay pulls $400 and the bill closes with both spent;
+  // before, a $60 remainder stayed open that neither credit could clear.
+  it('S654: $460 bill, $10 paid ahead, $50 credit — autopay pulls $400 and the bill closes', async () => {
+    const real = await vi.importActual<typeof import('../services/rentCharge')>('../services/rentCharge')
+    chargeMock.mockImplementationOnce(async (input: any) => real.chargeLeaseBalance(input) as any)
+    await armForToday(f)
+    const inv = await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
+       VALUES ($1,$2,$3,$4,'INV-S654-AP2','2026-10-01',460,460,'pending') RETURNING id`,
+      [f.landlordId, f.tenantId, f.leaseId, f.unitId])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'rent',460,'pending','2026-10-01','RENT')`,
+      [inv.rows[0].id, f.unitId, f.leaseId, f.tenantId, f.landlordId])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1,$2,10,10)`, [f.leaseId, f.tenantId])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,50,50,'goodwill')`, [f.landlordId, f.tenantId, f.leaseId])
+
+    const r = await runAutopayForTimezone(TZ, runAt())
+    expect(r.charged).toBe(1)
+    const rem = await db.query<{ amount: string; unapplied_amount: string }>(
+      `SELECT amount::text, unapplied_amount::text FROM tenant_remittances WHERE lease_id = $1`, [f.leaseId])
+    expect(rem.rows).toEqual([{ amount: '400.00', unapplied_amount: '0.00' }])
+    const { rows: [l] } = await db.query<{ open: string; total: string; prepaid: string; credit: string }>(`
+      SELECT COALESCE(SUM(amount) FILTER (WHERE status IN ('pending','failed')), 0)::text AS open,
+             SUM(amount)::text AS total,
+             (SELECT SUM(amount_remaining) FROM lease_prepaid_credits WHERE lease_id = $1)::text AS prepaid,
+             (SELECT SUM(amount_remaining) FROM tenant_credits WHERE lease_id = $1)::text AS credit
+        FROM payments WHERE invoice_id = $2`, [f.leaseId, inv.rows[0].id])
+    expect(l).toEqual({ open: '0', total: '460.00', prepaid: '0.00', credit: '0.00' })
+  })
+
+  // S654: the notice quoted the bank total — fee included — as "rent".
+  it('S654: the notice quotes the rent and the processing fee apart', async () => {
+    const { createNotification } = await import('../services/notifications')
+    ;(createNotification as any).mockClear()
+    chargeMock.mockImplementationOnce(async () => ({
+      remittanceId: 'rem_x', paymentIntentId: 'pi_x', status: 'processing',
+      appliedTotal: 450, payAhead: 0, platformCutAmount: 6, chargeAmount: 456, processingFee: 6, lines: [],
+    }) as any)
+    await armForToday(f)
+    await seedCharge(f, 450)
+    await runAutopayForTimezone(TZ, runAt())
+    const body = (createNotification as any).mock.calls[0][0].body as string
+    expect(body).toContain('rent payment of $450.00')
+    expect(body).toContain('$6.00 processing fee ($456.00 in all)')
+  })
+
+  it('S654: with no fee to the tenant the notice is just the rent', async () => {
+    const { createNotification } = await import('../services/notifications')
+    ;(createNotification as any).mockClear()
+    chargeMock.mockImplementationOnce(async () => ({
+      remittanceId: 'rem_x', paymentIntentId: 'pi_x', status: 'processing',
+      appliedTotal: 450, payAhead: 0, platformCutAmount: 6, chargeAmount: 450, processingFee: 0, lines: [],
+    }) as any)
+    await armForToday(f)
+    await seedCharge(f, 450)
+    await runAutopayForTimezone(TZ, runAt())
+    const body = (createNotification as any).mock.calls[0][0].body as string
+    expect(body).toBe("We've started your scheduled rent payment of $450.00. Bank payments usually take 3–5 business days to clear.")
+  })
+
+  // S654: the charge refused because the credit could not be laid on the bill
+  // (nothing was charged). That is the office's to settle, never the bank's:
+  // it used to tell the tenant to check their account and count toward
+  // switching autopay off.
+  it('S654: a credit the charge cannot place goes to the office — no bank failure, no count', async () => {
+    const { createNotification } = await import('../services/notifications')
+    ;(createNotification as any).mockClear()
+    await armForToday(f)
+    await seedCharge(f, 460)
+    chargeMock.mockImplementationOnce(async () => {
+      throw new AppError(409, `${CREDIT_NOT_PLACEABLE}. Nothing was charged — please ask the office to apply it.`)
+    })
+    const r = await runAutopayForTimezone(TZ, runAt())
+    expect(r).toMatchObject({ charged: 0, failed: 0, skipped: 1 })
+    const row = await autopayRow(f.leaseId)
+    expect(row.consecutive_failures).toBe(0)
+    expect(row.enabled).toBe(true)
+    expect((createNotification as any).mock.calls.filter((c: any[]) => c[0].type === 'autopay_failed')).toHaveLength(0)
+    const alerts = await db.query(`SELECT title FROM admin_notifications WHERE category = 'autopay_credit_not_applied'`)
+    expect(alerts.rows).toHaveLength(1)
+  })
+
+  // S654: $10 paid ahead and a $450 credit on a $460 bill — the credit settles
+  // it. Nothing is pulled and nobody is told anything went wrong.
+  it('S654: credits covering the bill settle it — no bank pull, no notice', async () => {
+    const real = await vi.importActual<typeof import('../services/rentCharge')>('../services/rentCharge')
+    chargeMock.mockImplementationOnce(async (input: any) => real.chargeLeaseBalance(input) as any)
+    const { createNotification } = await import('../services/notifications')
+    ;(createNotification as any).mockClear()
+    const { createRentPlatformCharge } = await import('../services/stripeConnect')
+    ;(createRentPlatformCharge as any).mockClear()
+    await armForToday(f)
+    const inv = await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
+       VALUES ($1,$2,$3,$4,'INV-S654-AP3','2026-10-01',460,460,'pending') RETURNING id`,
+      [f.landlordId, f.tenantId, f.leaseId, f.unitId])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'rent',460,'pending','2026-10-01','RENT')`,
+      [inv.rows[0].id, f.unitId, f.leaseId, f.tenantId, f.landlordId])
+    await db.query(`INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining) VALUES ($1,$2,10,10)`,
+      [f.leaseId, f.tenantId])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,450,450,'goodwill')`, [f.landlordId, f.tenantId, f.leaseId])
+
+    const r = await runAutopayForTimezone(TZ, runAt())
+    expect(r).toMatchObject({ charged: 0, failed: 0, skipped: 1 })
+    expect(createRentPlatformCharge).not.toHaveBeenCalled()
+    expect(createNotification).not.toHaveBeenCalled()
+    const row = await autopayRow(f.leaseId)
+    expect(row.consecutive_failures).toBe(0)
+    expect(row.last_success_cycle).toBe(row.last_run_cycle)
+    const { rows: [i] } = await db.query(`SELECT status FROM invoices WHERE id = $1`, [inv.rows[0].id])
+    expect(i.status).toBe('settled')
+  })
+
+  // S654: a neighbor's utility on this lease's bill is paid with it, so a bill
+  // whose only open line is that utility is still pulled, not skipped.
+  it('S654: a bill whose only open line is a neighbor’s utility is still charged', async () => {
+    await armForToday(f)
+    const nb = await (async () => { const c = await db.connect(); try { return await seedLandlord(c) } finally { c.release() } })()
+    const inv = await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status)
+       VALUES ($1,$2,$3,$4,'INV-S654-NB','2026-10-01',40,'pending') RETURNING id`,
+      [f.landlordId, f.tenantId, f.leaseId, f.unitId])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,NULL,$3,$4,'utility',40,'pending','2026-10-01','UTILITY')`,
+      [inv.rows[0].id, f.unitId, f.tenantId, nb.landlordId])
+    const r = await runAutopayForTimezone(TZ, runAt())
+    expect(r.charged).toBe(1)
+    expect(chargeMock.mock.calls[0][0]).toMatchObject({ leaseId: f.leaseId, chargeRequiredOnly: true })
+  })
+
+  // S654: a landlord who passes the platform fee on — it is not a processing fee.
+  it('S654: the notice names the processing fee and a passed-on platform fee apart', async () => {
+    const { createNotification } = await import('../services/notifications')
+    ;(createNotification as any).mockClear()
+    chargeMock.mockImplementationOnce(async () => ({
+      remittanceId: 'rem_x', paymentIntentId: 'pi_x', status: 'processing',
+      appliedTotal: 450, payAhead: 0, platformCutAmount: 8, chargeAmount: 458,
+      processingFee: 6, platformFeePassthrough: 2, lines: [],
+    }) as any)
+    await armForToday(f)
+    await seedCharge(f, 450)
+    await runAutopayForTimezone(TZ, runAt())
+    const body = (createNotification as any).mock.calls[0][0].body as string
+    expect(body).toContain('rent payment of $450.00, plus a $6.00 processing fee and a $2.00 platform fee ($458.00 in all)')
   })
 
   describe('which day it fires', () => {

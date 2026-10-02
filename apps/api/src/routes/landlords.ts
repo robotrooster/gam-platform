@@ -14,7 +14,7 @@ import { collectedRentMtd } from '../lib/rentCollected'
 import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue, emailSigningRequest } from '../services/email'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { createNotification } from '../services/notifications'
-import { applyScreeningWaive, listOnboardingWindowsForLandlord } from '../services/onboardingWindow'
+import { applyScreeningWaive, listOnboardingWindowsForLandlord, openOnboardingWindow } from '../services/onboardingWindow'
 import { scheduleParserJob } from '../jobs/leaseParser/runParserJob'
 import { resolveIntent } from '../jobs/leaseParser/resolveIntent'
 import { parse as parseCsv } from 'csv-parse/sync'
@@ -28,7 +28,7 @@ import {
   applyPaymentMapping, buildPaymentTemplateCsv, getPaymentPlatformConfig,
   type CsvImportPlatform,
 } from '../lib/csvImportMappings'
-import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT, occupancyRateFrom, WORK_TRADE_COVERABLE } from '@gam/shared'
+import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT, occupancyRateFrom, WORK_TRADE_COVERABLE, timezoneForState, labelFor, FALLBACK_TIMEZONE } from '@gam/shared'
 import { emailPmPropertyInvitation, emailLandlordCoOwnerInvitation } from '../services/email'
 import { platformFeesByPropertyForEntities, periodMonths } from '../services/platformFee'
 import {
@@ -2403,8 +2403,8 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
     } catch (emailErr) {
       // Failure also lands in email_send_log via send()'s internal logging;
       // landlord can surface it via GET /api/landlords/me/email-failures.
+      // S654: never the activation link: it is a password-setting key.
       logger.error({ err: emailErr, ctx: emailNorm }, '[ONBOARD] notify failed for')
-      if (activationUrl) logger.info(`[ONBOARD] Manual activation URL: ${activationUrl}`)
     }
 
     res.json({
@@ -2732,8 +2732,8 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
           await emailTenantOnboarded(emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl!, { landlordId, tenantId })
         }
       } catch (emailErr) {
+        // S654: never the activation link: it is a password-setting key.
         logger.error({ err: emailErr, ctx: emailNorm }, '[ONBOARD-NEW-LEASE] notify failed for')
-        if (activationUrl) logger.info(`[ONBOARD-NEW-LEASE] Manual activation URL: ${activationUrl}`)
       }
     }
 
@@ -2776,8 +2776,6 @@ type CsvRow = {
   noticeDaysRequired: string
   outstandingBalance: string
   resolvedUnitId?: string
-  resolvedExistingUserId?: string
-  resolvedExistingTenantId?: string
   // S294: source-platform columns that aren't canonical-mapped and
   // aren't on the platform's noise list. Stored on the lease's
   // import_extra_data JSONB at commit time. Original-case keys
@@ -2786,6 +2784,49 @@ type CsvRow = {
   issues: CsvIssue[]
 }
 
+
+// S654: who a tenant-CSV email already is on GAM: the account (any letter
+// case), its role, and whether its resident holds an active lease here or with
+// another landlord. Validate shows it; commit decides with it. Commit never
+// takes an account id from the browser: one landlord's own login was attached
+// to another landlord's lease that way, and its activation link mailed to a
+// stranger.
+type ImportAccount = {
+  userId: string; email: string; role: string; tenantId: string | null
+  activeHere: boolean; activeElsewhere: boolean
+}
+const NOT_A_RESIDENT_ACCOUNT =
+  "This email belongs to a GAM account that isn't a resident's, so it can't be added as a tenant. Use the resident's own email."
+const TENANT_OF_ANOTHER_LANDLORD =
+  'This email is a tenant of another landlord. Cross-landlord onboarding requires a separate flow.'
+
+async function lookupImportAccounts(emails: string[], landlordId: string): Promise<Map<string, ImportAccount>> {
+  const out = new Map<string, ImportAccount>()
+  if (emails.length === 0) return out
+  const found = await query<any>(
+    `SELECT DISTINCT ON (LOWER(u.email))
+            LOWER(u.email) AS email_key, u.id AS user_id, u.email, u.role, t.id AS tenant_id
+       FROM users u
+       LEFT JOIN tenants t ON t.user_id = u.id
+      WHERE LOWER(u.email) = ANY($1::text[])
+      ORDER BY LOWER(u.email), (u.email = LOWER(u.email)) DESC, u.created_at, t.created_at`,
+    [emails])
+  const leases = found.length === 0 ? [] : await query<{ user_id: string; here: boolean }>(
+    `SELECT DISTINCT t.user_id, (l.landlord_id = $2) AS here
+       FROM tenants t
+       JOIN lease_tenants lt ON lt.tenant_id = t.id
+       JOIN leases l ON l.id = lt.lease_id
+      WHERE t.user_id = ANY($1::uuid[]) AND lt.status = 'active' AND l.status = 'active'`,
+    [found.map(f => f.user_id), landlordId])
+  for (const f of found) {
+    out.set(f.email_key, {
+      userId: f.user_id, email: f.email, role: f.role, tenantId: f.tenant_id ?? null,
+      activeHere: leases.some(l => l.user_id === f.user_id && l.here),
+      activeElsewhere: leases.some(l => l.user_id === f.user_id && !l.here),
+    })
+  }
+  return out
+}
 
 // ── PENDING TENANT INTENTS (S29c-2-A: limbo-state onboarding) ──────────
 // Landlord types name + email + phone, no lease info. Creates user (no
@@ -3834,6 +3875,46 @@ type PropertyCsvRow = {
   issues: CsvIssue[]
 }
 
+// S654: a property's dates are its own, so an imported zone must read the same
+// in the date helpers (Intl) and in Postgres. Area/Location names only: Intl
+// also takes "+05:00" (Postgres flips its sign) and "EST" (Intl reads it as
+// Panama, no daylight saving). Returns the standard name, or null.
+function importTimezone(raw: string): string | null {
+  if (!raw.includes('/')) return null
+  try {
+    const tz = new Intl.DateTimeFormat('en-US', { timeZone: raw }).resolvedOptions().timeZone
+    return tz.includes('/') || tz === 'UTC' ? tz : null
+  } catch { return null }
+}
+
+// S654: what the file says → the standard spelling, for the zones GAM can
+// read. Postgres must know that exact name too: the properties trigger refuses
+// any other, and 'america/chicago' has to be stored as 'America/Chicago'.
+async function readableZones(raws: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  for (const raw of new Set(raws.filter(Boolean))) {
+    const tz = importTimezone(raw)
+    if (tz) out.set(raw, tz)
+  }
+  if (out.size === 0) return out
+  const known = new Set((await query<{ name: string }>(
+    `SELECT name FROM pg_timezone_names WHERE name = ANY($1::text[])`,
+    [Array.from(new Set(out.values()))])).map(r => r.name))
+  for (const [raw, tz] of out) if (!known.has(tz)) out.delete(raw)
+  return out
+}
+
+// S654: a new property with no readable zone runs on its state's (S624). A
+// state GAM doesn't know would quietly land it on Arizona time.
+const unknownStateFor = (state: string): boolean => {
+  const st = String(state || '').trim().toUpperCase()
+  return !!st && st !== 'AZ' && timezoneForState(st) === FALLBACK_TIMEZONE
+}
+const unknownStateMessage = (state: string) =>
+  `GAM doesn't know the state "${String(state).trim()}". Use the 2-letter code, like CO, ` +
+  `so the property's dates run on its own time zone.`
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 // GET /api/landlords/me/onboard-properties-csv/template?source=generic
 landlordsRouter.get('/me/onboard-properties-csv/template', requirePerm('properties.create'), async (req, res, next) => {
   try {
@@ -4075,6 +4156,52 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
       rows.push(row)
     }
 
+    // S654: time zones, read after every row so a property's rows agree. A
+    // new property runs on the zone its file names, else its state's (S624);
+    // a zone GAM can't read is a warning and the state's zone is used. The
+    // import never changes the zone of a property already on GAM.
+    {
+      const zones = await readableZones(rows.map(r => r.timezone))
+      const keyOf = (r: PropertyCsvRow) => `${r.propertyName.toLowerCase()}|${r.street1.toLowerCase()}`
+      const named = new Map<string, string>()
+      const unreadable = new Set<PropertyCsvRow>()
+      for (const row of rows) {
+        if (!row.timezone) continue
+        if (row.resolvedPropertyId) {
+          row.issues.push({ severity: 'warn', field: 'timezone',
+            message: `This property is already on GAM, so the import doesn't change its time zone. ` +
+                     `Change it on the property's page if it's wrong.` })
+          continue
+        }
+        const tz = zones.get(row.timezone)
+        if (!tz) { unreadable.add(row); continue }
+        const prior = named.get(keyOf(row))
+        if (prior && prior !== tz) {
+          row.issues.push({ severity: 'block', field: 'timezone',
+            message: `Another row for this property says ${prior}. Use one time zone per property, then upload the file again.` })
+          continue
+        }
+        row.timezone = tz
+        named.set(keyOf(row), tz)
+      }
+      for (const row of rows) {
+        if (row.resolvedPropertyId) continue
+        const zone = named.get(keyOf(row))
+        if (unreadable.has(row)) {
+          row.issues.push({ severity: 'warn', field: 'timezone',
+            message: zone
+              ? `GAM can't read "${row.timezone}" as a time zone, so this row's zone is left out. The property uses ${zone}, from another row.`
+              : `GAM can't read "${row.timezone}" as a time zone, so the property uses its state's time zone` +
+                (unknownStateFor(row.state) ? '.' : ` (${labelFor(timezoneForState(row.state))}).`) +
+                ` You can change it on the property's page later.` })
+        }
+        if (!zone && unknownStateFor(row.state)) {
+          row.issues = row.issues.filter(i => !(i.field === 'state' && i.severity === 'warn'))
+          row.issues.push({ severity: 'block', field: 'state', message: unknownStateMessage(row.state) })
+        }
+      }
+    }
+
     // S491: state-law mismatch check. Run after the per-row validation
     // so blocker issues stay leading. Fires only on rows that already
     // have both a parseable rent + deposit + state — uncataloged or
@@ -4224,6 +4351,45 @@ landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('propertie
       }
     }
 
+    // S654: a property the browser says already exists must be this company's.
+    // The id comes back in the body, and nothing else checked it: another
+    // landlord's id put a unit on their property and rewrote its late fee.
+    {
+      const claimed = (rows as PropertyCsvRow[]).filter(r => !!r.resolvedPropertyId)
+      for (const row of claimed) {
+        if (typeof row.resolvedPropertyId !== 'string' || !UUID_RE.test(row.resolvedPropertyId)) {
+          throw new AppError(403, `Row ${row.rowIndex + 1} references a property not owned by this landlord`)
+        }
+      }
+      if (claimed.length > 0) {
+        const owned = new Set((await query<{ id: string }>(
+          `SELECT id FROM properties WHERE id = ANY($1::uuid[]) AND landlord_id = $2`,
+          [Array.from(new Set(claimed.map(r => r.resolvedPropertyId!))), landlordId])).map(p => p.id))
+        for (const row of claimed) {
+          if (!owned.has(row.resolvedPropertyId!)) {
+            throw new AppError(403, `Row ${row.rowIndex + 1} references a property not owned by this landlord`)
+          }
+        }
+      }
+    }
+
+    // S654: the rows come back from the browser, so the zone is read again
+    // here. Only a new property takes one; a zone GAM can't read is left out
+    // and the state's zone is used (S624), as validate warned.
+    const zones = await readableZones((rows as PropertyCsvRow[]).map(r => String(r.timezone ?? '').trim()))
+    const zoneByPropKey = new Map<string, string>()
+    for (const row of rows as PropertyCsvRow[]) {
+      if (row.resolvedPropertyId) continue
+      const tz = zones.get(String(row.timezone ?? '').trim())
+      if (!tz) continue
+      const key = `${row.propertyName.toLowerCase()}|${row.street1.toLowerCase()}`
+      const prior = zoneByPropKey.get(key)
+      if (prior && prior !== tz) {
+        throw new AppError(400, `Row ${row.rowIndex + 1}: another row for this property says ${prior}. Use one time zone per property.`)
+      }
+      zoneByPropKey.set(key, tz)
+    }
+
     await client.query('BEGIN')
 
     // Track property creates within this commit so multiple rows for the
@@ -4282,24 +4448,37 @@ landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('propertie
         const propType = ['residential', 'rv_longterm', 'rv_weekly', 'rv_nightly', 'mixed'].includes(row.propertyType)
           ? row.propertyType
           : 'mixed'
+        // S654: same as POST /properties — the zone comes from the state
+        // unless the file names one (then it is the landlord's, 'manual').
+        // The first bill from GAM is left for the landlord to answer once,
+        // as before; a default here would lock (S652) at the first lease.
+        const fileZone = zoneByPropKey.get(propKey)
+        if (!fileZone && unknownStateFor(row.state)) {
+          throw new AppError(400, `Row ${row.rowIndex + 1}: ${unknownStateMessage(row.state)}`)
+        }
+        const timezone = fileZone ?? timezoneForState(row.state)
         const propRes = await client.query<any>(
           `INSERT INTO properties
              (landlord_id, name, street1, street2, city, state, zip, type,
-              timezone,
+              timezone, timezone_source,
               owner_user_id, managed_by_user_id)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-              COALESCE(NULLIF($9, ''), 'America/Phoenix'),
+              $9, $10,
               (SELECT user_id FROM landlords WHERE id=$1),
               (SELECT user_id FROM landlords WHERE id=$1))
            RETURNING id, name`,
           [
             landlordId, row.propertyName, row.street1, row.street2 || null,
             row.city, row.state, row.zip, propType,
-            row.timezone || '',
+            timezone, fileZone ? 'manual' : 'derived',
           ]
         )
         propertyId = propRes.rows[0].id as string
         propertyIdByKey.set(propKey, propertyId)
+        // S654: open the onboarding window, as POST /properties does — without
+        // it a CSV-made property's sitting residents can never skip the
+        // background check and its late-fee question never shows.
+        await openOnboardingWindow(propertyId, client)
         createdProperties.push({
           id: propertyId, name: propRes.rows[0].name,
           street1: row.street1, street2: row.street2 || null,
@@ -4658,51 +4837,19 @@ landlordsRouter.post('/me/onboard-tenants-csv/validate', requirePerm('tenants.cr
       rows.push(row)
     }
 
-    const allEmails = Array.from(new Set(rows.map(r => r.email).filter(Boolean)))
-    if (allEmails.length > 0) {
-      const existing = await query<any>(
-        `SELECT u.id AS user_id, u.email, t.id AS tenant_id
-         FROM users u
-         LEFT JOIN tenants t ON t.user_id = u.id
-         WHERE u.email = ANY($1::text[])`,
-        [allEmails]
-      )
-      const byEmail = new Map(existing.map(e => [e.email, e]))
-
-      const tenantIds = existing.filter(e => e.tenant_id).map(e => e.tenant_id)
-      if (tenantIds.length > 0) {
-        const otherLeases = await query<any>(
-          `SELECT lt.tenant_id FROM lease_tenants lt
-           JOIN leases l ON l.id = lt.lease_id
-           WHERE lt.tenant_id = ANY($1::uuid[])
-             AND lt.status='active' AND l.status='active'
-             AND l.landlord_id != $2`,
-          [tenantIds, landlordId]
-        )
-        const otherSet = new Set(otherLeases.map(r => r.tenant_id))
-
-        const sameLandlord = await query<any>(
-          `SELECT lt.tenant_id FROM lease_tenants lt
-           JOIN leases l ON l.id = lt.lease_id
-           WHERE lt.tenant_id = ANY($1::uuid[])
-             AND lt.status='active' AND l.status='active'
-             AND l.landlord_id = $2`,
-          [tenantIds, landlordId]
-        )
-        const sameSet = new Set(sameLandlord.map(r => r.tenant_id))
-
-        for (const row of rows) {
-          const found = byEmail.get(row.email)
-          if (!found) continue
-          row.resolvedExistingUserId = found.user_id
-          row.resolvedExistingTenantId = found.tenant_id || undefined
-
-          if (found.tenant_id && otherSet.has(found.tenant_id)) {
-            row.issues.push({ severity: 'block', field: 'email', message: 'This email is a tenant of another landlord. Cross-landlord onboarding requires a separate flow.' })
-          } else if (found.tenant_id && sameSet.has(found.tenant_id)) {
-            row.issues.push({ severity: 'warn', field: 'email', message: 'Already onboarded with you on an active lease. Row will be skipped on commit.' })
-          }
-        }
+    // S654: an existing account must be a resident's, and not one living
+    // under another landlord. The ids stay on the server.
+    const accounts = await lookupImportAccounts(
+      Array.from(new Set(rows.map(r => r.email).filter(Boolean))), landlordId)
+    for (const row of rows) {
+      const found = accounts.get(row.email)
+      if (!found) continue
+      if (found.role !== 'tenant') {
+        row.issues.push({ severity: 'block', field: 'email', message: NOT_A_RESIDENT_ACCOUNT })
+      } else if (found.activeElsewhere) {
+        row.issues.push({ severity: 'block', field: 'email', message: TENANT_OF_ANOTHER_LANDLORD })
+      } else if (found.activeHere) {
+        row.issues.push({ severity: 'warn', field: 'email', message: 'Already onboarded with you on an active lease. Row will be skipped on commit.' })
       }
     }
 
@@ -4824,6 +4971,11 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
     const landlordId = await landlordForRequest(req, 'import')
 
     // Defense in depth: re-resolve unit ownership and check no blockers remain.
+    for (const row of rows as CsvRow[]) {
+      if (row.resolvedUnitId && (typeof row.resolvedUnitId !== 'string' || !UUID_RE.test(row.resolvedUnitId))) {
+        throw new AppError(403, `Row ${row.rowIndex + 1} references a unit not owned by this landlord`)
+      }
+    }
     const unitIds = Array.from(new Set((rows as CsvRow[]).map(r => r.resolvedUnitId).filter(Boolean) as string[]))
     const ownedUnits = await query<any>(
       `SELECT id FROM units WHERE id = ANY($1::uuid[]) AND landlord_id = $2`,
@@ -4840,13 +4992,34 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
       }
     }
 
-    // Group by unit. Skip already-onboarded duplicate rows.
-    const groups = new Map<string, CsvRow[]>()
+    // S654: who each row is, decided here from its email. Any id the browser
+    // sends back for an existing account is ignored; see lookupImportAccounts.
     for (const row of rows as CsvRow[]) {
-      const isDupSkip = (row.issues || []).some(i =>
-        i.severity === 'warn' && i.field === 'email' && i.message.startsWith('Already onboarded')
-      )
-      if (isDupSkip) continue
+      row.email = String(row.email ?? '').trim().toLowerCase()
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email)) {
+        throw new AppError(400, `Row ${row.rowIndex + 1}: the email isn't a valid address`)
+      }
+    }
+    const accounts = await lookupImportAccounts(
+      Array.from(new Set((rows as CsvRow[]).map(r => r.email))), landlordId)
+    for (const row of rows as CsvRow[]) {
+      const found = accounts.get(row.email)
+      if (found && found.role !== 'tenant') {
+        throw new AppError(409, `Row ${row.rowIndex + 1}: ${NOT_A_RESIDENT_ACCOUNT}`)
+      }
+      if (found?.activeElsewhere) {
+        throw new AppError(409, `Row ${row.rowIndex + 1}: ${TENANT_OF_ANOTHER_LANDLORD}`)
+      }
+    }
+
+    // Group by unit. Skip, as validate said: someone already on an active
+    // lease with you, and a repeat of an email earlier in the file.
+    const groups = new Map<string, CsvRow[]>()
+    const emailsTaken = new Set<string>()
+    for (const row of rows as CsvRow[]) {
+      if (accounts.get(row.email)?.activeHere) continue
+      if (emailsTaken.has(row.email)) continue
+      emailsTaken.add(row.email)
       if (!row.resolvedUnitId) continue
       if (!groups.has(row.resolvedUnitId)) groups.set(row.resolvedUnitId, [])
       groups.get(row.resolvedUnitId)!.push(row)
@@ -4983,9 +5156,14 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
         const row = groupRows[idx]
         const role = idx === 0 ? 'primary' : 'co_tenant'
 
+        // S654: the account was found by email above. Its activation link
+        // goes only to the address that account holds.
+        const account = accounts.get(row.email)
         let userId: string
-        if (row.resolvedExistingUserId) {
-          userId = row.resolvedExistingUserId
+        let sendTo: string
+        if (account) {
+          userId = account.userId
+          sendTo = account.email
         } else {
           const tempHash = '$2b$10$placeholder_invite_pending'
           const u = await client.query(
@@ -4994,6 +5172,7 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
             [row.email, tempHash, row.firstName, row.lastName, row.phone]
           )
           userId = u.rows[0].id
+          sendTo = row.email
         }
 
         // S410 (S377): tenant_invite_token + 7-day expiry. See note at
@@ -5006,8 +5185,8 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
           [inviteToken, userId])
 
         let tenantId: string
-        if (row.resolvedExistingTenantId) {
-          tenantId = row.resolvedExistingTenantId
+        if (account?.tenantId) {
+          tenantId = account.tenantId
           await client.query(
             `UPDATE tenants SET onboarding_source='onboarded' WHERE id=$1 AND onboarding_source != 'onboarded'`,
             [tenantId]
@@ -5028,7 +5207,7 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
 
         // S654: portalLink, never a localhost fallback (S641 rule).
         const activationUrl = portalLink('tenant', `accept-invite?token=${inviteToken}`)
-        created.push({ tenantId, leaseId, email: row.email, activationUrl, firstName: row.firstName, unitId })
+        created.push({ tenantId, leaseId, email: sendTo, activationUrl, firstName: row.firstName, unitId })
       }
     }
 
@@ -5045,8 +5224,8 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
           { landlordId, tenantId: c.tenantId }
         )
       } catch (emailErr) {
+        // S654: never the activation link: it is a password-setting key.
         logger.error({ err: emailErr, ctx: c.email }, '[ONBOARD CSV] Email send failed for')
-        logger.info(`[ONBOARD CSV] Manual activation URL for ${c.email}: ${c.activationUrl}`)
       }
     }
 
@@ -6729,9 +6908,10 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
   requirePerm('payments.view'), async (req, res, next) => {
     try {
       const tenantId = z.string().uuid().parse(req.params.tenantId)
-      const rows = await query<any>(`
+      const all = await query<any>(`
         SELECT p.id, p.type, p.amount::float AS amount, p.notes, p.landlord_id, p.lease_id,
-               to_char(p.due_date, 'YYYY-MM-DD') AS due_date,
+               p.invoice_id, p.status, p.entry_description, inv.service_agreement_id,
+               p.due_date::text AS due_date,
                to_char(p.due_date, 'Mon D, YYYY') AS due_label,
                u.id AS tenant_user_id, u.email, u.first_name,
                TRIM(CONCAT_WS(' ', u.first_name, u.last_name)) AS tenant_name,
@@ -6746,36 +6926,49 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
           JOIN properties pr ON pr.id = un.property_id
           JOIN landlords la ON la.id = p.landlord_id
           JOIN users lu ON lu.id = la.user_id
+          LEFT JOIN invoices inv ON inv.id = p.invoice_id
          WHERE p.tenant_id = $1
-           AND p.status IN ('pending', 'overdue', 'failed')
            AND p.work_trade_suspended_at IS NULL
-         ORDER BY p.due_date`, [tenantId])
-      if (!rows.length) {
+           -- S654: the rows the resident's portal counts as owed. A pending row
+           -- with a payment already started is in flight, not owed.
+           AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
+                OR p.status = 'failed')
+         ORDER BY p.due_date, p.created_at`, [tenantId])
+      if (!all.length) {
         return res.json({ success: true, data: { sent: false, reason: 'They do not owe anything right now.' } })
       }
-      if (!canAccessLandlordResource(req.user, rows[0].landlord_id)) throw new AppError(403, 'Forbidden')
+      // S654: only charges the caller's company billed. Another landlord's bill
+      // is theirs to remind about, and never shown to this one.
+      const rows = all.filter((r: any) => canAccessLandlordResource(req.user, r.landlord_id))
+      if (!rows.length) throw new AppError(403, 'Forbidden')
       if (!rows[0].email) {
         return res.json({ success: true, data: { sent: false, reason: 'No email address on file for them.' } })
       }
 
-      const gross = Math.round(rows.reduce((s: number, r: any) => s + Number(r.amount), 0) * 100) / 100
-      const creditRow = await queryOne<{ credit: string }>(
-        `SELECT COALESCE(SUM(amount_remaining), 0)::text AS credit
-           FROM tenant_credits
-          WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0`, [tenantId])
-      // S653 (Nic): the headline is what they will actually be asked for —
-      // paid-ahead money this month may use (capped by their monthly draw)
-      // comes off too, exactly as it does when they pay.
-      let prepaidApplied = 0
-      const leaseIdForDraw = rows.find((r: any) => r.lease_id)?.lease_id ?? null
-      if (leaseIdForDraw) {
-        const { prepaidDrawAvailable } = await import('../services/prepaidRelease')
-        const { db } = await import('../db')
-        const month = String(rows[0].due_date ?? new Date().toISOString()).slice(0, 7) + '-01'
-        prepaidApplied = Math.min(gross, (await prepaidDrawAvailable(db as any, leaseIdForDraw, month)).available)
+      // S654: the figure the resident's portal shows, from the same helper.
+      // Paid-ahead credit comes off first, each bill against its own month
+      // (prepaidPlan), then the landlord's credit, spent once per landlord.
+      // A utility-service bill is paid on its own and nets nothing, as there.
+      const { netTenantLeaseBalances } = await import('../services/openBalances')
+      const cents = (n: number) => Math.round(n * 100) / 100
+      const byLease = new Map<string | null, { leaseId: string | null; landlordId: string; outstanding: number; rows: any[] }>()
+      for (const r of rows) {
+        if (r.service_agreement_id) continue
+        const key = r.lease_id ?? null
+        let g = byLease.get(key)
+        if (!g) { g = { leaseId: key, landlordId: r.landlord_id, outstanding: 0, rows: [] }; byLease.set(key, g) }
+        g.outstanding = cents(g.outstanding + Number(r.amount))
+        g.rows.push(r)
       }
-      const creditApplied = Math.min(Number(creditRow?.credit ?? 0), Math.max(0, gross - prepaidApplied))
-      const total = Math.round((gross - prepaidApplied - creditApplied) * 100) / 100
+      const net = await netTenantLeaseBalances(tenantId, [...byLease.values()])
+      let prepaidApplied = 0
+      let creditApplied = 0
+      for (const g of byLease.values()) {
+        prepaidApplied = cents(prepaidApplied + (net.get(g.leaseId)?.prepaidApplied ?? 0))
+        creditApplied = cents(creditApplied + (net.get(g.leaseId)?.creditApplied ?? 0))
+      }
+      const gross = cents(rows.reduce((s: number, r: any) => s + Number(r.amount), 0))
+      const total = cents(gross - prepaidApplied - creditApplied)
       if (total <= 0) {
         return res.json({ success: true, data: { sent: false,
           reason: 'Their credit on account covers everything owed.' } })
@@ -6802,7 +6995,7 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
       }, { landlordId: rows[0].landlord_id, tenantId })
 
       res.json({ success: true, data: {
-        sent: !!id, to: rows[0].email, total, creditApplied, lines: rows.length,
+        sent: !!id, to: rows[0].email, total, creditApplied, prepaidApplied, lines: rows.length,
       } })
     } catch (e) { next(e) }
   })

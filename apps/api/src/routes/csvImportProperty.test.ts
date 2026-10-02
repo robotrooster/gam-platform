@@ -304,6 +304,18 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
       expect(r.card_fee_payer).toBe('tenant')
       expect(r.platform_fee_payer).toBe('landlord')
     }
+
+    // S654: every property the import made opened its onboarding window.
+    const windows = await db.query<{ name: string; open: boolean }>(
+      `SELECT name, (onboarding_started_at IS NOT NULL AND onboarding_completed_at IS NULL
+                     AND onboarding_window_until > now()) AS open
+         FROM properties WHERE landlord_id = $1 ORDER BY name`,
+      [landlordId],
+    )
+    expect(windows.rows).toEqual([
+      { name: 'Mesa Pads', open: true },
+      { name: 'Sunset Apartments', open: true },
+    ])
   })
 
   it('shares one property across multiple unit rows (find-or-create within batch)', async () => {

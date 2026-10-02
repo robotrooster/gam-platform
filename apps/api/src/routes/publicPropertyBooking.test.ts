@@ -13,6 +13,14 @@ import { publicPropertyBookingRouter, computeStayTotal } from './publicPropertyB
 import { errorHandler } from '../middleware/errorHandler'
 import { todayIn, addDaysTo } from '../lib/timezone'
 
+const { emailGuestStayLinkMock } = vi.hoisted(() => ({
+  emailGuestStayLinkMock: vi.fn(async () => 'msg'),
+}))
+vi.mock('../services/email', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return { ...actual, emailGuestStayLink: emailGuestStayLinkMock }
+})
+
 function buildApp() {
   const app = express()
   app.use(express.json())
@@ -21,7 +29,7 @@ function buildApp() {
   return app
 }
 
-beforeEach(async () => { await cleanupAllSchema() })
+beforeEach(async () => { await cleanupAllSchema(); emailGuestStayLinkMock.mockClear() })
 
 // date N days from today, as YYYY-MM-DD (avoids coupling to a fixed clock)
 // S654: N days from the property's today (seeded properties default to
@@ -187,5 +195,69 @@ describe('same-day check-in on the property calendar', () => {
       Settings.defaultZone = prevZone
       vi.useRealTimers()
     }
+  })
+
+  // S654: the booking site asks availability before it books, so this route
+  // has to agree with the book path on what "today" is.
+  it('availability for today, asked at 6 pm Phoenix on a UTC server, is allowed', async () => {
+    await seedSite()
+    const today = todayIn('America/Phoenix')
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(`${today}T18:00:00-07:00`))
+    const prevZone = Settings.defaultZone
+    Settings.defaultZone = 'UTC'
+    try {
+      const res = await request(buildApp())
+        .get(`/api/public/property/sunny-rv-park/availability?siteTypeId=general&checkIn=${today}&checkOut=${addDaysTo(today, 2)}&stayType=nightly`)
+      expect(res.status).toBe(200)
+      expect(res.body.data.available).toBe(true)
+
+      const past = await request(buildApp())
+        .get(`/api/public/property/sunny-rv-park/availability?siteTypeId=general&checkIn=${addDaysTo(today, -1)}&checkOut=${addDaysTo(today, 2)}&stayType=nightly`)
+      expect(past.status).toBe(400)
+      expect(JSON.stringify(past.body)).toMatch(/in the past/)
+    } finally {
+      Settings.defaultZone = prevZone
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── S654: "still staying" is the park's calendar, not the database's ────
+describe('POST stay-link', () => {
+  it("links only stays that have not checked out on the park's calendar", async () => {
+    const s = await seedSite()
+    // A zone far from the database's, so the two days differ most of the time.
+    await db.query(`UPDATE properties SET timezone = 'Pacific/Kiritimati' WHERE id = $1`, [s.propertyId])
+    const parkToday = todayIn('Pacific/Kiritimati')
+    await db.query(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, guest_email, lease_type, check_in, check_out, status)
+       VALUES ($1, $2, 'Gone Guest',  'pat@example.com', 'nightly', $3, $4, 'confirmed'),
+              ($1, $2, 'Here Guest',  'pat@example.com', 'nightly', $4, $5, 'confirmed')`,
+      [s.unitId, s.landlordId, addDaysTo(parkToday, -4), addDaysTo(parkToday, -1), addDaysTo(parkToday, 2)])
+    const res = await request(buildApp())
+      .post('/api/public/property/sunny-rv-park/stay-link')
+      .send({ email: 'pat@example.com' })
+    expect(res.status).toBe(200)
+    expect(emailGuestStayLinkMock).toHaveBeenCalledTimes(1)
+    expect((emailGuestStayLinkMock.mock.calls as any[][])[0][1]).toBe('Here Guest')
+  })
+})
+
+// ── S654: the claim landing names calendar days ────
+describe('GET claim link', () => {
+  it("returns the stay's dates as YYYY-MM-DD", async () => {
+    const s = await seedSite()
+    await db.query(
+      `INSERT INTO unit_booking_waitlists
+         (unit_id, property_id, landlord_id, guest_name, guest_email, check_in, check_out,
+          status, claim_token, notified_at, claim_expires_at)
+       VALUES ($1,$2,$3,'Pat Guest','pat@example.com',$4,$5,'notified','tok-s654',now(),now() + interval '1 hour')`,
+      [s.unitId, s.propertyId, s.landlordId, plusDays(10), plusDays(12)])
+    const res = await request(buildApp()).get('/api/public/property/sunny-rv-park/claim/tok-s654')
+    expect(res.status).toBe(200)
+    expect(res.body.data.checkIn).toBe(plusDays(10))
+    expect(res.body.data.checkOut).toBe(plusDays(12))
+    expect(res.body.data.expired).toBe(false)
   })
 })

@@ -86,7 +86,6 @@ import {
   seedLandlord, seedTenant, seedProperty, seedUnit,
   seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
-import { todayIn } from '../lib/timezone'
 
 const stripeMocks: {
   transfersCreate:      ReturnType<typeof vi.fn>
@@ -938,12 +937,20 @@ describe('repriceFlexPayRetryPayment', () => {
 
   it('recomputes fee to the retry day + passes through the ACH-return fee; updates PI + advance + payment', async () => {
     const seed = await seedFailedFlexPayPull()
-    // S654: the retry day is the property's calendar day (Phoenix here), not UTC's.
-    const retryDay = Math.min(Math.max(Number(todayIn(null).slice(8, 10)), 1), FLEXPAY_MAX_PULL_DAY)
+    // S654: the retry day is the property's calendar day (Phoenix here), not
+    // UTC's. Clock pinned to June 10, 7 pm Phoenix — UTC already reads June 11.
+    const retryDay = 10
+    expect(retryDay).toBeLessThanOrEqual(FLEXPAY_MAX_PULL_DAY)
     const newFee = calculateFlexPayFee(retryDay)
     const expectedTotal = 1000 + newFee + FLEXPAY_ACH_RETURN_FEE  // boost 0 (no outstanding GAM balances)
 
-    await repriceFlexPayRetryPayment(seed.paymentId)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date('2026-06-11T02:00:00Z'))
+      await repriceFlexPayRetryPayment(seed.paymentId)
+    } finally {
+      vi.useRealTimers()
+    }
 
     // PI amount updated to the re-priced total (in cents).
     expect(stripeMocks.paymentIntentsUpdate).toHaveBeenCalledTimes(1)
@@ -951,6 +958,7 @@ describe('repriceFlexPayRetryPayment', () => {
     expect(piId).toBe('pi_repx')
     expect(args.amount).toBe(Math.round(expectedTotal * 100))
     expect(args.metadata.gam_fee).toBe(String(newFee))
+    expect(args.metadata.gam_repriced_retry_day).toBe('10')
 
     // Advance fee re-stamped.
     const { rows: [adv] } = await db.query<any>(`SELECT tenant_fee_amount FROM flexpay_advances WHERE id=$1`, [seed.advanceId])

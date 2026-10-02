@@ -28,8 +28,9 @@ import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
-  cleanupAllSchema, seedLandlord, seedProperty, seedUnit,
+  cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
+import { logger } from '../lib/logger'
 
 const {
   recordValidateAttemptMock,
@@ -421,3 +422,169 @@ describe('POST /api/landlords/me/onboard-tenants-csv/commit', () => {
     expect(callArgs[0]).toBe(email)  // first arg is recipient email
   })
 })
+
+// ── S654: the commit decides who each row is, from its email ──────────────
+//
+// It used to take resolvedExistingUserId / resolvedExistingTenantId straight
+// from the body. Landlord B posted landlord A's own user id with an email B
+// chose: A's login got a tenant invite token, was tied to B's lease, and the
+// activation link (which sets a password) went to B's address.
+describe('S654: tenant CSV commit never trusts account ids from the browser', () => {
+  function row(f: TFixture, overrides: any = {}) {
+    return {
+      rowIndex: 0, firstName: 'Mal', lastName: 'Lory', phone: '555-0000',
+      email: `row-${randomUUID().slice(0, 6)}@test.dev`,
+      propertyName: f.propertyName, unitNumber: f.unitNumber,
+      leaseStart: '2026-01-01', leaseEnd: '', monthlyRent: '700', securityDeposit: '',
+      lateFeeAmount: '', lateFeeGraceDays: '', autoRenew: '', autoRenewMode: '',
+      noticeDaysRequired: '', outstandingBalance: '',
+      resolvedUnitId: f.unitId, issues: [], ...overrides,
+    }
+  }
+  const commit = (f: TFixture, rows: any[]) => request(buildApp())
+    .post('/api/landlords/me/onboard-tenants-csv/commit')
+    .set('Authorization', `Bearer ${f.landlordToken}`)
+    .send({ rows, source: 'generic', claimedPlatformName: 'TestPlatform' })
+  const victimState = async (userId: string) => ({
+    user: (await db.query(
+      `SELECT email, role, password_hash, tenant_invite_token, tenant_invite_expires_at, sessions_valid_from
+         FROM users WHERE id=$1`, [userId])).rows[0],
+    tenants: (await db.query(`SELECT id FROM tenants WHERE user_id=$1`, [userId])).rows,
+  })
+
+  it('the takeover attempt: another landlord\'s user id with the attacker\'s email touches nothing of theirs', async () => {
+    const victim = await seedTFixture()
+    const attacker = await seedTFixture()
+    const before = await victimState(victim.landlordUserId)
+
+    const res = await commit(attacker, [row(attacker, {
+      email: 'attacker@evil.test',
+      resolvedExistingUserId: victim.landlordUserId,
+      resolvedExistingTenantId: randomUUID(),
+    })])
+    expect(res.status).toBe(200)
+
+    // The victim's login is exactly as it was: no token, no resident profile.
+    expect(await victimState(victim.landlordUserId)).toEqual(before)
+    expect(before.user.tenant_invite_token).toBeNull()
+    // The row became a NEW resident account at the address it named, and that
+    // is the only place an activation link went.
+    const made = (await db.query(`SELECT id, role FROM users WHERE email='attacker@evil.test'`)).rows
+    expect(made).toHaveLength(1)
+    expect(made[0].id).not.toBe(victim.landlordUserId)
+    expect(made[0].role).toBe('tenant')
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+    expect(emailTenantOnboardedMock.mock.calls[0]![0]).toBe('attacker@evil.test')
+    const onLease = (await db.query(
+      `SELECT t.user_id FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id
+         JOIN leases l ON l.id = lt.lease_id WHERE l.unit_id = $1`, [attacker.unitId])).rows
+    expect(onLease).toEqual([{ user_id: made[0].id }])
+  })
+
+  it('a landlord\'s own email is refused at commit (409) and at validate, with nothing written or sent', async () => {
+    const victim = await seedTFixture()
+    const attacker = await seedTFixture()
+    const victimEmail = (await db.query(`SELECT email FROM users WHERE id=$1`, [victim.landlordUserId])).rows[0].email
+    const before = await victimState(victim.landlordUserId)
+
+    const res = await commit(attacker, [row(attacker, { email: victimEmail.toUpperCase() })])
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/Row 1: This email belongs to a GAM account that isn't a resident's/)
+    expect(await victimState(victim.landlordUserId)).toEqual(before)
+    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [attacker.unitId])).rows).toEqual([])
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+
+    const v = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenants-csv/validate')
+      .set('Authorization', `Bearer ${attacker.landlordToken}`)
+      .send({ csv: CANONICAL_HEADERS + '\n' + rowFor(attacker, { email: victimEmail }), source: 'generic' })
+    expect(v.status).toBe(200)
+    const r0 = v.body.data.rows[0]
+    expect(r0.issues.some((i: any) => i.severity === 'block' && /isn't a resident's/.test(i.message))).toBe(true)
+    // Validate no longer hands out anyone's account ids.
+    expect(r0.resolvedExistingUserId).toBeUndefined()
+    expect(r0.resolvedExistingTenantId).toBeUndefined()
+  })
+
+  it('a resident on another landlord\'s active lease is refused at commit even with no blocker sent', async () => {
+    const other = await seedTFixture()
+    const me = await seedTFixture()
+    const tenantEmail = `held-${randomUUID().slice(0, 6)}@test.dev`
+    const c = await db.connect()
+    try {
+      const tenantId = await seedTenant(c, { email: tenantEmail })
+      const leaseId = await seedLease(c, { unitId: other.unitId, landlordId: other.landlordId })
+      await seedLeaseTenant(c, { leaseId, tenantId })
+    } finally { c.release() }
+
+    const res = await commit(me, [row(me, { email: tenantEmail })])
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/Row 1: This email is a tenant of another landlord/)
+    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [me.unitId])).rows).toEqual([])
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  it('an existing resident is found by email in any case, and the link goes to the address on their account', async () => {
+    const f = await seedTFixture()
+    const stored = `Kim.Harland-${randomUUID().slice(0, 6)}@Test.dev`
+    let tenantId: string
+    const c = await db.connect()
+    try { tenantId = await seedTenant(c, { email: stored }) } finally { c.release() }
+
+    const res = await commit(f, [row(f, { email: stored.toLowerCase(), resolvedExistingUserId: f.landlordUserId })])
+    expect(res.status).toBe(200)
+    expect(res.body.data.tenants[0].tenantId).toBe(tenantId!)
+    expect((await db.query(`SELECT id FROM users WHERE LOWER(email)=LOWER($1)`, [stored])).rows).toHaveLength(1)
+    expect(emailTenantOnboardedMock.mock.calls[0]![0]).toBe(stored)
+    const landlordUser = await db.query(`SELECT tenant_invite_token FROM users WHERE id=$1`, [f.landlordUserId])
+    expect(landlordUser.rows[0].tenant_invite_token).toBeNull()
+  })
+
+  it('someone already on an active lease with you is skipped by the server, as validate promised', async () => {
+    const f = await seedTFixture()
+    const second = await db.connect()
+    let unit2: string
+    const tenantEmail = `here-${randomUUID().slice(0, 6)}@test.dev`
+    try {
+      unit2 = await seedUnit(second, { propertyId: f.propertyId, landlordId: f.landlordId, withLateFeeDecision: false })
+      const tenantId = await seedTenant(second, { email: tenantEmail })
+      const leaseId = await seedLease(second, { unitId: f.unitId, landlordId: f.landlordId })
+      await seedLeaseTenant(second, { leaseId, tenantId })
+    } finally { second.release() }
+
+    // No "Already onboarded" warning in the body: the server decides.
+    const res = await commit(f, [row(f, { email: tenantEmail, resolvedUnitId: unit2! })])
+    expect(res.status).toBe(200)
+    expect(res.body.data.committed).toBe(0)
+    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [unit2!])).rows).toEqual([])
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  it('a repeated email in the file is skipped, not a failed import', async () => {
+    const f = await seedTFixture()
+    const email = `twice-${randomUUID().slice(0, 6)}@test.dev`
+    const res = await commit(f, [row(f, { email }), row(f, { email, rowIndex: 1, firstName: 'Bob' })])
+    expect(res.status).toBe(200)
+    expect(res.body.data.committed).toBe(1)
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('a failed activation email never writes the link or its token to the logs', async () => {
+    const f = await seedTFixture()
+    const email = `logs-${randomUUID().slice(0, 6)}@test.dev`
+    emailTenantOnboardedMock.mockRejectedValueOnce(new Error('resend down'))
+    const info = vi.spyOn(logger, 'info')
+    const error = vi.spyOn(logger, 'error')
+    try {
+      const res = await commit(f, [row(f, { email })])
+      expect(res.status).toBe(200)
+      const token = (await db.query(`SELECT tenant_invite_token FROM users WHERE email=$1`, [email])).rows[0].tenant_invite_token
+      expect(token).toBeTruthy()
+      const logged = JSON.stringify([...info.mock.calls, ...error.mock.calls], (_k, v) => v instanceof Error ? v.message : v)
+      expect(logged).not.toContain(token)
+      expect(logged).not.toContain('accept-invite')
+      expect(error).toHaveBeenCalled()
+    } finally { info.mockRestore(); error.mockRestore() }
+  })
+})
+

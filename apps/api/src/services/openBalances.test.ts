@@ -158,6 +158,98 @@ describe('S654 listOpenTenantBalances', () => {
     const rows = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
     expect(rows[0].balance).toBe('450.00')
     expect(rows[0].credit_on_account).toBe(10)
+    expect(rows[0].prepaid_held).toBe(0)
+  })
+
+  // S654: credit_on_account is what the desk says was "taken off". With a $100
+  // monthly draw on $1,000 held, $100 was — the rest is reported as still held.
+  it('a monthly draw: $100 taken off, $900 still held, reported apart', async () => {
+    const p = await park()
+    const t = await resident('Glenda Greek')
+    const s = await space(p, 'RV 12')
+    await bill(p, t, s, daysAgo(30), [['rent', 460]])
+    await db.query(`UPDATE leases SET prepaid_monthly_draw = 100 WHERE id = $1`, [s.leaseId])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1,$2,1000,1000)`, [s.leaseId, t])
+    const rows = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
+    expect(rows[0].balance).toBe('360.00')
+    expect(rows[0].credit_on_account).toBe(100)
+    expect(rows[0].prepaid_held).toBe(900)
+  })
+
+  // S654: every open bill takes its share, oldest first — the same plan the
+  // charge settles, so this list, the portal and what settles agree.
+  it('two open bills: paid-ahead covers September, then $10 of October', async () => {
+    const p = await park()
+    const t = await resident('Mark Rensberger')
+    const s = await space(p, 'RV 41')
+    await bill(p, t, s, daysAgo(55), [['rent', 460]])
+    await bill(p, t, s, daysAgo(10), [['rent', 460]])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1,$2,470,470)`, [s.leaseId, t])
+    const rows = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
+    expect(rows[0].balance).toBe('450.00')
+    expect(rows[0].credit_on_account).toBe(470)
+    expect(rows[0].prepaid_held).toBe(0)
+    // The overdue digest reads only the older bill: paid-ahead covers it whole.
+    expect(await listOpenTenantBalances({ landlordIds: [p.landlordId], overdueDays: 20 })).toEqual([])
+  })
+
+  it('two open bills under a $100 monthly draw: $100 off each', async () => {
+    const p = await park()
+    const t = await resident('Todd Niemeyer')
+    const s = await space(p, 'RV 42')
+    await bill(p, t, s, daysAgo(55), [['rent', 460]])
+    await bill(p, t, s, daysAgo(10), [['rent', 460]])
+    await db.query(`UPDATE leases SET prepaid_monthly_draw = 100 WHERE id = $1`, [s.leaseId])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1,$2,1000,1000)`, [s.leaseId, t])
+    const rows = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
+    expect(rows[0].balance).toBe('720.00')
+    expect(rows[0].credit_on_account).toBe(200)
+    expect(rows[0].prepaid_held).toBe(800)
+  })
+
+  // S654: the landlord's credit clears only this lease's own charges — the
+  // same cap the charge uses — never a neighbor's utility billed alongside.
+  it('a neighbor’s utility on the bill is not taken off by this landlord’s credit', async () => {
+    const p = await park()
+    const nb = await park()
+    const t = await resident('Ruth Neighbor')
+    const s = await space(p, 'RV 7')
+    const inv = await bill(p, t, s, daysAgo(30), [['rent', 460]], 500)
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,NULL,$3,$4,'utility',40,'pending',$5,'UTILITY')`, [inv, s.unitId, t, nb.landlordId, daysAgo(30)])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,480,480,'goodwill')`, [p.landlordId, t, s.leaseId])
+    const rows = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
+    expect(rows[0].balance).toBe('40.00')
+    expect(rows[0].spaces[0].credit_applied).toBe(460)
+  })
+
+  // S654: an account with two companies — a general credit from one is never
+  // taken off the other's bill, even when that bill is older.
+  it('one company’s general credit never comes off another company’s bill', async () => {
+    const a = await park()
+    const b = await park()
+    const t = await resident('Kim Twocos')
+    const sa = await space(a, 'A 1')
+    const sb = await space(b, 'B 1')
+    await bill(a, t, sa, daysAgo(10), [['rent', 300]])
+    await bill(b, t, sb, daysAgo(30), [['rent', 500]])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,NULL,100,100,'goodwill')`, [a.landlordId, t])
+    const rows = await listOpenTenantBalances({ landlordIds: [a.landlordId, b.landlordId] })
+    expect(rows[0].balance).toBe('700.00')
+    const byLease = new Map(rows[0].spaces.map(x => [x.lease_id, x.credit_applied]))
+    expect(byLease.get(sa.leaseId)).toBe(100)
+    expect(byLease.get(sb.leaseId)).toBe(0)
   })
 
   it('reads only the companies and properties it is given', async () => {

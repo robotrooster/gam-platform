@@ -228,3 +228,75 @@ describe('POST /api/tenants/invite — what it actually does', () => {
       .tenant_invite_token).toBeTruthy()
   })
 })
+
+// ── S654: an invite link only ever activates a resident or e-sign contact ──
+//
+// A landlord's own login was given a tenant invite token through the bulk CSV
+// import (since fixed there), and accept-invite never looked at whose account
+// the token sat on: whoever held the link could set that landlord's password.
+describe('S654: accept-invite refuses any account that is not a resident\'s or a contact\'s', () => {
+  async function tokenOn(role: string) {
+    const token = `tok-${Math.random().toString(16).slice(2)}${Date.now()}`
+    const email = `${role}-${Math.random().toString(16).slice(2)}@example.test`
+    const u = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name,
+                          tenant_invite_token, tenant_invite_expires_at)
+       VALUES ($1, 'original-hash', $2, 'Pat', 'Lee', $3, NOW() + INTERVAL '7 days') RETURNING id`,
+      [email, role, token])).rows[0]
+    return { userId: u.id, email, token }
+  }
+  const accept = (token: string) => request(buildApp()).post('/api/tenants/accept-invite')
+    .send({ token, password: 'a-long-new-password', acceptedTerms: true })
+
+  for (const role of ['landlord', 'property_manager', 'admin', 'super_admin']) {
+    it(`a ${role} account: the link reads as invalid and the password is untouched`, async () => {
+      const v = await tokenOn(role)
+      const before = (await db.query(
+        `SELECT password_hash, sessions_valid_from, tenant_invite_token, tenant_invite_accepted_at
+           FROM users WHERE id=$1`, [v.userId])).rows[0]
+      const res = await accept(v.token)
+      expect(res.status).toBe(404)
+      expect(res.body.error).toBe('Invalid or expired invite link')
+      const after = (await db.query(
+        `SELECT password_hash, sessions_valid_from, tenant_invite_token, tenant_invite_accepted_at
+           FROM users WHERE id=$1`, [v.userId])).rows[0]
+      expect(after).toEqual(before)
+      expect(after.password_hash).toBe('original-hash')
+
+      const info = await request(buildApp()).get(`/api/tenants/invite-info?token=${v.token}`)
+      expect(info.status).toBe(404)
+    })
+  }
+
+  it('a resident account still activates', async () => {
+    const v = await tokenOn('tenant')
+    await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [v.userId])
+    const res = await accept(v.token)
+    expect(res.status).toBe(200)
+    const u = (await db.query(`SELECT password_hash, tenant_invite_accepted_at FROM users WHERE id=$1`, [v.userId])).rows[0]
+    expect(u.password_hash).not.toBe('original-hash')
+    expect(u.tenant_invite_accepted_at).not.toBeNull()
+  })
+
+  it('an e-sign contact account still activates (S568 signs in through this link)', async () => {
+    const v = await tokenOn('contact')
+    const res = await accept(v.token)
+    expect(res.status).toBe(200)
+    expect(res.body.data.user.role).toBe('contact')
+  })
+
+  it('the invite route refuses a landlord\'s email instead of minting a link it hands back', async () => {
+    const { token, unitId } = await seed()
+    const other = await seed()
+    const otherEmail = (await db.query(`SELECT email FROM users WHERE id=$1`, [other.userId])).rows[0].email
+    const res = await post(buildApp(), token, { email: otherEmail, firstName: 'Al', unitId })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/isn't a resident's/)
+    expect(res.body.data).toBeUndefined()
+    const u = (await db.query(`SELECT tenant_invite_token FROM users WHERE id=$1`, [other.userId])).rows[0]
+    expect(u.tenant_invite_token).toBeNull()
+    expect((await db.query(`SELECT id FROM tenants WHERE user_id=$1`, [other.userId])).rows).toEqual([])
+    expect(sentInvites).toHaveLength(0)
+  })
+})
+

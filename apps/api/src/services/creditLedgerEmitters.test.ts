@@ -36,7 +36,7 @@
  *     with visibility flip on breach
  */
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import type { PoolClient } from 'pg'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
@@ -60,7 +60,12 @@ import {
   emitHabitabilityUnresolvedEvent,
   emitMultiLandlordHistoryCleanEvent,
 } from './creditLedgerEmitters'
-import { cleanupAllSchema } from '../test/dbHelpers'
+import {
+  cleanupAllSchema,
+  seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant, seedRentPayment,
+} from '../test/dbHelpers'
+import { settleManualRentPayment } from './manualPaymentSettle'
+import { logger } from '../lib/logger'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -238,6 +243,82 @@ describe('classifyPaymentTier — the property calendar decides the day (S654)',
       .toBe('payment_received_on_time')
     expect(classifyPaymentTier({ dueDate: '2026-10-01', settledAt, graceDays: 5, propertyTz: 'America/New_York' }))
       .toBe('payment_received_late_grace')
+  })
+
+  it('an unrecognized zone reads on Phoenix and does not throw (settle must not roll back)', () => {
+    expect(() => classifyPaymentTier({
+      dueDate: '2026-10-01', settledAt: new Date('2026-10-02T01:30:00Z'), graceDays: 5, propertyTz: 'Arizona',
+    })).not.toThrow()
+    expect(classifyPaymentTier({
+      dueDate: '2026-10-01',
+      settledAt: new Date('2026-10-02T01:30:00Z'),   // 6:30 pm Oct 1 Phoenix
+      graceDays: 5,
+      propertyTz: 'Arizona',
+    })).toBe('payment_received_on_time')
+  })
+
+  // S654: the fallback must not be silent — the bad zone is logged so it gets fixed.
+  it('an unrecognized zone logs a warning naming the zone; a good zone logs nothing', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation((() => undefined) as any)
+    try {
+      classifyPaymentTier({
+        dueDate: '2026-10-01', settledAt: new Date('2026-10-02T01:30:00Z'), graceDays: 5, propertyTz: 'America/Phoenix',
+      })
+      expect(warn).not.toHaveBeenCalled()
+      classifyPaymentTier({
+        dueDate: '2026-10-01', settledAt: new Date('2026-10-02T01:30:00Z'), graceDays: 5, propertyTz: 'Arizona',
+      })
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn.mock.calls[0][0]).toEqual({ propertyTz: 'Arizona' })
+    } finally { warn.mockRestore() }
+  })
+
+  it('emitPaymentSettledEvent with an unrecognized zone still records the event', async () => {
+    const tenantId = randomUUID()
+    await withTx(c => emitPaymentSettledEvent(c, {
+      tenantId, paymentId: randomUUID(), paymentType: 'rent', amount: '1000',
+      dueDate: '2026-10-01', settledAt: new Date('2026-10-02T01:30:00Z'),
+      graceDays: 5, stripePaymentIntentId: null, propertyTz: 'Arizona',
+    }))
+    const e = await readSoleEvent('tenant', tenantId)
+    expect(e.event_type).toBe('payment_received_on_time')
+  })
+
+  // S654: the desk (cash/check) settle classified with a Date due date and no
+  // zone, so it always read Phoenix's calendar. It now passes the due day as
+  // text and the property's zone, as the Stripe webhook does.
+  it('a desk cash settle reads the property\'s calendar, not Phoenix\'s', async () => {
+    const c = await db.connect()
+    let tenantId = ''
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      tenantId = await seedTenant(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      await c.query(`UPDATE properties SET timezone = 'America/New_York' WHERE id = $1`, [propertyId])
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const leaseId = await seedLease(c, { unitId, landlordId })
+      await seedLeaseTenant(c, { leaseId, tenantId })
+      await c.query(`UPDATE leases SET late_fee_grace_days = 5 WHERE id = $1`, [leaseId])
+      const paymentId = await seedRentPayment(c, { unitId, tenantId, landlordId, amount: 1000, status: 'pending' })
+      await c.query(`UPDATE payments SET lease_id = $2, due_date = DATE '2026-10-01' WHERE id = $1`, [paymentId, leaseId])
+      await settleManualRentPayment(c, {
+        payment: {
+          id: paymentId, landlord_id: landlordId, tenant_id: tenantId, unit_id: unitId,
+          lease_id: leaseId, due_date: '2026-10-01', manual_fee_payer: null, background_check_status: null,
+        },
+        method: 'cash',
+        // 1:30 am Oct 2 in New York (10:30 pm Oct 1 in Phoenix).
+        settledAt: new Date('2026-10-02T05:30:00Z'),
+      })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e }
+    finally { c.release() }
+
+    const e = await readSoleEvent('tenant', tenantId)
+    expect(e.event_type).toBe('payment_received_late_grace')
+    expect(e.event_data.due_date).toBe('2026-10-01')
+    expect(e.attestation_source).toBe('landlord_self_reported_with_evidence')
   })
 
   it('late tiers count whole days past the last grace day', () => {

@@ -2,6 +2,7 @@ import type { PoolClient } from 'pg'
 import { appendEvent } from './creditLedger'
 import type { CreditEventType, CreditAttestationSource } from '@gam/shared'
 import { dateIn, addDaysTo } from '../lib/timezone'
+import { logger } from '../lib/logger'
 
 // ============================================================
 // Credit-ledger emitters: thin wrappers that compute the right
@@ -41,7 +42,17 @@ export function classifyPaymentTier(args: {
   propertyTz?: string | null
 }): CreditEventType {
   const due = calendarDay(args.dueDate)
-  const paid = dateIn(args.propertyTz, args.settledAt)
+  // S654: an unrecognized zone (e.g. 'Arizona' typed on a CSV import) makes
+  // Intl throw; this runs inside the settle transaction, so a throw would undo
+  // the whole settlement on every retry. Read it on Phoenix's calendar instead,
+  // and warn so the bad zone gets fixed.
+  let paid: string
+  try {
+    paid = dateIn(args.propertyTz, args.settledAt)
+  } catch {
+    logger.warn({ propertyTz: args.propertyTz }, '[credit-ledger] property timezone not recognized; payment tier read on Phoenix time')
+    paid = dateIn(null, args.settledAt)
+  }
   if (paid <= due) return 'payment_received_on_time'
   const lastGraceDay = addDaysTo(due, args.graceDays)
   if (paid <= lastGraceDay) return 'payment_received_late_grace'

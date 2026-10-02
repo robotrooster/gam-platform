@@ -24,13 +24,12 @@
  * broken behavior.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
-import { todayIn } from '../lib/timezone'
 import {
   isOtpVisibleForLandlord,
   getQualificationStatus,
@@ -442,7 +441,17 @@ describe('isLastBusinessDayOfMonth', () => {
     expect(isLastBusinessDayOfMonth(new Date('2026-05-01T01:00:00Z'))).toBe(true)
   })
 
-  it('no argument → GAM\'s today, matching the explicit Phoenix date', () => {
-    expect(isLastBusinessDayOfMonth()).toBe(isLastBusinessDayOfMonth(todayIn(null)))
+  it('no argument → GAM\'s (Phoenix) today, not the UTC day', () => {
+    // Fri May 29, 6 pm Phoenix; UTC already reads Sat May 30 (→ false).
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date('2026-05-30T01:00:00Z'))
+      expect(isLastBusinessDayOfMonth()).toBe(true)
+      // Sat May 30, 6 pm Phoenix → false.
+      vi.setSystemTime(new Date('2026-05-31T01:00:00Z'))
+      expect(isLastBusinessDayOfMonth()).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

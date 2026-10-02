@@ -126,7 +126,7 @@ async function draftNotice(): Promise<any> {
 }
 
 describe('S654 continuity since an approved check', () => {
-  it('a lease that ran from before the check to 10 days ago is continuous — no screening email', async () => {
+  it('a lease starting 5 days after the check and ending 10 days ago is continuous — no screening email', async () => {
     const email = `cont-${randomUUID().slice(0, 6)}@test.dev`
     const bookingId = await seedHistory(email, 90, [{ startAgo: 85, endAgo: 10, status: 'expired' }])
     const r = await maybeDraftLeaseFromBooking(bookingId)

@@ -325,6 +325,7 @@ describe('S654 GET /api/balances — paid-ahead credit is netted first', () => {
     expect(Number(row.balance)).toBe(606.40)
     expect(row.spaces[0].credit_applied).toBe(10)
     expect(row.credit_on_account).toBe(10)
+    expect(row.prepaid_held).toBe(0)
   })
 
   it('a monthly cap limits what comes off; the rest is still shown on the account', async () => {
@@ -336,7 +337,11 @@ describe('S654 GET /api/balances — paid-ahead credit is netted first', () => {
        VALUES ($1,$2,1000,1000)`, [leaseId, f.tenantId])
     const row = await rowFor(f)
     expect(Number(row.balance)).toBe(516.40)
-    expect(row.credit_on_account).toBe(1000)           // 100 applied + 900 held
+    // S654: the desk says "taken off" of credit_on_account — only $100 was.
+    // The other $900 is still held, and reported on its own.
+    expect(row.credit_on_account).toBe(100)
+    expect(row.spaces[0].credit_applied).toBe(100)
+    expect(row.prepaid_held).toBe(900)
   })
 
   it('paid-ahead first, then the landlord credit on what is left', async () => {
@@ -354,6 +359,7 @@ describe('S654 GET /api/balances — paid-ahead credit is netted first', () => {
     expect(Number(row.balance)).toBe(6.40)               // 616.40 − 600 − 10
     expect(row.spaces[0].credit_applied).toBe(610)
     expect(row.credit_on_account).toBe(610)
+    expect(row.prepaid_held).toBe(0)
   })
 
   it('credit covering the whole bill takes the person off the list', async () => {

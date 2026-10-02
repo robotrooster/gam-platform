@@ -174,14 +174,20 @@ export async function sendPendingInvoiceNotices(
           WHERE tenant_id = $1 AND landlord_id = $2
             AND status = 'active' AND amount_remaining > 0`,
         [inv.tenant_id, inv.landlord_id])
-      const openBills = pool.length ? await query<{ id: string; lease_id: string | null; open: string; due: string }>(
+      const openBills = pool.length ? await query<{ id: string; lease_id: string | null; open: string; own_open: string; due: string }>(
         `SELECT i.id, i.lease_id, to_char(i.due_date, 'YYYY-MM-DD') AS due,
                 -- S654: a suspended work-trade line is already outside
                 -- total_amount (the S634 shape, every writer); netting it again
                 -- here drove these balances negative.
                 (i.total_amount - COALESCE((SELECT SUM(p.amount) FROM payments p
                    WHERE p.invoice_id = i.id
-                     AND p.status IN ('settled','processing')), 0))::text AS open
+                     AND p.status IN ('settled','processing')), 0))::text AS open,
+                -- S654: what the landlord's credit may clear — the lease's own
+                -- open rows (a neighbor's utility on the bill carries no lease).
+                COALESCE((SELECT SUM(p.amount) FROM payments p
+                   WHERE p.invoice_id = i.id AND p.lease_id = i.lease_id
+                     AND p.work_trade_suspended_at IS NULL
+                     AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL) OR p.status = 'failed')), 0)::text AS own_open
            FROM invoices i
           WHERE i.tenant_id = $1 AND i.landlord_id = $2
             AND (i.status IN ('pending','partial') OR i.id = $3)`,
@@ -189,21 +195,28 @@ export async function sendPendingInvoiceNotices(
 
       const invoiceTotal = Number(inv.total_amount)
       const openNow = Math.round(Math.max(0, invoiceTotal - paidAlready) * 100) / 100
-      // S653: the paid-ahead money this bill's month may still use (capped by
-      // the resident's monthly draw, if they set one). It is netted when they
-      // pay, so the headline nets it now.
+      // S653/S654: the paid-ahead money THIS bill takes — the same per-bill plan
+      // the portal and the charge use (prepaidPlan): oldest open bill first, each
+      // by its month's draw. Reading only this bill's month let a later bill net
+      // money an older bill takes first, so the email and the portal disagreed.
       const leaseId = lines.find(l => l.lease_id)?.lease_id ?? null
-      let prepaidApplied = 0
-      if (leaseId && openNow > 0) {
-        const { prepaidDrawAvailable } = await import('./prepaidRelease')
+      const takes = new Map<string, number>()
+      if (inv.tenant_id) {
         const { db } = await import('../db')
-        const month = inv.due_date.slice(0, 7) + '-01'
-        prepaidApplied = Math.min(openNow, (await prepaidDrawAvailable(db as any, leaseId, month)).available)
+        const { prepaidPlan, fetchOutstandingRows } = await import('./rentCharge')
+        const leases = new Set<string>([leaseId, ...openBills.map(b => b.lease_id)].filter((x): x is string => !!x))
+        for (const l of leases) {
+          const plan = await prepaidPlan(db, l, await fetchOutstandingRows(inv.tenant_id, l))
+          for (const t of plan.takes) takes.set(t.invoiceId, t.take)
+        }
       }
+      const prepaidApplied = Math.round(Math.min(openNow, takes.get(inv.id) ?? 0) * 100) / 100
       const creditApplied = pool.length
         ? Math.min(Math.max(0, openNow - prepaidApplied), allocateCredits(
             pool.map(c => ({ leaseId: c.lease_id, amount: Number(c.amount) })),
-            openBills.map(b => ({ key: b.id, leaseId: b.lease_id, total: Number(b.open), earliestDue: b.due })),
+            openBills.map(b => ({ key: b.id, leaseId: b.lease_id,
+                                  total: Math.max(0, Math.min(Number(b.open), Number(b.own_open)) - (takes.get(b.id) ?? 0)),
+                                  earliestDue: b.due })),
           ).applied[inv.id] ?? 0)
         : 0
       const total = Math.round((openNow - prepaidApplied - creditApplied) * 100) / 100
