@@ -148,11 +148,106 @@ export async function activateHomeSaleContract(documentId: string): Promise<{ ac
     await client.query('COMMIT')
     logger.info({ contractId: c.id, documentId, installments: schedule.length },
       'home sale: purchase agreement signed — billing schedule created')
+    // S654 (Nic, Shane Rueff MH 11): "if he signs today and the bill was
+    // generated yesterday, that $150 needs to go on this month's bill as well
+    // after he signs." Best-effort after the commit: the signature and the
+    // schedule stand even if this fails, and the monthly run still picks the
+    // installment up as a straggler.
+    await attachDueInstallmentsToOpenInvoices(c.id).catch(err =>
+      logger.error({ err, contractId: c.id }, 'home sale: could not put due installments on the open bill'))
     return { activated: true }
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
     throw e
   } finally { client.release() }
+}
+
+/**
+ * S654 (Nic): a purchase agreement signed after this month's bill went out puts
+ * the installment(s) already due onto that open bill, instead of waiting for the
+ * next monthly run to bill two at once.
+ *
+ * For each unbilled installment whose billing month has arrived (and is on or
+ * after the property's first billing cycle — earlier ones were paid outside GAM
+ * and are stamped so, exactly as billDueHomeSaleInstallments does), find the
+ * still-open invoice on the contract's lease for THAT month and add a
+ * home_payment line to it, written the same way the monthly run writes one.
+ * No open bill for that month (none yet, or already paid) → left for the
+ * monthly run, which bills stragglers; a paid bill never grows a line.
+ *
+ * Idempotent: the partial-unique index on payments.home_sale_installment_id
+ * and the installment's own payment_id stamp mean an installment bills once.
+ * `dryRun` reports what would be attached and changes nothing.
+ */
+export async function attachDueInstallmentsToOpenInvoices(
+  contractId: string, opts: { dryRun?: boolean } = {},
+): Promise<{ attached: { installmentNumber: number; amount: number; invoiceId: string; dueDate: string }[] }> {
+  const attached: { installmentNumber: number; amount: number; invoiceId: string; dueDate: string }[] = []
+  const c = await queryOne<any>(
+    `SELECT c.id, c.unit_id, c.lease_id, c.tenant_id, c.landlord_id, c.installments_total, p.first_billing_cycle
+       FROM home_sale_contracts c
+       JOIN units u ON u.id = c.unit_id JOIN properties p ON p.id = u.property_id
+      WHERE c.id = $1 AND c.status = 'active' AND c.lease_id IS NOT NULL`, [contractId])
+  if (!c) return { attached }
+
+  if (!opts.dryRun && c.first_billing_cycle) {
+    await query(
+      `UPDATE home_sale_installments SET settled_off_platform_at = NOW()
+        WHERE contract_id = $1 AND payment_id IS NULL AND settled_off_platform_at IS NULL
+          AND billing_month < date_trunc('month', $2::date)::date`, [c.id, c.first_billing_cycle])
+  }
+  const due = await query<any>(
+    `SELECT id, installment_number, amount::text AS amount, billing_month::text AS billing_month
+       FROM home_sale_installments
+      WHERE contract_id = $1 AND payment_id IS NULL AND settled_off_platform_at IS NULL
+        AND billing_month <= date_trunc('month', CURRENT_DATE)::date
+        AND ($2::date IS NULL OR billing_month >= date_trunc('month', $2::date)::date)
+      ORDER BY installment_number`, [c.id, c.first_billing_cycle])
+
+  for (const d of due) {
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const inv = (await client.query<{ id: string; due_date: string }>(
+        `SELECT id, due_date::text AS due_date FROM invoices
+          WHERE lease_id = $1 AND status IN ('pending','partial')
+            AND date_trunc('month', due_date)::date = $2::date
+          ORDER BY due_date LIMIT 1
+          FOR UPDATE`, [c.lease_id, d.billing_month])).rows[0]
+      if (!inv) { await client.query('ROLLBACK'); continue }
+      const amount = Number(d.amount)
+      if (opts.dryRun) {
+        attached.push({ installmentNumber: d.installment_number, amount, invoiceId: inv.id, dueDate: inv.due_date })
+        await client.query('ROLLBACK'); continue
+      }
+      const ins = await client.query<{ id: string }>(
+        `INSERT INTO payments (
+           invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description, notes, home_sale_installment_id
+         ) VALUES ($1,$2,$3,$4,$5,'home_payment',$6,'pending',$7,'HOMEPMT',$8,$9)
+         ON CONFLICT (home_sale_installment_id) WHERE home_sale_installment_id IS NOT NULL DO NOTHING
+         RETURNING id`,
+        [inv.id, c.unit_id, c.lease_id, c.tenant_id, c.landlord_id, amount.toFixed(2), inv.due_date,
+         `Home payment ${d.installment_number} of ${c.installments_total}`, d.id])
+      if (!ins.rows.length) { await client.query('ROLLBACK'); continue }
+      await client.query(
+        `UPDATE home_sale_installments SET payment_id = $1 WHERE id = $2 AND payment_id IS NULL`,
+        [ins.rows[0].id, d.id])
+      await client.query(
+        `UPDATE invoices
+            SET subtotal_home_payments = COALESCE(subtotal_home_payments, 0) + $2,
+                total_amount = total_amount + $2,
+                updated_at = NOW()
+          WHERE id = $1`, [inv.id, amount.toFixed(2)])
+      await client.query('COMMIT')
+      attached.push({ installmentNumber: d.installment_number, amount, invoiceId: inv.id, dueDate: inv.due_date })
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
+  }
+  if (attached.length && !opts.dryRun) await reconcileHomeSaleContract(c.id)
+  return { attached }
 }
 
 /**

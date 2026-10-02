@@ -403,3 +403,105 @@ describe('purchase agreement gates the billing', () => {
     expect(again).toHaveLength(24)
   })
 })
+
+/**
+ * S654 (Nic, Shane Rueff at Country Acres MH 11): "if he signs today and the
+ * bill was generated yesterday, that $150 needs to go on this month's bill as
+ * well after he signs." Signing after the month's bill went out puts the
+ * installment already due onto that open bill — not two at once next month.
+ */
+describe('signing after the bill went out', () => {
+  async function contractAwaitingSignature(s: { unitId: string; leaseId: string; tenantId: string; landlordId: string }, startMonth: string) {
+    const docId = (await db.query(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status)
+       VALUES ($1,$2,'Installment contract','purchase_agreement','sent') RETURNING id`,
+      [s.landlordId, s.unitId])).rows[0].id
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const c = await createHomeSaleContract(client, {
+        ...s, salePrice: 8250, downPayment: 0, annualInterestRate: 0,
+        termMonths: 55, startMonth, planType: 'flat', pendingSignature: true,
+      })
+      await client.query(`UPDATE home_sale_contracts SET purchase_document_id=$2 WHERE id=$1`, [c.id, docId])
+      await client.query('COMMIT')
+      return { docId, contractId: c.id as string }
+    } finally { client.release() }
+  }
+  async function openBill(s: { unitId: string; leaseId: string; tenantId: string; landlordId: string }, dueDate: string, status = 'pending') {
+    return (await db.query(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
+                             due_date, subtotal_rent, subtotal_utilities, total_amount, status)
+       VALUES ($1,$2,$3,$4,'INV-HS-0001',$5,450,28.05,478.05,$6) RETURNING id`,
+      [s.landlordId, s.tenantId, s.leaseId, s.unitId, dueDate, status])).rows[0].id as string
+  }
+  const thisMonth = async () =>
+    (await queryOne<{ m: string }>(`SELECT date_trunc('month', CURRENT_DATE)::date::text AS m`))!.m
+
+  it("puts this month's $150 on the open bill the moment he signs", async () => {
+    const s = await seed()
+    const month = await thisMonth()
+    const invoiceId = await openBill(s, month)
+    const { docId, contractId } = await contractAwaitingSignature(s, month)
+
+    expect((await activateHomeSaleContract(docId)).activated).toBe(true)
+
+    const lines = await query<any>(
+      `SELECT type, amount::float AS amount, status, due_date::text AS due_date, notes
+         FROM payments WHERE invoice_id = $1 AND type = 'home_payment'`, [invoiceId])
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatchObject({ amount: 150, status: 'pending', due_date: month, notes: 'Home payment 1 of 55' })
+    const inv = await queryOne<any>(
+      `SELECT total_amount::float AS total, subtotal_home_payments::float AS home FROM invoices WHERE id=$1`, [invoiceId])
+    expect(inv).toMatchObject({ total: 628.05, home: 150 })
+    const c = await queryOne<any>(`SELECT installments_billed FROM home_sale_contracts WHERE id=$1`, [contractId])
+    expect(c.installments_billed).toBe(1)
+  })
+
+  it('bills it once — the monthly job and a second signing pass add nothing', async () => {
+    const s = await seed()
+    const month = await thisMonth()
+    const invoiceId = await openBill(s, month)
+    const { docId, contractId } = await contractAwaitingSignature(s, month)
+    await activateHomeSaleContract(docId)
+    const { attachDueInstallmentsToOpenInvoices } = await import('../services/homeSale')
+    expect((await attachDueInstallmentsToOpenInvoices(contractId)).attached).toHaveLength(0)
+    await billDueHomeSaleInstallments(month)
+    const all = await query<any>(`SELECT 1 FROM payments WHERE type='home_payment' AND lease_id=$1`, [s.leaseId])
+    expect(all).toHaveLength(1)
+    const inv = await queryOne<any>(`SELECT total_amount::float AS total FROM invoices WHERE id=$1`, [invoiceId])
+    expect(inv.total).toBe(628.05)
+  })
+
+  it('never grows a bill that is already paid — the monthly run picks it up instead', async () => {
+    const s = await seed()
+    const month = await thisMonth()
+    const invoiceId = await openBill(s, month, 'settled')
+    const { docId, contractId } = await contractAwaitingSignature(s, month)
+    await activateHomeSaleContract(docId)
+    const lines = await query<any>(`SELECT 1 FROM payments WHERE invoice_id=$1 AND type='home_payment'`, [invoiceId])
+    expect(lines).toHaveLength(0)
+    const unbilled = await query<any>(
+      `SELECT 1 FROM home_sale_installments WHERE contract_id=$1 AND payment_id IS NULL AND billing_month <= $2::date`,
+      [contractId, month])
+    expect(unbilled).toHaveLength(1)
+  })
+
+  it('a dry run reports the line and changes nothing', async () => {
+    const s = await seed()
+    const month = await thisMonth()
+    const invoiceId = await openBill(s, month)
+    const { contractId } = await contractAwaitingSignature(s, month)
+    // Activate WITHOUT the attach, the way a contract signed before this code shipped looks.
+    await db.query(`UPDATE home_sale_contracts SET status='active' WHERE id=$1`, [contractId])
+    await db.query(
+      `INSERT INTO home_sale_installments (contract_id, installment_number, billing_month, amount, principal_portion, interest_portion, remaining_balance)
+       VALUES ($1, 1, $2::date, 150, 150, 0, 8100)`, [contractId, month])
+    const { attachDueInstallmentsToOpenInvoices } = await import('../services/homeSale')
+    const dry = await attachDueInstallmentsToOpenInvoices(contractId, { dryRun: true })
+    expect(dry.attached).toEqual([{ installmentNumber: 1, amount: 150, invoiceId, dueDate: month }])
+    const lines = await query<any>(`SELECT 1 FROM payments WHERE invoice_id=$1 AND type='home_payment'`, [invoiceId])
+    expect(lines).toHaveLength(0)
+    expect((await attachDueInstallmentsToOpenInvoices(contractId)).attached).toHaveLength(1)
+  })
+})
