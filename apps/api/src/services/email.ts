@@ -756,6 +756,42 @@ export async function emailPropertyTransferApproval(
   )
 }
 
+/**
+ * S655 — the BUYER's side of a property sale. A property used to land on the
+ * receiving account the moment the seller's owners confirmed: the buyer was
+ * never told, never asked, and a mistyped email handed every tenant's record
+ * to an unrelated landlord. Now the buyer accepts with this code before
+ * anything moves.
+ */
+export async function emailPropertyTransferOffer(
+  to: string,
+  args: {
+    propertyName: string
+    sellerName: string
+    code: string
+  },
+) {
+  const property = escapeHtml(args.propertyName)
+  const seller = escapeHtml(args.sellerName)
+  await send(to, `${args.sellerName} wants to transfer ${args.propertyName} to you`,
+    base(
+      h(`A property is being transferred to you`) +
+      p(`<strong style="color:#eef1f8">${seller}</strong> has asked to transfer <strong style="color:#eef1f8">${property}</strong> to your GAM account.`) +
+      p('If you accept, the property, its units, its leases and tenants, its security deposits and its equipment move to the company you choose, rent from then on goes to that company, and GAM\'s monthly platform fee for those units is billed to it. Nothing moves unless you accept.') +
+      p('Your acceptance code:') +
+      `<div style="margin:18px 0;padding:14px 18px;border-radius:10px;background:#12151c;border:1px solid #2a2f3a;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:1.6rem;letter-spacing:.35em;color:#e8c766">${args.code}</div>` +
+      p('Sign in to GAM and open Properties to review the transfer, choose which of your companies takes it, and enter the code. The request expires in 7 days.') +
+      `<div style="margin-top:16px;font-size:.78rem;color:#c0392b"><strong>If you were not expecting this, do not enter the code.</strong> Decline it on your Properties page and nothing will move.</div>`
+    ),
+    {
+      category: 'property_transfer_offer',
+      landlordId: null,
+      metadata: { property_name: args.propertyName },
+    },
+    'support',
+  )
+}
+
 export async function emailPmInvitation(
   to: string,
   inviterName: string,

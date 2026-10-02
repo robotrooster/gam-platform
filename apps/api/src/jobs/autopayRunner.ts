@@ -30,7 +30,8 @@
 import { query, queryOne } from '../db'
 import { getStripe } from '../lib/stripe'
 import { chargeLeaseBalance } from '../services/rentCharge'
-import { createNotification } from '../services/notifications'
+import { createNotification, notifyAutopayFailed, type AutopayFailureKind } from '../services/notifications'
+import { createAdminNotification } from '../services/adminNotifications'
 import { logger } from '../lib/logger'
 import { registerEngine } from './timezoneCronManager'
 
@@ -127,7 +128,7 @@ export async function runAutopayForTimezone(tz: string, now: Date = new Date()):
     try {
       const method = await resolvePaymentMethod(c.payment_method_id, c.stripe_customer_id)
       if (!method) {
-        throw new Error('No usable payment method on file')
+        throw new NoPaymentMethodError('No usable payment method on file')
       }
 
       // The live balance, right now. Nothing forecast.
@@ -242,6 +243,44 @@ async function resolvePaymentMethod(
   return null
 }
 
+/** Our own "nothing to charge with" failure — the tenant's side to fix. */
+class NoPaymentMethodError extends Error {}
+
+/**
+ * Stripe error codes that mean the tenant's payment method cannot be used as it
+ * stands (a card error is always one, whatever its code). Anything else Stripe
+ * or GAM throws is not something the tenant's account caused.
+ */
+const PAYMENT_METHOD_ERROR_CODES = new Set([
+  'card_declined', 'expired_card', 'incorrect_cvc', 'insufficient_funds', 'authentication_required',
+  'payment_intent_authentication_failure', 'payment_intent_payment_attempt_failed',
+  'payment_method_unactivated', 'payment_method_unexpected_state', 'payment_method_not_available',
+  'payment_method_provider_decline', 'payment_method_customer_decline', 'payment_method_bank_account_blocked',
+  'bank_account_unusable', 'bank_account_declined', 'bank_account_unverified',
+  'bank_account_verification_failed', 'bank_account_restricted',
+  'account_closed', 'no_account', 'invalid_account_number', 'debit_not_authorized',
+])
+
+/**
+ * S654: why an autopay pull failed, as the tenant is told it. A space in
+ * eviction mode is read from the unit itself (chargeLeaseBalance refuses it
+ * with a 409), so it never depends on an error's wording.
+ */
+export async function classifyAutopayFailure(e: unknown, leaseId: string): Promise<AutopayFailureKind> {
+  const paused = await queryOne<{ payment_block: boolean | null }>(
+    `SELECT u.payment_block FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id = $1`, [leaseId])
+  if (paused?.payment_block) return 'payments_paused'
+  if (e instanceof NoPaymentMethodError) return 'payment_method'
+  const err = e as any
+  if (err?.type === 'StripeCardError' || err?.rawType === 'card_error') return 'payment_method'
+  if (err?.type === 'StripeInvalidRequestError' || err?.rawType === 'invalid_request_error') {
+    if (err?.param === 'payment_method' || PAYMENT_METHOD_ERROR_CODES.has(String(err?.code ?? ''))) {
+      return 'payment_method'
+    }
+  }
+  return 'our_side'
+}
+
 /**
  * A pull failed. Count it, tell both sides, and switch autopay off if this is
  * the second failure in a row.
@@ -275,11 +314,50 @@ async function handleFailure(
 
   // The tenant believes the money moved. Tell them plainly that it did not, and
   // that rent is still owed — never a bank error code.
-  await notifyTenant(c.tenant_id, 'autopay_failed',
-    disarming ? 'Autopay has been turned off' : 'Your scheduled rent payment didn’t go through',
-    disarming
-      ? 'Two scheduled payments in a row couldn’t be completed, so we’ve switched autopay off to stop your bank charging you for further attempts. Your rent is still owed — pay it from the Payments page, then turn autopay back on.'
-      : 'Your scheduled rent payment couldn’t be completed, so your rent is still owed. Check the account you pay from, then pay from the Payments page. Autopay is still on and will try again next month.')
+  //
+  // S654: by email too, with a Pay now button. This was an in-app notice only,
+  // and a tenant who thinks rent paid itself has no reason to open the app.
+  // The button is the same signed sign-in link the bill email uses (lands on
+  // Payments); without a portal account it is the plain Payments link.
+  //
+  // S654 (review): what they are told depends on WHY. "Check the account you
+  // pay from, then pay" was going out for an eviction hold (whose Payments page
+  // refuses the payment) and for GAM's own errors. notifyAutopayFailed words
+  // each kind truthfully and only emails the ones a payment can fix.
+  let kind: AutopayFailureKind = 'our_side'
+  try {
+    kind = await classifyAutopayFailure(e, c.lease_id)
+  } catch (err) {
+    logger.error({ err, leaseId: c.lease_id }, '[autopay] failure classification failed')
+  }
+  if (kind === 'our_side') {
+    // Nothing about the tenant's account caused this, so someone at GAM has to
+    // look — the tenant is told it was our side.
+    await createAdminNotification({
+      severity: 'warn',
+      category: 'autopay_charge_error',
+      title:    `Autopay could not start a rent payment (lease ${c.lease_id})`,
+      body:     message.slice(0, 1000),
+      context:  { autopay_id: c.autopay_id, lease_id: c.lease_id, tenant_id: c.tenant_id, failures, disarming },
+    })
+  }
+  try {
+    const t = await queryOne<{ user_id: string | null; email: string | null }>(
+      `SELECT t.user_id, u.email FROM tenants t LEFT JOIN users u ON u.id = t.user_id WHERE t.id = $1`,
+      [c.tenant_id])
+    if (t?.user_id) {
+      const { payNowLink } = await import('../services/invoiceNotice')
+      let payUrl: string | null = null
+      try {
+        payUrl = payNowLink({ tenant_user_id: t.user_id, tenant_email: t.email })
+      } catch (err) {
+        logger.error({ err, leaseId: c.lease_id }, '[autopay] pay link failed')
+      }
+      await notifyAutopayFailed({ tenantUserId: t.user_id, tenantEmail: t.email, disarming, kind, payUrl })
+    }
+  } catch (err) {
+    logger.error({ err, leaseId: c.lease_id }, '[autopay] tenant failure notice failed')
+  }
 
   // The landlord is watching a lease that says a payment is scheduled. Without
   // this they read the silence as a tenant who stopped paying.
@@ -306,7 +384,7 @@ async function handleFailure(
 }
 
 async function notifyTenant(
-  tenantId: string, type: 'autopay' | 'autopay_failed', title: string, body: string,
+  tenantId: string, type: 'autopay', title: string, body: string,
 ): Promise<void> {
   const u = await queryOne<{ user_id: string }>(
     `SELECT user_id FROM tenants WHERE id = $1`, [tenantId])

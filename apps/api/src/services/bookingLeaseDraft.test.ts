@@ -149,3 +149,98 @@ describe('S654 continuity since an approved check', () => {
     expect(String(screeningMock.mock.calls[0][0])).toBe(email)
   })
 })
+
+// S655: the screening context read ANY company's approved check and walked the
+// guest's leases at EVERY GAM landlord. Company B's notification then told B
+// that company A had approved the guest, on what date, and that the guest had
+// lived at other GAM properties since — and B's own screening email was skipped
+// on A's say-so. Each company's screening decision is its own.
+describe('S655 another company’s check and leases never count', () => {
+  // pooled: the applicant ticked "share my screening". viaPoolAccount: the
+  // check was run through GAM's renter-pool intake (the is_system pool
+  // account) instead of for company A.
+  async function seedApprovedElsewhere(email: string, opts: { pooled?: boolean; viaPoolAccount?: boolean } = {}) {
+    const c = await getClient()
+    try {
+      await c.query('BEGIN')
+      // Company A screened and housed the guest.
+      const a = await seedLandlord(c)
+      const aProp = await seedProperty(c, { landlordId: a.landlordId, ownerUserId: a.userId, managedByUserId: a.userId })
+      const tenantId = await seedTenant(c, { email })
+      const { rows: [t] } = await c.query(`SELECT user_id FROM tenants WHERE id = $1`, [tenantId])
+      let checkLandlordId = a.landlordId
+      if (opts.viaPoolAccount) {
+        const pool = await seedLandlord(c)
+        await c.query(`UPDATE landlords SET is_system = true WHERE id = $1`, [pool.landlordId])
+        checkLandlordId = pool.landlordId
+      }
+      await c.query(
+        `INSERT INTO background_checks (landlord_id, user_id, tenant_id, status, decided_at, consent_pool)
+         VALUES ($1, $2, $3, 'approved', now() - INTERVAL '90 days', $4)`,
+        [checkLandlordId, t.user_id, tenantId, !!opts.pooled])
+      const aUnit = await seedUnit(c, { propertyId: aProp, landlordId: a.landlordId })
+      const { rows: [d] } = await c.query(`SELECT (CURRENT_DATE - 85)::text AS s`)
+      const leaseId = await seedLease(c, { unitId: aUnit, landlordId: a.landlordId, rentAmount: 900, startDate: d.s, status: 'active' })
+      await seedLeaseTenant(c, { leaseId, tenantId })
+      // Company B takes the long-stay booking.
+      const b = await seedLandlord(c)
+      const bProp = await seedProperty(c, { landlordId: b.landlordId, ownerUserId: b.userId, managedByUserId: b.userId })
+      const bUnit = await seedUnit(c, { propertyId: bProp, landlordId: b.landlordId })
+      const { rows: [bk] } = await c.query<{ id: string }>(
+        `INSERT INTO unit_bookings
+           (unit_id, landlord_id, guest_name, guest_email, check_in, check_out, status, lease_type, total_amount)
+         VALUES ($1, $2, 'Long Stayer', $3, CURRENT_DATE, CURRENT_DATE + 45, 'confirmed', 'month_to_month', 900)
+         RETURNING id`, [bUnit, b.landlordId, email])
+      await c.query('COMMIT')
+      return bk.id
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('a guest approved and housed by another company is screened like anyone else, and B is told nothing about A', async () => {
+    const email = `else-${randomUUID().slice(0, 6)}@test.dev`
+    const bookingId = await seedApprovedElsewhere(email)
+    const r = await maybeDraftLeaseFromBooking(bookingId)
+    expect(r.drafted).toBe(true)
+    const data = await draftNotice()
+    expect(data.approvedCheckAt).toBeNull()
+    expect(data.continuousTenancySince).toBe(false)
+    expect(screeningMock).toHaveBeenCalledTimes(1)
+    const { rows: [n] } = await db.query<{ body: string }>(
+      `SELECT body FROM notifications WHERE type = 'lease_drafted_from_booking'`)
+    expect(n.body).not.toMatch(/passed a/i)
+    expect(n.body).toMatch(/No background check with you is on file/)
+  })
+
+  it('a check another company ran stays that company’s, even with the share box ticked — not counted, not revealed', async () => {
+    const email = `shared-${randomUUID().slice(0, 6)}@test.dev`
+    const bookingId = await seedApprovedElsewhere(email, { pooled: true })
+    const r = await maybeDraftLeaseFromBooking(bookingId)
+    expect(r.drafted).toBe(true)
+    const data = await draftNotice()
+    expect(data.approvedCheckAt).toBeNull()
+    expect(data.continuousTenancySince).toBe(false)
+    expect(screeningMock).toHaveBeenCalledTimes(1)
+    const { rows: [n] } = await db.query<{ body: string }>(
+      `SELECT body FROM notifications WHERE type = 'lease_drafted_from_booking'`)
+    expect(n.body).not.toMatch(/passed a/i)
+    expect(n.body).toMatch(/No background check with you is on file/)
+  })
+
+  it('a check the guest ran through GAM’s renter pool still counts', async () => {
+    const email = `pool-${randomUUID().slice(0, 6)}@test.dev`
+    const bookingId = await seedApprovedElsewhere(email, { pooled: true, viaPoolAccount: true })
+    await maybeDraftLeaseFromBooking(bookingId)
+    const data = await draftNotice()
+    expect(data.approvedCheckAt).toBeTruthy()
+    // Their leases elsewhere are still not this company's business.
+    expect(data.continuousTenancySince).toBe(false)
+  })
+
+  it('a renter-pool intake the guest did NOT agree to share does not count', async () => {
+    const email = `nopool-${randomUUID().slice(0, 6)}@test.dev`
+    const bookingId = await seedApprovedElsewhere(email, { pooled: false, viaPoolAccount: true })
+    await maybeDraftLeaseFromBooking(bookingId)
+    const data = await draftNotice()
+    expect(data.approvedCheckAt).toBeNull()
+  })
+})

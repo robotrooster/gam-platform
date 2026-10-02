@@ -27,10 +27,13 @@ import { AppError } from '../middleware/errorHandler'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
 import { createLandlordExpense } from './landlordExpenses'
-import type { MerchantRuleScope } from '@gam/shared'
-import { OTHER_INCOME_CATEGORIES, EXPENSE_CATEGORIES } from '@gam/shared'
+import { payoutCompositions } from './payoutComposition'
+import type { PoolClient } from 'pg'
+import type { MerchantRuleScope, BankTxnBankStatus } from '@gam/shared'
+import { OTHER_INCOME_CATEGORIES, EXPENSE_CATEGORIES, BANK_TXN_HIDDEN_REASONS } from '@gam/shared'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
+const cents = (n: number | string) => Math.round(Number(n) * 100)
 
 // Auto-match tolerance: a settled disbursement counts as the source of an inbound
 // bank deposit if the amounts match to the cent and the posted date is within this
@@ -200,77 +203,340 @@ export async function finalizeConnection(landlordId: string, sessionId: string):
 }
 
 // ── Sync ────────────────────────────────────────────────────────────────────
+
+/** One transaction as the bank reports it. `status` defaults to posted (CSV). */
+export interface FeedRow {
+  externalId: string
+  postedDate: string
+  amount: number
+  currency?: string
+  description?: string | null
+  status?: BankTxnBankStatus
+}
+
 /**
- * Upsert a batch of normalized transactions for a connection (idempotent on
- * external_id) and auto-match new rows. Shared by the Stripe pull and any future
- * CSV import — pure DB, no Stripe. Returns how many were newly inserted.
+ * S655: how far apart the two copies of one transaction can be dated across two
+ * links to the same account. The bank's pending date and its posted date differ
+ * by a day or so — Oak Park's DoorLoop deposit was 9/9 on the old link (pending)
+ * and 9/10 on the new one (posted).
+ */
+export const RELINK_PAIR_WINDOW_DAYS = 3
+
+const dayNumber = (iso: string) =>
+  Math.round(Date.UTC(Number(iso.slice(0, 4)), Number(iso.slice(5, 7)) - 1, Number(iso.slice(8, 10))) / 86400000)
+
+/**
+ * SQL: has the landlord (or GAM on their behalf) already DONE something with
+ * this row? A filed row is never hidden in favor of a copy — the copy is.
+ * Rows in review and rows hidden only for predating the books are untouched.
+ */
+const FILED_SQL = (t: string) => `(
+  ${t}.status IN ('categorized', 'matched')
+  OR (${t}.status = 'ignored' AND ${t}.ignored_reason IS DISTINCT FROM 'before_books')
+  OR EXISTS (SELECT 1 FROM bank_deposit_allocations a WHERE a.bank_transaction_id = ${t}.id)
+  OR EXISTS (SELECT 1 FROM tenant_declared_deposits dd WHERE dd.bank_transaction_id = ${t}.id))`
+
+/**
+ * SQL: nobody has acted on this row — in review, or hidden only for predating
+ * the books, and nothing booked from it. The sync re-checks this on the row it
+ * is about to change, so it can never overwrite a row someone filed.
+ */
+const UNTOUCHED_SQL = (t: string) => `(NOT ${FILED_SQL(t)}
+  AND (${t}.status = 'needs_review' OR (${t}.status = 'ignored' AND ${t}.ignored_reason = 'before_books'))
+  AND ${t}.expense_id IS NULL AND ${t}.landlord_other_income_id IS NULL)`
+
+interface StoredRow {
+  id: string; external_id: string; posted_date: string; amount: string; description: string | null
+  status: string; ignored_reason: string | null; bank_status: string | null; filed: boolean
+}
+interface Sibling { id: string; posted_date: string; amount: string; description: string | null; filed: boolean; day: number }
+
+/**
+ * Upsert a batch of normalized transactions for a connection and auto-match.
+ * Shared by the Stripe pull and any future CSV import — pure DB, no Stripe.
+ * Returns how many genuinely NEW transactions arrived (a copy that replaced the
+ * same transaction from an earlier link is not new to the landlord).
+ *
+ * S655 (Nic, Oak Park PNC relink) — three rules, each from a real failure:
+ *
+ *  1. ONLY POSTED TRANSACTIONS BECOME ROWS, AND A STORED ROW FOLLOWS ITS BANK.
+ *     Stripe lists pending, posted and void transactions alike, and the feed
+ *     stored whatever it saw and never looked again: the old PNC link froze the
+ *     bank's short pending wording ('PIN POS MOUNTAINAI CARD#2971') and its
+ *     pending dates, and a pending charge later voided would have stayed a real
+ *     row forever. Now a pending transaction waits until it posts (a day or two
+ *     later than before), a stored row nobody has filed takes the bank's posted
+ *     wording/date/amount when they change, and a voided one is hidden as
+ *     `bank_void` — or, if it was already filed, kept and flagged.
+ *
+ *  2. A RELINK PAIRS COPIES ONE FOR ONE. Stripe issues a fresh account id per
+ *     link, so the same transaction arrives again under a new external id. The
+ *     S605 guard matched only identical text on the identical day (91 of Oak
+ *     Park's 104 copies), and as a plain set it would drop BOTH of two identical
+ *     same-day charges if the old link had one. Each new row now pairs with at
+ *     most one row on the account's other links: same amount to the cent,
+ *     within RELINK_PAIR_WINDOW_DAYS, identical text first, then nearest date.
+ *     Rows that are already copies are never paired against.
+ *
+ *  3. KEEP THE COPY THAT MATTERS, HIDE THE OTHER, LOSE NOTHING. If the old copy
+ *     is untouched, the new link's copy is kept (it is the one the bank keeps
+ *     updating) and the old one becomes `duplicate` pointing at it. If the old
+ *     copy was already filed, it stays and the new copy lands as the duplicate.
+ *     Nothing is deleted; every hidden copy points at the one kept.
+ *
+ * Rows before the books start date land ignored as `before_books` on every
+ * path, so pre-GAM history never enters review (S605/S654).
+ *
+ * Every stored row the sync may change — this link's own rows and the copies
+ * on the account's other links — is locked before it is read, so a landlord
+ * filing a row while the sync runs either finishes first (and the sync sees it
+ * filed) or waits for the sync (and is refused if the row became a copy). The
+ * changes themselves re-check that the row is still untouched.
  */
 export async function upsertTransactions(
   connectionId: string,
   landlordId: string,
-  rows: Array<{ externalId: string; postedDate: string; amount: number; currency?: string; description?: string | null }>,
+  rows: FeedRow[],
 ): Promise<number> {
-  // S605: anything before the landlord's books start date is still stored, but
-  // lands as `ignored` so pre-GAM history never clutters the review queue.
-  // S654: ::text — node-pg hands a DATE back as a JS Date, and a string < Date
-  // comparison is always false, so the cutoff never applied.
-  const [ll] = await query<{ books_start_date: string | null }>(
-    `SELECT books_start_date::text AS books_start_date FROM landlords WHERE id = $1`, [landlordId])
-  const cutoff = ll?.books_start_date ?? null
+  let inserted = 0, replacedOldCopy = 0, keptOldCopy = 0, followed = 0, notPostedYet = 0
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const conn = (await client.query<{ institution_name: string | null; account_last4: string | null }>(
+      `SELECT institution_name, account_last4 FROM bank_connections WHERE id = $1 AND landlord_id = $2`,
+      [connectionId, landlordId])).rows[0]
+    if (!conn) throw new AppError(404, 'Connection not found')
+    // One import at a time per physical account: the hourly sync and a Sync
+    // press on a fresh relink must not both pair the same old copy.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [`bank_feed_account:${landlordId}:${conn.institution_name ?? ''}:${conn.account_last4 ?? connectionId}`])
 
-  // S605: re-linking the SAME bank is now an expected action — granting balances
-  // consent requires it — and Stripe issues a fresh account id each time, so the
-  // (bank_connection_id, external_id) key sees the new rows as new. Left alone,
-  // Oak Park's history would import a second time and every figure in the P&L
-  // would double.
-  //
-  // So when a sibling connection exists for the same physical account (same
-  // landlord, same institution, same last4), treat a same-day / same-amount /
-  // same-description row as already-imported. Deliberately conservative: it only
-  // engages for the re-link case, and a genuine duplicate charge — same merchant,
-  // same amount, same day, same account — is rare enough that silently importing
-  // it twice is the worse error.
-  // S654: posted_date::text — as a JS Date the key began 'Wed Sep 30' and never
-  // matched the incoming 'YYYY-MM-DD', so a relink imported the history twice.
-  const siblings = await query<{ posted_date: string; amount: string; description: string | null }>(
-    `SELECT t.posted_date::text AS posted_date, t.amount, t.description
+    // S654: ::text — node-pg hands a DATE back as a JS Date, and a string < Date
+    // comparison is always false, so the cutoff never applied.
+    const cutoff = (await client.query<{ books_start_date: string | null }>(
+      `SELECT books_start_date::text AS books_start_date FROM landlords WHERE id = $1`, [landlordId])).rows[0]?.books_start_date ?? null
+    const reviewState = (postedDate: string) => cutoff != null && postedDate < cutoff
+      ? { status: 'ignored', reason: 'before_books' as string | null }
+      : { status: 'needs_review', reason: null as string | null }
+
+    // Lock every row this sync may change before reading any of them: this
+    // link's own rows, and the rows on the account's other links within reach
+    // of a pairing (a superset of the copies step 2 reads). One statement, in
+    // id order, so it can't deadlock with another ordered locker (the books
+    // start date). A filing in progress finishes first and is read as filed;
+    // a filing that starts now waits for this sync and then sees its result.
+    const postedDates = rows.filter(r => (r.status ?? 'posted') === 'posted').map(r => r.postedDate).sort()
+    await client.query(
+      `SELECT t.id FROM bank_transactions t
+        WHERE (t.bank_connection_id = $1 AND t.external_id = ANY($2::text[]))
+           OR ($4::text IS NOT NULL AND $5::date IS NOT NULL
+               AND t.landlord_id = $3
+               AND t.bank_connection_id IN (
+                     SELECT c.id FROM bank_connections c
+                      WHERE c.landlord_id = $3 AND c.id <> $1
+                        AND c.account_last4 = $4 AND c.institution_name IS NOT DISTINCT FROM $7)
+               AND t.posted_date BETWEEN ($5::date - $8::int) AND ($6::date + $8::int))
+        ORDER BY t.id FOR UPDATE OF t`,
+      [connectionId, rows.map(r => r.externalId), landlordId, conn.account_last4,
+       postedDates[0] ?? null, postedDates[postedDates.length - 1] ?? null, conn.institution_name,
+       RELINK_PAIR_WINDOW_DAYS])
+
+    // 1. What this link already holds: follow the bank.
+    const stored = new Map<string, StoredRow>((await client.query<StoredRow>(
+      `SELECT t.id, t.external_id, t.posted_date::text AS posted_date, t.amount::text AS amount,
+              t.description, t.status, t.ignored_reason, t.bank_status, ${FILED_SQL('t')} AS filed
+         FROM bank_transactions t
+        WHERE t.bank_connection_id = $1 AND t.external_id = ANY($2::text[])`,
+      [connectionId, rows.map(r => r.externalId)])).rows.map(r => [r.external_id, r]))
+    const fresh: FeedRow[] = []
+    for (const r of rows) {
+      const s = stored.get(r.externalId)
+      if (s) { if (await followTheBank(client, s, r, reviewState)) followed++; continue }
+      if ((r.status ?? 'posted') !== 'posted') { notPostedYet++; continue }
+      fresh.push(r)
+    }
+
+    // 2. Pair new rows with their copies on the account's other links.
+    const partners = await pairAcrossLinks(client, connectionId, landlordId, conn, fresh)
+
+    // 3. Store, keeping the copy that matters.
+    for (const r of fresh) {
+      const partner = partners.get(r)
+      let state = reviewState(r.postedDate)
+      let duplicateOf: string | null = null
+      if (partner?.filed) { state = { status: 'ignored', reason: 'duplicate' }; duplicateOf = partner.id }
+      const res = await client.query<{ id: string }>(
+        `INSERT INTO bank_transactions
+           (bank_connection_id, landlord_id, external_id, posted_date, amount, currency,
+            description, normalized_merchant, status, ignored_reason, duplicate_of_id, bank_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'posted')
+         ON CONFLICT (bank_connection_id, external_id) DO NOTHING
+         RETURNING id`,
+        [connectionId, landlordId, r.externalId, r.postedDate, round2(r.amount).toFixed(2),
+         r.currency ?? 'usd', r.description ?? null, normalizeMerchant(r.description),
+         state.status, state.reason, duplicateOf])
+      const id = res.rows[0]?.id
+      if (!id) continue
+      if (!partner) { inserted++; continue }
+      if (partner.filed) { keptOldCopy++; continue }
+      // Keep this copy: hide the old one as a copy of this — only if it is
+      // still untouched — then point anything that pointed at it here.
+      const hid = await client.query(
+        `UPDATE bank_transactions t
+            SET status = 'ignored', ignored_reason = 'duplicate', duplicate_of_id = $2, updated_at = now()
+          WHERE t.id = $1 AND ${UNTOUCHED_SQL('t')}`, [partner.id, id])
+      if (!hid.rowCount) {
+        // Filed after it was read: the old copy stays, this one is its copy.
+        await client.query(
+          `UPDATE bank_transactions
+              SET status = 'ignored', ignored_reason = 'duplicate', duplicate_of_id = $2, updated_at = now()
+            WHERE id = $1`, [id, partner.id])
+        keptOldCopy++
+        continue
+      }
+      await client.query(
+        `UPDATE bank_transactions SET duplicate_of_id = $2, updated_at = now() WHERE duplicate_of_id = $1`,
+        [partner.id, id])
+      replacedOldCopy++
+    }
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+
+  await autoMatchLandlord(landlordId)
+  // S624: and settle any deposit a tenant declared that the bank now confirms.
+  await autoSettleDeclaredDeposits(landlordId)
+  if (replacedOldCopy || keptOldCopy || followed || notPostedYet) {
+    logger.info({ connectionId, inserted, replacedOldCopy, keptOldCopy, followed, notPostedYet },
+      '[bank-feed] sync: copies from an earlier link paired, bank changes followed, pending left for later')
+  }
+  return inserted
+}
+
+/**
+ * A row this link already holds, reported again: take the bank's latest word.
+ * Returns whether anything changed.
+ */
+async function followTheBank(
+  client: PoolClient, s: StoredRow, r: FeedRow,
+  reviewState: (postedDate: string) => { status: string; reason: string | null },
+): Promise<boolean> {
+  const incoming = r.status ?? 'posted'
+  if (s.bank_status === 'void') return false            // a void never comes back
+  // In review, or hidden only for predating the books — nobody has acted on it.
+  const untouched = !s.filed
+    && (s.status === 'needs_review' || (s.status === 'ignored' && s.ignored_reason === 'before_books'))
+
+  // Each change to an untouched row re-checks, on the row itself, that it is
+  // still untouched; if not, it falls through to only recording the bank's state.
+  if (incoming === 'void') {
+    const hidden = untouched && (await client.query(
+      `UPDATE bank_transactions t
+          SET status = 'ignored', ignored_reason = 'bank_void', bank_status = 'void', updated_at = now()
+        WHERE t.id = $1 AND ${UNTOUCHED_SQL('t')}`, [s.id])).rowCount
+    if (!hidden) {
+      // Filed, a copy, or the landlord's own call: keep it, flag it. The page
+      // tells the landlord the bank voided something they already filed.
+      await client.query(`UPDATE bank_transactions SET bank_status = 'void', updated_at = now() WHERE id = $1`, [s.id])
+      if (s.status === 'categorized' || s.status === 'matched') {
+        logger.warn({ transactionId: s.id, status: s.status }, '[bank-feed] the bank voided a transaction that was already filed')
+      }
+    }
+    return true
+  }
+
+  const changed = s.posted_date.slice(0, 10) !== r.postedDate
+    || cents(s.amount) !== cents(r.amount)
+    || (s.description ?? null) !== (r.description ?? null)
+  if (untouched && changed) {
+    const next = reviewState(r.postedDate)
+    const res = await client.query(
+      `UPDATE bank_transactions t
+          SET posted_date = $2, amount = $3, description = $4, normalized_merchant = $5,
+              bank_status = $6, status = $7, ignored_reason = $8, updated_at = now()
+        WHERE t.id = $1 AND ${UNTOUCHED_SQL('t')}`,
+      [s.id, r.postedDate, round2(r.amount).toFixed(2), r.description ?? null,
+       normalizeMerchant(r.description), incoming, next.status, next.reason])
+    if (res.rowCount) return true
+  }
+  if (s.bank_status !== incoming) {
+    await client.query(`UPDATE bank_transactions SET bank_status = $2, updated_at = now() WHERE id = $1`, [s.id, incoming])
+    return true
+  }
+  return false
+}
+
+/**
+ * Pair each new row with at most one row on the same account's OTHER links —
+ * same amount to the cent, posted within RELINK_PAIR_WINDOW_DAYS. Identical
+ * bank text pairs first, then nearest date. Two identical charges on the new
+ * link with one on the old pair once, and the second is stored as the real,
+ * separate charge it is.
+ */
+async function pairAcrossLinks(
+  client: PoolClient, connectionId: string, landlordId: string,
+  conn: { institution_name: string | null; account_last4: string | null },
+  fresh: FeedRow[],
+): Promise<Map<FeedRow, Sibling>> {
+  const pairs = new Map<FeedRow, Sibling>()
+  // No last four, no way to know two links are the same account (a CSV import
+  // has none) — never guess.
+  if (!fresh.length || !conn.account_last4) return pairs
+  const dates = fresh.map(r => r.postedDate).sort()
+  // These rows are already locked by upsertTransactions, so `filed` is current
+  // and stays so until the sync commits.
+  const siblings = (await client.query<Omit<Sibling, 'day'>>(
+    `SELECT t.id, t.posted_date::text AS posted_date, t.amount::text AS amount, t.description,
+            ${FILED_SQL('t')} AS filed
        FROM bank_transactions t
        JOIN bank_connections c ON c.id = t.bank_connection_id
       WHERE t.landlord_id = $1
         AND t.bank_connection_id <> $2
-        AND c.account_last4 IS NOT DISTINCT FROM (SELECT account_last4 FROM bank_connections WHERE id = $2)
-        AND c.institution_name IS NOT DISTINCT FROM (SELECT institution_name FROM bank_connections WHERE id = $2)`,
-    [landlordId, connectionId])
-  const seen = new Set(siblings.map((s) =>
-    `${String(s.posted_date).slice(0, 10)}|${Number(s.amount).toFixed(2)}|${s.description ?? ''}`))
+        AND c.account_last4 = $3
+        AND c.institution_name IS NOT DISTINCT FROM $4
+        AND t.ignored_reason IS DISTINCT FROM 'duplicate'
+        AND t.ignored_reason IS DISTINCT FROM 'bank_void'
+        AND t.bank_status IS DISTINCT FROM 'void'
+        -- already paired with a row on THIS link (which was kept as its copy)
+        AND NOT EXISTS (SELECT 1 FROM bank_transactions d
+                         WHERE d.duplicate_of_id = t.id AND d.bank_connection_id = $2)
+        AND t.posted_date BETWEEN ($5::date - $7::int) AND ($6::date + $7::int)
+      ORDER BY t.posted_date, t.created_at, t.id`,
+    [landlordId, connectionId, conn.account_last4, conn.institution_name,
+     dates[0], dates[dates.length - 1], RELINK_PAIR_WINDOW_DAYS])).rows
+  if (!siblings.length) return pairs
 
-  let inserted = 0
-  let skippedDuplicate = 0
-  for (const r of rows) {
-    if (seen.size && seen.has(`${r.postedDate}|${round2(r.amount).toFixed(2)}|${r.description ?? ''}`)) {
-      skippedDuplicate++
-      continue
+  const byAmount = new Map<number, Sibling[]>()
+  for (const s of siblings) {
+    const k = cents(s.amount)
+    const list = byAmount.get(k) ?? []
+    list.push({ ...s, day: dayNumber(s.posted_date) })
+    byAmount.set(k, list)
+  }
+  const taken = new Set<string>()
+  const pass = (sameTextOnly: boolean) => {
+    for (const r of fresh) {
+      if (pairs.has(r)) continue
+      const day = dayNumber(r.postedDate)
+      let best: Sibling | null = null
+      let bestGap = Infinity
+      for (const s of byAmount.get(cents(r.amount)) ?? []) {
+        if (taken.has(s.id)) continue
+        const gap = Math.abs(s.day - day)
+        if (gap > RELINK_PAIR_WINDOW_DAYS) continue
+        if (sameTextOnly && (s.description ?? '') !== (r.description ?? '')) continue
+        if (gap < bestGap) { best = s; bestGap = gap }
+      }
+      if (best) { pairs.set(r, best); taken.add(best.id) }
     }
-    const beforeCutoff = cutoff != null && r.postedDate < cutoff
-    const res = await queryOne<{ id: string }>(
-      `INSERT INTO bank_transactions
-         (bank_connection_id, landlord_id, external_id, posted_date, amount, currency,
-          description, normalized_merchant, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       ON CONFLICT (bank_connection_id, external_id) DO NOTHING
-       RETURNING id`,
-      [connectionId, landlordId, r.externalId, r.postedDate, round2(r.amount).toFixed(2),
-       r.currency ?? 'usd', r.description ?? null, normalizeMerchant(r.description),
-       beforeCutoff ? 'ignored' : 'needs_review'])
-    if (res?.id) inserted++
   }
-  await autoMatchLandlord(landlordId)
-  // S624: and settle any deposit a tenant declared that the bank now confirms.
-  await autoSettleDeclaredDeposits(landlordId)
-  if (skippedDuplicate) {
-    console.log(`[bankFeed] connection ${connectionId}: skipped ${skippedDuplicate} row(s) already imported via a prior link to the same account`)
-  }
-  return inserted
+  pass(true)
+  pass(false)
+  return pairs
 }
 
 /** Pull transactions from Stripe FC for one connection and upsert them. */
@@ -281,7 +547,7 @@ export async function syncConnection(connectionId: string): Promise<{ inserted: 
     return { inserted: 0 } // CSV connections are populated via import, not sync.
   }
   const stripe = getStripe()
-  const rows: Array<{ externalId: string; postedDate: string; amount: number; currency?: string; description?: string | null }> = []
+  const rows: FeedRow[] = []
   try {
     const list = stripe.financialConnections.transactions.list({ account: conn.stripe_fc_account_id, limit: 100 })
     let count = 0
@@ -294,6 +560,9 @@ export async function syncConnection(connectionId: string): Promise<{ inserted: 
         amount: (t.amount ?? 0) / 100,      // FC amount is in cents, +in / -out
         currency: t.currency ?? 'usd',
         description: t.description ?? null,
+        // S655: pending / posted / void. Only posted becomes a new row; a stored
+        // row follows the bank when it posts or is voided (upsertTransactions).
+        status: t.status === 'pending' || t.status === 'void' ? t.status : 'posted',
       })
       if (++count >= 2000) break            // hard cap for a single sync pass
     }
@@ -403,7 +672,9 @@ export async function refreshBalance(conn: any): Promise<void> {
 export async function autoMatchLandlord(landlordId: string): Promise<number> {
   const candidates = await query<any>(
     `SELECT id, amount, posted_date FROM bank_transactions
-      WHERE landlord_id = $1 AND status = 'needs_review' AND amount > 0`, [landlordId])
+      WHERE landlord_id = $1 AND status = 'needs_review' AND amount > 0
+        -- S655: only once the bank has posted it (NULL = stored before S655)
+        AND COALESCE(bank_status, 'posted') = 'posted'`, [landlordId])
   let matched = 0
   for (const t of candidates) {
     const disb = await queryOne<{ id: string }>(
@@ -455,7 +726,10 @@ export async function autoSettleDeclaredDeposits(landlordId: string): Promise<nu
     `SELECT id, landlord_id, amount::float AS amount,
             to_char(posted_date,'YYYY-MM-DD') AS posted_date, description
        FROM bank_transactions
-      WHERE landlord_id = $1 AND status = 'needs_review' AND amount > 0`,
+      WHERE landlord_id = $1 AND status = 'needs_review' AND amount > 0
+        -- S655: a deposit still pending at the bank can be voided; settle rent
+        -- from it only once the bank has posted it (NULL = stored before S655).
+        AND COALESCE(bank_status, 'posted') = 'posted'`,
     [landlordId])
 
   let settled = 0
@@ -527,157 +801,193 @@ async function rememberMerchantChoice(landlordId: string, normalizedMerchant: st
     [landlordId, normalizedMerchant, input.category, input.scopeKind, input.propertyId, input.unitId])
 }
 
-// ── Categorize (2-click → expense) ──────────────────────────────────────────
-/**
- * Turn an outflow transaction into a landlord_expenses row. Landlord-confirmed;
- * scope is required. Remembers the merchant choice for next time. Transactional:
- * the expense insert + the txn flip happen together.
- */
-export async function categorizeTransaction(landlordId: string, txnId: string, input: {
+// ── Categorize (2-click → expense or income) ────────────────────────────────
+
+type CategorizeInput = {
   category: string
   scopeKind: MerchantRuleScope
   unitId?: string | null
   propertyId?: string | null
   vendor?: string | null
   description?: string | null
-}): Promise<{ expenseId?: string; incomeId?: string }> {
-  const txn = await queryOne<any>(
-    `SELECT *, to_char(posted_date, 'YYYY-MM-DD') AS posted_date_str
-       FROM bank_transactions WHERE id = $1 AND landlord_id = $2`, [txnId, landlordId])
-  if (!txn) throw new AppError(404, 'Transaction not found')
+}
+
+/**
+ * S655: may this row be filed into the P&L? Only from review, or from a row the
+ * landlord ignored themselves (changing their mind). Everything else is either
+ * already in the books or is not a transaction to file — and the message says
+ * which, because "not found" would send the landlord looking for a bug.
+ */
+function assertFileable(txn: any) {
   if (txn.status === 'categorized') throw new AppError(409, 'Transaction already categorized')
-
-  // S605: money IN is now categorizable as income rather than only ignorable.
-  // The branch is on the sign of the amount, not on a caller-supplied flag, so
-  // there's no way to file a deposit as an expense or a payment as income.
-  if (Number(txn.amount) > 0) {
-    return categorizeAsIncome(landlordId, txn, input)
+  // Whatever its status says, a row that already booked an expense or income
+  // is in the books. Filing it again would count the same money twice.
+  if (txn.expense_id || txn.landlord_other_income_id) {
+    throw new AppError(409, 'This transaction is already filed in your books.')
   }
-  if (Number(txn.amount) === 0) throw new AppError(400, 'This transaction has no amount to categorize')
-  // Symmetric to the income check below: the route accepts both category sets,
-  // so the expense branch must refuse an income category outright.
-  if (!EXPENSE_CATEGORIES.includes(input.category as any)) {
-    throw new AppError(400, 'Pick an expense category for money going out')
+  // Money GAM already has on record reaches the P&L through `payments`; filing
+  // it here too would count it twice (S605). A tenant's confirmed deposit is
+  // the same money as the rent it settled.
+  if (txn.status === 'matched' || txn.matched_disbursement_id || txn.matched_payment_id) {
+    throw new AppError(409, txn.matched_payment_id && !txn.matched_disbursement_id
+      ? 'This deposit is already applied to a tenant’s rent, so it’s counted in your income automatically. Recording it again would double it.'
+      : 'This deposit is money GAM already sent you, so it’s counted in your income automatically. Recording it again would double it.')
   }
-
-  // Scope → expense shape.
-  let unitId: string | null = null
-  let propertyId: string | null = null
-  let isCommon = false
-  if (input.scopeKind === 'unit') {
-    if (!input.unitId) throw new AppError(400, 'A unit is required for unit scope')
-    unitId = input.unitId
-  } else {
-    if (!input.propertyId) throw new AppError(400, 'A property is required for property scope')
-    propertyId = input.propertyId
-    isCommon = true
-    // S603 (Nic): 'property_common' and 'property_allocate' now behave
-    // IDENTICALLY — every non-unit cost is split across the property's units at
-    // report time, so there is nothing left to choose between. The enum value is
-    // still accepted (existing merchant rules carry it) but no longer branches.
-    // Retiring the duplicate value needs its own migration + backfill.
+  if (txn.bank_status === 'void' || txn.ignored_reason === 'bank_void') {
+    throw new AppError(409, 'Your bank voided this transaction, so there’s nothing to file.')
   }
-
-  const client = await getClient()
-  try {
-    await client.query('BEGIN')
-    const expense = await createLandlordExpense({
-      landlordId,
-      propertyId,
-      unitId,
-      category: input.category,
-      amount: Math.abs(Number(txn.amount)),
-      description: input.description ?? txn.description ?? null,
-      vendor: input.vendor ?? txn.normalized_merchant ?? null,
-      expenseDate: txn.posted_date_str,
-      isCommon,
-    })
-    await client.query(
-      `UPDATE bank_transactions
-          SET status='categorized', expense_id=$2, categorized_at=now(), updated_at=now()
-        WHERE id=$1`, [txnId, expense.id])
-    await client.query('COMMIT')
-    // Remember the merchant choice (outside the txn — a best-effort learning write).
-    await rememberMerchantChoice(landlordId, txn.normalized_merchant, {
-      category: input.category, scopeKind: input.scopeKind, propertyId, unitId,
-    })
-    return { expenseId: expense.id }
-  } catch (e) {
-    await client.query('ROLLBACK')
-    throw e
-  } finally {
-    client.release()
+  if (txn.status === 'ignored' && txn.ignored_reason === 'duplicate') {
+    throw new AppError(409,
+      'This is a second copy of a transaction already on your feed, from an earlier link to the same bank. File the original instead.')
+  }
+  if (txn.status === 'ignored' && txn.ignored_reason === 'before_books') {
+    throw new AppError(409, 'This is from before your books start date. Move the start date earlier if you want to file it.')
+  }
+  if (txn.status !== 'needs_review' && txn.status !== 'ignored') {
+    throw new AppError(409, 'This transaction can’t be filed.')
   }
 }
 
 /**
- * S605: record a money-in bank row as landlord income.
+ * File a bank row into the landlord's P&L: money out → landlord_expenses, money
+ * in → landlord_other_income (S605). Landlord-confirmed; scope is required.
+ * Remembers the merchant choice for next time.
  *
- * The guard that matters is the `matched` check. Auto-matching ties inbound rows
- * to the GAM disbursement that produced them; those already reach the P&L via
- * `payments`, so letting one be filed here too would count the same rent twice
- * and overstate the landlord's income. Only unmatched deposits — money GAM never
- * moved — are eligible.
+ * S655: the row is locked for the whole filing, so a double click can no longer
+ * book the same charge twice, and the guards above run against the locked row.
  */
-async function categorizeAsIncome(landlordId: string, txn: any, input: {
-  category: string
-  scopeKind: MerchantRuleScope
-  unitId?: string | null
-  propertyId?: string | null
-  vendor?: string | null
-  description?: string | null
-}) {
-  if (txn.status === 'matched' || txn.disbursement_id) {
-    throw new AppError(409,
-      'This deposit is money GAM already sent you, so it’s counted in your income ' +
-      'automatically. Recording it again would double it.')
+export async function categorizeTransaction(landlordId: string, txnId: string, input: CategorizeInput):
+  Promise<{ expenseId?: string; incomeId?: string }> {
+  const client = await getClient()
+  let remembered: { normalizedMerchant: string; propertyId: string | null; unitId: string | null } | null = null
+  let result: { expenseId?: string; incomeId?: string }
+  try {
+    await client.query('BEGIN')
+    const txn = (await client.query(
+      `SELECT *, to_char(posted_date, 'YYYY-MM-DD') AS posted_date_str
+         FROM bank_transactions WHERE id = $1 AND landlord_id = $2 FOR UPDATE`, [txnId, landlordId])).rows[0]
+    if (!txn) throw new AppError(404, 'Transaction not found')
+    assertFileable(txn)
+    if (Number(txn.amount) === 0) throw new AppError(400, 'This transaction has no amount to categorize')
+
+    // S605: the branch is on the sign of the amount, not on a caller-supplied
+    // flag, so there's no way to file a deposit as an expense or a payment as
+    // income — and neither category set may cross over.
+    if (Number(txn.amount) > 0) {
+      const r = await fileAsIncome(client, landlordId, txn, input)
+      result = { incomeId: r.incomeId }
+      remembered = { normalizedMerchant: txn.normalized_merchant, propertyId: r.propertyId, unitId: r.unitId }
+    } else {
+      if (!EXPENSE_CATEGORIES.includes(input.category as any)) {
+        throw new AppError(400, 'Pick an expense category for money going out')
+      }
+      // Scope → expense shape.
+      let unitId: string | null = null
+      let propertyId: string | null = null
+      let isCommon = false
+      if (input.scopeKind === 'unit') {
+        if (!input.unitId) throw new AppError(400, 'A unit is required for unit scope')
+        unitId = input.unitId
+      } else {
+        if (!input.propertyId) throw new AppError(400, 'A property is required for property scope')
+        propertyId = input.propertyId
+        isCommon = true
+        // S603 (Nic): 'property_common' and 'property_allocate' now behave
+        // IDENTICALLY — every non-unit cost is split across the property's units at
+        // report time, so there is nothing left to choose between. The enum value is
+        // still accepted (existing merchant rules carry it) but no longer branches.
+        // Retiring the duplicate value needs its own migration + backfill.
+      }
+      // createLandlordExpense checks the unit/property belong to this landlord.
+      const expense = await createLandlordExpense({
+        landlordId,
+        propertyId,
+        unitId,
+        category: input.category,
+        amount: Math.abs(Number(txn.amount)),
+        description: input.description ?? txn.description ?? null,
+        vendor: input.vendor ?? txn.normalized_merchant ?? null,
+        expenseDate: txn.posted_date_str,
+        isCommon,
+      })
+      await client.query(
+        `UPDATE bank_transactions
+            SET status='categorized', ignored_reason=NULL, expense_id=$2, categorized_at=now(), updated_at=now()
+          WHERE id=$1`, [txnId, expense.id])
+      result = { expenseId: expense.id }
+      remembered = { normalizedMerchant: txn.normalized_merchant, propertyId, unitId }
+    }
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
   }
+  // Remember the merchant choice (outside the txn — a best-effort learning write).
+  if (remembered) {
+    await rememberMerchantChoice(landlordId, remembered.normalizedMerchant, {
+      category: input.category, scopeKind: input.scopeKind,
+      propertyId: remembered.propertyId, unitId: remembered.unitId,
+    })
+  }
+  return result
+}
+
+/**
+ * S605: record a money-in bank row as landlord income, inside the caller's
+ * transaction. Only unmatched deposits — money GAM never moved — reach here
+ * (assertFileable refuses the rest).
+ *
+ * S655: the unit or property named in the request must be this landlord's.
+ * It was stored unchecked, so a request could file income against another
+ * company's unit. A unit-scoped row also records the unit's property, the same
+ * shape createLandlordExpense gives an expense.
+ */
+async function fileAsIncome(client: PoolClient, landlordId: string, txn: any, input: CategorizeInput) {
   if (!OTHER_INCOME_CATEGORIES.includes(input.category as any)) {
     throw new AppError(400, 'Pick an income category for money coming in')
   }
 
   let unitId: string | null = null
   let propertyId: string | null = null
+  let rowPropertyId: string | null = null
   let isCommon = false
   if (input.scopeKind === 'unit') {
     if (!input.unitId) throw new AppError(400, 'A unit is required for unit scope')
+    const u = (await client.query<{ property_id: string; landlord_id: string }>(
+      `SELECT property_id, landlord_id FROM units WHERE id = $1`, [input.unitId])).rows[0]
+    if (!u || u.landlord_id !== landlordId) throw new AppError(400, 'Unit does not belong to you')
     unitId = input.unitId
+    rowPropertyId = u.property_id
   } else {
     if (!input.propertyId) throw new AppError(400, 'A property is required for property scope')
+    const p = (await client.query<{ landlord_id: string }>(
+      `SELECT landlord_id FROM properties WHERE id = $1`, [input.propertyId])).rows[0]
+    if (!p || p.landlord_id !== landlordId) throw new AppError(400, 'Property does not belong to you')
     propertyId = input.propertyId
+    rowPropertyId = input.propertyId
     isCommon = true
   }
 
-  const client = await getClient()
-  try {
-    await client.query('BEGIN')
-    const inc = await client.query(
-      `INSERT INTO landlord_other_income
-         (landlord_id, property_id, unit_id, category, amount, description, payer, income_date, is_common)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-      [landlordId, propertyId, unitId, input.category, Math.abs(Number(txn.amount)),
-       input.description ?? txn.description ?? null,
-       input.vendor ?? txn.normalized_merchant ?? null, txn.posted_date_str, isCommon])
-    await client.query(
-      `UPDATE bank_transactions
-          SET status='categorized', landlord_other_income_id=$2, categorized_at=now(), updated_at=now()
-        WHERE id=$1`, [txn.id, inc.rows[0].id])
-    await client.query('COMMIT')
-    await rememberMerchantChoice(landlordId, txn.normalized_merchant, {
-      category: input.category, scopeKind: input.scopeKind, propertyId, unitId,
-    })
-    return { incomeId: inc.rows[0].id }
-  } catch (e) {
-    await client.query('ROLLBACK')
-    throw e
-  } finally {
-    client.release()
-  }
+  const inc = await client.query(
+    `INSERT INTO landlord_other_income
+       (landlord_id, property_id, unit_id, category, amount, description, payer, income_date, is_common)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+    [landlordId, rowPropertyId, unitId, input.category, Math.abs(Number(txn.amount)),
+     input.description ?? txn.description ?? null,
+     input.vendor ?? txn.normalized_merchant ?? null, txn.posted_date_str, isCommon])
+  await client.query(
+    `UPDATE bank_transactions
+        SET status='categorized', ignored_reason=NULL, landlord_other_income_id=$2, categorized_at=now(), updated_at=now()
+      WHERE id=$1`, [txn.id, inc.rows[0].id])
+  return { incomeId: inc.rows[0].id as string, propertyId, unitId }
 }
 
+/** The landlord dismisses a row. Recorded as THEIR call, so nothing automatic ever undoes it. */
 export async function ignoreTransaction(landlordId: string, txnId: string) {
   const res = await queryOne<{ id: string }>(
-    `UPDATE bank_transactions SET status='ignored', updated_at=now()
+    `UPDATE bank_transactions SET status='ignored', ignored_reason='landlord', updated_at=now()
       WHERE id=$1 AND landlord_id=$2 AND status IN ('needs_review','matched') RETURNING id`,
     [txnId, landlordId])
   if (!res) throw new AppError(404, 'Transaction not found or not ignorable')
@@ -723,24 +1033,55 @@ export async function listConnections(landlordId: string) {
  * can pre-fill without an N+1 from the client). Defaults to the review queue.
  */
 export async function listTransactions(landlordId: string, opts: { status?: string; connectionId?: string; limit?: number } = {}) {
-  const conds = ['bt.landlord_id = $1']
-  const params: any[] = [landlordId]
+  // S655: a copy from an earlier link, or a transaction the bank voided, is kept
+  // on file but never listed — it is not money that moved.
+  const conds = ['bt.landlord_id = $1', `NOT (COALESCE(bt.ignored_reason, '') = ANY($2::text[]))`]
+  const params: any[] = [landlordId, [...BANK_TXN_HIDDEN_REASONS]]
   if (opts.status) { params.push(opts.status); conds.push(`bt.status = $${params.length}`) }
   if (opts.connectionId) { params.push(opts.connectionId); conds.push(`bt.bank_connection_id = $${params.length}`) }
   const limit = Math.min(Math.max(opts.limit ?? 200, 1), 500)
   const rows = await query<any>(
     `SELECT bt.id, bt.amount::float AS amount, bt.posted_date, bt.description,
             bt.normalized_merchant, bt.status, bt.currency,
+            -- S655: why it is ignored, and what the bank says about it
+            bt.ignored_reason, bt.bank_status,
             c.display_name AS connection_name,
             r.category AS suggested_category, r.scope_kind AS suggested_scope_kind,
-            r.property_id AS suggested_property_id, r.unit_id AS suggested_unit_id
+            r.property_id AS suggested_property_id, r.unit_id AS suggested_unit_id,
+            -- S655: what a matched row was matched TO. The page called every
+            -- matched row a GAM payout, including a tenant's own cash deposit.
+            CASE WHEN bt.status <> 'matched' THEN NULL
+                 WHEN bt.matched_disbursement_id IS NOT NULL THEN 'gam_payout'
+                 WHEN bt.matched_payment_id IS NOT NULL THEN 'tenant_deposit'
+            END AS match_kind,
+            bt.matched_disbursement_id,
+            dep.unit_number AS matched_unit_number, dep.tenant_name AS matched_tenant_name,
+            dep.charge_count AS matched_charge_count
        FROM bank_transactions bt
        JOIN bank_connections c ON c.id = bt.bank_connection_id
        LEFT JOIN landlord_merchant_rules r
               ON r.landlord_id = bt.landlord_id AND r.normalized_merchant = bt.normalized_merchant
+       LEFT JOIN LATERAL (
+         SELECT u.unit_number,
+                (SELECT us.first_name || ' ' || us.last_name FROM tenants t JOIN users us ON us.id = t.user_id
+                  WHERE t.id = p.tenant_id) AS tenant_name,
+                (SELECT COUNT(*)::int FROM bank_deposit_allocations a WHERE a.bank_transaction_id = bt.id) AS charge_count
+           FROM payments p LEFT JOIN units u ON u.id = p.unit_id
+          WHERE p.id = bt.matched_payment_id
+       ) dep ON bt.matched_payment_id IS NOT NULL
       WHERE ${conds.join(' AND ')}
       ORDER BY bt.posted_date DESC, bt.created_at DESC
       LIMIT ${limit}`, params)
+
+  // S655 (Nic): a GAM payout row says what it carried — every payment inside
+  // it. One batch for every payout on the page.
+  const payoutIds = rows.filter((r: any) => r.match_kind === 'gam_payout').map((r: any) => r.matched_disbursement_id)
+  if (payoutIds.length) {
+    const comps = await payoutCompositions(payoutIds)
+    for (const r of rows) {
+      if (r.match_kind === 'gam_payout') r.payout_breakdown = comps.get(r.matched_disbursement_id) ?? null
+    }
+  }
   return rows
 }
 
@@ -807,38 +1148,57 @@ export async function refreshAllBalances(): Promise<{ refreshed: number; failed:
  * pulled 112 rows back to February before this existed. Moving the date is
  * therefore two-way and non-destructive:
  *   • rows before the cutoff that are still awaiting review  → ignored
- *   • rows on/after the cutoff that were auto-ignored by a PREVIOUS, later
- *     cutoff → returned to needs_review
+ *   • rows on/after the cutoff that were hidden by a PREVIOUS, later cutoff
+ *     → returned to needs_review
  *
  * Rows the landlord already CATEGORIZED are never touched. Those are real
  * expenses in their P&L; silently un-booking them because a date moved would
  * change their financials behind their back.
+ *
+ * S655: and it moves ONLY rows it hid itself (ignored_reason = before_books).
+ * It used to bring back every ignored row on/after the date — a row the
+ * landlord dismissed, a copy from an earlier link to the same bank, a charge the
+ * bank voided — because a bare `ignored` could not say which was which. Re-saving
+ * Oak Park's date would have put 35 hidden PNC copies straight back in review.
  */
 export async function setBooksStartDate(
   landlordId: string,
   date: string | null,
 ): Promise<{ ignored: number; restored: number }> {
-  await query('UPDATE landlords SET books_start_date = $2 WHERE id = $1', [landlordId, date])
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    await client.query('UPDATE landlords SET books_start_date = $2 WHERE id = $1', [landlordId, date])
+    // Lock what may move in id order — the order a bank sync locks in — so a
+    // save that lands mid-sync waits for it instead of deadlocking with it.
+    await client.query(
+      `SELECT id FROM bank_transactions
+        WHERE landlord_id = $1 AND (status = 'needs_review' OR (status = 'ignored' AND ignored_reason = 'before_books'))
+        ORDER BY id FOR UPDATE`, [landlordId])
 
-  if (!date) {
-    // Cleared: bring auto-ignored rows back for review. Categorized stays.
-    const restored = await query<{ id: string }>(
-      `UPDATE bank_transactions SET status = 'needs_review'
-        WHERE landlord_id = $1 AND status = 'ignored' RETURNING id`, [landlordId])
-    return { ignored: 0, restored: restored.length }
+    const ignored = date
+      ? (await client.query(
+          `UPDATE bank_transactions SET status = 'ignored', ignored_reason = 'before_books', updated_at = now()
+            WHERE landlord_id = $1 AND posted_date < $2::date AND status = 'needs_review'
+            RETURNING id`, [landlordId, date])).rowCount ?? 0
+      : 0
+
+    // Cleared: everything the date hid comes back. Moved: what is now on or
+    // after it comes back.
+    const restored = (await client.query(
+      `UPDATE bank_transactions SET status = 'needs_review', ignored_reason = NULL, updated_at = now()
+        WHERE landlord_id = $1 AND status = 'ignored' AND ignored_reason = 'before_books'
+          AND ($2::date IS NULL OR posted_date >= $2::date)
+        RETURNING id`, [landlordId, date])).rowCount ?? 0
+
+    await client.query('COMMIT')
+    return { ignored, restored }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
   }
-
-  const ignored = await query<{ id: string }>(
-    `UPDATE bank_transactions SET status = 'ignored'
-      WHERE landlord_id = $1 AND posted_date < $2::date AND status = 'needs_review'
-      RETURNING id`, [landlordId, date])
-
-  const restored = await query<{ id: string }>(
-    `UPDATE bank_transactions SET status = 'needs_review'
-      WHERE landlord_id = $1 AND posted_date >= $2::date AND status = 'ignored'
-      RETURNING id`, [landlordId, date])
-
-  return { ignored: ignored.length, restored: restored.length }
 }
 
 /**

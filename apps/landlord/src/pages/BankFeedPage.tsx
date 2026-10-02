@@ -11,8 +11,13 @@ import { useNavigate } from 'react-router-dom'
 import { loadStripe } from '@stripe/stripe-js'
 import { EntityPicker } from '../components/EntityPicker'
 import { apiGet, apiPost , apiPut } from '../lib/api'
-import { EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, OTHER_INCOME_CATEGORIES, OTHER_INCOME_CATEGORY_LABEL } from '@gam/shared'
+import {
+  EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, OTHER_INCOME_CATEGORIES, OTHER_INCOME_CATEGORY_LABEL,
+  BANK_TXN_IGNORED_REASON_LABEL, BANK_TXN_MATCH_KIND_LABEL,
+  type BankTxnIgnoredReason,
+} from '@gam/shared'
 import { toast, appConfirm } from '../components/dialogs'
+import { PayoutBreakdown } from '../components/PayoutBreakdown'
 import { Landmark, RefreshCw, Check, X, Plus } from 'lucide-react'
 
 const STRIPE_PK = (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY as string | undefined
@@ -169,7 +174,9 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
     (date: string | null) => apiPut('/bank-feed/books-start-date', { date, entityId }),
     { onSuccess: (r: any) => {
         qc.invalidateQueries(['bank-txns']); qc.invalidateQueries('landlord-books-start')
-        const ig = r?.data?.ignored ?? 0, re = r?.data?.restored ?? 0
+        // S655: apiPut already unwraps the response's `data` — reading
+        // r.data.ignored was always undefined, so the count never showed.
+        const ig = r?.ignored ?? 0, re = r?.restored ?? 0
         toast(ig || re
           ? `Updated — ${ig} hidden, ${re} brought back for review.`
           : 'Start date saved.')
@@ -349,7 +356,8 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
             <div style={{ fontWeight: 600, fontSize: '.82rem' }}>Start my books from</div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2, lineHeight: 1.5 }}>
               Anything before this stays on file but is hidden from review — use it to skip spending
-              from before you joined GAM. Already-categorized transactions are never changed.
+              from before you joined GAM. Already-categorized transactions are never changed, and
+              nothing you ignored yourself comes back.
             </div>
           </div>
           <input className="form-input" type="date" value={booksStart} style={{ width: 'auto' }}
@@ -445,18 +453,34 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                       </div>
                     )}
 
+                    {/* S655: a transaction the bank has not posted yet can still
+                        change its amount or wording when it does. */}
+                    {t.status === 'needs_review' && t.bankStatus === 'pending' && (
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+                        Still pending at your bank — the amount or wording can change when it posts.
+                      </div>
+                    )}
                     {t.status === 'categorized' && (
                       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
                         Added to your {isExpense ? 'expenses' : 'income'}.
                       </div>
                     )}
-                    {t.status === 'matched' && (
-                      <div style={{ fontSize: '.72rem', color: 'var(--gold, #c9a227)', marginTop: 4 }}>
-                        GAM payout — matched to its disbursement; already in your books, never counted twice.
+                    {/* S655: a row already filed or matched that the bank later
+                        voided stays (it is in the books), and says so. */}
+                    {t.bankStatus === 'void' && t.status !== 'ignored' && (
+                      <div style={{ fontSize: '.72rem', color: 'var(--amber)', marginTop: 4 }}>
+                        {t.status === 'matched'
+                          ? 'Your bank voided this deposit after it was matched. Check what it was matched to — the money may never have arrived.'
+                          : `Your bank voided this transaction after it was filed. Check the ${isExpense ? 'expense' : 'income'} it created — the money may never have moved.`}
                       </div>
                     )}
+                    {t.status === 'matched' && <MatchedLine t={t} />}
                     {t.status === 'ignored' && (
-                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Ignored.</div>
+                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+                        {t.ignoredReason && t.ignoredReason in BANK_TXN_IGNORED_REASON_LABEL
+                          ? `${BANK_TXN_IGNORED_REASON_LABEL[t.ignoredReason as BankTxnIgnoredReason]}.`
+                          : 'Ignored.'}
+                      </div>
                     )}
                   </div>
                 )
@@ -465,4 +489,44 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       </div>
     </div>
   )
+}
+
+// S655: what a matched row was matched TO. Every matched row used to read "GAM
+// payout", including a tenant's own cash deposit. A payout now lists the
+// payments inside it; a tenant's deposit names whose rent it paid.
+function MatchedLine({ t }: { t: any }) {
+  const [open, setOpen] = useState(false)
+  const line = { fontSize: '.72rem', color: 'var(--gold, #c9a227)', marginTop: 4 } as const
+  if (t.matchKind === 'gam_payout') {
+    const b = t.payoutBreakdown
+    const n = b?.payments?.length ?? 0
+    return (
+      <div>
+        <div style={{ ...line, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span>
+            {BANK_TXN_MATCH_KIND_LABEL['gam_payout']}
+            {b?.traced ? ` — ${n} payment${n === 1 ? '' : 's'}` : ''}; already in your books, never counted twice.
+          </span>
+          {b && (
+            <button className="btn btn-primary btn-sm" style={{ padding: '1px 8px', fontSize: '.68rem' }}
+                    onClick={() => setOpen(v => !v)}>
+              {open ? 'Hide' : 'Show'} what it paid
+            </button>
+          )}
+        </div>
+        {open && b && <div style={{ marginTop: 8 }}><PayoutBreakdown breakdown={b} /></div>}
+      </div>
+    )
+  }
+  if (t.matchKind === 'tenant_deposit') {
+    const who = [t.matchedUnitNumber, t.matchedTenantName].filter(Boolean).join(' · ')
+    const more = Number(t.matchedChargeCount) > 1 ? ` (${t.matchedChargeCount} charges)` : ''
+    return (
+      <div style={line}>
+        {BANK_TXN_MATCH_KIND_LABEL['tenant_deposit']} — applied to {who ? `${who}’s` : 'a tenant’s'} rent{more};
+        already in your books, never counted twice.
+      </div>
+    )
+  }
+  return <div style={line}>Matched to money GAM already has on record — never counted twice.</div>
 }

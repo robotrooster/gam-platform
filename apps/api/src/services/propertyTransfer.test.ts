@@ -7,7 +7,7 @@ import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
-import { transferProperty, initiateTransfer, approveTransfer, declineTransfer } from './propertyTransfer'
+import { transferProperty, initiateTransfer, approveTransfer, declineTransfer, acceptTransfer, confirmTransfer, listIncomingTransfers } from './propertyTransfer'
 import { vi } from 'vitest'
 
 beforeEach(async () => { await cleanupAllSchema() })
@@ -162,10 +162,16 @@ describe('transfer consent', () => {
       `SELECT code FROM property_transfer_approvals WHERE request_id=$1 AND user_id=$2`,
       [requestId, userId])).rows[0].code
 
+  // S655: a sale to another account names the buyer's LOGIN; the buyer
+  // accepts with their own code before anything moves.
   const initiate = (f: any) => initiateTransfer({
     propertyId: f.propertyId, fromLandlordId: f.seller.landlordId,
-    toLandlordId: f.buyer.landlordId, byUserId: f.seller.userId,
+    toUserId: f.buyer.userId, byUserId: f.seller.userId,
   })
+  const buyerCode = async (requestId: string) =>
+    (await db.query<any>(`SELECT buyer_code FROM property_transfer_requests WHERE id=$1`, [requestId])).rows[0].buyer_code
+  const buyerAccepts = async (f: any, requestId: string) =>
+    acceptTransfer({ requestId, userId: f.buyer.userId, code: await buyerCode(requestId) })
 
   it('raising a request moves NOTHING', async () => {
     const f = await seedSale()
@@ -182,6 +188,7 @@ describe('transfer consent', () => {
       [f.seller.landlordId, f.seller.userId])
     const partnerId = await withPartner(f)
     const { requestId } = await initiate(f)
+    await buyerAccepts(f, requestId)   // the buyer is ready; the sellers are not
 
     const res = await approveTransfer({
       requestId, userId: f.seller.userId, code: await codeFor(requestId, f.seller.userId) })
@@ -247,9 +254,214 @@ describe('transfer consent', () => {
       [f.seller.landlordId, f.seller.userId])
     const { requestId } = await initiate(f)
     await withPartner(f)     // joins AFTER the request
+    await buyerAccepts(f, requestId)
     const res = await approveTransfer({
       requestId, userId: f.seller.userId, code: await codeFor(requestId, f.seller.userId) })
     expect(res.required).toBe(1)
     expect(res.executed).toBe(true)
+  })
+
+  // ── S655: the receiving side consents too ──────────────────────────────────
+  it('every seller confirmed but the buyer silent: nothing moves', async () => {
+    const f = await seedSale()
+    const { requestId, awaitingBuyer } = await initiate(f)
+    expect(awaitingBuyer).toBe(true)
+    const res = await approveTransfer({
+      requestId, userId: f.seller.userId, code: await codeFor(requestId, f.seller.userId) })
+    expect(res.executed).toBe(false)
+    expect(res.awaitingBuyer).toBe(true)
+    const { rows: [p] } = await db.query<any>(`SELECT landlord_id FROM properties WHERE id=$1`, [f.propertyId])
+    expect(p.landlord_id).toBe(f.seller.landlordId)
+    const { rows: [r] } = await db.query<any>(`SELECT status, to_landlord_id FROM property_transfer_requests WHERE id=$1`, [requestId])
+    expect(r.status).toBe('pending')
+    expect(r.to_landlord_id).toBeNull()   // the receiving company is the buyer's choice
+  })
+
+  it('the buyer accepts with the right code into their own company, and that executes the sale', async () => {
+    const f = await seedSale()
+    const { requestId } = await initiate(f)
+    await approveTransfer({ requestId, userId: f.seller.userId, code: await codeFor(requestId, f.seller.userId) })
+    const res = await confirmTransfer({ requestId, userId: f.buyer.userId, code: await buyerCode(requestId) })
+    expect(res.side).toBe('buyer')
+    expect(res.executed).toBe(true)
+    const { rows: [p] } = await db.query<any>(`SELECT landlord_id FROM properties WHERE id=$1`, [f.propertyId])
+    expect(p.landlord_id).toBe(f.buyer.landlordId)
+    const { rows: [r] } = await db.query<any>(
+      `SELECT status, to_landlord_id, buyer_accepted_by FROM property_transfer_requests WHERE id=$1`, [requestId])
+    expect(r.status).toBe('executed')
+    expect(r.to_landlord_id).toBe(f.buyer.landlordId)
+    expect(r.buyer_accepted_by).toBe(f.buyer.userId)
+  })
+
+  it('either order works: the buyer first, then the last seller executes it', async () => {
+    const f = await seedSale()
+    const { requestId } = await initiate(f)
+    const accepted = await buyerAccepts(f, requestId)
+    expect(accepted.executed).toBe(false)
+    const res = await approveTransfer({ requestId, userId: f.seller.userId, code: await codeFor(requestId, f.seller.userId) })
+    expect(res.executed).toBe(true)
+  })
+
+  it('refuses a wrong buyer code, a stranger, and the selling company named as the receiver', async () => {
+    const f = await seedSale()
+    const { requestId } = await initiate(f)
+    await expect(acceptTransfer({ requestId, userId: f.buyer.userId, code: '000000' }))
+      .rejects.toThrow(/not correct/i)
+    const c = await db.connect()
+    let stranger: any
+    try { stranger = await seedLandlord(c) } finally { c.release() }
+    await expect(acceptTransfer({ requestId, userId: stranger.userId, code: await buyerCode(requestId) }))
+      .rejects.toThrow(/not addressed to you/i)
+    // The buyer is ALSO an owner of the selling company — they still cannot
+    // name it as the receiver.
+    await db.query(`INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1,$2,'owner')`,
+      [f.seller.landlordId, f.buyer.userId])
+    await expect(acceptTransfer({ requestId, userId: f.buyer.userId, code: await buyerCode(requestId),
+      receivingLandlordId: f.seller.landlordId })).rejects.toThrow(/one transferring it/i)
+    // ...nor a company that is not theirs.
+    await expect(acceptTransfer({ requestId, userId: f.buyer.userId, code: await buyerCode(requestId),
+      receivingLandlordId: stranger.landlordId })).rejects.toThrow(/not yours/i)
+    const { rows: [r] } = await db.query<any>(`SELECT buyer_accepted_at FROM property_transfer_requests WHERE id=$1`, [requestId])
+    expect(r.buyer_accepted_at).toBeNull()
+  })
+
+  it('a buyer with several companies must choose which one takes it', async () => {
+    const f = await seedSale()
+    const { rows: [second] } = await db.query<any>(
+      `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`, [f.buyer.userId])
+    const { requestId } = await initiate(f)
+    await expect(buyerAccepts(f, requestId)).rejects.toThrow(/Choose which of your companies/i)
+    await approveTransfer({ requestId, userId: f.seller.userId, code: await codeFor(requestId, f.seller.userId) })
+    const res = await acceptTransfer({ requestId, userId: f.buyer.userId, code: await buyerCode(requestId),
+      receivingLandlordId: second.id })
+    expect(res.executed).toBe(true)
+    const { rows: [p] } = await db.query<any>(`SELECT landlord_id FROM properties WHERE id=$1`, [f.propertyId])
+    expect(p.landlord_id).toBe(second.id)
+  })
+
+  it('the buyer can decline, which cancels the request', async () => {
+    const f = await seedSale()
+    const { requestId } = await initiate(f)
+    await declineTransfer(requestId, f.buyer.userId)
+    const { rows: [r] } = await db.query<any>(
+      `SELECT status, cancelled_by FROM property_transfer_requests WHERE id=$1`, [requestId])
+    expect(r.status).toBe('cancelled')
+    expect(r.cancelled_by).toBe(f.buyer.userId)
+    await expect(approveTransfer({ requestId, userId: f.seller.userId, code: await codeFor(requestId, f.seller.userId) }))
+      .rejects.toThrow(/already called off/i)
+  })
+
+  // A decline that lands while the other side's confirmation is executing the
+  // sale must not report success: it read the row unlocked and updated
+  // "WHERE status='pending'" without checking anything matched, so the seller
+  // was told "declined, nothing moved" over a property that had moved.
+  it('a decline racing the sale waits for it and is refused once the property has moved', async () => {
+    const f = await seedSale()
+    const { requestId } = await initiate(f)
+    await approveTransfer({ requestId, userId: f.seller.userId, code: await codeFor(requestId, f.seller.userId) })
+
+    // Stand in for the buyer's acceptance mid-flight: hold the request row
+    // the way acceptTransfer does while it moves the property.
+    const holder = await db.connect()
+    let declined: Promise<void> | null = null
+    try {
+      await holder.query('BEGIN')
+      await holder.query(`SELECT 1 FROM property_transfer_requests WHERE id = $1 FOR UPDATE`, [requestId])
+      declined = declineTransfer(requestId, f.seller.userId)
+      const settled = declined.then(() => 'ok', () => 'err')
+      // Wait until the decline is actually blocked on the row lock.
+      const deadline = Date.now() + 5000
+      for (;;) {
+        const { rows: [w] } = await db.query<{ n: string }>(
+          `SELECT COUNT(*)::text AS n FROM pg_stat_activity
+            WHERE datname = current_database() AND wait_event_type = 'Lock'`)
+        if (Number(w.n) > 0) break
+        if (Date.now() > deadline) throw new Error('decline never waited on the lock')
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      expect(await Promise.race([settled, new Promise((r) => setTimeout(() => r('pending'), 50))])).toBe('pending')
+      await holder.query(
+        `UPDATE property_transfer_requests SET status = 'executed', executed_at = now() WHERE id = $1`, [requestId])
+      await holder.query('COMMIT')
+    } catch (e) {
+      await holder.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { holder.release() }
+
+    await expect(declined!).rejects.toThrow(/already went through/i)
+    const { rows: [r] } = await db.query<any>(
+      `SELECT status, cancelled_by FROM property_transfer_requests WHERE id=$1`, [requestId])
+    expect(r.status).toBe('executed')
+    expect(r.cancelled_by).toBeNull()
+    const { rows: [a] } = await db.query<any>(
+      `SELECT declined_at FROM property_transfer_approvals WHERE request_id=$1 AND user_id=$2`,
+      [requestId, f.seller.userId])
+    expect(a.declined_at).toBeNull()
+  })
+
+  it('a buyer accepting and a seller declining at the same moment never both succeed', async () => {
+    const f = await seedSale()
+    const { requestId } = await initiate(f)
+    await approveTransfer({ requestId, userId: f.seller.userId, code: await codeFor(requestId, f.seller.userId) })
+    const code = await buyerCode(requestId)
+    const [acc, dec] = await Promise.allSettled([
+      acceptTransfer({ requestId, userId: f.buyer.userId, code }),
+      declineTransfer(requestId, f.seller.userId),
+    ])
+    expect([acc.status, dec.status].filter((s) => s === 'fulfilled')).toHaveLength(1)
+    const { rows: [p] } = await db.query<any>(`SELECT landlord_id FROM properties WHERE id=$1`, [f.propertyId])
+    const { rows: [r] } = await db.query<any>(`SELECT status FROM property_transfer_requests WHERE id=$1`, [requestId])
+    if (dec.status === 'fulfilled') {
+      expect(r.status).toBe('cancelled')
+      expect(p.landlord_id).toBe(f.seller.landlordId)
+    } else {
+      expect(r.status).toBe('executed')
+      expect(p.landlord_id).toBe(f.buyer.landlordId)
+    }
+  })
+
+  it('a move between two companies of the same account needs no buyer step', async () => {
+    const f = await seedSale()
+    const { rows: [mine] } = await db.query<any>(
+      `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`, [f.seller.userId])
+    const { requestId, awaitingBuyer } = await initiateTransfer({
+      propertyId: f.propertyId, fromLandlordId: f.seller.landlordId,
+      toLandlordId: mine.id, byUserId: f.seller.userId,
+    })
+    expect(awaitingBuyer).toBe(false)
+    const res = await approveTransfer({ requestId, userId: f.seller.userId, code: await codeFor(requestId, f.seller.userId) })
+    expect(res.executed).toBe(true)
+    const { rows: [p] } = await db.query<any>(`SELECT landlord_id FROM properties WHERE id=$1`, [f.propertyId])
+    expect(p.landlord_id).toBe(mine.id)
+  })
+
+  it('a company the initiator does not own cannot be named as the receiver', async () => {
+    const f = await seedSale()
+    await expect(initiateTransfer({
+      propertyId: f.propertyId, fromLandlordId: f.seller.landlordId,
+      toLandlordId: f.buyer.landlordId, byUserId: f.seller.userId,
+    })).rejects.toThrow(/company you own/i)
+  })
+
+  it('a company with no member row can still raise a sale — its founding login confirms', async () => {
+    const f = await seedSale()   // no landlord_members row at all
+    const { requestId, approversNotified } = await initiate(f)
+    expect(approversNotified).toBe(1)
+    const { rows } = await db.query<any>(`SELECT user_id FROM property_transfer_approvals WHERE request_id=$1`, [requestId])
+    expect(rows.map((r: any) => r.user_id)).toEqual([f.seller.userId])
+  })
+
+  it('the buyer sees the incoming transfer — property and counts, no tenant names, no codes', async () => {
+    const f = await seedSale()
+    const { requestId } = await initiate(f)
+    const rows = await listIncomingTransfers(f.buyer.userId)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].id).toBe(requestId)
+    expect(rows[0].unit_count).toBe(1)
+    expect(rows[0].active_lease_count).toBe(1)
+    expect(rows[0].seller_required).toBe(1)
+    const flat = JSON.stringify(rows)
+    expect(flat).not.toMatch(/buyer_code|"code"/)
+    expect(await listIncomingTransfers(f.seller.userId)).toHaveLength(0)
   })
 })

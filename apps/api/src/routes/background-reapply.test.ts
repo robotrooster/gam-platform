@@ -105,3 +105,58 @@ describe('POST /api/background/reapply', () => {
     expect(res.status).toBe(409)
   })
 })
+
+// S655: a grandfather waiver is now the granting company's record, not a value
+// written onto the person's screening status. GET /status is the person's own
+// view: `status` still reads 'waived' (the tenant portal routes on it) while
+// `screenedStatus` reports the real result the marketplace must use.
+describe('GET /api/background/status — own view with a company waiver', () => {
+  async function seedResident(real: string) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { landlordId } = await seedLandlord(c)
+      const u = await c.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ($1, 'x', 'tenant', 'Sit', 'Ting', TRUE) RETURNING id`, [`st-${randomUUID()}@test.dev`])
+      const t = await c.query<{ id: string }>(
+        `INSERT INTO tenants (user_id, background_check_status) VALUES ($1, $2) RETURNING id`,
+        [u.rows[0].id, real])
+      await c.query('COMMIT')
+      return { landlordId, userId: u.rows[0].id, tenantId: t.rows[0].id }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+  const waive = (tenantId: string, landlordId: string) => db.query(
+    `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, screening_waived, screening_attested)
+     VALUES ($1, $2, 'not_uploaded', NULL, true, true)`, [landlordId, tenantId])
+
+  it('a waived resident with no check of their own reads waived; the real result is not_started', async () => {
+    const r = await seedResident('not_started')
+    await waive(r.tenantId, r.landlordId)
+    const res = await request(buildApp()).get('/api/background/status')
+      .set('Authorization', `Bearer ${sign(r.userId)}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('waived')
+    expect(res.body.data.screenedStatus).toBe('not_started')
+  })
+
+  it('a real approval or denial wins over a waiver', async () => {
+    for (const real of ['approved', 'denied', 'submitted']) {
+      const r = await seedResident(real)
+      await waive(r.tenantId, r.landlordId)
+      const res = await request(buildApp()).get('/api/background/status')
+        .set('Authorization', `Bearer ${sign(r.userId)}`)
+      expect(res.body.data.status).toBe(real)
+      expect(res.body.data.screenedStatus).toBe(real)
+    }
+  })
+
+  it('a cancelled waiver does not count', async () => {
+    const r = await seedResident('not_started')
+    await waive(r.tenantId, r.landlordId)
+    await db.query(`UPDATE pending_tenant_intents SET cancelled_at = NOW() WHERE tenant_id = $1`, [r.tenantId])
+    const res = await request(buildApp()).get('/api/background/status')
+      .set('Authorization', `Bearer ${sign(r.userId)}`)
+    expect(res.body.data.status).toBe('not_started')
+  })
+})

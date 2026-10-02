@@ -3640,29 +3640,20 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     required: ['applicationId'],
     confirmFirst: true,
   },
-  {
-    id: 'approve_property_transfer',
-    audience: 'landlord', method: 'POST',
-    path: '/api/properties/transfer-request/:requestId/approve',
-    pathParams: ['requestId'],
-    description:
-      'Accept a property somebody is transferring to this account. Use for "yes, take on the ' +
-      'duplex".\n' +
-      'This moves OWNERSHIP of a property, with its units, leases and tenants. Read back which ' +
-      'property and who it is coming from, and get an unambiguous yes — this is not something to do ' +
-      'off a "sure".',
-    params: { requestId: { type: 'string', description: 'The transfer request id, from a lookup.' } },
-    required: ['requestId'],
-    confirmFirst: true,
-  },
+  // S655: there is no agent action to ACCEPT or CONFIRM a property transfer.
+  // Both sides consent with a code emailed to that owner, on the Properties /
+  // Ownership pages — the owner's own consent, never the agent's (see
+  // actionGap DELIBERATE). Stopping one is safe, so that stays.
   {
     id: 'decline_property_transfer',
     audience: 'landlord', method: 'POST',
     path: '/api/properties/transfer-request/:requestId/decline',
     pathParams: ['requestId'],
     description:
-      'Turn down a property somebody is trying to transfer to this account. The property stays with ' +
-      'whoever holds it now. Offer to say why on their behalf if they want that.',
+      'Stop a property transfer: one this company is selling (any one owner can stop it), or one ' +
+      'somebody is transferring to this account. Nothing moves; the property stays with whoever ' +
+      'holds it now. Accepting or confirming a transfer is never yours to do — the owner enters ' +
+      'the code from their own email on the Properties page.',
     params: { requestId: { type: 'string', description: 'The transfer request id, from a lookup.' } },
     required: ['requestId'],
     confirmFirst: true,

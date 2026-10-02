@@ -25,12 +25,14 @@ import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { emailLoginCode } from '../services/email'
 import { logger } from '../lib/logger'
+import { signSessionToken, policyOfPass } from '../lib/sessionToken'
+import { claimInvitationsOnProvenAddress } from '../services/coOwnerInvites'
+import type { SessionPolicy } from '@gam/shared'
 
 export const emailOtpRouter = Router()
 
 const OTP_TTL_MINUTES = 10
 const PENDING_TTL_SECONDS = 15 * 60   // the session may outlive one code (allows a resend)
-const FULL_SESSION_TTL = '7d'
 const MAX_ATTEMPTS = 5
 const BCRYPT_ROUNDS = 10
 
@@ -44,6 +46,8 @@ interface EmailOtpClaims {
   businessId?: string | null
   staffRole?: string | null
   permissions?: unknown
+  /** S655: the session policy chosen at sign-in, carried to the full pass. */
+  sp?: SessionPolicy
 }
 
 export function signEmailOtpSessionToken(claims: EmailOtpClaims): string {
@@ -52,10 +56,6 @@ export function signEmailOtpSessionToken(claims: EmailOtpClaims): string {
     process.env.JWT_SECRET!,
     { expiresIn: PENDING_TTL_SECONDS }
   )
-}
-
-function signFullToken(payload: object): string {
-  return jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: FULL_SESSION_TTL })
 }
 
 /**
@@ -152,27 +152,45 @@ emailOtpRouter.post('/verify', async (req, res, next) => {
     // S578: completing an emailed code proves the user controls the address, so
     // it doubles as email verification. This lets signup's mandatory-2FA step
     // also verify the email (no separate link), and is a harmless no-op for an
-    // already-verified login.
-    await query(
+    // already-verified login. S655: RETURNING says whether THIS code was the
+    // address's first proof.
+    const firstVerification = (await query(
       `UPDATE users
           SET email_verified = TRUE,
               email_verified_at = COALESCE(email_verified_at, NOW()),
               updated_at = NOW()
-        WHERE id = $1 AND email_verified IS NOT TRUE`,
+        WHERE id = $1 AND email_verified IS NOT TRUE
+        RETURNING id`,
       [userId],
-    )
+    )).length > 0
 
-    const token = signFullToken({
+    // S655 SECURITY: the address is proven NOW, so this — not the signup form —
+    // is where an invited co-owner becomes an owner (services/coOwnerInvites.ts).
+    // Only for a landlord account with no company; never blocks the sign-in (the
+    // invite link still works if this fails). requireAuth refreshes landlordIds
+    // on every request anyway (S629); merging them here just makes the first
+    // pass right too.
+    let landlordIds = session.landlordIds ?? null
+    if (session.role === 'landlord') {
+      try {
+        const gained = await claimInvitationsOnProvenAddress(userId, { firstVerification })
+        if (gained.length > 0) landlordIds = Array.from(new Set([...(landlordIds ?? []), ...gained]))
+      } catch (err) {
+        logger.error({ err, userId }, '[emailOtp] co-owner invitation claim failed')
+      }
+    }
+
+    const token = signSessionToken({
       userId:      session.userId,
       role:        session.role,
       email:       session.email,
       profileId:   session.profileId,
       landlordId:  session.landlordId ?? null,
-      landlordIds: session.landlordIds ?? null,
+      landlordIds,
       businessId:  session.businessId ?? null,
       staffRole:   session.staffRole ?? null,
       permissions: session.permissions ?? null,
-    })
+    }, policyOfPass(session))
     res.json({
       success: true,
       data: {

@@ -116,7 +116,7 @@ export async function confirmDepositMatch(
 
     const txn = (await client.query(
       `SELECT id, landlord_id, amount::float AS amount,
-              to_char(posted_date,'YYYY-MM-DD') AS posted_date, status
+              to_char(posted_date,'YYYY-MM-DD') AS posted_date, status, landlord_other_income_id
          FROM bank_transactions WHERE id = $1 FOR UPDATE`,
       [input.bankTransactionId])).rows[0]
     if (!txn) throw new AppError(404, 'Bank transaction not found')
@@ -124,6 +124,16 @@ export async function confirmDepositMatch(
     // confirm would settle the same rent twice off one deposit.
     if (txn.status === 'matched') {
       throw new AppError(409, 'This deposit has already been matched')
+    }
+    // S655: and ONLY a deposit still waiting for review. A deposit already
+    // filed as income is already in the landlord's books — settling rent from
+    // it too would count the same money twice. A hidden copy (a relink
+    // duplicate), a pre-books row or a voided one is not a deposit to settle
+    // anything with.
+    if (txn.status !== 'needs_review' || txn.landlord_other_income_id) {
+      throw new AppError(409, txn.status === 'categorized' || txn.landlord_other_income_id
+        ? 'This deposit is already filed as income, so it can’t also pay rent — that would count it twice.'
+        : 'This deposit is hidden from review, so it can’t be matched to rent.')
     }
     if (!(txn.amount > 0)) {
       throw new AppError(400, 'Only a deposit can settle a charge')

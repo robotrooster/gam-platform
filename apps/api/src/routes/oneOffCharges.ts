@@ -4,6 +4,7 @@ import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canAccessLandlordResource } from '../middleware/scope'
+import { landlordScopeIds } from '../lib/landlordScope'
 
 // ============================================================
 // S616 (Nic) — charging for something that happened.
@@ -81,12 +82,15 @@ oneOffChargesRouter.post('/', requirePerm('payments.edit', 'properties.edit'),
 oneOffChargesRouter.get('/', requirePerm('payments.edit', 'properties.edit', 'payments.view_all'),
   async (req, res, next) => {
     try {
-      const landlordId = req.user!.role === 'landlord'
-        ? req.user!.profileId : req.user!.landlordId
-      if (!landlordId) return res.json({ success: true, data: [] })
+      // Every company this account owns (a team member: the one company they
+      // work for). This used to read profileId for an owner, which has named
+      // no company since S633 — so the Tenant page's charges card was always
+      // empty for owners.
+      const scope = landlordScopeIds(req.user!)
+      if (!scope.length) return res.json({ success: true, data: [] })
 
-      const params: any[] = [landlordId]
-      let where = 'c.landlord_id = $1'
+      const params: any[] = [scope]
+      let where = 'c.landlord_id = ANY($1::uuid[])'
       if (typeof req.query.tenantId === 'string') {
         params.push(req.query.tenantId)
         where += ` AND c.tenant_id = $${params.length}`

@@ -232,6 +232,47 @@ describe('guards', () => {
       .rejects.toThrow(/eviction mode/)
   })
 
+  // S655: only a deposit still in review settles rent. A deposit already filed
+  // as income is in the books once — settling rent off it too counts it twice.
+  it('refuses a deposit already filed as income', async () => {
+    const s = await buildStack()
+    await db.query(`UPDATE bank_transactions SET status='categorized' WHERE id=$1`, [s.txnId])
+    await expect(confirmDepositMatch({
+      bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'cash' }))
+      .rejects.toThrow(/already filed as income/)
+    expect((await rentRow(s.rentId)).status).toBe('pending')
+  })
+
+  // S655 review: the income it booked is what counts, not the status — a row a
+  // sync race once put back in review still has its income on file.
+  it('refuses a deposit that already booked income, even back in review', async () => {
+    const s = await buildStack()
+    const inc = (await db.query(
+      `INSERT INTO landlord_other_income (landlord_id, category, amount, income_date)
+       SELECT landlord_id, 'other', amount, posted_date FROM bank_transactions WHERE id = $1 RETURNING id`,
+      [s.txnId])).rows[0].id
+    await db.query(`UPDATE bank_transactions SET landlord_other_income_id = $2 WHERE id = $1`, [s.txnId, inc])
+    await expect(confirmDepositMatch({
+      bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'cash' }))
+      .rejects.toThrow(/already filed as income/)
+    expect((await rentRow(s.rentId)).status).toBe('pending')
+  })
+
+  it('refuses a hidden copy from an earlier link to the same bank', async () => {
+    const s = await buildStack()
+    const kept = (await db.query(
+      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, status)
+       SELECT bank_connection_id, landlord_id, $2, posted_date, amount, 'needs_review'
+         FROM bank_transactions WHERE id = $1 RETURNING id`, [s.txnId, randomUUID()])).rows[0].id
+    await db.query(
+      `UPDATE bank_transactions SET status='ignored', ignored_reason='duplicate', duplicate_of_id=$2 WHERE id=$1`,
+      [s.txnId, kept])
+    await expect(confirmDepositMatch({
+      bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'cash' }))
+      .rejects.toThrow(/hidden from review/)
+    expect((await rentRow(s.rentId)).status).toBe('pending')
+  })
+
   it('refuses an outflow', async () => {
     const s = await buildStack()
     await db.query(`UPDATE bank_transactions SET amount=-250 WHERE id=$1`, [s.txnId])

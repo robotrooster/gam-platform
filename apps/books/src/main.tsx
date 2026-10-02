@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue, readKeepSignedInChoice, rememberKeepSignedInChoice } from '@gam/shared'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -18,13 +18,20 @@ import axios from 'axios'
 import { formatCurrency, applyCamelizeInterceptor, humanize } from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
 
-const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
-const ADMIN_URL = (import.meta as any).env?.VITE_ADMIN_APP_URL || 'http://localhost:3003'
+const ENV = (import.meta as any).env || {}
+const API = ENV.VITE_API_URL || 'http://localhost:4000'
+const ADMIN_URL = ENV.VITE_ADMIN_APP_URL || 'http://localhost:3003'
+// S655: Books people are on the landlord side, so password recovery is there.
+const LANDLORD_URL = ENV.VITE_LANDLORD_APP_URL || (ENV.PROD ? 'https://landlord.goldassetmanagement.com' : 'http://localhost:3001')
 const api = axios.create({ baseURL: `${API}/api` })
-const TOKEN_KEYS = ['gam_admin_token', 'gam_books_token']
-const getToken = () => TOKEN_KEYS.map(k => localStorage.getItem(k)).find(Boolean) || null
+// S655: Books keeps ONE pass, its own. It used to also read 'gam_admin_token'
+// and take a pass from the web address (?token=), which is how the admin
+// console's "GAM Books" button handed over a super_admin pass in a URL — only
+// for Books to refuse it, since admins are kept out (S568).
+const TOKEN = 'gam_books_token'
+const getToken = () => localStorage.getItem(TOKEN)
 api.interceptors.request.use(c => { const t=getToken(); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
-api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401&&!e.config.url.includes('/auth/')){ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); window.location.href='/login' } return Promise.reject(e) })
+api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401&&!e.config.url.includes('/auth/')){ localStorage.removeItem(TOKEN); window.location.href='/login' } return Promise.reject(e) })
 // Inject active client header for bookkeepers
 api.interceptors.request.use(c=>{ const cid=localStorage.getItem('gam_books_client'); if(cid) c.headers['X-Client-Id']=cid; return c })
 // S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
@@ -39,7 +46,17 @@ const del=(url:string)=>api.delete(url).then(r=>r.data)
 // bookkeepers + business/POS operators.
 const ALLOWED_ROLES=['landlord','bookkeeper','business_owner','business_staff']
 interface AuthUser{id:string;email:string;role:string;firstName:string;lastName:string;landlordId?:string;activeClientId?:string;activeClientName?:string}
-interface AuthCtx{user:AuthUser|null;loading:boolean;activeClientId:string|null;activeClientName:string|null;setActiveClient:(id:string,name:string)=>void;login:(e:string,p:string)=>Promise<void>;logout:()=>void}
+const BOOKS_ONLY='GAM Books is for landlords, their bookkeepers, and business owners and staff.'
+// S655: every sign-in has a second step since S578 — the emailed code, or an
+// authenticator app. Books never had one, so nobody could sign in at all.
+type LoginResult={kind:'success'}|{kind:'totp_required';totpSession:string}|{kind:'email_otp_required';emailOtpSession:string}
+interface AuthCtx{user:AuthUser|null;loading:boolean;activeClientId:string|null;activeClientName:string|null;setActiveClient:(id:string,name:string)=>void
+  login:(e:string,p:string,keepSignedIn:boolean)=>Promise<LoginResult>
+  loginWithTotp:(totpSession:string,code:string)=>Promise<void>
+  loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>
+  resendEmailOtp:(emailOtpSession:string)=>Promise<void>
+  logout:()=>void}
+const toAuthUser=(u:any):AuthUser=>({id:u.id,email:u.email,role:u.role,firstName:u.firstName||'',lastName:u.lastName||'',landlordId:u.landlordId||undefined})
 const Ctx=createContext<AuthCtx>(null!)
 const useAuth=()=>useContext(Ctx)
 
@@ -47,27 +64,79 @@ function AuthProvider({children}:{children:React.ReactNode}){
   const[user,setUser]=useState<AuthUser|null>(null)
   const[loading,setLoading]=useState(true)
   const[activeClientId,setActiveClientId]=useState<string|null>(()=>localStorage.getItem('gam_books_client'))
-  const logout=React.useCallback(()=>{ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); delete api.defaults.headers.common['Authorization']; setUser(null) },[])
+  // S639 SECURITY: a change of identity empties the client cache, so one
+  // person's cached books never show under the next person's sign-in.
+  const _qc=useQueryClient()
+  const wipeCache=()=>{ try{ _qc.clear() }catch{ /* no cache yet */ } }
+  const logout=React.useCallback(()=>{ wipeCache(); localStorage.removeItem(TOKEN); delete api.defaults.headers.common['Authorization']; setUser(null) },[])
+
+  // S655: a Books sign-in ends 7 days after it started, even mid-task, unless
+  // "Keep me signed in on this device" was ticked. sessionRenewalDue() says no
+  // for a fixed pass, so this only ever renews a kept sign-in (the server
+  // refuses to extend a fixed one regardless) — on load and whenever Books
+  // comes back into view, once the pass is more than a day old.
+  const renewSession=React.useCallback(async()=>{
+    const current=getToken()
+    if(!sessionRenewalDue(current))return
+    try{
+      const r=await api.post('/auth/refresh',{})
+      // A sign-out (or another sign-in) while this was in flight wins.
+      if(getToken()!==current)return
+      const tk=r.data?.data?.token
+      if(!tk)return
+      localStorage.setItem(TOKEN,tk)
+      api.defaults.headers.common['Authorization']='Bearer '+tk
+    }catch(e){ if(isAuthRejection(e)) logout() }
+  },[logout])
+
   React.useEffect(()=>{
-    const params=new URLSearchParams(window.location.search)
-    const urlToken=params.get('token')
-    if(urlToken){ localStorage.setItem('gam_books_token',urlToken); window.history.replaceState({},'',window.location.pathname) }
     const t=getToken()
     if(!t){setLoading(false);return}
     api.defaults.headers.common['Authorization']='Bearer '+t
-    fetchAuthMeWithRetry(() => api.get('/auth/me')).then(res=>{
+    fetchAuthMeWithRetry(() => api.get('/auth/me')).then(async res=>{
       const u=res.data.data
       if(!u||!ALLOWED_ROLES.includes(u.role)){logout();return}
-      setUser({id:u.id,email:u.email,role:u.role,firstName:u.firstName||u.firstName||'',lastName:u.lastName||u.lastName||'',landlordId:u.landlordId||u.landlordId})
+      setUser(toAuthUser(u))
+      await renewSession()
     }).catch((e:any)=>{ if (isAuthRejection(e)) logout() }).finally(()=>setLoading(false))
-  },[logout])
-  const login=async(email:string,password:string)=>{
-    const res=await axios.post(`${API}/api/auth/login`,{email,password})
-    const{token:tk,user:u}=res.data.data
-    if(!u||!ALLOWED_ROLES.includes(u.role))throw new Error('GAM Books is for landlords, their bookkeepers, and business operators')
-    localStorage.setItem('gam_books_token',tk)
+  },[logout,renewSession])
+  React.useEffect(()=>{
+    const onVisible=()=>{ if(document.visibilityState==='visible') renewSession() }
+    document.addEventListener('visibilitychange',onVisible)
+    return()=>document.removeEventListener('visibilitychange',onVisible)
+  },[renewSession])
+
+  // The full pass from whichever step finished the sign-in.
+  const acceptPass=async(tk:string)=>{
+    wipeCache(); localStorage.setItem(TOKEN,tk)
     api.defaults.headers.common['Authorization']='Bearer '+tk
-    setUser({id:u.id,email:u.email,role:u.role,firstName:u.firstName||u.firstName||'',lastName:u.lastName||u.lastName||'',landlordId:u.landlordId||u.landlordId})
+    try{
+      const res=await fetchAuthMeWithRetry(() => api.get('/auth/me'))
+      const u=res.data.data
+      if(!u||!ALLOWED_ROLES.includes(u.role))throw new Error(BOOKS_ONLY)
+      setUser(toAuthUser(u))
+    }catch(e){ logout(); throw e }
+  }
+  // S655: portal 'books' — the server refuses anyone Books does not serve
+  // before any code is emailed, and signs in for a fixed length unless kept.
+  const login=async(email:string,password:string,keepSignedIn:boolean):Promise<LoginResult>=>{
+    const res=await axios.post(`${API}/api/auth/login`,{email,password,portal:'books',keepSignedIn})
+    const data=res.data.data
+    if(data.requiresTotp)return{kind:'totp_required',totpSession:data.totpSession as string}
+    if(data.requiresEmailOtp)return{kind:'email_otp_required',emailOtpSession:data.emailOtpSession as string}
+    await acceptPass(data.token)
+    return{kind:'success'}
+  }
+  const loginWithTotp=async(totpSession:string,code:string)=>{
+    const res=await axios.post(`${API}/api/auth/totp/verify`,{totpSession,code})
+    await acceptPass(res.data.data.token)
+  }
+  const loginWithEmailOtp=async(emailOtpSession:string,code:string)=>{
+    const res=await axios.post(`${API}/api/auth/email-otp/verify`,{emailOtpSession,code})
+    await acceptPass(res.data.data.token)
+  }
+  const resendEmailOtp=async(emailOtpSession:string)=>{
+    await axios.post(`${API}/api/auth/email-otp/resend`,{emailOtpSession})
   }
   const setActiveClient=(id:string,name:string)=>{
     localStorage.setItem('gam_books_client',id)
@@ -76,7 +145,7 @@ function AuthProvider({children}:{children:React.ReactNode}){
     setUser(u=>u?{...u,activeClientId:id,activeClientName:name}:u)
   }
   const activeClientName=localStorage.getItem('gam_books_client_name')
-  return<Ctx.Provider value={{user,loading,activeClientId,activeClientName,setActiveClient,login,logout}}>{children}</Ctx.Provider>
+  return<Ctx.Provider value={{user,loading,activeClientId,activeClientName,setActiveClient,login,loginWithTotp,loginWithEmailOtp,resendEmailOtp,logout}}>{children}</Ctx.Provider>
 }
 
 const qc=new QueryClient({defaultOptions:{queries:{retry:1,staleTime:15000}}})
@@ -2218,35 +2287,136 @@ function ComingSoon({title,icon,description}:{title:string;icon:string;descripti
 }
 
 // ── LOGIN ────────────────────────────────────────────────────────────
+// S655: remembered per browser so the box starts the way it was last left.
+const KEEP_SIGNED_IN_KEY='gam_books_keep_signed_in'
+
+// S639: the code step must survive leaving the page — a phone browser can
+// discard and reload the tab while someone reads the code in their mail app.
+// sessionStorage holds only the short-lived pre-sign-in pass, which is
+// worthless without the code.
+function usePendingOtpSession(key:string):[string|null,(v:string|null)=>void]{
+  const[v,setV]=useState<string|null>(()=>{ try{ return sessionStorage.getItem(key) }catch{ return null } })
+  const set=(next:string|null)=>{
+    setV(next)
+    try{ if(next) sessionStorage.setItem(key,next); else sessionStorage.removeItem(key) }catch{ /* private mode */ }
+  }
+  return[v,set]
+}
+
 function LoginPage(){
-  React.useEffect(()=>{ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); delete api.defaults.headers.common['Authorization'] },[])
-  const{login}=useAuth();const navigate=useNavigate()
+  React.useEffect(()=>{ localStorage.removeItem(TOKEN); delete api.defaults.headers.common['Authorization'] },[])
+  const{login,loginWithTotp,loginWithEmailOtp,resendEmailOtp}=useAuth();const navigate=useNavigate()
   const[email,setEmail]=useState('');const[pw,setPw]=useState('');const[err,setErr]=useState('');const[loading,setLoading]=useState(false)
+  const[keepSignedIn,setKeepSignedIn]=useState(()=>readKeepSignedInChoice(KEEP_SIGNED_IN_KEY))
+  const[totpSession,setTotpSession]=useState<string|null>(null)
+  const[emailOtpSession,setEmailOtpSession]=usePendingOtpSession('gam.otp.books.login')
+  const[code,setCode]=useState('');const[resent,setResent]=useState(false)
+
   const onSubmit=async(e:React.FormEvent)=>{
     e.preventDefault();setLoading(true);setErr('')
-    try{await login(email,pw);navigate('/dashboard')}
-    catch(ex:any){setErr(ex.response?.data?.error||ex.message||'Login failed')}
+    try{
+      rememberKeepSignedInChoice(KEEP_SIGNED_IN_KEY,keepSignedIn)
+      const r=await login(email,pw,keepSignedIn)
+      if(r.kind==='totp_required'){setTotpSession(r.totpSession);setCode('')}
+      else if(r.kind==='email_otp_required'){setEmailOtpSession(r.emailOtpSession);setCode('');setResent(false)}
+      else navigate('/dashboard')
+    }
+    catch(ex:any){setErr(ex.response?.data?.error||ex.message||'Sign-in failed')}
     finally{setLoading(false)}
   }
+
+  const backToCredentials=()=>{setTotpSession(null);setEmailOtpSession(null);setCode('');setPw('');setResent(false)}
+
+  const onCodeSubmit=async(e:React.FormEvent)=>{
+    e.preventDefault();setLoading(true);setErr('')
+    try{
+      if(emailOtpSession){await loginWithEmailOtp(emailOtpSession,code.trim());setEmailOtpSession(null)}
+      else await loginWithTotp(totpSession!,code.trim())
+      navigate('/dashboard')
+    }
+    catch(ex:any){
+      const msg=ex.response?.data?.error||ex.message||'Invalid code.'
+      setErr(msg)
+      // An expired sign-in, or a failure after the code was accepted, starts over.
+      if(/session/i.test(msg)||!ex.response)backToCredentials()
+    }
+    finally{setLoading(false)}
+  }
+
+  const onResend=async()=>{
+    setErr('');setResent(false)
+    try{await resendEmailOtp(emailOtpSession!);setResent(true)}
+    catch(ex:any){setErr(ex.response?.data?.error||'Could not resend the code.')}
+  }
+
+  const header=(
+    <div style={{textAlign:'center',marginBottom:40}}>
+      <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>📒 GAM Books</div>
+      <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Payroll & Bookkeeping · Gold Asset Management</div>
+    </div>
+  )
+
+  // ── Step 2: the emailed code, or the authenticator app ──────────────
+  if(totpSession||emailOtpSession){
+    return(
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+        <div style={{width:'100%',maxWidth:400}}>
+          {header}
+          <div className="card" style={{padding:24}}>
+            <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:14,lineHeight:1.6}}>
+              {emailOtpSession
+                ?'Enter the 6-digit code we emailed you.'
+                :'Enter the 6-digit code from your authenticator app, or one of your recovery codes.'}
+            </div>
+            {resent&&!err&&<div style={{marginBottom:14,fontSize:'.8rem',color:'var(--green)'}}>A new code is on its way.</div>}
+            {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
+            <form onSubmit={onCodeSubmit}>
+              <div className="frow"><label>Code</label>
+                <input type="text" value={code} onChange={e=>setCode(e.target.value)} autoFocus required
+                  autoComplete="one-time-code" inputMode="text" placeholder="123456"
+                  style={{textAlign:'center',letterSpacing:'.2em',fontFamily:'var(--font-m)'}}/>
+              </div>
+              <button className="bp btn" type="submit" disabled={loading||!code.trim()} style={{width:'100%',justifyContent:'center',marginTop:4}}>
+                {loading?<span className="spinner"/>:'Verify and sign in'}
+              </button>
+            </form>
+            <div style={{marginTop:14,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <button onClick={()=>{backToCredentials();setErr('')}} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.82rem',cursor:'pointer',textDecoration:'underline'}}>← Back to sign in</button>
+              {emailOtpSession&&<button onClick={onResend} style={{background:'none',border:'none',color:'var(--gold)',fontSize:'.82rem',cursor:'pointer',textDecoration:'underline'}}>Resend code</button>}
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Step 1: email and password ──────────────────────────────────────
   return(
     <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
       <div style={{width:'100%',maxWidth:400}}>
-        <div style={{textAlign:'center',marginBottom:40}}>
-          <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>📒 GAM Books</div>
-          <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Payroll & Bookkeeping · Gold Asset Management</div>
-        </div>
+        {header}
         <div className="card" style={{padding:24}}>
           {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
           <div className="alert agold" style={{marginBottom:20,fontSize:'.75rem'}}>Sign in with your GAM Landlord or Business credentials.</div>
           <form onSubmit={onSubmit}>
             <div className="frow"><label>Email</label><input type="email" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/></div>
             <div className="frow"><label>Password</label><input type="password" value={pw} onChange={e=>setPw(e.target.value)} required/></div>
+            {/* S655: off by default. Off, this sign-in ends 7 days after it
+                starts, even mid-task; on, it stays signed in while in use. */}
+            <label style={{display:'flex',alignItems:'flex-start',gap:8,marginBottom:16,cursor:'pointer',fontSize:'.82rem',color:'var(--t1)',lineHeight:1.45,textTransform:'none',letterSpacing:'normal',fontWeight:400}}>
+              <input type="checkbox" checked={keepSignedIn} onChange={e=>setKeepSignedIn(e.target.checked)} style={{width:'auto',marginTop:3,accentColor:'var(--gold)'}}/>
+              <span>Keep me signed in on this device
+                <span style={{display:'block',color:'var(--t3)',fontSize:'.74rem'}}>Leave this off on a shared computer. Off, you are signed out 7 days after you sign in.</span>
+              </span>
+            </label>
             <button className="bp btn" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center',marginTop:4}}>
               {loading?<span className="spinner"/>:'Sign in to GAM Books'}
             </button>
           </form>
         </div>
-        <div style={{textAlign:'center',marginTop:20}}><a href={ADMIN_URL} style={{color:'var(--t3)',fontSize:'.75rem'}}>← Back to Admin Console</a></div>
+        {/* S655: was "Back to Admin Console" — admins cannot use Books (S568),
+            and the people who can had no way back from a forgotten password. */}
+        <div style={{textAlign:'center',marginTop:20}}><a href={`${LANDLORD_URL}/forgot-password`} style={{color:'var(--t3)',fontSize:'.8rem'}}>Forgot your password?</a></div>
       </div>
     </div>
   )

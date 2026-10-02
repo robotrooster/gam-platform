@@ -9,6 +9,7 @@ import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, 
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
+import { IncomingTransfersCard } from '../components/IncomingTransfersCard'
 import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, cardFeeLabel, achFeeLabel, type FeePayer } from '@gam/shared'
 // Narrow KPI tiles use the compact format ($18,400 / $248.6K / $1.24M) so a
 // six-/seven-figure property (or portfolio sum) never overflows or resizes a card.
@@ -982,6 +983,10 @@ export function PropertiesPage() {
       </div>
 
       <ConnectReadinessBanner />
+
+      {/* S655: a property somebody is transferring to you waits here for you
+          to accept or decline — nothing moves until you do. */}
+      <IncomingTransfersCard />
 
       {/* Summary stats */}
       {(props as any[]).length > 0 && (

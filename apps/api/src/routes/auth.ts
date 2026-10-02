@@ -1,10 +1,11 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
-import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { db, query, queryOne } from '../db'
-import { UserRole, PLATFORM_FEE_GRACE_CYCLES, MIGRATION_WINDOW_DAYS, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN } from '@gam/shared'
+import { UserRole, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN, SIGN_IN_PORTAL_VALUES, type SignInPortal } from '@gam/shared'
+import { signSessionToken, renewSessionToken, sessionPolicyFor } from '../lib/sessionToken'
+import { createFoundingLandlordEntity, claimInvitationsOnProvenAddress } from '../services/coOwnerInvites'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp,
@@ -153,15 +154,29 @@ const loginSchema = z.object({
   email:    z.string().trim().toLowerCase().pipe(z.string().email()),
   password: z.string(),
   // S650: the portal the sign-in came from. Only the staff consoles change
-  // anything — see the staff gate in /login.
-  portal:   z.enum(['admin', 'admin_ops']).optional(),
+  // anything — see the per-portal gate in /login. S655: GAM Books names itself
+  // too, and every named portal signs in for a fixed length by default.
+  portal:   z.enum(SIGN_IN_PORTAL_VALUES).optional(),
+  // S655: "Keep me signed in on this device" on the admin console, Support and
+  // GAM Books. Ticked, the session renews while in use like every other portal;
+  // unticked, it ends SESSION_TTL_SECONDS after this sign-in. lib/sessionToken.ts.
+  keepSignedIn: z.boolean().optional(),
   // S654: the bill email's Pay now link vouches for the inbox — see
   // signEmailFactorToken. Optional; a stale or foreign one means the usual code.
   emailFactor: z.string().max(4000).optional(),
 })
 
-function signToken(payload: object) {
-  return jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '7d' })
+// S650/S655: who each named sign-in page admits, checked before any code is
+// emailed. Books matches its own ALLOWED_ROLES (apps/books) — S568: no admins.
+const PORTAL_ROLES: Record<SignInPortal, string[]> = {
+  admin:     ['admin', 'super_admin'],
+  admin_ops: ['admin', 'super_admin', 'portfolio_manager'],
+  books:     ['landlord', 'bookkeeper', 'business_owner', 'business_staff'],
+}
+const PORTAL_REFUSAL: Record<SignInPortal, string> = {
+  admin:     'This sign-in is for GAM staff accounts. Check the email address — landlords sign in at the landlord portal.',
+  admin_ops: 'This sign-in is for GAM staff accounts. Check the email address — landlords sign in at the landlord portal.',
+  books:     'GAM Books is for landlords, their bookkeepers, and business owners and staff. Check the email address you signed in with.',
 }
 
 // POST /api/auth/register
@@ -195,9 +210,9 @@ authRouter.post('/register', async (req, res, next) => {
         [body.email, hash, body.role, body.firstName, body.lastName, body.phone ?? null, devAutoVerify]
       ).then(r => r.rows)
 
-      let profileId: string
-      // S637: companies this account was INVITED into, claimed during signup.
-      let invitedLandlordIds: string[] = []
+      // Null for a landlord who was invited: they get no company here (S637)
+      // and claim the invited one once the address is proven (S655).
+      let profileId: string | null
       // Hoisted so the post-commit signup alert can read closer attribution.
       let closerId: string | null = null
       let referredByUserId: string | null = null
@@ -225,14 +240,6 @@ authRouter.post('/register', async (req, res, next) => {
               [uplineId, user.id])
           }
         }
-        // S568: open the onboarding reconciliation window (21 days). While it's
-        // open the landlord can mark a tenant's FIRST GAM invoice paid off-platform
-        // (old-system autopay overlap during a migration) — see landlords.reconciliation_until.
-        // S600: open the no-double-bill onboarding grace. billing_starts_at stays
-        // NULL (not billed) until the landlord goes live — first settled rent flips
-        // it (webhooks.ts), else the grace-cap cron flips it at billing_grace_until:
-        // first-of-month(signup) + PLATFORM_FEE_GRACE_CYCLES full cycles. Superadmin-
-        // extendable for long large-portfolio setups.
         // ── S637: AN INVITED CO-OWNER GETS ONE COMPANY, NOT TWO ───────────
         //
         // Nic: "Dusty only owns one company, but it's telling him he owns two.
@@ -247,54 +254,33 @@ authRouter.post('/register', async (req, res, next) => {
         // page it turned a one-click task into a choice between a real company
         // and a phantom.
         //
-        // An invitation addressed to this email is proof of why the account
-        // exists. Claim it BEFORE deciding whether a personal entity is
-        // warranted: if they were invited, the invited company IS their
-        // company and no second one is created.
-        const claimed = await client.query<{ landlord_id: string; invited_by_user_id: string | null }>(
-          `UPDATE landlord_member_invitations
-              SET status = 'accepted', accepted_at = now(),
-                  accepted_user_id = $2, updated_at = now()
+        // An invitation addressed to this email is why the account exists, so
+        // no personal company is created beside the invited one.
+        //
+        // S655 SECURITY: but registering only LOOKS at the invitation now. It
+        // used to accept it right here, before anything proved this person owns
+        // the address — so whoever registered an invited address first became
+        // an owner of that company with a password they chose, and the real
+        // partner's link said "already used". The invitation is accepted when
+        // the address is proven, at the emailed code a few seconds from now
+        // (services/coOwnerInvites.ts claimInvitationsOnProvenAddress). If the
+        // invitation is gone by then, that step makes this company instead.
+        const invited = (await client.query(
+          `SELECT 1 FROM landlord_member_invitations
             WHERE LOWER(email) = LOWER($1)
               AND status = 'pending'
               AND expires_at > now()
-            RETURNING landlord_id, invited_by_user_id`,
-          [user.email, user.id])
-        for (const inv of claimed.rows) {
-          await client.query(
-            `INSERT INTO landlord_members (landlord_id, user_id, role, added_by_user_id)
-             VALUES ($1, $2, 'owner', $3) ON CONFLICT (landlord_id, user_id) DO NOTHING`,
-            [inv.landlord_id, user.id, inv.invited_by_user_id ?? null])
-        }
-        invitedLandlordIds = claimed.rows.map(r => r.landlord_id)
+            LIMIT 1`,
+          [user.email])).rows.length > 0
 
         // Somebody joining an existing company needs no company of their own.
         // If they later buy property under their own name they can create one
         // deliberately, which is a better moment to name it than a signup form.
-        if (invitedLandlordIds.length > 0) {
-          profileId = invitedLandlordIds[0]
-        } else {
-        const [l] = await client.query(
-          // S624: migration_window_ends_at MUST be set here. It was not, and a
-          // NULL read as "window open forever" in the screening gate — so every
-          // landlord who signed up after the S623 backfill had the background-check
-          // requirement silently disabled for life, in contradiction of the
-          // published Terms (§9.2). Found on a real organic signup 15 minutes old.
-          `INSERT INTO landlords (user_id, portfolio_manager_id, referred_by_user_id, reconciliation_until, billing_grace_until,
-                                  business_name, ein, migration_window_ends_at)
-           VALUES ($1, $2, $3, NOW() + INTERVAL '21 days',
-                   (date_trunc('month', NOW()) + ($4::int * INTERVAL '1 month'))::date,
-                   $5, $6, NOW() + ($7::int * INTERVAL '1 day')) RETURNING id`,
-          [user.id, closerId, referredByUserId, PLATFORM_FEE_GRACE_CYCLES,
-           body.businessName ?? null, null, MIGRATION_WINDOW_DAYS]
-        ).then(r => r.rows)
-        profileId = l.id
-        // S553: founding owner-membership (multi-owner entities).
-        await client.query(
-          `INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1, $2, 'owner')
-           ON CONFLICT (landlord_id, user_id) DO NOTHING`,
-          [l.id, user.id])
-        }
+        profileId = invited
+          ? null
+          : await createFoundingLandlordEntity(client, {
+              userId: user.id, closerId, referredByUserId, businessName: body.businessName ?? null,
+            })
 
       } else {
         const [t] = await client.query(
@@ -322,12 +308,11 @@ authRouter.post('/register', async (req, res, next) => {
         userId: user.id, role: user.role, email: user.email,
         profileId: body.role === 'landlord' ? null : profileId,
         landlordId: null,
-        // S637: every company they were invited into, not just the first —
-        // an account can be a co-owner of more than one from the start.
-        landlordIds: body.role === 'landlord'
-          ? (invitedLandlordIds.length > 0 ? invitedLandlordIds : [profileId])
-          : null,
+        // S655: an invited signup owns nothing yet — the invited companies
+        // arrive when the code proves the address (see above).
+        landlordIds: body.role === 'landlord' ? (profileId ? [profileId] : []) : null,
         businessId: null, staffRole: null, permissions: null,
+        sp: sessionPolicyFor(user.role, null, false),
       })
       await issueEmailOtp(user.id, user.email)
 
@@ -484,7 +469,7 @@ async function sessionClaimsFor(user: any) {
 
 authRouter.post('/login', async (req, res, next) => {
   try {
-    const { email, password, portal, emailFactor } = loginSchema.parse(req.body)
+    const { email, password, portal, keepSignedIn, emailFactor } = loginSchema.parse(req.body)
     const user = await loadUserForSession('email', email)
     if (!user) throw new AppError(401, 'Invalid credentials')
 
@@ -556,13 +541,13 @@ authRouter.post('/login', async (req, res, next) => {
     // autofilled Nic's landlord address into the admin login, the password
     // matched that landlord account, and the 2FA code was emailed to the
     // landlord inbox — only to be refused after it was typed in.
-    const STAFF_ROLES: Record<string, string[]> = {
-      admin: ['admin', 'super_admin'],
-      admin_ops: ['admin', 'super_admin', 'portfolio_manager'],
+    // S655: GAM Books gets the same gate for its own people (S568: no admins).
+    if (portal && !PORTAL_ROLES[portal].includes(user.role)) {
+      throw new AppError(403, PORTAL_REFUSAL[portal])
     }
-    if (portal && !STAFF_ROLES[portal].includes(user.role)) {
-      throw new AppError(403, 'This sign-in is for GAM staff accounts. Check the email address — landlords sign in at the landlord portal.')
-    }
+    // S655: fixed-length or renewing — decided once, here, and carried on every
+    // pass this sign-in mints (pending, enrolment and full).
+    const sp = sessionPolicyFor(user.role, portal, keepSignedIn)
 
     // For landlord-assignable roles + business_staff, look up the scope
     // row to pull (landlordId | businessId) + permissions for the JWT
@@ -588,6 +573,7 @@ authRouter.post('/login', async (req, res, next) => {
         businessId,
         staffRole,
         permissions: scope?.permissions || null,
+        sp,
       })
       return res.json({
         success: true,
@@ -634,6 +620,7 @@ authRouter.post('/login', async (req, res, next) => {
         businessId,
         staffRole,
         permissions: scope?.permissions || null,
+        sp,
       })
       await issueEmailOtp(user.id, user.email)
       return res.json({
@@ -648,7 +635,7 @@ authRouter.post('/login', async (req, res, next) => {
     // server-side — not just by the client honoring mustEnrollTotp. S565: email
     // 2FA also satisfies the mandatory requirement, so it exempts from enroll.
     const mustEnroll = MANDATORY_TOTP_ROLES.has(user.role) && !user.totp_enabled && !user.email_2fa_enabled
-    const token = mustEnroll ? signTotpEnrollToken(claims) : signToken(claims)
+    const token = mustEnroll ? signTotpEnrollToken({ ...claims, sp }) : signSessionToken(claims, sp)
     res.json({
       success: true,
       data: { token, user: {
@@ -842,7 +829,10 @@ authRouter.post('/refresh', requireAuth, async (req, res, next) => {
     }
     assertPassPostdatesPasswordChange(req.user, user.sessions_valid_from)
     const { claims } = await sessionClaimsFor(user)
-    res.json({ success: true, data: { token: signToken(claims) } })
+    // S655: a fixed-length pass (admin console, Support, GAM Books without
+    // "Keep me signed in") is rebuilt here but keeps its original expiry, so no
+    // portal — not even one that renews automatically — can stretch it.
+    res.json({ success: true, data: { token: renewSessionToken(claims, req.user!) } })
   } catch (e) { next(e) }
 })
 
@@ -957,7 +947,7 @@ authRouter.post('/register-prospect', async (req, res, next) => {
       // sign-in needs the code, and the report is not viewable until the address
       // is verified.
       if (inline) {
-        const token = signToken(claims)
+        const token = signSessionToken(claims, sessionPolicyFor('tenant', null, false))
         return res.status(201).json({
           success: true,
           data: { requiresEmailOtp: false, token,
@@ -1104,12 +1094,22 @@ authRouter.post('/forgot-password', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// S655: an address just proven by a link from its own inbox (reset or
+// verification) — the same moment the emailed code is. A landlord account with
+// no company accepts the invitations waiting for that address here
+// (services/coOwnerInvites.ts). Best-effort: it never fails the request, and
+// the invite link and the next code sign-in both still do it.
+async function claimOnProvenAddress(userId: string, firstVerification: boolean): Promise<void> {
+  try { await claimInvitationsOnProvenAddress(userId, { firstVerification }) }
+  catch (err) { logger.error({ err, userId }, '[auth] co-owner invitation claim failed') }
+}
+
 // POST /api/auth/reset-password
 authRouter.post('/reset-password', async (req, res, next) => {
   try {
     const { token, newPassword } = resetPasswordSchema.parse(req.body)
-    const user = await queryOne<{ id: string }>(
-      `SELECT id FROM users
+    const user = await queryOne<{ id: string; email_verified: boolean | null }>(
+      `SELECT id, email_verified FROM users
         WHERE reset_token = $1
           AND reset_token_expires IS NOT NULL
           AND reset_token_expires > NOW()`,
@@ -1143,6 +1143,8 @@ authRouter.post('/reset-password', async (req, res, next) => {
         WHERE id = $2`,
       [hash, user.id],
     )
+    // S655: the same proof of the address accepts a waiting co-owner invitation.
+    await claimOnProvenAddress(user.id, user.email_verified !== true)
     res.json({ success: true, data: { message: 'Password updated. Please sign in with your new password.' } })
   } catch (e) { next(e) }
 })
@@ -1230,18 +1232,25 @@ authRouter.post('/verify-email', async (req, res, next) => {
   try {
     const { token } = verifyEmailSchema.parse(req.body)
     // Single-use: the same UPDATE clears the token. A replay sees
-    // email_verify_token=NULL and matches no row.
-    const r = await query<{ id: string }>(
-      `UPDATE users
+    // email_verify_token=NULL and matches no row. S655: `was_verified` says
+    // whether this link was the address's first proof.
+    const r = await query<{ id: string; was_verified: boolean | null }>(
+      `WITH prev AS (
+         SELECT id, email_verified FROM users WHERE email_verify_token = $1 FOR UPDATE
+       )
+       UPDATE users u
           SET email_verified = TRUE,
               email_verified_at = NOW(),
               email_verify_token = NULL,
               updated_at = NOW()
-        WHERE email_verify_token = $1
-        RETURNING id`,
+         FROM prev
+        WHERE u.id = prev.id
+        RETURNING u.id, prev.email_verified AS was_verified`,
       [token],
     )
     if (r.length === 0) throw new AppError(400, 'Verification link is invalid or already used')
+    // S655: the same proof of the address accepts a waiting co-owner invitation.
+    await claimOnProvenAddress(r[0].id, r[0].was_verified !== true)
     res.json({ success: true, data: { message: 'Email verified. You can now sign in.' } })
   } catch (e) { next(e) }
 })

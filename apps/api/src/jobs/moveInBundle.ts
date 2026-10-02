@@ -1,5 +1,5 @@
 import { DateTime } from 'luxon'
-import { prorateMoveInRent, nextDueDateAfter, LEASE_COLUMN_LABEL } from '@gam/shared'
+import { prorateMoveInRent, nextDueDateAfter, dayBefore, LEASE_COLUMN_LABEL } from '@gam/shared'
 import type { PoolClient } from 'pg'
 import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
 import { getClient, queryOne } from '../db'
@@ -189,10 +189,32 @@ export function existingTenancyFirstDue(
   return due >= anchor ? due : nextDueDateAfter(anchor, day)
 }
 
+export interface MoveInOpts {
+  /**
+   * The lease RENEWS one the household is already on (lease_documents.renews_lease_id).
+   *
+   * Nic: "people get billed on their due date according to how the landlord
+   * sets the property." A renewal is not a move-in, so this bill carries NO
+   * rent — the nightly run bills the renewal's rent on the household's own
+   * due dates (invoiceGeneration, isRenewalSuccessor). It bills only one-time
+   * money the landlord put on the renewal: a deposit increase (the S534
+   * top-up row) and any one-time fee typed on the form. With none of that,
+   * no invoice is written at all.
+   *
+   * It is dated the day before the new lease starts — the old lease's last
+   * day. That date can never be one of the new lease's rent dates (it bills
+   * nothing before its start), so the (lease, due date) slot stays free for
+   * the regular bill.
+   */
+  renewal?: boolean
+}
+
 export async function generateMoveInInvoice(
   inputs: MoveInInputs,
-  externalClient?: PoolClient
+  externalClient?: PoolClient,
+  opts: MoveInOpts = {},
 ): Promise<MoveInBundleResult> {
+  const renewal = opts.renewal === true
   // S548: booking-sourced leases prorate the arrival month by the days in it
   // (the calendar schedule the guest was quoted); regular leases keep the
   // long-standing days-remaining/days-in-month proration.
@@ -263,7 +285,8 @@ export async function generateMoveInInvoice(
   const bookingArrival = leaseMeta && isBookingScheduleLease(leaseMeta)
     ? bookingRentForDueDate(inputs.start_date, leaseMeta.end_date!, inputs.rent_amount, inputs.start_date)
     : null
-  const rentForMoveIn = bookingArrival != null
+  const rentForMoveIn = renewal ? 0
+    : bookingArrival != null
     ? roundHalfEvenCents(bookingArrival)
     // S648 (Nic): page 8 IS the move-in invoice. A new tenant is billed the
     // first month's rent and proration the landlord signed (specials
@@ -284,7 +307,9 @@ export async function generateMoveInInvoice(
   // that stuff is known. It's an existing tenancy. Late fees are there."
   // S652: the first time the resident's own due day comes round after signing
   // — the 1st of the cycle only when the 1st is their day.
-  const invoiceDueDate = leaseMeta?.is_existing_tenancy
+  const invoiceDueDate = renewal
+    ? dayBefore(inputs.start_date)
+    : leaseMeta?.is_existing_tenancy
     ? existingTenancyFirstDue(inputs.start_date, leaseMeta.first_billing_cycle, leaseMeta.rent_due_day, leaseMeta.property_added_on)
     : inputs.start_date
 
@@ -293,7 +318,7 @@ export async function generateMoveInInvoice(
   // it is made by the nightly job WHEN that cycle arrives — with the month's
   // meter reads on it. Making it at signing, weeks early, put an empty October
   // statement in Curtis Clabough's inbox on September 23rd.
-  if (leaseMeta?.is_existing_tenancy) {
+  if (leaseMeta?.is_existing_tenancy && !renewal) {
     const tzRow = await client.query<{ tz: string }>(
       `SELECT COALESCE(p.timezone, 'America/Phoenix') AS tz FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
       [inputs.unit_id])
@@ -349,11 +374,27 @@ export async function generateMoveInInvoice(
      WHERE lease_id = $1 AND due_timing = 'move_in'`,
     [inputs.lease_id]
   )
-  const fees = feesRes.rows as Array<{
+  const fees = (feesRes.rows as Array<{
     id: string; fee_type: string; amount: string; description: string | null
     // S653: what the landlord tagged the box as — fee / deposit / prepaid.
     money_kind: 'fee' | 'deposit' | 'prepaid'
-  }>
+  }>)
+    // A renewal's carried deposits are copied onto the new lease AFTER this
+    // runs (routes/esign.ts), and a $0 box is no charge; only what is owed now.
+    .filter(f => !renewal || Number(f.amount) > 0)
+
+  // A renewal with nothing one-time to bill writes no invoice at all — an
+  // empty bill is still a document in the tenant's portal and the landlord's
+  // books. Checked before an invoice number is spent.
+  if (renewal) {
+    const utilitiesWaiting = await client.query(
+      `SELECT 1 FROM utility_bills WHERE lease_id = $1 AND payment_id IS NULL
+          AND status IN ('unbilled','billed') AND charge_amount > 0 LIMIT 1`, [inputs.lease_id])
+    if (fees.length === 0 && utilitiesWaiting.rows.length === 0) {
+      if (ownsTx) client.release()
+      return { invoiceCreated: false, invoiceId: null, invoiceNumber: null, rentAmount: 0, moveInFeesInserted: 0, depositInserted: false }
+    }
+  }
 
   try {
     if (ownsTx) await client.query('BEGIN')
@@ -424,7 +465,9 @@ export async function generateMoveInInvoice(
     // system wide"). This path had the waiver but not the 20th, so a resident
     // signed on the 25th was exempt if billed overnight and fined if billed
     // at signing. A voided history invoice is not a prior bill (S654).
-    const startedAfter20th = DateTime
+    // A renewal is nobody's first bill on the platform: the S638 grace for
+    // people who need days to get set up does not apply to it.
+    const startedAfter20th = !renewal && DateTime
       .fromISO(leaseMeta?.lease_start_date ?? inputs.start_date,
         { zone: leaseMeta?.property_tz ?? 'America/Phoenix' }).day > 20
     const priorInvoice = await client.query<{ n: string }>(
@@ -432,8 +475,12 @@ export async function generateMoveInInvoice(
       [inputs.lease_id, invoiceDueDate])
     const isFirstInvoice = Number(priorInvoice.rows[0].n) === 0
     const onboardingWaived =
-      !!leaseMeta?.is_existing_tenancy && !!leaseMeta?.onboarding_late_fee_waiver
-    const lateFeeExempt = !!wtAgreement
+      !renewal && !!leaseMeta?.is_existing_tenancy && !!leaseMeta?.onboarding_late_fee_waiver
+    // A renewal signed after its own start is dated a day already gone; a fee
+    // for missing a bill nobody had sent yet is not a late fee (S647's reasoning).
+    const renewalBackdated = renewal
+      && invoiceDueDate < DateTime.now().setZone(leaseMeta?.property_tz ?? 'America/Phoenix').toISODate()!
+    const lateFeeExempt = !!wtAgreement || renewalBackdated
       || (isFirstInvoice && (onboardingWaived || startedAfter20th))
 
     const invoiceRes = await client.query(

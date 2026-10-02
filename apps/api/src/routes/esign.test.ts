@@ -573,7 +573,10 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
     const parse = (WRITABLE_LEASE_COLUMN_SPECS as any).rent_due_day.parse
     expect(parse({ rent_due_day: '15' })).toEqual({ rent_due_day: 15 })
     expect(parse({ rent_due_day: 'the 1st' })).toEqual({ rent_due_day: 1 })
-    expect(parse({ rent_due_day: '31st' })).toEqual({})
+    // Nic: "the 29th through the 31st are moved to be due on the first
+    // because not every month has those days and we don't want any skips."
+    expect(parse({ rent_due_day: '31st' })).toEqual({ rent_due_day: 1 })
+    expect(parse({ rent_due_day: '45th' })).toEqual({})
     expect(parse({})).toEqual({})
   })
 
@@ -836,6 +839,74 @@ describe('POST /documents/:id/send', () => {
         `INSERT INTO background_checks (tenant_id, user_id, landlord_id, unit_id, status, amount_charged, platform_net)
          VALUES ($1, $2, $3, $4, 'approved', 35, 35)`,
         [t.rows[0].id, f.tenantUserId, f.landlordId, f.unitId])
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(200)
+    })
+
+    // S655: each company's screening decision is its own. An approval another
+    // company ran never lets this company send a lease — even when the
+    // applicant ticked "share my screening" on it; a check run through GAM's
+    // renter-pool intake (the is_system pool account) with that consent does.
+    it('another company’s approval does not pass the gate', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
+      await setStart(documentId, tomorrow())
+      const t = await db.query<{ id: string }>(`SELECT id FROM tenants WHERE user_id = $1`, [f.tenantUserId])
+      const c = await db.connect()
+      let otherLandlordId: string
+      try { otherLandlordId = (await seedLandlord(c)).landlordId } finally { c.release() }
+      await db.query(
+        `INSERT INTO background_checks (tenant_id, user_id, landlord_id, status, amount_charged, platform_net)
+         VALUES ($1, $2, $3, 'approved', 35, 35)`,
+        [t.rows[0].id, f.tenantUserId, otherLandlordId])
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(409)
+      expect(res.body.error || res.body.message).toMatch(/background check/i)
+    })
+
+    it('another company’s approval with the share box ticked still does not pass the gate', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
+      await setStart(documentId, tomorrow())
+      const t = await db.query<{ id: string }>(`SELECT id FROM tenants WHERE user_id = $1`, [f.tenantUserId])
+      const c = await db.connect()
+      let otherLandlordId: string
+      try { otherLandlordId = (await seedLandlord(c)).landlordId } finally { c.release() }
+      await db.query(
+        `INSERT INTO background_checks (tenant_id, user_id, landlord_id, status, amount_charged, platform_net, consent_pool)
+         VALUES ($1, $2, $3, 'approved', 35, 35, TRUE)`,
+        [t.rows[0].id, f.tenantUserId, otherLandlordId])
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(409)
+      expect(res.body.error || res.body.message).toMatch(/background check/i)
+      expect(emailSigningRequestMock).not.toHaveBeenCalled()
+    })
+
+    it('a check the applicant ran through GAM’s renter pool passes the gate', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
+      await setStart(documentId, tomorrow())
+      const t = await db.query<{ id: string }>(`SELECT id FROM tenants WHERE user_id = $1`, [f.tenantUserId])
+      const c = await db.connect()
+      let poolLandlordId: string
+      try { poolLandlordId = (await seedLandlord(c)).landlordId } finally { c.release() }
+      await db.query(`UPDATE landlords SET is_system = true WHERE id = $1`, [poolLandlordId])
+      await db.query(
+        `INSERT INTO background_checks (tenant_id, user_id, landlord_id, status, amount_charged, platform_net, consent_pool)
+         VALUES ($1, $2, $3, 'approved', 35, 35, TRUE)`,
+        [t.rows[0].id, f.tenantUserId, poolLandlordId])
 
       const res = await request(buildApp())
         .post(`/api/esign/documents/${documentId}/send`)

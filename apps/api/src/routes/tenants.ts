@@ -5,7 +5,7 @@ import fs from 'fs'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth, requirePerm, userHasPerm } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { emailTenantInvite } from '../services/email'
@@ -13,7 +13,7 @@ import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
-import { applyScreeningWaive } from '../services/onboardingWindow'
+import { applyScreeningWaive, WAIVER_NOT_RECORDED_MESSAGE } from '../services/onboardingWindow'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { portalLink } from '../lib/portalUrls'
 
@@ -2309,8 +2309,9 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
 // the property's onboarding window is OPEN, only for an occupied unit's sitting
 // tenant, and only with the landlord's attestation that the person is an
 // existing resident. Outside the window there is no waive — every new applicant
-// screens. It sets background_check_status='waived' (the portal gate treats
-// that as pass) and records an audit trail. It deliberately does NOT touch the
+// screens. It records the waiver on this company's intent row (only this
+// account reads it as "screened"; the person's own screening status is never
+// touched) and records an audit trail. It deliberately does NOT touch the
 // tenant's intent unit_id (that would auto-draft a lease colliding with the
 // e-sign onboarding) — the grandfathered unit is recorded in a dedicated column.
 // See services/onboardingWindow.ts + memory gam-screening-grandfather-onboarding-window.
@@ -2335,8 +2336,28 @@ tenantsRouter.post('/:tenantId/waive-screening', requirePerm('tenants.invite'), 
     if (!unit || unit.property_id !== propertyId) {
       return res.status(400).json({ success: false, error: 'Unit does not belong to that property' })
     }
-    const tenant = await queryOne<{ id: string }>(`SELECT id FROM tenants WHERE id = $1`, [tenantId])
-    if (!tenant) return res.status(404).json({ success: false, error: 'Tenant not found' })
+    // The person must actually be coming onto THIS unit with THIS company: a
+    // live invite to it, or a lease on it. Before, any tenant id on GAM could
+    // be waived by any landlord with an open window — a brand-new landlord
+    // could mark a stranger (or someone denied elsewhere) as screened. Same 404
+    // for "no such person" and "not yours to waive", so it reveals nothing.
+    const onboarding = await queryOne<{ one: number }>(
+      `SELECT 1 AS one
+         FROM tenants t
+        WHERE t.id = $1
+          AND (EXISTS (SELECT 1 FROM pending_tenant_intents i
+                        WHERE i.tenant_id = t.id AND i.unit_id = $2
+                          AND i.landlord_id = $3 AND i.cancelled_at IS NULL)
+               OR EXISTS (SELECT 1 FROM lease_tenants lt
+                            JOIN leases l ON l.id = lt.lease_id
+                           WHERE lt.tenant_id = t.id AND l.unit_id = $2
+                             AND l.landlord_id = $3
+                             AND l.status IN ('active', 'pending')))`,
+      [tenantId, unitId, property.landlord_id])
+    if (!onboarding) {
+      return res.status(404).json({ success: false,
+        error: 'Tenant not found. Invite them to this unit first, then waive their screening.' })
+    }
 
     const result = await applyScreeningWaive({
       tenantId, landlordId: property.landlord_id, propertyId, unitId, byUserId: req.user!.userId,
@@ -2349,7 +2370,12 @@ tenantsRouter.post('/:tenantId/waive-screening', requirePerm('tenants.invite'), 
       if (result.reason === 'unit_taken') {
         return res.status(409).json({ success: false, error: 'This unit already has a grandfathered resident.' })
       }
+      if (result.reason === 'not_recorded') {
+        return res.status(409).json({ success: false, error: WAIVER_NOT_RECORDED_MESSAGE })
+      }
     }
+    // The waiver is this company's record; the person's own screening status
+    // is untouched (see services/onboardingWindow.ts recordWaiver).
     res.json({ success: true, data: { tenantId, status: 'waived' } })
   } catch (e) { next(e) }
 })
@@ -2358,40 +2384,77 @@ tenantsRouter.post('/:tenantId/waive-screening', requirePerm('tenants.invite'), 
 // this file, BEFORE tenantsRouter.use(requireAuth). See header
 // comment on the pre-auth public routes section.
 
-// GET /api/tenants/:id/profile — full lifetime tenant profile.
-// Authorization: tenant viewing themselves; admin/super_admin; or landlord
-// (or scoped team role) on any property where the tenant has a lease_tenants
-// row. Cross-tenant data (payments, maintenance, work-trade) is gated on this
-// check — pre-S71 the endpoint had no auth at all.
+// GET /api/tenants/:id/profile — a resident's profile.
+//
+// Who sees what:
+//  - the resident themselves and GAM admin: the person's whole GAM life;
+//  - a landlord, or a scoped staff member, who has had this person on one of
+//    their leases: ONLY what happened with their own company (or the other
+//    companies of the same account). Never another company's units, payments,
+//    maintenance, work trade or late marks.
+//
+// Before this the gate asked "is this landlord related to the person at all?"
+// and then every query filtered on tenant_id alone, so a landlord who got the
+// person onto one lease could read another company's rent history, its
+// payment notes, its maintenance notes and costs, plus the person's bank
+// last-4, date of birth and Stripe id off the whole tenants row. Every block
+// below now carries the same company scope, and a landlord or staff viewer
+// gets named fields only — the ones the Tenant page draws.
+//
+// S641 (Nic, on his on-site manager): "I don't want her to see ... the payment
+// histories from people." Staff without payments.view_all or books.view get no
+// payment history, no work trade and no money figures here.
 tenantsRouter.get('/:id/profile', async (req, res, next) => {
   try {
-    // Basic tenant info
-    const tenant = await queryOne<any>(`
+    const tenantRow = await queryOne<any>(`
       SELECT t.*, u.first_name, u.last_name, u.email, u.phone,
         u.created_at as account_created
       FROM tenants t
       JOIN users u ON u.id = t.user_id
       WHERE t.id = $1`, [req.params.id])
-    if (!tenant) throw new AppError(404, 'Tenant not found')
+    if (!tenantRow) throw new AppError(404, 'Tenant not found')
 
     const role = req.user!.role
     const isAdmin = role === 'admin' || role === 'super_admin'
     const isSelf = role === 'tenant' && req.user!.profileId! === req.params.id
+    // null = unrestricted (admin, self). Otherwise the companies this viewer
+    // may see that the person has actually been on a lease with.
+    let scope: string[] | null = null
     if (!isAdmin && !isSelf) {
-      // Find any landlord this tenant has a lease relationship with, then
-      // check if the calling user has access to that landlord's resources.
       const relatedLandlords = await query<{ landlord_id: string }>(`
         SELECT DISTINCT l.landlord_id
           FROM lease_tenants lt
           JOIN leases l ON l.id = lt.lease_id
          WHERE lt.tenant_id = $1
       `, [req.params.id])
-      const allowed = relatedLandlords.some(r =>
-        canAccessLandlordResource(req.user, r.landlord_id))
-      if (!allowed) throw new AppError(403, 'Forbidden')
+      scope = relatedLandlords
+        .map(r => r.landlord_id)
+        .filter(id => canAccessLandlordResource(req.user, id))
+      if (!scope.length) throw new AppError(403, 'Forbidden')
     }
+    const scoped = scope !== null
+    const seesPayments = !scoped || userHasPerm(req.user, 'payments.view_all', 'books.view')
 
-    // All units ever occupied (current + historical via lease_tenants)
+    // A landlord or staff viewer gets the fields the Tenant page uses and
+    // nothing else: no Stripe id, bank or routing digits, date of birth,
+    // mailing address, Flex enrollment or screening fields.
+    // ssi_ssdi stays exactly as it was (Nic is deciding on the badge).
+    const tenant = scoped
+      ? {
+          id: tenantRow.id,
+          user_id: tenantRow.user_id,
+          first_name: tenantRow.first_name,
+          last_name: tenantRow.last_name,
+          email: tenantRow.email,
+          phone: tenantRow.phone,
+          ach_verified: tenantRow.ach_verified,
+          ssi_ssdi: tenantRow.ssi_ssdi,
+          avatar_url: tenantRow.avatar_url,
+          account_created: tenantRow.account_created,
+        }
+      : tenantRow
+
+    // Units occupied — with this company only, for a scoped viewer.
     const units = await query<any>(`
       SELECT DISTINCT u.id, u.unit_number, u.rent_amount, u.status,
         p.name as property_name, p.street1, p.city, p.state,
@@ -2402,31 +2465,43 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
       WHERE lt.tenant_id = $1
-      ORDER BY is_current DESC, start_date DESC`, [req.params.id])
+        AND ($2::uuid[] IS NULL OR l.landlord_id = ANY($2::uuid[]))
+      ORDER BY is_current DESC, start_date DESC`, [req.params.id, scope])
 
-    // Full payment history across all units
-    const payments = await query<any>(`
-      SELECT p.*, u.unit_number, pr.name as property_name
+    const payments = !seesPayments ? [] : await query<any>(`
+      SELECT ${scoped
+        ? `p.id, p.type, p.amount, p.status, p.due_date, p.settled_at, p.processed_at,
+           p.manual_method, p.work_trade_suspended_at`
+        : 'p.*'}, u.unit_number, pr.name as property_name
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
       WHERE p.tenant_id = $1
+        AND ($2::uuid[] IS NULL OR p.landlord_id = ANY($2::uuid[]))
       ORDER BY p.due_date DESC
-      LIMIT 36`, [req.params.id])
+      LIMIT 36`, [req.params.id, scope])
 
     // Lifetime payment stats. S652 (Nic): lateCount is the number of charges
     // the credit ledger recorded as paid past grace — once per charge, the
     // same events the score reads. The old tenants.late_payment_count column
     // was bumped every morning a balance stayed open and is no longer kept.
-    const lateRow = await queryOne<{ n: string }>(
-      `SELECT ` + `(SELECT COUNT(*) FROM credit_events ce
-                JOIN credit_subjects cs ON cs.id = ce.subject_id
-               WHERE cs.subject_type = 'tenant' AND cs.subject_ref_id = $1
-                 AND ce.superseded_by IS NULL
-                 AND ce.event_type IN ('payment_received_late_minor','payment_received_late_major','payment_received_late_severe'))` + ` AS n`,
-      [req.params.id])
+    // A scoped viewer counts only late marks on THIS company's charges: the
+    // ledger event names the payment it was raised for. The ledger itself is
+    // unchanged.
+    const lateRow = !seesPayments ? null : await queryOne<{ n: string }>(
+      `SELECT COUNT(*)::text AS n
+         FROM credit_events ce
+         JOIN credit_subjects cs ON cs.id = ce.subject_id
+        WHERE cs.subject_type = 'tenant' AND cs.subject_ref_id = $1
+          AND ce.superseded_by IS NULL
+          AND ce.event_type IN ('payment_received_late_minor','payment_received_late_major','payment_received_late_severe')
+          AND ($2::uuid[] IS NULL OR EXISTS (
+                SELECT 1 FROM payments p
+                 WHERE p.id::text = ce.event_data->>'payment_id'
+                   AND p.landlord_id = ANY($2::uuid[])))`,
+      [req.params.id, scope])
     // S652 (Nic): a work-trade charge is paid in hours — it counts as paid.
-    const paymentStats = await queryOne<any>(`
+    const paymentStats = !seesPayments ? null : await queryOne<any>(`
       SELECT
         COUNT(*) as total_payments,
         COUNT(*) FILTER (WHERE status = 'settled' OR work_trade_suspended_at IS NOT NULL) as settled,
@@ -2435,26 +2510,49 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
         COALESCE(AVG(amount) FILTER (WHERE status = 'settled'), 0) as avg_payment,
         MIN(due_date) as first_payment,
         MAX(due_date) as last_payment
-      FROM payments WHERE tenant_id = $1`, [req.params.id])
+      FROM payments
+      WHERE tenant_id = $1
+        AND ($2::uuid[] IS NULL OR landlord_id = ANY($2::uuid[]))`, [req.params.id, scope])
 
-    // Maintenance requests
+    // Maintenance requests — this company's only, for a scoped viewer, and
+    // never its internal notes.
     const maintenance = await query<any>(`
-      SELECT mr.*, u.unit_number, p.name as property_name
+      SELECT ${scoped
+        ? 'mr.id, mr.title, mr.status, mr.priority, mr.created_at, mr.actual_cost'
+        : 'mr.*'}, u.unit_number, p.name as property_name
       FROM maintenance_requests mr
       LEFT JOIN units u ON u.id = mr.unit_id
       LEFT JOIN properties p ON p.id = u.property_id
       WHERE mr.tenant_id = $1
+        AND ($2::uuid[] IS NULL OR mr.landlord_id = ANY($2::uuid[]))
       ORDER BY mr.created_at DESC
-      LIMIT 20`, [req.params.id])
+      LIMIT 20`, [req.params.id, scope])
 
-    // Work trade agreements
-    const workTrade = await query<any>(`
-      SELECT wta.*, u.unit_number, p.name as property_name
+    // Work trade agreements (S641: a private arrangement — staff without the
+    // payment permissions do not get it).
+    const workTrade = !seesPayments ? [] : await query<any>(`
+      SELECT ${scoped
+        ? `wta.id, wta.status, wta.start_date, wta.end_date, wta.monthly_hours_target,
+           wta.tracks_hours, wta.covered_charges, wta.landlord_id`
+        : 'wta.*'}, u.unit_number, p.name as property_name
       FROM work_trade_agreements wta
       JOIN units u ON u.id = wta.unit_id
       JOIN properties p ON p.id = u.property_id
       WHERE wta.tenant_id = $1
-      ORDER BY wta.created_at DESC`, [req.params.id])
+        AND ($2::uuid[] IS NULL OR wta.landlord_id = ANY($2::uuid[]))
+      ORDER BY wta.created_at DESC`, [req.params.id, scope])
+
+    // S652: money that arrived before its bill — shown on the Tenant page so
+    // nobody posts it twice. (S652 wrote this into the avatar upload by
+    // mistake, so the page's "Paid ahead" line never had a number.) Scoped to
+    // this company's leases.
+    const paidAhead = Number((await queryOne<{ n: string }>(
+      `SELECT COALESCE(SUM(c.amount_remaining), 0)::text AS n
+         FROM lease_prepaid_credits c
+         JOIN leases l ON l.id = c.lease_id
+        WHERE c.tenant_id = $1 AND c.amount_remaining > 0
+          AND ($2::uuid[] IS NULL OR l.landlord_id = ANY($2::uuid[]))`,
+      [req.params.id, scope]))?.n ?? 0)
 
     // Lifetime metrics
     const firstPayment = paymentStats?.first_payment ? new Date(paymentStats.first_payment) : null
@@ -2473,7 +2571,11 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
         payments,
         maintenance,
         workTrade,
-        stats: {
+        paidAhead,
+        // True when this viewer may not see payment history (S641). The page
+        // hides the payment cards rather than drawing zeros.
+        paymentsHidden: !seesPayments,
+        stats: seesPayments ? {
           tenantMonths,
           totalPaid:    parseFloat(paymentStats?.total_paid || 0),
           avgPayment:   parseFloat(paymentStats?.avg_payment || 0),
@@ -2484,6 +2586,19 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
           onTimeRate,
           firstPayment: paymentStats?.first_payment,
           lastPayment:  paymentStats?.last_payment,
+          unitsOccupied: units.length,
+          maintenanceCount: maintenance.length,
+        } : {
+          tenantMonths: null,
+          totalPaid:    null,
+          avgPayment:   null,
+          settledCount: null,
+          failedCount:  null,
+          lateCount:    null,
+          totalPayments: null,
+          onTimeRate:   null,
+          firstPayment: null,
+          lastPayment:  null,
           unitsOccupied: units.length,
           maintenanceCount: maintenance.length,
         }

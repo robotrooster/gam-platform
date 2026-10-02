@@ -39,15 +39,12 @@ import {
   hashRecoveryCode,
   verifyRecoveryCode,
 } from '../lib/totp'
+import { signSessionToken, renewSessionToken, policyOfPass } from '../lib/sessionToken'
+import type { SessionPolicy } from '@gam/shared'
 
 export const totpRouter = Router()
 
 const TOTP_SESSION_TTL_SECONDS = 5 * 60   // 5 minutes
-const FULL_SESSION_TTL = '7d'
-
-function signFullToken(payload: object): string {
-  return jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: FULL_SESSION_TTL })
-}
 
 /**
  * Mint a short-lived TOTP-pending token. Holds the user context the
@@ -70,6 +67,8 @@ export function signTotpSessionToken(payload: {
   businessId?: string | null
   staffRole?: string | null
   permissions?: unknown
+  /** S655: the session policy chosen at sign-in, carried to the full pass. */
+  sp?: SessionPolicy
 }): string {
   return jwt.sign(
     { ...payload, purpose: 'totp_pending' },
@@ -214,7 +213,11 @@ totpRouter.post('/enroll-confirm', requireEnrollable, async (req, res, next) => 
     // S560: 2FA is now set up, so upgrade the (possibly enrollment-scoped)
     // session to a full token. The enroll token carries the same claims, so a
     // just-enrolled admin gets a working session without re-login.
-    const fullToken = signFullToken({
+    // S655: an enrollment pass is the tail of a sign-in, so it becomes a fresh
+    // pass under the policy chosen at that sign-in. A FULL session enrolling
+    // from settings is a renewal: a fixed pass keeps its original expiry, so
+    // enrolling is never a way to stretch a fixed sign-in.
+    const claims = {
       userId,
       role:        sess.role,
       email:       sess.email,
@@ -224,7 +227,10 @@ totpRouter.post('/enroll-confirm', requireEnrollable, async (req, res, next) => 
       businessId:  sess.businessId ?? null,
       staffRole:   sess.staffRole ?? null,
       permissions: sess.permissions ?? null,
-    })
+    }
+    const fullToken = sess.purpose === 'totp_enroll'
+      ? signSessionToken(claims, policyOfPass(sess))
+      : renewSessionToken(claims, sess)
     res.json({ success: true, data: { message: 'Two-factor authentication enabled.', token: fullToken } })
   } catch (e) { next(e) }
 })
@@ -349,8 +355,9 @@ totpRouter.post('/verify', async (req, res, next) => {
     }
 
     // Mint the full session JWT — same claim shape /login would
-    // issue had TOTP not been required.
-    const token = signFullToken({
+    // issue had TOTP not been required. S655: under the session policy chosen
+    // at sign-in (carried on the pending pass).
+    const token = signSessionToken({
       userId:      session.userId,
       role:        session.role,
       email:       session.email,
@@ -360,7 +367,7 @@ totpRouter.post('/verify', async (req, res, next) => {
       businessId:  (session as any).businessId ?? null,
       staffRole:   (session as any).staffRole ?? null,
       permissions: session.permissions ?? null,
-    })
+    }, policyOfPass(session))
 
     res.json({
       success: true,

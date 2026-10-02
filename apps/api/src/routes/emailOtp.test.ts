@@ -174,3 +174,38 @@ describe('tenant email-2FA (universal)', () => {
     expect(row.email_2fa_enabled).toBe(true) // flipped on during login
   })
 })
+
+// ── S655: the full pass carries the session policy chosen at sign-in ───────
+describe('S655 /email-otp/verify mints under the policy chosen at sign-in', () => {
+  it('a fixed sign-in becomes a fixed full pass, seven days from now', async () => {
+    const u = await seedOwner()
+    const session = signEmailOtpSessionToken({ userId: u.id, role: 'super_admin', email: u.email, profileId: null, sp: 'fixed' })
+    const code = await issueEmailOtp(u.id, u.email, { skipSend: true })
+    const res = await request(buildApp()).post('/api/auth/email-otp/verify').send({ emailOtpSession: session, code })
+    const decoded: any = jwt.decode(res.body.data.token)
+    expect(decoded.sp).toBe('fixed')
+    expect(decoded.exp - decoded.iat).toBe(7 * 24 * 3600)
+  })
+
+  it('"keep me signed in" (rolling) survives the code step', async () => {
+    const u = await seedOwner()
+    const session = signEmailOtpSessionToken({ userId: u.id, role: 'super_admin', email: u.email, profileId: null, sp: 'rolling' })
+    const code = await issueEmailOtp(u.id, u.email, { skipSend: true })
+    const res = await request(buildApp()).post('/api/auth/email-otp/verify').send({ emailOtpSession: session, code })
+    expect((jwt.decode(res.body.data.token) as any).sp).toBe('rolling')
+  })
+
+  it('a pending pass from before the change reads by role: staff fixed, tenant rolling', async () => {
+    const admin = await seedOwner()
+    const s1 = signEmailOtpSessionToken({ userId: admin.id, role: 'super_admin', email: admin.email, profileId: null })
+    const c1 = await issueEmailOtp(admin.id, admin.email, { skipSend: true })
+    const r1 = await request(buildApp()).post('/api/auth/email-otp/verify').send({ emailOtpSession: s1, code: c1 })
+    expect((jwt.decode(r1.body.data.token) as any).sp).toBe('fixed')
+
+    const t = await seedTenantUser({ enabled: true })
+    const s2 = signEmailOtpSessionToken({ userId: t.id, role: 'tenant', email: t.email, profileId: null })
+    const c2 = await issueEmailOtp(t.id, t.email, { skipSend: true })
+    const r2 = await request(buildApp()).post('/api/auth/email-otp/verify').send({ emailOtpSession: s2, code: c2 })
+    expect((jwt.decode(r2.body.data.token) as any).sp).toBe('rolling')
+  })
+})

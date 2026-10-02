@@ -506,6 +506,48 @@ describe('S636 — property binding from a scanned QR', () => {
   })
 })
 
+// S655: the last fallback took the property from the person's latest
+// application ANYWHERE, so a check run for company X could be tied to company
+// Y's park — and X's screening views then showed where else the person had
+// applied. Only an application to the company being screened for counts.
+describe('S655 — property binding from an older application is per company', () => {
+  const applyTo = (applicantUserId: string, landlordId: string, unitId: string, propertyId: string) =>
+    db.query(
+      `INSERT INTO unit_applications (unit_id, landlord_id, property_id, applicant_user_id, first_name, last_name, email)
+       VALUES ($1, $2, $3, $4, 'App', 'Licant', $5)`,
+      [unitId, landlordId, propertyId, applicantUserId, `app-${randomUUID()}@test.dev`])
+
+  it('an application to another company never binds this company’s check to that park', async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    const other = await seedFixture({ provider: 'mock' })
+    await applyTo(f.applicantUserId, other.landlordId, other.unitId, other.propertyId)
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(happyPayload({ landlordId: f.landlordId }))
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT property_id FROM background_checks WHERE id=$1`, [res.body.data.id])
+    expect(row.property_id).toBeNull()
+  })
+
+  it('an older application to this company still binds its property', async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    const other = await seedFixture({ provider: 'mock' })
+    await applyTo(f.applicantUserId, f.landlordId, f.unitId, f.propertyId)
+    // A newer application elsewhere does not win over it.
+    await applyTo(f.applicantUserId, other.landlordId, other.unitId, other.propertyId)
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(happyPayload({ landlordId: f.landlordId }))
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT property_id FROM background_checks WHERE id=$1`, [res.body.data.id])
+    expect(row.property_id).toBe(f.propertyId)
+  })
+})
+
 // ── S642: THE MONEY HAS TO REFLECT WHAT ACTUALLY HAPPENED ────────────────────
 //
 // Nic: "I don't know what the $40 is, but let's get it fixed because that's not

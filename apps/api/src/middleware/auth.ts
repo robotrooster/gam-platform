@@ -39,6 +39,15 @@ export interface AuthPayload {
   // requireAuth constrains such sessions to the register surface (see
   // isPosLimitedRequestAllowed). Absent/false on every normal session.
   posLimited?: boolean
+  // S655: 'fixed' — ends SESSION_TTL_SECONDS after sign-in, never extended;
+  // 'rolling' — renewed while in use. Absent on a pass minted before S655 (read
+  // through policyOfPass in lib/sessionToken.ts). Type only: requireAuth does
+  // not enforce it; jwt.verify already enforces exp, and /auth/refresh refuses
+  // to extend a fixed pass.
+  sp?: 'fixed' | 'rolling'
+  // Standard JWT times, present on every verified pass.
+  iat?: number
+  exp?: number
 }
 
 declare global {
@@ -390,6 +399,17 @@ const membershipCache = new Map<string, { ids: string[]; at: number }>()
 // was a default by another name; it is gone from the session, so nothing can
 // read it. See resolveLandlordTarget / landlordForRequest.
 export function _clearMembershipCache(): void { membershipCache.clear() }
+/**
+ * S655: drop one account's cached company list. Called right after something
+ * GIVES an account a company (accepting a co-owner invitation, the claim when
+ * an address is proven). The 15s TTL is the right bound for a removal, but a
+ * person who just accepted is told the company is in their account and clicks
+ * straight through to it — the page load before the accept filled this cache,
+ * so without this their next request would still be missing the company.
+ * Call it only AFTER the commit, or a concurrent request can refill it from
+ * the pre-commit rows.
+ */
+export function forgetMembership(userId: string): void { membershipCache.delete(userId) }
 
 async function currentLandlordIds(payload: AuthPayload): Promise<string[]> {
   const key = payload.userId

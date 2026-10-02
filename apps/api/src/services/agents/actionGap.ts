@@ -254,7 +254,12 @@ const DELIBERATE = new Map(Object.entries({
   'tenants POST /:id/transfer': 'retired at S20 — returns 501; a transfer is terminate + re-sign',
   'units DELETE /:id': 'GAM never erases — retire_unit is how a unit is removed',
   'books DELETE /transactions/:id': 'GAM never erases — correct it with update_book_transaction',
-  'properties POST /:id/transfer': 'moves ownership of a property to another account by email; owner-only, and too easy to aim at a mistyped address',
+  'properties POST /:id/transfer': 'raises a transfer of a property to another account by email; owner-only, and too easy to aim at a mistyped address',
+  // S655: confirming a sale (a selling owner) or accepting one (the buyer) is
+  // that owner's own consent, given with the code emailed to them. The agent
+  // never accepts anything on someone's behalf; it can stop a transfer.
+  'properties POST /transfer-request/:requestId/approve':
+    'confirms or accepts a property transfer with the code emailed to that owner — the owner\'s own consent, never the agent\'s',
   'esign PUT /templates/:id/fields': 'field geometry on a PDF — placed visually, not described',
   // S652: marking a document slot as "already in my lease" is bookkeeping for
   // what the Templates page shows — done on the page, where the slots and the

@@ -1775,6 +1775,12 @@ CREATE TABLE public.bank_transactions (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     landlord_other_income_id uuid,
+    ignored_reason text,
+    duplicate_of_id uuid,
+    bank_status text,
+    CONSTRAINT bank_transactions_bank_status_check CHECK (((bank_status IS NULL) OR (bank_status = ANY (ARRAY['pending'::text, 'posted'::text, 'void'::text])))),
+    CONSTRAINT bank_transactions_duplicate_points_at_original CHECK (((ignored_reason IS DISTINCT FROM 'duplicate'::text) OR (duplicate_of_id IS NOT NULL))),
+    CONSTRAINT bank_transactions_ignored_reason_check CHECK (((ignored_reason IS NULL) OR (ignored_reason = ANY (ARRAY['landlord'::text, 'before_books'::text, 'duplicate'::text, 'bank_void'::text])))),
     CONSTRAINT bank_transactions_status_check CHECK ((status = ANY (ARRAY['needs_review'::text, 'matched'::text, 'categorized'::text, 'ignored'::text])))
 );
 
@@ -1784,6 +1790,27 @@ CREATE TABLE public.bank_transactions (
 --
 
 COMMENT ON TABLE public.bank_transactions IS 'S570: normalized bank feed rows. needs_review→landlord categorizes; matched=GAM-known money (auto, hidden); categorized→landlord_expenses; ignored=dismissed. Idempotent on (connection, external_id).';
+
+
+--
+-- Name: COLUMN bank_transactions.ignored_reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bank_transactions.ignored_reason IS 'S655: why an ignored row is ignored — landlord (pressed Ignore), before_books (before landlords.books_start_date; moves with it), duplicate (a copy of duplicate_of_id), bank_void (the bank voided it). NULL when not ignored.';
+
+
+--
+-- Name: COLUMN bank_transactions.duplicate_of_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bank_transactions.duplicate_of_id IS 'S655: for ignored_reason = duplicate, the row that was kept (on the same physical account, usually another link).';
+
+
+--
+-- Name: COLUMN bank_transactions.bank_status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bank_transactions.bank_status IS 'S655: the bank''s own state (Stripe FC): pending / posted / void. NULL on rows imported before S655.';
 
 
 --
@@ -7105,9 +7132,17 @@ CREATE TABLE public.platform_transfer_intents (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     transferred_at timestamp with time zone,
     business_id uuid,
+    disbursement_id uuid,
     CONSTRAINT platform_transfer_intents_one_payee CHECK (((landlord_id IS NULL) <> (business_id IS NULL))),
     CONSTRAINT platform_transfer_intents_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'transferred'::text, 'failed'::text])))
 );
+
+
+--
+-- Name: COLUMN platform_transfer_intents.disbursement_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.platform_transfer_intents.disbursement_id IS 'S655: the payout (disbursements row) that carried this transfer from the landlord''s Stripe balance to their bank. NULL until paid out.';
 
 
 --
@@ -7410,6 +7445,7 @@ CREATE TABLE public.pos_customers (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     archived_at timestamp with time zone,
     created_from text DEFAULT 'manual'::text NOT NULL,
+    tenant_id uuid,
     CONSTRAINT pos_customers_created_from_check CHECK ((created_from = ANY (ARRAY['manual'::text, 'card_reader'::text])))
 );
 
@@ -8579,7 +8615,7 @@ CREATE TABLE public.property_transfer_requests (
     id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     property_id uuid NOT NULL,
     from_landlord_id uuid NOT NULL,
-    to_landlord_id uuid NOT NULL,
+    to_landlord_id uuid,
     initiated_by uuid NOT NULL,
     status text DEFAULT 'pending'::text NOT NULL,
     note text,
@@ -8590,6 +8626,11 @@ CREATE TABLE public.property_transfer_requests (
     cancelled_by uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    to_user_id uuid,
+    buyer_code text,
+    buyer_accepted_at timestamp with time zone,
+    buyer_accepted_by uuid,
+    CONSTRAINT property_transfer_requests_receiver_named CHECK (((to_landlord_id IS NOT NULL) OR (to_user_id IS NOT NULL))),
     CONSTRAINT property_transfer_requests_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'executed'::text, 'cancelled'::text, 'expired'::text])))
 );
 
@@ -8599,6 +8640,20 @@ CREATE TABLE public.property_transfer_requests (
 --
 
 COMMENT ON TABLE public.property_transfer_requests IS 'S605: a proposed property sale awaiting consent from every owner-member of the selling entity. Only a fully-approved request executes.';
+
+
+--
+-- Name: COLUMN property_transfer_requests.to_user_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.property_transfer_requests.to_user_id IS 'S655: the buyer''s login for a sale to another account. NULL for a move between companies of the same account.';
+
+
+--
+-- Name: COLUMN property_transfer_requests.buyer_accepted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.property_transfer_requests.buyer_accepted_at IS 'S655: when the receiving side accepted. Set at creation for a same-account move. Nothing executes without it.';
 
 
 --
@@ -15742,6 +15797,13 @@ CREATE INDEX idx_bank_transactions_connection ON public.bank_transactions USING 
 
 
 --
+-- Name: idx_bank_transactions_duplicate_of; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bank_transactions_duplicate_of ON public.bank_transactions USING btree (duplicate_of_id) WHERE (duplicate_of_id IS NOT NULL);
+
+
+--
 -- Name: idx_bank_transactions_external; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17485,6 +17547,13 @@ CREATE UNIQUE INDEX idx_leases_source_booking ON public.leases USING btree (sour
 
 
 --
+-- Name: idx_leases_supersedes; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_leases_supersedes ON public.leases USING btree (supersedes_lease_id) WHERE (supersedes_lease_id IS NOT NULL);
+
+
+--
 -- Name: idx_leases_unit; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17951,6 +18020,20 @@ CREATE INDEX idx_platform_revenue_ledger_reference ON public.platform_revenue_le
 --
 
 CREATE INDEX idx_platform_transfer_intents_pending ON public.platform_transfer_intents USING btree (created_at) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: idx_platform_transfer_intents_disbursement; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_transfer_intents_disbursement ON public.platform_transfer_intents USING btree (disbursement_id) WHERE (disbursement_id IS NOT NULL);
+
+
+--
+-- Name: idx_platform_transfer_intents_unpaid_out; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_transfer_intents_unpaid_out ON public.platform_transfer_intents USING btree (destination_connect_account_id, transferred_at) WHERE ((disbursement_id IS NULL) AND (status = 'transferred'::text));
 
 
 --
@@ -18976,6 +19059,13 @@ CREATE UNIQUE INDEX idx_transfer_request_one_pending ON public.property_transfer
 
 
 --
+-- Name: idx_transfer_request_to_user_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_transfer_request_to_user_pending ON public.property_transfer_requests USING btree (to_user_id) WHERE (status = 'pending'::text);
+
+
+--
 -- Name: idx_unit_applications_applicant_user_id; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -19823,6 +19913,13 @@ CREATE INDEX payments_work_trade_suspended_idx ON public.payments USING btree (i
 
 
 --
+-- Name: pending_tenant_intents_tenant_landlord_nounit_live_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pending_tenant_intents_tenant_landlord_nounit_live_key ON public.pending_tenant_intents USING btree (tenant_id, landlord_id) WHERE ((cancelled_at IS NULL) AND (unit_id IS NULL));
+
+
+--
 -- Name: pending_tenant_intents_tenant_nounit_live_key; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -19890,6 +19987,13 @@ CREATE INDEX pos_customer_cards_customer_idx ON public.pos_customer_cards USING 
 --
 
 CREATE UNIQUE INDEX pos_customers_email_landlord_uniq ON public.pos_customers USING btree (landlord_id, lower(email));
+
+
+--
+-- Name: pos_customers_landlord_tenant_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pos_customers_landlord_tenant_uniq ON public.pos_customers USING btree (landlord_id, tenant_id) WHERE ((archived_at IS NULL) AND (tenant_id IS NOT NULL));
 
 
 --
@@ -22121,6 +22225,14 @@ ALTER TABLE ONLY public.bank_reconciliations
 
 ALTER TABLE ONLY public.bank_transactions
     ADD CONSTRAINT bank_transactions_bank_connection_id_fkey FOREIGN KEY (bank_connection_id) REFERENCES public.bank_connections(id);
+
+
+--
+-- Name: bank_transactions bank_transactions_duplicate_of_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_transactions
+    ADD CONSTRAINT bank_transactions_duplicate_of_id_fkey FOREIGN KEY (duplicate_of_id) REFERENCES public.bank_transactions(id);
 
 
 --
@@ -25540,6 +25652,14 @@ ALTER TABLE ONLY public.platform_transfer_intents
 
 
 --
+-- Name: platform_transfer_intents platform_transfer_intents_disbursement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_transfer_intents
+    ADD CONSTRAINT platform_transfer_intents_disbursement_id_fkey FOREIGN KEY (disbursement_id) REFERENCES public.disbursements(id);
+
+
+--
 -- Name: platform_transfer_intents platform_transfer_intents_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25857,6 +25977,14 @@ ALTER TABLE ONLY public.pos_customer_invitations
 
 ALTER TABLE ONLY public.pos_customers
     ADD CONSTRAINT pos_customers_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: pos_customers pos_customers_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customers
+    ADD CONSTRAINT pos_customers_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
 
 
 --
@@ -26628,6 +26756,14 @@ ALTER TABLE ONLY public.property_transfer_approvals
 
 
 --
+-- Name: property_transfer_requests property_transfer_requests_buyer_accepted_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_transfer_requests
+    ADD CONSTRAINT property_transfer_requests_buyer_accepted_by_fkey FOREIGN KEY (buyer_accepted_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
 -- Name: property_transfer_requests property_transfer_requests_cancelled_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26673,6 +26809,14 @@ ALTER TABLE ONLY public.property_transfer_requests
 
 ALTER TABLE ONLY public.property_transfer_requests
     ADD CONSTRAINT property_transfer_requests_transfer_id_fkey FOREIGN KEY (transfer_id) REFERENCES public.property_transfers(id) ON DELETE SET NULL;
+
+
+--
+-- Name: property_transfer_requests property_transfer_requests_to_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_transfer_requests
+    ADD CONSTRAINT property_transfer_requests_to_user_id_fkey FOREIGN KEY (to_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --

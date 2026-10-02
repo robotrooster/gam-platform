@@ -61,6 +61,10 @@ export function PropertyDetailPage() {
   const navigate = useNavigate()
   const qc = useQueryClient()
   const [showAddUnit, setShowAddUnit] = useState(false)
+  // S655: where the OWNER's signing requests for this property go is the
+  // owner's call alone; staff never see the setting (the server refuses them
+  // too). Hook kept above the early returns — see S609 below.
+  const { isOwner } = usePerms()
 
   const { data: property, isLoading: propLoading } = useQuery(
     ['property', id], () => apiGet<any>(`/properties/${id}`)
@@ -217,7 +221,7 @@ export function PropertyDetailPage() {
       <CardFeePayerCard property={property} onSaved={() => { qc.invalidateQueries(['property', id]); qc.invalidateQueries('properties') }} />
       <PropertyFeeScheduleSection propertyId={property.id}
         unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
-      <PropertyLeaseSigningSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      {isOwner && <PropertyLeaseSigningSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />}
       {/* S558: the security-deposit multiplier is a LEASE term (set on the
             lease template, deposit = rent × template.deposit_months), not a
             property setting — the S556 property-level section was removed. */}

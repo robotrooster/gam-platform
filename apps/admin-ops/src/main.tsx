@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue, readKeepSignedInChoice, rememberKeepSignedInChoice } from '@gam/shared'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -17,7 +17,15 @@ import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient
 import axios from 'axios'
 import { applyCamelizeInterceptor, humanize } from '@gam/shared'
 
-const API = 'http://localhost:4000'
+// S655: read the deployed API address like every other portal. This was a bare
+// 'http://localhost:4000', so the live Support build (ops.goldassetmanagement.com)
+// sent every sign-in to the browser's own machine and nobody could sign in; the
+// VITE_API_URL in .env.production was never read.
+const ENV = (import.meta as any).env || {}
+const API = ENV.VITE_API_URL || 'http://localhost:4000'
+// The admin console's reset page serves Support too: the reset email routes by
+// the account's role, and the new password works on both consoles.
+const ADMIN_URL = ENV.VITE_ADMIN_APP_URL || (ENV.PROD ? 'https://admin.goldassetmanagement.com' : 'http://localhost:3003')
 const api = axios.create({ baseURL: `${API}/api` })
 const TOKEN = 'gam_admin_ops_token'
 api.interceptors.request.use(c => { const t=localStorage.getItem(TOKEN); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
@@ -34,7 +42,7 @@ type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:stri
 interface AuthCtx {
   user:AuthUser|null
   loading:boolean
-  login:(e:string,p:string)=>Promise<LoginResult>
+  login:(e:string,p:string,keepSignedIn:boolean)=>Promise<LoginResult>
   loginWithTotp:(totpSession:string,code:string)=>Promise<void>
   loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>
   resendEmailOtp:(emailOtpSession:string)=>Promise<void>
@@ -49,6 +57,25 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true)
   const logout = useCallback(() => { localStorage.removeItem(TOKEN); delete api.defaults.headers.common['Authorization']; setUser(null) }, [])
 
+  // S655: a sign-in here ends 7 days after it started, even mid-task, unless
+  // "Keep me signed in on this device" was ticked. sessionRenewalDue() says no
+  // for a fixed pass, so this only ever renews a kept sign-in (and the server
+  // refuses to extend a fixed one regardless). Renewed on load and whenever the
+  // page comes back into view, once the pass is more than a day old.
+  const renewSession = useCallback(async () => {
+    const current = localStorage.getItem(TOKEN)
+    if (!sessionRenewalDue(current)) return
+    try {
+      const r = await api.post('/auth/refresh', {}, { headers: { Authorization: 'Bearer ' + current } })
+      // A sign-out (or another sign-in) while this was in flight wins.
+      if (localStorage.getItem(TOKEN) !== current) return
+      const tk = r.data?.data?.token
+      if (!tk) return
+      localStorage.setItem(TOKEN, tk)
+      api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
+    } catch (e) { if (isAuthRejection(e)) logout() }
+  }, [logout])
+
   const refresh = useCallback(async () => {
     const t = localStorage.getItem(TOKEN)
     if (!t) { setLoading(false); return }
@@ -58,18 +85,26 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
       const u = res.data.data
       if (!u || (u.role !== 'admin' && u.role !== 'super_admin' && u.role !== 'portfolio_manager')) { logout(); return }
       setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||'', lastName:u.lastName||'', totpEnabled:!!u.totpEnabled, mustEnrollTotp:!!u.mustEnrollTotp })
+      // Renewed last, so a refused renewal signs out without a request still in flight.
+      await renewSession()
     } catch (e) { if (isAuthRejection(e)) logout() }  // S540: transient failures keep the token
     finally { setLoading(false) }
-  }, [logout])
+  }, [logout, renewSession])
 
   React.useEffect(() => { refresh() }, [refresh])
+  React.useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') renewSession() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [renewSession])
 
   // S289: post-credentials login. Returns a discriminated result so
   // LoginPage can pivot into the TOTP second step when 2FA is enabled
   // on the account. Doesn't set user state until the full JWT lands —
   // a totp_session JWT is not a valid auth token.
-  const login = async (email: string, password: string): Promise<LoginResult> => {
-    const res = await axios.post(`${API}/api/auth/login`, { email, password, portal: 'admin_ops' })
+  const login = async (email: string, password: string, keepSignedIn: boolean): Promise<LoginResult> => {
+    // S655: the choice rides inside the pending pass, so the code step needs nothing new.
+    const res = await axios.post(`${API}/api/auth/login`, { email, password, portal: 'admin_ops', keepSignedIn })
     const data = res.data.data
     if (data.requiresTotp) {
       return { kind: 'totp_required', totpSession: data.totpSession as string }
@@ -667,8 +702,12 @@ function Payments() {
 // S289: two-step login. Step 1 is email + password; if the backend
 // gates on 2FA the credentials call returns a totp_session and we
 // pivot to step 2 (6-digit authenticator code or a recovery code).
+// S655: remembered per browser so the box starts the way it was last left.
+const KEEP_SIGNED_IN_KEY = 'gam_admin_ops_keep_signed_in'
+
 function LoginPage() {
   const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp } = useAuth()
+  const [keepSignedIn, setKeepSignedIn] = useState(() => readKeepSignedInChoice(KEEP_SIGNED_IN_KEY))
   const navigate = useNavigate()
   React.useEffect(() => {
     localStorage.removeItem(TOKEN)
@@ -687,7 +726,8 @@ function LoginPage() {
   const onCredentialsSubmit = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setErr('')
     try {
-      const r = await login(email, pw)
+      rememberKeepSignedInChoice(KEEP_SIGNED_IN_KEY, keepSignedIn)
+      const r = await login(email, pw, keepSignedIn)
       if (r.kind === 'totp_required') { setTotpSession(r.totpSession); setCode('') }
       else if (r.kind === 'email_otp_required') { setEmailOtpSession(r.emailOtpSession); setCode(''); setResent(false) }
       else navigate('/onboarding')
@@ -784,13 +824,25 @@ function LoginPage() {
               <label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Email</label>
               <input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',outline:'none'}} type="email" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/>
             </div>
-            <div style={{marginBottom:16}}>
+            <div style={{marginBottom:14}}>
               <label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Password</label>
               <input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',outline:'none'}} type="password" value={pw} onChange={e=>setPw(e.target.value)} required/>
             </div>
+            {/* S655: off by default. Off, this sign-in ends 7 days after it
+                starts, even mid-task; on, it stays signed in while in use. */}
+            <label style={{display:'flex',alignItems:'flex-start',gap:8,marginBottom:16,cursor:'pointer',fontSize:'.82rem',color:'var(--t1)',lineHeight:1.45}}>
+              <input type="checkbox" checked={keepSignedIn} onChange={e=>setKeepSignedIn(e.target.checked)} style={{marginTop:3,accentColor:'var(--gold)'}}/>
+              <span>Keep me signed in on this device
+                <span style={{display:'block',color:'var(--t3)',fontSize:'.74rem'}}>Leave this off on a shared computer. Off, you are signed out 7 days after you sign in.</span>
+              </span>
+            </label>
             <button className="bp btn" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center'}}>
               {loading?<span className="spinner"/>:'Sign in'}
             </button>
+            {/* S655: Support had no way back in from a forgotten password. */}
+            <div style={{marginTop:12,textAlign:'center'}}>
+              <a href={`${ADMIN_URL}/forgot-password`} style={{color:'var(--t3)',fontSize:'.8rem'}}>Forgot your password?</a>
+            </div>
           </form>
         </div>
       </div>

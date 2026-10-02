@@ -652,6 +652,42 @@ export type BankConnectionStatus = typeof BANK_CONNECTION_STATUSES[number]
 export const BANK_TXN_STATUSES = ['needs_review', 'matched', 'categorized', 'ignored'] as const
 export type BankTxnStatus = typeof BANK_TXN_STATUSES[number]
 
+// S655 (Nic, Oak Park PNC relink): WHY an ignored row is ignored. One status
+// could not tell "the landlord dismissed it" from "it is before the books start"
+// from "it is a second copy of a row already on the feed", so moving the books
+// start date brought hidden copies back into review. Backs
+// bank_transactions.ignored_reason (migration 20261002172100_bank_txn_ignored_reason).
+//   landlord      the landlord pressed Ignore
+//   before_books  dated before the company's books start date (moves with it)
+//   duplicate     a copy of a row kept elsewhere (duplicate_of_id says which)
+//   bank_void     the bank voided it — it never happened
+export const BANK_TXN_IGNORED_REASONS = ['landlord', 'before_books', 'duplicate', 'bank_void'] as const
+export type BankTxnIgnoredReason = typeof BANK_TXN_IGNORED_REASONS[number]
+export const BANK_TXN_IGNORED_REASON_LABEL: Record<BankTxnIgnoredReason, string> = {
+  landlord: 'Ignored by you',
+  before_books: 'Before your books start date',
+  duplicate: 'A second copy of a transaction already on your feed',
+  bank_void: 'Voided by your bank',
+}
+// Reasons that keep a row out of the transaction log altogether: a copy, or a
+// transaction that never happened. Kept on file, never shown, never filed.
+export const BANK_TXN_HIDDEN_REASONS = ['duplicate', 'bank_void'] as const satisfies readonly BankTxnIgnoredReason[]
+
+// The bank's own state for a transaction (Stripe Financial Connections). Only
+// posted transactions become new rows; a stored row follows the bank when it
+// posts or is voided. NULL on rows imported before S655.
+export const BANK_TXN_BANK_STATUSES = ['pending', 'posted', 'void'] as const
+export type BankTxnBankStatus = typeof BANK_TXN_BANK_STATUSES[number]
+
+// S655: what a matched money-in row was matched TO — the page said "GAM payout"
+// for every matched row, including a tenant's own cash deposit.
+export const BANK_TXN_MATCH_KINDS = ['gam_payout', 'tenant_deposit'] as const
+export type BankTxnMatchKind = typeof BANK_TXN_MATCH_KINDS[number]
+export const BANK_TXN_MATCH_KIND_LABEL: Record<BankTxnMatchKind, string> = {
+  gam_payout: 'GAM payout',
+  tenant_deposit: 'Tenant’s bank deposit',
+}
+
 // How a categorized bank charge maps onto the expense model: to one unit, to the
 // property as a common cost, or to the property split across its units.
 export const MERCHANT_RULE_SCOPES = ['unit', 'property_common', 'property_allocate'] as const
@@ -4967,16 +5003,37 @@ export type FlexChargeStatementStatus = typeof FLEX_CHARGE_STATEMENT_STATUSES[nu
 // only on certain return codes — account-related failures (closed,
 // invalid, no account) are NOT retry-eligible because retrying won't
 // change the outcome. Zero-tolerance codes obviously can't retry.
-export const ACH_RETURN_CONFIG: Record<string, { zeroTolerance: boolean; retryEligible: boolean; description: string }> = {
-  R05: { zeroTolerance: true,  retryEligible: false, description: 'Unauthorized debit to consumer account' },
-  R07: { zeroTolerance: true,  retryEligible: false, description: 'Authorization revoked by customer' },
-  R10: { zeroTolerance: true,  retryEligible: false, description: 'Customer advises not authorized' },
-  R29: { zeroTolerance: true,  retryEligible: false, description: 'Corporate customer advises not authorized' },
-  R01: { zeroTolerance: false, retryEligible: true,  description: 'Insufficient funds' },
-  R09: { zeroTolerance: false, retryEligible: true,  description: 'Uncollected funds' },
-  R02: { zeroTolerance: false, retryEligible: false, description: 'Account closed' },
-  R03: { zeroTolerance: false, retryEligible: false, description: 'No account / unable to locate' },
-  R04: { zeroTolerance: false, retryEligible: false, description: 'Invalid account number' },
+//
+// `description` is the bank's own name for the code (what the records keep).
+// `plain` is how a person is told it: an email or a screen says "the account is
+// closed", never "R02" or "Customer advises not authorized".
+export const ACH_RETURN_CONFIG: Record<string, { zeroTolerance: boolean; retryEligible: boolean; description: string; plain: string }> = {
+  R05: { zeroTolerance: true,  retryEligible: false, description: 'Unauthorized debit to consumer account',    plain: 'the bank says this debit was not authorized' },
+  R07: { zeroTolerance: true,  retryEligible: false, description: 'Authorization revoked by customer',         plain: 'the account holder took back permission for this debit' },
+  R10: { zeroTolerance: true,  retryEligible: false, description: 'Customer advises not authorized',           plain: 'the account holder told the bank this debit was not authorized' },
+  R29: { zeroTolerance: true,  retryEligible: false, description: 'Corporate customer advises not authorized', plain: 'the account holder told the bank this debit was not authorized' },
+  R01: { zeroTolerance: false, retryEligible: true,  description: 'Insufficient funds',                        plain: 'there was not enough money in the account' },
+  R09: { zeroTolerance: false, retryEligible: true,  description: 'Uncollected funds',                         plain: 'the money in the account was not available yet' },
+  R02: { zeroTolerance: false, retryEligible: false, description: 'Account closed',                            plain: 'the account is closed' },
+  R03: { zeroTolerance: false, retryEligible: false, description: 'No account / unable to locate',             plain: 'the bank could not find the account' },
+  R04: { zeroTolerance: false, retryEligible: false, description: 'Invalid account number',                    plain: 'the account number is not valid' },
+}
+
+// S654: Stripe names a bank debit's failure (last_payment_error.code, or the
+// charge's failure_code) instead of handing over the NACHA R-code. Read only by
+// code, every live bounce looked unreadable — and an unreadable reason is
+// treated as final, so "not enough money this week" never got its two retries
+// and the tenant was told at once that it could not be tried again. Each name
+// maps to the R-code whose rules it carries. Several zero-tolerance codes
+// (R05, R07, R10, R29) all arrive as `debit_not_authorized`; R10 stands for them,
+// and none of them is ever retried, so the choice cannot change an outcome.
+// Confirm against the first live bounce (or a Stripe test-mode failing account).
+export const STRIPE_ACH_FAILURE_CODE_TO_RETURN_CODE: Record<string, string> = {
+  insufficient_funds:     'R01',
+  account_closed:         'R02',
+  no_account:             'R03',
+  invalid_account_number: 'R04',
+  debit_not_authorized:   'R10',
 }
 
 // ── UTILITY FUNCTIONS ──────────────────────────────────────
@@ -6659,32 +6716,14 @@ export function isAuthRejection(e: any): boolean {
   return s === 401 || s === 403
 }
 
+// S654/S655: session lifetime — which sign-ins renew while in use
+// (sessionRenewalDue) and which end a set time after they started (the `sp`
+// claim, FIXED_SESSION_ROLES / FIXED_SESSION_PORTALS). See sessionRenewal.ts.
+export * from './sessionRenewal'
+
 // Ride out short API restarts (~12s window at the defaults). Auth
 // rejections re-throw immediately; other errors retry, then re-throw
 // the last one so callers can decide (they should keep the token).
-/**
- * S654 (Nic): "your most recent deploy signed me out." A session was a fixed
- * 7-day pass from the last password sign-in, never renewed, so every account
- * was thrown out on the seventh day mid-task. Each portal renews a pass that
- * is more than a day old on load and whenever it comes back into view, so a
- * session ends only after seven IDLE days. This reads the pass's own issue
- * time (the JWT `iat`; no secret needed) and says whether renewal is due. A
- * dead pass, or a pending/enrolment pass (it carries a `purpose`), is never
- * renewed — those take the sign-in path.
- */
-export function sessionRenewalDue(token: string | null | undefined, minAgeMs = 24 * 60 * 60 * 1000): boolean {
-  if (!token || typeof atob !== 'function') return false
-  try {
-    const part = token.split('.')[1]
-    if (!part) return false
-    const p = JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')))
-    if (!p || typeof p.iat !== 'number' || p.purpose) return false
-    const now = Date.now()
-    if (typeof p.exp === 'number' && p.exp * 1000 <= now) return false
-    return now - p.iat * 1000 > minAgeMs
-  } catch { return false }
-}
-
 export async function fetchAuthMeWithRetry<T>(
   fetchMe: () => Promise<T>,
   attempts = 5,

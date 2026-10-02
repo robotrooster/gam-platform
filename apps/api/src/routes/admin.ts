@@ -4011,9 +4011,16 @@ adminInviteRouter.post('/:token/accept', async (req, res, next) => {
       }
 
       const hash = await bcrypt.hash(body.password, 12)
+      // S655: the address is verified at creation. This link was mailed only to
+      // that address and is 64 random characters, so opening it proves the inbox
+      // exactly as a verification link would (the S650 password-reset reasoning).
+      // Without it the new admin's first sign-in was refused with "Please verify
+      // your email" — Ben Layton accepted on Sept 5 and was still locked out,
+      // unverified, a month later.
       const user = (await client.query(
-        `INSERT INTO users (email, password_hash, role, first_name, last_name)
-         VALUES (lower($1), $2, $3, $4, $5) RETURNING id, email, role`,
+        `INSERT INTO users (email, password_hash, role, first_name, last_name,
+                            email_verified, email_verified_at)
+         VALUES (lower($1), $2, $3, $4, $5, TRUE, NOW()) RETURNING id, email, role`,
         [inv.email, hash, inv.role, body.firstName, body.lastName])).rows[0]
 
       await client.query(

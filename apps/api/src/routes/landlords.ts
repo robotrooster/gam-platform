@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requireAdmin, requireLandlord, requirePerm, getScopedPropertyIds } from '../middleware/auth'
+import { requireAuth, requireAdmin, requireLandlord, requirePerm, getScopedPropertyIds, forgetMembership } from '../middleware/auth'
 import { canAccessLandlordResource, canViewLandlordFinances, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 // S633 — the account is not an entity. Reads span every company the account
@@ -14,7 +14,7 @@ import { collectedRentMtd } from '../lib/rentCollected'
 import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue, emailSigningRequest } from '../services/email'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { createNotification } from '../services/notifications'
-import { applyScreeningWaive, listOnboardingWindowsForLandlord, openOnboardingWindow } from '../services/onboardingWindow'
+import { applyScreeningWaive, listOnboardingWindowsForLandlord, openOnboardingWindow, approvedCheckForAccountSql, screeningWaivedByAccountSql } from '../services/onboardingWindow'
 import { scheduleParserJob } from '../jobs/leaseParser/runParserJob'
 import { resolveIntent, accountTiedElsewhere, NOT_A_RESIDENT_ACCOUNT } from '../jobs/leaseParser/resolveIntent'
 import { parse as parseCsv } from 'csv-parse/sync'
@@ -30,6 +30,7 @@ import {
 } from '../lib/csvImportMappings'
 import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT, occupancyRateFrom, WORK_TRADE_COVERABLE, timezoneForState, labelFor, FALLBACK_TIMEZONE } from '@gam/shared'
 import { emailPmPropertyInvitation, emailLandlordCoOwnerInvitation } from '../services/email'
+import { acceptCoOwnerInvitation } from '../services/coOwnerInvites'
 import { platformFeesByPropertyForEntities, periodMonths } from '../services/platformFee'
 import {
   sendPropertyInvitation, acceptPropertyInvitation,
@@ -66,18 +67,32 @@ landlordsRouter.get('/member-invite/:token', async (req, res, next) => {
   try {
     const inv = await queryOne<any>(
       `SELECT i.id, i.email, i.expires_at, i.status, l.business_name,
-              u.first_name, u.last_name
+              u.first_name, u.last_name,
+              EXISTS (SELECT 1 FROM landlord_members m
+                       WHERE m.landlord_id = i.landlord_id
+                         AND m.user_id = i.accepted_user_id) AS acceptor_still_owner
          FROM landlord_member_invitations i
          JOIN landlords l ON l.id = i.landlord_id
          JOIN users u ON u.id = i.invited_by_user_id
         WHERE i.token = $1`, [req.params.token])
-    if (!inv || inv.status !== 'pending' || new Date(inv.expires_at) < new Date()) {
+    // S655: a USED invitation is not a bad link. Registering with the invited
+    // address and entering the emailed code accepts it (services/coOwnerInvites),
+    // and then the registration redirect — or the person reopening their email —
+    // lands here. Saying "expired or already used" to someone who is now an
+    // owner reads as being locked out. Say it was accepted; the accept call
+    // below confirms it for the person who accepted it.
+    // Only while that person is STILL an owner: removing an owner deletes the
+    // membership but leaves the invitation marked accepted, and the old link
+    // must not go on saying they own the company.
+    const accepted = inv?.status === 'accepted' && inv.acceptor_still_owner === true
+    if (!inv || (!accepted && (inv.status !== 'pending' || new Date(inv.expires_at) < new Date()))) {
       throw new AppError(404, 'That invitation has expired or already been used. Ask your partner to send a new one.')
     }
     res.json({ success: true, data: {
       email: inv.email,
       entityName: inv.business_name,
       invitedBy: [inv.first_name, inv.last_name].filter(Boolean).join(' ').trim(),
+      accepted,
     } })
   } catch (e) { next(e) }
 })
@@ -2081,10 +2096,16 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     // S593: listings-marketplace applicants (real accounts) with no lease drafted
     // yet — the long-term acquisition channel joining the SAME onboarding funnel
     // as invites + imports, so both public surfaces converge on one to-do list.
+    // "Passed screening" is what THIS account knows: a check run for one of
+    // its companies, a check run through GAM's renter pool (never another
+    // company's own check, share box or not), or this account's own
+    // grandfather waiver. Never the person's platform-wide
+    // status, which carried other companies' verdicts.
     const applicantRows = await query<any>(`
       SELECT a.id, a.first_name, a.last_name,
              un.unit_number, p.name AS property_name,
-             t.background_check_status
+             (${approvedCheckForAccountSql('t.id', 'a.applicant_user_id', 'a.landlord_id')}
+              OR ${screeningWaivedByAccountSql('t.id', 'a.landlord_id')}) AS screened
         FROM unit_applications a
         JOIN units un ON un.id = a.unit_id
         JOIN properties p ON p.id = un.property_id
@@ -2098,7 +2119,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     for (const a of applicantRows as any[]) {
       const who = [a.first_name, a.last_name].filter(Boolean).join(' ') || 'Applicant'
       const where = a.unit_number ? ' — Unit ' + a.unit_number + (a.property_name ? ' (' + a.property_name + ')' : '') : ''
-      const screened = ['approved', 'waived'].includes(a.background_check_status)
+      const screened = a.screened === true
       onboarding.push({
         id: 'application-' + a.id,
         type: 'new_applicant',
@@ -2142,6 +2163,25 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
                  JOIN units u2 ON u2.id = mh.unit_id
                 WHERE u2.property_id = p.id)
     `, [scopeIds]).catch(() => [])
+
+    // S655: a property somebody is transferring to THIS login waits on the
+    // buyer's acceptance now. It expires in 7 days, so it goes first.
+    try {
+      const { listIncomingTransfers } = await import('../services/propertyTransfer')
+      const incoming = await listIncomingTransfers(userId)
+      for (const t of incoming.reverse()) {
+        onboarding.unshift({
+          id: 'transfer-' + t.id,
+          type: 'incoming_property_transfer',
+          title: `Accept or decline ${t.property_name}`,
+          subtitle: `${t.seller_name} wants to transfer ${t.property_name} to you. Nothing moves until you `
+            + `accept with the code from your email.`,
+          href: '/properties',
+        })
+      }
+    } catch (err) {
+      logger.error({ err }, '[todos] incoming property transfers failed')
+    }
 
     const homeInventory = homeInventoryRows.map((r: any) => ({
       id: r.id,
@@ -3578,13 +3618,20 @@ landlordsRouter.delete('/me/pending-tenants/:intentId', requirePerm('tenant_onbo
     // 79 waivers wrongly cancelled earlier in this session are why that
     // distinction is written down). It stops being something to chase, and the
     // audit survives.
+    //
+    // Only THIS company's waiver row. It used to close the person's waiver rows
+    // at every company, so one landlord backing out of an invite cancelled
+    // another landlord's grandfather record.
     const closedWaivers = await query<{ id: string }>(
-      `UPDATE pending_tenant_intents
+      `UPDATE pending_tenant_intents w
           SET cancelled_at = NOW(), updated_at = NOW()
-        WHERE tenant_id = (SELECT tenant_id FROM pending_tenant_intents WHERE id = $1)
-          AND unit_id IS NULL AND screening_waived
-          AND resolved_at IS NULL AND cancelled_at IS NULL
-        RETURNING id`,
+         FROM pending_tenant_intents src
+        WHERE src.id = $1
+          AND w.tenant_id = src.tenant_id
+          AND w.landlord_id = src.landlord_id
+          AND w.unit_id IS NULL AND w.screening_waived
+          AND w.resolved_at IS NULL AND w.cancelled_at IS NULL
+        RETURNING w.id`,
       [intentId])
 
     res.json({
@@ -6585,90 +6632,68 @@ async function createCoOwnerInvitation(landlordId: string, email: string, invite
 
 // POST /api/landlords/member-invite/:token/accept — requires the invitee to be
 // signed in as a landlord (registering through the invite link gets them there).
+//
+// S655: the work itself lives in services/coOwnerInvites.ts, shared with the
+// claim that runs when a registered invitee's address is proven. Idempotent for
+// the person who accepted: registering + the emailed code already accepted it,
+// and the registration then lands here — "already used" would read as being
+// locked out of the company they now own.
 landlordsRouter.post('/member-invite/:token/accept', async (req, res, next) => {
   try {
     const u = req.user!
     if (u.role !== 'landlord') throw new AppError(403, 'Co-owners need a landlord account')
-    // S654: invited_by_user_id is selected so the membership records who added
-    // them; it was read below but never fetched, so every accepted invite
-    // stored added_by_user_id as NULL.
-    const inv = await queryOne<any>(
-      `SELECT id, landlord_id, email, expires_at, status, invited_by_user_id
-         FROM landlord_member_invitations WHERE token = $1`, [req.params.token])
-    if (!inv || inv.status !== 'pending' || new Date(inv.expires_at) < new Date()) {
-      throw new AppError(404, 'That invitation has expired or already been used.')
-    }
-    // The invite is addressed to a person, not a link-holder: accepting from a
-    // different account would silently attach the wrong business.
-    const me = await queryOne<{ email: string }>(`SELECT email FROM users WHERE id = $1`, [u.userId])
-    if ((me?.email ?? '').toLowerCase() !== String(inv.email).toLowerCase()) {
-      throw new AppError(403, 'This invitation was sent to a different email address. Sign in with that address to accept it.')
-    }
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      // S654: invited_by_user_id is selected so the membership records who added
+      // them; it was read below but never fetched, so every accepted invite
+      // stored added_by_user_id as NULL. S655: locked, so two accepts of one
+      // link cannot both run.
+      const inv = (await client.query<any>(
+        `SELECT id, landlord_id, email, expires_at, status, invited_by_user_id, accepted_user_id
+           FROM landlord_member_invitations WHERE token = $1 FOR UPDATE`, [req.params.token])).rows[0]
+      // "Already accepted" only while the caller still holds the membership.
+      // A co-owner who was removed (or left) still has an invitation marked
+      // accepted by them; telling them they own the company would be false, so
+      // they fall through to "expired or already used" like anyone else.
+      if (inv?.status === 'accepted' && inv.accepted_user_id === u.userId) {
+        const stillOwner = (await client.query(
+          `SELECT 1 FROM landlord_members WHERE landlord_id = $1 AND user_id = $2`,
+          [inv.landlord_id, u.userId])).rows.length > 0
+        if (stillOwner) {
+          await client.query('COMMIT')
+          return res.json({ success: true, data: { landlordId: inv.landlord_id, alreadyAccepted: true } })
+        }
+      }
+      if (!inv || inv.status !== 'pending' || new Date(inv.expires_at) < new Date()) {
+        throw new AppError(404, 'That invitation has expired or already been used.')
+      }
+      // The invite is addressed to a person, not a link-holder: accepting from a
+      // different account would silently attach the wrong business.
+      const me = (await client.query<{ email: string }>(`SELECT email FROM users WHERE id = $1`, [u.userId])).rows[0]
+      if ((me?.email ?? '').toLowerCase() !== String(inv.email).toLowerCase()) {
+        throw new AppError(403, 'This invitation was sent to a different email address. Sign in with that address to accept it.')
+      }
 
-    await query(
-      `INSERT INTO landlord_members (landlord_id, user_id, role, added_by_user_id)
-       VALUES ($1, $2, 'owner', $3) ON CONFLICT (landlord_id, user_id) DO NOTHING`,
-      [inv.landlord_id, u.userId, inv.invited_by_user_id ?? null])
-    await query(
-      `UPDATE landlord_member_invitations
-          SET status='accepted', accepted_at=now(), accepted_user_id=$2, updated_at=now()
-        WHERE id=$1`, [inv.id, u.userId])
+      // Owner row, accepted mark, the S654 referrer rule and the S605/S633
+      // onboarding-wizard rule — see acceptCoOwnerInvitation.
+      await acceptCoOwnerInvitation(client, inv, u.userId)
+      await client.query('COMMIT')
+      // requireAuth caches each account's companies for 15s (S629), and the
+      // page load just before this accept filled it. Dropped after the commit
+      // so the "Go to your dashboard" click right after lands WITH the company.
+      forgetMembership(u.userId)
 
-    // S592, restored at the point of consent (S654, Nic): "I added them as a
-    // co-owner. They opted to put their own other properties on the software.
-    // They only found out about it because of me. So therefore I am the
-    // referrer." A co-owner with no upline of their own becomes the downline of
-    // the company's founding owner — now only when THEY accept from their own
-    // session. First-touch wins (an existing upline is never changed); a
-    // founding owner accepting into their own company is a no-op.
-    const founding = await queryOne<{ user_id: string }>(
-      `SELECT user_id FROM landlords WHERE id = $1`, [inv.landlord_id])
-    if (founding && founding.user_id !== u.userId) {
-      await query(
-        `UPDATE users SET referred_by_user_id = $1
-          WHERE id = $2 AND referred_by_user_id IS NULL`,
-        [founding.user_id, u.userId])
-    }
-
-    // S605 (Nic): "for him to just register, it would have tried to get him to
-    // onboard his property, which is already onboarded because I've completed
-    // Oak Park." The portal sends any landlord with onboarding_complete = false
-    // to the wizard — so an invited co-owner would land in a five-step flow
-    // asking for a first property, a payout account and a signed agreement for
-    // an entity that owns nothing, to reach a property somebody else already
-    // set up.
-    //
-    // Clearing the flag on their OWN entity lets them straight in. Guarded on
-    // having no properties of their own, so this can never skip a real
-    // onboarding: a landlord who already has property keeps whatever state they
-    // were in. If they add their first property later, the dashboard's standing
-    // tasks (Connect KYC, connect your operating bank) surface what's needed —
-    // those are the gates that matter before money can move.
-    // S633: "their OWN entity" is now "every company the account owns that holds
-    // no property" — the empty one registering created, and any other. Each is
-    // judged on its own properties, so a company that already has property keeps
-    // whatever onboarding state it was in and a real onboarding is never skipped.
-    await query(
-      `UPDATE landlords l SET onboarding_complete = TRUE
-        WHERE l.id = ANY($1::uuid[])
-          AND l.onboarding_complete = FALSE
-          AND NOT EXISTS (SELECT 1 FROM properties p WHERE p.landlord_id = l.id)`,
-      [landlordScopeIds(u)])
-
-    // S620 (Nic): "that co-owner should see everything. It should be defaulted
-    // to the invited entity, not defaulted to a blank entity."
-    //
-    // S634: nothing to default TO any more. Accepting the invite created the
-    // membership row, and a co-owner is now signed into every company they
-    // belong to at once — including the empty one registering made for them and
-    // the one they were just invited into. The bug this guarded against (Blue
-    // landing on an onboarding wizard with no sign of Oak Park) is fixed by the
-    // account seeing both, not by choosing one for him.
-
-    // landlordIds is stamped into the JWT at login, so the new entity appears
-    // once they re-authenticate. Say so rather than letting them wonder why the
-    // property isn't there yet.
-    res.json({ success: true, data: { landlordId: inv.landlord_id, reloginRequired: true } })
+      // S620/S634: nothing to default TO — a co-owner is signed into every
+      // company they belong to at once, and requireAuth reads membership on
+      // every request (S629, cleared above), so the company is there on the
+      // next page load without signing in again. `reloginRequired` stays for
+      // older clients.
+      res.json({ success: true, data: { landlordId: inv.landlord_id, alreadyAccepted: false, reloginRequired: false } })
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
   } catch (e) { next(e) }
 })
 

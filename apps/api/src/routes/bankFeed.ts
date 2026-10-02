@@ -5,7 +5,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { MERCHANT_RULE_SCOPES, EXPENSE_CATEGORIES, OTHER_INCOME_CATEGORIES } from '@gam/shared'
+import { MERCHANT_RULE_SCOPES, EXPENSE_CATEGORIES, OTHER_INCOME_CATEGORIES, BANK_TXN_STATUSES } from '@gam/shared'
 import { queryOne } from '../db'
 import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
 import { logger } from '../lib/logger'
@@ -132,7 +132,8 @@ bankFeedRouter.post('/connections/:id/disconnect', requireLandlord, async (req: 
 bankFeedRouter.get('/transactions', requireLandlord, async (req: any, res, next) => {
   try {
     const q = z.object({
-      status: z.enum(['needs_review', 'matched', 'categorized', 'ignored']).optional(),
+      // S655: the shared list, not a re-declared copy of it.
+      status: z.enum(BANK_TXN_STATUSES).optional(),
       connectionId: z.string().uuid().optional(),
       limit: z.coerce.number().int().positive().max(500).optional(),
     }).parse(req.query)

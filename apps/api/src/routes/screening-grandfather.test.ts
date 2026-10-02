@@ -6,8 +6,9 @@
  *   - getOnboardingWindow open/closed semantics
  *   - POST /tenants/invite with propertyId → property-bound intent (unit_id NULL)
  *   - POST /tenants/:id/waive-screening — window-gated grandfather:
- *       open + attested → status='waived' + audit; closed → 403;
- *       not attested → 400; one-grandfather-per-unit → 409.
+ *       open + attested → waiver recorded on THIS company's intent + audit
+ *       (the person's own screening status is untouched); closed → 403;
+ *       not attested → 400; not being onboarded to that unit → 404.
  */
 import { vi, describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
@@ -18,7 +19,7 @@ import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
 import {
   computeWindowDays, getOnboardingWindow, openOnboardingWindow, closeOnboardingWindow,
-  ONBOARDING_WINDOW_CAP_DAYS,
+  ONBOARDING_WINDOW_CAP_DAYS, hasScreeningWaiver, applyScreeningWaive,
 } from '../services/onboardingWindow'
 
 vi.mock('../services/notifications', async (importOriginal) => {
@@ -63,6 +64,14 @@ async function seedTenant(): Promise<string> {
      VALUES ($1,'x','tenant','Sit','Ting') RETURNING id`, [`t-${randomUUID()}@test.dev`])
   const t = await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.rows[0].id])
   return t.rows[0].id
+}
+
+/** The person is being onboarded to this unit by this company (a live invite). */
+async function inviteToUnit(tenantId: string, f: { landlordId: string; propertyId: string; unitId: string }) {
+  await db.query(
+    `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, property_id)
+     VALUES ($1, $2, 'not_uploaded', $3, $4)`,
+    [f.landlordId, tenantId, f.unitId, f.propertyId])
 }
 
 /** Open the property's onboarding window for the waive tests. */
@@ -119,10 +128,11 @@ describe('POST /tenants/invite — property-level', () => {
 })
 
 describe('POST /tenants/:id/waive-screening — grandfather', () => {
-  it('window open + attested → status waived + audit recorded', async () => {
+  it('window open + attested → waiver recorded on this company, the person’s own status untouched', async () => {
     const f = await seedFixture()
     await openWindow(f.propertyId)
     const tenantId = await seedTenant()
+    await inviteToUnit(tenantId, f)
     const res = await request(buildApp())
       .post(`/api/tenants/${tenantId}/waive-screening`)
       .set('Authorization', `Bearer ${f.token}`)
@@ -130,10 +140,14 @@ describe('POST /tenants/:id/waive-screening — grandfather', () => {
     expect(res.status).toBe(200)
     const t = await db.query<{ background_check_status: string }>(
       `SELECT background_check_status FROM tenants WHERE id=$1`, [tenantId])
-    expect(t.rows[0].background_check_status).toBe('waived')
-    const intent = await db.query<{ screening_waived: boolean; screening_attested: boolean; screening_waived_unit_id: string; unit_id: string | null }>(
-      `SELECT screening_waived, screening_attested, screening_waived_unit_id, unit_id
-         FROM pending_tenant_intents WHERE tenant_id=$1`, [tenantId])
+    // The waiver is THIS company's record — never stamped platform-wide.
+    expect(t.rows[0].background_check_status).toBe('not_started')
+    expect(await hasScreeningWaiver(tenantId, [f.landlordId])).toBe(true)
+    const intent = await db.query<{ landlord_id: string; screening_waived: boolean; screening_attested: boolean; screening_waived_unit_id: string; unit_id: string | null }>(
+      `SELECT landlord_id, screening_waived, screening_attested, screening_waived_unit_id, unit_id
+         FROM pending_tenant_intents WHERE tenant_id=$1 AND unit_id IS NULL`, [tenantId])
+    expect(intent.rows).toHaveLength(1)
+    expect(intent.rows[0].landlord_id).toBe(f.landlordId)
     expect(intent.rows[0].screening_waived).toBe(true)
     expect(intent.rows[0].screening_attested).toBe(true)
     expect(intent.rows[0].screening_waived_unit_id).toBe(f.unitId)
@@ -157,6 +171,7 @@ describe('POST /tenants/:id/waive-screening — grandfather', () => {
     await openWindow(f.propertyId)
     await closeOnboardingWindow(f.propertyId)
     const tenantId = await seedTenant()
+    await inviteToUnit(tenantId, f)
     const res = await request(buildApp())
       .post(`/api/tenants/${tenantId}/waive-screening`)
       .set('Authorization', `Bearer ${f.token}`)
@@ -193,6 +208,7 @@ describe('S636 every adult in a household is grandfathered, not just the first',
     const second = await seedTenant()
 
     for (const tenantId of [first, second]) {
+      await inviteToUnit(tenantId, f)
       const res = await request(buildApp())
         .post(`/api/tenants/${tenantId}/waive-screening`)
         .set('Authorization', `Bearer ${f.token}`)
@@ -200,11 +216,9 @@ describe('S636 every adult in a household is grandfathered, not just the first',
       expect(res.status, `tenant ${tenantId} was refused the waive`).toBe(200)
     }
 
-    const { rows } = await db.query<{ background_check_status: string }>(
-      `SELECT background_check_status FROM tenants WHERE id = ANY($1::uuid[])`, [[first, second]])
-    expect(rows).toHaveLength(2)
     // THE POINT: the spouse is not sent to a background check.
-    expect(rows.every(r => r.background_check_status === 'waived')).toBe(true)
+    expect(await hasScreeningWaiver(first, [f.landlordId])).toBe(true)
+    expect(await hasScreeningWaiver(second, [f.landlordId])).toBe(true)
   })
 
   it('the window still bounds it — a closed window screens everybody', async () => {
@@ -212,6 +226,7 @@ describe('S636 every adult in a household is grandfathered, not just the first',
     await openWindow(f.propertyId)
     await db.query(`UPDATE properties SET onboarding_completed_at = NOW() WHERE id = $1`, [f.propertyId])
     const tenantId = await seedTenant()
+    await inviteToUnit(tenantId, f)
     const res = await request(buildApp())
       .post(`/api/tenants/${tenantId}/waive-screening`)
       .set('Authorization', `Bearer ${f.token}`)
@@ -238,7 +253,8 @@ describe('returning resident — attested, recorded, capped', () => {
       `SELECT t.background_check_status, i.waive_reason FROM tenants t JOIN users u ON u.id = t.user_id
          LEFT JOIN pending_tenant_intents i ON i.tenant_id = t.id AND i.waive_reason IS NOT NULL
         WHERE u.email = 'back1@test.dev'`)).rows[0]
-    expect(t1.background_check_status).toBe('waived')
+    // Recorded on this company's intent; the person's own status is untouched.
+    expect(t1.background_check_status).toBe('not_started')
     expect(t1.waive_reason).toBe('returning_resident')
     expect(Number((await db.query(`SELECT COUNT(*) FROM admin_notifications WHERE category = 'returning_resident_over_allowance'`)).rows[0].count)).toBe(0)
 
@@ -253,5 +269,134 @@ describe('returning resident — attested, recorded, capped', () => {
       .set('Authorization', `Bearer ${f.token}`)
       .send({ email: 'back3@test.dev', firstName: 'Back', lastName: 'Again', propertyId: f.propertyId, returningResident: true })
     expect(res.status).toBe(400)
+  })
+})
+
+
+// ─── S655 security: a waiver is one company's record ─────────────────────────
+//
+// A grandfather waiver used to be written onto the person's ONE platform-wide
+// screening status. Every company then read it as "screened", it overwrote a
+// real approval or denial, and any landlord with an open window could waive any
+// tenant id on GAM.
+describe('S655 the waiver belongs to the company that granted it', () => {
+  it('a person not being onboarded to that unit gets 404 and nothing is written', async () => {
+    const f = await seedFixture()
+    await openWindow(f.propertyId)
+    const stranger = await seedTenant()
+    const res = await request(buildApp())
+      .post(`/api/tenants/${stranger}/waive-screening`)
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, unitId: f.unitId, attested: true })
+    expect(res.status).toBe(404)
+    const { rows } = await db.query(`SELECT 1 FROM pending_tenant_intents WHERE tenant_id = $1`, [stranger])
+    expect(rows).toHaveLength(0)
+  })
+
+  it('an invite to a DIFFERENT unit is not enough', async () => {
+    const f = await seedFixture()
+    await openWindow(f.propertyId)
+    const tenantId = await seedTenant()
+    const c = await db.connect()
+    let otherUnit: string
+    try { otherUnit = await seedUnit(c, { propertyId: f.propertyId, landlordId: f.landlordId }) } finally { c.release() }
+    await inviteToUnit(tenantId, { ...f, unitId: otherUnit })
+    const res = await request(buildApp())
+      .post(`/api/tenants/${tenantId}/waive-screening`)
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, unitId: f.unitId, attested: true })
+    expect(res.status).toBe(404)
+  })
+
+  it('a resident on an active lease at that unit can be waived', async () => {
+    const f = await seedFixture()
+    await openWindow(f.propertyId)
+    const tenantId = await seedTenant()
+    const { rows: [l] } = await db.query<{ id: string }>(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date)
+       VALUES ($1, $2, 900, 'month_to_month', 'active', '2020-01-01') RETURNING id`, [f.unitId, f.landlordId])
+    await db.query(`INSERT INTO lease_tenants (lease_id, tenant_id, role) VALUES ($1, $2, 'primary')`, [l.id, tenantId])
+    const res = await request(buildApp())
+      .post(`/api/tenants/${tenantId}/waive-screening`)
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, unitId: f.unitId, attested: true })
+    expect(res.status).toBe(200)
+  })
+
+  it('a real approval or denial survives a waiver', async () => {
+    const f = await seedFixture()
+    await openWindow(f.propertyId)
+    for (const real of ['approved', 'denied']) {
+      const tenantId = await seedTenant()
+      await db.query(`UPDATE tenants SET background_check_status = $2 WHERE id = $1`, [tenantId, real])
+      await inviteToUnit(tenantId, f)
+      const res = await request(buildApp())
+        .post(`/api/tenants/${tenantId}/waive-screening`)
+        .set('Authorization', `Bearer ${f.token}`)
+        .send({ propertyId: f.propertyId, unitId: f.unitId, attested: true })
+      expect(res.status).toBe(200)
+      const { rows: [t] } = await db.query<{ background_check_status: string }>(
+        `SELECT background_check_status FROM tenants WHERE id = $1`, [tenantId])
+      expect(t.background_check_status).toBe(real)
+    }
+  })
+
+  it('hasScreeningWaiver answers only for the companies asked about', async () => {
+    const x = await seedFixture()
+    const y = await seedFixture()
+    await openWindow(x.propertyId)
+    const tenantId = await seedTenant()
+    await inviteToUnit(tenantId, x)
+    const r = await applyScreeningWaive({
+      tenantId, landlordId: x.landlordId, propertyId: x.propertyId, unitId: x.unitId, byUserId: x.userId,
+    })
+    expect(r.waived).toBe(true)
+    expect(await hasScreeningWaiver(tenantId, [x.landlordId])).toBe(true)
+    expect(await hasScreeningWaiver(tenantId, [y.landlordId])).toBe(false)
+    expect(await hasScreeningWaiver(tenantId, [])).toBe(false)
+  })
+
+  it('company X’s waiver never rewrites company Y’s no-unit invite', async () => {
+    const x = await seedFixture()
+    const y = await seedFixture()
+    await openWindow(x.propertyId)
+    const tenantId = await seedTenant()
+    // Y invited this person to its PROPERTY (a live no-unit row).
+    const { rows: [yRow] } = await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id)
+       VALUES ($1, $2, 'not_uploaded', $3, NULL) RETURNING id`, [y.landlordId, tenantId, y.propertyId])
+    await inviteToUnit(tenantId, x)
+
+    const before = (await db.query(`SELECT * FROM pending_tenant_intents WHERE id = $1`, [yRow.id])).rows[0]
+
+    // While the old tenant-only index still stands (before the contract
+    // migration), X's waiver is refused rather than written onto Y's row.
+    const res = await request(buildApp())
+      .post(`/api/tenants/${tenantId}/waive-screening`)
+      .set('Authorization', `Bearer ${x.token}`)
+      .send({ propertyId: x.propertyId, unitId: x.unitId, attested: true })
+    expect(res.status).toBe(409)
+    const mid = (await db.query(`SELECT * FROM pending_tenant_intents WHERE id = $1`, [yRow.id])).rows[0]
+    expect(mid).toEqual(before)
+
+    // Once the old index is gone (the contract step), X gets its OWN row and
+    // Y's is still untouched.
+    await db.query(`DROP INDEX pending_tenant_intents_tenant_nounit_live_key`)
+    try {
+      const res2 = await request(buildApp())
+        .post(`/api/tenants/${tenantId}/waive-screening`)
+        .set('Authorization', `Bearer ${x.token}`)
+        .send({ propertyId: x.propertyId, unitId: x.unitId, attested: true })
+      expect(res2.status).toBe(200)
+      const after = (await db.query(`SELECT * FROM pending_tenant_intents WHERE id = $1`, [yRow.id])).rows[0]
+      expect(after).toEqual(before)
+      expect(await hasScreeningWaiver(tenantId, [x.landlordId])).toBe(true)
+      expect(await hasScreeningWaiver(tenantId, [y.landlordId])).toBe(false)
+    } finally {
+      await db.query(`UPDATE pending_tenant_intents SET cancelled_at = NOW() WHERE tenant_id = $1 AND unit_id IS NULL AND landlord_id = $2`, [tenantId, x.landlordId])
+      await db.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS pending_tenant_intents_tenant_nounit_live_key
+           ON pending_tenant_intents (tenant_id) WHERE cancelled_at IS NULL AND unit_id IS NULL`)
+    }
   })
 })

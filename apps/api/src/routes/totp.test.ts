@@ -527,3 +527,35 @@ describe('S578: un-enrolled admin gets universal email 2FA (supersedes forced TO
     expect(login.body.data.token).toBeUndefined()
   })
 })
+
+// ── S655: the authenticator step keeps the session policy chosen at sign-in ─
+describe('S655 TOTP passes carry the session policy', () => {
+  it('an authenticator sign-in at the admin console is fixed unless kept', async () => {
+    const secret = authenticator.generateSecret()
+    await seedUser({ email: 's655-totp@test.dev', password: 'pw123456789012', role: 'admin', totpEnabled: true, totpSecret: secret })
+    for (const [keepSignedIn, sp] of [[false, 'fixed'], [true, 'rolling']] as const) {
+      const login = await request(buildApp()).post('/api/auth/login')
+        .send({ email: 's655-totp@test.dev', password: 'pw123456789012', portal: 'admin', keepSignedIn })
+      expect((jwt.decode(login.body.data.totpSession) as any).sp).toBe(sp)
+      const verify = await request(buildApp()).post('/api/auth/totp/verify')
+        .send({ totpSession: login.body.data.totpSession, code: authenticator.generate(secret) })
+      expect(verify.status).toBe(200)
+      expect((jwt.decode(verify.body.data.token) as any).sp).toBe(sp)
+    }
+  })
+
+  it('setting up an authenticator from settings never stretches a fixed sign-in', async () => {
+    const { userId } = await seedUser({ email: 's655-enroll@test.dev', password: 'pw123456789012', role: 'admin' })
+    const exp = Math.floor(Date.now() / 1000) + 3600
+    const fixed = jwt.sign({ userId, role: 'admin', email: 's655-enroll@test.dev', profileId: null, sp: 'fixed', exp },
+      process.env.JWT_SECRET!)
+    await request(buildApp()).post('/api/auth/totp/enroll-start').set('Authorization', `Bearer ${fixed}`).send({})
+    const secret = (await db.query<{ totp_secret: string }>(`SELECT totp_secret FROM users WHERE id=$1`, [userId])).rows[0].totp_secret
+    const confirm = await request(buildApp()).post('/api/auth/totp/enroll-confirm')
+      .set('Authorization', `Bearer ${fixed}`).send({ token: authenticator.generate(secret) })
+    expect(confirm.status).toBe(200)
+    const pass = jwt.decode(confirm.body.data.token) as any
+    expect(pass.sp).toBe('fixed')
+    expect(pass.exp).toBe(exp)
+  })
+})

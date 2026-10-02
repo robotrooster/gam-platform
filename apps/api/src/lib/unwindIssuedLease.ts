@@ -26,6 +26,14 @@
  * re-signed lease's release treat the charge as already accounted for, and drop
  * it. The charge itself is not lost — it goes back on hold (below).
  *
+ * A RENEWAL'S DEPOSIT GOES BACK. Signing a renewal moves the household's
+ * deposit record onto the new lease (and a deposit increase raises its target).
+ * Cancelling the renewal used to leave that funded deposit on the cancelled
+ * lease, so the lease they still live under had no deposit on record and their
+ * eventual move-out found nothing to return. The record moves back, the
+ * uncollected increase comes off its target, and the renewal request reopens.
+ * The fee rows copied onto the cancelled lease stay there as its history.
+ *
  * WHAT IT DOES NOT DO: re-draft. A landlord voids for many reasons, including
  * "this person is not moving in". The household reappears on the front desk as
  * a voided lease, and re-sending is the landlord's decision.
@@ -53,6 +61,71 @@ export async function unwindIssuedLease(
     throw new AppError(409,
       'Money has already been paid on this lease, so it cannot be voided. ' +
       'Create a superseding document instead.')
+  }
+
+  // ── A renewal: the deposit goes back to the lease still in force ─────────
+  // Before the pending-deposit cleanup below, which would otherwise delete a
+  // carried record that was never collected.
+  const renews: string | null = (await q(
+    `SELECT renews_lease_id FROM lease_documents WHERE id = $1`, [doc.id])).rows[0]?.renews_lease_id ?? null
+  if (renews) {
+    // The increase this renewal raised the target by — its top-up rows. Nothing
+    // was paid on them (refused above), so the whole increase comes off.
+    const increase = Number((await q(
+      `SELECT COALESCE(SUM(amount), 0)::text AS total FROM lease_fees
+        WHERE lease_id = $1 AND due_timing = 'move_in' AND is_refundable = TRUE
+          AND description LIKE '[deposit top-up on renewal]%'`, [leaseId])).rows[0]?.total ?? 0)
+    await q(
+      `UPDATE security_deposits
+          SET lease_id = $2,
+              total_amount = GREATEST(total_amount - $3::numeric, COALESCE(collected_amount, 0)),
+              status = CASE WHEN status = 'partial'
+                             AND COALESCE(collected_amount, 0) >= total_amount - $3::numeric
+                            THEN 'funded' ELSE status END,
+              updated_at = NOW()
+        WHERE lease_id = $1 AND flex_deposit_enabled = FALSE`,
+      [leaseId, renews, increase.toFixed(2)])
+    // The renewal request it completed is open again — the landlord still has
+    // a renewal to decide.
+    await q(
+      `UPDATE lease_renewal_requests SET status = 'approved', updated_at = NOW()
+        WHERE lease_id = $1 AND status = 'completed'`, [renews])
+    // Anything the household owes that reached the renewal (the lease-end
+    // hand-off moves open items onto it) goes back to the lease they are on.
+    // Their utility usage is real and theirs: it returns unbilled to their
+    // lease rather than going on hold like a move-in that never happened.
+    for (const b of (await q(
+      `SELECT id, payment_id FROM utility_bills WHERE lease_id = $1`, [leaseId])).rows) {
+      await q(
+        `UPDATE utility_bills
+            SET lease_id = $2, payment_id = NULL,
+                status = CASE WHEN status = 'billed' THEN 'unbilled' ELSE status END,
+                updated_at = NOW()
+          WHERE id = $1`, [b.id, renews])
+      if (b.payment_id) {
+        await q(`DELETE FROM payments WHERE id = $1 AND status IN ('pending','failed')`, [b.payment_id])
+      }
+    }
+    await q(
+      `UPDATE tenant_one_off_charges SET lease_id = $2, updated_at = NOW()
+        WHERE lease_id = $1 AND status = 'pending'`, [leaseId, renews])
+    await q(
+      `UPDATE propane_fills f SET lease_id = $2
+        WHERE f.lease_id = $1
+          AND EXISTS (SELECT 1 FROM propane_fill_installments i
+                       WHERE i.fill_id = f.id AND i.payment_id IS NULL)`, [leaseId, renews])
+    await q(
+      `UPDATE tenant_credits SET lease_id = $2, updated_at = NOW()
+        WHERE lease_id = $1 AND status = 'active' AND amount_remaining > 0`, [leaseId, renews])
+    await q(
+      `UPDATE lease_prepaid_credits SET lease_id = $2, updated_at = NOW()
+        WHERE lease_id = $1 AND amount_remaining > 0`, [leaseId, renews])
+    // Autopay set up on (or moved to) the renewal keeps pulling for the lease
+    // they are on — unless that lease already has its own.
+    await q(
+      `UPDATE tenant_autopay SET lease_id = $2, updated_at = NOW()
+        WHERE lease_id = $1
+          AND NOT EXISTS (SELECT 1 FROM tenant_autopay x WHERE x.lease_id = $2)`, [leaseId, renews])
   }
 
   // ── Utility: back on hold, out of the unique slot ────────────────────────

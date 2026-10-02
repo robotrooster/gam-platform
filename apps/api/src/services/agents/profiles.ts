@@ -365,7 +365,7 @@ const LANDLORD_ENTRY: AgentProfile = {
     'remove_utility_meter', 'draft_add_tenant_addendum', 'draft_remove_tenant_addendum',
     'draft_work_trade_addendum', 'auto_place_template_fields', 'add_witness',
     'set_property_pm_assignment', 'set_lease_signer', 'onboard_applicant_to_unit',
-    'approve_property_transfer', 'decline_property_transfer', 'record_prior_arrangement',
+    'decline_property_transfer', 'record_prior_arrangement',
     'edit_survey',
     // S628: getting sitting tenants onto the platform — three routes, three
     // different situations, and picking the wrong one is the mistake.
@@ -483,7 +483,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'remove_utility_meter', 'draft_add_tenant_addendum', 'draft_remove_tenant_addendum',
     'draft_work_trade_addendum', 'auto_place_template_fields', 'add_witness',
     'set_property_pm_assignment', 'set_lease_signer', 'onboard_applicant_to_unit',
-    'approve_property_transfer', 'decline_property_transfer', 'record_prior_arrangement',
+    'decline_property_transfer', 'record_prior_arrangement',
     'edit_survey',
     // S628: getting sitting tenants onto the platform — three routes, three
     // different situations, and picking the wrong one is the mistake.

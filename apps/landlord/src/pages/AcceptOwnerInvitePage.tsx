@@ -45,12 +45,29 @@ export function AcceptOwnerInvitePage() {
   const accept = async () => {
     setBusy(true); setError(null)
     try {
+      // S655: answers yes again for the person who already accepted (registering
+      // with the invited address and entering the emailed code accepts it, then
+      // the registration lands here).
       await apiPost(`/landlords/member-invite/${token}/accept`, {})
       sessionStorage.removeItem(PENDING_KEY)
       setDone(true)
     } catch (e: any) {
       setError(e?.response?.data?.error || 'Could not accept the invitation.')
     } finally { setBusy(false) }
+  }
+
+  // S655: a dead invitation must not keep pulling the person back here. The
+  // stashed token made every sign-in redirect (RoleRedirect in main.tsx) land on
+  // this same error card, with no way past it.
+  useEffect(() => {
+    if (error && (!invite || invite.accepted)) { try { sessionStorage.removeItem(PENDING_KEY) } catch { /* private mode */ } }
+  }, [error, invite])
+
+  // Membership is read fresh on every request (S629), so a full page load is all
+  // it takes for the company to appear — no second sign-in.
+  const goToDashboard = () => {
+    try { sessionStorage.removeItem(PENDING_KEY) } catch { /* private mode */ }
+    window.location.assign('/')
   }
 
   // Signed in as the invited person → accept straight away. Signed in as
@@ -94,11 +111,28 @@ export function AcceptOwnerInvitePage() {
       </div>
       <h2 style={{ fontSize: '1.1rem', margin: '14px 0 8px' }}>You're an owner of {invite.entityName}</h2>
       <p style={{ fontSize: '.86rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
-        Sign in again to load it — your portfolio is stamped when you log in, so {invite.entityName} appears
-        on your next sign-in.
+        {invite.entityName} is in your account now, next to anything else you own.
       </p>
       <button className="btn btn-primary" style={{ marginTop: 16, width: '100%' }}
-        onClick={() => navigate('/login')}>Sign in</button>
+        onClick={goToDashboard}>Go to your dashboard</button>
+    </>
+  )
+
+  // S655: already accepted, and nobody signed in yet — e.g. reopening the email
+  // after registering. Not an error: they own it; they just need to sign in.
+  // (Signed in as the person who accepted, the accept call above answers yes
+  // and the done screen shows; signed in as anyone else, it refuses.)
+  if (invite.accepted && (!user || error)) return shell(
+    <>
+      <Check size={26} style={{ color: 'var(--green)' }} />
+      <h2 style={{ fontSize: '1.1rem', margin: '12px 0 8px' }}>This invitation has been accepted</h2>
+      <p style={{ fontSize: '.86rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
+        {invite.email} is an owner of {invite.entityName}. Sign in with that address to see it.
+      </p>
+      <button className="btn btn-primary" style={{ marginTop: 16, width: '100%' }}
+        onClick={() => { try { sessionStorage.removeItem(PENDING_KEY) } catch { /* private mode */ } navigate('/login') }}>
+        Sign in
+      </button>
     </>
   )
 

@@ -18,6 +18,7 @@ vi.mock('../services/email', async (orig) => ({
 
 import { landlordsRouter } from './landlords'
 import { errorHandler } from '../middleware/errorHandler'
+import { requireAuth } from '../middleware/auth'
 
 function buildApp() {
   const app = express()
@@ -180,6 +181,130 @@ describe('S654 only an owner adds an owner', () => {
       expect([401, 403]).toContain(res.status)
     }
     const { rows } = await db.query(`SELECT 1 FROM landlord_member_invitations WHERE lower(email)='staffs-own-landlord@mailer-test.co'`)
+    expect(rows).toHaveLength(0)
+  })
+})
+
+// S655: an invitation that was USED is not a bad link. Registering with the
+// invited address and entering the emailed code accepts it, and the
+// registration then lands on the invite page — which used to say "expired or
+// already been used" to the person who now owns the company.
+describe('S655 an accepted invitation reads as accepted, for the person who accepted it', () => {
+  async function acceptedInvite() {
+    const f = await seedTwoLandlords()
+    await request(buildApp()).post('/api/landlords/members')
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ email: f.bEmail })
+    const { rows: [inv] } = await db.query<any>(
+      `SELECT token FROM landlord_member_invitations WHERE lower(email)=lower($1)`, [f.bEmail])
+    const first = await request(buildApp()).post(`/api/landlords/member-invite/${inv.token}/accept`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+    expect(first.status).toBe(200)
+    expect(first.body.data.alreadyAccepted).toBe(false)
+    return { ...f, token: inv.token as string }
+  }
+
+  it('the preview of an accepted invitation says accepted instead of 404', async () => {
+    const f = await acceptedInvite()
+    const res = await request(buildApp()).get(`/api/landlords/member-invite/${f.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.accepted).toBe(true)
+    expect(res.body.data.entityName).toBe('Oak Park LLC')
+  })
+
+  it('accepting again as the same person is a harmless yes', async () => {
+    const f = await acceptedInvite()
+    const again = await request(buildApp()).post(`/api/landlords/member-invite/${f.token}/accept`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+    expect(again.status).toBe(200)
+    expect(again.body.data.alreadyAccepted).toBe(true)
+    expect(again.body.data.landlordId).toBe(f.a.landlordId)
+    const { rows } = await db.query(
+      `SELECT 1 FROM landlord_members WHERE user_id=$1 AND landlord_id=$2`, [f.b.userId, f.a.landlordId])
+    expect(rows).toHaveLength(1)
+  })
+
+  it('anyone else is still refused an accepted invitation', async () => {
+    const f = await acceptedInvite()
+    const res = await request(buildApp()).post(`/api/landlords/member-invite/${f.token}/accept`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(404)
+  })
+
+  it('a revoked or expired invitation still previews as gone', async () => {
+    const f = await seedTwoLandlords()
+    await request(buildApp()).post('/api/landlords/members')
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ email: 'gone@mailer-test.co' })
+    const { rows: [inv] } = await db.query<any>(
+      `SELECT token FROM landlord_member_invitations WHERE lower(email)='gone@mailer-test.co'`)
+    await db.query(`UPDATE landlord_member_invitations SET status='revoked' WHERE token=$1`, [inv.token])
+    expect((await request(buildApp()).get(`/api/landlords/member-invite/${inv.token}`)).status).toBe(404)
+    await db.query(`UPDATE landlord_member_invitations SET status='pending', expires_at = now() - interval '1 minute' WHERE token=$1`, [inv.token])
+    expect((await request(buildApp()).get(`/api/landlords/member-invite/${inv.token}`)).status).toBe(404)
+  })
+})
+
+// S655 review: what the accept screen promises has to be true on the very next
+// click. The screen says "{company} is in your account now" and its button
+// reloads the dashboard at once — but requireAuth keeps each account's company
+// list for 15 seconds (S629), and the page load right before the accept filled
+// it. A removed co-owner reopening the old email must not be told they own it.
+describe('S655 accepting is true on the next request, and only while it is still true', () => {
+  function appWithEcho() {
+    const app = express()
+    app.use(express.json())
+    app.get('/echo', requireAuth, (req, res) => res.json({ landlordIds: req.user!.landlordIds }))
+    app.use('/api/landlords', landlordsRouter)
+    app.use(errorHandler)
+    return app
+  }
+
+  it('the invited company is in the account on the very next request after accepting', async () => {
+    const f = await seedTwoLandlords()
+    const app = appWithEcho()
+    // The dashboard was open before the accept — this fills the 15s cache.
+    const before = await request(app).get('/echo').set('Authorization', `Bearer ${f.tokenB}`)
+    expect(before.body.landlordIds).not.toContain(f.a.landlordId)
+
+    await request(app).post('/api/landlords/members')
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ email: f.bEmail })
+    const { rows: [inv] } = await db.query<any>(
+      `SELECT token FROM landlord_member_invitations WHERE lower(email)=lower($1)`, [f.bEmail])
+    const acc = await request(app).post(`/api/landlords/member-invite/${inv.token}/accept`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+    expect(acc.status).toBe(200)
+    expect(acc.body.data.reloginRequired).toBe(false)
+
+    // "Go to your dashboard", clicked straight away.
+    const after = await request(app).get('/echo').set('Authorization', `Bearer ${f.tokenB}`)
+    expect(after.body.landlordIds).toContain(f.a.landlordId)
+    expect(after.body.landlordIds).toContain(f.b.landlordId)
+  })
+
+  it('a removed co-owner reopening the old link is not told they own the company', async () => {
+    const f = await seedTwoLandlords()
+    const app = appWithEcho()
+    await request(app).post('/api/landlords/members')
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ email: f.bEmail })
+    const { rows: [inv] } = await db.query<any>(
+      `SELECT token FROM landlord_member_invitations WHERE lower(email)=lower($1)`, [f.bEmail])
+    expect((await request(app).post(`/api/landlords/member-invite/${inv.token}/accept`)
+      .set('Authorization', `Bearer ${f.tokenB}`)).status).toBe(200)
+
+    // The founding owner removes them. The invitation stays marked accepted.
+    const { rows: [m] } = await db.query<any>(
+      `SELECT id FROM landlord_members WHERE landlord_id=$1 AND user_id=$2`, [f.a.landlordId, f.b.userId])
+    const removed = await request(app).delete(`/api/landlords/members/${m.id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(removed.status).toBe(200)
+
+    const preview = await request(app).get(`/api/landlords/member-invite/${inv.token}`)
+    expect(preview.status).toBe(404)
+    const again = await request(app).post(`/api/landlords/member-invite/${inv.token}/accept`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+    expect(again.status).toBe(404)
+    expect(again.body.data?.alreadyAccepted).toBeUndefined()
+    const { rows } = await db.query(
+      `SELECT 1 FROM landlord_members WHERE user_id=$1 AND landlord_id=$2`, [f.b.userId, f.a.landlordId])
     expect(rows).toHaveLength(0)
   })
 })

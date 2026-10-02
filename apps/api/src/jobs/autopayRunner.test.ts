@@ -35,7 +35,13 @@ vi.mock('../lib/stripe', () => ({
     customers: { retrieve: vi.fn(async () => ({ invoice_settings: { default_payment_method: 'pm_default' } })) },
   }),
 }))
-vi.mock('../services/notifications', () => ({ createNotification: vi.fn(async () => undefined) }))
+const { notifyAutopayFailedMock } = vi.hoisted(() => ({
+  notifyAutopayFailedMock: vi.fn(async (_o?: any) => undefined),
+}))
+vi.mock('../services/notifications', () => ({
+  createNotification: vi.fn(async () => undefined),
+  notifyAutopayFailed: notifyAutopayFailedMock,
+}))
 
 import { runAutopayForTimezone, isPullDayToday, AUTOPAY_DISARM_AFTER_FAILURES } from './autopayRunner'
 
@@ -114,6 +120,13 @@ async function seedCharge(f: Fixture, amount: number, type: 'rent' | 'late_fee' 
      type === 'late_fee' ? 'LATEFEE' : 'RENT'])
 }
 
+/** A card refused on the spot, as the Stripe SDK throws it. */
+function cardDeclined(): Error {
+  return Object.assign(new Error('Your card was declined.'), {
+    type: 'StripeCardError', rawType: 'card_error', code: 'card_declined', decline_code: 'insufficient_funds',
+  })
+}
+
 const autopayRow = async (leaseId: string) => (await db.query<any>(
   `SELECT enabled, consecutive_failures, last_run_cycle::text AS last_run_cycle,
           last_success_cycle::text AS last_success_cycle, disarmed_reason
@@ -134,6 +147,7 @@ describe('S609 autopay runner', () => {
   beforeEach(async () => {
     await cleanupAllSchema()
     chargeMock.mockClear()
+    notifyAutopayFailedMock.mockClear()
     chargeMock.mockImplementation(async (_input?: any) => ({
       remittanceId: 'rem_x', paymentIntentId: 'pi_x', status: 'processing',
       appliedTotal: 0, payAhead: 0, platformCutAmount: 0, lines: [],
@@ -217,13 +231,77 @@ describe('S609 autopay runner', () => {
     expect(row.consecutive_failures).toBe(1)
   })
 
+  // S654: the failure notice was an in-app bell only. A tenant who thinks rent
+  // paid itself does not open the app, so it now emails, with a Pay now button
+  // that signs them in and lands on Payments.
+  it('a failed pull emails the tenant a Pay now link that lands on Payments', async () => {
+    await armForToday(f)
+    await seedCharge(f, 1000)
+    chargeMock.mockImplementationOnce(async () => { throw cardDeclined() })
+
+    await runAutopayForTimezone(TZ, runAt())
+
+    expect(notifyAutopayFailedMock).toHaveBeenCalledTimes(1)
+    const arg = notifyAutopayFailedMock.mock.calls[0][0]
+    const t = (await db.query<{ user_id: string; email: string }>(
+      `SELECT t.user_id, u.email FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`,
+      [f.tenantId])).rows[0]
+    expect(arg).toMatchObject({ tenantUserId: t.user_id, tenantEmail: t.email, disarming: false, kind: 'payment_method' })
+    expect(arg.payUrl).toMatch(/\/login\?ef=[^&]+&to=%2Fpayments$/)
+  })
+
+  // S654 (review): the tenant is told WHY, truthfully. An eviction hold's
+  // Payments page refuses the payment, and GAM's own errors are not their
+  // account's fault — neither gets "check the account you pay from, then pay".
+  it('an eviction hold is told as a paused space, not as a problem with their account', async () => {
+    await armForToday(f)
+    await seedCharge(f, 1000)
+    await db.query(`UPDATE units SET payment_block = TRUE WHERE id = $1`, [f.unitId])
+    const { AppError } = await import('../middleware/errorHandler')
+    chargeMock.mockImplementationOnce(async () => {
+      throw new AppError(409, 'This unit is in eviction mode — payments to the landlord are paused. Accepting one could reset the eviction timeline. Contact the landlord.')
+    })
+    await runAutopayForTimezone(TZ, runAt())
+    expect(notifyAutopayFailedMock).toHaveBeenCalledTimes(1)
+    expect(notifyAutopayFailedMock.mock.calls[0][0]).toMatchObject({ kind: 'payments_paused' })
+  })
+
+  it('an error on our side is told as ours, and an admin is alerted', async () => {
+    await armForToday(f)
+    await seedCharge(f, 1000)
+    chargeMock.mockImplementationOnce(async () => { throw new Error('connection terminated unexpectedly') })
+    await runAutopayForTimezone(TZ, runAt())
+    expect(notifyAutopayFailedMock.mock.calls[0][0]).toMatchObject({ kind: 'our_side' })
+    const alerts = await db.query(`SELECT 1 FROM admin_notifications WHERE category = 'autopay_charge_error'`)
+    expect(alerts.rows).toHaveLength(1)
+  })
+
+  it('no usable payment method is the tenant\'s to fix — told as such, no admin alert', async () => {
+    await armForToday(f)
+    await seedCharge(f, 1000)
+    await db.query(`UPDATE tenants SET stripe_customer_id = NULL WHERE id = $1`, [f.tenantId])
+    await runAutopayForTimezone(TZ, runAt())
+    expect(chargeMock).not.toHaveBeenCalled()
+    expect(notifyAutopayFailedMock.mock.calls[0][0]).toMatchObject({ kind: 'payment_method' })
+    const alerts = await db.query(`SELECT 1 FROM admin_notifications WHERE category = 'autopay_charge_error'`)
+    expect(alerts.rows).toHaveLength(0)
+  })
+
+  it('a pull that succeeds sends no failure notice', async () => {
+    await armForToday(f)
+    await seedCharge(f, 1000)
+    await runAutopayForTimezone(TZ, runAt())
+    expect(notifyAutopayFailedMock).not.toHaveBeenCalled()
+  })
+
   it('two failures in a row switch it off, with a reason the tenant can read', async () => {
     await armForToday(f)
     await seedCharge(f, 1000)
     // Pre-load the first failure so this run is the second.
     await db.query(`UPDATE tenant_autopay SET consecutive_failures = $2 WHERE lease_id = $1`,
       [f.leaseId, AUTOPAY_DISARM_AFTER_FAILURES - 1])
-    chargeMock.mockImplementationOnce(async () => { throw new Error('account closed') })
+    chargeMock.mockImplementationOnce(async () => { throw Object.assign(new Error('account closed'), {
+      type: 'StripeInvalidRequestError', code: 'bank_account_unusable' }) })
 
     await runAutopayForTimezone(TZ, runAt())
 
@@ -232,6 +310,8 @@ describe('S609 autopay runner', () => {
     expect(row.disarmed_reason).toBeTruthy()
     // Never the bank's error text — that is between the tenant and their bank.
     expect(row.disarmed_reason).not.toMatch(/account closed/i)
+    // S654: the "turned off" notice is the one emailed.
+    expect(notifyAutopayFailedMock.mock.calls[0][0]).toMatchObject({ disarming: true })
   })
 
   it('a switched-off schedule is never charged', async () => {

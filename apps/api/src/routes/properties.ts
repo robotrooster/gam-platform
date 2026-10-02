@@ -6,11 +6,11 @@ import { z } from 'zod'
 import { normalizeAddress } from '../lib/address'
 import { formatPropertyInput, formatName, formatStreet, formatStreet2, formatCity, formatState, formatZip } from '../lib/format'
 import { db, query, queryOne, getClient } from '../db'
-import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
+import { requireAuth, requireLandlord, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { suggestBookingSlug } from './propertyBookingAdmin'
-import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow } from '../services/onboardingWindow'
+import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow, screeningWaivedByAccountSql, approvedCheckForAccountSql, pooledCheckSql } from '../services/onboardingWindow'
 import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 import { loadSubtype, setSubtypeUnits } from '../services/unitSubtype'
 import { AppError } from '../middleware/errorHandler'
@@ -35,7 +35,7 @@ import { logger } from '../lib/logger'
 import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 import { checkAgainstStatute, checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { resolveLeaseSigner } from '../services/leaseSigner'
-import { initiateTransfer, approveTransfer, declineTransfer } from '../services/propertyTransfer'
+import { initiateTransfer, confirmTransfer, declineTransfer, listIncomingTransfers } from '../services/propertyTransfer'
 
 export const propertiesRouter = Router()
 export const publicPropertiesRouter = Router()
@@ -439,6 +439,15 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
   }
 })
 
+// S655 — property transfers waiting on THIS login to accept (the buyer's
+// side). Declared before GET /:id with the other literal paths. Only the
+// buyer's own login sees these; nothing about the tenants is included.
+propertiesRouter.get('/transfer-requests/incoming', async (req, res, next) => {
+  try {
+    res.json({ success: true, data: await listIncomingTransfers(req.user!.userId) })
+  } catch (e) { next(e) }
+})
+
 // S399 fix: /applications declared BEFORE GET /:id so Express doesn't
 // match `applications` as the :id param. Pre-fix the dedicated
 // /applications handler at the bottom of this file was unreachable —
@@ -448,17 +457,39 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
 
 propertiesRouter.get('/applications', requirePerm('tenants.create'), async (req, res, next) => {
   try {
+    // Every company this account owns. This read profileId, which names no
+    // company for an owner since S633, so the page was always empty.
+    const scope = landlordScopeIds(req.user!)
+    if (!scope.length) return res.json({ success: true, data: [] })
+    // Screening as THIS account knows it — never the person's platform-wide
+    // status, which carried other companies' verdicts (an approval or denial
+    // somewhere else, or another park's grandfather waiver).
+    //   approved  — a check run for this account, or a renter-pool check (run
+    //               through GAM's pool intake, shared by the applicant). A
+    //               check another company ran never counts or shows, even
+    //               with its share box ticked.
+    //   waived    — this account grandfathered them
+    //   otherwise — the latest such check's own status, or not_started
     const { rows } = await db.query(
       `SELECT ua.*, u.unit_number, p.name AS property_name,
-              t.background_check_status,
+              CASE
+                WHEN ${approvedCheckForAccountSql('t.id', 'ua.applicant_user_id', 'ua.landlord_id')} THEN 'approved'
+                WHEN ${screeningWaivedByAccountSql('t.id', 'ua.landlord_id')} THEN 'waived'
+                ELSE COALESCE((
+                  SELECT bc.status FROM background_checks bc
+                   WHERE (bc.tenant_id = t.id OR bc.user_id = ua.applicant_user_id)
+                     AND (${pooledCheckSql('bc')}
+                          OR bc.landlord_id IN (SELECT public.account_companies(ua.landlord_id)))
+                   ORDER BY bc.created_at DESC LIMIT 1), 'not_started')
+              END AS background_check_status,
               EXISTS (SELECT 1 FROM leases l WHERE l.source_application_id = ua.id) AS lease_drafted
        FROM unit_applications ua
        LEFT JOIN units u ON u.id = ua.unit_id
        LEFT JOIN properties p ON p.id = u.property_id
        LEFT JOIN tenants t ON t.user_id = ua.applicant_user_id
-       WHERE ua.landlord_id = $1
+       WHERE ua.landlord_id = ANY($1::uuid[])
        ORDER BY ua.created_at DESC`,
-      [req.user!.profileId]
+      [scope]
     )
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
@@ -1170,9 +1201,109 @@ propertiesRouter.patch('/:id/onboarding-late-fee-waiver', requirePerm('propertie
   } catch (e) { next(e) }
 })
 
+/**
+ * S655 — record a change to a property's owner-signing routing and re-route
+ * the owner's open signing seats. One transaction: the audit row, the address
+ * move and the new tokens land together or not at all.
+ */
+async function applyLeaseSigningChange(a: {
+  propertyId: string; landlordId: string; byUserId: string
+  oldEmail: string | null; newEmail: string | null
+  oldName: string | null; newName: string | null
+  emailChanged: boolean
+}): Promise<{ seatsMoved: number }> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
+       VALUES ($1, 'property_lease_signing_changed', 'property', $2, $3::jsonb, $4::jsonb)`,
+      [a.byUserId, a.propertyId,
+       JSON.stringify({ leaseSigningEmail: a.oldEmail, leaseSigningName: a.oldName }),
+       JSON.stringify({ leaseSigningEmail: a.newEmail, leaseSigningName: a.newName })])
+    let seatsMoved = 0
+    if (a.emailChanged) {
+      // The owner seat is the company's founding login (landlordSigningContact).
+      // An address that was never delegated means the account email.
+      const owner = (await client.query<{ user_id: string; email: string }>(
+        `SELECT u.id AS user_id, LOWER(u.email) AS email
+           FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [a.landlordId])).rows[0]
+      if (owner) {
+        const from = (a.oldEmail || owner.email).toLowerCase()
+        const to = (a.newEmail || owner.email).toLowerCase()
+        if (from !== to) {
+          const moved = await client.query(
+            `UPDATE lease_document_signers s
+                SET email = $4, token = encode(gen_random_bytes(32), 'hex')
+               FROM lease_documents d
+               JOIN units u ON u.id = d.unit_id
+              WHERE d.id = s.document_id
+                AND u.property_id = $1
+                AND d.landlord_id = $2
+                AND d.status IN ('pending', 'sent', 'in_progress')
+                AND s.role = 'landlord'
+                AND s.user_id = $3
+                AND s.status NOT IN ('signed', 'declined')
+                AND LOWER(s.email) = $5`,
+            [a.propertyId, a.landlordId, owner.user_id, to, from])
+          seatsMoved = moved.rowCount ?? 0
+        }
+      }
+    }
+    await client.query('COMMIT')
+    return { seatsMoved }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
 propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const raw = req.body as any
+    // S655: authorize FIRST. The address-change block below writes an audit
+    // row and raises an admin notification; it ran before this check, so any
+    // landlord could trigger both on another company's property id and only
+    // then get a 403. A property-scoped staff member was also never held to
+    // the properties they are assigned to.
+    const prop = await queryOne<any>('SELECT * FROM properties WHERE id=$1', [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) {
+      throw new AppError(403, 'Forbidden')
+    }
+    await assertPropertyInScope(req.user, req.params.id)
+
+    // S630 (Nic): where THIS property's lease-signing requests go, so an on-site
+    // manager can sign for their property without the portfolio login or the
+    // other properties' mail. Sent explicitly (even as '') to allow clearing it
+    // back to the account email, which COALESCE alone cannot express.
+    const signingEmailSent = raw.leaseSigningEmail !== undefined
+    const signingEmail = signingEmailSent
+      ? (String(raw.leaseSigningEmail).trim().toLowerCase() || null) : null
+    if (signingEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(signingEmail)) {
+      throw new AppError(400, 'That lease-signing address is not a valid email.')
+    }
+    const signingNameSent = raw.leaseSigningName !== undefined
+    const signingName = signingNameSent
+      ? (String(raw.leaseSigningName).trim().slice(0, 120) || null) : null
+    // S655: these two decide where the OWNER's signature requests for this
+    // property are mailed, and the emailed link signs as the owner without a
+    // password. Only an owner of this company (or GAM admin) may change them —
+    // never a property manager, whose "Edit properties" permission covers
+    // every other field here. An unchanged value arriving on an ordinary save
+    // is not a change. Decided HERE, before anything below writes (the
+    // address block logs an audit row), so a refused request leaves no trace
+    // of a change that never happened.
+    const storedSigningEmail = prop.lease_signing_email ? String(prop.lease_signing_email).trim().toLowerCase() || null : null
+    const storedSigningName = prop.lease_signing_name ? String(prop.lease_signing_name).trim() || null : null
+    const signingEmailChanged = signingEmailSent && signingEmail !== storedSigningEmail
+    const signingNameChanged = signingNameSent && signingName !== storedSigningName
+    if ((signingEmailChanged || signingNameChanged) && !canManageLandlordResource(req.user, prop.landlord_id, [])) {
+      throw new AppError(403, "Only the property owner can change where the owner's signing requests go.")
+    }
+
     const name    = raw.name    !== undefined ? formatName(raw.name)       : undefined
     const street1 = raw.street1 !== undefined ? formatStreet(raw.street1)  : undefined
     const street2 = raw.street2 !== undefined ? (raw.street2 ? formatStreet2(raw.street2) : raw.street2) : undefined
@@ -1254,20 +1385,6 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // into new leases at this property (LeaseFormModal default-pull is a
     // separate carry-forward; for now this surface stores the policy).
     // CHECK constraint allows late_fee_initial_type ∈ {flat, percent_of_rent}.
-    // S630 (Nic): where THIS property's lease-signing requests go, so an on-site
-    // manager can sign for their property without the portfolio login or the
-    // other properties' mail. Sent explicitly (even as '') to allow clearing it
-    // back to the account email, which COALESCE alone cannot express.
-    const signingEmailSent = raw.leaseSigningEmail !== undefined
-    const signingEmail = signingEmailSent
-      ? (String(raw.leaseSigningEmail).trim().toLowerCase() || null) : null
-    if (signingEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(signingEmail)) {
-      throw new AppError(400, 'That lease-signing address is not a valid email.')
-    }
-    const signingNameSent = raw.leaseSigningName !== undefined
-    const signingName = signingNameSent
-      ? (String(raw.leaseSigningName).trim().slice(0, 120) || null) : null
-
     const lateFeeEnabled =
       typeof raw.lateFeeEnabled === 'boolean' ? raw.lateFeeEnabled : undefined
     const lateFeeGraceDays =
@@ -1313,12 +1430,6 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     }
     if (lateFeeCapType !== undefined && lateFeeCapType !== null && lateFeeCapType !== 'flat' && lateFeeCapType !== 'percent_of_rent') {
       throw new AppError(400, 'late_fee_cap_type must be flat, percent_of_rent, or null')
-    }
-
-    const prop = await queryOne<any>('SELECT * FROM properties WHERE id=$1', [req.params.id])
-    if (!prop) throw new AppError(404, 'Property not found')
-    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) {
-      throw new AppError(403, 'Forbidden')
     }
 
     // S247: per-property subleasing toggle. NULL = no change.
@@ -1386,6 +1497,22 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     if (addressChangedState) {
       await query(`UPDATE properties SET timezone = $2 WHERE id = $1`,
         [req.params.id, timezoneForState(addressChangedState)])
+    }
+
+    // S655: a change to the owner's signing routing is recorded (who, from
+    // what, to what) and takes effect on links ALREADY mailed. Every unsigned
+    // owner seat on an open document at this property that still points at
+    // the old address moves to the new one (the owner's account email when it
+    // is cleared) with a fresh signing token, so a link sitting in an inbox
+    // the owner just revoked stops signing as them. Same pattern as a
+    // resident's corrected address (S654). Reminders send the new link.
+    if (signingEmailChanged || signingNameChanged) {
+      await applyLeaseSigningChange({
+        propertyId: req.params.id, landlordId: prop.landlord_id, byUserId: req.user!.userId,
+        oldEmail: prop.lease_signing_email ?? null, newEmail: signingEmailChanged ? signingEmail : (prop.lease_signing_email ?? null),
+        oldName: prop.lease_signing_name ?? null, newName: signingNameChanged ? signingName : (prop.lease_signing_name ?? null),
+        emailChanged: signingEmailChanged,
+      })
     }
 
     // S226: separate dynamic UPDATE for accrual + cap. The COALESCE
@@ -2116,14 +2243,6 @@ publicPropertiesRouter.post('/listings/:unitId/apply', requireAuth, async (req: 
     if (!z.string().uuid().safeParse(req.params.unitId).success) throw new AppError(404, 'Listing not found')
     const body = z.object({ message: z.string().max(5000).nullish() }).parse(req.body ?? {})
 
-    // The one hard gate. 403 here is what the frontend turns into "start your
-    // background check" — the server never trusts the client to have gated it.
-    const t = await queryOne<{ background_check_status: string }>(
-      'SELECT background_check_status FROM tenants WHERE user_id=$1', [u.userId])
-    if (!t || !['approved', 'waived'].includes(t.background_check_status)) {
-      throw new AppError(403, 'A completed background check is required to contact a landlord')
-    }
-
     const unit = await queryOne<any>(`
       SELECT u.id, u.unit_number, u.landlord_id, p.name AS property_name,
              lu.id AS landlord_user_id, lu.first_name AS landlord_first,
@@ -2134,6 +2253,26 @@ publicPropertiesRouter.post('/listings/:unitId/apply', requireAuth, async (req: 
         JOIN users lu ON lu.id = l.user_id
        WHERE u.id=$1 AND u.status='vacant' AND u.listed_vacant=TRUE`, [req.params.unitId])
     if (!unit) throw new AppError(404, 'Listing not found')
+
+    // The one hard gate. 403 here is what the frontend turns into "start your
+    // background check" — the server never trusts the client to have gated it.
+    //
+    // Passes on a completed (approved) background check, or on a screening
+    // waiver granted by THIS listing's own account. A waiver is one company's
+    // decision about somebody already living with it; it used to be stamped
+    // on the person's platform-wide status, so one park's waiver opened every
+    // landlord's listing on GAM. A leftover platform-wide 'waived' no longer
+    // counts on its own.
+    const t = await queryOne<{ id: string; background_check_status: string }>(
+      'SELECT id, background_check_status FROM tenants WHERE user_id=$1', [u.userId])
+    const screened = !!t && (
+      t.background_check_status === 'approved' ||
+      !!(await queryOne<{ one: number }>(
+        `SELECT 1 AS one WHERE ${screeningWaivedByAccountSql('$1::uuid', '$2::uuid')}`,
+        [t.id, unit.landlord_id])))
+    if (!screened) {
+      throw new AppError(403, 'A completed background check is required to contact a landlord')
+    }
 
     const me = await queryOne<any>(
       'SELECT first_name, last_name, email, phone FROM users WHERE id=$1', [u.userId])
@@ -2456,9 +2595,16 @@ propertiesRouter.post('/:id/transfer', requirePerm('properties.edit'), async (re
     const body = z.object({
       // Identify the buyer by the email they log in with — a landlord selling a
       // park knows the buyer's email, not their internal id.
-      toEmail: z.string().trim().email(),
+      toEmail: z.string().trim().email().optional(),
+      // S655: or one of YOUR OWN companies — a move inside the account (Oak
+      // Park → Mountain View). The initiating owner owns the receiver, so there
+      // is no buyer step.
+      toLandlordId: z.string().uuid().optional(),
       note: z.string().max(500).optional(),
     }).parse(req.body)
+    if (!!body.toEmail === !!body.toLandlordId) {
+      throw new AppError(400, 'Enter the email of the person receiving it, or choose one of your own companies.')
+    }
 
     const prop = await queryOne<any>(
       `SELECT p.id, p.landlord_id, l.user_id AS owner_user_id
@@ -2472,22 +2618,34 @@ propertiesRouter.post('/:id/transfer', requirePerm('properties.edit'), async (re
       throw new AppError(403, 'Only the account owner can transfer a property')
     }
 
-    const buyer = await queryOne<any>(
-      `SELECT l.id FROM users u JOIN landlords l ON l.user_id = u.id
-        WHERE lower(u.email) = lower($1)`, [body.toEmail])
-    if (!buyer) {
-      throw new AppError(404,
-        'No landlord account with that email. The buyer needs to register on GAM before the property can be transferred to them.')
+    // S655: the buyer is a LOGIN, not a company. This used to join to the
+    // company a login founded (landlords.user_id), so a co-owner could never
+    // receive, and an account that founded two companies got whichever row
+    // came back first. The buyer now chooses which of their companies takes
+    // it when they accept.
+    let toUserId: string | null = null
+    if (body.toEmail) {
+      const buyer = await queryOne<{ id: string }>(
+        `SELECT id FROM users WHERE lower(email) = lower($1) AND role = 'landlord' LIMIT 1`, [body.toEmail])
+      if (!buyer) {
+        throw new AppError(404,
+          'No landlord account with that email. The buyer needs to register on GAM before the property can be transferred to them.')
+      }
+      toUserId = buyer.id
+    } else if (!landlordScopeIds(req.user!).includes(body.toLandlordId!)) {
+      throw new AppError(403, 'That company is not yours. To transfer it to someone else, enter their email.')
     }
 
     // S605 (Nic): this RAISES a request — it no longer transfers anything.
     // "Anybody that has a GAM platform account as an owner needs to all have a
     // signing or confirmation... so that one person can't just accidentally sell
     // or transfer account ownership out from underneath other people."
+    // S655: and a sale to another account also waits for that account to accept.
     const result = await initiateTransfer({
       propertyId: req.params.id,
       fromLandlordId: prop.landlord_id,
-      toLandlordId: buyer.id,
+      toLandlordId: body.toLandlordId ?? null,
+      toUserId,
       byUserId: req.user!.userId,
       note: body.note ?? null,
     })
@@ -2522,11 +2680,19 @@ propertiesRouter.get('/:id/transfer-request', async (req, res, next) => {
     if (!prop) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
 
+    // S655: the receiving company is unknown until the buyer accepts (they
+    // choose it), so it is a LEFT JOIN; until then the seller sees the email
+    // they typed and "waiting on the buyer".
     const reqRow = await queryOne<any>(
       `SELECT r.id, r.status, r.expires_at, r.note, r.initiated_by,
-              tl.business_name AS buyer_name
+              tl.business_name AS buyer_name,
+              bu.email AS buyer_email,
+              r.buyer_accepted_at,
+              (r.buyer_accepted_at IS NULL) AS awaiting_buyer,
+              (r.to_user_id IS NULL) AS own_company_move
          FROM property_transfer_requests r
-         JOIN landlords tl ON tl.id = r.to_landlord_id
+         LEFT JOIN landlords tl ON tl.id = r.to_landlord_id
+         LEFT JOIN users bu ON bu.id = r.to_user_id
         WHERE r.property_id = $1 AND r.status = 'pending'
         LIMIT 1`, [req.params.id])
     if (!reqRow) return res.json({ success: true, data: null })
@@ -2548,18 +2714,25 @@ propertiesRouter.get('/:id/transfer-request', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// Confirm with the code from your email. The LAST approval executes the sale.
+// Confirm with the code from your email — a selling owner, or (S655) the buyer,
+// who also names which of their companies takes it. Whichever step completes
+// both sides executes the sale.
 propertiesRouter.post('/transfer-request/:requestId/approve', async (req, res, next) => {
   try {
-    const { code } = z.object({ code: z.string().min(4).max(12) }).parse(req.body)
-    const result = await approveTransfer({
+    const { code, receivingLandlordId } = z.object({
+      code: z.string().min(4).max(12),
+      receivingLandlordId: z.string().uuid().optional(),
+    }).parse(req.body)
+    const result = await confirmTransfer({
       requestId: req.params.requestId, userId: req.user!.userId, code: code.trim(),
+      receivingLandlordId: receivingLandlordId ?? null,
     })
     res.json({ success: true, data: result })
   } catch (e) { next(e) }
 })
 
 // Any one owner can stop it — consent is unanimous, so a single refusal decides.
+// S655: so can the named buyer.
 propertiesRouter.post('/transfer-request/:requestId/decline', async (req, res, next) => {
   try {
     await declineTransfer(req.params.requestId, req.user!.userId)

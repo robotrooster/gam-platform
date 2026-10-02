@@ -9,7 +9,7 @@ import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { portalLink } from '../lib/portalUrls'
 import { query, queryOne, getClient } from '../db'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
-import { generateInvoices, registerInvoiceEngine } from './invoiceGeneration'
+import { generateInvoices, registerInvoiceEngine, unbilledDueDates, CATCHUP_DAYS } from './invoiceGeneration'
 import { registerLateFeeEngine } from './lateFees'
 import { registerServiceAgreementInvoiceEngine } from './serviceAgreementInvoices'
 import { registerAutopayEngine } from './autopayRunner'
@@ -84,7 +84,9 @@ export async function checkLeaseExpiryNotices() {
 // via the renewal-decision flow, future-dated at creation) to active when
 // their start date arrives, and mark the unit occupied. Runs in the 2am
 // cron BEFORE processLeaseEnds so a renewal starting the day after the old
-// lease ends activates before/despite the old lease's expiry handling.
+// lease ends activates before/despite the old lease's expiry handling — except
+// a renewal whose old lease is past its end and still in force: that one comes
+// into force at the hand-off (processLeaseEnds), never alongside it.
 export async function activatePendingLeases() {
   try {
     const due = await query<any>(`
@@ -97,7 +99,21 @@ export async function activatePendingLeases() {
         -- activating, and therefore never billing, which is the exact failure
         -- issuance exists to end.
         AND signed_by_landlord=TRUE
-        AND start_date <= CURRENT_DATE`)
+        AND start_date <= CURRENT_DATE
+        -- RENEWAL HAND-OFF: a renewal waits while the lease it renews is past
+        -- its end but still has a bill to make (processLeaseEnds holds the
+        -- hand-off for it, and activates the renewal when it hands off). So a
+        -- household never has two leases in force on the unit — two would
+        -- count its people twice in a split by headcount. Bounded by the bill
+        -- run's catch-up window, so a stuck hand-off cannot hold it forever.
+        AND NOT EXISTS (
+          SELECT 1 FROM leases pl
+           WHERE pl.status = 'active' AND pl.unit_id = leases.unit_id
+             AND pl.end_date < CURRENT_DATE
+             AND pl.end_date >= CURRENT_DATE - $1::int
+             AND (pl.id = leases.supersedes_lease_id
+                  OR EXISTS (SELECT 1 FROM lease_documents d
+                              WHERE d.lease_id = leases.id AND d.renews_lease_id = pl.id)))`, [CATCHUP_DAYS])
     for (const l of due) {
       await query(`UPDATE leases SET status='active', updated_at=NOW() WHERE id=$1`, [l.id])
       await query(`UPDATE units SET status='active', updated_at=NOW() WHERE id=$1`, [l.unit_id])
@@ -130,10 +146,72 @@ export async function activatePendingLeases() {
   } catch(e) { logger.error({ err: e }, '[SCHEDULER] activate pending leases') }
 }
 
+/**
+ * RENEWAL HAND-OFF: money still open on the old lease goes with the tenancy.
+ *
+ * Utility bills, one-off charges, propane installments, landlord credits and
+ * paid-ahead money are kept on the lease, and the new lease's bills only look
+ * at their own lease. Left behind, December's read entered on the 31st was
+ * never invoiced, and a standing $10 credit stopped reducing anything. Only
+ * OPEN rows move — what is settled stays on the old lease as its history —
+ * and they move, never get recreated, so a paid-ahead row keeps whose money
+ * it is (S654: GAM-held vs landlord-recorded). One transaction: all or none.
+ */
+export async function handOffOpenItemsToRenewal(
+  oldLeaseId: string, newLeaseId: string,
+): Promise<Record<string, number>> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const moved = async (sql: string) =>
+      (await client.query(sql, [oldLeaseId, newLeaseId])).rowCount ?? 0
+    const counts = {
+      utilityBills: await moved(
+        `UPDATE utility_bills SET lease_id = $2, updated_at = NOW()
+          WHERE lease_id = $1 AND payment_id IS NULL AND status IN ('unbilled', 'billed')`),
+      oneOffCharges: await moved(
+        `UPDATE tenant_one_off_charges SET lease_id = $2, updated_at = NOW()
+          WHERE lease_id = $1 AND status = 'pending'`),
+      propaneFills: await moved(
+        `UPDATE propane_fills f SET lease_id = $2
+          WHERE f.lease_id = $1
+            AND EXISTS (SELECT 1 FROM propane_fill_installments i
+                         WHERE i.fill_id = f.id AND i.payment_id IS NULL)`),
+      credits: await moved(
+        `UPDATE tenant_credits SET lease_id = $2, updated_at = NOW()
+          WHERE lease_id = $1 AND status = 'active' AND amount_remaining > 0`),
+      paidAhead: await moved(
+        `UPDATE lease_prepaid_credits SET lease_id = $2, updated_at = NOW()
+          WHERE lease_id = $1 AND amount_remaining > 0`),
+      // Autopay is one row per lease, and the runner only pulls for a lease in
+      // force. Left on the old lease it never ran again — every renewal bill
+      // un-pulled, each one turning into a late fee. It goes with the household
+      // as it is (pull day, payment method, and the month it last ran, so that
+      // month is never pulled twice), for someone who is on the renewal, unless
+      // the renewal already has its own.
+      autopay: await moved(
+        `UPDATE tenant_autopay a SET lease_id = $2, updated_at = NOW()
+          WHERE a.lease_id = $1
+            AND NOT EXISTS (SELECT 1 FROM tenant_autopay x WHERE x.lease_id = $2)
+            AND EXISTS (SELECT 1 FROM lease_tenants lt
+                         WHERE lt.lease_id = $2 AND lt.tenant_id = a.tenant_id
+                           AND lt.status IN ('active', 'pending_add'))`),
+    }
+    await client.query('COMMIT')
+    return counts
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
 export async function processLeaseEnds() {
   try {
     const ended = await query<any>(`
-      SELECT l.*, un.id as unit_id_ref, un.unit_number
+      SELECT l.*, un.id as unit_id_ref, un.unit_number,
+             (l.end_date < CURRENT_DATE) AS past_end
       FROM leases l
       JOIN units un ON un.id = l.unit_id
       WHERE l.status = 'active'
@@ -154,9 +232,21 @@ export async function processLeaseEnds() {
         // deposit-return draft is created (the deposit carried forward onto
         // the successor at renewal completion).
         const successor = await queryOne<any>(`
-          SELECT id FROM leases
-          WHERE unit_id=$1 AND status IN ('pending','active') AND id != $2
-            AND start_date > $3
+          SELECT s.id,
+                 -- This lease's own renewal: linked by the signing that built
+                 -- it (a renewal drafted before the link existed is found by
+                 -- its document).
+                 (s.supersedes_lease_id = $2
+                   OR EXISTS (SELECT 1 FROM lease_documents d
+                               WHERE d.lease_id = s.id AND d.renews_lease_id = $2)) AS renews,
+                 -- Somebody on this lease is on the next one too.
+                 EXISTS (SELECT 1 FROM lease_tenants nt
+                           JOIN lease_tenants ot ON ot.tenant_id = nt.tenant_id
+                          WHERE nt.lease_id = s.id AND nt.status IN ('active','pending_add')
+                            AND ot.lease_id = $2 AND ot.status IN ('active','pending_add','pending_remove')) AS same_household
+          FROM leases s
+          WHERE s.unit_id=$1 AND s.status IN ('pending','active') AND s.id != $2
+            AND s.start_date > $3
             -- S647: landlord signature only, for the same reason as
             -- activatePendingLeases. A renewal is issued the moment the
             -- landlord signs it, so requiring the tenant's signature here would
@@ -165,17 +255,80 @@ export async function processLeaseEnds() {
             -- resident who is not leaving. Reading it as a handoff is the
             -- recoverable direction — if they really do go, terminating the
             -- successor produces the deposit return then.
-            AND signed_by_landlord=TRUE
-          ORDER BY start_date ASC LIMIT 1`,
+            AND s.signed_by_landlord=TRUE
+          ORDER BY (s.supersedes_lease_id = $2) DESC NULLS LAST, s.start_date ASC LIMIT 1`,
           [lease.unit_id, lease.id, lease.start_date])
+
+        // RENEWAL (Nic: "people get billed on their due date according to how
+        // the landlord sets the property"): the old lease is in force through
+        // its last day, and that day can be a due date. Expiring it at 2am ON
+        // its end date, before the 7am bill run, lost that bill — a renewal
+        // ending 10/1 never billed October. With a renewal following, the
+        // hand-off happens the morning AFTER the last day. A plain move-out
+        // keeps today's timing (the move-out notice reads the end date as the
+        // day they leave).
+        if (successor?.renews && !lease.past_end) continue
+
+        // ...and until the old lease's last bill is made. A bill still held (an
+        // unread meter, a reading run the landlord has not approved yet) or
+        // missed on its last due date was lost at the hand-off: once expired the
+        // bill run never looks at the lease again, and the renewal's schedule
+        // counts that month as the old lease's. A renewal ending 10/1 whose
+        // October bill waited on approval never billed October. The renewal
+        // waits pending meanwhile (activatePendingLeases). The wait ends when the
+        // run itself would give up on the date (its catch-up window).
+        if (successor?.renews) {
+          let owed: string[]
+          try {
+            owed = await unbilledDueDates(lease.id)
+          } catch (e) {
+            logger.error({ err: e, leaseId: lease.id }, '[LeaseEnd] could not check the old lease for an unmade bill — the hand-off waits a night')
+            continue
+          }
+          if (owed.length > 0) {
+            logger.info({ leaseId: lease.id, successorId: successor.id, owed },
+              '[LeaseEnd] renewal hand-off waits — the old lease still has a bill to make')
+            continue
+          }
+        }
+
+        // A signed lease for somebody ELSE on this unit is the next tenancy,
+        // not a renewal: this household is moving out. Only the unit stays
+        // occupied. (It used to read as a hand-off: no deposit return for the
+        // people leaving, a "renewed" credit event, work trade left running.)
+        const handOff = !!successor && (successor.renews || successor.same_household)
+
+        // The renewal's open money follows it, before the old lease closes. If
+        // the move fails the old lease stays active another night and this is
+        // retried — its bills cannot overlap the renewal's (the bill run stops
+        // a lease the day before a fully signed renewal starts).
+        if (successor?.renews) {
+          try {
+            const moved = await handOffOpenItemsToRenewal(lease.id, successor.id)
+            logger.info({ leaseId: lease.id, successorId: successor.id, ...moved },
+              '[LeaseEnd] renewal hand-off: open items moved to the new lease')
+          } catch (e) {
+            logger.error({ err: e, leaseId: lease.id, successorId: successor.id },
+              '[LeaseEnd] renewal hand-off could not move the open items — the old lease stays active and retries tomorrow')
+            continue
+          }
+        }
+
         await query(`UPDATE leases SET status='expired', terminated_at=NOW() WHERE id=$1`, [lease.id])
         await query(`
           UPDATE lease_tenants
           SET status='removed', removed_at=NOW(), removed_reason='lease_ended', updated_at=NOW()
           WHERE lease_id=$1 AND status IN ('active','pending_add','pending_remove')
         `, [lease.id])
-        if (successor) {
+        if (handOff) {
           logger.info(`[LeaseEnd] Expired lease ${lease.id}; unit ${lease.unit_id} hands off to successor lease ${successor.id} — no vacate, no deposit-return draft`)
+          // The renewal comes into force now, not before (see the wait above).
+          if (successor.renews) {
+            await query(
+              `UPDATE leases SET status='active', updated_at=NOW()
+                WHERE id=$1 AND status='pending' AND signed_by_landlord=TRUE AND start_date <= CURRENT_DATE`,
+              [successor.id])
+          }
           try {
             await emitLeaseLifecycleEvent('renewed', lease.id, lease.landlord_id)
           } catch (e) {
@@ -183,8 +336,12 @@ export async function processLeaseEnds() {
           }
           continue
         }
-        await query(`UPDATE units SET status='vacant', updated_at=NOW() WHERE id=$1`, [lease.unit_id])
-        logger.info(`[LeaseEnd] Expired lease ${lease.id}, vacated unit ${lease.unit_id}`)
+        if (successor) {
+          logger.info(`[LeaseEnd] Expired lease ${lease.id}; the next tenancy (lease ${successor.id}) holds unit ${lease.unit_id} — this household is moving out`)
+        } else {
+          await query(`UPDATE units SET status='vacant', updated_at=NOW() WHERE id=$1`, [lease.unit_id])
+          logger.info(`[LeaseEnd] Expired lease ${lease.id}, vacated unit ${lease.unit_id}`)
+        }
 
         // Credit ledger: lease_terminated_natural for every active
         // tenant on the lease + a single landlord event.

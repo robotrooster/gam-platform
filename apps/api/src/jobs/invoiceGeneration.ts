@@ -1,7 +1,7 @@
 import { DateTime } from 'luxon'
 // S624: the month-close settlement model. This file OPENS a period; the credit
 // itself is applied by jobs/workTradeSettlement.ts once the month is over.
-import { nextDueDateAfter } from '@gam/shared'
+import { nextDueDateAfter, renewalSchedule, prorateMoveInRent } from '@gam/shared'
 import { proratedTarget, hourRateFor } from '../services/workTradeSettlement'
 import { formatInvoiceNumber } from '@gam/shared'
 import { getClient, query, queryOne } from '../db'
@@ -48,6 +48,24 @@ interface ActiveLease {
   lease_source: string | null   // S548: 'booking_draft' bills the calendar schedule
   // S648: page 8's first month, when the move-in invoice collected it.
   move_in_first_month_rent?: string | null
+  // Renewals (Nic: "people get billed on their due date according to how the
+  // landlord sets the property"). A renewal names the lease it continues; the
+  // predecessor's last day and due day decide the renewal's first bill.
+  supersedes_lease_id?: string | null
+  predecessor_end_date?: string | null
+  predecessor_due_day?: number | null
+  // On the OLD lease: the start of a fully signed renewal of it. It never
+  // bills on or after that day, whatever order the jobs run in.
+  successor_start_date?: string | null
+}
+
+/**
+ * A lease that continues one before it — an e-signed renewal. Booking and
+ * imported leases keep their own rules (a booking bills its calendar; an
+ * imported supersede replaces a record rather than continuing a tenancy).
+ */
+export function isRenewalSuccessor(lease: Pick<ActiveLease, 'supersedes_lease_id' | 'lease_source'>): boolean {
+  return !!lease.supersedes_lease_id && (lease.lease_source ?? 'esigned') === 'esigned'
 }
 
 interface MonthlyFee {
@@ -79,7 +97,7 @@ interface RunOpts {
   dryRun?: boolean
 }
 
-const CATCHUP_DAYS = 30
+export const CATCHUP_DAYS = 30
 
 /**
  * Compute every rent_due_day date in [fromDate, toDate] inclusive, given a rent_due_day.
@@ -225,6 +243,24 @@ export async function generateFinalUtilityInvoice(
 }
 
 /**
+ * The renewal facts every generator reads (see isRenewalSuccessor and the
+ * successor / predecessor rules in runGeneration). `pl` is the lease this one
+ * continues.
+ */
+const RENEWAL_COLUMNS = `
+           l.supersedes_lease_id,
+           to_char(pl.end_date, 'YYYY-MM-DD') AS predecessor_end_date,
+           pl.rent_due_day AS predecessor_due_day,
+           -- A renewal of THIS lease that everyone has signed. Only then does
+           -- the new lease own the dates from its start on; an unsigned one can
+           -- still be cancelled, and the old lease must keep billing if it is.
+           (SELECT to_char(MIN(s.start_date), 'YYYY-MM-DD') FROM leases s
+             WHERE s.supersedes_lease_id = l.id
+               AND s.lease_source = 'esigned'
+               AND s.status IN ('pending', 'active')
+               AND s.signed_by_landlord AND s.signed_by_tenant) AS successor_start_date`
+
+/**
  * S648: ONE lease query for every generator. There were three copies, and the
  * one production actually runs (generateInvoicesForTimezone) had drifted: it
  * never loaded is_existing_tenancy (so the S639 first-bill waiver stamp never
@@ -252,10 +288,12 @@ const ACTIVE_LEASE_SELECT = `
               FROM v_lease_active_tenants vlat
               WHERE vlat.lease_id = l.id AND vlat.role = 'primary'
               LIMIT 1) AS tenant_id,
-           COALESCE(p.timezone, 'America/Phoenix') AS property_tz
+           COALESCE(p.timezone, 'America/Phoenix') AS property_tz,
+${RENEWAL_COLUMNS}
     FROM leases l
     JOIN units u ON u.id = l.unit_id
     JOIN properties p ON p.id = u.property_id
+    LEFT JOIN leases pl ON pl.id = l.supersedes_lease_id
     WHERE l.status = 'active'
       AND (l.needs_review IS NULL OR l.needs_review = false)
       -- S576 Snowbird: a hibernating (seasonally-paused) lease generates NO
@@ -277,6 +315,172 @@ export async function generateInvoices(
 }
 
 /**
+ * Which due dates the bill run owes a lease today, and the rent on any date
+ * that is not a regular due date (a renewal's bridge). No holds, no existence
+ * check — that is the run's job. One function, so the lease-end job asks
+ * exactly the question the run answers (see unbilledDueDates).
+ */
+export function billDatesForLease(
+  lease: ActiveLease,
+  nowUtc: Date,
+  opts: Pick<RunOpts, 'explicitWindow'> = {},
+): { dueDates: string[]; rentForDate: Record<string, string> } {
+  const none = { dueDates: [] as string[], rentForDate: {} as Record<string, string> }
+  const leaseStart = DateTime.fromISO(lease.start_date, { zone: lease.property_tz })
+  const leaseEnd = lease.end_date
+    ? DateTime.fromISO(lease.end_date, { zone: lease.property_tz })
+    : null
+
+  let windowStart: DateTime
+  let windowEnd: DateTime
+  if (opts.explicitWindow) {
+    const fromInTz = DateTime.fromISO(opts.explicitWindow.from, { zone: lease.property_tz }).startOf('day')
+    const toInTz = DateTime.fromISO(opts.explicitWindow.to, { zone: lease.property_tz }).startOf('day')
+    windowStart = fromInTz > leaseStart ? fromInTz : leaseStart
+    windowEnd = leaseEnd && leaseEnd < toInTz ? leaseEnd : toInTz
+  } else {
+    const todayInTz = DateTime.fromJSDate(nowUtc, { zone: lease.property_tz }).startOf('day')
+    const catchupStart = todayInTz.minus({ days: CATCHUP_DAYS })
+    windowStart = catchupStart > leaseStart ? catchupStart : leaseStart
+    windowEnd = leaseEnd && leaseEnd < todayInTz ? leaseEnd : todayInTz
+  }
+
+  // RENEWAL (Nic's rule): the old lease bills every due date up to its last
+  // day and never one on or after the renewal's start — whatever its printed
+  // end date says, and whatever order tonight's jobs run in (a property's 7am
+  // run can land before the 2am lease-end job, or that job can miss a night).
+  if (lease.successor_start_date) {
+    const lastDay = DateTime.fromISO(lease.successor_start_date, { zone: lease.property_tz }).minus({ days: 1 })
+    if (lastDay < windowEnd) windowEnd = lastDay
+  }
+
+  if (windowEnd < windowStart) return none
+
+  // S652 (Nic): nothing is due before the property's first billing cycle.
+  // The floor is on the invoice's DUE month, not on what was consumed: the
+  // October 1 invoice still carries September's water and electric, because
+  // utilities bill in arrears and ride whichever invoice comes next.
+  //
+  // S652 (Nic): EXCEPT a resident billed on their own day, whose floor is the
+  // day the property was added: "if I onboard the 15th... and I choose
+  // October 1st as the first billing cycle... somebody's on the 20th... they
+  // would be billed before the 1st of the month." Their floor is applied
+  // below, as their first due date.
+  const ownDay = lease.is_existing_tenancy && (Number(lease.rent_due_day) || 1) !== 1
+  const floor = lease.first_billing_cycle ? lease.first_billing_cycle.slice(0, 7) + '-01' : null
+  const candidateDueDates = dueDatesInRange(windowStart, windowEnd, lease.rent_due_day)
+    .filter(d => ownDay || !floor || d >= floor)
+  const renewal = isRenewalSuccessor(lease)
+  // A renewal's bridge (below) can fall between due dates, so it is not in
+  // the candidates; everything else needs one.
+  if (candidateDueDates.length === 0 && !renewal) return none
+
+  // The move-in invoice (moveInBundle, dated lease.start_date) prorates rent
+  // for the ENTIRE start calendar month — start_date through month-end (a
+  // lease starting on the 1st bills the full month; a booking lease's arrival
+  // segment likewise runs to the day before its first 1st-of-month segment).
+  // So EVERY regular due date that falls in the start month is already covered
+  // by it. Skipping ONLY the date equal to start_date was a bug: a lease with
+  // a mid-month rent_due_day (e.g. due on the 15th — any rent_due_day > 1)
+  // would land a second full-month invoice inside the already-prorated move-in
+  // window and double-bill the first month. Skip the whole start month.
+  // (Candidates are always on/after start_date — the window floors at the
+  // lease start — so a start-month match is necessarily on/after move-in;
+  // it can never drop a legitimately earlier same-month cycle.)
+  const startMonth = lease.start_date.slice(0, 7)   // 'YYYY-MM'
+  const dueDay = Number(lease.rent_due_day) || 1
+  let dueDates: string[]
+  // The rent on a date that is not a regular due date — a renewal's bridge.
+  const rentForDate: Record<string, string> = {}
+  if (renewal) {
+    // ── A RENEWAL CONTINUES THE SCHEDULE ───────────────────────────────────
+    //
+    // Nic: "people get billed on their due date according to how the
+    // landlord sets the property." One tenancy, one billing schedule. None of
+    // the move-in rules below apply — nobody moved in. The old lease's last
+    // bill already covered up to the first of its due dates after its last
+    // day; this lease bills from there (or from its own start, if later).
+    // Only a due day changed on the new form leaves a stretch to bridge, and
+    // that is the one prorated bill.
+    const sched = renewalSchedule({
+      oldEnd: lease.predecessor_end_date ?? null,
+      oldDueDay: Number(lease.predecessor_due_day) || dueDay,
+      newStart: lease.start_date,
+      newDueDay: dueDay,
+      rent: Number(lease.rent_amount),
+    })
+    dueDates = candidateDueDates.filter(d => d >= sched.firstFullDue)
+    const bridgeIn = sched.bridge != null && sched.bridge > 0
+      && sched.firstBill >= windowStart.toISODate()! && sched.firstBill <= windowEnd.toISODate()!
+      && (ownDay || !floor || sched.firstBill >= floor)
+    if (bridgeIn) {
+      dueDates = [sched.firstBill, ...dueDates]
+      rentForDate[sched.firstBill] = sched.bridge!.toFixed(2)
+    }
+  } else if (lease.is_existing_tenancy && dueDay !== 1) {
+    // S652 (Nic): an onboarding resident on their own due day. Their first
+    // bill is the first time that day comes round after signing (or the day
+    // itself, if they signed on it — the move-in invoice makes that one).
+    // This run makes it when the day arrives. Skipping the start month, as
+    // the 1st does, skipped that bill entirely: a month of rent never
+    // invoiced. Anything already invoiced is left alone by the (lease, due
+    // date) check.
+    const firstDue = existingTenancyFirstDue(lease.start_date, lease.first_billing_cycle ?? null, dueDay, lease.property_added_on ?? null)
+    dueDates = candidateDueDates.filter(d => d >= firstDue)
+  } else if (lease.is_existing_tenancy || dueDay === 1) {
+    dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
+  } else {
+    // S648 (Nic): rent due on another day (a fixed 15th, or the tenant's
+    // move-in day). The move-in invoice covers the start date up to the next
+    // due date — which may fall inside the start month — so everything
+    // before that date is already billed; the start-month rule above would
+    // skip a real due date (move in the 5th, due the 15th) or double-bill.
+    const firstRegular = nextDueDateAfter(lease.start_date, dueDay)
+    dueDates = candidateDueDates.filter(d => d >= firstRegular)
+  }
+  // S648 (Nic): a new tenant who moved in between due dates and paid page
+  // 8's "first month's rent" on top of the proration has ALREADY paid the
+  // next due date. Billing it again would charge that month twice.
+  const paidNextAtMoveIn = !renewal && !lease.is_existing_tenancy
+    && Number(lease.move_in_first_month_rent ?? 0) > 0
+    && Number(lease.start_date.slice(8, 10)) !== dueDay
+  if (paidNextAtMoveIn) {
+    const firstAfter = dueDay === 1
+      ? dueDatesInRange(leaseStart, leaseStart.plus({ months: 2 }), dueDay).find(d => d.slice(0, 7) !== startMonth)
+      : nextDueDateAfter(lease.start_date, dueDay)
+    if (firstAfter) dueDates = dueDates.filter(d => d !== firstAfter)
+  }
+  return { dueDates, rentForDate }
+}
+
+/**
+ * The due dates the bill run still owes this lease and has not made — held by
+ * an unread meter or an unapproved reading run, or a run that never happened.
+ *
+ * RENEWAL HAND-OFF (Nic: "people get billed on their due date"): once the old
+ * lease is handed off it is expired, and the run never looks at it again, while
+ * the renewal's schedule counts that month as the old lease's. A bill still
+ * owed then was never billed by anyone — a renewal ending 10/1 whose October
+ * bill waited on the landlord's approval lost October's rent. The lease-end job
+ * asks this first and waits. The answer is empty once a date falls out of the
+ * run's own catch-up window, so the wait ends when the run would give up.
+ */
+export async function unbilledDueDates(leaseId: string, nowUtc: Date = new Date()): Promise<string[]> {
+  const lease = await queryOne<ActiveLease>(`${ACTIVE_LEASE_SELECT} AND l.id = $1`, [leaseId])
+  if (!lease) return []
+  const { dueDates } = billDatesForLease(lease, nowUtc)
+  // A booking lease owes nothing on a due date that starts no stay segment.
+  const owed = isBookingScheduleLease(lease)
+    ? dueDates.filter(d => bookingRentForDueDate(lease.start_date, lease.end_date!, Number(lease.rent_amount), d) != null)
+    : dueDates
+  if (owed.length === 0) return []
+  const made = new Set((await query<{ d: string }>(
+    `SELECT to_char(due_date, 'YYYY-MM-DD') AS d FROM invoices
+      WHERE lease_id = $1 AND due_date = ANY($2::date[])`, [leaseId, owed])).map(r => r.d))
+  return owed.filter(d => !made.has(d))
+}
+
+/**
  * Per-lease loop that does the actual work. Shared between the legacy
  * global generateInvoices() and the per-tz generateInvoicesForTimezone().
  */
@@ -293,95 +497,13 @@ async function runGeneration(
   let homePaymentsInserted = 0
 
   for (const lease of leases) {
-    const leaseStart = DateTime.fromISO(lease.start_date, { zone: lease.property_tz })
-    const leaseEnd = lease.end_date
-      ? DateTime.fromISO(lease.end_date, { zone: lease.property_tz })
-      : null
-
-    let windowStart: DateTime
-    let windowEnd: DateTime
-    if (opts.explicitWindow) {
-      const fromInTz = DateTime.fromISO(opts.explicitWindow.from, { zone: lease.property_tz }).startOf('day')
-      const toInTz = DateTime.fromISO(opts.explicitWindow.to, { zone: lease.property_tz }).startOf('day')
-      windowStart = fromInTz > leaseStart ? fromInTz : leaseStart
-      windowEnd = leaseEnd && leaseEnd < toInTz ? leaseEnd : toInTz
-    } else {
-      const todayInTz = DateTime.fromJSDate(nowUtc, { zone: lease.property_tz }).startOf('day')
-      const catchupStart = todayInTz.minus({ days: CATCHUP_DAYS })
-      windowStart = catchupStart > leaseStart ? catchupStart : leaseStart
-      windowEnd = leaseEnd && leaseEnd < todayInTz ? leaseEnd : todayInTz
-    }
-
-    if (windowEnd < windowStart) continue
-
-    // S652 (Nic): nothing is due before the property's first billing cycle.
-    // The floor is on the invoice's DUE month, not on what was consumed: the
-    // October 1 invoice still carries September's water and electric, because
-    // utilities bill in arrears and ride whichever invoice comes next.
-    //
-    // S652 (Nic): EXCEPT a resident billed on their own day, whose floor is the
-    // day the property was added: "if I onboard the 15th... and I choose
-    // October 1st as the first billing cycle... somebody's on the 20th... they
-    // would be billed before the 1st of the month." Their floor is applied
-    // below, as their first due date.
-    const ownDay = lease.is_existing_tenancy && (Number(lease.rent_due_day) || 1) !== 1
-    const floor = lease.first_billing_cycle ? lease.first_billing_cycle.slice(0, 7) + '-01' : null
-    const candidateDueDates = dueDatesInRange(windowStart, windowEnd, lease.rent_due_day)
-      .filter(d => ownDay || !floor || d >= floor)
-    if (candidateDueDates.length === 0) continue
-
-    // The move-in invoice (moveInBundle, dated lease.start_date) prorates rent
-    // for the ENTIRE start calendar month — start_date through month-end (a
-    // lease starting on the 1st bills the full month; a booking lease's arrival
-    // segment likewise runs to the day before its first 1st-of-month segment).
-    // So EVERY regular due date that falls in the start month is already covered
-    // by it. Skipping ONLY the date equal to start_date was a bug: a lease with
-    // a mid-month rent_due_day (e.g. due on the 15th — any rent_due_day > 1)
-    // would land a second full-month invoice inside the already-prorated move-in
-    // window and double-bill the first month. Skip the whole start month.
-    // (Candidates are always on/after start_date — the window floors at the
-    // lease start — so a start-month match is necessarily on/after move-in;
-    // it can never drop a legitimately earlier same-month cycle.)
-    const startMonth = lease.start_date.slice(0, 7)   // 'YYYY-MM'
+    const renewal = isRenewalSuccessor(lease)
     const dueDay = Number(lease.rent_due_day) || 1
-    let dueDates: string[]
-    if (lease.is_existing_tenancy && dueDay !== 1) {
-      // S652 (Nic): an onboarding resident on their own due day. Their first
-      // bill is the first time that day comes round after signing (or the day
-      // itself, if they signed on it — the move-in invoice makes that one).
-      // This run makes it when the day arrives. Skipping the start month, as
-      // the 1st does, skipped that bill entirely: a month of rent never
-      // invoiced. Anything already invoiced is left alone by the (lease, due
-      // date) check.
-      const firstDue = existingTenancyFirstDue(lease.start_date, lease.first_billing_cycle ?? null, dueDay, lease.property_added_on ?? null)
-      dueDates = candidateDueDates.filter(d => d >= firstDue)
-    } else if (lease.is_existing_tenancy || dueDay === 1) {
-      dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
-    } else {
-      // S648 (Nic): rent due on another day (a fixed 15th, or the tenant's
-      // move-in day). The move-in invoice covers the start date up to the next
-      // due date — which may fall inside the start month — so everything
-      // before that date is already billed; the start-month rule above would
-      // skip a real due date (move in the 5th, due the 15th) or double-bill.
-      const firstRegular = nextDueDateAfter(lease.start_date, dueDay)
-      dueDates = candidateDueDates.filter(d => d >= firstRegular)
-    }
-    // S648 (Nic): a new tenant who moved in between due dates and paid page
-    // 8's "first month's rent" on top of the proration has ALREADY paid the
-    // next due date. Billing it again would charge that month twice.
-    const paidNextAtMoveIn = !lease.is_existing_tenancy
-      && Number(lease.move_in_first_month_rent ?? 0) > 0
-      && Number(lease.start_date.slice(8, 10)) !== dueDay
-    if (paidNextAtMoveIn) {
-      const firstAfter = dueDay === 1
-        ? dueDatesInRange(leaseStart, leaseStart.plus({ months: 2 }), dueDay).find(d => d.slice(0, 7) !== startMonth)
-        : nextDueDateAfter(lease.start_date, dueDay)
-      if (firstAfter) dueDates = dueDates.filter(d => d !== firstAfter)
-    }
+    const { dueDates, rentForDate } = billDatesForLease(lease, nowUtc, opts)
     if (dueDates.length === 0) continue
 
     // Load monthly fees once per lease
-    const fees = await query<MonthlyFee>(
+    const monthlyFees = await query<MonthlyFee>(
       `SELECT id, lease_id, fee_type, amount, description
        FROM lease_fees
        WHERE lease_id = $1 AND due_timing = 'monthly_ongoing'`,
@@ -389,6 +511,13 @@ async function runGeneration(
     )
 
     for (const dueDate of dueDates) {
+      // RENEWAL BRIDGE: a bill on a date that is not a due date (rentForDate)
+      // covers only the days up to the next due date, so its monthly fees are
+      // prorated by the same days as its rent. In full, the first full due date
+      // charged them again — half a period of pet rent cost a whole month.
+      const fees: MonthlyFee[] = dueDate in rentForDate
+        ? monthlyFees.map(f => ({ ...f, amount: prorateMoveInRent(Number(f.amount), dueDate, dueDay).toFixed(2) }))
+        : monthlyFees
       // S534 (Nic): two things hold a unit's invoice — and they hold the
       // WHOLE invoice (rent included), never a partial send:
       //   1. a missing ORIGINAL read on a tenant-responsible submeter
@@ -537,7 +666,7 @@ async function runGeneration(
         bookingRent = seg.toFixed(2)
       }
       const effectiveRentAmount = sublease ? Number(sublease.sub_monthly_amount).toFixed(2)
-        : bookingRent ?? lease.rent_amount
+        : bookingRent ?? rentForDate[dueDate] ?? lease.rent_amount
 
       // S178: pull any utility_bills for this lease that haven't been
       // attached to an invoice yet (payment_id IS NULL) and whose cycle
@@ -943,8 +1072,12 @@ async function runGeneration(
         const isFirstInvoice = Number(priorInvoice.rows[0].n) === 0
         const onboardingWaived =
           lease.is_existing_tenancy === true && lease.onboarding_late_fee_waiver === true
+        // A renewal is not an onboarding: the resident has been set up and
+        // paying here for a whole lease. The after-the-20th grace exists for
+        // people who have days to get set up, and a renewal starting the 25th
+        // is nobody's first bill.
         const lateStartExempt =
-          isFirstInvoice && (onboardingWaived || startedAfter20th)
+          isFirstInvoice && (onboardingWaived || (startedAfter20th && !renewal))
 
         const invoiceRes = await client.query(
           `INSERT INTO invoices (
@@ -1001,14 +1134,21 @@ async function runGeneration(
         // change must not reprice labor owed for THIS month.
         if (wt && creditBasis > 0) {
           const monthStart = DateTime.fromISO(dueDate).startOf('month').toISODate()!
+          // A bridge prorated its fees as well as its rent; the full month counts
+          // them whole, so the hours asked shrink by the same days.
+          const proratedFeeShortfall = fees.reduce((s, f, i) =>
+            s + (feeCovered[i] ? Number(monthlyFees[i].amount) - Number(f.amount) : 0), 0)
           const fullMonthBasis = round2(
             (rentCovered ? Number(lease.rent_amount ?? effectiveRentAmount) : 0)
-            + (creditBasis - (rentCovered ? rentAmountNum : 0)))
+            + (creditBasis - (rentCovered ? rentAmountNum : 0))
+            + proratedFeeShortfall)
           const target = proratedTarget(wt.target, creditBasis, fullMonthBasis)
           // S648 (Nic): the hours that count run from THIS due date to the day
           // before the next — the calendar month when rent is due on the 1st.
-          const periodStart = dueDay === 1 ? monthStart : dueDate
-          const periodEnd = dueDay === 1
+          // A renewal's bridge runs from its own date to the next due date.
+          const calendarMonth = dueDay === 1 && !(dueDate in rentForDate)
+          const periodStart = calendarMonth ? monthStart : dueDate
+          const periodEnd = calendarMonth
             ? DateTime.fromISO(monthStart).endOf('month').toISODate()!
             : DateTime.fromISO(nextDueDateAfter(dueDate, dueDay)).minus({ days: 1 }).toISODate()!
           await client.query(
@@ -1405,45 +1545,21 @@ export async function backfillInvoices(opts: BackfillOpts): Promise<InvoiceGenRe
   if (!to.isValid) throw new Error(`Invalid to date: ${opts.to}`)
   if (from > to) throw new Error('from must be on or before to')
 
-  const where: string[] = [
-    `l.status = 'active'`,
-    `(l.needs_review IS NULL OR l.needs_review = false)`,
-  ]
+  // The daily run's own lease query, narrowed — a catch-up must bill exactly
+  // as the daily run does (this was a fourth copy that had already drifted:
+  // it billed a hibernating snowbird's paused lease and knew nothing of
+  // renewals).
   const params: any[] = []
+  let narrow = ''
   if (opts.leaseId) {
     params.push(opts.leaseId)
-    where.push(`l.id = $${params.length}`)
+    narrow = ` AND l.id = $${params.length}`
   } else if (opts.landlordId) {
     params.push(opts.landlordId)
-    where.push(`l.landlord_id = $${params.length}`)
+    narrow = ` AND l.landlord_id = $${params.length}`
   }
 
-  const leases = await query<ActiveLease>(`
-    SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
-           l.lease_source,
-           -- S648: the same fields as ACTIVE_LEASE_SELECT; a catch-up must bill
-           -- exactly as the daily run does.
-           l.is_existing_tenancy,
-           COALESCE(p.onboarding_late_fee_waiver, FALSE) AS onboarding_late_fee_waiver,
-           -- S652 (Nic): the property's first billing cycle is the hard floor on
-           -- the DUE month. Country Acres was set to October; this job billed
-           -- September on the 23rd and the late-fee job followed.
-           to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
-           to_char((COALESCE(p.onboarding_started_at, p.created_at)
-                    AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on,
-           l.move_in_first_month_rent::text AS move_in_first_month_rent,
-           to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
-           to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
-           (SELECT vlat.tenant_id
-              FROM v_lease_active_tenants vlat
-              WHERE vlat.lease_id = l.id AND vlat.role = 'primary'
-              LIMIT 1) AS tenant_id,
-           COALESCE(p.timezone, 'America/Phoenix') AS property_tz
-    FROM leases l
-    JOIN units u ON u.id = l.unit_id
-    JOIN properties p ON p.id = u.property_id
-    WHERE ${where.join(' AND ')}
-  `, params)
+  const leases = await query<ActiveLease>(ACTIVE_LEASE_SELECT + narrow, params)
 
   return runGeneration(leases, new Date(), {
     explicitWindow: { from: opts.from, to: opts.to },

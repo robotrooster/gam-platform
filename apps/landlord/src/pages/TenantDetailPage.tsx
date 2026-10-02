@@ -25,6 +25,9 @@ export function TenantDetailPage() {
   if (isLoading) return <div style={{ color: 'var(--text-3)', padding: 32 }}>Loading...</div>
   if (!data) return <div className="empty-state"><h3>Tenant not found</h3></div>
   const { tenant, units, payments, maintenance, stats } = data
+  // S641: staff without the payment permissions get no payment history or
+  // money figures from the server; the payment cards are left out for them.
+  const paymentsHidden = !!data.paymentsHidden
   const currentUnit = units?.find((u: any) => u.isCurrent)
   const onTimeColor = stats.onTimeRate >= 90 ? 'var(--green)' : stats.onTimeRate >= 75 ? 'var(--amber)' : 'var(--red)'
   const onTimeLabel = stats.onTimeRate >= 90 ? 'Excellent' : stats.onTimeRate >= 75 ? 'Good' : 'Needs Attention'
@@ -51,13 +54,17 @@ export function TenantDetailPage() {
       {(
         <div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12, marginBottom: 24 }}>
-            {[
+            {/* Figures cover this person's time with YOUR company only — another
+                company's history is never shown here. */}
+            {(paymentsHidden ? [
+              { label: 'Units With You', val: stats.unitsOccupied, color: 'var(--text-0)' },
+            ] : [
               { label: 'Tenant Since', val: stats.firstPayment ? new Date(stats.firstPayment).toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) : '--', color: 'var(--text-0)' },
-              { label: 'Months as Tenant', val: stats.tenantMonths + ' mo', color: 'var(--text-0)' },
+              { label: 'Months With You', val: stats.tenantMonths + ' mo', color: 'var(--text-0)' },
               { label: 'Total Paid', val: fmt(stats.totalPaid), color: 'var(--gold)' },
               { label: 'On-Time Rate', val: stats.onTimeRate + '%', color: onTimeColor, sub: onTimeLabel },
-              { label: 'Units Occupied', val: stats.unitsOccupied, color: 'var(--text-0)' },
-            ].map(s => (
+              { label: 'Units With You', val: stats.unitsOccupied, color: 'var(--text-0)' },
+            ]).map(s => (
               <div key={s.label} className="card" style={{ padding: '14px 16px' }}>
                 <div style={{ fontSize: '.65rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 6 }}>{s.label}</div>
                 <div style={{ fontFamily: 'var(--font-mono)', fontSize: '1rem', fontWeight: 700, color: s.color }}>{s.val}</div>
@@ -83,6 +90,7 @@ export function TenantDetailPage() {
             </div>
             {/* W-25 (S531): the health card drills into per-payment lateness —
                 aggregate health hides whether "late" meant 2 days or 3 weeks. */}
+            {!paymentsHidden && (
             <div className="card" style={{ cursor: 'pointer' }} onClick={() => setShowPaymentDetail(true)} title="See how late each payment actually was">
               <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
                 <span>Payment Health</span>
@@ -109,6 +117,7 @@ export function TenantDetailPage() {
                 </div>
               ))}
             </div>
+            )}
           </div>
 
           <div className="card" style={{ marginBottom: 16 }}>
@@ -139,6 +148,7 @@ export function TenantDetailPage() {
           <PostPaymentCard tenantId={id!} hasUnit={!!currentUnit} paidAhead={Number(data.paidAhead ?? 0)} />
           <OneOffChargesCard tenantId={id!} hasUnit={!!currentUnit} />
 
+          {!paymentsHidden && (
           <div className="card" style={{ marginBottom: 16 }}>
             <div className="card-title" style={{ marginBottom: 14 }}>Payment History</div>
             {payments?.length === 0 ? (
@@ -160,6 +170,7 @@ export function TenantDetailPage() {
               </table>
             )}
           </div>
+          )}
 
           <div className="card">
             <div className="card-title" style={{ marginBottom: 14 }}>Maintenance History</div>

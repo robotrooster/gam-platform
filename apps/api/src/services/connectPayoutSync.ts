@@ -21,6 +21,7 @@
 import { query, queryOne } from '../db'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
+import { stampPayoutTransfers } from './payoutComposition'
 
 export type PayoutLister = {
   payouts: { list: (params: any, opts: any) => Promise<{ data: any[] }> }
@@ -63,15 +64,36 @@ export async function fileConnectPayout(
               bank_name=COALESCE(bank_name,$4), bank_last4=COALESCE(bank_last4,$5),
               landlord_id=COALESCE(landlord_id,$6)
         WHERE id=$1`, [existing.id, status, settled, bank?.name ?? null, bank?.last4 ?? null, owner.landlord_id])
+    // S655: a failed payout's money goes back onto the Stripe balance, and the
+    // next payout carries it — so its transfers go back in the queue with it.
+    if (status === 'failed') {
+      await query(
+        `UPDATE platform_transfer_intents SET disbursement_id = NULL, updated_at = NOW() WHERE disbursement_id = $1`,
+        [existing.id])
+    }
     return 'updated'
   }
-  await query(
+  const created = await queryOne<{ id: string }>(
     `INSERT INTO disbursements
        (user_id, landlord_id, trigger_type, amount, status, stripe_payout_id, initiated_at, settled_at,
         fee_charged, bank_name, bank_last4, notes, created_at)
-     VALUES ($1,$2,'stripe_dashboard',$3,$4,$5,$6,$7,0,$8,$9,$10,$6)`,
+     VALUES ($1,$2,'stripe_dashboard',$3,$4,$5,$6,$7,0,$8,$9,$10,$6)
+     RETURNING id`,
     [owner.user_id, owner.landlord_id, amount, status, p.id, initiated, settled, bank?.name ?? null, bank?.last4 ?? null,
      'Paid out from the Stripe dashboard; recorded by GAM from Stripe.'])
+  // S655: a payout made in Stripe sweeps the same balance GAM's transfers fill,
+  // so it carried the transfers that landed before it. Record them, so this
+  // payout lists its payments like any other. A failed payout carried nothing.
+  if (created?.id && status !== 'failed') {
+    try {
+      await stampPayoutTransfers({
+        disbursementId: created.id, connectAccountId: owner.account,
+        payoutAmount: amount, payoutAt: initiated,
+      })
+    } catch (e) {
+      logger.warn({ err: e, payout_id: p.id }, '[payout-sync] could not record what the payout carried')
+    }
+  }
   return 'created'
 }
 
@@ -100,7 +122,11 @@ export async function syncConnectPayouts(stripe: PayoutLister = getStripe() as a
     let page: { data: any[] }
     try { page = await stripe.payouts.list({ limit: opts.limit ?? 25 }, { stripeAccount: a.account }) }
     catch (e) { logger.warn({ err: e, account: a.account }, '[payout-sync] could not list payouts'); continue }
-    for (const p of page.data) {
+    // S655: oldest first. Stripe lists newest first, and a payout claims the
+    // transfers waiting before it — filing the newest first would hand it the
+    // older payout's transfers.
+    const oldestFirst = [...page.data].sort((a, b) => Number(a.created ?? 0) - Number(b.created ?? 0))
+    for (const p of oldestFirst) {
       seen++
       if (await fileConnectPayout(stripe, a, p, banks) === 'created') created++; else updated++
     }

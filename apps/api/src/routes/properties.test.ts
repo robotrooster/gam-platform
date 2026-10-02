@@ -894,3 +894,196 @@ describe('S649 an address change cannot land on another landlord\'s property', (
     expect(String(res.body.error)).toMatch(/already registered/i)
   })
 })
+
+// S655: a property's "lease-signing email" decides where the OWNER's signature
+// requests for that property go, and the emailed link signs as the owner with
+// no password. It sat on the general edit endpoint, whose gate lets property
+// managers in — so a manager could point the owner's links at their own inbox.
+describe('PATCH /api/properties/:id — owner signing routing is owner-only', () => {
+  async function withManager(opts: { scoped: boolean } = { scoped: true }) {
+    const f = await seedPropsFixture()
+    const prop = await createProperty(f)
+    const propertyId = prop.body.data.id as string
+    const c = await db.connect()
+    let mgrId = ''
+    try { mgrId = await seedManager(c) } finally { c.release() }
+    await db.query(
+      `INSERT INTO property_manager_scopes (user_id, landlord_id, property_ids, all_properties)
+       VALUES ($1, $2, $3::uuid[], FALSE)`,
+      [mgrId, f.landlordId, opts.scoped ? [propertyId] : []])
+    const mgrToken = jwt.sign(
+      { userId: mgrId, role: 'property_manager', email: 'pm@test.dev', profileId: null,
+        landlordId: f.landlordId, permissions: { 'properties.edit': true } },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    return { f, propertyId, mgrId, mgrToken }
+  }
+
+  it('a property manager with Edit properties cannot change the signing email or name; other fields still save', async () => {
+    const { propertyId, mgrToken } = await withManager()
+    for (const body of [{ leaseSigningEmail: 'pm-inbox@evil.test' }, { leaseSigningName: 'Somebody Else' }]) {
+      const res = await request(buildApp())
+        .patch(`/api/properties/${propertyId}`)
+        .set('Authorization', `Bearer ${mgrToken}`)
+        .send(body)
+      expect(res.status).toBe(403)
+      expect(res.body.error).toMatch(/Only the property owner/)
+    }
+    const { rows: [p] } = await db.query(`SELECT lease_signing_email, lease_signing_name FROM properties WHERE id=$1`, [propertyId])
+    expect(p.lease_signing_email).toBeNull()
+    expect(p.lease_signing_name).toBeNull()
+
+    const ok = await request(buildApp())
+      .patch(`/api/properties/${propertyId}`)
+      .set('Authorization', `Bearer ${mgrToken}`)
+      .send({ name: 'Renamed By Manager', leaseSigningEmail: '' })   // unchanged value rides along
+    expect(ok.status).toBe(200)
+    expect(ok.body.data.name).toBe('Renamed By Manager')
+  })
+
+  it('the owner can set it, and the change is recorded', async () => {
+    const { f, propertyId } = await withManager()
+    const res = await request(buildApp())
+      .patch(`/api/properties/${propertyId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseSigningEmail: 'Office@Park.test', leaseSigningName: 'On-Site Office' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.lease_signing_email).toBe('office@park.test')
+    const { rows } = await db.query(
+      `SELECT user_id, old_value, new_value FROM audit_log
+        WHERE action = 'property_lease_signing_changed' AND entity_id = $1`, [propertyId])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].user_id).toBe(f.landlordUserId)
+    expect(rows[0].old_value.leaseSigningEmail).toBeNull()
+    expect(rows[0].new_value.leaseSigningEmail).toBe('office@park.test')
+    expect(rows[0].new_value.leaseSigningName).toBe('On-Site Office')
+  })
+
+  it('a manager not assigned to this property cannot edit it at all', async () => {
+    const { propertyId, mgrToken } = await withManager({ scoped: false })
+    const res = await request(buildApp())
+      .patch(`/api/properties/${propertyId}`)
+      .set('Authorization', `Bearer ${mgrToken}`)
+      .send({ name: 'Out of scope' })
+    expect(res.status).toBe(403)
+  })
+
+  it('a manager sending an address change with a signing-email change gets 403 and nothing is recorded or changed', async () => {
+    const { propertyId, mgrToken } = await withManager()
+    const { rows: [before] } = await db.query(`SELECT street1 FROM properties WHERE id=$1`, [propertyId])
+    const res = await request(buildApp())
+      .patch(`/api/properties/${propertyId}`)
+      .set('Authorization', `Bearer ${mgrToken}`)
+      .send({ street1: '99 Elsewhere Rd', leaseSigningEmail: 'pm-inbox@evil.test' })
+    expect(res.status).toBe(403)
+    expect(res.body.error).toMatch(/Only the property owner/)
+    const { rows: audits } = await db.query(
+      `SELECT action FROM audit_log WHERE entity_id = $1`, [propertyId])
+    expect(audits.map((a: any) => a.action)).not.toContain('property_address_changed')
+    expect(audits).toHaveLength(0)
+    const { rows: [after] } = await db.query(
+      `SELECT street1, lease_signing_email FROM properties WHERE id=$1`, [propertyId])
+    expect(after.street1).toBe(before.street1)
+    expect(after.lease_signing_email).toBeNull()
+  })
+
+  it('another company’s landlord gets 403 and no audit row or admin notice is written', async () => {
+    const { propertyId } = await withManager()
+    const other = await seedPropsFixture()
+    const res = await request(buildApp())
+      .patch(`/api/properties/${propertyId}`)
+      .set('Authorization', `Bearer ${other.landlordToken}`)
+      .send({ street1: '99 Elsewhere Rd', leaseSigningEmail: 'thief@evil.test' })
+    expect(res.status).toBe(403)
+    const { rows: audits } = await db.query(`SELECT 1 FROM audit_log WHERE entity_id = $1`, [propertyId])
+    expect(audits).toHaveLength(0)
+    const { rows: notes } = await db.query(
+      `SELECT 1 FROM admin_notifications WHERE context->>'propertyId' = $1`, [propertyId])
+    expect(notes).toHaveLength(0)
+  })
+})
+
+// S655: a transfer to another account waits for that account to accept.
+describe('property transfer — the receiving side', () => {
+  async function sale() {
+    const seller = await seedPropsFixture()
+    const buyer = await seedPropsFixture()
+    const prop = await createProperty(seller)
+    const propertyId = prop.body.data.id as string
+    const { rows: [b] } = await db.query<{ email: string }>(`SELECT email FROM users WHERE id=$1`, [buyer.landlordUserId])
+    return { seller, buyer, propertyId, buyerEmail: b.email }
+  }
+
+  it('a transfer by email raises a request that waits on the buyer — no codes in the response', async () => {
+    const s = await sale()
+    const res = await request(buildApp())
+      .post(`/api/properties/${s.propertyId}/transfer`)
+      .set('Authorization', `Bearer ${s.seller.landlordToken}`)
+      .send({ toEmail: s.buyerEmail.toUpperCase() })
+    expect(res.status).toBe(202)
+    expect(res.body.data.awaitingBuyer).toBe(true)
+    expect(JSON.stringify(res.body)).not.toMatch(/code/i)
+    const { rows: [r] } = await db.query<any>(
+      `SELECT to_user_id, to_landlord_id, buyer_code FROM property_transfer_requests WHERE id=$1`, [res.body.data.requestId])
+    expect(r.to_user_id).toBe(s.buyer.landlordUserId)
+    expect(r.to_landlord_id).toBeNull()
+    expect(r.buyer_code).toMatch(/^\d{6}$/)
+
+    // The seller's Ownership tab: the typed email, waiting on the buyer.
+    const view = await request(buildApp())
+      .get(`/api/properties/${s.propertyId}/transfer-request`)
+      .set('Authorization', `Bearer ${s.seller.landlordToken}`)
+    expect(view.status).toBe(200)
+    expect(view.body.data.buyer_email).toBe(s.buyerEmail)
+    expect(view.body.data.awaiting_buyer).toBe(true)
+    expect(view.body.data.buyer_name).toBeNull()
+  })
+
+  it('requires exactly one receiver, and a company named directly must be your own', async () => {
+    const s = await sale()
+    for (const body of [{}, { toEmail: s.buyerEmail, toLandlordId: s.buyer.landlordId }]) {
+      const res = await request(buildApp())
+        .post(`/api/properties/${s.propertyId}/transfer`)
+        .set('Authorization', `Bearer ${s.seller.landlordToken}`)
+        .send(body)
+      expect(res.status).toBe(400)
+    }
+    const theirs = await request(buildApp())
+      .post(`/api/properties/${s.propertyId}/transfer`)
+      .set('Authorization', `Bearer ${s.seller.landlordToken}`)
+      .send({ toLandlordId: s.buyer.landlordId })
+    expect(theirs.status).toBe(403)
+    const { rows } = await db.query(`SELECT 1 FROM property_transfer_requests WHERE property_id=$1`, [s.propertyId])
+    expect(rows).toHaveLength(0)
+  })
+
+  it('the buyer sees it under incoming transfers and accepts with their code; a stranger sees nothing', async () => {
+    const s = await sale()
+    const raised = await request(buildApp())
+      .post(`/api/properties/${s.propertyId}/transfer`)
+      .set('Authorization', `Bearer ${s.seller.landlordToken}`)
+      .send({ toEmail: s.buyerEmail })
+    const requestId = raised.body.data.requestId
+
+    const incoming = await request(buildApp())
+      .get('/api/properties/transfer-requests/incoming')
+      .set('Authorization', `Bearer ${s.buyer.landlordToken}`)
+    expect(incoming.status).toBe(200)
+    expect(incoming.body.data.map((r: any) => r.id)).toEqual([requestId])
+    const stranger = await seedPropsFixture()
+    const none = await request(buildApp())
+      .get('/api/properties/transfer-requests/incoming')
+      .set('Authorization', `Bearer ${stranger.landlordToken}`)
+    expect(none.body.data).toEqual([])
+
+    const { rows: [r] } = await db.query<any>(`SELECT buyer_code FROM property_transfer_requests WHERE id=$1`, [requestId])
+    const accepted = await request(buildApp())
+      .post(`/api/properties/transfer-request/${requestId}/approve`)
+      .set('Authorization', `Bearer ${s.buyer.landlordToken}`)
+      .send({ code: r.buyer_code })
+    expect(accepted.status).toBe(200)
+    expect(accepted.body.data.side).toBe('buyer')
+    expect(accepted.body.data.executed).toBe(false)   // the seller has not confirmed yet
+    const { rows: [p] } = await db.query<any>(`SELECT landlord_id FROM properties WHERE id=$1`, [s.propertyId])
+    expect(p.landlord_id).toBe(s.seller.landlordId)
+  })
+})

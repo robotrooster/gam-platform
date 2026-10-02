@@ -2,14 +2,16 @@ import { query, queryOne } from '../db'
 import { logger } from '../lib/logger'
 import { createNotification } from './notifications'
 import { todayIn, dateIn } from '../lib/timezone'
+import { pooledCheckSql } from './onboardingWindow'
 
 // S547 (Nic): the long-stay ping is a DECISION for the landlord — screen
 // first, or send the lease directly if they know the guest. The system never
 // auto-sends a background check. To inform that decision we surface the
-// guest's GAM history: prior completed stays with this landlord, any approved
-// background check already in the system, and whether they've had continuous
-// tenancy in GAM since that check (approved check + continuous tenancy since
-// = no new check needed).
+// guest's history WITH THIS ACCOUNT: prior completed stays with this landlord,
+// an approved background check run for this account (or shared by the guest
+// through the renter pool), and whether they've rented from this account
+// continuously since that check (approved check + continuous tenancy since
+// = no new check needed). S655: never another company's checks or leases.
 const CONTINUITY_GAP_DAYS = 30   // move-between-units grace when chaining leases
 
 interface GuestScreeningContext {
@@ -40,11 +42,23 @@ async function guestScreeningContext(
   if (!person) return out
 
   // decided_at can be NULL on older approved rows — fall back to created_at.
+  //
+  // S655: only a check THIS account may rely on — one run for any of its
+  // companies, or one the guest put in the renter pool (they agreed to share
+  // it). This read any company's approval, so the notification told company B
+  // that company A had approved the guest, on what date, and B's own screening
+  // email was skipped on A's say-so. Each company's screening decision is its
+  // own.
+  //
+  // "Renter pool" means a check run through GAM's pool intake (no company),
+  // not any check with the share box ticked — a check another company ran is
+  // that company's decision even when the applicant agreed to share it.
   const check = await queryOne<{ at: string }>(
-    `SELECT COALESCE(decided_at, created_at) AS at FROM background_checks
-      WHERE status = 'approved' AND (user_id = $1 OR tenant_id = $2)
-      ORDER BY COALESCE(decided_at, created_at) DESC LIMIT 1`,
-    [person.user_id, person.tenant_id])
+    `SELECT COALESCE(bc.decided_at, bc.created_at) AS at FROM background_checks bc
+      WHERE bc.status = 'approved' AND (bc.user_id = $1 OR bc.tenant_id = $2)
+        AND (${pooledCheckSql('bc')} OR bc.landlord_id IN (SELECT public.account_companies($3)))
+      ORDER BY COALESCE(bc.decided_at, bc.created_at) DESC LIMIT 1`,
+    [person.user_id, person.tenant_id, landlordId])
   if (!check?.at) return out
   // pg returns a Date object — normalize to YYYY-MM-DD. S654: the day it was
   // approved on the property's calendar; the UTC day reads as tomorrow for a
@@ -52,9 +66,10 @@ async function guestScreeningContext(
   out.approvedCheckAt = dateIn(tz, new Date(check.at))
 
   if (person.tenant_id) {
-    // Continuous = their leases (any GAM landlord, via the lease_tenants
-    // junction), merged with a small move-between-properties grace, cover
-    // check-date → today.
+    // Continuous = their leases with THIS account (any of its companies, via
+    // the lease_tenants junction), merged with a small move-between-properties
+    // grace, cover check-date → today. S655: it walked leases at every GAM
+    // landlord, which told this company where else the guest had lived.
     // S654: ::text — pg hands a bare DATE back as a JS Date, and String(Date)
     // .slice(0, 10) is "Fri Jul 10", which made every lease below an Invalid
     // Date: the walk never advanced and continuity was judged off the check
@@ -64,7 +79,8 @@ async function guestScreeningContext(
          FROM leases l
          JOIN lease_tenants lt ON lt.lease_id = l.id
         WHERE lt.tenant_id = $1 AND l.status NOT IN ('pending', 'cancelled')
-        ORDER BY l.start_date ASC`, [person.tenant_id])
+          AND l.landlord_id IN (SELECT public.account_companies($2))
+        ORDER BY l.start_date ASC`, [person.tenant_id, landlordId])
     let cover = new Date(out.approvedCheckAt + 'T12:00:00Z')
     // S654: today is the property's calendar day, anchored at noon UTC like
     // the lease dates, so the 30-day grace is counted in whole days and does
@@ -183,13 +199,15 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
             logger.error({ err: e, bookingId }, '[booking-lease-draft] auto screening email failed')
           }
         }
+        // S655: everything here is this account's own record (plus a check the
+        // guest shared through the renter pool) — never another company's.
         const history = ctx.approvedCheckAt && ctx.continuousTenancySince
-          ? ` They passed a GAM background check on ${ctx.approvedCheckAt} and have had continuous tenancy in GAM since — no new check is needed.`
+          ? ` They passed a background check on ${ctx.approvedCheckAt} and have rented from you continuously since — no new check is needed.`
           : ctx.approvedCheckAt
-          ? ` They passed a GAM background check on ${ctx.approvedCheckAt}, but haven't had continuous tenancy since.`
+          ? ` They passed a background check on ${ctx.approvedCheckAt}, but haven't rented from you continuously since.`
           : ctx.priorStays > 0
-          ? ` They've stayed with you ${ctx.priorStays} time${ctx.priorStays === 1 ? '' : 's'} before; no background check is on file.`
-          : ' No GAM history is on file for this guest.'
+          ? ` They've stayed with you ${ctx.priorStays} time${ctx.priorStays === 1 ? '' : 's'} before; no background check with you is on file.`
+          : ' No background check with you is on file for this guest.'
         await createNotification({
           userId: owner.user_id,
           landlordId: booking.landlord_id,
@@ -199,7 +217,7 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
             + (screeningEmailed
                 ? 'A background-check link has been emailed to them automatically, as it is for every stay over the threshold — nothing to do until it comes back.'
                 : alreadyCleared
-                ? 'No screening was sent: they already passed a GAM check and have had continuous tenancy since.'
+                ? 'No screening was sent: they already passed a background check and have rented from you continuously since.'
                 : 'No screening was sent because the reservation has no guest email on file.'),
           data: {
             leaseId, bookingId,

@@ -345,3 +345,43 @@ describe('processAutoPayouts — a transfer that landed late (S652)', () => {
     expect(res.candidatesScanned).toBe(0)
   })
 })
+
+// S655 (Nic): "$2,638.11 from GAM" — which payments? A payout now records the
+// transfers it swept off the landlord's Stripe balance, so the bank row and the
+// Payouts page can list every payment inside it.
+describe('a payout records what it carried', () => {
+  it('links the transfers that landed on the account before it to the payout row', async () => {
+    const userId = await seedConnectReadyLandlord('acct_carry')
+    const ll = (await db.query(`SELECT id FROM landlords WHERE user_id=$1`, [userId])).rows[0].id
+    const intent = (await db.query(
+      `INSERT INTO platform_transfer_intents
+         (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, status,
+          stripe_transfer_id, transferred_at)
+       VALUES ($1,$2,'acct_carry',100,100,'transferred','tr_carry', NOW() - interval '1 day') RETURNING id`,
+      [ll, userId])).rows[0].id
+    getBalanceMock.mockResolvedValue(100)
+
+    const res = await processAutoPayouts(THURSDAY)
+    expect(res.payoutsFired).toBe(1)
+    const d = (await db.query(`SELECT id FROM disbursements WHERE user_id=$1`, [userId])).rows[0]
+    const linked = (await db.query(`SELECT disbursement_id FROM platform_transfer_intents WHERE id=$1`, [intent])).rows[0]
+    expect(linked.disbursement_id).toBe(d.id)
+    // Fully traced — no gap notice.
+    expect(adminNotifyMock.mock.calls.filter((c: any) => c[0]?.category === 'payout_composition_gap')).toHaveLength(0)
+  })
+
+  it('claims the row the Connect webhook filed first, instead of writing a second one', async () => {
+    const userId = await seedConnectReadyLandlord('acct_race')
+    firePayoutMock.mockResolvedValue({ id: 'po_race' } as any)
+    await db.query(
+      // (dated back so the engine's own spacing rule does not skip the run —
+      // in production this row can only appear after the payout fires)
+      `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, notes, created_at)
+       VALUES ($1,'stripe_dashboard',100,'processing','po_race',NOW(),0,'Paid out from the Stripe dashboard; recorded by GAM from Stripe.',
+               NOW() - interval '10 days')`,
+      [userId])
+    await processAutoPayouts(THURSDAY)
+    const rows = (await db.query(`SELECT trigger_type, notes FROM disbursements WHERE stripe_payout_id='po_race'`)).rows
+    expect(rows).toEqual([{ trigger_type: 'auto_friday', notes: null }])
+  })
+})

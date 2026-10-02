@@ -302,3 +302,180 @@ describe('GET /:id/available-units', () => {
     expect(res.body.data).toEqual([])
   })
 })
+
+// A resident who lived at company A and now rents from company B. B's Tenant
+// page used to show A's units, rent history, maintenance (with A's internal
+// notes and costs), work trade and late marks, plus the person's bank digits,
+// date of birth and Stripe id off the whole tenants row.
+describe('GET /:id/profile — a landlord sees only its own company', () => {
+  async function seedMovedResident() {
+    const a = await seedPortfolio()   // company A: the resident's old landlord
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      await c.query(`UPDATE leases SET status='terminated' WHERE id=$1`, [a.leaseId])
+      await c.query(
+        `UPDATE tenants SET stripe_customer_id='cus_secret', bank_last4='6789',
+                bank_routing_last4='4321', date_of_birth='1980-02-03',
+                mailing_address='1 Private Way', flexpay_disqualified_reason='returned payment'
+          WHERE id=$1`, [a.tenantId])
+      const { userId: bUserId, landlordId: bLandlordId } = await seedLandlord(c)
+      const bPropertyId = await seedProperty(c, {
+        landlordId: bLandlordId, ownerUserId: bUserId, managedByUserId: bUserId,
+      })
+      const bUnitId = await seedUnit(c, { propertyId: bPropertyId, landlordId: bLandlordId })
+      const bLeaseId = await seedLease(c, { unitId: bUnitId, landlordId: bLandlordId, status: 'active', startDate: '2026-06-01' })
+      await seedLeaseTenant(c, { leaseId: bLeaseId, tenantId: a.tenantId, role: 'primary' })
+      await c.query('COMMIT')
+      const sign = (payload: object) => jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '1h' })
+      return {
+        a, bUserId, bLandlordId, bUnitId, bLeaseId,
+        bToken: sign({ userId: bUserId, role: 'landlord', email: 'b@test.dev', profileId: null, permissions: {} }),
+      }
+    } catch (e) { await c.query('ROLLBACK'); throw e }
+    finally { c.release() }
+  }
+
+  async function payment(unitId: string, tenantId: string, landlordId: string, amount: number, monthsAgo: number, status = 'settled') {
+    const { rows: [r] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, notes)
+       VALUES ($1, $2, $3, 'rent', $4, $5, 'RENT', CURRENT_DATE - ($6 || ' months')::interval, 'private note')
+       RETURNING id`,
+      [unitId, tenantId, landlordId, amount, status, monthsAgo])
+    return r.id
+  }
+
+  it('shows company B nothing from company A', async () => {
+    const m = await seedMovedResident()
+    const aPay = await payment(m.a.unitId, m.a.tenantId, m.a.landlordId, 700, 6)
+    await payment(m.bUnitId, m.a.tenantId, m.bLandlordId, 900, 1)
+    await db.query(
+      `INSERT INTO maintenance_requests (tenant_id, unit_id, landlord_id, title, description, priority, status, landlord_notes, actual_cost)
+       VALUES ($1, $2, $3, 'A leak', 'at A', 'normal', 'completed', 'A internal note', 450)`,
+      [m.a.tenantId, m.a.unitId, m.a.landlordId])
+    await db.query(
+      `INSERT INTO maintenance_requests (tenant_id, unit_id, landlord_id, title, description, priority, status)
+       VALUES ($1, $2, $3, 'B door', 'at B', 'normal', 'open')`,
+      [m.a.tenantId, m.bUnitId, m.bLandlordId])
+    await db.query(
+      `INSERT INTO work_trade_agreements (unit_id, tenant_id, landlord_id, start_date, duties)
+       VALUES ($1, $2, $3, '2025-01-01', 'A grounds work')`,
+      [m.a.unitId, m.a.tenantId, m.a.landlordId])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1, $2, 300, 300)`, [m.a.leaseId, m.a.tenantId])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1, $2, 40, 40)`, [m.bLeaseId, m.a.tenantId])
+    // A late mark recorded on company A's charge.
+    const { emitPaymentSettledEvent } = await import('../services/creditLedgerEmitters')
+    const c = await db.connect()
+    try {
+      const due = new Date('2026-03-01T00:00:00Z')
+      await emitPaymentSettledEvent(c, {
+        tenantId: m.a.tenantId, paymentId: aPay, paymentType: 'rent', amount: '700',
+        dueDate: due, settledAt: new Date(due.getTime() + 20 * 86_400_000), graceDays: 5, stripePaymentIntentId: null,
+      })
+    } finally { c.release() }
+
+    const res = await request(buildApp())
+      .get(`/api/tenants/${m.a.tenantId}/profile`)
+      .set('Authorization', `Bearer ${m.bToken}`)
+    expect(res.status).toBe(200)
+    const d = res.body.data
+    expect(d.units.map((u: any) => u.id)).toEqual([m.bUnitId])
+    expect(d.payments).toHaveLength(1)
+    expect(Number(d.payments[0].amount)).toBe(900)
+    expect(d.payments[0].notes).toBeUndefined()
+    expect(d.maintenance.map((r: any) => r.title)).toEqual(['B door'])
+    expect(d.maintenance[0].landlord_notes).toBeUndefined()
+    expect(d.workTrade).toEqual([])
+    expect(d.stats.totalPayments).toBe(1)
+    expect(d.stats.totalPaid).toBeCloseTo(900, 2)
+    expect(d.stats.lateCount).toBe(0)
+    expect(d.stats.unitsOccupied).toBe(1)
+    expect(d.paidAhead).toBe(40)
+
+    // Company A still sees its own history, including the late mark.
+    const resA = await request(buildApp())
+      .get(`/api/tenants/${m.a.tenantId}/profile`)
+      .set('Authorization', `Bearer ${m.a.landlordToken}`)
+    expect(resA.status).toBe(200)
+    expect(resA.body.data.units.map((u: any) => u.id)).toEqual([m.a.unitId])
+    expect(resA.body.data.payments).toHaveLength(1)
+    expect(resA.body.data.stats.lateCount).toBe(1)
+    expect(resA.body.data.workTrade).toHaveLength(1)
+    expect(resA.body.data.paidAhead).toBe(300)
+
+    // GAM admin keeps the whole picture.
+    const resAdmin = await request(buildApp())
+      .get(`/api/tenants/${m.a.tenantId}/profile`)
+      .set('Authorization', `Bearer ${m.a.adminToken}`)
+    expect(resAdmin.body.data.units).toHaveLength(2)
+    expect(resAdmin.body.data.payments).toHaveLength(2)
+    expect(resAdmin.body.data.stats.lateCount).toBe(1)
+    expect(resAdmin.body.data.paidAhead).toBe(340)
+  })
+
+  it('gives a landlord only the contact fields the page uses — no bank, Stripe, birth date or Flex fields', async () => {
+    const m = await seedMovedResident()
+    const res = await request(buildApp())
+      .get(`/api/tenants/${m.a.tenantId}/profile`)
+      .set('Authorization', `Bearer ${m.bToken}`)
+    expect(res.status).toBe(200)
+    const t = res.body.data.tenant
+    expect(t.id).toBe(m.a.tenantId)
+    expect(t.email).toBeTruthy()
+    expect('ssi_ssdi' in t).toBe(true)
+    for (const k of ['stripe_customer_id', 'bank_last4', 'bank_routing_last4', 'date_of_birth',
+      'mailing_address', 'flexpay_disqualified_reason', 'background_check_status', 'flexpay_enrolled']) {
+      expect(t[k]).toBeUndefined()
+    }
+  })
+
+  it('keeps the whole record for the resident themselves and for GAM admin', async () => {
+    const m = await seedMovedResident()
+    for (const token of [m.a.tenantToken, m.a.adminToken]) {
+      const res = await request(buildApp())
+        .get(`/api/tenants/${m.a.tenantId}/profile`)
+        .set('Authorization', `Bearer ${token}`)
+      expect(res.status).toBe(200)
+      expect(res.body.data.tenant.bank_last4).toBe('6789')
+      expect(res.body.data.units).toHaveLength(2)
+    }
+  })
+
+  it('a staff member without the payment permissions sees no payment history, work trade or money figures (S641)', async () => {
+    const f = await seedPortfolio()
+    await payment(f.unitId, f.tenantId, f.landlordId, 800, 1)
+    await db.query(
+      `INSERT INTO work_trade_agreements (unit_id, tenant_id, landlord_id, start_date)
+       VALUES ($1, $2, $3, '2025-01-01')`, [f.unitId, f.tenantId, f.landlordId])
+    const { rows: [staff] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'On', 'Site', TRUE) RETURNING id`, [`os-${randomUUID()}@test.dev`])
+    const sign = (payload: object) => jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const plain = sign({ userId: staff.id, role: 'onsite_manager', email: 'os@test.dev',
+      profileId: null, landlordId: f.landlordId, permissions: {} })
+    const res = await request(buildApp())
+      .get(`/api/tenants/${f.tenantId}/profile`)
+      .set('Authorization', `Bearer ${plain}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.payments).toEqual([])
+    expect(res.body.data.workTrade).toEqual([])
+    expect(res.body.data.paymentsHidden).toBe(true)
+    expect(res.body.data.stats.totalPaid).toBeNull()
+    expect(res.body.data.stats.onTimeRate).toBeNull()
+    expect(res.body.data.units).toHaveLength(1)
+
+    // With "View all payments" they do see this company's history.
+    const withPerm = sign({ userId: staff.id, role: 'onsite_manager', email: 'os@test.dev',
+      profileId: null, landlordId: f.landlordId, permissions: { 'payments.view_all': true } })
+    const res2 = await request(buildApp())
+      .get(`/api/tenants/${f.tenantId}/profile`)
+      .set('Authorization', `Bearer ${withPerm}`)
+    expect(res2.body.data.payments).toHaveLength(1)
+    expect(res2.body.data.paymentsHidden).toBe(false)
+    expect(res2.body.data.stats.totalPaid).toBeCloseTo(800, 2)
+  })
+})

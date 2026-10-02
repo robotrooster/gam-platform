@@ -15,7 +15,13 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import { toast, appConfirm } from '../components/dialogs'
+import { EntityPicker, useEntities } from '../components/EntityPicker'
 import { ArrowRightLeft, Check, X, AlertTriangle } from 'lucide-react'
+
+// S655: a transfer to ANOTHER account now waits for that account to accept
+// (with its own emailed code, choosing which of its companies takes it).
+// Moving a property between two companies YOU own needs no acceptance step.
+type Mode = 'email' | 'company'
 
 export function PropertyOwnershipTab({ propertyId, propertyName }:
   { propertyId: string; propertyName: string }) {
@@ -24,6 +30,9 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
   const [note, setNote] = useState('')
   const [code, setCode] = useState('')
   const [err, setErr] = useState('')
+  const [mode, setMode] = useState<Mode>('email')
+  const [toCompany, setToCompany] = useState('')
+  const { data: entities = [] } = useEntities()
 
   const { data: request } = useQuery<any>(
     ['transfer-request', propertyId],
@@ -38,11 +47,22 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
 
   const invalidate = () => qc.invalidateQueries(['transfer-request', propertyId])
 
+  // Another company of yours to move it to — only offered when the account
+  // owns one besides the company that holds this property.
+  const otherCompanies = (entities as any[]).filter(en => en.id !== property?.landlordId)
+  const companyName = (id: string) =>
+    (entities as any[]).find(en => en.id === id)?.businessName || 'your other company'
+
   const start = useMutation(
-    () => apiPost(`/properties/${propertyId}/transfer`, { toEmail: email.trim(), note: note.trim() || undefined }),
+    () => apiPost(`/properties/${propertyId}/transfer`, mode === 'company'
+      ? { toLandlordId: toCompany, note: note.trim() || undefined }
+      : { toEmail: email.trim(), note: note.trim() || undefined }),
     { onSuccess: (r: any) => {
-        invalidate(); setEmail(''); setNote('')
-        toast(`Sale proposed. ${r?.data?.approversNotified ?? 0} owner(s) emailed a confirmation code.`)
+        invalidate(); setEmail(''); setNote(''); setToCompany('')
+        const d = r?.data ?? r
+        toast(d?.awaitingBuyer
+          ? `Transfer proposed. ${d?.approversNotified ?? 0} owner(s) emailed a confirmation code, and the buyer was emailed a code to accept.`
+          : `Transfer proposed. ${d?.approversNotified ?? 0} owner(s) emailed a confirmation code.`)
       },
       onError: (e: any) => setErr(e?.response?.data?.error || 'Could not start the transfer') })
 
@@ -50,9 +70,12 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
     () => apiPost(`/properties/transfer-request/${request.id}/approve`, { code: code.trim() }),
     { onSuccess: (r: any) => {
         invalidate(); setCode('')
-        toast(r?.data?.executed
+        const d = r?.data ?? r
+        toast(d?.executed
           ? 'Approved — the property has been transferred.'
-          : `Approved. ${r?.data?.approved}/${r?.data?.required} owners have confirmed.`)
+          : d?.awaitingBuyer
+            ? 'Confirmed. Every owner has confirmed — waiting on the buyer to accept.'
+            : `Approved. ${d?.approved}/${d?.required} owners have confirmed.`)
       },
       onError: (e: any) => setErr(e?.response?.data?.error || 'Could not confirm') })
 
@@ -101,12 +124,15 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
         <div className="card" style={{ padding: 18, borderLeft: '3px solid var(--gold)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
             <ArrowRightLeft size={17} style={{ color: 'var(--gold)' }} />
-            <h3 style={{ margin: 0, fontSize: '1rem' }}>Sale proposed — awaiting owner approval</h3>
+            <h3 style={{ margin: 0, fontSize: '1rem' }}>
+              {request.ownCompanyMove ? 'Move proposed — awaiting owner approval' : 'Sale proposed — awaiting approval'}
+            </h3>
           </div>
           <p style={{ fontSize: '.85rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
             <strong style={{ color: 'var(--text-0)' }}>{propertyName}</strong> would transfer to{' '}
-            <strong style={{ color: 'var(--text-0)' }}>{request.buyerName || 'the buyer'}</strong>.
-            It will not go ahead until <strong style={{ color: 'var(--text-0)' }}>every owner</strong> confirms.
+            <strong style={{ color: 'var(--text-0)' }}>{request.buyerName || request.buyerEmail || 'the buyer'}</strong>.
+            It will not go ahead until <strong style={{ color: 'var(--text-0)' }}>every owner</strong> confirms
+            {request.ownCompanyMove ? '' : <> and <strong style={{ color: 'var(--text-0)' }}>the buyer accepts</strong></>}.
             Expires {String(request.expiresAt).slice(0, 10)}.
           </p>
           {request.note && (
@@ -131,6 +157,18 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
                 </span>
               </div>
             ))}
+            {!request.ownCompanyMove && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10,
+                padding: '7px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.84rem' }}>
+                {request.awaitingBuyer
+                  ? <span style={{ width: 15, textAlign: 'center', color: 'var(--text-3)' }}>·</span>
+                  : <Check size={15} style={{ color: 'var(--green)' }} />}
+                <span style={{ flex: 1 }}>Buyer — {request.buyerName || request.buyerEmail}</span>
+                <span style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
+                  {request.awaitingBuyer ? 'waiting on the buyer' : 'accepted'}
+                </span>
+              </div>
+            )}
           </div>
 
           {request.youAreApprover && !request.youApproved && (
@@ -156,7 +194,11 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
           )}
           {request.youApproved && (
             <div style={{ fontSize: '.82rem', color: 'var(--green)' }}>
-              ✓ You've confirmed. Waiting on the other owners.
+              ✓ You've confirmed. {(request.approvals ?? []).every((a: any) => a.approvedAt)
+                ? 'Waiting on the buyer to accept.'
+                : request.awaitingBuyer && !request.ownCompanyMove
+                  ? 'Waiting on the other owners and the buyer.'
+                  : 'Waiting on the other owners.'}
             </div>
           )}
         </div>
@@ -169,8 +211,9 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
     <div style={{ maxWidth: 640 }}>
       <h3 style={{ fontSize: '1rem', margin: '0 0 6px' }}>Sell or transfer this property</h3>
       <p style={{ fontSize: '.85rem', color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 14 }}>
-        Hands {propertyName} to another GAM account. <strong style={{ color: 'var(--text-0)' }}>Every owner
-        of this account must confirm</strong> before anything moves.
+        Hands {propertyName} to another GAM account{otherCompanies.length ? ', or moves it to another company you own' : ''}.{' '}
+        <strong style={{ color: 'var(--text-0)' }}>Every owner of this company must confirm</strong>, and another
+        account <strong style={{ color: 'var(--text-0)' }}>must accept</strong>, before anything moves.
       </p>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
@@ -199,17 +242,37 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
         </div>
       </div>
 
-      <div style={{ marginBottom: 12 }}>
-        <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Buyer's GAM email *</label>
-        <input className="input" value={email} onChange={e => { setEmail(e.target.value); setErr('') }}
-          placeholder="buyer@example.com" style={{ width: '100%' }} />
-        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
-          They need a landlord account on GAM first.
+      {otherCompanies.length > 0 && (
+        <div style={{ display: 'flex', gap: 16, marginBottom: 12, fontSize: '.82rem', color: 'var(--text-1)' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+            <input type="radio" checked={mode === 'email'} onChange={() => { setMode('email'); setErr('') }} />
+            Someone else, by email
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+            <input type="radio" checked={mode === 'company'} onChange={() => { setMode('company'); setErr('') }} />
+            Another of your companies
+          </label>
         </div>
-      </div>
+      )}
+
+      {mode === 'company' && otherCompanies.length > 0 ? (
+        <div style={{ marginBottom: 12 }}>
+          <EntityPicker value={toCompany} onChange={id => { setToCompany(id); setErr('') }} label="Move to"
+            note="A company you own — no acceptance step. Every owner of this company still confirms." />
+        </div>
+      ) : (
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Buyer's GAM email *</label>
+          <input className="input" value={email} onChange={e => { setEmail(e.target.value); setErr('') }}
+            placeholder="buyer@example.com" style={{ width: '100%' }} />
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+            They need a landlord account on GAM first. They are emailed a code and must accept before anything moves.
+          </div>
+        </div>
+      )}
 
       <div style={{ marginBottom: 14 }}>
-        <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Note for your co-owners</label>
+        <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Note (your co-owners and the buyer see it)</label>
         <input className="input" value={note} onChange={e => setNote(e.target.value)}
           placeholder="Closing 30 Sept — per the purchase agreement" style={{ width: '100%' }} />
       </div>
@@ -219,13 +282,18 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
           border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>{err}</div>
       )}
 
-      <button className="btn btn-primary" disabled={!email.trim() || start.isLoading}
+      <button className="btn btn-primary"
+        disabled={(mode === 'company' && otherCompanies.length > 0 ? !toCompany : !email.trim()) || start.isLoading}
         onClick={async () => {
-          if (await appConfirm(
-            `Propose transferring ${propertyName} to ${email.trim()}? Every owner will be emailed a confirmation code.`,
-            { confirmLabel: 'Propose sale' })) { setErr(''); start.mutate() }
+          const toCompanyMode = mode === 'company' && otherCompanies.length > 0
+          const message = toCompanyMode
+            ? `Move ${propertyName} to ${companyName(toCompany)}? Every owner of this company will be emailed a confirmation code.`
+            : `Propose transferring ${propertyName} to ${email.trim()}? Every owner will be emailed a confirmation code, and the buyer must accept with their own code before anything moves.`
+          if (await appConfirm(message, { confirmLabel: toCompanyMode ? 'Propose move' : 'Propose sale' })) {
+            setErr(''); start.mutate()
+          }
         }}>
-        <ArrowRightLeft size={15} /> Propose sale
+        <ArrowRightLeft size={15} /> {mode === 'company' && otherCompanies.length > 0 ? 'Propose move' : 'Propose sale'}
       </button>
     </div>
   )

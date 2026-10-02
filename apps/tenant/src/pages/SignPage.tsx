@@ -4,7 +4,8 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
-import { humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso, startVersionWatch } from '@gam/shared'
+import { humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso, startVersionWatch,
+  renewalSchedule, renewalBillingSummary, dayBefore, parseDueDay, moneyBoxValue } from '@gam/shared'
 import { TypedDateInput } from '../components/TypedDateInput'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -357,6 +358,16 @@ export function SignPage() {
     { retry:false }
   )
 
+  // RENEWAL (Nic: "people get billed on their due date according to how the
+  // landlord sets the property"). The lease this one renews — the resident's
+  // own current lease — decides when the new rent starts. Read with their
+  // session; a signing link opened without one states the rule rather than a
+  // date it cannot know.
+  const priorLeaseId: string | null = data?.document?.renewsLeaseId ?? null
+  const { data: priorLease } = useQuery(['renewal-prior', priorLeaseId],
+    () => authFetch('/leases/' + priorLeaseId).then(r => r.ok ? r.json() : null).then((r: any) => r?.success ? r.data : null),
+    { enabled: !!priorLeaseId && !!tok() && !SIGNER_TOKEN_RE.test(documentId || ''), retry: false })
+
   // S234: tenant draft persistence. Save in-progress field values to
   // localStorage keyed by document id so an accidental refresh / nav-
   // away doesn't lose the work. Cleared on successful submit + on
@@ -603,6 +614,29 @@ export function SignPage() {
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
   const allFilled = unfilledRequired.length === 0
 
+  // RENEWAL: the first bill under the new lease, from the terms the landlord
+  // signed — the same arithmetic the bill run uses.
+  const renewalLine: string | null = (() => {
+    if (!doc?.renewsLeaseId) return null
+    const valOf = (col: string) => allFields.find((x:any) => x.leaseColumn === col && String(x.value ?? '').trim() !== '')?.value ?? null
+    const startRaw = valOf('start_date')
+    const start = startRaw ? (/^\d{4}-\d{2}-\d{2}/.test(startRaw) ? startRaw.slice(0, 10) : documentDateToIso(startRaw)) : null
+    const rent = moneyBoxValue(valOf('rent_amount'))
+    if (!start || !(rent > 0)) return null
+    // The first bill depends on the current lease's last day and due day.
+    // Without them (a signing link opened with no session) a specific date
+    // could be wrong — a changed due day makes a bridge this page cannot see —
+    // so the note states only the rule.
+    if (!priorLease) return null
+    const priorDay = priorLease.rentDueDay != null ? Number(priorLease.rentDueDay) : null
+    const newDay = parseDueDay(valOf('rent_due_day')) ?? priorDay ?? 1
+    const sched = renewalSchedule({
+      oldEnd: priorLease.endDate ? String(priorLease.endDate).slice(0, 10) : dayBefore(start),
+      oldDueDay: priorDay ?? newDay, newStart: start, newDueDay: newDay, rent,
+    })
+    return renewalBillingSummary(sched, rent, newDay)
+  })()
+
   const handleFieldClick = (field:any) => {
     if (field.fieldType==='signature' && savedSig) {
       setFieldValues(p=>({...p,[field.id]:savedSig.value}))
@@ -768,6 +802,14 @@ export function SignPage() {
       <div style={{ height:3, background:'var(--bg-3)', borderRadius:2, marginBottom:12, overflow:'hidden' }}>
         <div style={{ height:'100%', background:'var(--gold,#c9a227)', borderRadius:2, width:`${requiredFields.length?Math.round((requiredFields.length-unfilledRequired.length)/requiredFields.length*100):0}%`, transition:'width .3s' }}/>
       </div>
+
+      {doc?.renewsLeaseId && (
+        <div style={{ background:'var(--bg-2,#151a22)', border:'1px solid var(--border-0)', borderLeft:'3px solid var(--gold,#c9a227)', borderRadius:8, padding:'10px 12px', marginBottom:12, fontSize:'.8rem', color:'var(--text-1,#ddd)', lineHeight:1.5 }}>
+          <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>Your new lease</div>
+          {renewalLine ?? 'Your rent picks up where your current lease\'s bills leave off, so no stretch is billed twice.'}
+          {' '}Signing it bills no rent — only one-time money on it, like a deposit increase.
+        </div>
+      )}
 
       <div ref={containerRef} style={{ position:'relative', background:'#525659', borderRadius:12, overflow:'auto', maxHeight:'78vh', marginBottom:16 }}>
         <div style={{ position:'relative', display:'inline-block', width:'100%' }}>

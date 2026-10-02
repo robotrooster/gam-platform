@@ -6,6 +6,7 @@ import { apiGet } from '../lib/api'
 import { useEntities } from '../components/EntityPicker'
 import { usePerms } from '../lib/permissions'
 import { X } from 'lucide-react'
+import { PayoutBreakdown } from '../components/PayoutBreakdown'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 // ── S651: what you pay GAM ────────────────────────────────────────────────
@@ -244,7 +245,7 @@ export function DisbursementsPage() {
 
       {selected && (
         <div className="modal-overlay" onClick={() => setSelected(null)}>
-          <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
+          <div className="modal" style={{ maxWidth: 640 }} onClick={e => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
               <div className="modal-title" style={{ marginBottom: 0 }}>Disbursement Detail</div>
               <button className="btn btn-ghost btn-sm" onClick={() => setSelected(null)} style={{ padding: 6 }}><X size={15} /></button>
@@ -262,9 +263,9 @@ export function DisbursementsPage() {
             <div className="data-row"><span className="data-key">Trigger</span>
               <span className="data-val">{DISBURSEMENT_TRIGGER_LABEL[selected.triggerType] ?? (selected.triggerType ? humanize(selected.triggerType) : '—')}</span>
             </div>
-            {selected.bankNickname && (
+            {(selected.bankNickname || selected.bankName) && (
               <div className="data-row"><span className="data-key">Destination bank</span>
-                <span className="data-val">{selected.bankNickname} •••• {selected.bankLast4}</span>
+                <span className="data-val">{selected.bankNickname || selected.bankName} •••• {selected.bankLast4}</span>
               </div>
             )}
             {parseFloat(selected.feeCharged ?? '0') > 0 && (
@@ -272,6 +273,8 @@ export function DisbursementsPage() {
             )}
             <div className="data-row"><span className="data-key">Initiated</span><span className="data-val mono" style={{ fontSize: '.8rem' }}>{selected.initiatedAt ? new Date(selected.initiatedAt).toLocaleString() : '—'}</span></div>
             <div className="data-row"><span className="data-key">Settled</span><span className="data-val mono" style={{ fontSize: '.8rem' }}>{selected.settledAt ? new Date(selected.settledAt).toLocaleString() : 'Pending'}</span></div>
+            {/* S655 (Nic): what this payout carried — every payment inside it. */}
+            <PayoutContents disbursementId={selected.id} />
           </div>
         </div>
       )}
@@ -454,6 +457,22 @@ function PmImpactSection() {
           ))}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+// S655: the payments inside one payout, read from GAM's own records (Stripe
+// cannot itemize a manual payout). Same table as the bank row it landed as.
+function PayoutContents({ disbursementId }: { disbursementId: string }) {
+  const { data, isLoading, isError } = useQuery<any>(
+    ['payout-composition', disbursementId],
+    () => apiGet(`/disbursements/${disbursementId}/composition`))
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div style={{ fontWeight: 600, fontSize: '.85rem', marginBottom: 6 }}>What this payout carried</div>
+      {isLoading ? <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>Loading…</div>
+        : isError ? <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>Could not load what this payout carried.</div>
+        : <PayoutBreakdown breakdown={data} />}
     </div>
   )
 }

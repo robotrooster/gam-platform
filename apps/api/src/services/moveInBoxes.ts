@@ -15,12 +15,23 @@
  *     resident the two cannot differ)
  *   - move_in_total_due ← the sum of everything the move-in invoice bills
  *
+ * RENEWAL (Nic: "people get billed on their due date according to how the
+ * landlord sets the property"). A renewal is not a move-in: its rent continues
+ * on the household's own due dates, billed by the nightly run, so page 8 bills
+ * NO rent — first month and proration are $0 and locked. Its deposit line is
+ * only what rises above the deposit the old lease already holds (the S534
+ * top-up the build bills), and each deposit-type box likewise; a fee box bills
+ * as typed. The total is the one-time bill the renewal actually sends.
+ *
  * Runs when a lease is drafted and again when the landlord signs, on the
  * caller's connection so it sees the values just written. Only unsigned
- * computed boxes are touched — nothing a signature already sits over changes.
+ * computed boxes are touched — nothing a signature already sits over changes —
+ * except the computed boxes themselves (the deposit copy, the total, and on a
+ * renewal the $0 rent lines), which are the system's to keep honest.
  */
 import {
-  FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue,
+  FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue, defaultMoneyKind,
+  type FeeType,
 } from '@gam/shared'
 
 type Exec = { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> }
@@ -51,15 +62,35 @@ export async function restampMoveInBoxes(c: Exec, documentId: string): Promise<v
       || r.lease_column === 'move_in_first_month_rent')) return
 
   const first = (col: string) => rows.find(r => r.lease_column === col && r.value != null && r.value.trim() !== '')?.value ?? null
-  const existing = await isExistingTenancyDocument(c, documentId)
+  const billed = await renewalBilledAmount(c, documentId)
+  const renewal = billed !== null
+  const existing = !renewal && await isExistingTenancyDocument(c, documentId)
+  const computed = renewal
+    ? ['move_in_security_deposit', 'move_in_total_due', 'move_in_first_month_rent', 'move_in_proration']
+    : ['move_in_security_deposit', 'move_in_total_due']
   const set = async (col: string, value: string) => {
     await c.query(
       `UPDATE lease_document_fields SET value = $3
         WHERE document_id = $1 AND lease_column = $2
-          AND (signed_at IS NULL OR lease_column IN ('move_in_security_deposit', 'move_in_total_due'))
+          AND (signed_at IS NULL OR lease_column = ANY($4::text[]))
           AND value IS DISTINCT FROM $3`,
-      [documentId, col, value])
+      [documentId, col, value, computed])
     for (const r of rows) if (r.lease_column === col) r.value = value
+  }
+
+  if (renewal) {
+    // The renewal's rent is billed on the household's due dates by the nightly
+    // run — never on page 8.
+    await set('move_in_first_month_rent', money(0))
+    await set('move_in_proration', money(0))
+    const deposit = billed('security_deposit', moneyBoxValue(first('security_deposit')))
+    await set('move_in_security_deposit', money(deposit))
+    const total = moveInTotalDue({
+      firstMonthRent: 0, proration: 0, depositMirror: deposit,
+      moveInFees: MOVE_IN_FEE_TAGS.filter(t => t !== 'other_fee').map(t => billed(t, moneyBoxValue(first(t)))),
+    })
+    await set('move_in_total_due', money(total))
+    return
   }
 
   if (existing) {
@@ -81,4 +112,35 @@ export async function restampMoveInBoxes(c: Exec, documentId: string): Promise<v
     moveInFees: MOVE_IN_FEE_TAGS.filter(t => t !== 'other_fee').map(t => first(t)),
   })
   await set('move_in_total_due', money(total))
+}
+
+/**
+ * What a move-in box bills on a RENEWAL, or null when the document is not one.
+ *
+ * Mirrors the build exactly (routes/esign.ts executeOriginalLease, S534): a
+ * box tagged deposit or prepaid — refundable money the household may already
+ * have paid on the old lease — bills only what rises above what the old lease
+ * carries for that type, never below $0; a fee box bills as typed.
+ */
+export async function renewalBilledAmount(
+  c: Exec, documentId: string,
+): Promise<((tag: FeeType, amount: number) => number) | null> {
+  const doc = (await c.query(
+    `SELECT renews_lease_id, template_id FROM lease_documents WHERE id = $1`, [documentId])).rows[0]
+  if (!doc?.renews_lease_id) return null
+  const carried: Record<string, number> = {}
+  for (const r of (await c.query(
+    `SELECT fee_type, SUM(amount)::text AS total FROM lease_fees
+      WHERE lease_id = $1 AND due_timing = 'move_in' AND is_refundable = TRUE
+      GROUP BY fee_type`, [doc.renews_lease_id])).rows) carried[r.fee_type] = Number(r.total) || 0
+  const kinds: Record<string, string> = {}
+  if (doc.template_id) {
+    for (const r of (await c.query(
+      `SELECT lease_column, money_kind FROM lease_template_fields
+        WHERE template_id = $1 AND money_kind IS NOT NULL AND lease_column IS NOT NULL`,
+      [doc.template_id])).rows) kinds[r.lease_column] = r.money_kind
+  }
+  return (tag, amount) => (kinds[tag] ?? defaultMoneyKind(tag)) === 'fee'
+    ? amount
+    : Math.max(0, Math.round((amount - (carried[tag] ?? 0)) * 100) / 100)
 }

@@ -859,9 +859,18 @@ export async function createDocumentRecord(client: any, opts: {
                 AND (i.property_id = un.property_id OR i.unit_id = un.id)) AS r`,
           [residentIds, opts.unitId]).then((r: any) => r.rows[0]?.r === true) : false
 
+        // RENEWAL (Nic: "people get billed on their due date according to how
+        // the landlord sets the property"): the household already lives here.
+        // A renewal is not a move-in, so nothing a NEW resident is charged
+        // starts on its page — the deposit carries from the old lease (the
+        // renewal draft states what is held), and the property's fee list for
+        // new residents is not theirs. The landlord can still type a charge.
+        const renewal = !!opts.renewsLeaseId
+        const noNewResidentCharges = existingTenancy || renewal
+
         for (const [col, val] of Object.entries({
           rent_amount:      ctx.rent_amount,
-          security_deposit: (existingTenancy || returningResident) ? null : ctx.security_deposit,
+          security_deposit: (noNewResidentCharges || returningResident) ? null : ctx.security_deposit,
         })) {
           if (val != null && Number(val) > 0 && prefillValues[col] == null) {
             prefillValues[col] = Number(val).toFixed(2)
@@ -886,7 +895,7 @@ export async function createDocumentRecord(client: any, opts: {
         // other_fee is skipped: the property can list several, and a lease form
         // has one box, usually printed for something specific ("Guest fee").
         if (opts.documentType === 'original_lease') {
-          const schedule = existingTenancy ? [] : await client.query(
+          const schedule = noNewResidentCharges ? [] : await client.query(
             `SELECT pfs.fee_type, pfs.amount
                FROM property_fee_schedules pfs
                JOIN units u ON u.property_id = pfs.property_id AND u.unit_type = pfs.unit_type
@@ -895,7 +904,7 @@ export async function createDocumentRecord(client: any, opts: {
           for (const r of schedule) {
             if (prefillValues[r.fee_type] == null) prefillValues[r.fee_type] = Number(r.amount).toFixed(2)
           }
-          if (existingTenancy) {
+          if (noNewResidentCharges) {
             for (const tag of FEE_TYPES) {
               if (tag === 'security_deposit' || tag === 'other_fee') continue
               if (FEE_TYPE_META[tag].dueTiming !== 'move_in') continue
@@ -910,13 +919,12 @@ export async function createDocumentRecord(client: any, opts: {
             `SELECT p.move_in_collects_next_period AS on, p.rent_due_mode FROM units u
                JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [opts.unitId])
             .then((r: any) => r.rows[0])
-          const d = moveInDefaults({
+          // A renewal's page 8 bills no rent: the nightly run bills it on the
+          // household's own due dates (restampMoveInBoxes keeps it at $0).
+          const d = renewal ? { firstMonthRent: 0, proration: 0 } : moveInDefaults({
             rent: Number(prefillValues.rent_amount ?? ctx.rent_amount ?? 0),
             // S654: document dates are M/D/YYYY, which parseIso can't read.
-            // A renewal keeps its old reading until Nic sets the renewal rule.
-            startIso: opts.renewsLeaseId
-              ? (prefillValues.start_date ?? null)
-              : leaseFieldDate(prefillValues.start_date),
+            startIso: leaseFieldDate(prefillValues.start_date),
             existingTenancy, collectsNextPeriod: prop?.on === true,
             dueDay: parseDueDay(prefillValues.rent_due_day) ?? 1,
             mode: existingTenancy ? 'fixed_day' : prop?.rent_due_mode,
@@ -1425,6 +1433,24 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     }
   }
   // S648: a lease with no readable due day takes the property's rule.
+  //
+  // RENEWAL first (Nic: "people get billed on their due date according to how
+  // the landlord sets the property"): a renewal is not a move-in, so with no
+  // due-day box on the form the household keeps the day it is already on — a
+  // move-in-day tenant the day they first moved in, a fixed-day tenant the
+  // property's day. Reading the renewal's start instead moved a tenant due on
+  // the 1st to the 15th and billed June 15–30 twice. A due-day box on the form
+  // is how a landlord changes it.
+  const carriedDueDay: number | null = !writableCols.includes('rent_due_day') && doc.renews_lease_id
+    ? await client.query(`SELECT rent_due_day FROM leases WHERE id = $1`, [doc.renews_lease_id])
+        .then((r: any) => r.rows[0]?.rent_due_day ?? null)
+    : null
+  if (carriedDueDay != null) {
+    writableCols.push('rent_due_day')
+    writablePlaceholders.push('$' + paramIdx)
+    writableValues.push(Number(carriedDueDay))
+    paramIdx++
+  }
   if (!writableCols.includes('rent_due_day')) {
     const rule = await client.query(
       `SELECT p.rent_due_mode, p.rent_due_day FROM units u JOIN properties p ON p.id = u.property_id
@@ -1490,9 +1516,20 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
         WHERE unit_id = $1 AND cancelled_at IS NULL
           AND (resolved_at IS NULL OR resolved_lease_id = $2)`,
       [doc.unit_id, lease.id])
-    if (intent.rows[0]?.existing) {
+    // A renewal is not an onboarding, whatever invite is still open on the
+    // unit: its billing continues the household's schedule (below), and the
+    // onboarding first-bill rules must never reach it.
+    if (intent.rows[0]?.existing && !doc.renews_lease_id) {
       await client.query('UPDATE leases SET is_existing_tenancy = TRUE WHERE id=$1', [lease.id])
     }
+  }
+
+  // RENEWAL: link the tenancy. The new lease continues the one it renews —
+  // the nightly bill run reads this link to bill one schedule across both
+  // leases (invoiceGeneration, isRenewalSuccessor), the lease-end job to hand
+  // the open items over, and the renewal-tendency report to count it.
+  if (doc.renews_lease_id) {
+    await client.query('UPDATE leases SET supersedes_lease_id = $2 WHERE id = $1', [lease.id, doc.renews_lease_id])
   }
 
   // ── S638 (Nic): A SIGNED LEASE CLOSES THE INVITE ────────────────────────
@@ -1732,12 +1769,16 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       ).then((r: any) => Number(r.rows[0]?.total || 0))
       const delta = Math.round((Number(parsed.amount) - carried) * 100) / 100
       if (delta > 0) {
+        // money_kind rides with it: without it the row took the column default
+        // ('fee'), and a pet-deposit increase billed as the landlord's own
+        // money instead of a deposit held for the household (S653).
         await client.query(
           `INSERT INTO lease_fees (
-             lease_id, fee_type, amount, is_refundable, due_timing, description, is_override
-           ) VALUES ($1, $2, $3, TRUE, 'move_in', $4, FALSE)`,
+             lease_id, fee_type, amount, is_refundable, due_timing, description, is_override, money_kind
+           ) VALUES ($1, $2, $3, TRUE, 'move_in', $4, FALSE, $5)`,
           [lease.id, parsed.fee_type, delta.toFixed(2),
-           `[deposit top-up on renewal] $${carried.toFixed(2)} carried + $${delta.toFixed(2)} newly billed`],
+           `[deposit top-up on renewal] $${carried.toFixed(2)} carried + $${delta.toFixed(2)} newly billed`,
+           parsed.money_kind],
         )
         await client.query(
           `UPDATE security_deposits
@@ -1992,6 +2033,10 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     `SELECT to_char(start_date, 'YYYY-MM-DD') AS d FROM leases WHERE id = $1`,
     [lease.id]).then((r: any) => r.rows[0].d)
 
+  // RENEWAL: the move-in bill carries no rent — only one-time money the
+  // landlord put on the renewal (a deposit increase, a fee typed on the form),
+  // and none at all when there is none. The renewal's rent is the nightly
+  // run's, on the household's own due dates.
   await generateMoveInInvoice(
     {
       lease_id: lease.id,
@@ -2001,23 +2046,30 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       rent_amount: rentAmountNum,
       start_date: storedStart,
     },
-    client
+    client,
+    { renewal: !!doc.renews_lease_id },
   )
 
   // W-7 (S531): renewal completion — the deposit carries forward. Copy the
   // predecessor's refundable move-in deposits onto the new lease AFTER
-  // move-in invoice generation, so they exist for the final move-out
-  // deposit sweep without being re-billed (the tenant already paid them on
-  // the original lease). Also close the loop on the renewal request.
+  // move-in invoice generation, so the renewal records what the household
+  // already holds without billing it again: a later renewal bills only an
+  // increase over these rows, and the security-deposit row is the move-out
+  // fallback when there is no custody record. These rows are a record, not
+  // the money. A pet, key or cleaning deposit is returned at move-out from
+  // its SETTLED payment, which stays on the lease it was paid on — so the
+  // deposit return has to follow supersedes_lease_id back to find it.
+  // Also close the loop on the renewal request.
   if (doc.renews_lease_id) {
     // S534: a same-type "deposit top-up" row (delta billing when the
     // landlord raised the deposit in the renewal doc) must NOT block the
     // carry-forward copy — only a previously-carried row of the same
     // fee_type does (idempotency on retries).
+    // money_kind is copied too: a carried pet deposit is still a deposit.
     await client.query(`
-      INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing, description)
+      INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing, description, money_kind)
       SELECT $1, fee_type, amount, is_refundable, due_timing,
-             COALESCE(description, '') || ' [carried forward from previous lease]'
+             COALESCE(description, '') || ' [carried forward from previous lease]', money_kind
       FROM lease_fees
       WHERE lease_id=$2 AND due_timing='move_in' AND is_refundable=TRUE
         AND fee_type NOT IN (
@@ -4996,6 +5048,14 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
             // no background check either. An inner join would have let exactly
             // the least-established applicants through — the gate would have
             // looked correct and caught nobody.
+            //
+            // S655: only a check THIS account may rely on — one run for any of
+            // its companies, or a renter-pool check: run through GAM's pool
+            // intake (no company; the is_system pool account) with the
+            // applicant's consent to share. Another company's approval never
+            // counts, even with its share box ticked: each company's
+            // screening decision is its own. Same rule as pooledCheckSql()
+            // in services/onboardingWindow.ts.
             const unscreened = await query<{ name: string }>(
               `SELECT s.name
                  FROM lease_document_signers s
@@ -5006,7 +5066,11 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
                     SELECT 1 FROM background_checks bc
                      WHERE bc.tenant_id = t.id
                        AND bc.status IN ('approved', 'completed', 'clear')
-                  )`, [doc.id])
+                       AND ((bc.consent_pool = true
+                             AND (bc.landlord_id IS NULL
+                                  OR bc.landlord_id IN (SELECT pl.id FROM landlords pl WHERE pl.is_system = true)))
+                            OR bc.landlord_id IN (SELECT public.account_companies($2::uuid)))
+                  )`, [doc.id, doc.landlord_id])
             if (unscreened.length > 0) {
               const who = unscreened.map(u => u.name).join(', ')
               // S654: the landlord's window is account-level — name its day on
@@ -5669,12 +5733,29 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // tenant can never execute anything.
     const { primary, coTenants } = await getDocumentTenantSigners(doc.id)
     if (primary && doc.unit_id) {
-      const valsRes = await client.query(`
-        SELECT lease_column, value FROM lease_document_fields
-        WHERE document_id=$1 AND lease_column IN ('start_date','end_date') AND value IS NOT NULL`, [doc.id])
-      const vals = valsRes.rows
-      const startVal = (vals as any[]).find(v => v.lease_column === 'start_date')?.value
-      const endVal   = (vals as any[]).find(v => v.lease_column === 'end_date')?.value
+      // Check the dates being SIGNED, not only the ones already saved. The
+      // landlord types the dates in this very submit; checking the saved
+      // values let "6/31/2026", or a start overlapping the lease being renewed,
+      // through the signature — and then the lease could not be issued and the
+      // document sat stuck until voided. Refused here, the landlord can still
+      // fix the box. A submitted value counts only where this signer may write
+      // it (their own role's box, unsigned or signed by them) — the same rule
+      // the field UPDATE below applies.
+      const dateRows = (await client.query(`
+        SELECT id, lease_column, value, signer_role, signed_at, signer_id FROM lease_document_fields
+        WHERE document_id=$1 AND lease_column IN ('start_date','end_date')`, [doc.id])).rows as any[]
+      const submittedDates = new Map<string, string>()
+      for (const fv of (fieldValues || [])) {
+        if (fv?.fieldId && fv.value != null && String(fv.value).trim() !== '') submittedDates.set(fv.fieldId, String(fv.value))
+      }
+      const effectiveDate = (col: string): string | undefined => {
+        const typed = dateRows.find(r => r.lease_column === col && submittedDates.has(r.id)
+          && r.signer_role === signer.role && (r.signed_at == null || r.signer_id === signer.id))
+        if (typed) return submittedDates.get(typed.id)
+        return dateRows.find(r => r.lease_column === col && r.value != null && String(r.value).trim() !== '')?.value
+      }
+      const startVal = effectiveDate('start_date')
+      const endVal   = effectiveDate('end_date')
       if (doc.document_type === 'original_lease') assertLeaseNotAlreadyOver(endVal, todayIn(doc.property_timezone))
       if (startVal) {
         const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]

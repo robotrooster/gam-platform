@@ -1,7 +1,9 @@
 /**
- * Page 8 restamp for a new tenancy: the deposit line copies page 2 and the
- * total adds every move-in box in full. (S654: renewal page 8 is back to its
- * e32bdc1 behavior until Nic sets the renewal billing rule.)
+ * Page 8 restamp. A new tenancy: the deposit line copies page 2 and the total
+ * adds every move-in box in full. A renewal (Nic's rule — "people get billed on
+ * their due date according to how the landlord sets the property"): no rent on
+ * page 8, the deposit line is only the increase over what the old lease holds,
+ * and the total is the one-time bill the renewal actually sends.
  */
 import { describe, it, expect, beforeEach, afterAll } from 'vitest'
 import { db } from '../db'
@@ -31,16 +33,17 @@ async function seed() {
     const tpl = await c.query<{ id: string }>(
       `INSERT INTO lease_templates (landlord_id, name) VALUES ($1, 'Lease') RETURNING id`, [landlordId])
     await c.query('COMMIT')
-    return { landlordId, unitId, templateId: tpl.rows[0].id }
+    return { landlordId, unitId, templateId: tpl.rows[0].id, oldLeaseId }
   } catch (e) { await c.query('ROLLBACK'); throw e }
   finally { c.release() }
 }
 
-async function newTenancyDoc(s: Awaited<ReturnType<typeof seed>>, values: Record<string, string>) {
+async function newTenancyDoc(s: Awaited<ReturnType<typeof seed>>, values: Record<string, string>,
+  renewsLeaseId: string | null = null, columns = ['move_in_security_deposit', 'move_in_total_due']) {
   const d = await db.query<{ id: string }>(
-    `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, template_id)
-     VALUES ($1, $2, 'Lease', 'original_lease', $3) RETURNING id`,
-    [s.landlordId, s.unitId, s.templateId])
+    `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, template_id, renews_lease_id)
+     VALUES ($1, $2, 'Lease', 'original_lease', $3, $4) RETURNING id`,
+    [s.landlordId, s.unitId, s.templateId, renewsLeaseId])
   const all = {
     move_in_first_month_rent: '0.00', move_in_proration: '0.00',
     move_in_security_deposit: '', move_in_total_due: '', ...values,
@@ -53,7 +56,7 @@ async function newTenancyDoc(s: Awaited<ReturnType<typeof seed>>, values: Record
   await restampMoveInBoxes(db as any, d.rows[0].id)
   const { rows } = await db.query<{ lease_column: string; value: string }>(
     `SELECT lease_column, value FROM lease_document_fields
-      WHERE document_id = $1 AND lease_column IN ('move_in_security_deposit', 'move_in_total_due')`, [d.rows[0].id])
+      WHERE document_id = $1 AND lease_column = ANY($2)`, [d.rows[0].id, columns])
   return Object.fromEntries(rows.map(r => [r.lease_column, r.value]))
 }
 
@@ -63,5 +66,55 @@ describe('page 8 on a new tenancy', () => {
     expect(await newTenancyDoc(s, { security_deposit: '650.00', pet_deposit: '300', pet_fee: '75.00' })).toEqual({
       move_in_security_deposit: '650.00', move_in_total_due: '1025.00',
     })
+  })
+})
+
+describe('page 8 on a renewal says what the renewal bills', () => {
+  const ALL = ['move_in_first_month_rent', 'move_in_proration', 'move_in_security_deposit', 'move_in_total_due']
+
+  it('no rent, and the deposit already held is not owed again', async () => {
+    const s = await seed()
+    expect(await newTenancyDoc(s, {
+      security_deposit: '500.00', pet_deposit: '300', move_in_first_month_rent: '1050.00', move_in_proration: '533.33',
+    }, s.oldLeaseId, ALL)).toEqual({
+      move_in_first_month_rent: '0.00', move_in_proration: '0.00',
+      move_in_security_deposit: '0.00', move_in_total_due: '0.00',
+    })
+  })
+
+  it('a deposit increase bills only the difference; a fee typed on the form bills in full', async () => {
+    const s = await seed()
+    expect(await newTenancyDoc(s, {
+      security_deposit: '600.00', pet_deposit: '350', pet_fee: '75.00',
+    }, s.oldLeaseId, ALL)).toEqual({
+      move_in_first_month_rent: '0.00', move_in_proration: '0.00',
+      // $100 over the $500 held; the pet deposit's $50 over $300 is in the total.
+      move_in_security_deposit: '100.00', move_in_total_due: '225.00',
+    })
+  })
+
+  it('a lower deposit is never a negative charge', async () => {
+    const s = await seed()
+    expect(await newTenancyDoc(s, { security_deposit: '400.00' }, s.oldLeaseId, ALL)).toMatchObject({
+      move_in_security_deposit: '0.00', move_in_total_due: '0.00',
+    })
+  })
+
+  it('the landlord\'s signature over a renewal\'s rent line does not keep a rent figure on page 8', async () => {
+    const s = await seed()
+    const d = await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, template_id, renews_lease_id)
+       VALUES ($1, $2, 'Lease', 'original_lease', $3, $4) RETURNING id`,
+      [s.landlordId, s.unitId, s.templateId, s.oldLeaseId])
+    for (const [col, value] of Object.entries({ security_deposit: '500.00', move_in_first_month_rent: '1050.00',
+      move_in_proration: '0.00', move_in_security_deposit: '', move_in_total_due: '' })) {
+      await db.query(
+        `INSERT INTO lease_document_fields (document_id, field_type, signer_role, lease_column, value, required, signed_at)
+         VALUES ($1, 'text', 'landlord', $2, $3, FALSE, NOW())`, [d.rows[0].id, col, value])
+    }
+    await restampMoveInBoxes(db as any, d.rows[0].id)
+    const r = await db.query<{ value: string }>(
+      `SELECT value FROM lease_document_fields WHERE document_id=$1 AND lease_column='move_in_first_month_rent'`, [d.rows[0].id])
+    expect(r.rows[0].value).toBe('0.00')
   })
 })

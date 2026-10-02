@@ -61,6 +61,8 @@ vi.mock('stripe', () => {
   const paymentMethodsRetrieve = vi.fn(async () => ({
     id: 'pm_mock', us_bank_account: { last4: '6789', routing_number: '110000000' },
   }))
+  // S654: payment_failed reads a bare latest_charge id's failure_code.
+  const chargesRetrieve = vi.fn(async (id: string): Promise<any> => ({ id }))
   const constructEvent = (body: Buffer | string, _sig: any, _secret: string) => {
     const text = typeof body === 'string' ? body : body.toString('utf8')
     return JSON.parse(text)
@@ -71,8 +73,9 @@ vi.mock('stripe', () => {
     this.customers = { retrieve: customersRetrieve, update: customersUpdate }
     this.paymentIntents = { create: paymentIntentsCreate }
     this.paymentMethods = { retrieve: paymentMethodsRetrieve }
+    this.charges = { retrieve: chargesRetrieve }
   }
-  ;(FakeStripe as any).__mocks = { transfersCreate, customersRetrieve, customersUpdate, paymentIntentsCreate, paymentMethodsRetrieve, constructEvent }
+  ;(FakeStripe as any).__mocks = { transfersCreate, customersRetrieve, customersUpdate, paymentIntentsCreate, paymentMethodsRetrieve, chargesRetrieve, constructEvent }
   return { default: FakeStripe }
 })
 
@@ -95,6 +98,7 @@ const stripeMocks: {
   transfersCreate:      ReturnType<typeof vi.fn>
   customersRetrieve:    ReturnType<typeof vi.fn>
   paymentIntentsCreate: ReturnType<typeof vi.fn>
+  chargesRetrieve:      ReturnType<typeof vi.fn>
 } = (Stripe as any).__mocks
 
 // ── HTTP test app ───────────────────────────────────────────────────────────
@@ -923,6 +927,288 @@ describe('POST /webhooks/stripe — payment_intent.payment_failed', () => {
         paymentIntentId: 'pi_fail_unknown_1', returnCode: 'R01',
       }))
     expect(res.status).toBe(200)
+  })
+})
+
+// ── S654: the payment-didn't-go-through email (item G) ─────────────────────
+// Nic: the "Payment cannot be retried" email needs a Pay now button, it must be
+// true for both reasons it is sent, and the bank's reason must be read by name
+// (Stripe's 'insufficient_funds') as well as by R-code so retries actually happen.
+describe('POST /webhooks/stripe — payment_intent.payment_failed: what the tenant is told', () => {
+  async function seedPull(args: {
+    paymentIntentId: string
+    lines?: Array<{ type: 'rent' | 'utility' | 'fee' | 'deposit'; amount: number }>
+    retryCount?: number
+    timezone?: string
+  }) {
+    const client = await getClient()
+    try {
+      const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+      const tenantId = await seedTenant(client)
+      const propertyId = await seedProperty(client, { landlordId, ownerUserId, managedByUserId: ownerUserId })
+      if (args.timezone) await client.query(`UPDATE properties SET timezone = $2 WHERE id = $1`, [propertyId, args.timezone])
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+      const ids: Record<string, string> = {}
+      for (const line of args.lines ?? [{ type: 'rent', amount: 1000 }]) {
+        const entry = line.type === 'rent' ? 'RENT' : line.type === 'utility' ? 'UTILITY'
+          : line.type === 'deposit' ? 'DEPOSIT' : 'OTHERFEE'
+        const r = await client.query<{ id: string }>(
+          `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status,
+                                 entry_description, due_date, stripe_payment_intent_id, retry_count)
+           VALUES ($1, $2, $3, $4, $5, 'processing', $6, CURRENT_DATE, $7, $8) RETURNING id`,
+          [unitId, tenantId, landlordId, line.type, line.amount.toFixed(2), entry,
+           args.paymentIntentId, args.retryCount ?? 0])
+        ids[line.type] = r.rows[0].id
+      }
+      const t = (await client.query<{ email: string; user_id: string }>(
+        `SELECT u.email, u.id AS user_id FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`,
+        [tenantId])).rows[0]
+      return { ids, tenantEmail: t.email, tenantUserId: t.user_id, propertyId }
+    } finally { client.release() }
+  }
+
+  function failedEvent(pi: string, lpe: Record<string, unknown>, extra: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      id: 'evt_' + pi, type: 'payment_intent.payment_failed',
+      data: { object: { id: pi, metadata: {}, last_payment_error: lpe, ...extra } },
+    })
+  }
+  const bankError = (code: string) => ({ code, payment_method: { type: 'us_bank_account' } })
+  const post = (body: string) => request(buildApp())
+    .post('/webhooks/stripe')
+    .set('Content-Type', 'application/json')
+    .set('stripe-signature', 't=1,v1=stub')
+    .send(body)
+  const mailOf = (type: string) => vi.mocked(sendNotificationEmail).mock.calls
+    .map((c) => c[0] as any).filter((c) => c.notificationType === type)
+
+  beforeEach(() => { vi.mocked(sendNotificationEmail).mockClear() })
+
+  it('Stripe\'s named "insufficient_funds" schedules a retry (read as R01), not a final failure', async () => {
+    const { ids } = await seedPull({ paymentIntentId: 'pi_named_nsf' })
+    expect((await post(failedEvent('pi_named_nsf', bankError('insufficient_funds')))).status).toBe(200)
+    const row = (await db.query<{ return_code: string; next_retry_at: string | null }>(
+      `SELECT return_code, next_retry_at FROM payments WHERE id = $1`, [ids.rent])).rows[0]
+    expect(row.return_code).toBe('R01')
+    expect(row.next_retry_at).not.toBeNull()
+    expect(mailOf('ach_retry_scheduled')).toHaveLength(1)
+    expect(mailOf('ach_retries_exhausted')).toHaveLength(0)
+  })
+
+  it('the retry is set for the start of the property\'s day three days out — the day the email names', async () => {
+    const tz = 'America/New_York'
+    const { ids } = await seedPull({ paymentIntentId: 'pi_retry_day', timezone: tz })
+    await post(failedEvent('pi_retry_day', bankError('insufficient_funds')))
+    const row = (await db.query<{ local_day: string; local_time: string; want_day: string }>(
+      `SELECT (next_retry_at AT TIME ZONE $2)::date::text AS local_day,
+              (next_retry_at AT TIME ZONE $2)::time::text AS local_time,
+              ((NOW() AT TIME ZONE $2)::date + 3)::text AS want_day
+         FROM payments WHERE id = $1`, [ids.rent, tz])).rows[0]
+    expect(row.local_day).toBe(row.want_day)
+    expect(row.local_time).toBe('00:00:00')
+    // The email names that same day.
+    const [y, m, d] = row.want_day.split('-').map(Number)
+    const label = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', weekday: 'long', month: 'long', day: 'numeric' })
+      .format(new Date(Date.UTC(y, m - 1, d)))
+    expect(mailOf('ach_retry_scheduled')[0].subject).toBe(`Payment retry scheduled — ${label}`)
+  })
+
+  it('a closed account on the FIRST try: final, "your bank turned down", with a Pay now button to the signed link', async () => {
+    const { ids, tenantEmail } = await seedPull({ paymentIntentId: 'pi_named_closed' })
+    await post(failedEvent('pi_named_closed', bankError('account_closed')))
+    const row = (await db.query<{ return_code: string; next_retry_at: string | null }>(
+      `SELECT return_code, next_retry_at FROM payments WHERE id = $1`, [ids.rent])).rows[0]
+    expect(row).toMatchObject({ return_code: 'R02', next_retry_at: null })
+
+    const mails = mailOf('ach_retries_exhausted')
+    expect(mails.map((m) => m.to)).toEqual([tenantEmail])
+    const html: string = mails[0].html
+    expect(html).toContain('Your bank turned down your <b>$1000.00</b> payment')
+    expect(html).toContain('because the account is closed')
+    expect(html).not.toMatch(/multiple|NACHA|exhausted/i)
+    expect(html).toMatch(/<a href="[^"]*\/login\?ef=[^"&]+&to=%2Fpayments" class="btn">Pay now<\/a>/)
+  })
+
+  it('retries used up (R01 on the last retry): says it tried 3 times, and still has the button', async () => {
+    await seedPull({ paymentIntentId: 'pi_used_up', retryCount: 2 })
+    await post(failedEvent('pi_used_up', bankError('insufficient_funds')))
+    const html: string = mailOf('ach_retries_exhausted')[0].html
+    expect(html).toContain('from your bank 3 times')
+    expect(html).toContain('the last time because there was not enough money in the account')
+    expect(html).toContain('>Pay now</a>')
+  })
+
+  it('a pull that covered several lines: every notice quotes the whole pull, not its first line', async () => {
+    await seedPull({
+      paymentIntentId: 'pi_multi_line', retryCount: 2,
+      lines: [{ type: 'rent', amount: 495 }, { type: 'utility', amount: 25.20 }],
+    })
+    await post(failedEvent('pi_multi_line', bankError('insufficient_funds')))
+    const html: string = mailOf('ach_retries_exhausted')[0].html
+    expect(html).toContain('<b>$520.20</b>')
+    expect(html).not.toContain('$495.00')
+  })
+
+  it('a pull that covered several lines: the retry notice quotes the whole pull too', async () => {
+    await seedPull({
+      paymentIntentId: 'pi_multi_retry',
+      lines: [{ type: 'rent', amount: 495 }, { type: 'utility', amount: 25.20 }],
+    })
+    await post(failedEvent('pi_multi_retry', bankError('insufficient_funds')))
+    expect(mailOf('ach_retry_scheduled')[0].html).toContain('<b>$520.20</b>')
+    const rows = await db.query<{ next_retry_at: string | null }>(
+      `SELECT next_retry_at FROM payments WHERE stripe_payment_intent_id = 'pi_multi_retry'`)
+    expect(rows.rows).toHaveLength(2)
+    expect(rows.rows.every((r) => r.next_retry_at !== null)).toBe(true)
+  })
+
+  it('the rent line speaks for the pull in the credit history, even when a fee line shares it', async () => {
+    const { ids } = await seedPull({
+      paymentIntentId: 'pi_anchor_rent',
+      lines: [{ type: 'fee', amount: 6 }, { type: 'rent', amount: 495 }],
+    })
+    vi.mocked(emitPaymentFailedEvent).mockClear()
+    await post(failedEvent('pi_anchor_rent', bankError('account_closed')))
+    const calls = vi.mocked(emitPaymentFailedEvent).mock.calls
+    expect(calls).toHaveLength(1)
+    expect(calls[0][1].paymentId).toBe(ids.rent)
+  })
+
+  it('a FlexDeposit installment pull is not this notice\'s to tell — it has its own scheduled retry', async () => {
+    await seedPull({ paymentIntentId: 'pi_fd_pull', lines: [{ type: 'deposit', amount: 150 }] })
+    await post(failedEvent('pi_fd_pull', bankError('insufficient_funds'),
+      { metadata: { gam_purpose: 'flexdeposit_installment' } }))
+    expect(mailOf('ach_retries_exhausted')).toHaveLength(0)
+    expect(mailOf('ach_retries_exhausted_landlord')).toHaveLength(0)
+    expect(mailOf('ach_retry_scheduled')).toHaveLength(0)
+  })
+
+  // S654: the FlexDeposit handler sat inside the rent-only gate, and an
+  // installment row is type 'deposit' — so it never ran.
+  async function seedInstallmentPull(pi: string, attemptCount: number) {
+    const { ids } = await seedPull({ paymentIntentId: pi, lines: [{ type: 'deposit', amount: 150 }] })
+    const pay = (await db.query<{ unit_id: string; tenant_id: string; landlord_id: string }>(
+      `SELECT unit_id, tenant_id, landlord_id FROM payments WHERE id = $1`, [ids.deposit])).rows[0]
+    const client = await getClient()
+    try {
+      const leaseId = await seedLease(client, { unitId: pay.unit_id, landlordId: pay.landlord_id })
+      const dep = (await client.query<{ id: string }>(
+        `INSERT INTO security_deposits (unit_id, lease_id, tenant_id, total_amount, held_by)
+         VALUES ($1, $2, $3, 600, 'gam_escrow') RETURNING id`,
+        [pay.unit_id, leaseId, pay.tenant_id])).rows[0].id
+      const inst = (await client.query<{ id: string }>(
+        `INSERT INTO flex_deposit_installments
+           (security_deposit_id, tenant_id, installment_number, installment_count, amount, due_date,
+            payment_id, attempt_count)
+         VALUES ($1, $2, 1, 4, 150, CURRENT_DATE, $3, $4) RETURNING id`,
+        [dep, pay.tenant_id, ids.deposit, attemptCount])).rows[0].id
+      return inst
+    } finally { client.release() }
+  }
+  const installmentStatus = async (id: string) => (await db.query<{ status: string }>(
+    `SELECT status FROM flex_deposit_installments WHERE id = $1`, [id])).rows[0].status
+
+  it('a FlexDeposit installment whose retry pull also bounces is marked missed', async () => {
+    const inst = await seedInstallmentPull('pi_fd_retry_bounce', 2)
+    await post(failedEvent('pi_fd_retry_bounce', bankError('insufficient_funds'),
+      { metadata: { gam_purpose: 'flexdeposit_installment' } }))
+    expect(await installmentStatus(inst)).toBe('missed')
+  })
+
+  it('a FlexDeposit installment whose FIRST pull bounces waits for its scheduled retry', async () => {
+    const inst = await seedInstallmentPull('pi_fd_first_bounce', 1)
+    await post(failedEvent('pi_fd_first_bounce', bankError('insufficient_funds'),
+      { metadata: { gam_purpose: 'flexdeposit_installment' } }))
+    expect(await installmentStatus(inst)).toBe('pending')
+  })
+
+  // ── S654 (review): a retry in flight bounces again ──────────────────────
+  // The retry cron marks a pull's rows 'processing' while the bank works on it.
+  // A second bounce must put them back to owed, with the right notice.
+  it('a first retry that bounces short of money again: owed, one more retry set, "this is the last retry"', async () => {
+    const { ids } = await seedPull({ paymentIntentId: 'pi_retry1_bounce', retryCount: 1 })
+    await post(failedEvent('pi_retry1_bounce', bankError('insufficient_funds')))
+    const row = (await db.query<{ status: string; next_retry_at: string | null }>(
+      `SELECT status, next_retry_at FROM payments WHERE id = $1`, [ids.rent])).rows[0]
+    expect(row.status).toBe('failed')
+    expect(row.next_retry_at).not.toBeNull()
+    const html: string = mailOf('ach_retry_scheduled')[0].html
+    expect(html).toContain('This is the last retry')
+    expect(html).not.toContain('first of two')
+  })
+
+  it('a first bounce schedules the first of two retries — it never says "can\'t try again"', async () => {
+    await seedPull({ paymentIntentId: 'pi_first_of_two' })
+    await post(failedEvent('pi_first_of_two', bankError('insufficient_funds')))
+    const html: string = mailOf('ach_retry_scheduled')[0].html
+    expect(html).toContain('This is the first of two retries')
+    expect(html).not.toContain('can\'t try your bank again')
+  })
+
+  it('a retry in flight that bounces on a closed account: owed, final, "your bank turned down"', async () => {
+    const { ids } = await seedPull({ paymentIntentId: 'pi_retry_closed', retryCount: 1 })
+    await post(failedEvent('pi_retry_closed', bankError('account_closed')))
+    const row = (await db.query<{ status: string; next_retry_at: string | null }>(
+      `SELECT status, next_retry_at FROM payments WHERE id = $1`, [ids.rent])).rows[0]
+    expect(row).toMatchObject({ status: 'failed', next_retry_at: null })
+    expect(mailOf('ach_retries_exhausted')[0].html).toContain('Your bank turned down')
+  })
+
+  // S654 (review): webhook events carry latest_charge as a bare id. When the
+  // intent names no reason, the charge's failure_code is read.
+  it('reads the reason from the charge when the event carries only its id', async () => {
+    stripeMocks.chargesRetrieve.mockImplementationOnce(async (id: string) => ({ id, failure_code: 'insufficient_funds' }))
+    const { ids } = await seedPull({ paymentIntentId: 'pi_bare_charge' })
+    await post(failedEvent('pi_bare_charge', { payment_method: { type: 'us_bank_account' } },
+      { latest_charge: 'ch_bare_1' }))
+    expect(stripeMocks.chargesRetrieve).toHaveBeenCalledWith('ch_bare_1')
+    const row = (await db.query<{ return_code: string | null; next_retry_at: string | null }>(
+      `SELECT return_code, next_retry_at FROM payments WHERE id = $1`, [ids.rent])).rows[0]
+    expect(row.return_code).toBe('R01')
+    expect(row.next_retry_at).not.toBeNull()
+  })
+
+  // ── S654 (review): a bounced FlexDeposit pull still tells the TENANT ────
+  it('FlexDeposit first bounce: the tenant alone is told, with the scheduled retry day', async () => {
+    const inst = await seedInstallmentPull('pi_fd_tell_first', 1)
+    await db.query(`UPDATE flex_deposit_installments SET retry_pull_date = CURRENT_DATE + 5 WHERE id = $1`, [inst])
+    await post(failedEvent('pi_fd_tell_first', bankError('insufficient_funds'),
+      { metadata: { gam_purpose: 'flexdeposit_installment' } }))
+    const mails = mailOf('flexdeposit_payment_failed')
+    expect(mails).toHaveLength(1)
+    expect(mails[0].html).toContain('We\'ll try your bank again on <b>')
+    expect(mails[0].html).toContain('because there was not enough money in the account')
+    // Nobody on the landlord side hears about FlexDeposit.
+    expect(mailOf('ach_retries_exhausted_landlord')).toHaveLength(0)
+    expect(mailOf('ach_retry_scheduled_info')).toHaveLength(0)
+  })
+
+  it('FlexDeposit retry bounce: the tenant is told the installment was missed, with a button to the Lease page', async () => {
+    await seedInstallmentPull('pi_fd_tell_missed', 2)
+    await post(failedEvent('pi_fd_tell_missed', bankError('insufficient_funds'),
+      { metadata: { gam_purpose: 'flexdeposit_installment' } }))
+    const [mail] = mailOf('flexdeposit_payment_failed')
+    expect(mail.subject).toBe('A deposit installment was missed')
+    expect(mail.html).toMatch(/<a href="[^"]*\/login\?ef=[^"&]+&to=%2Flease" class="btn">Go to your lease<\/a>/)
+  })
+
+  it('a FlexDeposit pay-ahead that bounces: the tenant is told nothing else changes', async () => {
+    await seedPull({ paymentIntentId: 'pi_fd_payahead', lines: [{ type: 'deposit', amount: 450 }] })
+    await post(failedEvent('pi_fd_payahead', bankError('account_closed'),
+      { metadata: { gam_purpose: 'flexdeposit_payahead' } }))
+    const [mail] = mailOf('flexdeposit_payment_failed')
+    expect(mail.html).toContain('<b>$450.00</b> payment toward your deposit didn\'t go through because the account is closed')
+    expect(mailOf('ach_retries_exhausted')).toHaveLength(0)
+  })
+
+  it('a declined card says the card was declined, not "your bank"', async () => {
+    await seedPull({ paymentIntentId: 'pi_card_final' })
+    await post(failedEvent('pi_card_final',
+      { code: 'card_declined', decline_code: 'insufficient_funds', payment_method: { type: 'card' } },
+      { payment_method_types: ['card'] }))
+    const html: string = mailOf('ach_retries_exhausted')[0].html
+    expect(html).toContain('Your card was declined')
+    expect(html).not.toContain('Your bank')
   })
 })
 

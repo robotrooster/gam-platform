@@ -161,13 +161,46 @@ describe('Listings tier 3 — apply/contact (bg-gated)', () => {
     expect(rows[0].first_name).toBe('Rick')
   })
 
-  it('a waived renter is also allowed', async () => {
-    const fx = await seedFixture({ bg: 'waived' })
+  // A grandfather waiver is ONE company's decision about somebody already
+  // living with it. It used to be stamped on the person's platform-wide status,
+  // so one park's waiver opened every landlord's listing on GAM.
+  it('a renter waived by THIS listing’s own account may apply', async () => {
+    const fx = await seedFixture()
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id,
+         screening_waived, screening_waived_at, screening_attested)
+       VALUES ($1, $2, 'not_uploaded', $3, NULL, true, NOW(), true)`,
+      [fx.landlordId, fx.renterTenantId, fx.propertyId])
     const res = await request(buildApp())
       .post(`/api/public/properties/listings/${fx.unitId}/apply`)
       .set('Authorization', `Bearer ${renterToken(fx.renterUserId, fx.renterTenantId)}`)
       .send({})
     expect(res.status).toBe(201)
+  })
+
+  it('a renter waived by ANOTHER account is refused (403) and the landlord stays hidden', async () => {
+    const fx = await seedFixture()
+    const other = await seedFixture()
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id,
+         screening_waived, screening_waived_at, screening_attested)
+       VALUES ($1, $2, 'not_uploaded', $3, NULL, true, NOW(), true)`,
+      [other.landlordId, fx.renterTenantId, other.propertyId])
+    const res = await request(buildApp())
+      .post(`/api/public/properties/listings/${fx.unitId}/apply`)
+      .set('Authorization', `Bearer ${renterToken(fx.renterUserId, fx.renterTenantId)}`)
+      .send({})
+    expect(res.status).toBe(403)
+    expect(res.body.data?.landlord).toBeUndefined()
+  })
+
+  it('a leftover platform-wide "waived" status no longer counts on its own', async () => {
+    const fx = await seedFixture({ bg: 'waived' })
+    const res = await request(buildApp())
+      .post(`/api/public/properties/listings/${fx.unitId}/apply`)
+      .set('Authorization', `Bearer ${renterToken(fx.renterUserId, fx.renterTenantId)}`)
+      .send({})
+    expect(res.status).toBe(403)
   })
 
   it('applying twice is idempotent — no duplicate application', async () => {

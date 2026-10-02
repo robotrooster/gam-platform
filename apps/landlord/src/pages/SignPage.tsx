@@ -4,7 +4,8 @@ import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { LEASE_COLUMN_CATEGORY, humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso,
   FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue, prorateMoveInRent,
-  leaseDueDay, dueDayLabel, parseDueDay } from '@gam/shared'
+  leaseDueDay, dueDayLabel, parseDueDay, renewalSchedule, renewalBillingSummary, dayBefore, defaultMoneyKind,
+  type FeeType } from '@gam/shared'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
 import { TypedDateInput } from '../components/TypedDateInput'
@@ -404,6 +405,32 @@ export function SignPage() {
   }, [renderPageImperative, token])
 
   useEffect(() => { if (data?.document?.basePdfUrl && setupDone) loadPdf(data.document.basePdfUrl) }, [data, setupDone])
+
+  // RENEWAL (Nic: "people get billed on their due date according to how the
+  // landlord sets the property"). The lease this one renews: its last day and
+  // due day decide the renewal's first bill, and the deposits it holds are what
+  // page 8 does not bill again. Read with the landlord's session; a signing link
+  // opened without one states the rule rather than a date it cannot know.
+  const priorLeaseId: string | null = data?.document?.renewsLeaseId ?? null
+  const { data: priorLease } = useQuery(['renewal-prior', priorLeaseId],
+    () => authFetch('/leases/' + priorLeaseId).then(r => r.ok ? r.json() : null).then((r: any) => r?.success ? r.data : null),
+    { enabled: !!priorLeaseId && !!tok() && !isSignerToken(token), retry: false })
+  // How each money box on this form is tagged (deposit, prepaid or the
+  // landlord's fee). A renewal bills a deposit-type box only for its increase,
+  // and the tag decides which boxes those are — the same tag the server reads
+  // when it stamps page 8 and bills the increase. Without it (no session, or no
+  // access to the template) each box keeps the default for its type, as the
+  // server does for an untagged box.
+  const renewalTemplateId: string | null = priorLeaseId ? (data?.document?.templateId ?? null) : null
+  const { data: boxKinds } = useQuery(['renewal-box-kinds', renewalTemplateId],
+    () => authFetch('/esign/templates/' + renewalTemplateId).then(r => r.ok ? r.json() : null).then((r: any) => {
+      const kinds: Record<string, string> = {}
+      for (const f of (r?.success ? (r.data?.fields ?? []) : []) as any[]) {
+        if (f.leaseColumn && f.moneyKind) kinds[f.leaseColumn] = f.moneyKind
+      }
+      return kinds
+    }),
+    { enabled: !!renewalTemplateId && !!tok() && !isSignerToken(token), retry: false })
   useEffect(() => { if (pdfRef.current && setupDone) renderPageImperative(pdfRef.current, currentPage) }, [currentPage, setupDone])
 
   // ── S648 (Nic): PAGE 8 ADDS ITSELF UP AS YOU TYPE ─────────────────────
@@ -431,7 +458,28 @@ export function SignPage() {
       && FEE_TYPE_META[t].dueTiming === 'move_in')
     const want: Record<string, string> = {}
     const rent = moneyBoxValue(val('rent_amount'))
-    if (existing) {
+    // A renewal is not a move-in: page 8 bills no rent (the bill run bills it
+    // on the household's own due dates), the due day is the household's (never
+    // re-read from the renewal's start date), and a deposit-type box bills only
+    // what rises above what the old lease already holds.
+    const renewal = !!data.document?.renewsLeaseId
+    const carried: Record<string, number> = {}
+    if (renewal) {
+      carried['security_deposit'] = Number(data.carriedDeposit || 0)
+      for (const fee of (priorLease?.fees ?? []) as any[]) {
+        if (fee.dueTiming !== 'move_in' || !fee.isRefundable || fee.feeType === 'security_deposit') continue
+        carried[fee.feeType] = (carried[fee.feeType] ?? 0) + Number(fee.amount || 0)
+      }
+    }
+    const billedOnRenewal = (tag: string, raw: string | null) => {
+      const typed = moneyBoxValue(raw)
+      if (!renewal || ((boxKinds ?? {})[tag] ?? defaultMoneyKind(tag as FeeType)) === 'fee') return typed
+      return Math.max(0, Math.round((typed - (carried[tag] ?? 0)) * 100) / 100)
+    }
+    if (renewal) {
+      want['move_in_first_month_rent'] = '0.00'
+      want['move_in_proration'] = '0.00'
+    } else if (existing) {
       want['move_in_first_month_rent'] = rent.toFixed(2)
       want['move_in_proration'] = '0.00'
       for (const t of moveInFeeTags) want[t] = '0.00'
@@ -463,11 +511,13 @@ export function SignPage() {
     }
     const first = want['move_in_first_month_rent'] ?? val('move_in_first_month_rent')
     const prorate = want['move_in_proration'] ?? val('move_in_proration')
-    const deposit = moveInDepositMirror(val('security_deposit'), existing)
+    const deposit = renewal
+      ? billedOnRenewal('security_deposit', val('security_deposit'))
+      : moveInDepositMirror(val('security_deposit'), existing)
     want['move_in_security_deposit'] = deposit.toFixed(2)
     want['move_in_total_due'] = moveInTotalDue({
       firstMonthRent: first, proration: prorate, depositMirror: deposit,
-      moveInFees: moveInFeeTags.map(t => want[t] ?? val(t)),
+      moveInFees: moveInFeeTags.map(t => renewal ? billedOnRenewal(t, want[t] ?? val(t)) : (want[t] ?? val(t))),
     }).toFixed(2)
     const updates: Record<string, string> = {}
     for (const f of fs) {
@@ -476,7 +526,7 @@ export function SignPage() {
       if ((fieldValues[f.id] ?? '') !== want[f.leaseColumn]) updates[f.id] = want[f.leaseColumn]
     }
     if (Object.keys(updates).length) setFieldValues(prev => ({ ...prev, ...updates }))
-  }, [data, fieldValues])
+  }, [data, fieldValues, priorLease, boxKinds])
   useEffect(() => {
     if (!data?.fields) return
     const today = new Date().toLocaleDateString()
@@ -601,6 +651,32 @@ export function SignPage() {
   const nextField = unfilledRequired[0]
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
   const allFilled = unfilledRequired.length === 0
+
+  // RENEWAL: what the first bill under this lease will be, from the terms as
+  // typed right now — the same arithmetic the bill run uses.
+  const renewalLine: string | null = (() => {
+    if (!doc?.renewsLeaseId) return null
+    const valOf = (col: string) => {
+      const f = allFields.find((x:any) => x.leaseColumn === col && (fieldValues[x.id] ?? x.value ?? '').trim() !== '')
+      return f ? (fieldValues[f.id] ?? f.value) : null
+    }
+    const startRaw = valOf('start_date')
+    const start = startRaw ? (/^\d{4}-\d{2}-\d{2}/.test(startRaw) ? startRaw.slice(0, 10) : documentDateToIso(startRaw)) : null
+    const rent = moneyBoxValue(valOf('rent_amount'))
+    if (!start || !(rent > 0)) return null
+    // The first bill depends on the current lease's last day and due day.
+    // Without them (a signing link opened with no session) a specific date
+    // could be wrong — a changed due day makes a bridge this page cannot see —
+    // so the note states only the rule.
+    if (!priorLease) return null
+    const priorDay = priorLease.rentDueDay != null ? Number(priorLease.rentDueDay) : null
+    const newDay = parseDueDay(valOf('rent_due_day')) ?? priorDay ?? 1
+    const sched = renewalSchedule({
+      oldEnd: priorLease.endDate ? String(priorLease.endDate).slice(0, 10) : dayBefore(start),
+      oldDueDay: priorDay ?? newDay, newStart: start, newDueDay: newDay, rent,
+    })
+    return renewalBillingSummary(sched, rent, newDay)
+  })()
 
   const handleFieldClick = (field:any) => {
     if (field.fieldType==='signature' && savedSig) {
@@ -804,6 +880,14 @@ export function SignPage() {
         <div style={{ height:'100%', background:'var(--gold,#c9a227)', borderRadius:2, width:`${requiredFields.length?Math.round((requiredFields.length-unfilledRequired.length)/requiredFields.length*100):0}%`, transition:'width .3s' }}/>
       </div>
 
+      {doc?.renewsLeaseId && (
+        <div style={{ background:'var(--bg-2,#151a22)', border:'1px solid var(--border-0)', borderLeft:'3px solid var(--gold,#c9a227)', borderRadius:8, padding:'10px 12px', marginBottom:12, fontSize:'.8rem', color:'var(--text-1,#ddd)', lineHeight:1.5 }}>
+          <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>This is a renewal</div>
+          {renewalLine ?? 'Rent picks up where the current lease\'s bills leave off, on the household\'s due dates, so no stretch is billed twice.'}
+          {' '}Signing it bills no rent — only one-time money on it, like a deposit increase.
+        </div>
+      )}
+
       <div ref={containerRef} style={{ position:'relative', background:'#525659', borderRadius:12, overflow:'auto', maxHeight:'82vh', marginBottom:16 }}>
         <div style={{ position:'relative', display:'inline-block', width:'100%' }}>
           <canvas ref={canvasRef}/>
@@ -834,15 +918,20 @@ export function SignPage() {
             const DERIVED_LOCKED = new Set(['lease_type', 'end_date'])
             // S648 (Nic): an onboarding resident's page 8 is not a move-in —
             // their first month is the rent and every move-in fee is $0.
-            const ONBOARDING_LOCKED = data.existingTenancy && !!f.leaseColumn && (
+            const ONBOARDING_LOCKED = data.existingTenancy && !doc?.renewsLeaseId && !!f.leaseColumn && (
               f.leaseColumn === 'move_in_first_month_rent' || f.leaseColumn === 'move_in_proration'
               || (LEASE_COLUMN_CATEGORY[f.leaseColumn as keyof typeof LEASE_COLUMN_CATEGORY] === 'fee_row'
                   && f.leaseColumn !== 'security_deposit' && f.leaseColumn !== 'other_fee'
                   && FEE_TYPE_META[f.leaseColumn as keyof typeof FEE_TYPE_META]?.dueTiming === 'move_in'))
+            // A renewal's page 8 bills no rent — those two lines are the
+            // system's, not a move-in special to type over.
+            const RENEWAL_LOCKED = !!doc?.renewsLeaseId && (
+              f.leaseColumn === 'move_in_first_month_rent' || f.leaseColumn === 'move_in_proration')
             const locked = !!val && !!f.leaseColumn && (
               LEASE_COLUMN_CATEGORY[f.leaseColumn as keyof typeof LEASE_COLUMN_CATEGORY] === 'identity'
               || DERIVED_LOCKED.has(f.leaseColumn)
               || ONBOARDING_LOCKED
+              || RENEWAL_LOCKED
             )
             const colors: Record<string,string> = { signature:'#c9a227', initials:'#4a9eff', date:'#22c55e', text:'#a78bfa', checkbox:'#f59e0b', radio_group:'#ec4899' }
             const color = colors[f.fieldType]||'#c9a227'

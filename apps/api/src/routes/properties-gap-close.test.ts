@@ -491,6 +491,80 @@ describe('GET /applications', () => {
       `SELECT unit_number FROM units WHERE id = $1`, [f.unitAId])
     expect(res.body.data[0].unit_number).toBe(unitA.unit_number)
   })
+
+  // S633 left profileId naming no company for an owner; this list read it, so
+  // the Applications page was empty for every owner.
+  it('lists an owner’s applications when the session names no company', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO unit_applications (unit_id, landlord_id, first_name, last_name, email)
+       VALUES ($1, $2, 'A1', 'Applicant', 'a1@t.dev')`, [f.unitAId, f.landlordAId])
+    const owner = jwt.sign({ userId: f.landlordAUserId, role: 'landlord', email: 'l@t.dev', profileId: null, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(buildApp())
+      .get('/api/properties/applications')
+      .set('Authorization', `Bearer ${owner}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(1)
+  })
+
+  // S655: "screened" is what THIS account knows. The person-wide status
+  // carried other companies' verdicts — an approval or denial elsewhere, or
+  // another park's grandfather waiver.
+  it('shows screening as this account knows it, never another company’s verdict', async () => {
+    const f = await seed()
+    async function applicant(tag: string) {
+      const { rows: [u] } = await db.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ($1, 'x', 'tenant', $2, 'Applicant', TRUE) RETURNING id`, [`${tag}-${randomUUID()}@t.dev`, tag])
+      // The person-wide status says approved in every case — it must not decide.
+      const { rows: [t] } = await db.query<{ id: string }>(
+        `INSERT INTO tenants (user_id, background_check_status) VALUES ($1, 'approved') RETURNING id`, [u.id])
+      await db.query(
+        `INSERT INTO unit_applications (unit_id, landlord_id, applicant_user_id, first_name, last_name, email)
+         VALUES ($1, $2, $3, $4, 'Applicant', $5)`, [f.unitAId, f.landlordAId, u.id, tag, `${tag}@t.dev`])
+      return { userId: u.id, tenantId: t.id }
+    }
+    const check = (who: { userId: string; tenantId: string }, landlordId: string, consentPool = false, status = 'approved') =>
+      db.query(
+        `INSERT INTO background_checks (landlord_id, user_id, tenant_id, status, consent_pool)
+         VALUES ($1, $2, $3, $4, $5)`, [landlordId, who.userId, who.tenantId, status, consentPool])
+    const waiver = (who: { tenantId: string }, landlordId: string) => db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, screening_waived)
+       VALUES ($1, $2, 'not_uploaded', NULL, true)`, [landlordId, who.tenantId])
+
+    // GAM's renter-pool intake account (landlords.is_system), which the
+    // listings / no-company screening runs under.
+    const c = await db.connect()
+    let poolLandlordId: string
+    try { poolLandlordId = (await seedLandlord(c)).landlordId } finally { c.release() }
+    await db.query(`UPDATE landlords SET is_system = true WHERE id = $1`, [poolLandlordId])
+
+    const ownCheck = await applicant('Own');        await check(ownCheck, f.landlordAId)
+    const pooled = await applicant('Pooled');       await check(pooled, poolLandlordId, true)
+    const elsewhere = await applicant('Elsewhere'); await check(elsewhere, f.landlordBId)
+    // Company B's own checks with the "share my screening" box ticked are
+    // still B's — neither B's approval nor B's denial reaches A.
+    const sharedElsewhere = await applicant('SharedElsewhere'); await check(sharedElsewhere, f.landlordBId, true)
+    const deniedElsewhere = await applicant('DeniedElsewhere'); await check(deniedElsewhere, f.landlordBId, true, 'denied')
+    const ownWaiver = await applicant('OwnWaiver'); await waiver(ownWaiver, f.landlordAId)
+    const theirWaiver = await applicant('TheirWaiver'); await waiver(theirWaiver, f.landlordBId)
+    const ownDenied = await applicant('OwnDenied'); await check(ownDenied, f.landlordAId, false, 'denied')
+
+    const res = await request(buildApp())
+      .get('/api/properties/applications')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    const by = Object.fromEntries(res.body.data.map((a: any) => [a.first_name, a.background_check_status]))
+    expect(by.Own).toBe('approved')
+    expect(by.Pooled).toBe('approved')      // run through GAM's renter pool
+    expect(by.Elsewhere).toBe('not_started') // another company's approval is not shown
+    expect(by.SharedElsewhere).toBe('not_started')
+    expect(by.DeniedElsewhere).toBe('not_started')
+    expect(by.OwnWaiver).toBe('waived')
+    expect(by.TheirWaiver).toBe('not_started')
+    expect(by.OwnDenied).toBe('denied')
+  })
 })
 
 // ───────────────────────────────────────────────────────────────────

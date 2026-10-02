@@ -1421,12 +1421,19 @@ export async function billMoveOutRead(meterId: string, readingId: string): Promi
 // meter recording a FINAL read IS the move-out; the paper end date has no say.
 // `moveOut` is passed only from billMoveOutRead, which only ever runs off a
 // `move_out_final` read.
-async function invoiceEndedLeaseBills(
+export async function invoiceEndedLeaseBills(
   meterId: string, cycleIso: string, opts: { moveOut?: boolean } = {},
 ): Promise<void> {
   try {
-    const ended = await query<{ lease_id: string }>(`
-      SELECT DISTINCT ub.lease_id
+    const ended = await query<{ lease_id: string; renewal_id: string | null; still_active: boolean }>(`
+      SELECT DISTINCT ub.lease_id,
+             -- RENEWAL: a lease that ended because the household renewed is
+             -- not a move-out. Its renewal (landlord-signed, e-signed, linked).
+             (SELECT s.id FROM leases s
+               WHERE s.supersedes_lease_id = l.id AND s.lease_source = 'esigned'
+                 AND s.status IN ('pending', 'active') AND s.signed_by_landlord
+               ORDER BY s.start_date LIMIT 1) AS renewal_id,
+             (l.status = 'active') AS still_active
         FROM utility_bills ub
         JOIN leases l ON l.id = ub.lease_id
        WHERE ub.meter_id = $1 AND ub.billing_cycle_month = $2
@@ -1439,6 +1446,21 @@ async function invoiceEndedLeaseBills(
     if (ended.length === 0) return
     const { generateFinalUtilityInvoice } = await import('../jobs/invoiceGeneration')
     for (const r of ended) {
+      // RENEWAL HAND-OFF: the household is staying, so there is no "final"
+      // bill — the charge rides the renewal's next regular bill. While the old
+      // lease is still in force (its last day) it stays put and the lease-end
+      // job carries it over at the hand-off; once handed off, a late read goes
+      // straight to the renewal. A real move-out read (moveOut) is still final.
+      if (r.renewal_id && !opts.moveOut) {
+        if (!r.still_active) {
+          await query(
+            `UPDATE utility_bills SET lease_id = $2, updated_at = NOW()
+              WHERE lease_id = $1 AND meter_id = $3 AND billing_cycle_month = $4
+                AND payment_id IS NULL AND status IN ('unbilled', 'billed')`,
+            [r.lease_id, r.renewal_id, meterId, cycleIso])
+        }
+        continue
+      }
       await generateFinalUtilityInvoice(r.lease_id)
     }
   } catch (err) {

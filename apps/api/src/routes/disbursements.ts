@@ -15,26 +15,35 @@
  */
 
 import { Router } from 'express'
-import { query } from '../db'
+import { query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
+import { AppError } from '../middleware/errorHandler'
+import { payoutComposition } from '../services/payoutComposition'
 
 export const disbursementsRouter = Router()
 disbursementsRouter.use(requireAuth)
 
+/**
+ * Who may see which payouts. ONE rule for the list and for a single payout's
+ * contents, so the detail can never show a payout the list would not:
+ * super sees all; a regular admin (portfolio manager) sees payouts to landlords
+ * they close or service (S567); everyone else sees their own.
+ */
+function visibilityFilter(req: any, params: any[]): string {
+  const isSuper = req.user!.role === 'super_admin'
+  const isAdmin = req.user!.role === 'admin' || isSuper
+  if (!isAdmin) return `d.user_id = $${params.push(req.user!.userId)}`
+  if (!isSuper) {
+    const i = params.push(req.user!.userId)
+    return `d.user_id IN (SELECT user_id FROM landlords WHERE portfolio_manager_id = $${i} OR service_manager_id = $${i})`
+  }
+  return 'TRUE'
+}
+
 disbursementsRouter.get('/', async (req, res, next) => {
   try {
-    const isSuper = req.user!.role === 'super_admin'
-    const isAdmin = req.user!.role === 'admin' || isSuper
     const params: any[] = []
-    // S567: super sees all disbursements; a regular admin (portfolio manager)
-    // sees only payouts to landlords they close or service; others see own.
-    let filter = ''
-    if (!isAdmin) {
-      filter = `WHERE d.user_id = $${params.push(req.user!.userId)}`
-    } else if (!isSuper) {
-      const i = params.push(req.user!.userId)
-      filter = `WHERE d.user_id IN (SELECT user_id FROM landlords WHERE portfolio_manager_id = $${i} OR service_manager_id = $${i})`
-    }
+    const filter = `WHERE ${visibilityFilter(req, params)}`
     const rows = await query<any>(`
       SELECT d.id, d.user_id, d.bank_account_id, d.trigger_type,
              d.amount, d.fee_charged, d.status,
@@ -66,5 +75,20 @@ disbursementsRouter.get('/', async (req, res, next) => {
        LIMIT 50
     `, params)
     res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// GET /api/disbursements/:id/composition — S655 (Nic): what this payout
+// carried. Every payment inside it (unit, tenant, what for, amount), register
+// and booking items, GAM charges taken out, and any part GAM cannot trace —
+// which is shown, never hidden. See services/payoutComposition.ts.
+disbursementsRouter.get('/:id/composition', async (req, res, next) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) throw new AppError(404, 'Payout not found')
+    const params: any[] = [req.params.id]
+    const visible = await queryOne<{ id: string }>(
+      `SELECT d.id FROM disbursements d WHERE d.id = $1 AND ${visibilityFilter(req, params)}`, params)
+    if (!visible) throw new AppError(404, 'Payout not found')
+    res.json({ success: true, data: await payoutComposition(visible.id) })
   } catch (e) { next(e) }
 })

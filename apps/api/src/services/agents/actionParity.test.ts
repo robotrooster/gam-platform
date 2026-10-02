@@ -123,8 +123,16 @@ describe('action parity — what a person can do, the agent should be able to do
     // (POST /tenants/me/nudge-landlord-banking) is deleted too, so this is a
     // capability removed on purpose, not a tool that quietly stopped resolving.
     //
+    // S655 (security): 232 → 231. ONE action was deliberately taken away —
+    // approve_property_transfer. Accepting a property (the buyer) or confirming
+    // a sale (a selling owner) is that owner's own consent, given with the code
+    // emailed to them; the agent never accepts on anyone's behalf. It never
+    // worked anyway: the action sent no code (400), and the API refused the
+    // buyer (403). Its endpoint is named in actionGap DELIBERATE;
+    // decline_property_transfer stays, because stopping a transfer is safe.
+    //
     // The ratchet is doing its job by making this visible: it must only ever move
     // down for a stated reason, never because something quietly stopped working.
-    expect(writes.size).toBeGreaterThanOrEqual(232)
+    expect(writes.size).toBeGreaterThanOrEqual(231)
   })
 })

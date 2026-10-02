@@ -2,6 +2,7 @@ import { query, queryOne } from '../db'
 import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
 import { isCriticalNotificationType } from '@gam/shared'
+import { portalLink } from '../lib/portalUrls'
 
 // S536 (Nic): SMS is REMOVED platform-wide — notifications and
 // receipts go by email or in-app only. Do not reintroduce an SMS
@@ -132,12 +133,17 @@ export async function notifyRentReversed(o: { landlordUserId:string; landlordId:
 // landlord contacts and the tenant got one email per contact (none at all
 // when the property had no contact). Each audience's data carries only its
 // own fields.
+//
+// S654: `amount` is the whole bank pull (every line it covered), `reason` is
+// the bank's reason in plain words ("there was not enough money in the
+// account"), and the date reads "Sunday, October 4", not "2026-10-04".
 export async function notifyAchRetryScheduled(o: {
   tenantUserId: string; tenantEmail: string; tenantName: string;
   landlordId: string;
   landlordRecipients: Array<{ userId: string; email: string }>;
   unitNumber: string; propertyName: string;
-  amount: number; reason: string;          // human-readable description from ACH_RETURN_CONFIG
+  amount: number;
+  reason: string | null;                   // plain-words reason (ACH_RETURN_CONFIG.plain); null = unreadable
   retryDate: string;                       // ISO date string (YYYY-MM-DD)
   retryAttempt: 1 | 2;                     // which retry this is
 }) {
@@ -145,22 +151,25 @@ export async function notifyAchRetryScheduled(o: {
     tenantName: o.tenantName, unitNumber: o.unitNumber, propertyName: o.propertyName,
     amount: o.amount, reason: o.reason, retryDate: o.retryDate, retryAttempt: o.retryAttempt,
   }
+  const day = retryDayLabel(o.retryDate)
+  const amt = `$${o.amount.toFixed(2)}`
+  const because = o.reason ? ` because ${o.reason}` : ''
 
   // Tenant: actionable — tells them what failed, why, and when we'll try again
   await createNotification({
     userId: o.tenantUserId,
     type: 'ach_retry_scheduled',
-    title: `Payment retry scheduled — ${o.retryDate}`,
-    body: `Your $${o.amount.toFixed(2)} payment for Unit ${o.unitNumber} failed (${o.reason}). We'll automatically retry on ${o.retryDate}. Make sure your bank account has sufficient funds.`,
+    title: `Payment retry scheduled — ${day}`,
+    body: `Your ${amt} payment for Unit ${o.unitNumber} didn't go through${because}. We'll try your bank again on ${day}. Please make sure the money is in the account by then.`,
     data: { ...shared, tenantUserId: o.tenantUserId },
+    actionUrl: '/payments',
     sendEmail: true, emailTo: o.tenantEmail,
-    emailSubject: `Payment retry scheduled — ${o.retryDate}`,
+    emailSubject: `Payment retry scheduled — ${day}`,
     emailHtml: emailTemplate(
-      `Your Payment Will Retry on ${o.retryDate}`,
-      `<p>Your <b>$${o.amount.toFixed(2)}</b> payment for ${o.propertyName} Unit ${o.unitNumber} failed:</p>` +
-      `<div style="margin:12px 0;padding:10px;background:#0a0f14;border-left:3px solid #f59e0b;border-radius:6px;color:#b8c4d8">${o.reason}</div>` +
-      `<p>We'll automatically retry the charge on <b>${o.retryDate}</b>. Please make sure your bank account has sufficient funds before then.</p>` +
-      `<p style="font-size:.85rem;color:#4a5568">This is retry attempt ${o.retryAttempt} of 2 permitted by NACHA. If this retry also fails you'll need to update your payment method.</p>`
+      `We'll Try Your Payment Again on ${day}`,
+      `<p>Your <b>${amt}</b> payment for ${o.propertyName} Unit ${o.unitNumber} didn't go through${because}.</p>` +
+      `<p>We'll try your bank again on <b>${day}</b>. Please make sure the money is in the account before then.</p>` +
+      `<p style="font-size:.85rem;color:#4a5568">${retryFootnote(o.retryAttempt)}</p>`
     )
   })
 
@@ -169,81 +178,266 @@ export async function notifyAchRetryScheduled(o: {
     await createNotification({
       userId: r.userId, landlordId: o.landlordId,
       type: 'ach_retry_scheduled_info',
-      title: `${o.tenantName} payment retry — ${o.retryDate}`,
-      body: `${o.tenantName} (Unit ${o.unitNumber}) payment of $${o.amount.toFixed(2)} failed (${o.reason}). Auto-retry scheduled ${o.retryDate}.`,
+      title: `${o.tenantName} payment retry — ${day}`,
+      body: `${o.tenantName}'s ${amt} payment for Unit ${o.unitNumber} didn't go through${because}. GAM will try their bank again on ${day}.`,
       data: { ...shared, tenantUserId: o.tenantUserId, landlordId: o.landlordId },
       sendEmail: true, emailTo: r.email,
       emailSubject: `Tenant payment retry scheduled — Unit ${o.unitNumber}`,
       emailHtml: emailTemplate(
         `Tenant Payment Retry Scheduled`,
-        `<b>${o.tenantName}</b> payment of <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} failed (${o.reason}). GAM will automatically retry on <b>${o.retryDate}</b>. No action required.`
+        `<b>${o.tenantName}</b>'s payment of <b>${amt}</b> for Unit ${o.unitNumber} didn't go through${because}. GAM will try their bank again on <b>${day}</b>. Nothing for you to do.`
       ),
     })
   }
 }
 
-// S125: ACH retry-cap-reached alert. Fires when the second retry also
-// fails (or any failure on a non-retry-eligible code on retry_count = 2).
-// Landlord + tenant both get notified the payment is permanently failed
-// and needs manual intervention; admin in-app notification flags the
-// payment for review.
+/**
+ * What happens if this retry fails too. A short-of-money bounce gets two
+ * retries (the webhook schedules another while retry_count < 2), so after the
+ * FIRST one there is still one more — "we can't try again" is only true of the
+ * second. A first retry that bounces for a different reason (a closed account)
+ * is not retried, hence "for the same reason".
+ */
+function retryFootnote(attempt: 1 | 2): string {
+  return attempt === 1
+    ? `This is the first of two retries. If it doesn't go through for the same reason, we'll try one last time three days later. We'll email you either way.`
+    : `This is the last retry. If it doesn't go through, we can't try your bank again and you'll need to pay another way.`
+}
+
+/** 'YYYY-MM-DD' → "Sunday, October 4" (a calendar date, so read in UTC). */
+function retryDayLabel(ymd: string): string {
+  const [y, m, d] = ymd.slice(0, 10).split('-').map(Number)
+  if (!y || !m || !d) return ymd
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'UTC', weekday: 'long', month: 'long', day: 'numeric',
+  }).format(new Date(Date.UTC(y, m - 1, d)))
+}
+
+/**
+ * Why a payment is final, in the words each audience is told.
+ *   retries_used  — a short-of-money bounce that used all its tries (3)
+ *   bank_refused  — the bank will not take this debit at all (closed account,
+ *                   no account, not authorized, or a reason we could not read)
+ *   card_declined — a card payment the card issuer refused
+ *   partly_paid   — a bounced pull that was due a retry, but part of it was
+ *                   paid another way in the meantime (cash at the desk, a
+ *                   matched bank deposit). The retry would pull the WHOLE
+ *                   original amount, so it is not fired; the rest is owed.
+ */
+export type PaymentFinalReason = 'retries_used' | 'bank_refused' | 'card_declined' | 'partly_paid'
+
+// S125: final-failure notice. Fires on EVERY payment failure that will not be
+// retried: a short-of-money bounce whose second retry also failed, or the
+// first failure of a debit the bank will not take at all (closed, not found,
+// not authorized, unreadable). Tenant and landlord-side contacts are told it is
+// still owed.
 //
 // S654: same shape as notifyAchRetryScheduled — the tenant's copy once, then
 // one copy per landlord-side contact.
+//
+// S654 (Nic): the tenant's email gets a Pay now button, and says what actually
+// happened. It used to say "failed multiple times ... NACHA limits us to 2
+// retries. Both have now been exhausted" even when it fired on the FIRST bounce
+// (a closed account is never retried), and quoted only the first line of a
+// payment that covered several. Now: two true versions (plus a card one, and one
+// for a retry skipped because part of the pull was paid another way), the
+// whole amount, and the signed sign-in link the bill email uses (`payUrl`),
+// which lands on Payments. The link is never stored in either audience's data.
 export async function notifyAchRetriesExhausted(o: {
   paymentId: string;
   tenantUserId: string; tenantEmail: string; tenantName: string;
   landlordId: string;
   landlordRecipients: Array<{ userId: string; email: string }>;
   unitNumber: string; propertyName: string;
-  amount: number; reason: string;
+  amount: number;                          // the whole pull — every line it covered
+  reason: string | null;                   // plain-words reason; null = unreadable
+  finalReason: PaymentFinalReason;
+  attempts: number;                        // tries made, the first included
+  payUrl?: string | null;                  // signed Pay now link; falls back to the plain Payments link
 }) {
   const shared = {
     paymentId: o.paymentId, tenantName: o.tenantName, unitNumber: o.unitNumber,
     propertyName: o.propertyName, amount: o.amount, reason: o.reason,
+    finalReason: o.finalReason, attempts: o.attempts,
   }
+  const amt = `$${o.amount.toFixed(2)}`
+  const where = `${o.propertyName} Unit ${o.unitNumber}`
+  const times = `${o.attempts} time${o.attempts === 1 ? '' : 's'}`
+  const payUrl = o.payUrl || portalLink('tenant', 'payments')
 
-  // Tenant: action-required
+  // Tenant: what happened, that it is still owed, and a button to pay it.
+  const tenantLead =
+    o.finalReason === 'retries_used'
+      ? `We tried to collect your <b>${amt}</b> payment for ${where} from your bank ${times}, and it didn't go through${o.reason ? ` — the last time because ${o.reason}` : ''}.`
+    : o.finalReason === 'card_declined'
+      ? `Your card was declined for your <b>${amt}</b> payment for ${where}.`
+    : o.finalReason === 'partly_paid'
+      ? `Part of the bank payment we were going to try again for ${where} has since been paid another way, so we didn't try your bank again.`
+      : `Your bank turned down your <b>${amt}</b> payment for ${where}${o.reason ? ` because ${o.reason}` : ''}, so we can't try that account again.`
+  const tenantNext =
+    o.finalReason === 'retries_used'
+      ? `We won't try again on our own, so the <b>${amt}</b> is still owed. You can pay it now with a bank account or a card.`
+    : o.finalReason === 'card_declined'
+      ? `The <b>${amt}</b> is still owed. Please pay it now with another card or a bank account.`
+    : o.finalReason === 'partly_paid'
+      ? `The rest, <b>${amt}</b>, is still owed. You can pay it now with a bank account or a card.`
+      : `The <b>${amt}</b> is still owed. Please pay it now with a different bank account or a card.`
+  const plain = (html: string) => html.replace(/<[^>]+>/g, '')
+
   await createNotification({
     userId: o.tenantUserId,
     type: 'ach_retries_exhausted',
-    title: `Payment cannot be retried — manual action required`,
-    body: `Your $${o.amount.toFixed(2)} payment for Unit ${o.unitNumber} failed after multiple retry attempts (${o.reason}). Please update your payment method or contact your landlord directly.`,
+    title: `Your payment didn't go through — Unit ${o.unitNumber}`,
+    body: `${plain(tenantLead)} ${plain(tenantNext)}`,
     data: { ...shared, tenantUserId: o.tenantUserId },
+    actionUrl: '/payments',
     sendEmail: true, emailTo: o.tenantEmail,
-    emailSubject: `Payment cannot be retried — Unit ${o.unitNumber}`,
+    emailSubject: `Your payment didn't go through — Unit ${o.unitNumber}`,
     emailHtml: emailTemplate(
-      `Payment Cannot Be Retried`,
-      `<p>Your <b>$${o.amount.toFixed(2)}</b> payment for ${o.propertyName} Unit ${o.unitNumber} failed multiple times:</p>` +
-      `<div style="margin:12px 0;padding:10px;background:#0a0f14;border-left:3px solid #ef4444;border-radius:6px;color:#b8c4d8">${o.reason}</div>` +
-      `<p>NACHA limits us to 2 retries per failed transaction. Both have now been exhausted.</p>` +
-      `<p><b>What to do next:</b></p>` +
-      `<ul style="color:#b8c4d8;line-height:1.7">` +
-      `<li>Update your payment method or bank account in the tenant portal</li>` +
-      `<li>Contact your landlord directly to arrange payment</li>` +
-      `</ul>`
+      `Your Payment Didn't Go Through`,
+      `<p>${tenantLead}</p><p>${tenantNext}</p>`,
+      { label: 'Pay now', url: payUrl },
     )
   })
 
-  // Landlord side: action-required, urgent, one per contact
+  // Landlord side: one per contact. Same total, same reason, no pay link.
+  const landlordLine =
+    o.finalReason === 'retries_used'
+      ? `${o.tenantName}'s ${amt} payment for Unit ${o.unitNumber} didn't go through after ${times}${o.reason ? ` (the last time, ${o.reason})` : ''}. It won't be tried again.`
+    : o.finalReason === 'card_declined'
+      ? `${o.tenantName}'s card was declined for their ${amt} payment for Unit ${o.unitNumber}.`
+    : o.finalReason === 'partly_paid'
+      ? `Part of ${o.tenantName}'s bounced bank payment for Unit ${o.unitNumber} was paid another way before its retry, so GAM didn't try their bank again.`
+      : `${o.tenantName}'s bank turned down their ${amt} payment for Unit ${o.unitNumber}${o.reason ? ` (${o.reason})` : ''}, so it can't be tried again.`
   for (const r of o.landlordRecipients) {
     await createNotification({
       userId: r.userId, landlordId: o.landlordId,
       type: 'ach_retries_exhausted_landlord',
-      title: `🚨 ${o.tenantName} payment failed permanently — Unit ${o.unitNumber}`,
-      body: `${o.tenantName} payment of $${o.amount.toFixed(2)} failed all retry attempts (${o.reason}). Manual intervention needed.`,
+      title: `${o.tenantName}'s payment didn't go through — Unit ${o.unitNumber}`,
+      body: `${landlordLine} The ${amt} is still owed, and they've been asked to pay it now.`,
       data: { ...shared, tenantUserId: o.tenantUserId, landlordId: o.landlordId },
       sendEmail: true, emailTo: r.email,
-      emailSubject: `🚨 Tenant payment failed permanently — Unit ${o.unitNumber}`,
+      emailSubject: `Tenant payment didn't go through — Unit ${o.unitNumber}`,
       emailHtml: emailTemplate(
-        `Tenant Payment Failed Permanently`,
-        `<div style="margin-bottom:14px;padding:10px 14px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);border-radius:8px;color:#ef4444;font-size:.85rem">⚠️ Manual intervention required</div>` +
-        `<p><b>${o.tenantName}</b> payment of <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} has failed all NACHA-permitted retry attempts.</p>` +
-        `<div style="margin:12px 0;padding:10px;background:#0a0f14;border-radius:6px;color:#b8c4d8">${o.reason}</div>` +
-        `<p>The tenant has been notified to update their payment method. You may also want to contact them directly.</p>`
+        `Tenant Payment Didn't Go Through`,
+        `<p>${landlordLine}</p>` +
+        `<p>The <b>${amt}</b> is still owed. ${o.tenantName} has been asked to pay it now. You may also want to contact them directly.</p>`
       )
     })
   }
+}
+
+/**
+ * Why a scheduled (autopay) payment could not be started.
+ *   payment_method  — the tenant's side: no usable payment method, a card
+ *                     refused on the spot, a bank account that can't be used.
+ *                     Paying another way fixes it.
+ *   payments_paused — the space is in eviction mode; payments to the landlord
+ *                     are paused, so the Payments page would refuse it too.
+ *   our_side        — anything else: a GAM or Stripe error. Nothing was taken,
+ *                     and nothing about their account is wrong.
+ */
+export type AutopayFailureKind = 'payment_method' | 'payments_paused' | 'our_side'
+
+// S654: a scheduled (autopay) payment that couldn't even be started. This was an
+// in-app notice only, and a tenant who believes rent paid itself does not open
+// the app to check.
+//
+// Each kind says what is true of it. "Check the account you pay from, then pay"
+// is only true of 'payment_method'. An error on our side is not their account's
+// fault — they are told so, and still emailed with the Pay now button, because
+// the rent is still owed and they think it paid itself (the runner also raises
+// an admin alert). A paused space gets an in-app notice only and no pay
+// button: its Payments page refuses the payment, and the next step is the
+// landlord. autopay_failed is a critical type, so a tenant's email preference
+// cannot stop the emailed ones.
+export async function notifyAutopayFailed(o: {
+  tenantUserId: string; tenantEmail: string | null;
+  disarming: boolean;
+  kind?: AutopayFailureKind;
+  payUrl?: string | null;
+}) {
+  const kind = o.kind ?? 'payment_method'
+  const title = o.disarming ? 'Autopay has been turned off' : 'Your scheduled rent payment didn’t go through'
+  const switchedOff = 'Two scheduled payments in a row couldn’t be completed, so we’ve switched autopay off'
+  const body =
+    kind === 'payments_paused'
+      ? (o.disarming ? `${switchedOff}. ` : '') +
+        'Your scheduled rent payment wasn’t taken because payments for your space are paused right now. Please contact your landlord about your rent.'
+    : kind === 'our_side'
+      ? (o.disarming ? `${switchedOff}. ` : '') +
+        'Your scheduled rent payment couldn’t be started because of a problem on our end — nothing was taken from your account, and nothing is wrong with it. Your rent is still owed. You can pay it from the Payments page.' +
+        (o.disarming ? ' You can turn autopay back on there too.' : ' Autopay is still on for next month.')
+    : o.disarming
+      ? `${switchedOff} to stop your bank charging you for further attempts. Your rent is still owed — pay it from the Payments page, then turn autopay back on.`
+      : 'Your scheduled rent payment couldn’t be completed, so your rent is still owed. Check the account you pay from, then pay from the Payments page. Autopay is still on and will try again next month.'
+  const emailIt = kind !== 'payments_paused' && !!o.tenantEmail
+  await createNotification({
+    userId: o.tenantUserId,
+    type: 'autopay_failed',
+    title, body,
+    actionUrl: kind === 'payments_paused' ? '/lease' : '/payments',
+    sendEmail: emailIt, emailTo: emailIt ? o.tenantEmail! : undefined,
+    emailSubject: title,
+    emailHtml: emailIt
+      ? emailTemplate(title, body, { label: 'Pay now', url: o.payUrl || portalLink('tenant', 'payments') })
+      : undefined,
+  })
+}
+
+/**
+ * S654: a FlexDeposit pull that bounced. The generic "payment didn't go through"
+ * notices are not this one's to send — a FlexDeposit retry is a pull scheduled
+ * at enrollment, not three days out, and it is a GAM product the landlord side
+ * never hears about (product siloing). So the TENANT alone is told, in words
+ * true to the plan:
+ *   will_retry — the first pull of an installment bounced; its retry is set
+ *   missed     — the retry bounced too; the installment is marked missed (the
+ *                plan stays on — no acceleration, no default)
+ *   pay_ahead  — a deposit payment they started themselves bounced; nothing
+ *                else changes
+ * The button (missed / pay_ahead) lands on the Lease page, where the deposit is
+ * funded — never Payments.
+ */
+export type FlexDepositPullOutcome = 'will_retry' | 'missed' | 'pay_ahead'
+
+export async function notifyFlexDepositPullFailed(o: {
+  tenantUserId: string; tenantEmail: string | null;
+  amount: number;
+  reason: string | null;                   // plain-words reason; null = unreadable
+  outcome: FlexDepositPullOutcome;
+  retryDate?: string | null;               // 'YYYY-MM-DD' — the scheduled retry pull (will_retry)
+  leaseUrl?: string | null;                // signed link to the Lease page
+}) {
+  const amt = `$${o.amount.toFixed(2)}`
+  const because = o.reason ? ` because ${o.reason}` : ''
+  const day = o.retryDate ? retryDayLabel(o.retryDate) : null
+  const title =
+    o.outcome === 'missed' ? 'A deposit installment was missed'
+    : 'Your deposit payment didn’t go through'
+  const html =
+    o.outcome === 'will_retry'
+      ? `<p>Your <b>${amt}</b> deposit installment payment didn't go through${because}.</p>` +
+        `<p>We'll try your bank again ${day ? `on <b>${day}</b>` : 'in the next few days'}. Please make sure the money is in the account by then.</p>`
+    : o.outcome === 'missed'
+      ? `<p>Your <b>${amt}</b> deposit installment payment didn't go through${because}, and the second try didn't either, so this installment is marked missed.</p>` +
+        `<p>Your deposit plan stays on. You can fund the rest of your deposit any time from your Lease page.</p>`
+      : `<p>Your <b>${amt}</b> payment toward your deposit didn't go through${because}.</p>` +
+        `<p>Nothing else changes — your scheduled deposit installments continue as planned. You can try again any time from your Lease page.</p>`
+  const plain = html.replace(/<\/p><p>/g, ' ').replace(/<[^>]+>/g, '')
+  const cta = o.outcome === 'will_retry'
+    ? undefined
+    : { label: 'Go to your lease', url: o.leaseUrl || portalLink('tenant', 'lease') }
+  await createNotification({
+    userId: o.tenantUserId,
+    type: 'flexdeposit_payment_failed',
+    title, body: plain,
+    data: { amount: o.amount, reason: o.reason, outcome: o.outcome, retryDate: o.retryDate ?? null },
+    actionUrl: '/lease',
+    sendEmail: !!o.tenantEmail, emailTo: o.tenantEmail ?? undefined,
+    emailSubject: title,
+    emailHtml: emailTemplate(title, html, cta),
+  })
 }
 
 // S175: Stripe Connect payout notifications. Replaces the pre-S113

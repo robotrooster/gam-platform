@@ -34,7 +34,8 @@ vi.mock('./email', async (importOriginal) => {
   return { ...actual, sendNotificationEmail: sendNotificationEmailMock }
 })
 
-import { createNotification, notifyRentCollected, notifyAchRetryScheduled, notifyAchRetriesExhausted } from './notifications'
+import { createNotification, notifyRentCollected, notifyAchRetryScheduled, notifyAchRetriesExhausted, notifyAutopayFailed, notifyFlexDepositPullFailed } from './notifications'
+import { portalLink } from '../lib/portalUrls'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -359,7 +360,7 @@ describe('ACH retry notices — the tenant is told once per failed payment', () 
         tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Test Tenant',
         landlordId, landlordRecipients,
         unitNumber: 'MH 25', propertyName: 'Oak Park', amount: 450,
-        reason: 'Insufficient funds', retryDate: '2026-10-04', retryAttempt: 1,
+        reason: 'there was not enough money in the account', retryDate: '2026-10-04', retryAttempt: 1,
       })
       expect(sentTo('ach_retry_scheduled')).toEqual([tenant.email])
       expect(sentTo('ach_retry_scheduled_info').sort()).toEqual(landlordRecipients.map((r) => r.email).sort())
@@ -374,7 +375,9 @@ describe('ACH retry notices — the tenant is told once per failed payment', () 
         paymentId: randomUUID(),
         tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Test Tenant',
         landlordId, landlordRecipients,
-        unitNumber: 'MH 25', propertyName: 'Oak Park', amount: 450, reason: 'Insufficient funds',
+        unitNumber: 'MH 25', propertyName: 'Oak Park', amount: 450,
+        reason: 'there was not enough money in the account',
+        finalReason: 'retries_used', attempts: 3, payUrl: 'https://tenant.example/login?ef=tok&to=%2Fpayments',
       })
       expect(sentTo('ach_retries_exhausted')).toEqual([tenant.email])
       expect(sentTo('ach_retries_exhausted_landlord').sort()).toEqual(landlordRecipients.map((r) => r.email).sort())
@@ -394,5 +397,320 @@ describe('ACH retry notices — the tenant is told once per failed payment', () 
     const text = JSON.stringify(rows[0].data)
     for (const r of landlordRecipients) expect(text).not.toContain(r.email)
     expect(rows[0].data.retryDate).toBe('2026-10-04')
+  })
+})
+
+// S654 (Nic): the "Payment cannot be retried" email. It had no way to pay, it
+// said "failed multiple times ... NACHA limits us to 2 retries" even when it
+// fired on the first bounce of a closed account, and it quoted one line of a
+// payment that covered several. Now it has a Pay now button, the whole amount,
+// and one of two true stories.
+describe('the payment-didn\'t-go-through notice (final failure)', () => {
+  const PAY_URL = 'https://tenant.example/login?ef=signed-token&to=%2Fpayments'
+
+  async function fire(over: Partial<Parameters<typeof notifyAchRetriesExhausted>[0]> = {}) {
+    const tenant = await seedUser()
+    const staff = await seedUser()
+    const { userId: ownerUserId } = await seedUser()
+    const landlordId = (await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [ownerUserId])).rows[0].id
+    await notifyAchRetriesExhausted({
+      paymentId: randomUUID(),
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Pat Doe',
+      landlordId, landlordRecipients: [{ userId: staff.userId, email: staff.email }],
+      unitNumber: 'MH 25', propertyName: 'Oak Park', amount: 520.20,
+      reason: 'there was not enough money in the account',
+      finalReason: 'retries_used', attempts: 3, payUrl: PAY_URL,
+      ...over,
+    })
+    return { tenant, staff }
+  }
+  const mailOf = (type: string) => (sendNotificationEmailMock.mock.calls as any[][])
+    .map((c) => c[0] as any).find((c) => c.notificationType === type)
+
+  it('the tenant email has a gold Pay now button that opens the pay link', async () => {
+    await fire()
+    const html: string = mailOf('ach_retries_exhausted').html
+    expect(html).toContain(`<a href="${PAY_URL}" class="btn">Pay now</a>`)
+  })
+
+  it('the in-app notice opens the Payments page', async () => {
+    const { tenant } = await fire()
+    const { rows } = await db.query<{ action_url: string | null }>(
+      `SELECT action_url FROM notifications WHERE user_id = $1 AND type = 'ach_retries_exhausted'`, [tenant.userId])
+    expect(rows[0].action_url).toBe('/payments')
+  })
+
+  it('without a signed link the button still goes to the Payments page', async () => {
+    await fire({ payUrl: null })
+    expect(mailOf('ach_retries_exhausted').html).toContain(`href="${portalLink('tenant', 'payments')}"`)
+  })
+
+  it('retries used: says how many tries, the last reason, and that the whole amount is still owed', async () => {
+    const { tenant } = await fire()
+    const mail = mailOf('ach_retries_exhausted')
+    expect(mail.subject).toBe(`Your payment didn't go through — Unit MH 25`)
+    expect(mail.html).toContain('from your bank 3 times')
+    expect(mail.html).toContain('the last time because there was not enough money in the account')
+    expect(mail.html).toContain('<b>$520.20</b> is still owed')
+    expect(mail.html).not.toMatch(/NACHA|exhausted|R0\d/)
+    const { rows } = await db.query<{ body: string }>(
+      `SELECT body FROM notifications WHERE user_id = $1 AND type = 'ach_retries_exhausted'`, [tenant.userId])
+    expect(rows[0].body).toContain('3 times')
+    expect(rows[0].body).not.toContain('<b>')
+  })
+
+  it('bank refused on the FIRST try: says the bank turned it down and why — never "multiple times"', async () => {
+    await fire({ finalReason: 'bank_refused', attempts: 1, reason: 'the account is closed' })
+    const html: string = mailOf('ach_retries_exhausted').html
+    expect(html).toContain('Your bank turned down your <b>$520.20</b> payment for Oak Park Unit MH 25 because the account is closed')
+    expect(html).toContain('different bank account or a card')
+    expect(html).not.toMatch(/multiple|times|retries|NACHA/i)
+  })
+
+  it('bank refused with a reason we could not read: no empty "because"', async () => {
+    await fire({ finalReason: 'bank_refused', attempts: 1, reason: null })
+    const html: string = mailOf('ach_retries_exhausted').html
+    expect(html).toContain('Your bank turned down your <b>$520.20</b> payment for Oak Park Unit MH 25, so we can')
+    expect(html).not.toContain('because')
+  })
+
+  it('a declined card says so, not "your bank"', async () => {
+    await fire({ finalReason: 'card_declined', attempts: 1, reason: null })
+    const html: string = mailOf('ach_retries_exhausted').html
+    expect(html).toContain('Your card was declined')
+    expect(html).not.toContain('Your bank')
+  })
+
+  it('the landlord side gets the same total and reason, and no pay button', async () => {
+    await fire({ finalReason: 'bank_refused', attempts: 1, reason: 'the account is closed' })
+    const mail = mailOf('ach_retries_exhausted_landlord')
+    expect(mail.html).toContain('$520.20')
+    expect(mail.html).toContain('the account is closed')
+    expect(mail.html).not.toContain('Pay now')
+    expect(mail.html).not.toContain(PAY_URL)
+  })
+
+  it('the signed pay link is never stored in either audience\'s notice data', async () => {
+    const { tenant, staff } = await fire()
+    const { rows } = await db.query<{ data: any }>(
+      `SELECT data FROM notifications WHERE user_id = ANY($1::uuid[])`, [[tenant.userId, staff.userId]])
+    expect(rows).toHaveLength(2)
+    for (const r of rows) expect(JSON.stringify(r.data)).not.toContain('signed-token')
+  })
+})
+
+describe('the retry-scheduled notice reads plainly', () => {
+  async function fireRetry(retryAttempt: 1 | 2) {
+    const tenant = await seedUser()
+    const { userId: ownerUserId } = await seedUser()
+    const landlordId = (await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [ownerUserId])).rows[0].id
+    await notifyAchRetryScheduled({
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Pat Doe',
+      landlordId, landlordRecipients: [],
+      unitNumber: 'MH 25', propertyName: 'Oak Park', amount: 520.20,
+      reason: 'there was not enough money in the account', retryDate: '2026-10-04', retryAttempt,
+    })
+    return (sendNotificationEmailMock.mock.calls as any[][]).map((c) => c[0] as any)
+      .find((c) => c.notificationType === 'ach_retry_scheduled')
+  }
+
+  it('names the day in words and the reason in plain words — no NACHA, no ISO date in the copy', async () => {
+    const mail = await fireRetry(1)
+    expect(mail.subject).toBe('Payment retry scheduled — Sunday, October 4')
+    expect(mail.html).toContain('<b>$520.20</b> payment for Oak Park Unit MH 25 didn\'t go through because there was not enough money in the account')
+    expect(mail.html).not.toMatch(/NACHA|2026-10-04/)
+  })
+
+  // S654 (review): the first retry is not the last — a short-of-money bounce on
+  // retry 1 schedules retry 2. "We can't try your bank again" was false there.
+  it('the FIRST retry says one more try follows if it bounces for the same reason — never "can\'t try again"', async () => {
+    const mail = await fireRetry(1)
+    expect(mail.html).toContain('This is the first of two retries')
+    expect(mail.html).toContain('we\'ll try one last time three days later')
+    expect(mail.html).not.toMatch(/can't try your bank again|another way/)
+  })
+
+  it('the SECOND retry is the last, and says so', async () => {
+    const mail = await fireRetry(2)
+    expect(mail.html).toContain('This is the last retry')
+    expect(mail.html).toContain('we can\'t try your bank again and you\'ll need to pay another way')
+    expect(mail.html).not.toContain('first of two')
+  })
+})
+
+// S654 (review): a retry that was due but not fired because part of the pull
+// was paid another way (cash at the desk, a matched deposit) in the meantime.
+describe('the retry-skipped notice (part was paid another way)', () => {
+  it('tells the tenant the bank was not retried and what is still owed, with the Pay now button', async () => {
+    const tenant = await seedUser()
+    const staff = await seedUser()
+    const { userId: ownerUserId } = await seedUser()
+    const landlordId = (await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [ownerUserId])).rows[0].id
+    const PAY_URL = 'https://tenant.example/login?ef=signed-token&to=%2Fpayments'
+    await notifyAchRetriesExhausted({
+      paymentId: randomUUID(),
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Pat Doe',
+      landlordId, landlordRecipients: [{ userId: staff.userId, email: staff.email }],
+      unitNumber: 'MH 25', propertyName: 'Oak Park', amount: 25.20,
+      reason: 'there was not enough money in the account',
+      finalReason: 'partly_paid', attempts: 1, payUrl: PAY_URL,
+    })
+    const mails = (sendNotificationEmailMock.mock.calls as any[][]).map((c) => c[0] as any)
+    const toTenant = mails.find((c) => c.notificationType === 'ach_retries_exhausted')
+    expect(toTenant.html).toContain('has since been paid another way, so we didn\'t try your bank again')
+    expect(toTenant.html).toContain('The rest, <b>$25.20</b>, is still owed')
+    expect(toTenant.html).toContain(`<a href="${PAY_URL}" class="btn">Pay now</a>`)
+    expect(toTenant.html).not.toMatch(/turned down|times/)
+    const toStaff = mails.find((c) => c.notificationType === 'ach_retries_exhausted_landlord')
+    expect(toStaff.html).toContain('was paid another way before its retry')
+    expect(toStaff.html).toContain('$25.20')
+    expect(toStaff.html).not.toContain('Pay now')
+  })
+})
+
+// S654: an autopay that could not even start (no usable method, card refused on
+// the spot) was an in-app bell only. It is a critical type, so it emails.
+describe('notifyAutopayFailed', () => {
+  const PAY_URL = 'https://tenant.example/login?ef=signed-token&to=%2Fpayments'
+  const mail = () => (sendNotificationEmailMock.mock.calls as any[][]).map((c) => c[0] as any)
+    .find((c) => c.notificationType === 'autopay_failed')
+
+  it('emails the tenant with a Pay now button, and the bell opens Payments', async () => {
+    const tenant = await seedUser()
+    await notifyAutopayFailed({ tenantUserId: tenant.userId, tenantEmail: tenant.email, disarming: false, payUrl: PAY_URL })
+    expect(mail().to).toBe(tenant.email)
+    expect(mail().subject).toBe('Your scheduled rent payment didn’t go through')
+    expect(mail().html).toContain(`<a href="${PAY_URL}" class="btn">Pay now</a>`)
+    const { rows } = await db.query<{ action_url: string; body: string }>(
+      `SELECT action_url, body FROM notifications WHERE user_id = $1 AND type = 'autopay_failed'`, [tenant.userId])
+    expect(rows[0].action_url).toBe('/payments')
+    expect(rows[0].body).toContain('Autopay is still on')
+  })
+
+  it('emails even when the tenant switched that email off — a missed rent payment is critical', async () => {
+    const tenant = await seedUser()
+    await setPrefs(tenant.userId, 'autopay_failed', { email: false })
+    await notifyAutopayFailed({ tenantUserId: tenant.userId, tenantEmail: tenant.email, disarming: true, payUrl: PAY_URL })
+    expect(mail().to).toBe(tenant.email)
+    expect(mail().subject).toBe('Autopay has been turned off')
+  })
+})
+
+// S654 (review): "check the account you pay from, then pay" went out for every
+// autopay failure — including an eviction hold (whose Payments page refuses the
+// payment) and GAM's own errors. Each kind is now told what is true of it.
+describe('notifyAutopayFailed — each reason is told truthfully', () => {
+  const rowsFor = async (userId: string) => (await db.query<{ action_url: string; body: string }>(
+    `SELECT action_url, body FROM notifications WHERE user_id = $1 AND type = 'autopay_failed'`, [userId])).rows
+  const autopayMails = () => (sendNotificationEmailMock.mock.calls as any[][]).map((c) => c[0] as any)
+    .filter((c) => c.notificationType === 'autopay_failed')
+
+  it('a paused space: in-app only, no email, no pay button, and points them to their landlord', async () => {
+    const tenant = await seedUser()
+    await notifyAutopayFailed({ tenantUserId: tenant.userId, tenantEmail: tenant.email, disarming: false, kind: 'payments_paused', payUrl: 'https://x/pay' })
+    expect(autopayMails()).toHaveLength(0)
+    const [row] = await rowsFor(tenant.userId)
+    expect(row.body).toContain('payments for your space are paused')
+    expect(row.body).toContain('contact your landlord')
+    expect(row.body).not.toMatch(/Check the account|Payments page/)
+    expect(row.action_url).toBe('/lease')
+  })
+
+  it('our side: emailed with the Pay now button, says nothing was taken and nothing is wrong with their account', async () => {
+    const tenant = await seedUser()
+    await notifyAutopayFailed({ tenantUserId: tenant.userId, tenantEmail: tenant.email, disarming: false, kind: 'our_side', payUrl: 'https://x/pay' })
+    const [mail] = autopayMails()
+    expect(mail.to).toBe(tenant.email)
+    expect(mail.html).toContain('a problem on our end')
+    expect(mail.html).toContain('nothing was taken from your account')
+    expect(mail.html).not.toContain('Check the account you pay from')
+    expect(mail.html).toContain('<a href="https://x/pay" class="btn">Pay now</a>')
+  })
+
+  it('our side, second time: says autopay is off without blaming their bank', async () => {
+    const tenant = await seedUser()
+    await notifyAutopayFailed({ tenantUserId: tenant.userId, tenantEmail: tenant.email, disarming: true, kind: 'our_side' })
+    const [mail] = autopayMails()
+    expect(mail.subject).toBe('Autopay has been turned off')
+    expect(mail.html).not.toContain('stop your bank charging you')
+  })
+
+  it('the tenant\'s own payment method: the original copy, emailed', async () => {
+    const tenant = await seedUser()
+    await notifyAutopayFailed({ tenantUserId: tenant.userId, tenantEmail: tenant.email, disarming: false, kind: 'payment_method' })
+    const [mail] = autopayMails()
+    expect(mail.html).toContain('Check the account you pay from')
+  })
+})
+
+// S654 (review): a bounced FlexDeposit pull gets no generic notice (its retry is
+// pre-scheduled, and the landlord side never hears of FlexDeposit) — but the
+// tenant must still be told.
+describe('notifyFlexDepositPullFailed — tenant only, true to the plan', () => {
+  const LEASE_URL = 'https://tenant.example/login?ef=signed-token&to=%2Flease'
+  const fdMails = () => (sendNotificationEmailMock.mock.calls as any[][]).map((c) => c[0] as any)
+    .filter((c) => c.notificationType === 'flexdeposit_payment_failed')
+
+  it('first bounce: names the scheduled retry day and the reason, and has no pay button', async () => {
+    const tenant = await seedUser()
+    await notifyFlexDepositPullFailed({
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, amount: 150,
+      reason: 'there was not enough money in the account', outcome: 'will_retry', retryDate: '2026-10-04', leaseUrl: LEASE_URL,
+    })
+    const [mail] = fdMails()
+    expect(mail.to).toBe(tenant.email)
+    expect(mail.html).toContain('<b>$150.00</b> deposit installment payment didn\'t go through because there was not enough money in the account')
+    expect(mail.html).toContain('We\'ll try your bank again on <b>Sunday, October 4</b>')
+    expect(mail.html).not.toContain('class="btn"')
+  })
+
+  it('first bounce with its retry day already reached: no stale date', async () => {
+    const tenant = await seedUser()
+    await notifyFlexDepositPullFailed({
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, amount: 150, reason: null, outcome: 'will_retry', retryDate: null,
+    })
+    const [mail] = fdMails()
+    expect(mail.html).toContain('in the next few days')
+    expect(mail.html).not.toContain('because')
+  })
+
+  it('retry bounce: the installment is missed, the plan stays on, and the button opens the Lease page', async () => {
+    const tenant = await seedUser()
+    await notifyFlexDepositPullFailed({
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, amount: 154,
+      reason: 'there was not enough money in the account', outcome: 'missed', leaseUrl: LEASE_URL,
+    })
+    const [mail] = fdMails()
+    expect(mail.subject).toBe('A deposit installment was missed')
+    expect(mail.html).toContain('this installment is marked missed')
+    expect(mail.html).toContain('Your deposit plan stays on')
+    expect(mail.html).toContain(`<a href="${LEASE_URL}" class="btn">Go to your lease</a>`)
+    expect(mail.html).not.toMatch(/debt|collections|default/i)
+  })
+
+  it('a pay-ahead they started: nothing else changes', async () => {
+    const tenant = await seedUser()
+    await notifyFlexDepositPullFailed({
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, amount: 450, reason: 'the account is closed', outcome: 'pay_ahead',
+    })
+    const [mail] = fdMails()
+    expect(mail.html).toContain('<b>$450.00</b> payment toward your deposit didn\'t go through because the account is closed')
+    expect(mail.html).toContain('your scheduled deposit installments continue as planned')
+    expect(mail.html).toContain(`href="${portalLink('tenant', 'lease')}"`)
+  })
+
+  it('only the tenant is notified — one row, theirs, opening the Lease page; the link is not stored', async () => {
+    const tenant = await seedUser()
+    await notifyFlexDepositPullFailed({
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, amount: 150, reason: null, outcome: 'missed', leaseUrl: LEASE_URL,
+    })
+    const { rows } = await db.query<{ user_id: string; action_url: string; data: any }>(
+      `SELECT user_id, action_url, data FROM notifications`)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ user_id: tenant.userId, action_url: '/lease' })
+    expect(JSON.stringify(rows[0].data)).not.toContain('signed-token')
   })
 })

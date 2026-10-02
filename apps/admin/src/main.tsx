@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue, readKeepSignedInChoice, rememberKeepSignedInChoice } from '@gam/shared'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -23,7 +23,7 @@ import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient
 import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
-  Scale, SlidersHorizontal, BookOpen, Lightbulb, Landmark, Mail, Send,
+  Scale, SlidersHorizontal, Lightbulb, Landmark, Mail, Send,
   Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck,
 } from 'lucide-react'
 import axios from 'axios'
@@ -33,7 +33,6 @@ import { toast, appConfirm, DialogHost } from './components/dialogs'
 import { RentVolumeMonitor } from './components/RentVolumeMonitor'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
-const BOOKS_URL = (import.meta as any).env?.VITE_BOOKS_APP_URL || 'http://localhost:3006'
 const api = axios.create({ baseURL: `${API}/api` })
 api.interceptors.request.use(c => { const t=localStorage.getItem('gam_admin_token'); if(t)c.headers.Authorization=`Bearer ${t}`; return c })
 api.interceptors.response.use(r=>r, e=>{if(e.response?.status===401&&!String(e.config?.url||'').includes('/auth/')){localStorage.removeItem('gam_admin_token');window.location.href='/login'}return Promise.reject(e)})
@@ -50,7 +49,7 @@ interface AuthCtx{
   user:AuthUser|null
   token:string|null
   loading:boolean
-  login:(e:string,p:string)=>Promise<LoginResult>
+  login:(e:string,p:string,keepSignedIn:boolean)=>Promise<LoginResult>
   loginWithTotp:(totpSession:string,code:string)=>Promise<void>
   loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>
   resendEmailOtp:(emailOtpSession:string)=>Promise<void>
@@ -81,6 +80,27 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(null)
   }, [])
 
+  // S655: a sign-in here ends 7 days after it started, even mid-task, unless
+  // "Keep me signed in on this device" was ticked. The choice rides inside the
+  // pass, and sessionRenewalDue() says no for a fixed one — so this only ever
+  // renews a kept sign-in (the server would refuse to extend a fixed one
+  // anyway). Same renewal as the landlord portal (S654): on load and whenever
+  // the console comes back into view, once the pass is more than a day old.
+  const renewSession = React.useCallback(async () => {
+    const current = localStorage.getItem('gam_admin_token')
+    if (!sessionRenewalDue(current)) return
+    try {
+      const r = await api.post('/auth/refresh', {}, { headers: { Authorization: 'Bearer ' + current } })
+      // A sign-out (or another sign-in) while this was in flight wins.
+      if (localStorage.getItem('gam_admin_token') !== current) return
+      const tk = r.data?.data?.token
+      if (!tk) return
+      localStorage.setItem('gam_admin_token', tk)
+      api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
+      setToken(tk)
+    } catch (e) { if (isAuthRejection(e)) logout() }
+  }, [logout])
+
   const refresh = React.useCallback(async () => {
     const t = localStorage.getItem('gam_admin_token')
     if (!t) { setLoading(false); return }
@@ -96,18 +116,26 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
         totpEnabled: !!u.totpEnabled,
         mustEnrollTotp: !!u.mustEnrollTotp,
       })
+      // Renewed last, so a refused renewal signs out without a request still in flight.
+      await renewSession()
     } catch (e) { if (isAuthRejection(e)) logout() }  // S540: transient failures keep the token
     finally { setLoading(false) }
-  }, [logout])
+  }, [logout, renewSession])
 
   React.useEffect(() => { refresh() }, [refresh])
+  React.useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') renewSession() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [renewSession])
 
   // S289: post-credentials login. Returns a discriminated result so
   // LoginPage can pivot into the TOTP second step when 2FA is enabled
   // on the account. Doesn't set user state until the full JWT lands —
   // a totp_session JWT is not a valid auth token.
-  const login = async (email: string, password: string): Promise<LoginResult> => {
-    const res = await axios.post(API + '/api/auth/login', { email, password, portal: 'admin' })
+  const login = async (email: string, password: string, keepSignedIn: boolean): Promise<LoginResult> => {
+    // S655: the choice rides inside the pending pass, so the code step needs nothing new.
+    const res = await axios.post(API + '/api/auth/login', { email, password, portal: 'admin', keepSignedIn })
     const data = res.data.data
     if (data.requiresTotp) {
       return { kind: 'totp_required', totpSession: data.totpSession as string }
@@ -328,8 +356,11 @@ function Layout(){
           {/* S508 (#6): these sections only hold super-admin items — don't
               render the section label for regular admins (was an empty "dead"
               header). */}
-          {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Tools</div>}
-          {isSuperAdmin&&<button className="ni" onClick={()=>{const t=localStorage.getItem('gam_admin_token');window.open(BOOKS_URL+(t?'?token='+t:''),'_blank')}}><BookOpen size={15}/> GAM Books</button>}
+          {/* S655: the "GAM Books" button that lived here is gone. It opened
+              Books with this console's pass in the web address (?token=…),
+              which left the most powerful pass on the platform in browser
+              history — and Books then refused it anyway, because admins are
+              kept out of Books on purpose (S568). A dead button that leaked. */}
 
           {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Sales</div>}
           {isSuperAdmin&&<NavLink to="/leads" className={({isActive})=>`ni${isActive?' active':''}`}><Target size={15}/> Leads</NavLink>}
@@ -3337,8 +3368,12 @@ function VerifyEmailPage(){
   )
 }
 
+// S655: remembered per browser so the box starts the way it was last left.
+const KEEP_SIGNED_IN_KEY='gam_admin_keep_signed_in'
+
 function LoginPage(){
   const{login,loginWithTotp,loginWithEmailOtp,resendEmailOtp}=useAuth()
+  const[keepSignedIn,setKeepSignedIn]=useState(()=>readKeepSignedInChoice(KEEP_SIGNED_IN_KEY))
   React.useEffect(()=>{
     localStorage.removeItem('gam_admin_token')
     delete api.defaults.headers.common['Authorization']
@@ -3352,7 +3387,8 @@ function LoginPage(){
   const onCredentialsSubmit=async(e:React.FormEvent)=>{
     e.preventDefault();setLoading(true);setErr('')
     try{
-      const r=await login(email,pw)
+      rememberKeepSignedInChoice(KEEP_SIGNED_IN_KEY,keepSignedIn)
+      const r=await login(email,pw,keepSignedIn)
       if(r.kind==='totp_required'){setTotpSession(r.totpSession);setCode('')}
       else if(r.kind==='email_otp_required'){setEmailOtpSession(r.emailOtpSession);setCode('');setResentMsg('')}
     }
@@ -3498,7 +3534,15 @@ function LoginPage(){
           {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
           <form onSubmit={onCredentialsSubmit}>
             <div style={{marginBottom:14}}><label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Email</label><input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',fontFamily:'var(--font-b)',outline:'none'}} type="email" name="gam-admin-login" autoComplete="off" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/></div>
-            <div style={{marginBottom:16}}><label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Password</label><input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',fontFamily:'var(--font-b)',outline:'none'}} type="password" value={pw} onChange={e=>setPw(e.target.value)} required/></div>
+            <div style={{marginBottom:14}}><label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Password</label><input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',fontFamily:'var(--font-b)',outline:'none'}} type="password" value={pw} onChange={e=>setPw(e.target.value)} required/></div>
+            {/* S655: off by default. Off, this sign-in ends 7 days after it
+                starts, even mid-task; on, it stays signed in while in use. */}
+            <label style={{display:'flex',alignItems:'flex-start',gap:8,marginBottom:16,cursor:'pointer',fontSize:'.82rem',color:'var(--t1)',lineHeight:1.45}}>
+              <input type="checkbox" checked={keepSignedIn} onChange={e=>setKeepSignedIn(e.target.checked)} style={{marginTop:3,accentColor:'var(--gold)'}}/>
+              <span>Keep me signed in on this device
+                <span style={{display:'block',color:'var(--t3)',fontSize:'.74rem'}}>Leave this off on a shared computer. Off, you are signed out 7 days after you sign in.</span>
+              </span>
+            </label>
             <button className="bp btn" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center'}}>
               {loading?<span className="spinner"/>:'Sign in'}
             </button>

@@ -430,6 +430,31 @@ describe('S639 pending pool — invite state tells the truth', () => {
         WHERE tenant_id = $1 AND screening_waived`, [rows[0].tenant_id])
     expect(kept.rows).toHaveLength(1)
   })
+
+  // S655: the waiver close used to match on the PERSON alone, so one company
+  // backing out of its invite cancelled another company's grandfather record.
+  it('cancelling an invite closes only this company’s waiver row, never another company’s', async () => {
+    const x = await seedTOFixture()
+    const y = await seedTOFixture()
+    const email = `s655-${randomUUID().slice(0, 6)}@test.dev`
+    const intentId = await pendingIntent(x, email)
+    const { rows: [xi] } = await db.query<any>(
+      `SELECT tenant_id FROM pending_tenant_intents WHERE id = $1`, [intentId])
+    await db.query(`UPDATE pending_tenant_intents SET unit_id = $2 WHERE id = $1`, [intentId, x.unitId])
+    // Company Y grandfathered the same person at its own park.
+    const { rows: [yWaiver] } = await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (tenant_id, landlord_id, unit_id, screening_waived)
+       VALUES ($1, $2, NULL, TRUE) RETURNING id`, [xi.tenant_id, y.landlordId])
+
+    const res = await request(buildApp())
+      .delete(`/api/landlords/me/pending-tenants/${intentId}`)
+      .set('Authorization', `Bearer ${x.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.waiverRowsClosed).toBe(0)
+    const { rows: [after] } = await db.query<{ cancelled_at: string | null }>(
+      `SELECT cancelled_at FROM pending_tenant_intents WHERE id = $1`, [yWaiver.id])
+    expect(after.cancelled_at).toBeNull()
+  })
 })
 
 describe('DELETE /me/pending-tenants/:intentId', () => {

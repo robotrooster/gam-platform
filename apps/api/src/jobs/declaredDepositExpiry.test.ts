@@ -19,7 +19,18 @@ import {
 
 beforeEach(cleanupAllSchema)
 
-async function declare(daysAgo: number) {
+/**
+ * S655: a report only expires once the company's bank was actually read past
+ * the report's window. declare() links one that synced today unless told 'none'.
+ */
+async function linkBank(landlordId: string, opts: { syncedDaysAgo?: number | null; status?: string } = {}) {
+  await db.query(
+    `INSERT INTO bank_connections (landlord_id, provider, status, last_synced_at)
+     VALUES ($1, 'stripe_fc', $2, CASE WHEN $3::int IS NULL THEN NULL ELSE NOW() - ($3::int * interval '1 day') END)`,
+    [landlordId, opts.status ?? 'active', opts.syncedDaysAgo === undefined ? 0 : opts.syncedDaysAgo])
+}
+
+async function declare(daysAgo: number, bank: 'synced' | 'none' = 'synced') {
   const client = await getClient()
   try {
     const { userId, landlordId } = await seedLandlord(client)
@@ -34,6 +45,7 @@ async function declare(daysAgo: number) {
          (tenant_id, lease_id, landlord_id, amount, declared_date, method)
        VALUES ($1,$2,$3,250,(CURRENT_DATE - $4::int),'cash') RETURNING id`,
       [tenantId, leaseId, landlordId, daysAgo])).rows[0]
+    if (bank === 'synced') await linkBank(landlordId)
     return { id: d.id, tenantId, leaseId, landlordId }
   } finally { client.release() }
 }
@@ -101,6 +113,7 @@ describe('expiring a report the bank never matched', () => {
       }
       ctx = { landlordId, ownerUserId: userId }
     } finally { client.release() }
+    await linkBank(ctx.landlordId)
 
     const r = await sweepExpiredDeclarations()
     expect(r.expired).toBe(2)
@@ -137,5 +150,52 @@ describe('expiring a report the bank never matched', () => {
     const r = await sweepExpiredDeclarations()
     expect(r.expired).toBe(0)
     expect((await statusOf(d.id)).status).toBe('confirmed')
+  })
+})
+
+// S655: Country Acres has no bank linked, and MH 21's $666.50 report of 9/4
+// expired anyway as "not found in your landlord's bank feed" — a strike for a
+// deposit nobody could look for. The 10/1 report would have been the second
+// strike and an alert to the landlord.
+describe('a report only expires once the bank was actually looked at', () => {
+  it('never expires while the company has no bank linked', async () => {
+    const d = await declare(DECLARATION_EXPIRY_DAYS + 20, 'none')
+    const r = await sweepExpiredDeclarations()
+    expect(r.expired).toBe(0)
+    expect((await statusOf(d.id)).status).toBe('pending')
+  })
+
+  it('waits while the linked bank has not synced past the end of the report’s window', async () => {
+    const d = await declare(DECLARATION_EXPIRY_DAYS + 2, 'none')
+    // Last read the day after the deposit — the window ran six more days.
+    await linkBank(d.landlordId, { syncedDaysAgo: DECLARATION_EXPIRY_DAYS + 1 })
+    expect((await sweepExpiredDeclarations()).expired).toBe(0)
+    expect((await statusOf(d.id)).status).toBe('pending')
+  })
+
+  it('a disconnected link does not count as looking', async () => {
+    const d = await declare(DECLARATION_EXPIRY_DAYS + 2, 'none')
+    await linkBank(d.landlordId, { status: 'disconnected' })
+    expect((await sweepExpiredDeclarations()).expired).toBe(0)
+    expect((await statusOf(d.id)).status).toBe('pending')
+  })
+
+  it('no strike and no alert to the landlord for reports there was no bank to check', async () => {
+    const first = await declare(DECLARATION_EXPIRY_DAYS + 20, 'none')
+    await db.query(
+      `INSERT INTO tenant_declared_deposits (tenant_id, lease_id, landlord_id, amount, declared_date, method)
+       VALUES ($1,$2,$3,815,(CURRENT_DATE - $4::int),'cash')`,
+      [first.tenantId, first.leaseId, first.landlordId, DECLARATION_EXPIRY_DAYS + 1])
+    const r = await sweepExpiredDeclarations()
+    expect(r).toMatchObject({ expired: 0, tenantsFlagged: 0 })
+    const n = await db.query(`SELECT 1 FROM notifications WHERE landlord_id = $1`, [first.landlordId])
+    expect(n.rowCount).toBe(0)
+  })
+
+  it('expires once a link has synced past the window', async () => {
+    const d = await declare(DECLARATION_EXPIRY_DAYS + 2, 'none')
+    await linkBank(d.landlordId, { syncedDaysAgo: 0 })
+    expect((await sweepExpiredDeclarations()).expired).toBe(1)
+    expect((await statusOf(d.id)).status).toBe('unconfirmed')
   })
 })

@@ -551,3 +551,85 @@ describe('to-dos for a co-owner of somebody else’s entity', () => {
     expect((res.body.data.ach as any[]).map((t) => t.id)).toContain('landlord-bank')
   })
 })
+
+// S655: the to-do list said an applicant "passed screening" off the person's
+// platform-wide status, which carried other companies' verdicts.
+describe('GET /api/landlords/me/todos — applicant screening is this account’s own', () => {
+  async function applicantWith(f: TFixture, setup: (userId: string, tenantId: string) => Promise<unknown>) {
+    const { rows: [t] } = await db.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id = $1`, [f.tenantId])
+    await db.query(`UPDATE tenants SET background_check_status = 'approved' WHERE id = $1`, [f.tenantId])
+    await db.query(
+      `INSERT INTO unit_applications (unit_id, landlord_id, applicant_user_id, first_name, last_name, email)
+       VALUES ($1, $2, $3, 'Ann', 'Applicant', 'ann@t.dev')`, [f.unitId, f.landlordId, t.user_id])
+    await setup(t.user_id, f.tenantId)
+    const res = await getTodos(f.landlordToken)
+    return res.body.data.onboarding.find((o: any) => o.type === 'new_applicant')
+  }
+
+  it('another company’s approval does not read as passed screening', async () => {
+    const f = await seedTFixture()
+    const other = await seedTFixture()
+    const item = await applicantWith(f, (userId, tenantId) => db.query(
+      `INSERT INTO background_checks (landlord_id, user_id, tenant_id, status) VALUES ($1, $2, $3, 'approved')`,
+      [other.landlordId, userId, tenantId]))
+    expect(item.subtitle).toMatch(/Screen them/)
+  })
+
+  it('this account’s own approval reads as passed screening', async () => {
+    const f = await seedTFixture()
+    const item = await applicantWith(f, (userId, tenantId) => db.query(
+      `INSERT INTO background_checks (landlord_id, user_id, tenant_id, status) VALUES ($1, $2, $3, 'approved')`,
+      [f.landlordId, userId, tenantId]))
+    expect(item.subtitle).toMatch(/passed screening/)
+  })
+
+  it('another company’s approval with the share box ticked does not read as passed screening', async () => {
+    const f = await seedTFixture()
+    const other = await seedTFixture()
+    const item = await applicantWith(f, (userId, tenantId) => db.query(
+      `INSERT INTO background_checks (landlord_id, user_id, tenant_id, status, consent_pool)
+       VALUES ($1, $2, $3, 'approved', true)`,
+      [other.landlordId, userId, tenantId]))
+    expect(item.subtitle).toMatch(/Screen them/)
+  })
+
+  it('a check run through GAM’s renter pool reads as passed screening', async () => {
+    const f = await seedTFixture()
+    const pool = await seedTFixture()
+    await db.query(`UPDATE landlords SET is_system = true WHERE id = $1`, [pool.landlordId])
+    const item = await applicantWith(f, (userId, tenantId) => db.query(
+      `INSERT INTO background_checks (landlord_id, user_id, tenant_id, status, consent_pool)
+       VALUES ($1, $2, $3, 'approved', true)`,
+      [pool.landlordId, userId, tenantId]))
+    expect(item.subtitle).toMatch(/passed screening/)
+  })
+
+  it('another company’s waiver does not read as passed screening', async () => {
+    const f = await seedTFixture()
+    const other = await seedTFixture()
+    const item = await applicantWith(f, (_userId, tenantId) => db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, screening_waived)
+       VALUES ($1, $2, 'not_uploaded', NULL, true)`, [other.landlordId, tenantId]))
+    expect(item.subtitle).toMatch(/Screen them/)
+  })
+})
+
+// S655: a transfer waiting on the buyer's acceptance shows on the buyer's
+// to-do list (and nowhere for anyone else).
+describe('GET /api/landlords/me/todos — an incoming property transfer', () => {
+  it('lists a transfer waiting on this login and links to Properties', async () => {
+    const seller = await seedTFixture()
+    const buyer = await seedTFixture()
+    const { initiateTransfer } = await import('../services/propertyTransfer')
+    await initiateTransfer({
+      propertyId: seller.propertyId, fromLandlordId: seller.landlordId,
+      toUserId: buyer.landlordUserId, byUserId: seller.landlordUserId,
+    })
+    const res = await getTodos(buyer.landlordToken)
+    const item = res.body.data.onboarding.find((o: any) => o.type === 'incoming_property_transfer')
+    expect(item).toBeTruthy()
+    expect(item.href).toBe('/properties')
+    const sellerView = await getTodos(seller.landlordToken)
+    expect(sellerView.body.data.onboarding.some((o: any) => o.type === 'incoming_property_transfer')).toBe(false)
+  })
+})

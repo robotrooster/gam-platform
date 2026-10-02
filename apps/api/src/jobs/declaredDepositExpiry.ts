@@ -37,6 +37,20 @@ export async function sweepExpiredDeclarations(
   try {
     // Expire on the DECLARED date, not on created_at: a tenant reporting a
     // deposit they made a week ago should not get a fresh week of waiting.
+    //
+    // ── S655: ONLY WHEN THE BANK WAS ACTUALLY LOOKED AT ──────────────────────
+    //
+    // "Not found in your landlord's bank feed" is only true if there IS a feed
+    // and it has been read past the end of the report's window. Country Acres
+    // has no bank linked at all, so MH 21's $666.50 report of 9/4 expired as
+    // not found — a strike against a tenant for nothing they did — and the 10/1
+    // report was headed the same way, which would have been the second strike
+    // and a "repeated reports have not matched" alert to the landlord.
+    //
+    // A report now waits, still pending, until the company has an active link
+    // whose last sync came after declared_date + the window. Nothing is
+    // credited while it waits (a declaration never credits anything), so
+    // waiting costs nobody anything; expiring wrongly costs the tenant a strike.
     const rows = await query<any>(
       `UPDATE tenant_declared_deposits d
           SET status = 'unconfirmed',
@@ -44,6 +58,11 @@ export async function sweepExpiredDeclarations(
               updated_at = NOW()
         WHERE d.status = 'pending'
           AND d.declared_date < ($1::date - $2::int)
+          AND EXISTS (
+            SELECT 1 FROM bank_connections c
+             WHERE c.landlord_id = d.landlord_id
+               AND c.status = 'active'
+               AND c.last_synced_at >= (d.declared_date + $2::int)::timestamp)
         RETURNING d.id, d.tenant_id, d.amount::float AS amount,
                   to_char(d.declared_date,'YYYY-MM-DD') AS declared_date,
                   d.landlord_id`,

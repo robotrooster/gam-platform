@@ -42,12 +42,22 @@ export function dueDayLabel(day: number): string {
   return `${n}${suf}`
 }
 
-/** Read a due day off a lease box ("the 15th", "15", "1st") → 1–28, else null. */
+/**
+ * Read a due day off a lease box ("the 15th", "15", "1st") → 1–28, else null.
+ *
+ * Nic: "the only thing we structured is that the 29th through the 31st are
+ * moved to be due on the first because not every month has those days and we
+ * don't want any skips." So a typed 29th, 30th or 31st reads as the 1st —
+ * the same rule leaseDueDay applies to a move-in on those days. Anything
+ * else that is not a day of the month (0, 32, words) is unreadable.
+ */
 export function parseDueDay(raw: unknown): number | null {
   const m = /(\d{1,2})/.exec(String(raw ?? ''))
   if (!m) return null
   const n = Number(m[1])
-  return n >= 1 && n <= 28 ? n : null
+  if (n >= 1 && n <= 28) return n
+  if (n >= 29 && n <= 31) return 1
+  return null
 }
 
 /**
@@ -90,6 +100,101 @@ export function prorateMoveInRent(rent: number, startIso: string, dueDay = 1): n
   const period = Math.round((nextMs - prevMs) / 86400000)
   const days = Math.round((nextMs - startMs) / 86400000)
   return roundHalfEvenCents(rent * days / period)
+}
+
+/** The calendar day before `iso`, as YYYY-MM-DD. */
+export function dayBefore(iso: string): string {
+  const p = parseIso(iso)!
+  const d = new Date(Date.UTC(p.y, p.m - 1, p.d - 1))
+  return d.toISOString().slice(0, 10)
+}
+
+// ── RENEWALS: ONE TENANCY, ONE BILLING SCHEDULE ───────────────────────────
+//
+// Nic: "people get billed on their due date according to how the landlord
+// sets the property." A renewal is not a move-in. The old lease bills every
+// due date up to and including its last day; the new lease bills every due
+// date after that. Nothing bills off-cycle because the paperwork changed.
+//
+// So the old lease is paid through the day before the first of its due dates
+// AFTER its last day (P). The new lease's first bill is on the later of its
+// start and P (B). B on the new lease's due day: full rent there and every due
+// date after — no proration. B off the due day happens only when the landlord
+// changed the due day on the new form (or left a gap): one prorated bridge
+// from B to the next due day, then full rent.
+//
+// Used by the nightly bill run and by the signing pages, so the page and the
+// bill can never tell different stories.
+export interface RenewalSchedule {
+  /** The first due date after the old lease's last day — it is paid up to here. */
+  paidThrough: string
+  /** The first bill under the new lease. */
+  firstBill: string
+  /** The prorated amount billed on firstBill when it is not a due date; null when it is. */
+  bridge: number | null
+  /** The first full month's rent under the new lease. */
+  firstFullDue: string
+  /** The new form moved the due day. A bridge without it is a gap between the leases. */
+  dueDayChanged: boolean
+}
+
+export function renewalSchedule(opts: {
+  /** The old lease's end date; null for a month-to-month that has none written. */
+  oldEnd: string | null
+  oldDueDay: number
+  newStart: string
+  newDueDay: number
+  /** The new lease's monthly rent. */
+  rent: number
+}): RenewalSchedule {
+  const clampDay = (d: number) => {
+    const n = Math.trunc(Number(d) || 1)
+    return n >= 1 && n <= 28 ? n : 1
+  }
+  const oldDay = clampDay(opts.oldDueDay)
+  const newDay = clampDay(opts.newDueDay)
+  // The old lease never bills on or after the new start, whatever its paper
+  // end date says (a renewal can start early), and a month-to-month with no
+  // end written runs to the day before.
+  const lastOld = dayBefore(opts.newStart)
+  const oldLast = opts.oldEnd && opts.oldEnd.slice(0, 10) < lastOld ? opts.oldEnd.slice(0, 10) : lastOld
+  const paidThrough = nextDueDateAfter(oldLast, oldDay)
+  const start = opts.newStart.slice(0, 10)
+  const firstBill = paidThrough > start ? paidThrough : start
+  const dueDayChanged = oldDay !== newDay
+  if (Number(firstBill.slice(8, 10)) === newDay) {
+    return { paidThrough, firstBill, bridge: null, firstFullDue: firstBill, dueDayChanged }
+  }
+  return {
+    paidThrough,
+    firstBill,
+    bridge: prorateMoveInRent(Number(opts.rent) || 0, firstBill, newDay),
+    firstFullDue: nextDueDateAfter(firstBill, newDay),
+    dueDayChanged,
+  }
+}
+
+/**
+ * The renewal's billing in one plain sentence, for the signing pages — so the
+ * landlord and the tenant read, beside page 8, what the first bill under the
+ * new lease will be. Built from renewalSchedule, the same arithmetic the bill
+ * run uses.
+ */
+export function renewalBillingSummary(s: RenewalSchedule, rent: number, newDueDay: number): string {
+  const date = (iso: string) => {
+    const p = parseIso(iso)
+    return p ? new Date(Date.UTC(p.y, p.m - 1, p.d))
+      .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' }) : iso
+  }
+  const usd = (n: number) => '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  const day = dueDayLabel(newDueDay)
+  if (s.bridge == null) {
+    return `Rent stays on its schedule, due on the ${day}. The first rent bill under this lease is ${date(s.firstBill)}: ${usd(rent)}.`
+  }
+  // A bridge with the due day unchanged is a gap between the leases (the old
+  // one ended before the day this one starts): the day did not move.
+  return `${s.dueDayChanged ? `Rent moves to the ${day}. ` : ''}The first bill under this lease is ${date(s.firstBill)}: ${usd(s.bridge)} for `
+    + `${date(s.firstBill)} to ${date(dayBefore(s.firstFullDue))}, then ${usd(rent)} on ${date(s.firstFullDue)} and every ${day} after.`
 }
 
 export interface MoveInDefaults { firstMonthRent: number; proration: number }

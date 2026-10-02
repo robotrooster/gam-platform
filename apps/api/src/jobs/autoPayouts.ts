@@ -42,8 +42,9 @@
  */
 
 import { isUsFederalHoliday } from '@gam/shared'
-import { query } from '../db'
+import { query, queryOne } from '../db'
 import { firePayoutForConnectAccount, getAvailableUsdBalance } from '../services/connectPayouts'
+import { stampPayoutTransfers } from '../services/payoutComposition'
 import { createAdminNotification } from '../services/adminNotifications'
 import { reconcilePlatformHeldPayments, recoverPendingPlatformTransfers } from '../services/landlordPassthrough'
 import { reconcileBusinessHeldFunds } from '../services/heldPayouts'
@@ -669,14 +670,43 @@ async function processOneCandidate(
   // 4. Audit row. Only for user-side payouts — PM payouts audit via the
   //    webhook-fed connect_payouts table (no pm_company_id on disbursements).
   if (cand.kind === 'user') {
-    await query(
+    const triggerType = catchUpRun ? 'catch_up' : 'auto_friday'
+    // S655: the Connect webhook files every payout it hears about (as
+    // 'stripe_dashboard' when no row exists yet). If it beat this insert, that
+    // row is this payout — claim it rather than write a second one.
+    const filedByWebhook = await queryOne<{ id: string }>(
+      `UPDATE disbursements
+          SET trigger_type = $2, user_id = $3,
+              landlord_id = COALESCE(landlord_id,
+                (SELECT id FROM landlords WHERE stripe_connect_account_id = $4 ORDER BY created_at LIMIT 1)),
+              notes = NULL
+        WHERE stripe_payout_id = $1 AND trigger_type = 'stripe_dashboard'
+        RETURNING id`,
+      [stripePayoutId, triggerType, cand.entity_id, cand.stripe_connect_account_id])
+    const disb = filedByWebhook ?? await queryOne<{ id: string }>(
       `INSERT INTO disbursements
          (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, landlord_id)
        VALUES ($1, $4, $2, 'processing', $3, NOW(), 0,
                -- S652: the company whose Connect account this is, so the row says who
-               (SELECT id FROM landlords WHERE stripe_connect_account_id = $5 ORDER BY created_at LIMIT 1))`,
-      [cand.entity_id, available, stripePayoutId, catchUpRun ? 'catch_up' : 'auto_friday', cand.stripe_connect_account_id]
+               (SELECT id FROM landlords WHERE stripe_connect_account_id = $5 ORDER BY created_at LIMIT 1))
+       RETURNING id`,
+      [cand.entity_id, available, stripePayoutId, triggerType, cand.stripe_connect_account_id]
     )
+    // S655 (Nic): "$2,638.11 from GAM" has to say which payments it was. Record
+    // the transfers this payout swept off the balance, so the bank row and the
+    // Payouts page can list every payment inside it. Best-effort: the payout has
+    // already gone, and a failure here must not report it as failed.
+    if (disb?.id) {
+      try {
+        await stampPayoutTransfers({
+          disbursementId: disb.id,
+          connectAccountId: cand.stripe_connect_account_id,
+          payoutAmount: available,
+        })
+      } catch (e) {
+        logger.error({ err: e, disbursementId: disb.id }, '[auto_payouts] could not record what the payout carried')
+      }
+    }
   }
 
   return 'fired'

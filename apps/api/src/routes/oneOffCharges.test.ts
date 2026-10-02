@@ -226,3 +226,38 @@ describe('PATCH /api/one-off-charges/:id/cancel (S616)', () => {
     expect(res.body.error).toMatch(/credit/i)
   })
 })
+
+describe('GET /api/one-off-charges — the owner’s list', () => {
+  // Since S633 an owner's session names no company in profileId; the list read
+  // profileId anyway, so the Tenant page's charges card was always empty for
+  // owners. The tests signed tokens WITH profileId set, which hid it.
+  it('lists an owner’s charges when the session names no company', async () => {
+    const f = await seed()
+    await request(buildApp())
+      .post('/api/one-off-charges')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ tenantId: f.tenantId, ...violation })
+    const ownerToken = jwt.sign({ userId: f.userId, role: 'landlord', profileId: null },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(buildApp())
+      .get(`/api/one-off-charges?tenantId=${f.tenantId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(1)
+    expect(res.body.data[0].reason).toBe('Parking in the fire lane')
+  })
+
+  it('does not list another company’s charges', async () => {
+    const mine = await seed()
+    const theirs = await seed()
+    await request(buildApp())
+      .post('/api/one-off-charges')
+      .set('Authorization', `Bearer ${theirs.token}`)
+      .send({ tenantId: theirs.tenantId, ...violation })
+    const res = await request(buildApp())
+      .get('/api/one-off-charges')
+      .set('Authorization', `Bearer ${mine.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(0)
+  })
+})

@@ -681,9 +681,11 @@ webhooksRouter.post('/stripe', async (req, res) => {
     }
     case 'payment_intent.payment_failed': {
       // S124: NACHA-compliant retry decision. Read the return code from
-      // Stripe's last_payment_error chain; if retryable AND retry_count < 2,
-      // schedule next_retry_at = NOW() + 3 days (NACHA recommends ≥1
-      // business day; 3 calendar days is a conservative weekend-safe proxy).
+      // Stripe's last_payment_error chain (an R-code, or — S654 — the name
+      // Stripe gives it, e.g. 'insufficient_funds'); if retryable AND
+      // retry_count < 2, schedule next_retry_at three calendar days out, at
+      // the start of the property's day (NACHA recommends ≥1 business day;
+      // 3 calendar days is a conservative weekend-safe proxy).
       // Otherwise: permanent failure, status='failed', next_retry_at=NULL.
       // S125: notification fires post-update — retry-scheduled or
       // retries-exhausted depending on outcome.
@@ -716,9 +718,17 @@ webhooksRouter.post('/stripe', async (req, res) => {
           [pi.metadata.gam_remittance_id])
       }
 
-      const { extractReturnCode, decideRetry } = await import('../services/achRetry')
+      const { extractReturnCode, decideRetry, pickPullAnchor, pullNoticeContext } = await import('../services/achRetry')
       const { ACH_RETURN_CONFIG } = await import('@gam/shared')
-      const returnCode = extractReturnCode(pi)
+      let returnCode = extractReturnCode(pi)
+      // S654: the event usually carries latest_charge as a bare id. When the
+      // intent itself names no reason, read the charge's failure_code — an
+      // unreadable reason is treated as final, so a missed read here would deny
+      // a short-of-money bounce its retries. resolveCharge never throws.
+      if (!returnCode && typeof pi.latest_charge === 'string' && pi.latest_charge) {
+        const ch = await resolveCharge(stripe, pi)
+        if (ch) returnCode = extractReturnCode({ ...pi, latest_charge: ch } as Stripe.PaymentIntent)
+      }
       const decision = decideRetry(returnCode)
       const reasonText = (returnCode && ACH_RETURN_CONFIG[returnCode]?.description)
         || 'Payment processor reported the charge failed'
@@ -733,41 +743,61 @@ webhooksRouter.post('/stripe', async (req, res) => {
         pi.metadata?.gam_purpose === 'flexdeposit_payahead'
       )
 
+      type FailedPullRow = { id: string; retry_count: number; amount: string; type: string }
+      // The row that speaks for the pull (credit ledger, decline fee, the
+      // notice's tenant/unit lookup): rent first, then utility, then anything
+      // else (pickPullAnchor, shared with the retry cron).
+      // The payment's property timezone, read per row (Phoenix when a row has no unit).
+      const PAYMENT_TZ_SQL = `COALESCE((SELECT pr.timezone FROM units un JOIN properties pr ON pr.id = un.property_id
+                                         WHERE un.id = payments.unit_id), 'America/Phoenix')`
+
       let willRetry = false
       let updatedRow: { id: string; retry_count: number } | null = null
+      // S654: every row this pull covered. A Pay Now of rent + water + a fee is
+      // one bank pull on three rows; the notices quoted the first row alone
+      // ("$495" for a $520.20 payment) and the credit ledger keyed off whichever
+      // row Postgres happened to return first.
+      let failedRows: FailedPullRow[] = []
 
       if (decision === 'retry' && !isFlexDepositPull) {
-        const r = await query<{ id: string; retry_count: number }>(
+        // S654: the retry fires on the start of the property's calendar day
+        // three days out — the day the tenant's email names. NOW() + 3 days
+        // missed the 4 am retry run on that day for any bounce that landed
+        // after 4 am, so the bank was pulled a day after the date we gave.
+        const r = await query<FailedPullRow>(
           `UPDATE payments
               SET status='failed',
                   return_code=$1,
-                  next_retry_at = NOW() + INTERVAL '3 days',
+                  next_retry_at = (
+                    ((NOW() AT TIME ZONE ${PAYMENT_TZ_SQL})::date + 3)::timestamp
+                      AT TIME ZONE ${PAYMENT_TZ_SQL}),
                   stripe_payment_intent_id=$2
             WHERE stripe_payment_intent_id=$2 AND retry_count < 2
-            RETURNING id, retry_count`,
+            RETURNING id, retry_count, amount::text AS amount, type`,
           [returnCode, pi.id]
         )
         if (r.length > 0) {
-          updatedRow = r[0]
+          failedRows = r
           willRetry = true
         }
       }
 
       // If retry path didn't claim (cap reached or non-retryable), fall
       // through to permanent.
-      if (!updatedRow) {
-        const r = await query<{ id: string; retry_count: number }>(
+      if (failedRows.length === 0) {
+        failedRows = await query<FailedPullRow>(
           `UPDATE payments
               SET status='failed',
                   return_code=$1,
                   next_retry_at=NULL,
                   stripe_payment_intent_id=$2
             WHERE stripe_payment_intent_id=$2
-            RETURNING id, retry_count`,
+            RETURNING id, retry_count, amount::text AS amount, type`,
           [returnCode, pi.id]
         )
-        updatedRow = r.length > 0 ? r[0] : null
       }
+      updatedRow = pickPullAnchor(failedRows)
+      const pullTotal = Math.round(failedRows.reduce((s, r) => s + Number(r.amount), 0) * 100) / 100
 
       // S603: declined-CARD-attempt fee ($1.00, entry_description
       // 'DECLINEFEE'). Stripe bills per AUTHORIZATION, so EVERY refused attempt
@@ -869,21 +899,29 @@ webhooksRouter.post('/stripe', async (req, res) => {
               } catch (e) {
                 logger.error({ err: e, payment_id: p.id }, 'flexpay nsf-handler failed')
               }
-              // S246 / S514: FlexDeposit NSF dispatcher (custody model).
-              // Installment pulls: handleFlexDepositPaymentNsf reads
-              // attempt_count to decide between primary-failed-await-retry
-              // and retry-failed → mark installment 'missed' (no
-              // acceleration, no plan default — ToS § 9.1.5).
-              // Voluntary pay-ahead pulls (gam_purpose='flexdeposit_payahead')
-              // have no installment row, so the handler no-ops on them; a
-              // failed pay-ahead is benign — the plan stays 'active' and the
-              // scheduled installment pulls continue.
-              try {
-                const { handleFlexDepositPaymentNsf } = await import('../services/flexDeposit')
-                await handleFlexDepositPaymentNsf(p.id)
-              } catch (e) {
-                logger.error({ err: e, payment_id: p.id }, 'flexdeposit nsf-handler failed')
-              }
+            }
+          }
+
+          // S246 / S514: FlexDeposit NSF dispatcher (custody model).
+          // Installment pulls: handleFlexDepositPaymentNsf reads
+          // attempt_count to decide between primary-failed-await-retry
+          // and retry-failed → mark installment 'missed' (no
+          // acceleration, no plan default — ToS § 9.1.5).
+          // Voluntary pay-ahead pulls (gam_purpose='flexdeposit_payahead')
+          // have no installment row, so the handler no-ops on them; a
+          // failed pay-ahead is benign — the plan stays 'active' and the
+          // scheduled installment pulls continue.
+          //
+          // S654: runs OUTSIDE the rent gate above. An installment row is
+          // type 'deposit', so inside `p.type === 'rent'` this handler could
+          // never run and a twice-bounced installment was never marked
+          // missed. It self-gates on type 'deposit' + entry 'DEPOSIT'.
+          if (p) {
+            try {
+              const { handleFlexDepositPaymentNsf } = await import('../services/flexDeposit')
+              await handleFlexDepositPaymentNsf(p.id)
+            } catch (e) {
+              logger.error({ err: e, payment_id: p.id }, 'flexdeposit nsf-handler failed')
             }
           }
 
@@ -911,54 +949,78 @@ webhooksRouter.post('/stripe', async (req, res) => {
       // ACH retry / exhausted are operational rent-collection events;
       // routed through the responsible-party resolver so the manager
       // (not owner) handles delegated properties.
-      if (updatedRow) {
+      //
+      // S654: a FlexDeposit pull gets neither generic notice. Its retry is a
+      // pre-scheduled installment pull, so "we can't try again" would be false
+      // the first time, and it is a GAM product the landlord side never hears
+      // about. The TENANT is still told, in a tenant-only notice true to the
+      // plan: first bounce → the scheduled retry day; retry bounce → the
+      // installment is missed; a pay-ahead they started → nothing else
+      // changes. Its button goes to the Lease page, where a deposit is funded
+      // (never Payments).
+      if (updatedRow && isFlexDepositPull) {
         try {
-          // Pull payment context for the notify helper
-          const ctx = await query<{
-            id:              string
-            amount:          string
-            tenant_user_id:  string
-            tenant_email:    string
-            tenant_name:     string
-            landlord_id_pk:  string
-            property_id:     string
-            unit_number:     string
-            property_name:   string
-            property_tz:     string | null
-          }>(`
-            SELECT p.id, p.amount,
-                   t.user_id AS tenant_user_id,
-                   tu.email  AS tenant_email,
-                   tu.first_name || ' ' || tu.last_name AS tenant_name,
-                   l.id  AS landlord_id_pk,
-                   pr.id AS property_id,
-                   un.unit_number,
-                   pr.name AS property_name,
-                   pr.timezone AS property_tz
-              FROM payments p
-              JOIN tenants    t  ON t.id = p.tenant_id
-              JOIN users      tu ON tu.id = t.user_id
-              JOIN landlords  l  ON l.id = p.landlord_id
-              JOIN units      un ON un.id = p.unit_id
-              JOIN properties pr ON pr.id = un.property_id
-             WHERE p.id = $1
-          `, [updatedRow.id])
-          const pctx = ctx[0]
+          const { notifyFlexDepositPullFailed } = await import('../services/notifications')
+          const { payNowLink } = await import('../services/invoiceNotice')
+          const who = (await query<{ tenant_user_id: string; tenant_email: string | null }>(
+            `SELECT t.user_id AS tenant_user_id, u.email AS tenant_email
+               FROM payments p JOIN tenants t ON t.id = p.tenant_id JOIN users u ON u.id = t.user_id
+              WHERE p.id = $1`, [updatedRow.id]))[0]
+          if (who) {
+            const isPayAhead = pi.metadata?.gam_purpose === 'flexdeposit_payahead'
+            // The retry day is named only while it is still ahead on the
+            // property's calendar; a retry date already reached is pulled by
+            // the next daily run, so the copy says "in the next few days".
+            const inst = isPayAhead ? null : (await query<{ attempt_count: number; retry_pull_date: string | null; status: string }>(
+              `SELECT i.attempt_count, i.status,
+                      CASE WHEN i.retry_pull_date > (NOW() AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date
+                           THEN i.retry_pull_date::text END AS retry_pull_date
+                 FROM flex_deposit_installments i
+                 JOIN payments p ON p.id = i.payment_id
+                 LEFT JOIN units u ON u.id = p.unit_id
+                 LEFT JOIN properties pr ON pr.id = u.property_id
+                WHERE i.payment_id = $1`, [updatedRow.id]))[0]
+            if (isPayAhead || inst) {
+              let leaseUrl: string | null = null
+              try { leaseUrl = payNowLink(who, '/lease') } catch (e) {
+                logger.error({ err: e, payment_id: updatedRow.id }, 'flexdeposit notice link failed')
+              }
+              await notifyFlexDepositPullFailed({
+                tenantUserId: who.tenant_user_id,
+                tenantEmail:  who.tenant_email,
+                amount:       pullTotal,
+                reason:       (returnCode && ACH_RETURN_CONFIG[returnCode]?.plain) || null,
+                outcome:      isPayAhead ? 'pay_ahead'
+                            : (inst!.status === 'missed' || inst!.attempt_count >= 2) ? 'missed' : 'will_retry',
+                retryDate:    inst?.retry_pull_date ?? null,
+                leaseUrl,
+              })
+            }
+          }
+        } catch (e) {
+          logger.error({ err: e, payment_id: updatedRow.id }, 'flexdeposit-pull-notify failed')
+        }
+      }
+
+      if (updatedRow && !isFlexDepositPull) {
+        try {
+          // Pull payment context for the notify helper (shared with the
+          // retry cron, services/achRetry.ts).
+          const pctx = await pullNoticeContext(updatedRow.id)
           if (pctx) {
-            const { getPropertyResponsibleParty } = await import('../services/responsibleParty')
-            const targets = await getPropertyResponsibleParty(pctx.property_id)
-            const recipients = targets?.primaries ?? []
             const { notifyAchRetryScheduled, notifyAchRetriesExhausted } =
               await import('../services/notifications')
             // S654: one call per failed payment — the tenant's copy goes out
             // once, each landlord-side contact gets theirs. This used to loop
             // the whole call per contact, so the tenant got one email per
             // contact (none when the property had no contact).
-            const landlordRecipients = recipients.map((r) => ({ userId: r.user_id, email: r.email }))
+            const landlordRecipients = pctx.landlordRecipients
+            // S654: the bank's reason in plain words ("the account is closed"),
+            // never the R-code or the bank's own jargon. Null when unreadable.
+            const reasonPlain = (returnCode && ACH_RETURN_CONFIG[returnCode]?.plain) || null
             if (willRetry) {
-              // S654: the retry day as the property's calendar reads it.
-              // next_retry_at is NOW() + 3 days; formatting that instant in
-              // UTC told a tenant who bounced after 5 pm Phoenix a day late.
+              // S654: the retry day as the property's calendar reads it — the
+              // same day next_retry_at now starts, so the retry run fires on it.
               const retryDate = addDaysTo(todayIn(pctx.property_tz), 3)
               await notifyAchRetryScheduled({
                 tenantUserId:    pctx.tenant_user_id,
@@ -968,12 +1030,25 @@ webhooksRouter.post('/stripe', async (req, res) => {
                 landlordRecipients,
                 unitNumber:      pctx.unit_number,
                 propertyName:    pctx.property_name,
-                amount:          parseFloat(pctx.amount),
-                reason:          reasonText,
+                amount:          pullTotal,
+                reason:          reasonPlain,
                 retryDate,
                 retryAttempt:    (updatedRow.retry_count + 1) as 1 | 2,
               })
             } else {
+              // S654 (Nic): the "cannot be retried" email gets a Pay now button
+              // — the same signed link the bill email uses, landing on
+              // Payments — and says which of its two reasons it is: a
+              // short-of-money bounce that used up its retries, or a bank that
+              // will not take this debit at all (closed, not found, not
+              // authorized, or a reason we could not read).
+              const { payNowLink } = await import('../services/invoiceNotice')
+              let payUrl: string | null = null
+              try {
+                payUrl = payNowLink({ tenant_user_id: pctx.tenant_user_id, tenant_email: pctx.tenant_email })
+              } catch (e) {
+                logger.error({ err: e, payment_id: pctx.id }, 'ach-retries-exhausted pay link failed')
+              }
               await notifyAchRetriesExhausted({
                 paymentId:       pctx.id,
                 tenantUserId:    pctx.tenant_user_id,
@@ -983,8 +1058,12 @@ webhooksRouter.post('/stripe', async (req, res) => {
                 landlordRecipients,
                 unitNumber:      pctx.unit_number,
                 propertyName:    pctx.property_name,
-                amount:          parseFloat(pctx.amount),
-                reason:          reasonText,
+                amount:          pullTotal,
+                reason:          reasonPlain,
+                finalReason:     isCardAttempt ? 'card_declined'
+                               : decision === 'retry' ? 'retries_used' : 'bank_refused',
+                attempts:        updatedRow.retry_count + 1,
+                payUrl,
               })
             }
           }

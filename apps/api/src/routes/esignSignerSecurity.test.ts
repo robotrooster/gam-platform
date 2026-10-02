@@ -916,3 +916,57 @@ describe('S654 — POST /esign/draft-household', () => {
     expect(seats.rows).toHaveLength(0)
   })
 })
+
+// S655: changing a property's lease-signing address used to leave the owner's
+// open seats where they were, so a link already mailed to an address the owner
+// had just revoked kept signing as the owner.
+describe('S655 — changing the lease-signing address re-routes the owner\'s open seats', () => {
+  it('moves the open owner seat to the new address with a new token; the old link stops working', async () => {
+    const { propertiesRouter } = await import('./properties')
+    const app = express()
+    app.use(express.json())
+    app.use('/api/esign', esignRouter)
+    app.use('/api/properties', propertiesRouter)
+    app.use(errorHandler)
+
+    const w = await seedWorld()
+    await db.query(`UPDATE properties SET lease_signing_email='office@park.test' WHERE id=$1`, [w.b.propertyId])
+    const made = await request(app).post('/api/esign/documents')
+      .set('Authorization', `Bearer ${w.b.token}`)
+      .send({
+        title: 'Lease', unitId: w.b.unitId,
+        signers: [
+          { role: 'landlord', orderIndex: 1, userId: w.b.userId, name: 'B', email: 'office@park.test' },
+          { role: 'primary', userId: w.y.userId, name: 'Why', email: w.y.email, orderIndex: 2 },
+        ],
+      })
+    expect(made.status).toBe(201)
+    const seat = async () => (await db.query(
+      `SELECT email, token FROM lease_document_signers WHERE document_id=$1 AND role='landlord'`, [made.body.data.id])).rows[0]
+    const before = await seat()
+    const residentBefore = (await db.query(
+      `SELECT email, token FROM lease_document_signers WHERE document_id=$1 AND role='primary'`, [made.body.data.id])).rows[0]
+
+    const res = await request(app).patch(`/api/properties/${w.b.propertyId}`)
+      .set('Authorization', `Bearer ${w.b.token}`)
+      .send({ leaseSigningEmail: 'new-office@park.test' })
+    expect(res.status).toBe(200)
+
+    const after = await seat()
+    expect(after.email).toBe('new-office@park.test')
+    expect(after.token).not.toBe(before.token)
+    const stale = await request(app).get(`/api/esign/sign/${before.token}`)
+    expect(stale.status).toBe(404)
+    // The resident's seat is not the owner's and is left alone.
+    const residentAfter = (await db.query(
+      `SELECT email, token FROM lease_document_signers WHERE document_id=$1 AND role='primary'`, [made.body.data.id])).rows[0]
+    expect(residentAfter).toEqual(residentBefore)
+
+    // Cleared: the seat comes home to the owner's own account address.
+    const cleared = await request(app).patch(`/api/properties/${w.b.propertyId}`)
+      .set('Authorization', `Bearer ${w.b.token}`)
+      .send({ leaseSigningEmail: '' })
+    expect(cleared.status).toBe(200)
+    expect((await seat()).email).toBe(w.b.email.toLowerCase())
+  })
+})

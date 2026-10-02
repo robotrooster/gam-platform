@@ -52,7 +52,7 @@ vi.mock('../services/email', async (importOriginal) => {
 
 import { db } from '../db'
 import { authRouter, mintAndSendVerifyEmail } from './auth'
-import { signEmailFactorToken, signEmailOtpSessionToken } from './emailOtp'
+import { signEmailFactorToken, signEmailOtpSessionToken, emailOtpRouter, issueEmailOtp } from './emailOtp'
 import { errorHandler } from '../middleware/errorHandler'
 import { cleanupAllSchema, seedLandlord, seedTenant } from '../test/dbHelpers'
 
@@ -1104,5 +1104,130 @@ describe('S639 API responses are not cacheable', () => {
     const app = buildApp()
     const res = await request(app).post('/api/auth/login').send({ email: 'nobody@test.dev', password: 'x' })
     expect(String(res.headers['cache-control'] || '')).toMatch(/no-store/)
+  })
+})
+
+// ─── S655: STAFF AND BOOKS SIGN-INS END A SET TIME AFTER SIGN-IN ────────────
+//
+// Nic: sign-ins on the admin console, Support (admin-ops) and GAM Books end
+// after a set time even while in use, unless the person ticks "Keep me signed
+// in on this device". Every other portal keeps renewing while in use (S654).
+// The policy rides inside the pass (`sp`), and /refresh refuses to extend a
+// fixed one — the browser declining to ask is not the only guard.
+describe('S655 session length: fixed at the staff consoles and Books unless kept', () => {
+  const PW = 'CorrectHorse!2026'
+  const SEVEN_DAYS = 7 * 24 * 3600
+
+  async function person(role: string): Promise<{ id: string; email: string }> {
+    const email = `s655-${role}-${randomUUID().slice(0, 8)}@test.dev`
+    const { rows: [u] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, $2, $3, 'A', 'B', TRUE) RETURNING id`, [email, await bcrypt.hash(PW, 10), role])
+    if (role === 'landlord') await db.query(`INSERT INTO landlords (user_id) VALUES ($1)`, [u.id])
+    if (role === 'tenant') await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [u.id])
+    return { id: u.id, email }
+  }
+
+  /** Password, then the emailed code — the whole sign-in. Returns the full pass. */
+  async function signIn(u: { id: string; email: string }, body: Record<string, unknown> = {}): Promise<any> {
+    const app = express()
+    app.use(express.json())
+    app.use('/api/auth/email-otp', emailOtpRouter)
+    app.use('/api/auth', authRouter)
+    app.use(errorHandler)
+    const login = await request(app).post('/api/auth/login').send({ email: u.email, password: PW, ...body })
+    expect(login.status).toBe(200)
+    const pending = jwt.decode(login.body.data.emailOtpSession) as any
+    const code = await issueEmailOtp(u.id, u.email, { skipSend: true })
+    const done = await request(app).post('/api/auth/email-otp/verify')
+      .send({ emailOtpSession: login.body.data.emailOtpSession, code })
+    expect(done.status).toBe(200)
+    return { pending, token: done.body.data.token as string, pass: jwt.decode(done.body.data.token) as any }
+  }
+
+  const refresh = (token: string) =>
+    request(buildApp()).post('/api/auth/refresh').set('Authorization', `Bearer ${token}`).send({})
+
+  it('the admin console without "keep me signed in" gives a fixed pass, and renewing it never moves the end', async () => {
+    const admin = await person('super_admin')
+    const s = await signIn(admin, { portal: 'admin' })
+    expect(s.pending.sp).toBe('fixed')
+    expect(s.pass.sp).toBe('fixed')
+    expect(s.pass.exp - s.pass.iat).toBe(SEVEN_DAYS)
+    await new Promise(r => setTimeout(r, 1100))   // a renewal a second later would otherwise read as the same exp by luck
+    const r = await refresh(s.token)
+    expect(r.status).toBe(200)
+    const renewed = jwt.decode(r.body.data.token) as any
+    expect(renewed.sp).toBe('fixed')
+    expect(renewed.exp).toBe(s.pass.exp)
+  })
+
+  it('ticking "keep me signed in" at the admin console makes it renew like any other portal', async () => {
+    const admin = await person('admin')
+    const s = await signIn(admin, { portal: 'admin', keepSignedIn: true })
+    expect(s.pass.sp).toBe('rolling')
+    await new Promise(r => setTimeout(r, 1100))
+    const renewed = jwt.decode((await refresh(s.token)).body.data.token) as any
+    expect(renewed.sp).toBe('rolling')
+    expect(renewed.exp).toBeGreaterThan(s.pass.exp)
+    expect(renewed.exp - renewed.iat).toBe(SEVEN_DAYS)
+  })
+
+  it('Support (admin-ops) is fixed by default too', async () => {
+    const pm = await person('portfolio_manager')
+    const s = await signIn(pm, { portal: 'admin_ops' })
+    expect(s.pass.sp).toBe('fixed')
+  })
+
+  it('an admin pass minted before this change (no policy on it) is not extended by renewing', async () => {
+    const admin = await person('super_admin')
+    const exp = Math.floor(Date.now() / 1000) + 3600
+    const old = jwt.sign({ userId: admin.id, role: 'super_admin', email: admin.email, profileId: null, exp },
+      process.env.JWT_SECRET!)
+    const r = await refresh(old)
+    expect(r.status).toBe(200)
+    const renewed = jwt.decode(r.body.data.token) as any
+    expect(renewed.exp).toBe(exp)
+    expect(renewed.sp).toBe('fixed')
+  })
+
+  it('an admin signing in at the landlord portal is fixed too — another portal cannot roll a staff pass', async () => {
+    const admin = await person('super_admin')
+    const s = await signIn(admin)
+    expect(s.pass.sp).toBe('fixed')
+  })
+
+  it('a landlord at the landlord portal is unchanged: renewing, seven days from each renewal', async () => {
+    const l = await person('landlord')
+    const s = await signIn(l)
+    expect(s.pass.sp).toBe('rolling')
+    expect(s.pass.exp - s.pass.iat).toBe(SEVEN_DAYS)
+    await new Promise(r => setTimeout(r, 1100))
+    const renewed = jwt.decode((await refresh(s.token)).body.data.token) as any
+    expect(renewed.exp).toBeGreaterThan(s.pass.exp)
+  })
+
+  it('GAM Books signs a landlord in on a fixed pass, or a renewing one when kept', async () => {
+    const l = await person('landlord')
+    expect((await signIn(l, { portal: 'books' })).pass.sp).toBe('fixed')
+    expect((await signIn(l, { portal: 'books', keepSignedIn: true })).pass.sp).toBe('rolling')
+  })
+
+  it('GAM Books refuses a tenant or an admin before any code is emailed', async () => {
+    for (const role of ['tenant', 'super_admin']) {
+      const u = await person(role)
+      const res = await request(buildApp()).post('/api/auth/login').send({ email: u.email, password: PW, portal: 'books' })
+      expect(res.status).toBe(403)
+      expect(res.body.data?.emailOtpSession).toBeUndefined()
+      expect((await db.query(`SELECT 1 FROM login_email_otps WHERE user_id = $1`, [u.id])).rows).toHaveLength(0)
+    }
+  })
+
+  it('the bill-link sign-in (no code) carries the policy too', async () => {
+    const t = await person('tenant')
+    await db.query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [t.id])
+    const res = await request(buildApp()).post('/api/auth/login')
+      .send({ email: t.email, password: PW, emailFactor: signEmailFactorToken({ userId: t.id, email: t.email }) })
+    expect((jwt.decode(res.body.data.token) as any).sp).toBe('rolling')
   })
 })

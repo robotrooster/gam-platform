@@ -519,10 +519,14 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     // landlord see "this check was for Oak Park" even before a unit is assigned.
     const effectivePropertyId =
       (unitId ? (await queryOne<{ property_id: string }>(`SELECT property_id FROM units WHERE id=$1`, [unitId]))?.property_id : null)
-      || (tenant ? (await queryOne<{ property_id: string }>(
+      // Only an intent from the company this check is FOR. A person can now
+      // hold a live intent at more than one company; "latest of any company"
+      // would bind this check to somebody else's park.
+      || (tenant && effectiveLandlordId ? (await queryOne<{ property_id: string }>(
             `SELECT property_id FROM pending_tenant_intents
               WHERE tenant_id=$1 AND cancelled_at IS NULL AND property_id IS NOT NULL
-              ORDER BY created_at DESC LIMIT 1`, [tenant.id]))?.property_id : null)
+                AND landlord_id = $2
+              ORDER BY created_at DESC LIMIT 1`, [tenant.id, effectiveLandlordId]))?.property_id : null)
       // S636: a walk-up who scanned the property's QR code has neither a
       // unit nor an invite — the code carried the property in the query
       // string and the page passes it through here. Verified against the
@@ -532,13 +536,17 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
             `SELECT id FROM properties WHERE id = $1 AND landlord_id = $2`,
             [propertyIdFromScan, effectiveLandlordId]))?.id ?? null : null)
       // Older rows: an application filed before the code pointed straight at
-      // screening. Matched on the account's own email, never a stranger's.
-      || (await queryOne<{ property_id: string }>(
+      // screening. Matched on the account's own email, never a stranger's —
+      // and, like the intent lookup above, only an application to the company
+      // this check is FOR. "Latest application anywhere" tied company X's
+      // check to company Y's park and showed X where else the person applied.
+      || (effectiveLandlordId ? (await queryOne<{ property_id: string }>(
             `SELECT a.property_id FROM unit_applications a
               WHERE a.property_id IS NOT NULL
+                AND a.landlord_id = $3
                 AND (a.applicant_user_id = $1 OR LOWER(a.email) = LOWER($2))
               ORDER BY a.created_at DESC LIMIT 1`,
-            [req.user!.userId, req.user!.email]))?.property_id
+            [req.user!.userId, req.user!.email, effectiveLandlordId]))?.property_id : null)
       || null
 
     // S639: what tenancy is being applied for. Month-to-month and a term are
@@ -795,9 +803,24 @@ backgroundRouter.get('/status', requireAuth, async (req, res, next) => {
            FROM background_checks WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`,
           [req.user!.userId]
         )
+    // screenedStatus is the person's real screening result. A grandfather
+    // waiver is no longer written onto it — the waiver belongs to the company
+    // that granted it (pending_tenant_intents) — so `status`, which routes the
+    // tenant portal, still reads 'waived' for somebody holding a live waiver
+    // and with no real result of their own. Anything deciding "screened"
+    // across companies (the marketplace) must read screenedStatus.
+    const screenedStatus = tenant?.background_check_status || (check?.status || 'not_started')
+    let status = screenedStatus
+    if (tenant && !['approved', 'submitted', 'denied'].includes(screenedStatus)) {
+      const waiver = await queryOne<{ one: number }>(
+        `SELECT 1 AS one FROM pending_tenant_intents
+          WHERE tenant_id = $1 AND screening_waived = true AND cancelled_at IS NULL
+          LIMIT 1`, [tenant.id])
+      if (waiver) status = 'waived'
+    }
     res.json({
       success: true,
-      data: { status: tenant?.background_check_status || (check?.status || 'not_started'), check },
+      data: { status, screenedStatus, check },
     })
   } catch (e) { next(e) }
 })
