@@ -513,12 +513,16 @@ export async function cancelReaderAction(stripeReaderId: string): Promise<void> 
 export interface ReaderCartLine { description: string; amountCents: number; quantity: number }
 
 /**
- * S654 (Nic, live): "nothing showed up on the terminal except $0.58 — tap or
- * insert." The cart went to the reader, but asking for the card replaced it
- * within a second. The reader holds the breakdown this long before the pay
- * screen takes over.
+ * S654 (Nic): "it needs to be on the screen the whole time — while they are
+ * tapping to pay." In the US the S700/S710 cart screen IS a pay screen: Stripe
+ * calls it pre-dip — "your customer can present a payment method at any point
+ * after set_reader_display is called… the reader captures the presented
+ * payment method and saves it to use later… process the PaymentIntent to
+ * complete the transaction." So the breakdown is held up for this long; a
+ * card tapped on it completes the moment we process, and the plain
+ * "tap or insert" screen only appears if nobody has tapped by then.
  */
-export const READER_CART_PAUSE_MS = process.env.NODE_ENV === 'test' ? 0 : 5000
+export const READER_CART_PAUSE_MS = process.env.NODE_ENV === 'test' ? 0 : 15000
 export const holdForTheCart = () => new Promise<void>(r => setTimeout(r, READER_CART_PAUSE_MS))
 
 /**
