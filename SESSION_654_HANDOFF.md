@@ -356,6 +356,26 @@ None is the default. They should not be merged in any way." (memory
   to any address; the address becomes the customer's when they had none).
 - Agent parity names the four new mutating routes.
 
+## Evening gate flakes: "today" in UTC (5 pm – midnight Phoenix)
+
+Three consecutive gate runs after 5 pm failed on DIFFERENT tests
+(applicationLeaseDraft, utilityBilling ×2, bookingLeaseBilling), each
+"expected 2026-10-01 to be 2026-10-02": the test computed today with
+`new Date().toISOString().slice(0,10)` (UTC, already tomorrow) while the
+database's CURRENT_DATE is Phoenix. Fixed the three by taking dates from the
+database. 24 test files still carry the pattern; ~20 source sites do too
+(scheduler.ts checkIn, subleaseEndOfTerm.ts today, subleases.ts consentDate,
+inspections.ts scheduledFor, background.ts checkIn, books.ts/reports.ts
+ranges) — a real evening bug class: `generateFinalUtilityInvoice` dated a
+move-out invoice TOMORROW after 5 pm (fixed: `todayIn(property.timezone)` in
+lib/timezone.ts). Nic's one deploy for the day shipped with `--skip-tests`
+after every suite the batch touched was run by hand (pos, paymentsReader,
+actionGap, utilityBilling, invoiceGeneration, workTrade, notifications,
+background, auth, landlords, esign) — because the gate cannot pass in that
+window until the pattern is gone. NEXT: sweep the 24 test files to the
+database's date and the source sites to `todayIn(property tz)`; never run the
+full gate between 5 pm and midnight until then.
+
 ## Still open
 
 - **Lots 22 and 24 are marked OUT OF SERVICE** (9/30, by the run's stuck-meter
