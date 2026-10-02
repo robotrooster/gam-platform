@@ -9,7 +9,11 @@ export const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
-// S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
+// S312: snake_case → camelCase response transform. Registered
+// BEFORE the auth interceptor so the camelize step runs on the
+// success path; the 401 redirect path doesn't touch r.data. See
+// packages/shared/src/camelize.ts for the passthrough rules
+// protecting JSONB blob columns.
 applyCamelizeInterceptor(api)
 
 // Attach JWT on every request
@@ -19,16 +23,47 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// Auto-logout on 401
+// Auto-logout on 401 — but NEVER for /auth/ calls.
+//
+// S605 (Nic, live bug): a wrong password on the SIGN-IN page returns 401, and
+// this interceptor was hard-navigating to /login for it. That reload destroyed
+// the React state holding the error, so a landlord who mistyped saw the screen
+// blank and the empty form come back with NO message — indistinguishable from
+// the app being broken, and impossible to tell apart from "2FA never sent me a
+// code" (the password check runs BEFORE any code is issued).
+//
+// Auth routes own their own error display: login, the 2FA verify/resend step,
+// register, forgot-password and reset-password all render the server's message
+// inline. Only a 401 on a NORMAL authed request means a dead session worth
+// bouncing. The tenant portal already had this carve-out (S537).
+//
+// S652: a 402 ACCOUNT_LOCKED is NOT a dead session and must never bounce anyone
+// to /login. The landlord is signed in perfectly well; GAM has suspended the
+// account because it cannot collect what it is owed. Throwing them at the login
+// page would leave them typing a correct password into a form that keeps
+// working, with no idea why nothing loads. The flag is broadcast instead, and
+// the app draws the lock screen over the top.
+export const ACCOUNT_LOCKED_EVENT = 'gam:account-locked'
+
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    // S650: a 401 on an /auth/ call is a sign-in answer (wrong password, wrong
-    // code, unverified email) that the form shows inline. Hard-navigating here
-    // RELOADS the page and destroys that message — the screen just blinks.
-    if (err.response?.status === 401 && !String(err.config?.url || '').includes('/auth/')) {
+    // S652: say WHY. Axios' own message is "Request failed with status code
+    // 400", and 61 screens fall back to e.message — so Blu, saving a package,
+    // saw a status code instead of the server's plain sentence. Every caller
+    // that reads e.message now gets the reason; callers reading
+    // response.data.error are unchanged.
+    const serverSays = err.response?.data?.error ?? err.response?.data?.message
+    if (typeof serverSays === 'string' && serverSays.trim()) err.message = serverSays
+    const url = String(err.config?.url || '')
+    if (err.response?.status === 401 && !url.includes('/auth/')) {
       localStorage.removeItem('gam_token')
       window.location.href = '/login'
+    }
+    if (err.response?.status === 402 && err.response?.data?.code === 'ACCOUNT_LOCKED') {
+      window.dispatchEvent(new CustomEvent(ACCOUNT_LOCKED_EVENT, {
+        detail: { reason: err.response?.data?.lockedReason ?? null },
+      }))
     }
     return Promise.reject(err)
   }

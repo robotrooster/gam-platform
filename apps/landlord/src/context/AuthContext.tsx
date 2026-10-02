@@ -3,6 +3,19 @@ import React, { createContext, useContext, useState, useEffect, useCallback } fr
 import { apiPost, apiGet } from '../lib/api'
 import { useQueryClient } from 'react-query'
 
+// S654 (Nic): "make sure that point of sale standalone is byte identical to point
+// of sale on the landlord page." This file is the same in apps/landlord and
+// apps/pos (pos-parity.test.ts). The terminal lock-screen parts below are used
+// by the standalone register; the landlord portal simply never calls them.
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000'
+
+// S574: read the posLimited claim straight off the JWT so it survives a reload
+// (a cashier session is register-only; the UI gates on this).
+function readPosLimited(tok: string | null): boolean {
+  if (!tok) return false
+  try { return !!JSON.parse(atob(tok.split('.')[1])).posLimited } catch { return false }
+}
+
 interface AuthUser {
   id: string; email: string; role: string
   firstName: string; lastName: string; profileId: string
@@ -33,8 +46,9 @@ interface AuthUser {
 }
 
 // login() returns a discriminated result so LoginPage can branch into the
-// second factor. Landlords always hit email_otp_required; totp_required only
-// fires for legacy authenticator accounts (no new landlord can enroll one).
+// second factor. Landlords and business owners always hit email_otp_required;
+// totp_required only fires for legacy authenticator accounts (no new account
+// can enroll one).
 type LoginResult =
   | { kind: 'success' }
   | { kind: 'totp_required'; totpSession: string }
@@ -50,6 +64,20 @@ interface AuthCtx {
   resendEmailOtp: (emailOtpSession: string) => Promise<void>
   logout: () => void
   refresh: () => Promise<void>
+  // S574 — terminal lock screen (standalone register).
+  // terminalToken present = this device is bound to a business register.
+  terminalToken: string | null
+  // posLimited = the current session is a passcode cashier session (register-only).
+  posLimited: boolean
+  // Owner/manager (full session) binds this device to their business register.
+  activateTerminal: () => Promise<void>
+  // Drop the full session but KEEP the terminal binding → show the lock screen.
+  // If not yet activated, activates first. This is "hand the register to cashiers".
+  lockRegister: () => Promise<void>
+  // Trade a passcode for a cashier session (uses the terminal token).
+  unlockWithPasscode: (passcode: string) => Promise<void>
+  // Forget the terminal binding entirely (owner un-binds this device).
+  deactivateTerminal: () => void
 }
 
 const Ctx = createContext<AuthCtx>(null!)
@@ -58,7 +86,9 @@ export const useAuth = () => useContext(Ctx)
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user,    setUser]    = useState<AuthUser | null>(null)
   const [token,   setToken]   = useState<string | null>(() => localStorage.getItem('gam_token'))
+  const [terminalToken, setTerminalToken] = useState<string | null>(() => localStorage.getItem('gam_pos_terminal'))
   const [loading, setLoading] = useState(true)
+  const posLimited = readPosLimited(token)
 
   // S639 SECURITY: a change of identity empties the client cache. Nick Platt
   // accepted his invite on a browser where another household member was signed
@@ -68,10 +98,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const _qc = useQueryClient()
   const wipeCache = () => { try { _qc.clear() } catch { /* no cache yet */ } }
 
+  // Full sign-out: leave this device entirely. Clears the session AND any
+  // register terminal binding → back to the login screen. (Handing the register
+  // to cashiers uses lockRegister instead, which keeps the terminal bound.)
   const logout = useCallback(() => {
     wipeCache()
     localStorage.removeItem('gam_token')
-    setToken(null); setUser(null)
+    localStorage.removeItem('gam_pos_terminal')
+    setToken(null); setUser(null); setTerminalToken(null)
   }, [])
 
   // S654 (Nic): "your most recent deploy signed me out of the landlord portal."
@@ -155,5 +189,55 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await apiPost('/auth/email-otp/resend', { emailOtpSession })
   }
 
-  return <Ctx.Provider value={{ user, token, loading, login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, logout, refresh }}>{children}</Ctx.Provider>
+  // ── S574: terminal lock screen (standalone register) ───────────
+  // Bind this device to the current (full) session's business register.
+  const activateTerminal = async (): Promise<void> => {
+    const res = await apiPost<any>('/pos-lock/activate', {})
+    const tok = res.data!.terminalToken as string
+    localStorage.setItem('gam_pos_terminal', tok)
+    setTerminalToken(tok)
+  }
+
+  // Hand the register to cashiers: bind the terminal if needed, then drop the
+  // full session (keeping the terminal) so the lock screen takes over. A stolen
+  // device now holds only the low-privilege terminal token, not a full session.
+  // S639: the owner's cached data goes with their session.
+  const lockRegister = async (): Promise<void> => {
+    if (!localStorage.getItem('gam_pos_terminal')) await activateTerminal()
+    wipeCache()
+    localStorage.removeItem('gam_token')
+    setToken(null); setUser(null)
+  }
+
+  // Trade a passcode for a cashier session. Uses the terminal token directly
+  // (a raw fetch — NOT the shared api instance — so a wrong-passcode 401 doesn't
+  // trip the global auto-logout-to-/login interceptor).
+  const unlockWithPasscode = async (passcode: string): Promise<void> => {
+    const tok = localStorage.getItem('gam_pos_terminal')
+    if (!tok) throw new Error('This register is not activated.')
+    const r = await fetch(`${API_URL}/api/pos-lock/unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+      body: JSON.stringify({ passcode }),
+    })
+    const body = await r.json().catch(() => ({}))
+    if (!r.ok || !body?.success) {
+      const err: any = new Error(body?.error || 'Incorrect passcode.')
+      err.response = { data: { error: body?.error } }
+      throw err
+    }
+    wipeCache(); localStorage.setItem('gam_token', body.data.token)
+    setToken(body.data.token)
+    await refresh()
+  }
+
+  const deactivateTerminal = (): void => {
+    localStorage.removeItem('gam_pos_terminal')
+    setTerminalToken(null)
+  }
+
+  return <Ctx.Provider value={{
+    user, token, loading, login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, logout, refresh,
+    terminalToken, posLimited, activateTerminal, lockRegister, unlockWithPasscode, deactivateTerminal,
+  }}>{children}</Ctx.Provider>
 }

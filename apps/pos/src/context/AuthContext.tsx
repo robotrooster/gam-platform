@@ -1,7 +1,12 @@
 import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue } from '@gam/shared'
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { apiPost, apiGet } from '../lib/api'
+import { useQueryClient } from 'react-query'
 
+// S654 (Nic): "make sure that point of sale standalone is byte identical to point
+// of sale on the landlord page." This file is the same in apps/landlord and
+// apps/pos (pos-parity.test.ts). The terminal lock-screen parts below are used
+// by the standalone register; the landlord portal simply never calls them.
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 
 // S574: read the posLimited claim straight off the JWT so it survives a reload
@@ -16,18 +21,34 @@ interface AuthUser {
   firstName: string; lastName: string; profileId: string
   onboardingComplete?: boolean
   bankAccountReady?: boolean
-  // S570: the shared POSPage reads these for cashier property-lock scoping +
-  // per-tab staff permissions. Undefined here (in the standalone POS this
-  // screen only renders for landlord-role users, who are owners → see all);
-  // populated in the landlord app where scoped workers exist.
+  // S82: worker-role users carry their scope's landlordId + the
+  // sub-permission map. Owner roles (admin/super_admin/landlord) get
+  // null for both — they're handled by role-based gates, not perms.
+  landlordId?: string | null
+  permissions?: Record<string, boolean | string> | null
+  // Property scope for scoped workers (cashier/onsite/PM/maintenance). The POS
+  // register locks its property dropdown to these. allProperties=true → every
+  // property; else only propertyIds. Owners get allProperties implicitly.
   propertyIds?: string[] | null
   allProperties?: boolean
-  permissions?: Record<string, boolean | string> | null
+  // S168: per-manager Connect opt-in — gates the /banking nav for managers.
+  directDepositEnabled?: boolean
+  // S575: true when the landlord owns ≥1 mobile-home unit — gates the
+  // "Lot Rent & Net" nav item (MH-only feature).
+  hasMobileHomeUnits?: boolean
+  // 2FA state. S574: email-code 2FA is MANDATORY for every landlord from
+  // signup (auth.ts enforces + canonicalizes email_2fa_enabled on login).
+  // The landlord portal exposes NO authenticator enrollment; totpEnabled is
+  // read-only backward-compat for any legacy TOTP account.
+  email2faEnabled?: boolean
+  totpEnabled?: boolean
+  mustEnrollTotp?: boolean
 }
 
-// S574: login() returns a discriminated result so LoginPage can branch into the
-// second factor. business_owner always hits email_otp_required (mandatory email
-// 2FA); totp_required only fires for a legacy authenticator account.
+// login() returns a discriminated result so LoginPage can branch into the
+// second factor. Landlords and business owners always hit email_otp_required;
+// totp_required only fires for legacy authenticator accounts (no new account
+// can enroll one).
 type LoginResult =
   | { kind: 'success' }
   | { kind: 'totp_required'; totpSession: string }
@@ -43,7 +64,7 @@ interface AuthCtx {
   resendEmailOtp: (emailOtpSession: string) => Promise<void>
   logout: () => void
   refresh: () => Promise<void>
-  // S574 — terminal lock screen.
+  // S574 — terminal lock screen (standalone register).
   // terminalToken present = this device is bound to a business register.
   terminalToken: string | null
   // posLimited = the current session is a passcode cashier session (register-only).
@@ -67,19 +88,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token,   setToken]   = useState<string | null>(() => localStorage.getItem('gam_token'))
   const [terminalToken, setTerminalToken] = useState<string | null>(() => localStorage.getItem('gam_pos_terminal'))
   const [loading, setLoading] = useState(true)
-
   const posLimited = readPosLimited(token)
 
-  // Full sign-out: leave this device entirely. Clears the session AND the
-  // terminal binding → back to the login screen. (Handing the register to
-  // cashiers uses lockRegister instead, which keeps the terminal bound.)
+  // S639 SECURITY: a change of identity empties the client cache. Nick Platt
+  // accepted his invite on a browser where another household member was signed
+  // in and landed in THEIR profile — the token swapped correctly and react-query
+  // kept serving the previous person's cached responses under the same keys.
+  // Every portal had the same gap.
+  const _qc = useQueryClient()
+  const wipeCache = () => { try { _qc.clear() } catch { /* no cache yet */ } }
+
+  // Full sign-out: leave this device entirely. Clears the session AND any
+  // register terminal binding → back to the login screen. (Handing the register
+  // to cashiers uses lockRegister instead, which keeps the terminal bound.)
   const logout = useCallback(() => {
+    wipeCache()
     localStorage.removeItem('gam_token')
     localStorage.removeItem('gam_pos_terminal')
     setToken(null); setUser(null); setTerminalToken(null)
   }, [])
 
-  // S654 (Nic): "your most recent deploy signed me out of the landlord portal" — the register's session is the same kind of pass."
+  // S654 (Nic): "your most recent deploy signed me out of the landlord portal."
   // A session was a fixed 7-day pass from the last password sign-in and nothing
   // renewed it. Renew a pass older than a day on load and whenever the portal
   // comes back into view, so a session ends only after seven idle days.
@@ -113,49 +142,54 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [renewSession])
 
-  // Post-credentials login. Returns a discriminated result so LoginPage can
-  // pivot into the second factor. Doesn't set token/user until the full JWT
-  // lands — a pending 2FA session JWT is not a valid auth token.
+  // Post-credentials login. Returns a discriminated result so LoginPage
+  // can pivot into the TOTP second step when 2FA is enabled on the
+  // account. Doesn't set token/user until the full JWT lands — a
+  // totp_session JWT is not a valid auth token.
   const login = async (email: string, password: string): Promise<LoginResult> => {
     const res = await apiPost<any>('/auth/login', { email, password })
     const data = res.data!
     if (data.requiresTotp) {
       return { kind: 'totp_required', totpSession: data.totpSession as string }
     }
-    // S574: mandatory email-code 2FA — backend emailed a code + returned a
-    // pending session instead of the full token.
+    // S574: mandatory email-code 2FA — the backend emailed a code and returned
+    // a pending session instead of the full token.
     if (data.requiresEmailOtp) {
       return { kind: 'email_otp_required', emailOtpSession: data.emailOtpSession as string }
     }
-    localStorage.setItem('gam_token', data.token)
+    wipeCache(); localStorage.setItem('gam_token', data.token)
     setToken(data.token)
-    setUser(data.user)
+    setUser(data.user ?? data)
     return { kind: 'success' }
   }
 
-  // Legacy authenticator second-step exchange (no new POS account can enroll one).
+  // TOTP second-step exchange. Trades the short-lived totp_session JWT
+  // (from /login) plus a 6-digit token or recovery code for the full
+  // session JWT, then loads /auth/me for accurate user state.
   const loginWithTotp = async (totpSession: string, code: string): Promise<void> => {
     const res = await apiPost<{ token: string }>('/auth/totp/verify', { totpSession, code })
-    localStorage.setItem('gam_token', res.data!.token)
+    wipeCache(); localStorage.setItem('gam_token', res.data!.token)
+    // Setting token triggers the refresh() effect, but set it eagerly
+    // here too so /auth/me carries the new bearer immediately.
     setToken(res.data!.token)
     await refresh()
   }
 
-  // S574: email-code second-step exchange. Trades the pending session + emailed
-  // 6-digit code for the full session JWT.
+  // S574: email-code second-step exchange. Trades the pending email_otp_session
+  // JWT (from /login) plus the 6-digit emailed code for the full session JWT.
   const loginWithEmailOtp = async (emailOtpSession: string, code: string): Promise<void> => {
     const res = await apiPost<{ token: string }>('/auth/email-otp/verify', { emailOtpSession, code })
-    localStorage.setItem('gam_token', res.data!.token)
+    wipeCache(); localStorage.setItem('gam_token', res.data!.token)
     setToken(res.data!.token)
     await refresh()
   }
 
-  // Resend a fresh email code (supersedes the prior one) for the same session.
+  // Resend a fresh email code (supersedes the prior one) for the same pending session.
   const resendEmailOtp = async (emailOtpSession: string): Promise<void> => {
     await apiPost('/auth/email-otp/resend', { emailOtpSession })
   }
 
-  // ── S574: terminal lock screen ────────────────────────────────
+  // ── S574: terminal lock screen (standalone register) ───────────
   // Bind this device to the current (full) session's business register.
   const activateTerminal = async (): Promise<void> => {
     const res = await apiPost<any>('/pos-lock/activate', {})
@@ -167,8 +201,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // Hand the register to cashiers: bind the terminal if needed, then drop the
   // full session (keeping the terminal) so the lock screen takes over. A stolen
   // device now holds only the low-privilege terminal token, not a full session.
+  // S639: the owner's cached data goes with their session.
   const lockRegister = async (): Promise<void> => {
     if (!localStorage.getItem('gam_pos_terminal')) await activateTerminal()
+    wipeCache()
     localStorage.removeItem('gam_token')
     setToken(null); setUser(null)
   }
@@ -190,7 +226,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       err.response = { data: { error: body?.error } }
       throw err
     }
-    localStorage.setItem('gam_token', body.data.token)
+    wipeCache(); localStorage.setItem('gam_token', body.data.token)
     setToken(body.data.token)
     await refresh()
   }
