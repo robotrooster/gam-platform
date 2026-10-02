@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue } from '@gam/shared'
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { apiPost, apiGet } from '../lib/api'
 import { useQueryClient } from 'react-query'
@@ -78,6 +78,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setPmCompanies([]); setActivePmCompanyState(null)
   }, [])
 
+  // S654: same renewal as the landlord portal. A session was a fixed 7-day pass
+  // from the last sign-in; renew one older than a day on load and whenever the
+  // portal comes back into view, so it ends only after seven idle days.
+  const renewSession = useCallback(async () => {
+    const current = localStorage.getItem('gam_token')
+    if (!sessionRenewalDue(current)) return
+    try {
+      const r = await apiPost<{ token: string }>('/auth/refresh')
+      localStorage.setItem('gam_token', r.data.token)
+      setToken(r.data.token)
+    } catch (e) { if (isAuthRejection(e)) logout() }
+  }, [logout])
+
   const setActivePmCompany = useCallback((c: ActivePmCompany) => {
     localStorage.setItem('gam_active_pm_company', c.id)
     setActivePmCompanyState(c)
@@ -87,6 +100,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const me = await fetchAuthMeWithRetry(() => apiGet<AuthUser>('/auth/me'))
       setUser(me)
+      await renewSession()
       // Load the user's pm_staff memberships
       try {
         const companies = await apiGet<ActivePmCompany[]>('/pm/companies')
@@ -109,9 +123,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (isAuthRejection(e)) logout()
     }
     finally { setLoading(false) }
-  }, [logout])
+  }, [logout, renewSession])
 
   useEffect(() => { token ? refresh() : setLoading(false) }, [token, refresh])
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') renewSession() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [renewSession])
 
   // Post-credentials login. Returns a discriminated result so LoginPage
   // can pivot into the TOTP second step when 2FA is enabled on the

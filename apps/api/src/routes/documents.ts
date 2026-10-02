@@ -266,27 +266,33 @@ documentsRouter.post('/', requirePerm('documents.upload', 'documents.post_photo'
       meta.unitId = meta.unitId ?? home.unit_id
       photoLandlordId = home.landlord_id
     }
-    // S633: a document tagged to a unit belongs to the company that owns THAT
-    // unit — derived, and authorized by the same lookup that used to be a
-    // separate ownership check below. Untagged, the account names the company.
-    // Previously this read the session's entity and then required the unit to
-    // match it, so a document about the other company's unit was refused.
-    const landlordId = photoLandlordId
-      ?? (meta.unitId
-        ? await landlordIdForUnit(req.user!, meta.unitId, query)
-        : await landlordForRequest(req, 'document'))
     // Body-supplied property ids are ownership-checked before use: a pin must
     // never reach a property this account does not hold.
     const pinIds = [...new Set([
       ...(meta.propertyId ? [meta.propertyId] : []),
       ...parsePropertyIds(meta.propertyIds),
     ])]
+    let pinCompany: string | null = null
     if (pinIds.length) {
-      const owned = await query<{ id: string }>(
-        `SELECT id FROM properties WHERE id = ANY($1::uuid[]) AND landlord_id = ANY($2::uuid[])`,
+      const owned = await query<{ id: string; landlord_id: string }>(
+        `SELECT id, landlord_id FROM properties WHERE id = ANY($1::uuid[]) AND landlord_id = ANY($2::uuid[])`,
         [pinIds, landlordScopeIds(req.user!)])
       if (owned.length !== pinIds.length) throw new AppError(403, 'One of those properties is not yours')
+      // S654: pins that all sit under ONE company say which company it is, so
+      // nobody is asked. Pins across companies (or none) leave it to the request.
+      const companies = new Set(owned.map(r => r.landlord_id))
+      if (companies.size === 1) pinCompany = owned[0].landlord_id
     }
+    // S633: a document tagged to a unit belongs to the company that owns THAT
+    // unit — derived, and authorized by the same lookup that used to be a
+    // separate ownership check below. Untagged, the pins decide (S654), else the
+    // account names the company. Previously this read the session's entity and
+    // then required the unit to match it, so a document about the other
+    // company's unit was refused.
+    const landlordId = photoLandlordId
+      ?? (meta.unitId
+        ? await landlordIdForUnit(req.user!, meta.unitId, query)
+        : pinCompany ?? await landlordForRequest(req, 'document'))
 
     const isReference = meta.isReference === true || String(meta.isReference) === 'true'
       || REFERENCE_DOCUMENT_CATEGORIES.includes(meta.type as any)

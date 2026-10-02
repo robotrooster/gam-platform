@@ -8,7 +8,7 @@ import { z } from 'zod'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { resolveLandlordTarget, landlordScopeIds } from '../lib/landlordScope'
+import { resolveLandlordTarget, landlordScopeIds, landlordForRequest, ownsLandlord } from '../lib/landlordScope'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { queryOne } from '../db'
 import { EXPENSE_CATEGORIES } from '@gam/shared'
@@ -36,16 +36,18 @@ const receiptUpload = multer({
   },
 })
 
-function scope(req: any): string {
-  // S633: an account is not an entity. `?entityId=` names one; otherwise the
-  // account's only company is used, and an account that owns several is asked
-  // which rather than being silently put on whichever one the session sat on.
-  // resolveLandlordTarget does the ownership check either way.
-  //
-  // WRITES ONLY. See readScope() for the read side — S633's two rules are
-  // "reads span, writes name", and using this resolver for a GET breaks the
-  // first one.
-  return resolveLandlordTarget(req.user, req.query?.entityId ?? req.body?.landlordId, 'record')
+/**
+ * S654: a write on an EXISTING expense acts for the company that row is filed
+ * under — the row says, so nothing is asked. A row another account holds reads
+ * as missing (404), never as "choose a company".
+ */
+async function companyOfExpense(req: any): Promise<string> {
+  const id = String(req.params.id || '')
+  const row = /^[0-9a-f-]{36}$/i.test(id)
+    ? await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM landlord_expenses WHERE id = $1`, [id])
+    : null
+  if (!row || !ownsLandlord(req.user, row.landlord_id)) throw new AppError(404, 'Expense not found')
+  return row.landlord_id
 }
 
 /**
@@ -90,8 +92,11 @@ expensesRouter.post('/', requireLandlord, async (req: any, res, next) => {
       // what came in for water vs what was billed back out for water.
       utilityType:     z.enum(['water','gas','electric','sewer','trash','propane']).nullable().optional(),
     }).parse(req.body)
+    // S654: the company comes from what the request names — a company, else
+    // the property, else the unit — all ownership-checked. Naming nothing on a
+    // several-company account is asked (400), never defaulted.
     const row = await createLandlordExpense({
-      landlordId: scope(req), createdBy: req.user.userId,
+      landlordId: await landlordForRequest(req, 'expense'), createdBy: req.user.userId,
       propertyId: body.propertyId ?? null, unitId: body.unitId ?? null,
       category: body.category, amount: body.amount, description: body.description ?? null,
       vendor: body.vendor ?? null, expenseDate: body.expenseDate,
@@ -107,7 +112,7 @@ expensesRouter.post('/', requireLandlord, async (req: any, res, next) => {
 expensesRouter.post('/:id/receipt', requireLandlord, receiptUpload.single('receipt'), async (req: any, res, next) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
-    const row = await attachExpenseReceipt(req.params.id, scope(req), {
+    const row = await attachExpenseReceipt(req.params.id, await companyOfExpense(req), {
       url: '/api/expenses/receipt-files/' + req.file.filename,
       name: (req.file.originalname || 'receipt').slice(0, 200),
       mime: req.file.mimetype,
@@ -140,7 +145,7 @@ expensesRouter.get('/receipt-files/:filename', async (req, res, next) => {
 // POST /api/expenses/:id/void
 expensesRouter.post('/:id/void', requireLandlord, async (req: any, res, next) => {
   try {
-    await voidLandlordExpense(req.params.id, scope(req))
+    await voidLandlordExpense(req.params.id, await companyOfExpense(req))
     res.json({ success: true, data: { id: req.params.id, status: 'voided' } })
   } catch (e) { next(e) }
 })

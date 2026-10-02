@@ -1,7 +1,8 @@
-import { useState, useRef, useMemo, useEffect } from 'react'
+import { useState, useRef, useMemo, useEffect, useCallback } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 // S633: an import lands in ONE company. The account names it.
-import { EntityPicker } from '../components/EntityPicker'
+import { EntityPicker, useCompanyMissing } from '../components/EntityPicker'
+import { toast } from '../components/dialogs'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, ArrowUp, X, Inbox } from 'lucide-react'
@@ -88,9 +89,17 @@ const PLATFORM_OPTIONS = [
 
 type Mode = 'choose' | 'bulk' | 'single' | 'new_lease'
 
+// S654: the API's reason lives in `error` (errorHandler). Reading only
+// `message` hid every 400 behind a generic line.
+const serverReason = (e: any, fallback: string): string =>
+  e?.response?.data?.error || e?.response?.data?.message || fallback
+
+const CHOOSE_COMPANY_FIRST = 'Choose the company this file belongs to first.'
+
 // S579: shows every property whose onboarding window is still OPEN — how many
 // days sitting tenants can still be grandfathered past screening — and lets the
-// landlord close a property's window early. After close, every new tenant there
+// landlord close a property's window early. S654: also any property, window
+// open or not, whose late-fee question is still unanswered. After close, every new tenant there
 // must pass a background check (no reopen). Uses an inline two-step confirm (no
 // native dialogs — Safari/webviews drop them).
 function OnboardingWindowsBanner() {
@@ -103,15 +112,50 @@ function OnboardingWindowsBanner() {
   )
   // S648 (Nic): waiving late fees while residents migrate is the landlord's
   // call, per property. Unanswered = residents are billed late fees.
+  const all = (windows as any[]).filter(Boolean)
   const waiverMut = useMutation(
     ({ propertyId, waive }: { propertyId: string; waive: boolean }) =>
       apiPatch(`/properties/${propertyId}/onboarding-late-fee-waiver`, { waive }),
-    { onSuccess: () => qc.invalidateQueries('onboarding-windows') },
+    {
+      onSuccess: (_d, { propertyId, waive }) => {
+        qc.invalidateQueries('onboarding-windows')
+        // A closed-window row leaves the list once answered; say what was saved.
+        const w = all.find(x => x.propertyId === propertyId)
+        if (w && !w.open) {
+          toast(`${w.propertyName}: ${waive ? 'late fees waived' : 'late fees apply'} on each resident's first bill.`)
+        }
+      },
+      onError: (e: any) => toast(serverReason(e, 'Could not save that answer. Try again.')),
+    },
   )
-  const openWins = (windows as any[]).filter(w => w?.open)
-  if (openWins.length === 0) return null
+  const openWins = all.filter(w => w.open)
+  // S654: Country Acres' window closed before this question shipped, so it could
+  // never be answered and its residents' first bills would carry late fees by
+  // default. An unanswered property keeps the question after its window closes;
+  // "Mark onboarding complete" stays limited to open windows.
+  const unansweredClosed = all.filter(w => !w.open && w.lateFeeWaiver == null)
+  if (openWins.length === 0 && unansweredClosed.length === 0) return null
+
+  const waiverQuestion = (w: any) => (
+    <div style={{ flexBasis: '100%', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: '.78rem' }}>
+      <span style={{ color: w.lateFeeWaiver == null ? 'var(--gold)' : 'var(--text-2)' }}>
+        Waive late fees on each resident&apos;s first bill while they move over?
+      </span>
+      <button className={`btn btn-sm ${w.lateFeeWaiver === true ? 'btn-primary' : 'btn-ghost'}`}
+        disabled={waiverMut.isLoading}
+        onClick={() => waiverMut.mutate({ propertyId: w.propertyId, waive: true })}>Yes, waive</button>
+      <button className={`btn btn-sm ${w.lateFeeWaiver === false ? 'btn-primary' : 'btn-ghost'}`}
+        disabled={waiverMut.isLoading}
+        onClick={() => waiverMut.mutate({ propertyId: w.propertyId, waive: false })}>No, charge them</button>
+      {w.lateFeeWaiver == null && (
+        <span style={{ color: 'var(--text-3)' }}>Not answered yet, so late fees apply.</span>
+      )}
+    </div>
+  )
+
   return (
     <div style={{ background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.3)', borderRadius: 10, padding: '14px 16px', marginBottom: 20 }}>
+      {openWins.length > 0 && <>
       <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--gold)', marginBottom: 8 }}>Onboarding window open</div>
       <div style={{ fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5, marginBottom: 10 }}>
         While a property&apos;s window is open you can grandfather existing residents past the background check. New applicants are always screened.
@@ -122,20 +166,7 @@ function OnboardingWindowsBanner() {
             <strong style={{ color: 'var(--text-0)' }}>{w.propertyName}</strong>
             {typeof w.daysRemaining === 'number' && <> — <span style={{ color: 'var(--gold)', fontWeight: 700 }}>{w.daysRemaining} day{w.daysRemaining === 1 ? '' : 's'}</span> left</>}
           </div>
-          <div style={{ flexBasis: '100%', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: '.78rem' }}>
-            <span style={{ color: w.lateFeeWaiver == null ? 'var(--gold)' : 'var(--text-2)' }}>
-              Waive late fees on each resident&apos;s first bill while they move over?
-            </span>
-            <button className={`btn btn-sm ${w.lateFeeWaiver === true ? 'btn-primary' : 'btn-ghost'}`}
-              disabled={waiverMut.isLoading}
-              onClick={() => waiverMut.mutate({ propertyId: w.propertyId, waive: true })}>Yes, waive</button>
-            <button className={`btn btn-sm ${w.lateFeeWaiver === false ? 'btn-primary' : 'btn-ghost'}`}
-              disabled={waiverMut.isLoading}
-              onClick={() => waiverMut.mutate({ propertyId: w.propertyId, waive: false })}>No, charge them</button>
-            {w.lateFeeWaiver == null && (
-              <span style={{ color: 'var(--text-3)' }}>Not answered yet, so late fees apply.</span>
-            )}
-          </div>
+          {waiverQuestion(w)}
           {confirmingId === w.propertyId ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ fontSize: '.74rem', color: 'var(--text-2)' }}>Close now? New tenants will be screened.</span>
@@ -147,6 +178,23 @@ function OnboardingWindowsBanner() {
           )}
         </div>
       ))}
+      </>}
+      {unansweredClosed.length > 0 && <>
+        <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--gold)', marginBottom: 8, marginTop: openWins.length > 0 ? 14 : 0 }}>
+          Late fees on residents&apos; first bill
+        </div>
+        <div style={{ fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5, marginBottom: 10 }}>
+          The onboarding window has closed at {unansweredClosed.length === 1 ? 'this property' : 'these properties'}, but this question was never answered.
+        </div>
+        {unansweredClosed.map(w => (
+          <div key={w.propertyId} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 0', borderTop: '1px solid var(--border-0)', flexWrap: 'wrap' }}>
+            <div style={{ fontSize: '.82rem', color: 'var(--text-1)' }}>
+              <strong style={{ color: 'var(--text-0)' }}>{w.propertyName}</strong>
+            </div>
+            {waiverQuestion(w)}
+          </div>
+        ))}
+      </>}
     </div>
   )
 }
@@ -502,7 +550,7 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
           okNames.push(`${p.firstName} ${p.lastName}`.trim() || p.email)
         } catch (e: any) {
           failed.push(p)
-          lastErr = e?.response?.data?.message || e?.message || 'Could not send the invite.'
+          lastErr = serverReason(e, e?.message || 'Could not send the invite.')
         }
       }
       if (failed.length) {
@@ -824,6 +872,11 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
   // until the intent resolves (migration protection).
   const [unitId, setUnitId] = useState('')
   const { data: allUnits = [] } = useQuery<any[]>('units', () => apiGet('/units'))
+  // S654 (NO DEFAULT COMPANY): a chosen unit names its company. With no unit,
+  // an account that owns several companies names it here; the server reads
+  // landlordId and checks it is theirs.
+  const [landlordId, setLandlordId] = useState('')
+  const needsCompany = useCompanyMissing(landlordId) && !unitId
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<{ intentId: string | null; name: string } | null>(null)
   const [uploadError, setUploadError] = useState<string | null>(null)
@@ -855,6 +908,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
     () => apiPost<any>('/landlords/me/onboard-tenant-pending', {
       ...form,
       unitId: unitId || undefined,
+      landlordId: !unitId && landlordId ? landlordId : undefined,
       existingResident: !!unitId && windowOpen && attestExisting,
       rentDueDay: unitId && windowOpen && attestExisting && ownDueDay ? Number(ownDueDay) : undefined,
       // Work trade is per unit — it trades labor for THAT tenancy's rent.
@@ -879,7 +933,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
         //  - "Tenant has an active lease with another landlord. Cannot onboard to your portfolio."
         //  - "Tenant already has an active lease with you."
         //  - "Pending intent already exists for this email."
-        setError(e?.response?.data?.message || 'Could not add tenant.')
+        setError(serverReason(e, 'Could not add tenant.'))
       },
     }
   )
@@ -897,6 +951,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
       setError('All fields are required.')
       return
     }
+    if (needsCompany) { setError('Pick the unit they live in, or choose the company they belong to.'); return }
     setForm(trimmed)
     submitMut.mutate()
   }
@@ -933,7 +988,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
       )
       onComplete()
     } catch (err: any) {
-      setUploadError(err?.response?.data?.message || 'Upload failed')
+      setUploadError(serverReason(err, 'Upload failed'))
     } finally {
       setUploading(false)
     }
@@ -994,6 +1049,12 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
               Holds their spot: guests can't book this unit while onboarding completes.
             </div>
+            {!unitId && (
+              <div style={{ marginTop: 12 }}>
+                <EntityPicker value={landlordId} onChange={setLandlordId}
+                  note="With no unit picked, they are added under this company." />
+              </div>
+            )}
           </div>
 
           {/* S579: grandfather — only when a unit is bound (per-occupied-unit). */}
@@ -1073,9 +1134,14 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
             </div>
           )}
 
-          <button type="submit" disabled={submitMut.isLoading} className="btn btn-primary" style={{ width: '100%' }}>
+          <button type="submit" disabled={submitMut.isLoading || needsCompany} className="btn btn-primary" style={{ width: '100%' }}>
             {submitMut.isLoading ? 'Adding...' : 'Add tenant to pending pool'}
           </button>
+          {needsCompany && (
+            <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 6, textAlign: 'center' }}>
+              Pick the unit they live in, or choose the company they belong to.
+            </div>
+          )}
         </form>
       </div>
     )
@@ -1173,6 +1239,26 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
   const [limboBanner, setLimboBanner] = useState<string>('')
   const [limboErrors, setLimboErrors] = useState<Array<{ rowIndex: number; email: string; message: string }>>([])
 
+  // S654: NO DEFAULT COMPANY — a several-company account validates and imports
+  // nothing until it names one.
+  const companyMissing = useCompanyMissing(landlordId)
+  // S654: a review was matched against one company's units; switching company
+  // makes it stale, so it goes. The first pick (from nothing) keeps it.
+  const chooseCompany = useCallback((id: string) => {
+    if (landlordId && id !== landlordId) {
+      setPunchListRows(null)
+      setValidateSummary(null)
+      setPendingDecisions([])
+      setDecisionInputs({})
+      setErrorMsg('')
+      setFastPathBanner('')
+      setReviewBanner(null)
+      setLimboBanner('')
+      setLimboErrors([])
+    }
+    setLandlordId(id)
+  }, [landlordId])
+
   // S297: client mirror of normalizeClaimName for soft-warning check.
   const normalizeClaim = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '')
   const claimMatchesExisting = useMemo(() => {
@@ -1238,7 +1324,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
           } catch (e: any) {
             // Fast-path failure: roll fast-path rows into punch list. Limbo
             // dispatch still attempted independently below — separate failures.
-            setErrorMsg(e?.response?.data?.message || 'Some rows could not be auto-onboarded. Review below.')
+            setErrorMsg(serverReason(e, 'Some rows could not be auto-onboarded. Review below.'))
             fastPathFailed = true
           }
         }
@@ -1268,7 +1354,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
           } catch (e: any) {
             // Network or 500-level failure on the whole batch. Roll limbo
             // rows back into punch list with banner-level error.
-            setErrorMsg(e?.response?.data?.message || 'Could not route tenants to pending pool. Review below.')
+            setErrorMsg(serverReason(e, 'Could not route tenants to pending pool. Review below.'))
             identityBlockerRows.push(...limboRows)
           }
         }
@@ -1281,7 +1367,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
         }
       },
       onError: (err: any) => {
-        setErrorMsg(err?.response?.data?.message || 'Validation failed. Check the CSV format and try again.')
+        setErrorMsg(serverReason(err, 'Validation failed. Check the CSV format and try again.'))
         setPunchListRows(null)
         setValidateSummary(null)
       },
@@ -1330,6 +1416,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
 
   const handleValidate = () => {
     if (!csvText.trim()) { setErrorMsg('Pick a CSV file first.'); return }
+    if (companyMissing) { setErrorMsg(CHOOSE_COMPANY_FIRST); return }
     if (source === 'generic' && !claimedPlatformName.trim()) {
       setErrorMsg('Enter the platform name your CSV came from before validating.')
       return
@@ -1346,6 +1433,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
   // S537: persist the decisions (properties already exist in the tenant
   // flow), then re-validate — the gate is satisfied and the import resumes.
   const handleSaveDecisions = async () => {
+    if (companyMissing) { setErrorMsg(CHOOSE_COMPANY_FIRST); return }
     const incomplete = pendingDecisions.some(m => {
       const d = decisionInputs[`${m.propertyId}|${m.unitType}`]
       return !d || (!d.noLateFee && (d.amount === '' || d.grace === ''))
@@ -1366,7 +1454,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
         ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
       })
     } catch (e: any) {
-      setErrorMsg(e?.response?.data?.error || 'Could not save the late-fee decisions.')
+      setErrorMsg(serverReason(e, 'Could not save the late-fee decisions.'))
     } finally {
       setSavingDecisions(false)
     }
@@ -1394,7 +1482,8 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
     <div>
       <button onClick={onBack} className="btn btn-ghost" style={{ marginBottom: 16 }}>&larr; Back</button>
 
-      <EntityPicker value={landlordId} onChange={setLandlordId}
+      <EntityPicker value={landlordId} onChange={chooseCompany}
+        disabled={validateMut.isLoading || savingDecisions}
         note="Every tenant in this file is onboarded under this company." />
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
@@ -1486,10 +1575,13 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
               <FileText size={14} color="var(--text-2)" /> <span style={{ fontSize: '.85rem', color: 'var(--text-0)' }}>{fileName}</span>
             </div>
             <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }}>Replace File</button>
-            <button onClick={handleValidate} className="btn btn-primary" disabled={validateMut.isLoading} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+            <button onClick={handleValidate} className="btn btn-primary" disabled={validateMut.isLoading || companyMissing} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               {validateMut.isLoading ? <span className="spinner" /> : null}
               {validateMut.isLoading ? 'Validating…' : 'Validate'}
             </button>
+            {companyMissing && (
+              <span style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>{CHOOSE_COMPANY_FIRST}</span>
+            )}
           </div>
         )}
       </div>
@@ -1604,17 +1696,20 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
               )
             })}
           </div>
-          <button className="btn btn-primary" style={{ marginTop: 14 }} disabled={savingDecisions}
+          <button className="btn btn-primary" style={{ marginTop: 14 }} disabled={savingDecisions || companyMissing}
             onClick={handleSaveDecisions}>
             {savingDecisions ? 'Saving…' : 'Save decisions & continue import'}
           </button>
+          {companyMissing && (
+            <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginTop: 6 }}>{CHOOSE_COMPANY_FIRST}</div>
+          )}
         </div>
       )}
 
       {validateSummary && <ValidateSummary summary={validateSummary} hasPunchList={!!(punchListRows && punchListRows.length > 0)} />}
 
       {punchListRows && punchListRows.length > 0 && (
-        <PunchList rows={punchListRows} source={source} claimedPlatformName={claimedPlatformName} landlordId={landlordId} onUnitCommitted={handleUnitCommitted} />
+        <PunchList rows={punchListRows} source={source} claimedPlatformName={claimedPlatformName} landlordId={landlordId} companyMissing={companyMissing} onUnitCommitted={handleUnitCommitted} />
       )}
 
       {punchListRows && punchListRows.length === 0 && validateSummary && validateSummary.total > 0 && !fastPathBanner && (
@@ -1661,7 +1756,7 @@ function SummaryStat({ label, value, color, icon }: { label: string; value: numb
 // S633: landlordId is threaded down rather than re-resolved here — the company
 // was chosen once, at the top of the import, and every row in the file belongs
 // to it. Re-deriving per card would let one file straddle two companies.
-function PunchList({ rows, source, claimedPlatformName, landlordId, onUnitCommitted }: { rows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; onUnitCommitted: (unitId: string) => void }) {
+function PunchList({ rows, source, claimedPlatformName, landlordId, companyMissing, onUnitCommitted }: { rows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; companyMissing: boolean; onUnitCommitted: (unitId: string) => void }) {
   // Group by resolvedUnitId. Rows without a resolved unit get a synthetic key per row
   // (so each unmatched row appears as its own card with a clear "add property first" message).
   const groups = useMemo(() => {
@@ -1689,6 +1784,7 @@ function PunchList({ rows, source, claimedPlatformName, landlordId, onUnitCommit
           source={source}
           claimedPlatformName={claimedPlatformName}
           landlordId={landlordId}
+          companyMissing={companyMissing}
           onCommitted={() => { if (groupRows[0].resolvedUnitId) onUnitCommitted(groupRows[0].resolvedUnitId) }}
         />
       ))}
@@ -1696,7 +1792,7 @@ function PunchList({ rows, source, claimedPlatformName, landlordId, onUnitCommit
   )
 }
 
-function UnitCard({ initialRows, source, claimedPlatformName, landlordId, onCommitted }: { initialRows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; onCommitted: () => void }) {
+function UnitCard({ initialRows, source, claimedPlatformName, landlordId, companyMissing, onCommitted }: { initialRows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; companyMissing: boolean; onCommitted: () => void }) {
   const [groupRows, setGroupRows] = useState<CsvRow[]>(initialRows)
   const [submitErr, setSubmitErr] = useState<string>('')
   const [submitting, setSubmitting] = useState<boolean>(false)
@@ -1747,6 +1843,7 @@ function UnitCard({ initialRows, source, claimedPlatformName, landlordId, onComm
   }
 
   const handleSubmit = async () => {
+    if (companyMissing) { setSubmitErr(CHOOSE_COMPANY_FIRST); return }
     setSubmitErr('')
     setSubmitting(true)
     try {
@@ -1789,7 +1886,7 @@ function UnitCard({ initialRows, source, claimedPlatformName, landlordId, onComm
       // Brief pause so the green confirmation flashes before the parent unmounts the card.
       setTimeout(() => onCommitted(), 600)
     } catch (e: any) {
-      setSubmitErr(e?.response?.data?.message || 'Submission failed. Check the highlighted fields.')
+      setSubmitErr(serverReason(e, 'Submission failed. Check the highlighted fields.'))
     } finally {
       setSubmitting(false)
     }
@@ -1897,8 +1994,9 @@ function UnitCard({ initialRows, source, claimedPlatformName, landlordId, onComm
         </div>
       )}
 
-      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-        <button onClick={handleSubmit} disabled={submitting || !hasResolvedUnit} className="btn btn-primary" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        {companyMissing && <span style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{CHOOSE_COMPANY_FIRST}</span>}
+        <button onClick={handleSubmit} disabled={submitting || !hasResolvedUnit || companyMissing} className="btn btn-primary" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
           {submitting ? <span className="spinner" /> : null}
           {submitting ? 'Onboarding…' : 'Onboard this unit'}
         </button>

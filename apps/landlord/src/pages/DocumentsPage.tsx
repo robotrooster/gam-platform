@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { Upload, X } from 'lucide-react'
 import { apiGet, apiPut } from '../lib/api'
 import { usePerms } from '../lib/permissions'
+import { EntityPicker, useEntities } from '../components/EntityPicker'
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 
@@ -129,6 +130,15 @@ function UploadModal({ onClose }: { onClose: () => void }) {
   const togglePin = (id: string) => setPinned(prev => {
     const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next
   })
+  // S654 (Nic, DIRECTIVE): no default company. A unit, or pins that all sit
+  // under one company, already say which company keeps this — the server reads
+  // them. Pins across companies (or none) on a several-company account do not,
+  // so the landlord names it here.
+  const [entityId, setEntityId] = useState('')
+  const { data: entities = [] } = useEntities()
+  const pinCompanies = new Set([...pinned].map(id => (props as any[]).find(p => p.id === id)?.landlordId).filter(Boolean))
+  const askCompany = !unitId && pinCompanies.size !== 1
+  const companyMissing = askCompany && entities.length >= 2 && !entityId
 
   const mut = useMutation(
     async () => {
@@ -138,6 +148,7 @@ function UploadModal({ onClose }: { onClose: () => void }) {
       fd.append('type', type)
       if (unitId) fd.append('unitId', unitId)
       if (pinned.size) fd.append('propertyIds', JSON.stringify([...pinned]))
+      if (askCompany && entityId) fd.append('landlordId', entityId)
       const res = await fetch(`${API_BASE}/api/documents`, {
         method: 'POST',
         headers: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') },
@@ -216,10 +227,14 @@ function UploadModal({ onClose }: { onClose: () => void }) {
                 : `Only at ${pinned.size} propert${pinned.size === 1 ? 'y' : 'ies'}.`}
             </div>
           </div>
+          {askCompany && (
+            <EntityPicker value={entityId} onChange={setEntityId} label="Filed under"
+              note="The company that keeps this document on file." />
+          )}
           {error && <div style={{ fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
           <div style={{ display: 'flex', gap: 8 }}>
             <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-            <button className="btn btn-primary" style={{ marginLeft: 'auto' }} disabled={!file || mut.isLoading} onClick={() => { setError(null); mut.mutate() }}>
+            <button className="btn btn-primary" style={{ marginLeft: 'auto' }} disabled={!file || companyMissing || mut.isLoading} onClick={() => { setError(null); mut.mutate() }}>
               {mut.isLoading ? 'Uploading…' : 'Upload'}
             </button>
           </div>

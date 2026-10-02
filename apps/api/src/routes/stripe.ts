@@ -414,14 +414,22 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
     // S571: exactly ONE bank on file — a new bank supersedes the old one (swap
     // within type; card is untouched). And ACH becomes the DEFAULT method (Nic:
     // ACH defaults when set up; the tenant can later switch to card).
+    //
+    // S654: the default is set here ONLY when the SetupIntent already
+    // succeeded. A microdeposit bank stays unattached until its code is
+    // confirmed, and Stripe refuses it as a default ("The customer does not
+    // have a payment method with the ID ..."), so every new bank logged an
+    // error here. The setup_intent.succeeded webhook promotes it once verified.
     try {
       const banks = await stripe.paymentMethods.list({ customer: tenant.stripe_customer_id!, type: 'us_bank_account', limit: 20 })
       for (const opm of banks.data) {
         if (opm.id !== paymentMethodId) await stripe.paymentMethods.detach(opm.id)
       }
-      await stripe.customers.update(tenant.stripe_customer_id!, {
-        invoice_settings: { default_payment_method: paymentMethodId },
-      })
+      if (verified) {
+        await stripe.customers.update(tenant.stripe_customer_id!, {
+          invoice_settings: { default_payment_method: paymentMethodId },
+        })
+      }
     } catch (e) {
       logger.error({ err: e }, '[stripe] one-bank swap / default set failed')
     }

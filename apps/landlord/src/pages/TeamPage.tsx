@@ -9,6 +9,7 @@ import {
   humanize,
 } from '@gam/shared'
 import { PermissionCatalogEditor } from '../components/PermissionCatalogEditor'
+import { EntityPicker, useEntities } from '../components/EntityPicker'
 
 // S526: the old expandable-row permission grid (SUB_PERMISSIONS_BY_ROLE
 // checkboxes + inline ScopePicker) is RETIRED — the dedicated per-user page at
@@ -388,11 +389,17 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
   const [lastName, setLastName] = useState('')
   const [email, setEmail] = useState('')
   const [accessLevel, setAccessLevel] = useState<string>(BOOKKEEPER_ACCESS_LEVELS[0])
+  // S654 (Nic, DIRECTIVE): no default company. A bookkeeper keeps one
+  // company's books; an account with several names which.
+  const [entityId, setEntityId] = useState('')
+  const { data: entities = [] } = useEntities()
+  const severalCompanies = entities.length >= 2
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
 
   const mut = useMutation(
     () => apiPost('/scopes/bookkeeper/invite', {
+      landlordId: entityId || undefined,
       email: email.trim(),
       firstName: firstName.trim() || undefined,
       lastName: lastName.trim() || undefined,
@@ -418,6 +425,7 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
     setError(null)
     if (!firstName.trim() || !lastName.trim()) { setError('First and last name are required'); return }
     if (!email.trim()) { setError('Email is required'); return }
+    if (severalCompanies && !entityId) { setError('Choose whose books they keep'); return }
     mut.mutate()
   }
 
@@ -428,9 +436,11 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
     <div className="card" style={{ padding: 16, marginBottom: 20 }}>
       <div style={{ fontSize: '.95rem', fontWeight: 600, marginBottom: 4 }}>Invite a bookkeeper</div>
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
-        A bookkeeper gets access to your GAM Books — accounts, payroll, and reports — across all your properties. They set their own password from the email link. You can change their access level or remove them anytime below.
+        A bookkeeper gets access to GAM Books — accounts, payroll, and reports — {severalCompanies ? 'for the company you choose' : 'across all your properties'}. They set their own password from the email link. You can change their access level or remove them anytime below.
       </div>
       <form onSubmit={submit} style={{ display: 'grid', gap: 10 }}>
+        <EntityPicker value={entityId} onChange={setEntityId} label="Books of"
+          note="They see this company's books and no other." />
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
           <div>
             <label style={labelStyle}>First name</label>
@@ -456,7 +466,7 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
         {error && (<div style={{ padding: '8px 12px', borderRadius: 6, background: 'rgba(220,76,76,.08)', border: '1px solid rgba(220,76,76,.25)', color: 'var(--red, #dc4c4c)', fontSize: '.78rem' }}>{error}</div>)}
         {success && (<div style={{ padding: '8px 12px', borderRadius: 6, background: 'rgba(46,163,90,.08)', border: '1px solid rgba(46,163,90,.25)', color: 'var(--green, #2ea35a)', fontSize: '.78rem' }}>{success}</div>)}
         <div>
-          <button type="submit" className="btn btn-primary" disabled={mut.isLoading || !email.trim()}>
+          <button type="submit" className="btn btn-primary" disabled={mut.isLoading || !email.trim() || (severalCompanies && !entityId)}>
             {mut.isLoading ? 'Sending…' : 'Send invitation'}
           </button>
         </div>

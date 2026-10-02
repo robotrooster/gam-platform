@@ -238,6 +238,7 @@ export async function generateMoveInInvoice(
     move_in_first_month_rent: string | null; move_in_proration: string | null
     rent_due_day: number
     property_added_on: string | null
+    lease_start_date: string; property_tz: string
   }>(
     `SELECT l.lease_source, to_char(l.end_date, 'YYYY-MM-DD') AS end_date,
             COALESCE(l.is_existing_tenancy, false) AS is_existing_tenancy,
@@ -248,7 +249,11 @@ export async function generateMoveInInvoice(
             COALESCE(l.rent_due_day, 1) AS rent_due_day,
             -- S652: the day the property was added to GAM, in its own time zone.
             to_char((COALESCE(p.onboarding_started_at, p.created_at)
-                     AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on
+                     AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on,
+            -- S654: read exactly as invoiceGeneration's ACTIVE_LEASE_SELECT does,
+            -- for the S638 started-after-the-20th exemption below.
+            to_char(l.start_date, 'YYYY-MM-DD') AS lease_start_date,
+            COALESCE(p.timezone, 'America/Phoenix') AS property_tz
        FROM leases l
        JOIN units u ON u.id = l.unit_id
        JOIN properties p ON p.id = u.property_id
@@ -412,6 +417,25 @@ export async function generateMoveInInvoice(
     const totalAmount = (rentSuspended ? 0 : rentForMoveIn)
       + feesTotal + depositAmountForInvoice + firstInstallmentAmount
 
+    // S654: the late-fee stamp is decided the same way the nightly generator
+    // decides it (invoiceGeneration.ts, lateStartExempt): work trade, OR the
+    // first bill AND (an existing tenancy where the landlord waived, OR a
+    // lease that started after the 20th — S638, "late onboarders are exempt
+    // system wide"). This path had the waiver but not the 20th, so a resident
+    // signed on the 25th was exempt if billed overnight and fined if billed
+    // at signing. A voided history invoice is not a prior bill (S654).
+    const startedAfter20th = DateTime
+      .fromISO(leaseMeta?.lease_start_date ?? inputs.start_date,
+        { zone: leaseMeta?.property_tz ?? 'America/Phoenix' }).day > 20
+    const priorInvoice = await client.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM invoices WHERE lease_id = $1 AND due_date < $2::date AND status <> 'void'`,
+      [inputs.lease_id, invoiceDueDate])
+    const isFirstInvoice = Number(priorInvoice.rows[0].n) === 0
+    const onboardingWaived =
+      !!leaseMeta?.is_existing_tenancy && !!leaseMeta?.onboarding_late_fee_waiver
+    const lateFeeExempt = !!wtAgreement
+      || (isFirstInvoice && (onboardingWaived || startedAfter20th))
+
     const invoiceRes = await client.query(
       `INSERT INTO invoices (
          landlord_id, tenant_id, lease_id, unit_id,
@@ -446,8 +470,8 @@ export async function generateMoveInInvoice(
         //
         // S648 (Nic): and only where the landlord chose to waive it for this
         // property. Unanswered = the resident is billed late fees.
-        !!wtAgreement
-          || (!!leaseMeta?.is_existing_tenancy && !!leaseMeta?.onboarding_late_fee_waiver),
+        // S654: plus the S638 after-the-20th rule — see lateFeeExempt above.
+        lateFeeExempt,
       ]
     )
 

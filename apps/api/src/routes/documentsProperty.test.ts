@@ -144,3 +144,63 @@ describe('pinning a document to the properties it applies to', () => {
     expect(names).toContain('Lead Paint Disclosure')
   })
 })
+
+// S654 (Nic, DIRECTIVE): no default company. An upload with no unit names its
+// company through its pins when they all sit under one company; pins across
+// companies (or none) must name it, and a two-company account is asked.
+describe('S654: which company an untagged upload is filed under', () => {
+  async function twoCompanies() {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const a = await seedLandlord(c)
+      const b = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`, [a.userId])
+      const llB = b.rows[0].id
+      const propA = await seedProperty(c, { landlordId: a.landlordId, ownerUserId: a.userId, managedByUserId: a.userId })
+      const propB1 = await seedProperty(c, { landlordId: llB, ownerUserId: a.userId, managedByUserId: a.userId })
+      const propB2 = await seedProperty(c, { landlordId: llB, ownerUserId: a.userId, managedByUserId: a.userId })
+      await c.query('COMMIT')
+      const token = jwt.sign({ userId: a.userId, role: 'landlord', email: 'two@t.dev', profileId: null, permissions: {} },
+        process.env.JWT_SECRET!, { expiresIn: '1h' })
+      return { llA: a.landlordId, llB, propA, propB1, propB2, token }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+  const upload = (token: string, fields: Record<string, string>) => {
+    let r = request(buildApp()).post('/api/documents').set('Authorization', `Bearer ${token}`)
+    for (const [k, v] of Object.entries(fields)) r = r.field(k, v)
+    return r.attach('file', Buffer.from('%PDF-1.4 rules'), { filename: 'rules.pdf', contentType: 'application/pdf' })
+  }
+
+  it('pins all under one company file there without asking', async () => {
+    const f = await twoCompanies()
+    const res = await upload(f.token, { name: 'B rules', type: 'other', propertyIds: JSON.stringify([f.propB1, f.propB2]) })
+    expect(res.status, JSON.stringify(res.body)).toBe(201)
+    expect(res.body.data.landlord_id).toBe(f.llB)
+  })
+
+  it('pins across two companies are asked, then filed where named', async () => {
+    const f = await twoCompanies()
+    const ask = await upload(f.token, { name: 'Mixed', type: 'other', propertyIds: JSON.stringify([f.propA, f.propB1]) })
+    expect(ask.status).toBe(400)
+    expect(String(ask.body?.error)).toMatch(/more than one company/i)
+    const named = await upload(f.token, { name: 'Mixed', type: 'other', landlordId: f.llA,
+      propertyIds: JSON.stringify([f.propA, f.propB1]) })
+    expect(named.status, JSON.stringify(named.body)).toBe(201)
+    expect(named.body.data.landlord_id).toBe(f.llA)
+  })
+
+  it('no pins and no company is asked; a company the account does not own is refused', async () => {
+    const f = await twoCompanies()
+    const ask = await upload(f.token, { name: 'Everywhere', type: 'other' })
+    expect(ask.status).toBe(400)
+    const c = await db.connect()
+    let foreignLl = ''
+    try { foreignLl = (await seedLandlord(c)).landlordId } finally { c.release() }
+    const foreign = await upload(f.token, { name: 'Everywhere', type: 'other', landlordId: foreignLl })
+    expect(foreign.status).toBe(403)
+    const ok = await upload(f.token, { name: 'Everywhere', type: 'other', landlordId: f.llB })
+    expect(ok.status, JSON.stringify(ok.body)).toBe(201)
+    expect(ok.body.data.landlord_id).toBe(f.llB)
+  })
+})

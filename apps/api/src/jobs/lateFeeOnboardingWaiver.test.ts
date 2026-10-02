@@ -17,8 +17,9 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant } from '../test/dbHelpers'
 import { generateLateFeesForTimezone } from './lateFees'
+import { generateMoveInInvoice } from './moveInBundle'
 
 const TZ = 'America/Phoenix'
 beforeEach(async () => { await cleanupAllSchema() })
@@ -120,5 +121,69 @@ describe('S640 onboarding waiver survives an unstamped invoice', () => {
     const { invoiceId } = await seedOverdue({ existingTenancy: false, stamped: true })
     await generateLateFeesForTimezone(TZ)
     expect(await feesOn(invoiceId)).toEqual({ count: 0, total: 0 })
+  })
+})
+
+// S654 — the S638 rule ("if onboarding happens after the twentieth of the
+// month, they are exempt from late fees", system wide) was applied by the
+// nightly generator only. The invoice made at signing stamped work trade and
+// the existing-tenancy waiver, never the 20th, so the same resident was exempt
+// or fined depending on which path billed them first.
+describe('S638 at signing: the move-in invoice stamps like the nightly run', () => {
+  async function seedNewLease(startDate: string) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const ll = await seedLandlord(c)
+      const tenantId = await seedTenant(c)
+      const propertyId = await seedProperty(c, { landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
+      await c.query(`UPDATE properties SET timezone=$2 WHERE id=$1`, [propertyId, TZ])
+      const unitId = await seedUnit(c, { propertyId, landlordId: ll.landlordId })
+      const leaseId = await seedLease(c, { unitId, landlordId: ll.landlordId, rentAmount: 900, startDate })
+      await seedLeaseTenant(c, { leaseId, tenantId })
+      await c.query('COMMIT')
+      return { landlordId: ll.landlordId, tenantId, unitId, leaseId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  const moveIn = async (s: Awaited<ReturnType<typeof seedNewLease>>, startDate: string) => {
+    const r = await generateMoveInInvoice({
+      lease_id: s.leaseId, unit_id: s.unitId, tenant_id: s.tenantId,
+      landlord_id: s.landlordId, rent_amount: 900, start_date: startDate,
+    })
+    expect(r.invoiceCreated).toBe(true)
+    const { rows: [inv] } = await db.query<{ late_fee_exempt: boolean }>(
+      `SELECT late_fee_exempt FROM invoices WHERE id=$1`, [r.invoiceId])
+    return inv.late_fee_exempt
+  }
+
+  /** An earlier bill on the same lease, in the given status. */
+  const priorBill = (s: Awaited<ReturnType<typeof seedNewLease>>, status: 'void' | 'settled') => db.query(
+    `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date,
+                           subtotal_rent, total_amount, status)
+     VALUES ($1,$2,$3,$4,'2026-08-01',900,900,$5)`,
+    [s.landlordId, s.leaseId, s.unitId, `INV-${Math.random().toString(36).slice(2, 10)}`, status])
+
+  it('exempts a lease that started after the 20th', async () => {
+    const s = await seedNewLease('2026-09-25')
+    expect(await moveIn(s, '2026-09-25')).toBe(true)
+  })
+
+  it('does not exempt a lease that started on the 20th or earlier', async () => {
+    const s = await seedNewLease('2026-09-20')
+    expect(await moveIn(s, '2026-09-20')).toBe(false)
+  })
+
+  // First bill only, as in the generator — and a voided bill is not a bill.
+  it('a voided earlier bill does not take the exemption away', async () => {
+    const s = await seedNewLease('2026-09-25')
+    await priorBill(s, 'void')
+    expect(await moveIn(s, '2026-09-25')).toBe(true)
+  })
+
+  it('a real earlier bill does', async () => {
+    const s = await seedNewLease('2026-09-25')
+    await priorBill(s, 'settled')
+    expect(await moveIn(s, '2026-09-25')).toBe(false)
   })
 })

@@ -9,6 +9,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
 import { toast } from '../components/dialogs'
+import { useEntities } from '../components/EntityPicker'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'
 const monthBounds = (ym: string) => {
@@ -24,12 +25,22 @@ const monthBounds = (ym: string) => {
 // later (S570) and nobody merged them, leaving a workaround sitting in the nav
 // beside the automated version of itself. `embedded` renders this as a section
 // of BankPage instead of a standalone screen.
-export function BankReconciliationPage({ embedded = false }: { embedded?: boolean } = {}) {
+export function BankReconciliationPage({ embedded = false, entityId = '' }: { embedded?: boolean; entityId?: string } = {}) {
   const qc = useQueryClient()
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7))
   const { from, to } = monthBounds(month)
-  const { data: ctx } = useQuery(['bank-rec-context', from, to], () => apiGet<any>(`/bank-reconciliations/context?from=${from}&to=${to}`))
-  const { data: history = [] } = useQuery<any[]>('bank-rec-history', () => apiGet('/bank-reconciliations'))
+  // S654 (Nic, DIRECTIVE): no default company. Each company has its own bank,
+  // so a two-company account loads nothing until BankPage's picker names one;
+  // asking first beats a 400 dressed up as an empty month.
+  const { data: entities = [] } = useEntities()
+  const ready = !!entityId || entities.length === 1
+  const entityQS = entityId ? `entityId=${encodeURIComponent(entityId)}` : ''
+  const { data: ctx } = useQuery(['bank-rec-context', from, to, entityId],
+    () => apiGet<any>(`/bank-reconciliations/context?from=${from}&to=${to}${entityQS ? '&' + entityQS : ''}`),
+    { enabled: ready })
+  const { data: history = [] } = useQuery<any[]>(['bank-rec-history', entityId],
+    () => apiGet('/bank-reconciliations' + (entityQS ? '?' + entityQS : '')),
+    { enabled: ready })
 
   const [charge, setCharge] = useState({ amount: '', description: '', expenseDate: from })
   const [statementBalance, setStatementBalance] = useState('')
@@ -39,14 +50,22 @@ export function BankReconciliationPage({ embedded = false }: { embedded?: boolea
   const bankCharges: any[] = ctx?.bankCharges ?? []
 
   const logCharge = useMutation(
-    () => apiPost('/expenses', { category: 'bank_fees', amount: Number(charge.amount), expenseDate: charge.expenseDate || from, description: charge.description.trim() || 'Bank charge' }),
+    () => apiPost('/expenses', { landlordId: entityId || undefined, category: 'bank_fees', amount: Number(charge.amount), expenseDate: charge.expenseDate || from, description: charge.description.trim() || 'Bank charge' }),
     { onSuccess: () => { qc.invalidateQueries(['bank-rec-context', from, to]); setCharge({ amount: '', description: '', expenseDate: from }); toast('Bank charge logged.') } })
 
   const save = useMutation(
-    () => apiPost('/bank-reconciliations', { periodStart: from, periodEnd: to, statementBalance: Number(statementBalance) }),
+    () => apiPost('/bank-reconciliations', { landlordId: entityId || undefined, periodStart: from, periodEnd: to, statementBalance: Number(statementBalance) }),
     { onSuccess: () => { qc.invalidateQueries('bank-rec-history'); setStatementBalance(''); toast('Reconciliation saved.') } })
 
   const difference = statementBalance !== '' ? Number(statementBalance) - gamDisbursed : null
+
+  if (!ready && entities.length >= 2) {
+    return (
+      <div className="card" style={{ padding: 14, fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 20 }}>
+        Choose a company above to check its month.
+      </div>
+    )
+  }
 
   return (
     <div>

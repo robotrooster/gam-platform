@@ -101,6 +101,62 @@ describe('landlord expenses', () => {
     void llA
   })
 
+  // S654 (Nic, DIRECTIVE): no default company. A write derives its company
+  // from what it names (property, unit) or from the row it acts on — a
+  // two-company account is never asked when the answer is already on the page.
+  it('S654: a two-company account files by property, and receipt/void follow the row', async () => {
+    const c = await db.connect()
+    let userId = '', llA = '', llB = '', propB = ''
+    try {
+      await c.query('BEGIN')
+      const a = await seedLandlord(c); userId = a.userId; llA = a.landlordId
+      const propA = await seedProperty(c, { landlordId: llA, ownerUserId: userId, managedByUserId: userId })
+      await seedUnit(c, { propertyId: propA, landlordId: llA })
+      const b = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`, [userId])
+      llB = b.rows[0].id
+      propB = await seedProperty(c, { landlordId: llB, ownerUserId: userId, managedByUserId: userId })
+      await seedUnit(c, { propertyId: propB, landlordId: llB })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const token = jwt.sign({ userId, role: 'landlord', email: 'two@t.dev', profileId: null, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const app = buildApp()
+
+    // POST naming only a property lands in THAT property's company.
+    const made = await request(app).post('/api/expenses').set('Authorization', `Bearer ${token}`)
+      .send(mk({ propertyId: propB, category: 'insurance', amount: 300, isCommon: true, description: 'B policy' }))
+    expect(made.status, JSON.stringify(made.body)).toBe(200)
+    expect(made.body.data.landlord_id).toBe(llB)
+    const id = made.body.data.id as string
+
+    // Receipt and void on company B's row work with no company named.
+    const att = await request(app).post(`/api/expenses/${id}/receipt`).set('Authorization', `Bearer ${token}`)
+      .attach('receipt', Buffer.from('policy-bytes'), { filename: 'policy.pdf', contentType: 'application/pdf' })
+    expect(att.status, JSON.stringify(att.body)).toBe(200)
+    expect(att.body.data.receipt_url).toMatch(/\/api\/expenses\/receipt-files\//)
+    const voided = await request(app).post(`/api/expenses/${id}/void`).set('Authorization', `Bearer ${token}`).send({})
+    expect(voided.status, JSON.stringify(voided.body)).toBe(200)
+    expect((await db.query(`SELECT status FROM landlord_expenses WHERE id = $1`, [id])).rows[0].status).toBe('voided')
+
+    // Another account's row is missing to this account — not "choose a company".
+    const other = await db.connect()
+    let foreignId = ''
+    try {
+      const o = await seedLandlord(other)
+      const r = await other.query<{ id: string }>(
+        `INSERT INTO landlord_expenses (landlord_id, category, amount, expense_date, description, status)
+         VALUES ($1,'repairs',75,'2026-08-12','Not yours','active') RETURNING id`, [o.landlordId])
+      foreignId = r.rows[0].id
+    } finally { other.release() }
+    await request(app).post(`/api/expenses/${foreignId}/void`).set('Authorization', `Bearer ${token}`).send({}).expect(404)
+    await request(app).post(`/api/expenses/${foreignId}/receipt`).set('Authorization', `Bearer ${token}`)
+      .attach('receipt', Buffer.from('x'), { filename: 'x.pdf', contentType: 'application/pdf' }).expect(404)
+    expect((await db.query(`SELECT status, receipt_url FROM landlord_expenses WHERE id = $1`, [foreignId])).rows[0])
+      .toEqual({ status: 'active', receipt_url: null })
+    void llA
+  })
+
   it('creates a unit-linked expense', async () => {
     const f = await seed()
     const res = await request(buildApp()).post('/api/expenses').set('Authorization', `Bearer ${f.token}`)

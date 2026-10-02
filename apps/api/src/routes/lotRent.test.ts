@@ -90,6 +90,56 @@ describe('lot rent', () => {
     expect(charges.status).toBe(200)
   })
 
+  // S654 (Nic, DIRECTIVE): no default company. Marking a charge paid acts for
+  // the company the CHARGE is filed under — a two-company account was asked
+  // "choose a company" for a row that already says which.
+  it('S654: record-paid on the second company\'s charge works; another account\'s is 404', async () => {
+    const c = await db.connect()
+    let userId = '', llB = '', homeB = ''
+    try {
+      await c.query('BEGIN')
+      const a = await seedLandlord(c); userId = a.userId
+      const propA = await seedProperty(c, { landlordId: a.landlordId, ownerUserId: userId, managedByUserId: userId })
+      await c.query(`UPDATE properties SET operator_owns_land = FALSE WHERE id = $1`, [propA])
+      const homeA = await seedUnit(c, { propertyId: propA, landlordId: a.landlordId, rentAmount: 900 })
+      await c.query(`UPDATE units SET lot_rent_amount = 350 WHERE id = $1`, [homeA])
+      const b = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`, [userId])
+      llB = b.rows[0].id
+      const propB = await seedProperty(c, { landlordId: llB, ownerUserId: userId, managedByUserId: userId })
+      await c.query(`UPDATE properties SET operator_owns_land = FALSE WHERE id = $1`, [propB])
+      homeB = await seedUnit(c, { propertyId: propB, landlordId: llB, rentAmount: 800 })
+      await c.query(`UPDATE units SET lot_rent_amount = 300 WHERE id = $1`, [homeB])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    expect(await accrueLotRentCharges('2026-08-01')).toBe(2)
+    const chargeB = (await db.query<{ id: string; landlord_id: string }>(
+      `SELECT id, landlord_id FROM lot_rent_charges WHERE unit_id = $1`, [homeB])).rows[0]
+    expect(chargeB.landlord_id).toBe(llB)
+
+    const token = jwt.sign({ userId, role: 'landlord', email: 'two@t.dev', profileId: null, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const paid = await request(buildApp()).post(`/api/lot-rent/charges/${chargeB.id}/record-paid`)
+      .set('Authorization', `Bearer ${token}`).send({})
+    expect(paid.status, JSON.stringify(paid.body)).toBe(200)
+    expect((await db.query(`SELECT status FROM lot_rent_charges WHERE id = $1`, [chargeB.id])).rows[0].status).toBe('paid')
+
+    // Another account cannot mark this account's remaining charge paid.
+    const chargeA = (await db.query<{ id: string }>(
+      `SELECT id FROM lot_rent_charges WHERE status = 'pending'`)).rows[0]
+    const oc = await db.connect()
+    let otherToken = ''
+    try {
+      const o = await seedLandlord(oc)
+      otherToken = jwt.sign({ userId: o.userId, role: 'landlord', email: 'o@t.dev', profileId: null, permissions: {} },
+        process.env.JWT_SECRET!, { expiresIn: '1h' })
+    } finally { oc.release() }
+    const foreign = await request(buildApp()).post(`/api/lot-rent/charges/${chargeA.id}/record-paid`)
+      .set('Authorization', `Bearer ${otherToken}`).send({})
+    expect(foreign.status).toBe(404)
+    expect((await db.query(`SELECT status FROM lot_rent_charges WHERE id = $1`, [chargeA.id])).rows[0].status).toBe('pending')
+  })
+
   it('accrues one charge per homes-only home with lot rent (idempotent); skips owned parks', async () => {
     const f = await seed()
     const n = await accrueLotRentCharges('2026-08-01')

@@ -556,6 +556,37 @@ describe('POST /api/stripe/tenant/confirm-setup', () => {
     expect(log).toHaveLength(0)             // first-sender waits for the webhook
   })
 
+  // S654: Stripe refuses an unattached microdeposit bank as the default
+  // ("The customer does not have a payment method with the ID ..."). The old
+  // bank still goes; the default waits for setup_intent.succeeded.
+  it('S654 microdeposit pending: older bank detached, default NOT set', async () => {
+    const { tenantId, userId } = await seedTenantWithStripe()
+    stripeMocks.setupIntentsRetrieve.mockResolvedValueOnce(
+      { id: 'seti_x', status: 'requires_action', customer: 'cus_mock_tenant', payment_method: 'pm_x' } as any)
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+    const res = await request(buildApp()).post('/api/stripe/tenant/confirm-setup')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ setupIntentId: 'seti_x', paymentMethodId: 'pm_x' })
+    expect(res.status).toBe(200)
+    expect(stripeMocks.paymentMethodsDetach).toHaveBeenCalledWith('pm_ach_1')
+    expect(stripeMocks.paymentMethodsDetach).not.toHaveBeenCalledWith('pm_x')
+    expect(stripeMocks.customersUpdate).not.toHaveBeenCalled()
+  })
+
+  it('S654 already verified: older bank detached, new bank made the default', async () => {
+    const { tenantId, userId } = await seedTenantWithStripe()
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+    const res = await request(buildApp()).post('/api/stripe/tenant/confirm-setup')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ setupIntentId: 'seti_x', paymentMethodId: 'pm_x' })
+    expect(res.status).toBe(200)
+    expect(stripeMocks.paymentMethodsDetach).toHaveBeenCalledWith('pm_ach_1')
+    expect(stripeMocks.customersUpdate).toHaveBeenCalledTimes(1)
+    expect(stripeMocks.customersUpdate).toHaveBeenCalledWith('cus_mock_tenant', {
+      invoice_settings: { default_payment_method: 'pm_x' },
+    })
+  })
+
   it('S406 fix: non-tenant caller → 403 (was 500 pre-fix from ach_monitoring_log FK)', async () => {
     const c = await db.connect()
     try {

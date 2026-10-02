@@ -22,10 +22,23 @@ export function useEntities() {
   return useQuery<EntityOption[]>('landlord-entities', () => apiGet('/landlords/me/entities'))
 }
 
-export function EntityPicker({ value, onChange, label = 'Company', note }: {
+/**
+ * S654 (NO DEFAULT COMPANY): true while an account that owns several companies
+ * has not named one. Gates the actions that would land data in a company. Team
+ * logins get a 403 on the entities list, so they read as an empty list and are
+ * never blocked — the server derives their company.
+ */
+export function useCompanyMissing(value: string): boolean {
+  const { data: entities = [] } = useEntities()
+  return entities.length > 1 && !value
+}
+
+export function EntityPicker({ value, onChange, label = 'Company', note, disabled }: {
   value: string
   onChange: (id: string) => void
   label?: string
+  /** S654: locked while a request for the chosen company is in flight. */
+  disabled?: boolean
   /**
    * S633: the trailing sentence explaining WHY the choice matters here. The
    * default is about banking, which is where this control started; a CSV import
@@ -51,7 +64,7 @@ export function EntityPicker({ value, onChange, label = 'Company', note }: {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
       <label className="form-label" style={{ margin: 0, fontSize: '.72rem' }}>{label}</label>
-      <select className="input" style={{ width: 'auto', minWidth: 240 }}
+      <select className="input" style={{ width: 'auto', minWidth: 240 }} disabled={disabled}
               value={value} onChange={e => onChange(e.target.value)}>
         <option value="">Choose a company…</option>
         {entities.map(en => (

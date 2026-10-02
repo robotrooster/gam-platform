@@ -49,7 +49,11 @@ export function BankPage() {
 
       {tab === 'reconcile' && (
         <div>
-          <BankReconciliationPage embedded />
+          {/* S654 (Nic, DIRECTIVE): no default company. One choice at the top
+              of the tab drives the month check AND the deposit matching below. */}
+          <EntityPicker value={entityId} onChange={setEntityId} label="Company"
+            note="Each company has its own bank, so its month is checked and its deposits matched on their own." />
+          <BankReconciliationPage embedded entityId={entityId} />
           <div style={{ marginTop: 28 }}>
             <div className="card-title" style={{ marginBottom: 8 }}>Deposits that may be rent</div>
             <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
@@ -57,8 +61,6 @@ export function BankPage() {
               tenant told us about. Recording it here dates the payment to the deposit, so any
               late fee charged while it was in transit comes back off.
             </div>
-            <EntityPicker value={entityId} onChange={setEntityId} label="Company"
-              note="Each company has its own bank, so its deposits are matched on their own." />
             <DepositMatchPanel entityId={entityId} />
             <div style={{ marginTop: 16 }}>
               <CashPositionPanel entityId={entityId} />

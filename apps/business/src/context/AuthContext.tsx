@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue } from '@gam/shared'
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { apiPost, apiGet } from '../lib/api'
 
@@ -61,6 +61,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setToken(null); setUser(null); setBusiness(null)
   }, [])
 
+  // S654: same renewal as the landlord portal. A session was a fixed 7-day pass
+  // from the last sign-in; renew one older than a day so it ends only after
+  // seven idle days. The new pass goes under this portal's own key.
+  const renewSession = useCallback(async () => {
+    const current = localStorage.getItem('gam_business_token')
+    if (!sessionRenewalDue(current)) return
+    try {
+      const r = await apiPost<{ token: string }>('/auth/refresh')
+      localStorage.setItem('gam_business_token', r.data.token)
+      setToken(r.data.token)
+    } catch (e) { if (isAuthRejection(e)) logout() }
+  }, [logout])
+
   const fetchBusiness = useCallback(async (role: string) => {
     // Staff fetch the business via a different shape later. Owner-side
     // /businesses/me works today and carries enabled_features.
@@ -94,13 +107,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       setUser(me)
       await fetchBusiness(me.role)
+      // S654: renew only once the pass is known to be a business account's.
+      await renewSession()
     } catch (e) {
       // S540: only a real auth rejection ends the session. API
       // restarts / network blips keep the token; next load recovers.
       if (isAuthRejection(e)) logout()
     }
     finally { setLoading(false) }
-  }, [logout, fetchBusiness])
+  }, [logout, fetchBusiness, renewSession])
 
   const refreshBusiness = useCallback(async () => {
     if (!user) return
@@ -108,6 +123,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [user, fetchBusiness])
 
   useEffect(() => { token ? refresh() : setLoading(false) }, [token, refresh])
+  // S654: renew when the portal comes back into view. `user` is set only after
+  // the business role check, so a stray non-business pass is never renewed here.
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible' && user) renewSession() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [renewSession, user])
 
   const login = async (email: string, password: string): Promise<LoginResult> => {
     const res = await apiPost<any>('/auth/login', { email, password })

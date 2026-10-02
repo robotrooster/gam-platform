@@ -19,6 +19,7 @@ import { SearchBox } from '../components/ListControls'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, Printer, MoreVertical, Undo2, Redo2, PenLine } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { toast, appConfirm } from '../components/dialogs'
+import { EntityPicker, useEntities } from '../components/EntityPicker'
 import { downloadAuthedFile, printAuthedFile } from '../lib/downloadFile'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -1195,6 +1196,14 @@ function SendDocumentModal({ onClose }) {
   const existingTenants = units.filter(u => u.tenantEmail).map(u => ({ email: u.tenantEmail, name: u.tenantFirst + ' ' + u.tenantLast, unit: u.unitNumber, unitId: u.id, propertyName: u.propertyName }))
   const properties = Array.from(new Map((units as any[]).map(u => [u.propertyId, { id: u.propertyId, name: u.propertyName }])).values())
   const selectedTemplate = templates.find(t => t.id === templateId)
+  // S654 (Nic, DIRECTIVE): no default company. Typed emails that match no
+  // tenant name no unit, so nothing says which company is sending; an account
+  // with several picks one BEFORE any invite goes out.
+  const [entityId, setEntityId] = useState('')
+  const { data: entities = [] } = useEntities()
+  const manualFirstEmail = (tenantEmails.find(e => e.trim()) || '').trim()
+  const manualNoUnit = mode === 'manual' && !existingTenants.find(t => t.email === manualFirstEmail)
+  const manualCompanyMissing = manualNoUnit && entities.length >= 2 && !entityId
 
   // S535 auto-pull: picking a unit selects the template written for its
   // type (newest exact-type match, else universal) unless the current
@@ -1343,6 +1352,10 @@ function SendDocumentModal({ onClose }) {
     const validEmails = tenantEmails.filter(e => e.trim())
     if (!validEmails.length) { setError('Please enter at least one email'); return }
     const firstTenant = existingTenants.find(t => t.email === validEmails[0].trim())
+    if (!firstTenant && entities.length >= 2 && !entityId) {
+      setError('Choose which company is sending this document.'); return
+    }
+    const company = !firstTenant && entityId ? { landlordId: entityId } : {}
     setSending(true)
     try {
       const signers = []
@@ -1355,7 +1368,7 @@ function SendDocumentModal({ onClose }) {
           : { firstName: (tenantNames[i]?.firstName || email.split('@')[0]), lastName: (tenantNames[i]?.lastName || '') }
         const inviteRes: any = await apiPost('/tenants/invite', {
           email, firstName: nameParts.firstName, lastName: nameParts.lastName,
-          phone: null, unitId: firstTenant?.unitId || null,
+          phone: null, unitId: firstTenant?.unitId || null, ...company,
         })
         signers.push({
           role: order === 2 ? 'primary' : 'co_tenant_' + (order - 2),
@@ -1374,7 +1387,7 @@ function SendDocumentModal({ onClose }) {
       if (w) signers.push(w)
       const unitId = firstTenant ? firstTenant.unitId : null
       const title = selectedTemplate ? selectedTemplate.name + (firstTenant ? ' — Unit ' + firstTenant.unit : '') : 'Lease Agreement'
-      const res = await apiPost('/esign/documents', { templateId, unitId, title, signers, prefillValues })
+      const res = await apiPost('/esign/documents', { templateId, unitId, title, signers, prefillValues, ...company })
       await apiPost('/esign/documents/' + res.data.id + '/send', {})
       qc.invalidateQueries('esign-documents')
       onClose()
@@ -1386,7 +1399,7 @@ function SendDocumentModal({ onClose }) {
   const canSend = !!templateId && (
     mode === 'unit' ? !!selectedUnitId && recipientGroups.length > 0 :
     mode === 'property' ? !!selectedPropertyId && recipientGroups.length > 0 :
-    tenantEmails.some(e => e.trim())
+    tenantEmails.some(e => e.trim()) && !manualCompanyMissing
   )
 
   return (
@@ -1485,6 +1498,12 @@ function SendDocumentModal({ onClose }) {
               )
             })}
             <button className='btn btn-ghost btn-sm' onClick={() => { setTenantEmails(prev => [...prev,'']); setSearches(prev => [...prev,'']) }}><Plus size={12} /> Add Another Signer</button>
+            {manualNoUnit && (
+              <div style={{ marginTop:10 }}>
+                <EntityPicker value={entityId} onChange={setEntityId} label="Sent by"
+                  note="No unit matches these emails, so choose the company sending it." />
+              </div>
+            )}
           </div>
         )}
 
