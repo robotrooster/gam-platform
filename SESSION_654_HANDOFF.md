@@ -446,6 +446,22 @@ in-flight ACH retry settled from credit). Main runs today's live payment logic
 plus two harmless fixes (autopay skips work-trade lines; the tenant assistant
 counts a bounced payment once and never quotes work-trade lines as owed).
 
+### Morning (Nic back, 10/2)
+- Landlord dashboard showed black in Safari; a refresh fixed it. Every request
+  it made was answered; cause not reproduced (no Safari access, no crash report).
+- Platform fee "$136 on 67 occupied": the bill was right (Oct accruals: Oak Park
+  24 + Mountain View 44 = 68, the owner-use space included); the card printed the
+  rent-roll count. Fixed: owner-use counts as occupied on the dashboard, and the
+  fee card shows the count the bill used. Owner-use units now also block the
+  landlord's own reservation form and the overlap check (the public site already
+  excluded them via is_bookable).
+- Add-owner referral restored (Nic: the adder is the referrer): set when the
+  invited owner ACCEPTS, to the company's founding owner, first-touch wins.
+- MH 25's $10 credit: check #170, recorded 9/9 10:28 am for $470 against the
+  $460 September rent; a check overpayment is always kept as credit. Nic says
+  Dominic always writes $460 — likely a typo. Remove the $10 only on Nic's OK.
+- Country Acres late fees: NOT waived (Nic). Blu can credit a bill one-off.
+
 ### Decisions for Nic (numbered; recommendation first)
 1. **Deploy** the overnight batch — the security fixes are the reason.
 2. **Country Acres late fees** — Blu's answer before 10 pm Oct 5 Arizona time

@@ -495,9 +495,9 @@ landlordsRouter.post('/members', async (req, res, next) => {
     }
     // S654: the invitation goes to the address on the existing account, never
     // the typed spelling, and its token travels only in that email; the
-    // response names the invitation, not its secret. No referral upline is
-    // written, here or on accept: an owner is not anybody's downline (this
-    // reverses S592's capture, which is how B came to earn on A).
+    // response names the invitation, not its secret. The S592 referral upline
+    // is written only when they ACCEPT from their own session (see the accept
+    // route) — never here, which is how B came to earn on A without consent.
     const invite = await createCoOwnerInvitation(landlordId, target?.email ?? b.email, u.userId)
     res.status(202).json({ success: true, data: { invited: true, invitationId: invite.id } })
   } catch (e) { next(e) }
@@ -670,6 +670,8 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COUNT(*) FILTER (WHERE u.status='vacant')::int AS vacant_units,
         COUNT(*) FILTER (WHERE u.status='delinquent')::int AS delinquent_units,
         COUNT(*) FILTER (WHERE u.status='suspended')::int AS suspended_units,
+        -- S654 (Nic): an owner-use space is occupied (and billed) — the owner lives there.
+        COUNT(*) FILTER (WHERE u.status='owner_use')::int AS owner_use_units,
         COUNT(*) FILTER (WHERE u.payment_block=TRUE)::int AS eviction_mode_units,
         -- S616 (Nic): a neighbor's serviced space is not inventory. Every
         -- status count above already excludes it by naming a status explicitly;
@@ -883,6 +885,17 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       propertyId: p.id, name: p.name, fee: Math.round((feeMap.get(p.id) ?? 0) * 100) / 100,
     }))
     const platformFee = Math.round(platformFeeByProperty.reduce((s, p) => s + p.fee, 0) * 100) / 100
+    // S654 (Nic): "$136 on 67 occupied units — where's the $136 from?" The fee
+    // was right (68 billed, the owner-use space included); the card printed the
+    // rent-roll count. Show the unit count the bill itself used, when the month
+    // has been billed for every property shown.
+    const billedUnits = await queryOne<{ n: number | null; props: number }>(
+      `SELECT SUM(total_billable)::int AS n, COUNT(DISTINCT property_id)::int AS props
+         FROM platform_fee_accruals
+        WHERE property_id = ANY($1::uuid[]) AND accrual_month = ANY($2::date[])`,
+      [feeProps.map((p: any) => p.id), feeMonth])
+    const platformFeeUnits = billedUnits && billedUnits.props === feeProps.length && feeMonth.length === 1
+      ? billedUnits.n : null
 
     // Rent KPIs that reconcile with the Reports page (/reports/summary) — same
     // SQL definitions, so the Dashboard's Collected/Outstanding cards agree with
@@ -1063,7 +1076,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const occupancyRate = occupancyRateFrom(
       stats?.active_units || 0, nightsRow?.nights || 0, totalUnits)
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, collected_in_flight: collected.inFlight, outstanding: outstandingRow?.outstanding||0,
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, platformFeeUnits, collected_mtd: collectedRow?.collected_mtd||0, collected_in_flight: collected.inFlight, outstanding: outstandingRow?.outstanding||0,
       work_trade_suspended: outstandingRow?.work_trade_suspended||0,
       // S640: what is actually going out on the next weekly run, and what is
       // still clearing behind it.
@@ -6600,6 +6613,22 @@ landlordsRouter.post('/member-invite/:token/accept', async (req, res, next) => {
       `UPDATE landlord_member_invitations
           SET status='accepted', accepted_at=now(), accepted_user_id=$2, updated_at=now()
         WHERE id=$1`, [inv.id, u.userId])
+
+    // S592, restored at the point of consent (S654, Nic): "I added them as a
+    // co-owner. They opted to put their own other properties on the software.
+    // They only found out about it because of me. So therefore I am the
+    // referrer." A co-owner with no upline of their own becomes the downline of
+    // the company's founding owner — now only when THEY accept from their own
+    // session. First-touch wins (an existing upline is never changed); a
+    // founding owner accepting into their own company is a no-op.
+    const founding = await queryOne<{ user_id: string }>(
+      `SELECT user_id FROM landlords WHERE id = $1`, [inv.landlord_id])
+    if (founding && founding.user_id !== u.userId) {
+      await query(
+        `UPDATE users SET referred_by_user_id = $1
+          WHERE id = $2 AND referred_by_user_id IS NULL`,
+        [founding.user_id, u.userId])
+    }
 
     // S605 (Nic): "for him to just register, it would have tried to get him to
     // onboard his property, which is already onboarded because I've completed

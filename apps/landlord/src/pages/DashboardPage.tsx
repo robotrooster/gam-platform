@@ -114,6 +114,11 @@ export function DashboardPage() {
   // Backs the "Expected Monthly Rent" subtext so the count matches the units
   // actually summed into that figure. (direct_pay retired W-15/S531.)
   const rentRollUnits = (stats?.activeUnits || 0) + (stats?.delinquentUnits || 0) + (stats?.suspendedUnits || 0)
+  // S654 (Nic): "I did mark one unit as owner use… it should say 68 occupied
+  // units." The owner lives there: occupied (and billed), just not rented.
+  const occupiedUnits = rentRollUnits + Number((stats as any)?.ownerUseUnits ?? 0)
+  // The fee card counts what the bill counted, once the month is billed.
+  const platformFeeUnits = Number((stats as any)?.platformFeeUnits ?? occupiedUnits)
   // S640 (Nic, DIRECTIVE): work trade is revenue that is never coming in as
   // money. It is out of Expected and out of Outstanding, and stands on its own
   // so the landlord can still see what the trades are worth.
@@ -263,7 +268,7 @@ export function DashboardPage() {
               reconciles with the Occupied Units card instead of looking like a
               third unexplained figure. */}
           <div className="kpi-sub">
-            payable across {payableUnits} of {rentRollUnits} occupied unit{rentRollUnits === 1 ? '' : 's'}
+            payable across {payableUnits} of {occupiedUnits} occupied unit{occupiedUnits === 1 ? '' : 's'}
           </div>
         </div>
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
@@ -307,7 +312,7 @@ export function DashboardPage() {
             Occupied is occupied — the same rule the utility billing follows. */}
         <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units?status=occupied')}>
           <div className="kpi-label">Occupied Units</div>
-          <div className="kpi-value green">{rentRollUnits}</div>
+          <div className="kpi-value green">{occupiedUnits}</div>
           <div className="kpi-sub">{stats?.vacantUnits || 0} vacant</div>
         </div>
         {/* S527 W-5: land pre-filtered to the expiring window. */}
@@ -368,7 +373,7 @@ export function DashboardPage() {
         <div className="kpi-card" style={{gridColumn:'span 12',cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
           <div className="kpi-value">{fmtWhole(platformFee)}</div>
-          <div className="kpi-sub">{rentRollUnits} occupied × $2/unit · $10/property min</div>
+          <div className="kpi-sub">{platformFeeUnits} occupied × $2/unit · $10/property min</div>
         </div>
       </div>
 

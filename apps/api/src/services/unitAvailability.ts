@@ -32,7 +32,7 @@ export interface StayWindow {
   ignoreUnpaidHolds?: boolean
 }
 
-export type StayConflict = 'booking' | 'lease' | 'pending_tenant' | 'out_of_order' | null
+export type StayConflict = 'booking' | 'lease' | 'pending_tenant' | 'out_of_order' | 'owner_use' | null
 
 export async function findStayConflict(unitId: string, w: StayWindow): Promise<StayConflict> {
   const booking = await queryOne<any>(`
@@ -47,6 +47,11 @@ export async function findStayConflict(unitId: string, w: StayWindow): Promise<S
       AND NOT ($5::boolean AND status = 'tentative' AND deposit_paid_at IS NULL)`,
     [unitId, w.excludeBookingId ?? null, w.checkOut ?? null, w.checkIn, w.ignoreUnpaidHolds === true])
   if (booking) return 'booking'
+  // S654 (Nic): "If I mark a unit as owner use, that should mark it as occupied
+  // in the system so that nothing can overlap the schedule on that." The owner
+  // lives there; no stay can be put on it until it is set back.
+  const owner = await queryOne<any>(`SELECT 1 FROM units WHERE id = $1 AND status = 'owner_use'`, [unitId])
+  if (owner) return 'owner_use'
   const lease = await queryOne<any>(`
     SELECT id FROM leases
     WHERE unit_id = $1 AND status = 'active'
@@ -74,6 +79,7 @@ export const STAY_CONFLICT_MESSAGE: Record<Exclude<StayConflict, null>, string> 
   lease:   'Unit has an active lease covering those dates',
   pending_tenant: 'Unit is held for a tenant completing onboarding',
   out_of_order: 'That site is out of order for those dates',
+  owner_use: 'That site is in the owner\'s own use',
 }
 
 // Every unit of the landlord that is free for the window. RV compatibility
@@ -112,6 +118,8 @@ export async function findAvailableUnits(opts: {
       -- DB triggers already refuse a new lease/booking on one; this keeps it out
       -- of the picker so nobody is shown a choice that would then be rejected.
       AND u.retired_at IS NULL
+      -- S654 (Nic): an owner-use site is occupied — never offered for a stay.
+      AND u.status <> 'owner_use'
       AND NOT EXISTS (
         SELECT 1 FROM unit_bookings b
         WHERE b.unit_id = u.id AND b.status NOT IN ('cancelled')

@@ -124,10 +124,10 @@ describe('landlord members CRUD', () => {
     expect(rmAdded.status).toBe(200)
   })
 
-  // S654: replaces S592's capture. Adding an owner never sets their referral
-  // upline: B posting A's owner's address made A's owner B's downline, and the
-  // commission run then paid B the closing share on A's company.
-  it('adding a co-owner never touches their upline, whether they had one or not', async () => {
+  // S592 kept, at the point of consent (S654, Nic: "I added them as a co-owner…
+  // therefore I am the referrer"): a co-owner who ACCEPTS becomes the founding
+  // owner's downline if they have no upline yet; an existing upline never changes.
+  it('a co-owner who accepts becomes the founding owner\'s downline; an existing upline is kept', async () => {
     const oakPark = await seedEntity('Oak Park LLC')
     const friend = await seedEntity('Friend WY Holdings')       // organic, no upline
     const priorUpline = await seedEntity('Prior Upline Co')
@@ -140,7 +140,7 @@ describe('landlord members CRUD', () => {
 
     const up = async (id: string) => (await db.query<{ referred_by_user_id: string | null }>(
       `SELECT referred_by_user_id FROM users WHERE id=$1`, [id])).rows[0].referred_by_user_id
-    expect(await up(friend.userId)).toBeNull()
+    expect(await up(friend.userId)).toBe(oakPark.userId)
     expect(await up(alreadyReferred.userId)).toBe(priorUpline.userId)
   })
 
@@ -283,11 +283,9 @@ describe("S654: POST /members on another company's owner", () => {
       `SELECT added_by_user_id FROM landlord_members WHERE landlord_id = $1 AND user_id = $2`,
       [b.landlordId, a.userId])).rows[0]
     expect(added.added_by_user_id).toBe(b.userId)
-    // Accepting never makes A's owner anybody's downline, and pays B nothing on A.
-    expect(await uplineOf(a.userId)).toBeNull()
-    await db.query(`DELETE FROM commission_accruals`)
-    await processCommissionAccrual()
-    expect(await accrualsTo(b.userId)).toEqual([])
+    // Having accepted, A's owner is B's downline (S592 at the point of consent) —
+    // the referral Nic wants, and it exists only because A said yes.
+    expect(await uplineOf(a.userId)).toBe(b.userId)
   })
 })
 
