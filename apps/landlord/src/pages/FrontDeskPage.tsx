@@ -448,12 +448,26 @@ export function FrontDeskPage() {
                     const open = !!b && openKey === key
                     return (
                       <div key={key} style={{ borderTop: '1px solid var(--border-0)' }}>
-                      <div style={{
-                        display: 'flex', gap: 14, alignItems: 'flex-start',
-                        padding: '11px 0',
-                      }}>
+                      {/* S654 (Nic): "the front desk page is still not clickable for the
+                          line item breakdown" — only the amount was, with a small hint.
+                          The whole row opens it now, like the Balances page, with the
+                          caret by the name; buttons and links inside keep their own job. */}
+                      <div
+                        onClick={e => {
+                          if (!b) return
+                          if ((e.target as HTMLElement).closest('a,button,input,select')) return
+                          setOpenKey(open ? null : key)
+                        }}
+                        title={b ? (open ? 'Hide the charges' : 'See every charge behind this amount') : undefined}
+                        style={{
+                          display: 'flex', gap: 14, alignItems: 'flex-start',
+                          padding: '11px 0', cursor: b ? 'pointer' : 'default',
+                        }}>
                         <div style={{ minWidth: 150 }}>
-                          <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>{name}</div>
+                          <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>
+                            {b && <span style={{ color: 'var(--text-3)', marginRight: 6, fontSize: '.7rem' }}>{open ? '▾' : '▸'}</span>}
+                            {name}
+                          </div>
                           <div style={{ fontSize: '.76rem', color: 'var(--text-3)' }}>
                             {unit || '—'}
                           </div>
