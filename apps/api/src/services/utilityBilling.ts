@@ -2344,8 +2344,13 @@ async function attachBillToOpenInvoice(
       || wt.covered_charges.includes(String(held.utility_type)))
 
     const kind = String(held.utility_type)
+    // S654 (Nic): an onboarding resident already lived there — "nobody moves in
+    // during onboarding" — so the before-signing note is for new tenancies only.
+    const existing = await q1<{ is_existing_tenancy: boolean }>(
+      `SELECT COALESCE(is_existing_tenancy, false) AS is_existing_tenancy FROM leases WHERE id = $1`,
+      [args.leaseId])
     const label = `${kind[0].toUpperCase()}${kind.slice(1)} — ${cycleLabel(held.billing_cycle_month)}`
-      + ' (used before the lease was signed)'
+      + (existing?.is_existing_tenancy ? '' : ' (used before the lease was signed)')
     const pay = await q1<{ id: string }>(
       `INSERT INTO payments (
          invoice_id, unit_id, lease_id, tenant_id, landlord_id,

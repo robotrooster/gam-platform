@@ -629,7 +629,11 @@ export async function generateMoveInInvoice(
       const amount = Number(ub.charge_amount)
       if (!(amount > 0)) continue
       const covered = wtCovers(String(ub.utility_type))
-      const label = `${String(ub.utility_type)[0].toUpperCase()}${String(ub.utility_type).slice(1)} — ${ub.cycle_label} (used before the lease was signed)`
+      // S654 (Nic): an onboarding resident already lived there — "nobody moves
+      // in during onboarding" — so their earlier usage is just that month's
+      // usage. Only a genuinely new tenancy gets the before-signing note.
+      const label = `${String(ub.utility_type)[0].toUpperCase()}${String(ub.utility_type).slice(1)} — ${ub.cycle_label}`
+        + (leaseMeta?.is_existing_tenancy ? '' : ' (used before the lease was signed)')
       const up = await client.query<{ id: string }>(
         `INSERT INTO payments (
            invoice_id, unit_id, lease_id, tenant_id, landlord_id,

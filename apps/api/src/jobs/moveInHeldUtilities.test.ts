@@ -105,6 +105,9 @@ describe('held utilities on the move-in invoice', () => {
     expect(rows.rows).toHaveLength(1)
     expect(Number(rows.rows[0].amount)).toBe(185.01)
     expect(rows.rows[0].notes).toContain('Electric')
+    // S654 (Nic): "nobody moves in during onboarding" — an existing resident's
+    // earlier usage is just that month's usage, with no before-signing note.
+    expect(rows.rows[0].notes).not.toContain('before the lease was signed')
 
     // And the hold is settled, so no later run can bill it twice.
     const held = await db.query<any>(
