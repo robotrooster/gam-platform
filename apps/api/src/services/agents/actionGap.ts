@@ -66,6 +66,8 @@ const DELIBERATE = new Map(Object.entries({
     'adds a customer at the register, named by the person standing at the counter. Typed there with the sale on screen; a misheard name or email files purchases under a stranger.',
   'pos POST /transactions/:id/email-receipt':
     'emails a receipt for a sale the register just rang up, to an address typed at the counter — a misheard address sends someone\'s purchase to a stranger.',
+  'pos PUT /transactions/:id/customer-info':
+    'types in the name, email and phone of the person a rung-up sale belongs to. Done on the receipt screen or the sale\'s line in History with the sale on screen — a misheard email files a purchase under a stranger.',
   'pos PATCH /transactions/:id/customer':
     'changes which person a rung-up sale belongs to. Done from the sale\'s own line in History with the list of names on screen — the wrong name is a purchase on the wrong person\'s record.',
   'pos PATCH /customers/:id':

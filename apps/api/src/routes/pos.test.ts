@@ -2892,3 +2892,65 @@ describe('S654 the breakdown on the reader while the cart is rung, with the cust
     expect(n.rows[0].n).toBe(0)
   })
 })
+
+// S654 (Nic): "I don't want to change it to a whole dropdown of a list. I want to
+// just edit the field as their first and last name and email and phone number."
+describe('S654 typing in a sale\'s customer after the sale', () => {
+  const put = (f: PosFixture, txId: string, body: any) => request(buildApp())
+    .put(`/api/pos/transactions/${txId}/customer-info`).set('Authorization', `Bearer ${f.landlordToken}`).send(body)
+
+  it('names the card customer the sale already has — the same record, not a new one', async () => {
+    const f = await seedPosFixture()
+    const txId = await seedCompletedTransaction(f, { paymentMethod: 'card', total: 4.19 })
+    const c = await db.query<{ id: string }>(`INSERT INTO pos_customers (landlord_id, first_name, last_name, created_from) VALUES ($1,'Card','Customer','card_reader') RETURNING id`, [f.landlordId])
+    await db.query(`UPDATE pos_transactions SET pos_customer_id = $1 WHERE id = $2`, [c.rows[0].id, txId])
+    const res = await put(f, txId, { firstName: 'Nic', lastName: 'Rhoades', email: 'NIC@example.com', phone: '602-555-0101' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data.id).toBe(c.rows[0].id)
+    const row = await db.query(`SELECT first_name, last_name, email, phone FROM pos_customers WHERE id = $1`, [c.rows[0].id])
+    expect(row.rows[0]).toEqual({ first_name: 'Nic', last_name: 'Rhoades', email: 'nic@example.com', phone: '602-555-0101' })
+  })
+
+  it('a sale with nobody gets a new customer; an email already on file is that customer (folded, never duplicated)', async () => {
+    const f = await seedPosFixture()
+    const cashTx = await seedCompletedTransaction(f)
+    const created = await put(f, cashTx, { firstName: 'Cash', lastName: 'Buyer' })
+    expect(created.status).toBe(200)
+    const linked = await db.query(`SELECT pos_customer_id FROM pos_transactions WHERE id = $1`, [cashTx])
+    expect(linked.rows[0].pos_customer_id).toBe(created.body.data.id)
+
+    const known = await db.query<{ id: string }>(`INSERT INTO pos_customers (landlord_id, first_name, last_name, email) VALUES ($1,'Jane','Doe','jane@example.com') RETURNING id`, [f.landlordId])
+    const cardTx = await seedCompletedTransaction(f, { paymentMethod: 'card' })
+    const placeholder = await db.query<{ id: string }>(`INSERT INTO pos_customers (landlord_id, first_name, last_name, created_from) VALUES ($1,'Card','Customer','card_reader') RETURNING id`, [f.landlordId])
+    await db.query(`UPDATE pos_transactions SET pos_customer_id = $1 WHERE id = $2`, [placeholder.rows[0].id, cardTx])
+    const folded = await put(f, cardTx, { firstName: 'Jane', lastName: 'Doe', email: 'jane@example.com' })
+    expect(folded.status, JSON.stringify(folded.body)).toBe(200)
+    expect(folded.body.data.id).toBe(known.rows[0].id)
+    const tx = await db.query(`SELECT pos_customer_id FROM pos_transactions WHERE id = $1`, [cardTx])
+    expect(tx.rows[0].pos_customer_id).toBe(known.rows[0].id)
+    const gone = await db.query(`SELECT archived_at FROM pos_customers WHERE id = $1`, [placeholder.rows[0].id])
+    expect(gone.rows[0].archived_at).not.toBeNull()
+  })
+
+  it('a resident\'s sale is not edited here; another company\'s sale is not found', async () => {
+    const f = await seedPosFixture()
+    const other = await seedPosFixture()
+    const tenantId = await seedRealTenant()
+    const txId = await seedCompletedTransaction(f)
+    await db.query(`UPDATE pos_transactions SET tenant_id = $1 WHERE id = $2`, [tenantId, txId])
+    expect((await put(f, txId, { firstName: 'X' })).status).toBe(409)
+    const theirs = await seedCompletedTransaction(other)
+    expect((await put(f, theirs, { firstName: 'X' })).status).toBe(404)
+  })
+
+  it('a card the reader took is only ever recorded as a card sale', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const itemId = await seedPosItem(f, { sellPrice: 5, stockQty: 9 })
+    const res = await request(buildApp()).post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ items: [{ id: itemId, name: 'Ice', qty: 1, price: 5, tax: 0 }], paymentMethod: 'cash', propertyId: f.propertyId,
+              subtotal: 5, taxAmount: 0, total: 5, stripePaymentIntentId: 'pi_from_reader' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/card sale/i)
+  })
+})

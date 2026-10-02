@@ -10,7 +10,7 @@ import {
   type RegisteredReader,
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { apiGet, apiPost, apiPatch, apiDel } from '../lib/api'
+import { apiGet, apiPost, apiPatch, apiPut, apiDel } from '../lib/api'
 import { humanize, processingFeeFor, rvSiteFactsLabel, SUPPORTED_CARD_READER, READER_ORDER_STATUS_LABEL } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
@@ -33,6 +33,45 @@ const STATUS_MAP: Record<string,string> = { completed:'badge-green', voided:'bad
 // The API says HOW a card arrived (tender); payment_method alone says only 'card'.
 const METHOD_MAP: Record<string,string> = { cash:'badge-green', card:'badge-blue', card_reader:'badge-blue', pay_link:'badge-gold', pay_link_in_person_cash:'badge-gold', pay_link_in_person_card:'badge-gold', card_on_file:'badge-blue', charge:'badge-amber' }
 // S654 (Nic): online and in person are different facts about the same card.
+// S654 (Nic): "another way to add a customer name after the sale is completed …
+// I don't want to change it to a whole dropdown of a list. I want to just edit
+// the field as their first and last name and email and phone number." Typed in
+// for the sale; the server keeps one record per person (same email or phone =
+// the same customer).
+function SaleCustomerForm({ txId, initial, onSaved, onCancel }: {
+  txId: string
+  initial: { firstName?: string | null; lastName?: string | null; email?: string | null; phone?: string | null } | null
+  onSaved: (c: any) => void
+  onCancel?: () => void
+}) {
+  const placeholder = initial?.firstName === 'Card' && initial?.lastName === 'Customer'
+  const [form, setForm] = useState({
+    firstName: placeholder ? '' : (initial?.firstName || ''), lastName: placeholder ? '' : (initial?.lastName || ''),
+    email: initial?.email || '', phone: initial?.phone || '' })
+  const save = useMutation(
+    () => apiPut(`/pos/transactions/${txId}/customer-info`, { firstName: form.firstName.trim(), lastName: form.lastName.trim() || null,
+      email: form.email.trim() || null, phone: form.phone.trim() || null }),
+    { onSuccess: (row: any) => { toast('Customer saved'); onSaved(row) },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'The customer could not be saved') })
+  const emailOk = !form.email.trim() || /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(form.email.trim())
+  return (
+    <div style={{display:'grid',gap:6,width:'100%'}}>
+      <div style={{display:'flex',gap:6}}>
+        <input className="form-input" placeholder="First name" value={form.firstName} onChange={e=>setForm(f=>({ ...f, firstName:e.target.value }))} />
+        <input className="form-input" placeholder="Last name" value={form.lastName} onChange={e=>setForm(f=>({ ...f, lastName:e.target.value }))} />
+      </div>
+      <div style={{display:'flex',gap:6}}>
+        <input className="form-input" type="email" placeholder="Email" value={form.email} onChange={e=>setForm(f=>({ ...f, email:e.target.value }))} />
+        <input className="form-input" placeholder="Phone" value={form.phone} onChange={e=>setForm(f=>({ ...f, phone:e.target.value }))} />
+      </div>
+      <div style={{display:'flex',gap:6}}>
+        <button type="button" className="btn btn-primary btn-sm" disabled={!form.firstName.trim()||!emailOk||save.isLoading} onClick={()=>save.mutate()}>{save.isLoading?'Saving…':'Save customer'}</button>
+        {onCancel && <button type="button" className="btn btn-ghost btn-sm" onClick={onCancel}>Cancel</button>}
+      </div>
+    </div>
+  )
+}
+
 // S654 (Nic): one customer record — edit it, open its history, fold it into
 // another. Merge candidates are the same email or the same phone; never the
 // same name ("people aren't going to have the same email if they're a different
@@ -702,6 +741,17 @@ export function POSPage() {
     setTapNow(Date.now()); setTapEndsAt(Date.now() + ms)
   })
   const tapSecondsLeft = tapEndsAt ? Math.max(0, Math.ceil((tapEndsAt - tapNow) / 1000)) : 0
+  // S654 (review): the window charges the sale that was on screen when Charge
+  // was pressed. If the tender, reader, cart or customer changes while it runs,
+  // the window ends as Cancel — nothing is charged; press Charge again.
+  const chargeSubject = JSON.stringify([method, liveReaderId, liveCartLines, discountAmt, tenantId, posCustomerId])
+  const tapSubject = useRef<string | null>(null)
+  useEffect(() => {
+    if (terminalStatus === 'awaiting_tap' && tapSubject.current && tapSubject.current !== chargeSubject) tapWaiter.current?.('cancel')
+  }, [chargeSubject, terminalStatus])
+  // While the reader holds a charge the tender, Clear, hold-for-delivery and
+  // pay link wait — a card the reader takes is only ever this card sale.
+  const readerHoldsCharge = terminalStatus === 'awaiting_tap' || terminalStatus === 'collecting' || terminalStatus === 'capturing'
 
   const applyDiscountCode = () => {
     const d = (discounts as any[]).find((x:any) => x.code?.toLowerCase() === discountCode.toLowerCase())
@@ -716,7 +766,8 @@ export function POSPage() {
   const checkoutMut = useMutation(
     (stripePaymentIntentId?: string) => apiPost('/pos/transactions', {
       items: cart.map(i => ({ id:i.id.startsWith('open-')?null:i.id, name:i.name, qty:i.qty, price:i.price, tax:i.tax, cat:i.cat })),
-      paymentMethod:method,
+      // S654: a card the reader took is a card sale, whatever the tender buttons say now.
+      paymentMethod: stripePaymentIntentId ? 'card' : method,
       // S254: charge mode posts customer + property scoping for FlexCharge
       tenantId: tenantId||null,
       // S652: a card on file belongs to a PERSON, so the sale has to say which
@@ -935,8 +986,12 @@ export function POSPage() {
           if (breakdownUp) shownOnReader.current = { readerId: activeReader.stripeReaderId, propertyId: registerProperty }
         }
         if (breakdownUp) {
+          tapSubject.current = JSON.stringify(['card', activeReader.stripeReaderId,
+            latest.current.cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax })),
+            latest.current.discountAmt, latest.current.tenantId, latest.current.posCustomerId])
           setTerminalStatus('awaiting_tap')
           const outcome = await waitForTap()
+          tapSubject.current = null
           if (outcome === 'cancel') { setTerminalStatus('idle'); return }
           setTerminalStatus('collecting')
           await liveCartCall.current?.catch(() => {})
@@ -1102,11 +1157,6 @@ export function POSPage() {
       onError: (e: any) => toast.error(e?.response?.data?.error || 'The receipt could not be sent') })
   const { data: customersBase = [], isLoading: custLoading } = useQuery<any[]>(['pos-customer-base', registerProperty],
     () => apiGet(`/pos/customers?propertyId=${registerProperty}`), { enabled: tab==='customers' && !!registerProperty })
-  const setTxCustomerMut = useMutation(
-    (v: { id: string; value: string }) => apiPatch(`/pos/transactions/${v.id}/customer`, {
-      tenantId: v.value.startsWith('t:') ? v.value.slice(2) : null, posCustomerId: v.value.startsWith('c:') ? v.value.slice(2) : null }),
-    { onSuccess: () => { setTxEdit(null); qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-customer-base') },
-      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not change the customer') })
   const txReceiptMut = useMutation(
     (v: { id: string; email: string }) => apiPost(`/pos/transactions/${v.id}/email-receipt`, { email: v.email.trim() }),
     { onSuccess: (r: any) => { setTxEdit(null); toast(`Receipt sent to ${r.data.sentTo}`); qc.invalidateQueries('pos-people'); qc.invalidateQueries('pos-customer-base') },
@@ -1144,6 +1194,15 @@ export function POSPage() {
             </div>
             {receipt.method==='cash'&&receipt.changeDue>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--green)',fontWeight:600}}><span>Change Due</span><span>{fmt(receipt.changeDue)}</span></div>}
           </div>
+          {!receipt.tenantId && (
+            <div style={{textAlign:'left',border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 12px',marginBottom:12,fontSize:'.82rem'}}>
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:6}}>Customer information</div>
+              <SaleCustomerForm key={`${receipt.id}:${receipt.customer?.id ?? ''}`} txId={receipt.id} initial={receipt.customer ?? null}
+                onSaved={(c:any)=>{ setReceipt((r:any)=>({ ...r, customer: { ...(r.customer || {}), id: c.id, firstName: c.firstName, lastName: c.lastName, email: c.email, phone: c.phone } }))
+                  if (c.email && !receiptEmail.trim()) setReceiptEmail(c.email)
+                  qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-customer-base'); qc.invalidateQueries('pos-people') }} />
+            </div>
+          )}
           {receipt.customer && (
             <div style={{textAlign:'left',border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 12px',marginBottom:12,fontSize:'.82rem'}}>
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
@@ -1290,7 +1349,7 @@ export function POSPage() {
               </div>
             )}
             <div className="card-header"><span className="card-title">Current Sale</span>
-              {cart.length>0&&<button onClick={() => {
+              {cart.length>0&&<button disabled={readerHoldsCharge} onClick={() => {
                 // S652 (Nic): "just clearing the cart should clear it, and if
                 // they have a name associated with it save it as a ticket."
                 if (tenantId || posCustomerId) { writeTicketMut.mutate(); return }
@@ -1363,7 +1422,7 @@ export function POSPage() {
                     point of sale customer, we can just auto charge them on
                     delivery and we don't even have to take the reader with us."
                     Same card, same fee — nobody is holding the plastic. */}
-                {(['cash','card','card_on_file','charge'] as const).filter(m=>!(LAUNCH_HIDE_CHARGE && m==='charge')).map(m=>(<button key={m} onClick={()=>setMethod(m)} style={{padding:'7px 0',border:"1px solid "+(method===m?'var(--gold)':'var(--border-1)'),background:method===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.75rem',fontWeight:method===m?700:400,color:method===m?'var(--gold)':'var(--text-2)'}}>{m==='card_on_file'?'On file':m==='charge'?'Charge':m==='cash'?'Cash':'Card'}</button>))}
+                {(['cash','card','card_on_file','charge'] as const).filter(m=>!(LAUNCH_HIDE_CHARGE && m==='charge')).map(m=>(<button key={m} disabled={readerHoldsCharge} onClick={()=>setMethod(m)} style={{opacity:readerHoldsCharge&&method!==m?0.45:1,padding:'7px 0',border:"1px solid "+(method===m?'var(--gold)':'var(--border-1)'),background:method===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.75rem',fontWeight:method===m?700:400,color:method===m?'var(--gold)':'var(--text-2)'}}>{m==='card_on_file'?'On file':m==='charge'?'Charge':m==='cash'?'Cash':'Card'}</button>))}
               </div>
             </div>
             {method==='cash'&&(<div style={{marginBottom:10}}>
@@ -1486,7 +1545,7 @@ export function POSPage() {
             {/* S648 (Nic): "generate an item, a charge and send it to a link so
                 they can pay by email." The same cart, paid later by card. */}
             <button className="btn btn-ghost" style={{width:'100%',marginTop:8}}
-              disabled={cart.length===0 || !registerProperty}
+              disabled={cart.length===0 || !registerProperty || readerHoldsCharge}
               onClick={()=>setPayLinkOpen(true)}>
               Email a pay link
             </button>
@@ -1497,7 +1556,7 @@ export function POSPage() {
                 instead of chasing somebody down later." */}
             <button className="btn btn-ghost" style={{width:'100%',marginTop:8}}
               disabled={cart.length===0 || !registerProperty || (!tenantId && !posCustomerId) || !!openTicketId || !!payLinkId
-                        || writeTicketMut.isLoading}
+                        || writeTicketMut.isLoading || readerHoldsCharge}
               onClick={()=>writeTicketMut.mutate()}>
               {writeTicketMut.isLoading ? 'Writing it up…' : 'Hold for delivery'}
             </button>
@@ -1573,14 +1632,11 @@ export function POSPage() {
                     {/* S654 (Nic): fix who a sale belongs to; resend its receipt. */}
                     <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',marginTop:8,paddingTop:8,borderTop:'1px solid var(--border-1)'}}>
                       {(() => { const te = txEdit && txEdit.id===t.id ? txEdit : null
-                      if (te && te.mode==='customer') { const cur = te; return (<>
-                        <select className="form-select" value={cur.value} onChange={e=>{ const v=e.target.value; setTxEdit(prev=>prev?{ ...prev, value:v }:prev) }} style={{minWidth:220}}>
-                          <option value="">No customer</option>
-                          {(people as any[]).map((p:any)=><option key={p.key} value={p.key}>{p.name}{p.detail?` — ${p.detail}`:''}</option>)}
-                        </select>
-                        <button className="btn btn-primary btn-sm" disabled={setTxCustomerMut.isLoading} onClick={()=>setTxCustomerMut.mutate({ id:t.id, value:cur.value })}>Save</button>
-                        <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit(null)}>Cancel</button>
-                      </>) }
+                      if (te && te.mode==='customer') return (
+                        <SaleCustomerForm txId={t.id}
+                          initial={{ firstName: t.customerFirstName, lastName: t.customerLastName, email: t.customerEmail, phone: t.customerPhone }}
+                          onSaved={()=>{ setTxEdit(null); qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-customer-base'); qc.invalidateQueries('pos-people') }}
+                          onCancel={()=>setTxEdit(null)} />)
                       if (te && te.mode==='receipt') { const cur = te; return (<>
                         <input className="form-input" type="email" placeholder="name@example.com" value={cur.value} onChange={e=>{ const v=e.target.value; setTxEdit(prev=>prev?{ ...prev, value:v }:prev) }} style={{minWidth:220}} />
                         <button className="btn btn-primary btn-sm" disabled={!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cur.value.trim())||txReceiptMut.isLoading} onClick={()=>txReceiptMut.mutate({ id:t.id, email:cur.value })}>{txReceiptMut.isLoading?'Sending…':'Send receipt'}</button>
@@ -1588,7 +1644,7 @@ export function POSPage() {
                       </>) }
                       return (<>
                         <span style={{color:'var(--text-3)',fontSize:'.75rem'}}>Customer: {t.tenantName||t.customerName||'—'}</span>
-                        <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit({ id:t.id, mode:'customer', value: t.tenantId?`t:${t.tenantId}`:t.posCustomerId?`c:${t.posCustomerId}`:'' })}>Change</button>
+                        {!t.tenantId && <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit({ id:t.id, mode:'customer', value:'' })}>{t.customerName ? 'Edit customer' : 'Add customer'}</button>}
                         <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit({ id:t.id, mode:'receipt', value: t.customerEmail||'' })}>Email receipt</button>
                       </>) })()}
                     </div>

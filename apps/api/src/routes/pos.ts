@@ -1126,6 +1126,11 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     if (paymentMethod === 'card' && !stripePaymentIntentId) {
       throw new AppError(400, 'Card sales go through the card reader')
     }
+    // S654: a card the reader took is a card sale — never recorded as cash or a
+    // charge account, which would leave the card authorized and uncaptured.
+    if (stripePaymentIntentId && paymentMethod !== 'card') {
+      throw new AppError(400, 'A card from the reader can only be recorded as a card sale.')
+    }
 
     // S652 — CHARGE THE CARD THEY ALREADY GAVE US.
     //
@@ -2098,6 +2103,7 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
         u.first_name || ' ' || u.last_name AS tenant_name,
         NULLIF(TRIM(pc.first_name || ' ' || pc.last_name), '') AS customer_name,
         pc.email AS customer_email,
+        pc.first_name AS customer_first_name, pc.last_name AS customer_last_name, pc.phone AS customer_phone,
         (SELECT COUNT(*) FROM pos_transaction_items WHERE transaction_id=t.id) as item_count,
         -- S653 (Nic): "flag the history different for pay links vs terminal
         -- reader." payment_method says card either way; how the card was
@@ -2979,6 +2985,72 @@ posRouter.post('/customers/:id/merge', requirePerm('pos.ring_sale'), async (req,
 })
 
 // Fix which customer a sale belongs to, after the fact.
+// S654 (Nic): "another way to add a customer name after the sale is completed …
+// I don't want to change it to a whole dropdown of a list. I want to just edit
+// the field as their first and last name and email and phone number." The
+// sale's customer is typed in: the record the sale already has is edited (a
+// name-less card customer gets their name); a sale with nobody gets a new
+// customer. An email or phone already on another customer of this company is
+// the same person — this record is folded into theirs, never duplicated.
+// A resident's details belong to their account and are not edited here.
+posRouter.put('/transactions/:id/customer-info', requirePerm('pos.ring_sale'), async (req, res, next) => {
+  try {
+    const b = z.object({
+      firstName: z.string().trim().min(1, 'A first name is needed').max(80),
+      lastName:  z.string().trim().max(80).optional().nullable(),
+      email:     z.string().trim().max(200).optional().nullable(),
+      phone:     z.string().trim().max(40).optional().nullable(),
+    }).parse(req.body)
+    const email = b.email ? b.email.toLowerCase() : null
+    if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new AppError(400, 'That email does not look right')
+    const phone = b.phone || null
+    const digits = phone ? phone.replace(/\D/g, '') : ''
+    const landlordId = posLandlordId(req)
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const tx = (await client.query<any>(
+        `SELECT id, tenant_id, pos_customer_id FROM pos_transactions WHERE id = $1 AND landlord_id = $2 FOR UPDATE`,
+        [req.params.id, landlordId])).rows[0]
+      if (!tx) throw new AppError(404, 'Sale not found')
+      if (tx.tenant_id) throw new AppError(409, "This sale is a resident's — their name and email are on their account.")
+      // Somebody else of this company's with the same email or phone is this person.
+      const same = (email || digits.length >= 7) ? (await client.query<any>(
+        `SELECT id FROM pos_customers
+          WHERE landlord_id = $1 AND archived_at IS NULL AND id <> COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+            AND (($3::text IS NOT NULL AND lower(email) = $3)
+              OR ($4::text <> '' AND ${phoneDigits('phone')} = $4))
+          ORDER BY (lower(email) = $3) DESC NULLS LAST, created_at
+          LIMIT 1`, [landlordId, tx.pos_customer_id, email, digits.length >= 7 ? digits : ''])).rows[0] : null
+      let customerId: string
+      if (tx.pos_customer_id && same) {
+        await mergePosCustomers(client, { landlordId, loserId: tx.pos_customer_id, into: same.id })
+        customerId = same.id
+      } else if (tx.pos_customer_id) {
+        customerId = tx.pos_customer_id
+      } else if (same) {
+        customerId = same.id
+      } else {
+        customerId = (await client.query<{ id: string }>(
+          `INSERT INTO pos_customers (landlord_id, first_name, last_name, created_from) VALUES ($1, $2, '', 'manual') RETURNING id`,
+          [landlordId, b.firstName])).rows[0].id
+      }
+      const row = (await client.query<any>(
+        `UPDATE pos_customers SET first_name = $1, last_name = $2, email = $3, phone = $4, updated_at = NOW()
+          WHERE id = $5 RETURNING id, first_name, last_name, email, phone`,
+        [b.firstName, b.lastName ?? '', email, phone, customerId])).rows[0]
+      // The sale (and, after a fold, every sale of the folded record) is this customer's.
+      await client.query(`UPDATE pos_transactions SET pos_customer_id = $1 WHERE id = $2`, [customerId, tx.id])
+      await client.query('COMMIT')
+      res.json({ success: true, data: row })
+    } catch (e: any) {
+      await client.query('ROLLBACK').catch(() => {})
+      if (e?.code === '23505') throw new AppError(409, 'That email is already on another customer.')
+      throw e
+    } finally { client.release() }
+  } catch (e) { next(e) }
+})
+
 posRouter.patch('/transactions/:id/customer', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const b = z.object({ posCustomerId: z.string().uuid().nullable().optional(), tenantId: z.string().uuid().nullable().optional() }).parse(req.body)
