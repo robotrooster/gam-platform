@@ -23,6 +23,20 @@ import { resolveLandlordTarget, landlordIdForProperty, landlordScopeIds } from '
 
 const INVITATION_TTL_HOURS = 24
 
+/**
+ * S654: every column of an invitation except its token.
+ *
+ * The invite, resend and revoke routes returned the row whole (RETURNING *) and
+ * the role listing read SELECT * FROM invitations, so the caller got the very
+ * secret that lets someone accept. Landlord B invited landlord A's property
+ * manager, read the token off the 201, and accepted it himself. The token goes
+ * only to the invitee's address, by email (buildAcceptUrl). No landlord screen
+ * reads it from a response.
+ */
+const INVITATION_COLUMNS = `id, email, landlord_id, role, scope_payload, invited_by_user_id,
+  status, expires_at, accepted_at, accepted_user_id, revoked_at, revoked_by_user_id,
+  created_at, first_name, last_name, phone`
+
 const SCOPE_TABLES: Record<LandlordAssignableRole, string> = {
   property_manager: 'property_manager_scopes',
   onsite_manager:   'onsite_manager_scopes',
@@ -403,8 +417,9 @@ scopesRouter.get('/:roleType', requirePerm('team.invite', 'team.manage_permissio
        ORDER BY s.created_at DESC`,
       [landlordIds])
 
+    // S654: by name, never the token.
     const invitations = await query<any>(
-      `SELECT * FROM invitations
+      `SELECT ${INVITATION_COLUMNS} FROM invitations
        WHERE landlord_id = ANY($1::uuid[]) AND role = $2
        ORDER BY created_at DESC
        LIMIT 100`,
@@ -466,7 +481,7 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
         `INSERT INTO invitations
            (email, landlord_id, role, scope_payload, invited_by_user_id, token, expires_at,
             first_name, last_name, phone)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING ${INVITATION_COLUMNS}`,
         [body.email, landlordId, role, JSON.stringify(scope),
          req.user!.userId, token, expiresAt,
          body.firstName || null, body.lastName || null, body.phone || null])
@@ -633,7 +648,7 @@ scopesRouter.post('/invitations/:id/resend', requirePerm('team.invite'), async (
     try {
       await client.query('BEGIN')
       const upd = await client.query(
-        `UPDATE invitations SET token = $1, expires_at = $2 WHERE id = $3 RETURNING *`,
+        `UPDATE invitations SET token = $1, expires_at = $2 WHERE id = $3 RETURNING ${INVITATION_COLUMNS}`,
         [token, expiresAt, inv.id])
       await client.query(
         `INSERT INTO platform_events (subject_type, subject_id, event_type, actor_user_id, payload)
@@ -670,7 +685,7 @@ scopesRouter.post('/invitations/:id/revoke', requirePerm('team.invite'), async (
       await client.query('BEGIN')
       const upd = await client.query(
         `UPDATE invitations SET status='revoked', revoked_at=NOW(), revoked_by_user_id=$1
-         WHERE id=$2 RETURNING *`,
+         WHERE id=$2 RETURNING ${INVITATION_COLUMNS}`,
         [req.user!.userId, inv.id])
       await client.query(
         `INSERT INTO platform_events (subject_type, subject_id, event_type, actor_user_id, payload)
@@ -736,8 +751,22 @@ invitationsRouter.get('/:token', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+/**
+ * S654: read the caller's session when they sent one, without demanding it.
+ * A new invitee has no account yet and accepts with the emailed link alone; an
+ * existing account accepts only from its own session (see the accept route).
+ * A malformed or expired token still gets requireAuth's 401.
+ */
+function sessionIfSent(req: any, res: any, next: any) {
+  if (!String(req.headers?.authorization ?? '').startsWith('Bearer ')) return next()
+  return requireAuth(req, res, next)
+}
+
+const ACCEPT_FROM_OWN_ACCOUNT =
+  'This email already has a GAM account. Sign in to that account, then open this link again to accept.'
+
 // POST /api/invitations/:token/accept
-invitationsRouter.post('/:token/accept', async (req, res, next) => {
+invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) => {
   try {
     const body = z.object({
       password:  z.string().min(8).optional(),
@@ -782,6 +811,19 @@ invitationsRouter.post('/:token/accept', async (req, res, next) => {
           [inv.email, hash, role, body.firstName, body.lastName, body.phone || null])
         user = newUser.rows[0]
       } else {
+        // S654: an account that already exists says yes from its OWN session.
+        // This asked for no login at all, so whoever held the link attached the
+        // person: landlord B invited landlord A's property manager, accepted
+        // with an empty body, and A's manager was on B's team (and could then be
+        // put in B's landlord signing seat) without ever being asked. The link
+        // proves who can read a mailbox, not who agreed. Same check as the
+        // co-owner accept (landlords.ts member-invite): the signed-in login must
+        // be the account on the invitation's address, and one login per address
+        // in any letter case means that is the same id. Checked before anything
+        // about the account is said back.
+        if (!req.user || req.user.userId !== user.id) {
+          throw new AppError(403, ACCEPT_FROM_OWN_ACCOUNT)
+        }
         // Existing account: only allow accept if existing role matches the invite role.
         // A landlord/tenant/admin cannot be rewritten into a worker role by accepting.
         // A worker role user can take additional scope with another landlord only if

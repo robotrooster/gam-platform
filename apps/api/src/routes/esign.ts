@@ -27,7 +27,6 @@ import {
   FEE_TYPES,
   FEE_TYPE_META, MONEY_KINDS, isMoneyBoxColumn,
   moveInDefaults,
-  nextDueDateAfter,
   leaseDueDay,
   dueDayLabel,
   parseDueDay,
@@ -63,6 +62,7 @@ import { activateHomeSaleContract } from '../services/homeSale'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 import { landlordSigningContact } from '../services/landlordSigningContact'
 import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, fileUnderCompany } from '../lib/landlordScope'
+import { NOT_A_RESIDENT_ACCOUNT } from '../jobs/leaseParser/resolveIntent'
 
 export const esignRouter = Router()
 
@@ -78,6 +78,223 @@ const TENANT_APP_URL   = process.env.TENANT_APP_URL   || 'http://localhost:3002'
 // creation time get their fields pruned (see POST /documents).
 const TENANT_ROLE_PATTERN = /^(primary|co_tenant_\d+)$/
 function isTenantRole(role: string): boolean { return TENANT_ROLE_PATTERN.test(role) }
+
+// ─────────────────────────────────────────────────────────────
+// S654 — WHO A COMPANY MAY PUT ON ITS DOCUMENT, AND WHERE THEIR MAIL GOES
+// ─────────────────────────────────────────────────────────────
+//
+// A signer row is a door. Its user id says whose signature the document
+// collects; its email is where the signing link goes — and, for a resident who
+// never set up their account, the password link too. Both used to come straight
+// from the request body. Landlord B looked up landlord A's invitee through
+// /witnesses/provision, listed them as the primary tenant with B's own address
+// in the email box, signed, and the relay mailed A's live password link to B.
+//
+// So every route that takes signers from the body runs these two checks, and
+// createDocumentRecord stores a non-landlord signer's own account address
+// whatever the body said:
+//   - a tenant role (primary, co_tenant_N) is a resident's login, never a
+//     landlord's or a staff member's (409 NOT_A_RESIDENT_ACCOUNT);
+//   - a witness is never a landlord or staff login (the same rule
+//     /witnesses/provision applies);
+//   - a resident's login never signs for the landlord, and the landlord's
+//     seat goes only to an owner or staff login on the document company's own
+//     account, at that login's own address, or the property's lease-signing
+//     address for the login the property names as its signer
+//     (assertLandlordSigners);
+//   - a resident (a login with a tenant profile) must already belong to this
+//     company: a lease, an invite or a draft lease with it. Anyone else is
+//     another company's resident, or nobody's yet — invite them first.
+//
+// A login with no tenant profile (a witness set up through /witnesses/provision,
+// or a contact the standalone flow just made) is not a resident, so it needs no
+// tie. Whatever it is mailed goes to its own address, and a password link only
+// under services/tenantLeaseLink's rules.
+
+/** Logins that may stand in a resident's or a witness's place on a document. */
+const RESIDENT_TYPE_LOGINS = new Set(['tenant', 'contact'])
+
+const WITNESS_NOT_A_STAFF_LOGIN =
+  "This email belongs to a landlord or staff login on GAM, so it can't be used for a witness. Use the witness's own email."
+const RESIDENT_CANNOT_SIGN_FOR_LANDLORD =
+  "A resident's account can't sign for the landlord. Use the landlord's or a staff member's own login."
+function notThisCompanysResident(who: string): string {
+  return `${who} has no lease, invite or draft lease with this company, so they can't be put on its documents. Invite them first.`
+}
+
+const SIGNER_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+type SignerAccount = { id: string; role: string; email: string; has_tenant: boolean }
+type RowsQuery = (sql: string, params: any[]) => Promise<any[]>
+const poolRows: RowsQuery = (sql, params) => query<any>(sql, params)
+
+/**
+ * S654: load each signer's account and refuse the wrong KIND of login for the
+ * role it is put in. Returns the accounts by id for assertResidentsBelong.
+ * `q` reads inside the caller's transaction when it has made accounts there.
+ */
+async function assertSignerLogins(
+  signers: Array<{ userId?: string; role: string; name?: string }>,
+  q: RowsQuery = poolRows,
+): Promise<Map<string, SignerAccount>> {
+  const ids = signers.map(s => s.userId).filter((id): id is string => !!id)
+  const noAccount = (s: { name?: string }) =>
+    new AppError(400, `${s.name?.trim() || 'A signer'} has no GAM account.`)
+  for (const s of signers) {
+    if (s.userId && !SIGNER_UUID_RE.test(s.userId)) throw noAccount(s)
+  }
+  const rows: SignerAccount[] = ids.length ? await q(
+    `SELECT u.id, u.role, u.email,
+            EXISTS (SELECT 1 FROM tenants t WHERE t.user_id = u.id) AS has_tenant
+       FROM users u WHERE u.id = ANY($1::uuid[])`, [ids]) : []
+  const byId = new Map(rows.map(r => [r.id, r]))
+  for (const s of signers) {
+    if (!s.userId) continue
+    const a = byId.get(s.userId)
+    if (!a) throw noAccount(s)
+    if (s.role === 'landlord') {
+      if (RESIDENT_TYPE_LOGINS.has(a.role)) throw new AppError(409, RESIDENT_CANNOT_SIGN_FOR_LANDLORD)
+    } else if (isTenantRole(s.role)) {
+      if (a.role !== 'tenant') throw new AppError(409, NOT_A_RESIDENT_ACCOUNT)
+    } else if (s.role === 'witness') {
+      if (!RESIDENT_TYPE_LOGINS.has(a.role)) throw new AppError(409, WITNESS_NOT_A_STAFF_LOGIN)
+    }
+  }
+  return byId
+}
+
+/**
+ * S654: the residents among `ids` who belong to `own` — a lease, a live invite
+ * or a draft lease with one of those companies.
+ */
+async function residentsTiedHere(ids: string[], own: string[], q: RowsQuery = poolRows): Promise<Set<string>> {
+  const companies = Array.from(new Set(own.filter(Boolean)))
+  if (!ids.length || !companies.length) return new Set()
+  const rows = await q(
+    `SELECT t.user_id FROM tenants t
+       JOIN lease_tenants lt ON lt.tenant_id = t.id
+       JOIN leases l ON l.id = lt.lease_id
+      WHERE t.user_id = ANY($1::uuid[]) AND l.landlord_id = ANY($2::uuid[])
+     UNION
+     SELECT t.user_id FROM tenants t
+       JOIN pending_tenant_intents i ON i.tenant_id = t.id
+      WHERE t.user_id = ANY($1::uuid[]) AND i.landlord_id = ANY($2::uuid[])
+        AND i.cancelled_at IS NULL
+     UNION
+     SELECT d.tenant_user_id FROM pending_lease_drafts d
+      WHERE d.tenant_user_id = ANY($1::uuid[]) AND d.landlord_id = ANY($2::uuid[])`,
+    [ids, companies])
+  return new Set(rows.map((r: any) => r.user_id))
+}
+
+/**
+ * S654: a resident on a document must already be this company's. `own` is the
+ * document's company plus the companies the acting account holds — the same
+ * set every other door counts as "this company".
+ */
+async function assertResidentsBelong(
+  signers: Array<{ userId?: string; role: string; name?: string }>,
+  accounts: Map<string, SignerAccount>,
+  own: string[],
+  q: RowsQuery = poolRows,
+): Promise<void> {
+  const residents = signers.filter(s => s.userId && s.role !== 'landlord'
+    && accounts.get(s.userId)?.role === 'tenant' && accounts.get(s.userId)?.has_tenant)
+  if (!residents.length) return
+  const tied = await residentsTiedHere(residents.map(s => s.userId!), own, q)
+  const stranger = residents.find(s => !tied.has(s.userId!))
+  if (stranger) throw new AppError(409, notThisCompanysResident(stranger.name?.trim() || 'This person'))
+}
+
+const LANDLORD_SEAT_NOT_THIS_COMPANY =
+  "Only an owner or staff member of this company can sign for the landlord. Use your own login or one of your team's."
+const LANDLORD_SEAT_WRONG_ADDRESS =
+  "The landlord's signing link can only go to that login's own email, or to this property's lease-signing email when the property's own signer holds the seat."
+
+/**
+ * S654: the landlord's seat on a document.
+ *
+ * assertSignerLogins only kept a resident's login out of it, so landlord B put
+ * landlord A's login in the landlord seat with attacker@evil.test as the
+ * address. The row was stored at that address, /send mailed it A's row token,
+ * B could sign B's document as A, and A — now a signer — could read it.
+ *
+ * So the seat goes only to a login on the document company's own account: an
+ * owner (landlords.user_id, or landlord_members) of a company in
+ * account_companies(document company), or a team member scoped to one — the
+ * same people who already sign there (services/leaseSigner hands the seat to a
+ * property's on-site manager). Its link goes only to that login's own address,
+ * or, for the one login the property names as its signer
+ * (services/landlordSigningContact), the property's lease-signing address.
+ * Anything else is 409.
+ *
+ * S654 round 8: the lease-signing address was accepted for ANY login allowed
+ * in the seat. The property owner chooses that address, so another company's
+ * person who had been attached to this account (a co-owner add, a team invite
+ * accepted with no login) had their row token mailed to wherever the owner
+ * pointed it, and anyone holding that link signed as them. The address now
+ * goes with the login landlordSigningContact names for the property, the same
+ * owner and address pair the renewal, work-trade and auto-draft paths produce.
+ * Everyone else reaches the seat only at their own users.email.
+ *
+ * Each landlord signer's email is set to the stored address it matched, and a
+ * blank one to the login's own address, since createDocumentRecord stores the
+ * landlord row at the address it is handed.
+ */
+async function assertLandlordSigners(
+  signers: Array<{ userId?: string; role: string; email?: string | null }>,
+  doc: { landlordId: string; unitId?: string | null },
+  q: RowsQuery = poolRows,
+): Promise<void> {
+  const seats = signers.filter(s => s.role === 'landlord' && s.userId)
+  if (!seats.length) return
+  const rows: Array<{ id: string; email: string }> = await q(
+    `WITH co AS (SELECT account_companies($2::uuid) AS id)
+     SELECT u.id, u.email FROM users u
+      WHERE u.id = ANY($1::uuid[])
+        AND (   EXISTS (SELECT 1 FROM landlords l
+                         WHERE l.user_id = u.id AND l.id IN (SELECT id FROM co))
+             OR EXISTS (SELECT 1 FROM landlord_members m
+                         WHERE m.user_id = u.id AND m.landlord_id IN (SELECT id FROM co))
+             OR EXISTS (SELECT 1 FROM property_manager_scopes s
+                         WHERE s.user_id = u.id AND s.landlord_id IN (SELECT id FROM co))
+             OR EXISTS (SELECT 1 FROM onsite_manager_scopes s
+                         WHERE s.user_id = u.id AND s.landlord_id IN (SELECT id FROM co))
+             OR EXISTS (SELECT 1 FROM maintenance_worker_scopes s
+                         WHERE s.user_id = u.id AND s.landlord_id IN (SELECT id FROM co))
+             OR EXISTS (SELECT 1 FROM bookkeeper_scopes s
+                         WHERE s.user_id = u.id AND s.landlord_id IN (SELECT id FROM co)))`,
+    [seats.map(s => s.userId), doc.landlordId])
+  const ours = new Map(rows.map(r => [r.id, r.email]))
+  const contact = doc.unitId
+    ? await landlordSigningContact(doc.landlordId, { unitId: doc.unitId },
+        { query: async (sql: string, params: any[]) => ({ rows: await q(sql, params) }) })
+    : null
+  const onSite = contact?.delegatedEmail?.trim() || null
+  const same = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase()
+  for (const s of seats) {
+    const own = ours.get(s.userId!)
+    if (!own) throw new AppError(409, LANDLORD_SEAT_NOT_THIS_COMPANY)
+    const given = String(s.email ?? '').trim()
+    if (!given || same(given, own)) s.email = own
+    // S654: the property's lease-signing address only for the property's own
+    // named signer, never for any other login in the seat.
+    else if (onSite && contact && s.userId === contact.userId && same(given, onSite)) s.email = onSite
+    else throw new AppError(409, LANDLORD_SEAT_WRONG_ADDRESS)
+  }
+}
+
+/**
+ * S654: where a signer's mail goes. Anyone but the landlord is reached only at
+ * the address on their own account, never one a signer row or a request
+ * carried. The landlord's row may hold the property's on-site signing address
+ * (services/landlordSigningContact), so it keeps its own.
+ */
+async function signerDeliveryAddress(s: { role: string; email: string; user_id: string }): Promise<string> {
+  if (s.role === 'landlord') return s.email
+  const u = await queryOne<{ email: string }>('SELECT email FROM users WHERE id = $1', [s.user_id])
+  return u?.email ?? s.email
+}
 
 // ─────────────────────────────────────────────────────────────
 // HELPERS
@@ -359,11 +576,18 @@ export async function createDocumentRecord(client: any, opts: {
   // INSERT signers
   for (const s of opts.signers) {
     const token = crypto.randomBytes(32).toString('hex')
+    // S654: anyone but the landlord is stored at the address on their own
+    // account. The email a caller passes is never where a resident's signing
+    // link (or password link) goes — that is how landlord B had landlord A's
+    // invitee's link mailed to B. The landlord's row keeps the address given:
+    // it may be the property's on-site signer (services/landlordSigningContact).
+    const own = s.role === 'landlord' ? null : await client.query(
+      'SELECT email FROM users WHERE id = $1', [s.userId]).then((r: any) => r.rows[0])
     await client.query(`
       INSERT INTO lease_document_signers
         (document_id, user_id, role, name, email, phone, order_index, token)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [doc.id, s.userId, s.role, s.name, s.email, s.phone || null, s.orderIndex || 1, token])
+      [doc.id, s.userId, s.role, s.name, own?.email ?? s.email, s.phone || null, s.orderIndex || 1, token])
   }
 
   // S535 (Nic): PROPERTY-LEVEL late fees — anti-discrimination. When the
@@ -661,13 +885,8 @@ export async function createDocumentRecord(client: any, opts: {
         //
         // other_fee is skipped: the property can list several, and a lease form
         // has one box, usually printed for something specific ("Guest fee").
-        //
-        // S654: a renewal is a sitting tenant too. Its deposits and fees carry
-        // from the old lease (POST /documents/renewal); the property's list for
-        // new residents re-billed its move-in fee and added deposits.
-        const sittingTenant = existingTenancy || !!opts.renewsLeaseId
         if (opts.documentType === 'original_lease') {
-          const schedule = sittingTenant ? [] : await client.query(
+          const schedule = existingTenancy ? [] : await client.query(
             `SELECT pfs.fee_type, pfs.amount
                FROM property_fee_schedules pfs
                JOIN units u ON u.property_id = pfs.property_id AND u.unit_type = pfs.unit_type
@@ -676,7 +895,7 @@ export async function createDocumentRecord(client: any, opts: {
           for (const r of schedule) {
             if (prefillValues[r.fee_type] == null) prefillValues[r.fee_type] = Number(r.amount).toFixed(2)
           }
-          if (sittingTenant) {
+          if (existingTenancy) {
             for (const tag of FEE_TYPES) {
               if (tag === 'security_deposit' || tag === 'other_fee') continue
               if (FEE_TYPE_META[tag].dueTiming !== 'move_in') continue
@@ -691,28 +910,13 @@ export async function createDocumentRecord(client: any, opts: {
             `SELECT p.move_in_collects_next_period AS on, p.rent_due_mode FROM units u
                JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [opts.unitId])
             .then((r: any) => r.rows[0])
-          // S654: a renewal is not a move-in. The old lease's last bill runs to
-          // its next due date, so a new term starting before that date owes no
-          // rent at signing and the new lease's monthly bills carry on. A start
-          // ON that date owes its first month, as below. A month-to-month old
-          // lease is still billing; a booking-drafted one bills only to its end
-          // date, so its stub is owed.
-          if (opts.renewsLeaseId) {
-            const old = await client.query(
-              `SELECT lease_source, to_char(end_date, 'YYYY-MM-DD') AS end_date, rent_due_day
-                 FROM leases WHERE id = $1`, [opts.renewsLeaseId]).then((r: any) => r.rows[0])
-            const startIso = leaseFieldDate(prefillValues.start_date)
-            const covered = !!old && old.lease_source !== 'booking_draft' && !!startIso
-              && (!old.end_date || startIso < nextDueDateAfter(old.end_date, parseDueDay(old.rent_due_day) ?? 1))
-            if (covered) {
-              if (prefillValues.move_in_first_month_rent == null) prefillValues.move_in_first_month_rent = '0.00'
-              if (prefillValues.move_in_proration == null) prefillValues.move_in_proration = '0.00'
-            }
-          }
           const d = moveInDefaults({
             rent: Number(prefillValues.rent_amount ?? ctx.rent_amount ?? 0),
             // S654: document dates are M/D/YYYY, which parseIso can't read.
-            startIso: leaseFieldDate(prefillValues.start_date),
+            // A renewal keeps its old reading until Nic sets the renewal rule.
+            startIso: opts.renewsLeaseId
+              ? (prefillValues.start_date ?? null)
+              : leaseFieldDate(prefillValues.start_date),
             existingTenancy, collectsNextPeriod: prop?.on === true,
             dueDay: parseDueDay(prefillValues.rent_due_day) ?? 1,
             mode: existingTenancy ? 'fixed_day' : prop?.rent_due_mode,
@@ -2154,11 +2358,28 @@ esignRouter.post('/witnesses/provision', requireAuth, requirePerm('leases.create
       throw new AppError(400, 'Invalid email format')
     }
 
-    // Reuse if a user already exists with this email (any role).
-    const existing = await queryOne<{ id: string }>(
-      `SELECT id FROM users WHERE lower(email) = $1`,
+    // Reuse an account already on this address (one per address in any case).
+    //
+    // S654: this used to hand back the id of ANY account, whatever its role
+    // and whoever's it was — the first step of landlord B putting landlord A's
+    // invitee on B's lease. Now:
+    //   - a landlord or staff login is never a witness (409);
+    //   - a resident (a login with a tenant profile) is reused only when they
+    //     already belong to this company — a lease, an invite or a draft lease
+    //     with it — and never by another company;
+    //   - a witness-only login or a contact is reused as it is.
+    // A reused account gets nothing that carries a link: no token is minted,
+    // read or returned here, only the id the document needs.
+    const existing = await queryOne<{ id: string; role: string; has_tenant: boolean }>(
+      `SELECT u.id, u.role, EXISTS (SELECT 1 FROM tenants t WHERE t.user_id = u.id) AS has_tenant
+         FROM users u WHERE lower(u.email) = $1`,
       [emailNorm])
     if (existing) {
+      if (!RESIDENT_TYPE_LOGINS.has(existing.role)) throw new AppError(409, WITNESS_NOT_A_STAFF_LOGIN)
+      if (existing.role === 'tenant' && existing.has_tenant) {
+        const tied = await residentsTiedHere([existing.id], landlordScopeIds(req.user!))
+        if (!tied.has(existing.id)) throw new AppError(409, notThisCompanysResident('This person'))
+      }
       return res.json({ success: true, data: { userId: existing.id, reused: true } })
     }
 
@@ -3065,6 +3286,8 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
         throw new AppError(400, `Invalid signer role: ${s.role}`)
       }
     }
+    // S654: the right kind of login in each role (see assertSignerLogins).
+    const signerAccounts = await assertSignerLogins(signers)
 
     // Resolve each tenant signer's tenant profile (validates they have one)
     for (const s of signers) {
@@ -3098,6 +3321,10 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
     const docLandlordId = finalUnitId
       ? await landlordIdForUnit(req.user!, finalUnitId, query)
       : await landlordForRequest(req, 'document')
+    // S654: a resident on this document must already be this company's, and
+    // the landlord's seat is this company's own login at its own address.
+    await assertResidentsBelong(signers, signerAccounts, [docLandlordId, ...landlordScopeIds(req.user!)])
+    await assertLandlordSigners(signers, { landlordId: docLandlordId, unitId: finalUnitId })
 
     // S535: templates are per unit type and may be property-locked —
     // refuse incompatible pairings (NULLs fit everything).
@@ -3374,6 +3601,15 @@ esignRouter.post('/standalone-documents', requireAuth, requirePerm('esign.templa
       }
       resolvedSigners.push({ userId: userId!, role: s.role, name: s.name, email: s.email, orderIndex: s.orderIndex ?? i + 1 })
     }
+    // S654: a pinned userId is a door onto any account. The right kind of login
+    // in each role, and a resident only when they are already this company's.
+    // A contact minted just above is not a resident, so it passes. Read inside
+    // this transaction, where those new accounts live.
+    const txRows: RowsQuery = (sql, params) => client.query(sql, params).then((r: any) => r.rows)
+    const standaloneAccounts = await assertSignerLogins(resolvedSigners, txRows)
+    await assertResidentsBelong(resolvedSigners, standaloneAccounts,
+      [landlordId, ...landlordScopeIds(req.user as any)], txRows)
+    await assertLandlordSigners(resolvedSigners, { landlordId, unitId: null }, txRows)
 
     const doc = await createDocumentRecord(client, {
       landlordId,
@@ -3713,6 +3949,13 @@ esignRouter.post('/documents/addendum-add', requireAuth, requirePerm('leases.cre
         throw new AppError(400, `Invalid signer role: ${s.role}`)
       }
     }
+    // S654: the right kind of login in each role, and a resident (a witness
+    // included) only when they are already this company's.
+    {
+      const accounts = await assertSignerLogins(signers)
+      await assertResidentsBelong(signers, accounts, [lease.landlord_id, ...landlordScopeIds(req.user!)])
+      await assertLandlordSigners(signers, { landlordId: lease.landlord_id, unitId: lease.unit_id })
+    }
 
     // 4. Resolve each tenant signer's tenant profile
     const tenantSigners: Array<{ userId: string, tenantId: string, role: string, email: string, name: string }> = []
@@ -3884,6 +4127,13 @@ esignRouter.post('/documents/addendum-remove', requireAuth, requirePerm('leases.
       if (!(s.role === 'landlord' || s.role === 'witness' || isTenantRole(s.role))) {
         throw new AppError(400, `Invalid signer role: ${s.role}`)
       }
+    }
+    // S654: the right kind of login in each role, and a resident (a witness
+    // included) only when they are already this company's.
+    {
+      const accounts = await assertSignerLogins(signers)
+      await assertResidentsBelong(signers, accounts, [lease.landlord_id, ...landlordScopeIds(req.user!)])
+      await assertLandlordSigners(signers, { landlordId: lease.landlord_id, unitId: lease.unit_id })
     }
 
     // 7. Resolve each tenant signer's tenant profile
@@ -4227,6 +4477,13 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
         throw new AppError(400, `Invalid signer role: ${s.role}`)
       }
     }
+    // S654: the right kind of login in each role, and a resident (a witness
+    // included) only when they are already this company's.
+    {
+      const accounts = await assertSignerLogins(signers)
+      await assertResidentsBelong(signers, accounts, [lease.landlord_id, ...landlordScopeIds(req.user!)])
+      await assertLandlordSigners(signers, { landlordId: lease.landlord_id, unitId: lease.unit_id })
+    }
 
     // 4. Resolve each tenant signer's tenant profile
     const tenantSigners: Array<{ userId: string, tenantId: string, role: string, email: string, name: string }> = []
@@ -4519,7 +4776,23 @@ esignRouter.get('/documents/:id', requireAuth, async (req, res, next) => {
     const isSigner = await queryOne<any>('SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND user_id=$2', [doc.id, req.user!.userId])
     if (!isOwner && !isSigner) throw new AppError(403, 'Not authorized for this document')
 
-    const signers = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1 ORDER BY order_index', [doc.id])
+    // S654: never the token. This was SELECT *, so every signer's signing
+    // token went to the owner and to every other signer — and a token is a
+    // full stand-in for its signer (S629). Resident Y read the landlord row's
+    // token and signed B's lease as the landlord; owner B read X's and signed
+    // as X. No screen reads a token from here (a signer's own link comes from
+    // GET /sign), so none is returned, not even the caller's own.
+    //
+    // Where and from what browser someone signed is the company's audit
+    // trail: the owner sees it on every row, a co-signer only on their own.
+    const signers = await query<any>(
+      `SELECT id, document_id, user_id, role, name, email, phone, order_index, status,
+              invite_sent, invite_sent_at, viewed_at, signed_at, signature_data,
+              reminder_sent_at, reminder_count, declined_at, decline_reason, created_at,
+              CASE WHEN $2::boolean OR user_id = $3 THEN ip_address END AS ip_address,
+              CASE WHEN $2::boolean OR user_id = $3 THEN user_agent END AS user_agent
+         FROM lease_document_signers WHERE document_id=$1 ORDER BY order_index`,
+      [doc.id, isOwner, req.user!.userId])
     const fields  = await query<any>('SELECT * FROM lease_document_fields WHERE document_id=$1 ORDER BY page, y', [doc.id])
     res.json({ success: true, data: { ...doc, signers, fields } })
   } catch (e) { next(e) }
@@ -4586,25 +4859,27 @@ esignRouter.post('/documents/:id/remind', requireAuth, requirePerm('esign.send')
     }
 
     const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
+    // S654: only ever to the address on the signer's own account.
+    const sendTo = await signerDeliveryAddress(signer)
     // S647: same one-link rule as the relay (services/tenantLeaseLink).
     let signingUrl = `${portalUrl('landlord')}/sign/${signer.token || doc.id}`
     let needsSetup = false
     if (signer.role !== 'landlord' && signer.role !== 'witness') {
       const { tenantLeaseLink } = await import('../services/tenantLeaseLink')
       const link = await tenantLeaseLink({
-        userId: signer.user_id, documentId: doc.id, signerToken: signer.token })
+        userId: signer.user_id, documentId: doc.id, signerToken: signer.token, sendTo })
       signingUrl = link.url
       needsSetup = link.needsSetup
     }
 
-    await emailSigningReminder(signer.email, signer.name, doc.title, unitLabel,
+    await emailSigningReminder(sendTo, signer.name, doc.title, unitLabel,
       doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
 
     await query(
       `UPDATE lease_document_signers
           SET reminder_count = 0, reminder_sent_at = NOW() WHERE id = $1`, [signer.id])
 
-    res.json({ success: true, data: { sentTo: signer.email, name: signer.name } })
+    res.json({ success: true, data: { sentTo: sendTo, name: signer.name } })
   } catch (e) { next(e) }
 })
 
@@ -4817,8 +5092,11 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
     // S410 (S377): read tenant_invite_token (was email_verify_token).
     const firstSignerUser = await queryOne<any>('SELECT email_verified, tenant_invite_token FROM users WHERE id=$1', [firstSigner.user_id])
     const signingUrl = signingUrlFor(firstSigner, doc.id, firstSignerUser)
+    // S654: a standalone document can open with a resident or another party —
+    // they are reached only at the address on their own account.
+    const firstSignerAddress = await signerDeliveryAddress(firstSigner)
 
-    await emailSigningRequest(firstSigner.email, firstSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id })
+    await emailSigningRequest(firstSignerAddress, firstSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id })
     await createNotification({
       userId: firstSigner.user_id,
       type: 'esign_request',
@@ -4859,7 +5137,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
          title: doc.title,
          landlordId: doc.landlord_id,
          documentType: doc.document_type,
-         sentTo: firstSigner.email,
+         sentTo: firstSignerAddress,
          sentToRole: firstSigner.role,
          sentToName: firstSigner.name,
          actingRole: req.user!.role,
@@ -4867,7 +5145,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
        }),
        (req.ip ?? '').slice(0, 64) || null]).catch(() => {})
 
-    res.json({ success: true, data: { sentTo: firstSigner.email } })
+    res.json({ success: true, data: { sentTo: firstSignerAddress } })
   } catch (e) { next(e) }
 })
 
@@ -5898,7 +6176,9 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         const portalHome = isTenantRole(s.role)
           ? (process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com') + '/lease'
           : (process.env.LANDLORD_APP_URL || 'https://landlord.goldassetmanagement.com') + '/esign'
-        await emailSigningCompleted(s.email, s.name, doc.title, unitLabel, undefined, portalHome,
+        // S654: the executed copy rides along, so it goes only to the address on
+        // each signer's own account (the landlord's row keeps its own).
+        await emailSigningCompleted(await signerDeliveryAddress(s), s.name, doc.title, unitLabel, undefined, portalHome,
           { landlordId: doc.landlord_id, documentId: doc.id }, executedBytes ?? undefined)
         await createNotification({
           userId: s.user_id,
@@ -5921,11 +6201,17 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         SELECT * FROM lease_document_signers
         WHERE document_id=$1 AND status='pending'
         ORDER BY order_index LIMIT 1`, [doc.id])
+      let nextSignerAddress: string | undefined
       if (nextSigner) {
         const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
         // S647: a tenant who has not set up their account gets ONE email that
         // sets it up and lands them on this lease (services/tenantLeaseLink) —
         // not a bare signing link on top of the portal invite they already got.
+        //
+        // S654: and only ever to the address on their own account. The signer
+        // row's address once came from the request body, which is how landlord
+        // B had landlord A's invitee's live password link mailed to B.
+        nextSignerAddress = await signerDeliveryAddress(nextSigner)
         let nextSigningUrl: string
         let needsSetup = false
         if (nextSigner.role === 'landlord' || nextSigner.role === 'witness') {
@@ -5934,11 +6220,12 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         } else {
           const { tenantLeaseLink } = await import('../services/tenantLeaseLink')
           const link = await tenantLeaseLink({
-            userId: nextSigner.user_id, documentId: doc.id, signerToken: nextSigner.token })
+            userId: nextSigner.user_id, documentId: doc.id, signerToken: nextSigner.token,
+            sendTo: nextSignerAddress })
           nextSigningUrl = link.url
           needsSetup = link.needsSetup
         }
-        await emailSigningRequest(nextSigner.email, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl, { landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
+        await emailSigningRequest(nextSignerAddress, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl, { landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
         await createNotification({
           userId: nextSigner.user_id,
           type: 'esign_request',
@@ -5967,7 +6254,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
           "UPDATE lease_documents SET sent_at = COALESCE(sent_at, NOW()), updated_at=NOW() WHERE id=$1",
           [doc.id])
       }
-      res.json({ success: true, data: { completed: false, nextSigner: nextSigner?.email } })
+      res.json({ success: true, data: { completed: false, nextSigner: nextSignerAddress } })
     }
   } catch (e) {
     if (!txnDone) {
@@ -6223,7 +6510,14 @@ esignRouter.get('/files/:filename', authOrSignerTokenQuery, async (req: any, res
 // Returns 200 with drafted:false rather than an error when no template exists:
 // the invites DID go out and the accounts ARE real, so this is information about
 // an optional next step, not a failure of the thing the landlord just did.
-esignRouter.post('/draft-household', requirePerm('leases.create'), async (req, res, next) => {
+//
+// S654: requireAuth was missing, so req.user was never set and every call came
+// back 401 — and the landlord app signs out on any 401, so inviting a household
+// to a unit logged the landlord out. With a session, it must also hold the line
+// every other door holds: a resident goes on this company's lease only once
+// they are this company's (resolveHouseholdByEmail only skips residents
+// actively leased elsewhere, so it accepted landlord A's invitee for B's unit).
+esignRouter.post('/draft-household', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const body = z.object({
       unitId: z.string().uuid(),
@@ -6244,6 +6538,13 @@ esignRouter.post('/draft-household', requirePerm('leases.create'), async (req, r
       return res.json({ success: true, data: { drafted: false,
         reason: 'None of those residents have tenant accounts under this landlord yet.' } })
     }
+    // S654: the seats draftHouseholdLease gives them (primary, co_tenant_N),
+    // put through the same checks as a hand-built document.
+    const seats = residents.map((r, i) => ({
+      userId: r.userId, name: r.name, role: i === 0 ? 'primary' : `co_tenant_${i}`,
+    }))
+    const accounts = await assertSignerLogins(seats)
+    await assertResidentsBelong(seats, accounts, [unit.landlord_id, ...landlordScopeIds(req.user!)])
     const result = await draftHouseholdLease({
       landlordId: unit.landlord_id, unitId: body.unitId, residents, homeSale: body.homeSale ?? null,
       packageTemplateIds: body.packageTemplateIds ?? null,

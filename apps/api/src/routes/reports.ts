@@ -6,7 +6,7 @@ import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/au
 import { AppError } from '../middleware/errorHandler'
 import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
 import { platformFeesByProperty, platformFeesByPropertyForEntities, periodMonths } from '../services/platformFee'
-import { computeLandlordPL, landlordIncomeSql } from '../services/landlordPL'
+import { computeLandlordPL, landlordIncomeSql, landlordDepositSql } from '../services/landlordPL'
 import { todayIn, addDaysTo, monthStartOf, localDateTimeToUtc } from '../lib/timezone'
 import {
   runReport, REPORT_LEVELS, REPORT_BUCKETS,
@@ -63,17 +63,6 @@ function round2(n: number): number {
 }
 
 /**
- * S654: what the tax and per-property reports count as collected — the
- * landlord's own money. Not a GAM fee (revenue_owner 'gam'), not paid-ahead
- * money GAM holds ('held', counted as rent when drawn down), not a deposit
- * (a held liability, reported as deposits). Every dollar counted once.
- */
-function landlordCollected(alias?: string): string {
-  const a = alias ? `${alias}.` : ''
-  return `${a}revenue_owner = 'landlord' AND ${a}type <> 'deposit'`
-}
-
-/**
  * S633 — REPORTS SPLIT TWO WAYS, AND THE SPLIT IS NOT ARBITRARY.
  *
  * The account owns entities; entities own properties. So "which landlord is
@@ -126,12 +115,14 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     const landlordIds = isAdmin ? null : reportScope(req.user!)
     const userId = req.user!.userId
 
+    // S654: rent the landlord collected, by the shared income definition
+    // (no FlexPay pull, which is GAM reimbursing its own front).
     const monthlyRows = isAdmin
       ? await query<any>(`
           SELECT to_char(date_trunc('month', settled_at), 'YYYY-MM') AS month,
                  SUM(amount)::numeric AS collected
             FROM payments
-           WHERE status='settled' AND type='rent'
+           WHERE status='settled' AND type='rent' AND ${landlordIncomeSql()}
              AND settled_at > NOW() - INTERVAL '6 months'
            GROUP BY 1 ORDER BY 1 DESC
         `)
@@ -139,7 +130,7 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
           SELECT to_char(date_trunc('month', settled_at), 'YYYY-MM') AS month,
                  SUM(amount)::numeric AS collected
             FROM payments
-           WHERE landlord_id = ANY($1::uuid[]) AND status='settled' AND type='rent'
+           WHERE landlord_id = ANY($1::uuid[]) AND status='settled' AND type='rent' AND ${landlordIncomeSql()}
              AND settled_at > NOW() - INTERVAL '6 months'
            GROUP BY 1 ORDER BY 1 DESC
         `, [landlordIds])
@@ -283,7 +274,7 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
           SELECT to_char(date_trunc('month', settled_at), 'YYYY-MM') AS month,
                  SUM(amount)::numeric AS collected
             FROM payments
-           WHERE status='settled' AND type='rent'
+           WHERE status='settled' AND type='rent' AND ${landlordIncomeSql()}
              AND settled_at >= date_trunc('year', NOW())
            GROUP BY 1 ORDER BY 1
         `)
@@ -291,7 +282,7 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
           SELECT to_char(date_trunc('month', settled_at), 'YYYY-MM') AS month,
                  SUM(amount)::numeric AS collected
             FROM payments
-           WHERE landlord_id = ANY($1::uuid[]) AND status='settled' AND type='rent'
+           WHERE landlord_id = ANY($1::uuid[]) AND status='settled' AND type='rent' AND ${landlordIncomeSql()}
              AND settled_at >= date_trunc('year', NOW())
            GROUP BY 1 ORDER BY 1
         `, [landlordIds])
@@ -359,9 +350,9 @@ reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, r
         LEFT JOIN tenants t     ON t.id  = p.tenant_id
         LEFT JOIN users us      ON us.id = t.user_id
        WHERE p.landlord_id = $1 AND p.status = 'settled'
-         -- S654: the rows the totals count (computeLandlordPL) — the landlord's
-         -- own income only, no GAM fee, no held money, no deposit — over the
-         -- same whole-day end, so the list sums to the gross.
+         -- S654: the rows the totals count (computeLandlordPL): the landlord's
+         -- own income only (no GAM fee, held money, FlexPay pull or deposit),
+         -- over the same whole-day end, so the list sums to the gross.
          AND ${landlordIncomeSql('p')}
          AND p.settled_at >= $2 AND p.settled_at < ($3::date + 1)
        ORDER BY p.settled_at DESC`, [landlordId, start, end])
@@ -449,7 +440,12 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
       WHERE u.landlord_id = $1
       ORDER BY p.name, u.unit_number`, [landlordId])
 
-    // Payments for the month
+    // Payments for the month. S654: the statement's money is the monthly P&L's
+    // money. A settled row is listed when it SETTLED this month (as the P&L
+    // counts it) and is the landlord's income or a deposit held; an unsettled
+    // row (pending, failed, returned) when it is DUE this month. GAM's own
+    // rows, held paid-ahead money and FlexPay pulls are not the landlord's and
+    // are not listed, so the settled rows here sum to the totals below.
     const payments = await query<any>(`
       SELECT p.*, u.unit_number, pr.name as property_name,
         us.first_name as tenant_first, us.last_name as tenant_last
@@ -459,7 +455,10 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
       LEFT JOIN tenants t ON t.id = p.tenant_id
       LEFT JOIN users us ON us.id = t.user_id
       WHERE p.landlord_id = $1
-        AND p.due_date >= $2 AND p.due_date <= $3
+        AND (${landlordIncomeSql('p')} OR ${landlordDepositSql('p')})
+        AND CASE WHEN p.status = 'settled'
+                 THEN p.settled_at >= $2 AND p.settled_at < ($3::date + 1)
+                 ELSE p.due_date >= $2::date AND p.due_date <= $3::date END
       ORDER BY pr.name, u.unit_number`, [landlordId, start, end])
 
     // Maintenance costs for the month
@@ -493,42 +492,37 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
       ORDER BY created_at DESC`, [landlordId, start, end])
 
     // ── P&L calculations ──────────────────────────────────────
-    // S609: a settled charge is only the LANDLORD'S income if it is their money.
-    // The tenant also pays GAM directly through this same ledger — an ACH-return
-    // fee, a card-decline fee, the manual-payment fee, an opt-in subscription —
-    // and those were being counted as landlord income, overstating this
-    // statement by every fee GAM collected. They are stamped revenue_owner='gam'
-    // at creation; everything else is the landlord's.
-    const settled = payments.filter((p:any) =>
-      p.status === 'settled' && p.revenue_owner !== 'gam')
-    // S654: 'held' is paid-ahead money GAM holds for the tenant. It becomes the
-    // landlord's as rent when drawn down, so counting it here counted it twice.
-    const sumTypes = (types: string[]) => round2(settled
-      .filter((p:any) => types.includes(p.type) && (p.type === 'deposit' || p.revenue_owner === 'landlord'))
-      .reduce((s:number, p:any) => s + parseFloat(p.amount||0), 0))
+    // S654: the statement's P&L IS the monthly P&L (computeLandlordPL), so the
+    // two can never disagree for the same month. It used to sum its own list by
+    // DUE date and only rent, fees, utilities and late fees, so it dropped
+    // home-sale payments and carried balances the P&L counts. Deposits are
+    // held, not income (depositsCollected), and stay out of the total and net.
+    const pl = await computeLandlordPL(landlordId, String(start), String(end), periodMonths(year, month))
+    const rentCollected      = pl.gross.rent
+    const feesCollected      = pl.gross.fees
+    const utilitiesCollected = pl.gross.utilities
+    const homeSaleCollected  = pl.gross.homeSale
+    const balancesCollected  = pl.gross.balances   // "Balances collected"
+    const bankedOtherIncome  = pl.gross.otherIncome // income the landlord banked outside GAM (S605)
+    const otherIncome        = pl.gross.other       // every line but rent, so rent + other = total
+    const totalIncome        = pl.gross.total
+    const depositsCollected  = pl.depositsHeld
+    // Settled rows listed above: income collected through GAM plus deposits held.
+    const settledRows = payments.filter((p:any) => p.status === 'settled')
+    const totalCollected = round2(settledRows.reduce((s:number, p:any) => s + parseFloat(p.amount||0), 0))
 
-    // Income — operating income only. Deposits are custody/liability, not income,
-    // so they're tracked separately and kept out of the P&L total + net.
-    const rentCollected     = sumTypes(['rent'])
-    const otherIncome       = sumTypes(['fee', 'utility', 'late_fee'])
-    const depositsCollected = sumTypes(['deposit'])
-    const totalIncome       = round2(rentCollected + otherIncome)
-    const totalCollected    = round2(settled.reduce((s:number, p:any) => s + parseFloat(p.amount||0), 0)) // all settled (incl. deposits) — reference only
-
-    // Platform fee = GAM's actual billed income for the month (accruals, with a
-    // live estimate for an un-accrued current month), across the landlord's
-    // properties. Period-based and short-stay-aware — not the current-occupancy
-    // snapshot that read $0 on properties earning via nightly/weekly bookings.
-    const feeMap = await platformFeesByProperty(landlordId, periodMonths(year, month))
-    const totalPlatformFees = round2(Array.from(feeMap.values()).reduce((s, v) => s + v, 0))
-    // Landlord pays only the actual maintenance cost; the maintenance platform
-    // fee (reserved for the future contractor marketplace) is never surfaced.
-    const totalMaintCost    = round2(maintenance.reduce((s:number, m:any) => s + parseFloat(m.actual_cost||0), 0))
+    // Expenses — the P&L's: platform fee (actual billed accruals), actual
+    // maintenance cost (the maintenance platform fee is never surfaced), lot
+    // rent and the landlord's entered expenses.
+    const totalPlatformFees = pl.expenses.platformFee
+    const totalMaintCost    = pl.expenses.maintenance
+    const lotRent           = pl.expenses.lotRent
+    const enteredExpenses   = pl.expenses.enteredExpenses
 
     // S86: PM subsystem superseded by 16a (DEFERRED Item 13). pmFee always 0.
     const pmFee = 0
 
-    const totalExpenses = round2(totalPlatformFees + totalMaintCost + pmFee)
+    const totalExpenses = round2(pl.expenses.total + pmFee)
     const netToOwner    = round2(totalIncome - totalExpenses)
 
     res.json({
@@ -539,14 +533,16 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
         properties, units, payments, maintenance, workTrade, disbursements,
         summary: {
           // income
-          rentCollected, otherIncome, depositsCollected, totalIncome, totalCollected,
+          rentCollected, feesCollected, utilitiesCollected, homeSaleCollected,
+          balancesCollected, bankedOtherIncome, otherIncome,
+          depositsCollected, totalIncome, totalCollected,
           // expenses
-          totalPlatformFees, totalMaintCost, pmFee, totalExpenses,
+          totalPlatformFees, totalMaintCost, lotRent, enteredExpenses, pmFee, totalExpenses,
           netToOwner,
           // occupancy + payment counts
           occupiedUnits:  units.filter((u:any) => u.is_occupied).length,
           vacantUnits:    units.filter((u:any) => !u.is_occupied).length,
-          settledPayments: payments.filter((p:any) => p.status === 'settled').length,
+          settledPayments: settledRows.length,
           latePayments:    payments.filter((p:any) => p.status === 'late').length,
           failedPayments:  payments.filter((p:any) => p.status === 'failed').length,
         }
@@ -572,14 +568,20 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
       FROM landlords l JOIN users u ON u.id = l.user_id
       WHERE l.id = $1`, [landlordId])
 
-    // Total rent collected. S654: the landlord's own money only — not a GAM
-    // fee, not held paid-ahead money, not a deposit (the deposits section below).
+    // Total income collected (totalRent). S654: the shared income definition
+    // (landlordIncomeSql), broken out by kind so a balance collected shows as
+    // its own line. Deposits are held, not income (the deposits section below).
     const rentStats = await queryOne<any>(`
       SELECT COALESCE(SUM(amount) FILTER (WHERE status='settled'), 0) as total_rent,
-        COUNT(*) FILTER (WHERE status='settled') as payment_count
+        COUNT(*) FILTER (WHERE status='settled') as payment_count,
+        COALESCE(SUM(amount) FILTER (WHERE status='settled' AND type='rent'), 0)::float AS rent,
+        COALESCE(SUM(amount) FILTER (WHERE status='settled' AND type IN ('late_fee','fee')), 0)::float AS fees,
+        COALESCE(SUM(amount) FILTER (WHERE status='settled' AND type='utility'), 0)::float AS utilities,
+        COALESCE(SUM(amount) FILTER (WHERE status='settled' AND type='home_payment'), 0)::float AS home_sale,
+        COALESCE(SUM(amount) FILTER (WHERE status='settled' AND type='carried_balance'), 0)::float AS balances
       FROM payments
       WHERE landlord_id=$1 AND due_date >= $2 AND due_date <= $3
-        AND ${landlordCollected()}`,
+        AND ${landlordIncomeSql()}`,
       [landlordId, start, end])
 
     // Platform fees paid — GAM's actual billed income, summed over each month of
@@ -659,7 +661,7 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
         COUNT(*) FILTER (WHERE status='failed') as failed
       FROM payments
       WHERE landlord_id=$1 AND due_date >= $2 AND due_date <= $3
-        AND ${landlordCollected()}
+        AND ${landlordIncomeSql()}
       GROUP BY month ORDER BY month`,
       [landlordId, start, end])
 
@@ -674,6 +676,14 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
         income: {
           totalRent,
           paymentCount: parseInt(rentStats?.payment_count || 0),
+          // S654: the lines that make up totalRent; balances = "Balances collected".
+          breakdown: {
+            rent: round2(+rentStats?.rent || 0),
+            fees: round2(+rentStats?.fees || 0),
+            utilities: round2(+rentStats?.utilities || 0),
+            homeSale: round2(+rentStats?.home_sale || 0),
+            balances: round2(+rentStats?.balances || 0),
+          },
         },
         deductions: {
           platformFees:  annualPlatformFees,
@@ -723,11 +733,11 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
         (SELECT COUNT(*) FROM units u
            JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
           WHERE u.property_id = p.id AND vuo.is_occupied) AS occupied_units,
-        -- S654: the landlord's own money only.
+        -- S654: the shared income definition (landlordIncomeSql).
         (SELECT COALESCE(SUM(pm.amount), 0) FROM payments pm
            JOIN units u ON u.id = pm.unit_id
           WHERE u.property_id = p.id AND pm.status='settled'
-            AND ${landlordCollected('pm')}
+            AND ${landlordIncomeSql('pm')}
             AND pm.due_date >= $2 AND pm.due_date <= $3) AS rent_collected,
         (SELECT COALESCE(SUM(mr.actual_cost), 0) FROM maintenance_requests mr
            JOIN units u ON u.id = mr.unit_id
@@ -834,8 +844,8 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
       LEFT JOIN tenants t ON t.id = pmt.tenant_id
       LEFT JOIN users us ON us.id = t.user_id
       WHERE u.property_id = $1
-        -- S654: the landlord's own money only, so the settled rows sum to collected.
-        AND ${landlordCollected('pmt')}
+        -- S654: the shared income definition, so the settled rows sum to collected.
+        AND ${landlordIncomeSql('pmt')}
         AND pmt.due_date >= $2 AND pmt.due_date <= $3
       ORDER BY pmt.due_date DESC`, [propertyId, start, end])
 
@@ -845,7 +855,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
         FROM payments pmt
         JOIN units u ON u.id = pmt.unit_id
        WHERE u.property_id = $1 AND pmt.status = 'settled'
-         AND pmt.type = 'deposit' AND pmt.revenue_owner <> 'gam'
+         AND ${landlordDepositSql('pmt')}
          AND pmt.due_date >= $2 AND pmt.due_date <= $3`, [propertyId, start, end])
     const depositsHeld = round2(parseFloat(depositRow?.held ?? '0'))
 
@@ -867,7 +877,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
       FROM payments pmt
       JOIN units u ON u.id = pmt.unit_id
       WHERE u.property_id = $1 AND pmt.status='settled'
-        AND ${landlordCollected('pmt')}   -- S654: the same rows as collected
+        AND ${landlordIncomeSql('pmt')}   -- S654: the same rows as collected
         AND pmt.due_date >= $2 AND pmt.due_date <= $3
       GROUP BY 1 ORDER BY 1`, [propertyId, yearStart, yearEnd])
 

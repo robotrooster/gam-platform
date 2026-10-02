@@ -35,6 +35,7 @@ import type {
 } from '@gam/shared'
 import { isScreeningFeeText } from '@gam/shared'
 import { logger } from '../../lib/logger'
+import { portalLink } from '../../lib/portalUrls'
 
 const pendingPdfDir = path.join(process.cwd(), 'uploads', 'lease-pdfs-pending')
 const leasesPdfDir  = path.join(process.cwd(), 'uploads', 'leases')
@@ -50,12 +51,15 @@ interface IntentRow {
   imported_pdf_url: string | null
 }
 
+// S654: no activation link in the result. The link sets the account's
+// password, so it goes only by email to the address on the account.
 interface ResolveSuccess {
   leaseId: string
   tenantId: string
   userId: string
   email: string
-  activationUrl: string
+  inviteSent: boolean
+  alreadyOnPlatform: boolean
   supersededLeaseId?: string | null   // S582: set when this resolve ended a prior active lease
 }
 // S582: when the resolved unit already has an active lease, resolve does NOT
@@ -104,6 +108,32 @@ export function pickCandidateByAddress<T extends { street1: string | null }>(
   return matches.length === 1 ? matches[0] : 'ambiguous'
 }
 
+const PLACEHOLDER_PASSWORD = '$2b$10$placeholder_invite_pending'
+
+// S654: the one refusal every resident door gives a login that isn't a
+// resident's (landlord, staff, admin).
+export const NOT_A_RESIDENT_ACCOUNT =
+  "This email belongs to a GAM account that isn't a resident's, so it can't be added as a tenant. Use the resident's own email."
+
+/**
+ * S654: does this account belong to a company outside `own`? Everything
+ * residentTiedElsewhere counts, plus an e-sign signer on another company's
+ * document (a witness login has no tenants row and no other tie). Such an
+ * account is never handed a fresh password link by another company.
+ */
+export async function accountTiedElsewhere(userId: string, own: Iterable<string>): Promise<boolean> {
+  const mine = Array.from(new Set(own))
+  const { residentTiedElsewhere } = await import('../../routes/tenants')
+  if (await residentTiedElsewhere(userId, mine)) return true
+  const signer = await queryOne<{ x: number }>(
+    `SELECT 1 AS x FROM lease_document_signers s
+       JOIN lease_documents d ON d.id = s.document_id
+      WHERE s.user_id = $1 AND NOT (d.landlord_id = ANY($2::uuid[]))
+      LIMIT 1`,
+    [userId, mine])
+  return !!signer
+}
+
 /**
  * Resolve a pending intent into a real lease. Throws AppError on any
  * validation failure -- caller endpoint surfaces these directly to the
@@ -125,8 +155,6 @@ export async function resolveIntent(
   landlordOverrides: Partial<ParserOutput>,
   opts: { confirmSupersede?: boolean } = {},
 ): Promise<ResolveResult> {
-  const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-
   // 1. Load intent + verify ownership + state
   const intent = await queryOne<IntentRow>(
     `SELECT id, landlord_id, tenant_id, parser_status, parser_output, imported_pdf_url
@@ -218,14 +246,26 @@ export async function resolveIntent(
   // decides the class policy before any tenant can be onboarded to it.
   await assertLateFeeDecisionForUnit(unit.id)
 
-  // 4. Cross-landlord active lease check (block).
-  const userTenant = await queryOne<{ user_id: string; tenant_id: string }>(
-    `SELECT u.id AS user_id, t.id AS tenant_id
-     FROM users u
-     LEFT JOIN tenants t ON t.user_id = u.id
-     WHERE LOWER(u.email) = $1`,
-    [emailNorm]
+  // 4. The account on this address, in any letter case.
+  // S654: the address comes from the landlord's overrides, so this is a door
+  // onto any account on GAM. Only a resident's login is used (409 otherwise).
+  const accounts = await query<{ user_id: string; email: string; role: string; tenant_id: string | null; activated: boolean }>(
+    `SELECT u.id AS user_id, u.email, u.role, t.id AS tenant_id,
+            (u.password_hash <> $2) AS activated
+       FROM users u
+       LEFT JOIN tenants t ON t.user_id = u.id
+      WHERE LOWER(u.email) = $1
+      ORDER BY (u.email = LOWER(u.email)) DESC, u.created_at, t.created_at`,
+    [emailNorm, PLACEHOLDER_PASSWORD]
   )
+  if (accounts.some(a => a.role !== 'tenant')) throw new AppError(409, NOT_A_RESIDENT_ACCOUNT)
+  const userTenant = accounts[0] ?? null
+  // S654: a password link only for an account that still needs setting up and
+  // belongs to no other company. Anyone else is already on GAM (S616).
+  const alreadyOnPlatform = !!userTenant && (userTenant.activated
+    || await accountTiedElsewhere(userTenant.user_id, [landlordId, ...landlordIds]))
+
+  // Cross-landlord active lease check (block).
   if (userTenant?.tenant_id) {
     const otherLease = await queryOne<{ landlord_id: string }>(
       `SELECT l.landlord_id FROM lease_tenants lt
@@ -380,11 +420,10 @@ export async function resolveIntent(
         [firstName, lastName, phone, userId]
       )
     } else {
-      const tempHash = '$2b$10$placeholder_invite_pending'
       const u = await client.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
          VALUES ($1, $2, 'tenant', $3, $4, $5) RETURNING id`,
-        [emailNorm, tempHash, firstName, lastName, phone]
+        [emailNorm, PLACEHOLDER_PASSWORD, firstName, lastName, phone]
       )
       userId = u.rows[0].id
     }
@@ -392,15 +431,20 @@ export async function resolveIntent(
     // 5e. Activation token -- finally fires now (deferred from limbo creation)
     // S410 (S377): tenant_invite_token + 7-day expiry. Pre-S410 wrote to
     // overloaded email_verify_token.
-    const inviteToken = crypto.randomBytes(32).toString('hex')
-    await client.query(
-      `UPDATE users SET tenant_invite_token=$1,
-                        tenant_invite_expires_at=NOW() + INTERVAL '7 days'
-        WHERE id=$2`,
-      [inviteToken, userId])
+    // S654: only for an account that still needs one; another company's live
+    // link is left alone.
+    let inviteToken: string | null = null
+    if (!alreadyOnPlatform) {
+      inviteToken = crypto.randomBytes(32).toString('hex')
+      await client.query(
+        `UPDATE users SET tenant_invite_token=$1,
+                          tenant_invite_expires_at=NOW() + INTERVAL '7 days'
+          WHERE id=$2`,
+        [inviteToken, userId])
+    }
 
     // 5f. Tenant row -- create or reuse, promote to onboarded
-    let tenantIdMaybe: string | undefined = userTenant?.tenant_id
+    let tenantIdMaybe: string | undefined = userTenant?.tenant_id ?? undefined
     if (tenantIdMaybe) {
       await client.query(
         `UPDATE tenants SET onboarding_source='onboarded' WHERE id=$1 AND onboarding_source != 'onboarded'`,
@@ -468,24 +512,46 @@ export async function resolveIntent(
 
     const propertyAddress = [unit.street1, unit.city, unit.state, unit.zip].filter(Boolean).join(', ')
     const unitLabel = `${unit.property_name} - Unit ${unit.unit_number}`
-    const activationUrl = `${tenantAppUrl}/accept-invite?token=${inviteToken}`
+    // S654: the address on the account, never the one typed.
+    const sendTo = userTenant?.email ?? emailNorm
+    let inviteSent = false
 
-    result = { leaseId, tenantId, userId, email: emailNorm, activationUrl, supersededLeaseId: oldLeaseToSupersede }
-
-    // 7. Send activation email (post-commit; failure logged but does not roll back)
+    // 7. Tell the resident (post-commit; failure logged but does not roll back)
     try {
       const landlord = await queryOne<{ first_name: string; last_name: string }>(
         `SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
         [landlordId]
       )
       const landlordName = landlord ? `${landlord.first_name} ${landlord.last_name}`.trim() : 'Your landlord'
-      await emailTenantOnboarded(
-        emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl,
-        { landlordId, tenantId }
-      )
+      if (inviteToken) {
+        await emailTenantOnboarded(
+          sendTo, firstName, landlordName, propertyAddress, unitLabel,
+          portalLink('tenant', `accept-invite?token=${inviteToken}`),
+          { landlordId, tenantId }
+        )
+        inviteSent = true
+      } else {
+        // S616: they already have an account. Point them at the lease there,
+        // never at "set a password".
+        const { createNotification } = await import('../../services/notifications')
+        await createNotification({
+          userId,
+          landlordId,
+          type: 'lease_drafted',
+          title: `${landlordName} added a lease for ${unitLabel}`,
+          body: `A lease for ${propertyAddress} is ready for you to review. Sign in as usual — you already have an account.`,
+          data: { unitId: unit.id, tenantId, leaseId },
+          actionUrl: '/lease',
+        })
+      }
     } catch (emailErr) {
-      logger.error({ err: emailErr, ctx: emailNorm }, '[RESOLVE] Email send failed for')
-      logger.info(`[RESOLVE] Manual activation URL for ${emailNorm}: ${activationUrl}`)
+      // S654: never log the link; it sets the account's password.
+      logger.error({ err: emailErr, ctx: sendTo }, '[RESOLVE] notify failed for')
+    }
+
+    result = {
+      leaseId, tenantId, userId, email: sendTo, inviteSent, alreadyOnPlatform,
+      supersededLeaseId: oldLeaseToSupersede,
     }
 
     return result

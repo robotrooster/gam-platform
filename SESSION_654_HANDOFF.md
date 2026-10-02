@@ -376,6 +376,114 @@ window until the pattern is gone. NEXT: sweep the 24 test files to the
 database's date and the source sites to `todayIn(property tz)`; never run the
 full gate between 5 pm and midnight until then.
 
+## Evening, live (deploys 13-15, Nic's word)
+
+The counter reader, as Nic asked: the breakdown (customer name on a $0 first
+line, each item, card fee, total) goes on the S710 while the cart is rung and
+follows every change; Charge (or Send at the desk) keeps it up 30 seconds for
+the tap (`TAP_WINDOW_SECONDS`), then charges with the tapped card; "They tapped —
+finish now" / Cancel on the register. Measured live: $0 lines are accepted; a tap
+on the breakdown shows "Completing order"; the reader object does NOT change on a
+tap (no tap signal exists). Customer picker on every sale (this property's
+residents + this company's customers); after a sale the customer is TYPED IN
+(first/last/email/phone) on the receipt screen and in History — never a dropdown.
+Money locks: tender, Clear, hold-for-delivery and pay link are locked while the
+reader holds a charge; any change ends the window as Cancel; a reader charge is
+recorded only as card (server refuses otherwise). Apple Pay never sends a
+cardholder name; chip inserts usually do.
+
+## Overnight (Nic away) — built, tested, reviewed; NOT deployed
+
+Nic: "finish testing all your other bugs… make sure that point of sale
+standalone is byte identical to point of sale on the landlord page." Worked in
+rounds: fixers on disjoint files, each change attacked by an independent
+reviewer, findings fixed in the next round. Full API suite run at the end (see
+below). Everything is committed and pushed; nothing is deployed.
+
+**Applied to prod tonight (additive migrations, safe with the live build):**
+`20261001160000` email archive matches the live table; `20261001170000`
+properties refuse an unknown time zone (prod has none); `20261001180000` one
+login per email in any letter case (prod has none). Also applied to gam_demo.
+
+**Shipped in code (needs deploy):**
+- POS parity: every file the register reaches is byte-identical in both apps
+  (lib/api, AuthContext, dialogs were drifted and are unified); the guard test
+  now follows the imports. Register + desk can't inherit each other's tap.
+- Dates are the property's, not UTC's: 58 files. Real bugs fixed with it:
+  monthly statement/P&L pulled next month's rent in; balance sheet and to-date
+  ranges dated tomorrow every evening; e-sign screening gate let an unscreened
+  applicant through after 5 pm; credit-record tier marked 5 pm–midnight
+  payments late; P&L dropped the last day; bank-feed books-start cutoff never
+  applied. The test gate now passes in the evening.
+- No-default-company fallout: Expenses, bank reconciliation, bookkeeper invite,
+  documents, e-sign to typed emails (now asks WHICH PROPERTY), FlexCharge,
+  lot-rent; CSV import waits for a company; PM portal asks which company.
+- Oak Park late digest = true open balance, one line per person (was rent only).
+- Reminder emails carry the bill-link sign-in factor.
+- Reports: one definition of landlord income everywhere (GAM's fees and held
+  deposits were counted as landlord income).
+- Work trade: an hour-tracking agreement's end no longer bills the shortfall
+  twice; re-running a month close no longer counts hours twice; late approvals
+  count.
+- Jobs: business invoicing fee crash, compliance archive, Stripe one-bank
+  default, S638 on move-in bills, session renewal on business/PM portals.
+- SECURITY (pre-existing holes, all in production today — deploy soon):
+  CSV import could write into another landlord's property and attach another
+  landlord's own login as a tenant and mail its activation link to an
+  attacker; invite/accept-invite, PDF intent resolve, contact-address change,
+  utility agreements, team invitations and e-sign (signing tokens returned to
+  every signer on GET /documents/:id; any login as landlord signer) could hand
+  one company a password or signing link for another company's person; "add
+  owner" added any landlord as co-owner with no consent and made the adder their
+  referral upline (commission). No sign of misuse in prod (co-owner links are
+  Nic's own people).
+
+**Taken back out (saved on branch `wip/credit-netting-s654`):** a redesign of how
+paid-ahead and landlord credit are netted and placed (it began as the MH 25
+fix). Four review rounds kept finding money edge cases (credits covering the
+whole bill, neighbor utilities, GAM fee rows, mixed GAM-held/check credit, an
+in-flight ACH retry settled from credit). Main runs today's live payment logic
+plus two harmless fixes (autopay skips work-trade lines; the tenant assistant
+counts a bounced payment once and never quotes work-trade lines as owed).
+
+### Decisions for Nic (numbered; recommendation first)
+1. **Deploy** the overnight batch — the security fixes are the reason.
+2. **Country Acres late fees** — Blu's answer before 10 pm Oct 5 Arizona time
+   (11 × $50). Stamp MH 15 (Mike Boyd) exempt under S638? (one invoice).
+3. **Credit netting (MH 25 and every paid-ahead tenant):** today the bill email
+   nets paid-ahead credit and the portal does not, so they show different
+   numbers. Options: (a) portal matches the email for the simple case only,
+   (b) the full redesign on the branch after a design review, (c) email stops
+   netting. Recommend a short design session before any code.
+4. **Renewal billing:** a mid-cycle renewal bills a full first month the old
+   lease already billed. Options explored and their edge cases are in the
+   round-6 notes; Nic sets the rule.
+5. **Bulk tenant CSV** emails every imported tenant at once (conflicts S647).
+6. **Reports basis:** confirm cash basis (by settle date) — some reports go by
+   due date.
+7. **FlexPay** (0 enrolled): the tenant pull collides with the rent row and
+   debits with no payment row. Fix before anyone enrolls.
+8. **Bank feed cleanup** (prod write, needs OK): 69 pre-books-start rows and 91
+   relink duplicates on the active PNC connection sit in needs_review.
+9. Delinquent mark counts rent only (utility-only debtors never marked).
+10. Session renewal for admin / admin-ops / books (super_admin would roll).
+11. Pay-now button on the "retries exhausted" email.
+12. Old bank detached when a new one is added, before it verifies.
+13. MH 25 overpaid $0.35 card fee — refund?
+14. Month-to-month renewals can't be sent (overlap check).
+15. Registration auto-claims co-owner invitations before email verification.
+16. Invite responses still return the activation link to the inviter for a
+    brand-new account (InviteTenantModal's copy box) — keep or email-only?
+17. POS pay-link people search shows other companies' residents' name/phone
+    (Nic agreed earlier; conflicts with data isolation).
+18. **Security punch list still open** (final audit, all pre-existing): onboard
+    routes attach another company's resident with no consent; tenant profile
+    shows a resident's cross-company history; property transfer needs no buyer
+    consent; waive-screening is platform-wide; a property manager can redirect
+    the owner's signing email; booking screening reveals other companies'
+    background checks; credit-settled rows and shortened stays count as income.
+    Recommend fixing these next, same review loop.
+
 ## Still open
 
 - **Lots 22 and 24 are marked OUT OF SERVICE** (9/30, by the run's stuck-meter
@@ -388,17 +496,21 @@ full gate between 5 pm and midnight until then.
   Tenant payments there will be platform-held with an admin alert each (not
   lost), and the $24 October platform fee cannot be debited. Blu must link his
   bank before the first Country Acres payment lands.
-- **Country Acres late fees fire the night of Oct 6** ($50, grace 5) on every
-  unpaid bill: `onboarding_late_fee_waiver` is NULL there (Blu never answered;
-  NULL = fees apply). Even if set, the first-bill test counts the ten VOID
-  history invoices as prior bills (`lateFees.ts` and the generator's
-  `priorInvoice` count include status void) — fix forward if Blu waives.
-- Verification pass also noted (not fixed): Oak Park late digest sums rent only
-  ($2,860 shown vs $4,519.33 open); nightly `businessMonthlyFees` job crashes
-  on a text→numeric cast (no businesses yet); monthly compliance archive fails
-  (`email_send_log_archive` missing `provider_message_id`); Mike Boyd's bank
-  default failed to set in Stripe (`[stripe] one-bank swap`); MH 25's $10
-  paid-ahead credit was not netted in the email headline.
+- **Country Acres late fees fire the night of Oct 6** ($50, grace 5) on 11
+  unpaid Oct 1 bills (MH 01, 11, 15, 17, 18, 21, 22, 24, 28, 29, 30 = $550 if
+  nobody pays): `onboarding_late_fee_waiver` is NULL (Blu could never answer —
+  the question only showed while the onboarding window was open, and it closed
+  9/14, two days before the question shipped). Overnight build: the question
+  now shows for any property where it is unanswered (Tenant Onboarding page).
+  The void-history count was already fixed (061e2f5, live); overnight added the
+  tests. MH 15 (Mike Boyd) started 9/25 and would be exempt under S638 (after
+  the 20th) but his bill was written by the move-in bundle before that rule
+  reached it — code fixed overnight; his one invoice needs Nic's OK to stamp.
+- Fixed overnight (see Overnight section): Oak Park late digest, business fee
+  job crash, compliance archive, Stripe one-bank default. MH 25: the bill
+  email was RIGHT ($450); the tenant PORTAL asked $460 (ignored the $10 paid-
+  ahead credit). The $10 is still on the account for November. Not fixed on
+  main — see Overnight, decision 3.
 - Shane Rueff, Kyra Smith, Jolyn Whitfield sign their purchase agreements.
 - Myria's contract record is $24,000 / 120 × $200; the agreement Blu signed says
   "$12,000 + taxes" and the sheet says $650 × 5 years (= $12,000). Monthly is the

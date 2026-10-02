@@ -47,10 +47,13 @@ beforeEach(async () => {
     const l = await seedLandlord(c)
     const propertyId = await seedProperty(c, { landlordId: l.landlordId, ownerUserId: l.userId, managedByUserId: l.userId })
     await seedUnit(c, { propertyId, landlordId: l.landlordId })
+    // S654: a never-set-up invitee holds the placeholder password, as every
+    // invite door writes it. accept-invite sets a password only over that
+    // placeholder; an empty hash matches no real account.
     const { rows: [u] } = await c.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified,
                           tenant_invite_token, tenant_invite_expires_at)
-       VALUES ($1, '', 'tenant', 'New', 'Tenant', FALSE, $2, NOW() + INTERVAL '7 days')
+       VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'New', 'Tenant', FALSE, $2, NOW() + INTERVAL '7 days')
        RETURNING id`, [`inv-${randomUUID().slice(0, 8)}@mailer-test.co`, token])
     await c.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [u.id])
     await c.query('COMMIT')

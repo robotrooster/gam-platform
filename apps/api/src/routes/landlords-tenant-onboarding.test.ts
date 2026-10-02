@@ -618,16 +618,19 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
 
   // An invite that was SENT but never accepted still needs re-sending — that
   // account is not "on the platform", it is waiting.
+  // S654: the call did not create this account, so the link is never handed
+  // back in the response; it is minted and emailed only to the address the
+  // account holds (stored here in another letter case than the one typed).
   it('re-invites someone who never accepted', async () => {
     const f = await seedTOFixture()
-    const email = `pending-${randomUUID().slice(0,6)}@test.dev`
+    const stored = `Pending-${randomUUID().slice(0,6)}@Test.dev`
     const c = await db.connect()
     try {
       await c.query('BEGIN')
       await c.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
          VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'Wait', 'Ing', '555-0111')`,
-        [email])
+        [stored])
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 
@@ -635,14 +638,23 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
       .post('/api/landlords/me/onboard-tenant')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
-        firstName: 'Wait', lastName: 'Ing', email, phone: '555-0111',
+        firstName: 'Wait', lastName: 'Ing', email: stored.toLowerCase(), phone: '555-0111',
         unitId: f.unitId,
         leaseStart: '2026-01-01', leaseEnd: '2027-01-01',
         monthlyRent: 1500, securityDeposit: 1000,
       })
     expect(res.status).toBe(200)
     expect(res.body.data.alreadyOnPlatform).toBe(false)
-    expect(res.body.data.activationUrl).toBeTruthy()
+    expect(res.body.data.activationUrl).toBeNull()
+    expect(JSON.stringify(res.body)).not.toMatch(/accept-invite/)
+
+    const token = (await db.query<{ tenant_invite_token: string | null }>(
+      `SELECT tenant_invite_token FROM users WHERE email=$1`, [stored])).rows[0].tenant_invite_token
+    expect(token).toMatch(/^[0-9a-f]{64}$/)
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+    const call = emailTenantOnboardedMock.mock.calls[0]!
+    expect(call[0]).toBe(stored)
+    expect(call[5]).toMatch(new RegExp(`/accept-invite\\?token=${token}$`))
   })
 
   // ── S618: importing a lease must mark the unit OCCUPIED ────────────────

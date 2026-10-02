@@ -6,6 +6,7 @@ import {
 } from '../services/email'
 import { runLateBalanceDigest } from './lateBalanceDigest'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
+import { portalLink } from '../lib/portalUrls'
 import { query, queryOne, getClient } from '../db'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import { generateInvoices, registerInvoiceEngine } from './invoiceGeneration'
@@ -409,10 +410,22 @@ const esign48hCutover = () => process.env.ESIGN_48H_CUTOVER || '2026-09-02T21:00
 // a document id is not recognized as a token URL and demanded a login);
 // tenants get the one link that sets up their account and opens the lease
 // (S647). Same helper the send path uses.
+//
+// S654: a signing token is a full stand-in for that signer, so it is mailed
+// only to the address on the signer's own account (`send_to`, the same rule as
+// signerDeliveryAddress in routes/esign.ts) — never the signer row's address,
+// which can be stale. And one reminder per PERSON per packet: grouping by the
+// row's address split one person in two when their rows disagreed (the email
+// correction moved only the lease's row) and mailed the old mailbox a token
+// whose signing page carries the rest of the packet. A landlord's rows keep
+// their own address (the property's on-site signer), so it stays in their key.
 async function remindByPacket(rows: any[], tag: string): Promise<number> {
   const groups = new Map<string, any[]>()
   for (const r of rows) {
-    const k = `${String(r.email).toLowerCase()}|${r.package_group_id ?? r.doc_id}`
+    const who = r.role === 'landlord'
+      ? `landlord|${r.user_id}|${String(r.send_to).toLowerCase()}`
+      : `signer|${r.user_id}`
+    const k = `${who}|${r.package_group_id ?? r.doc_id}`
     if (!groups.has(k)) groups.set(k, [])
     groups.get(k)!.push(r)
   }
@@ -422,11 +435,12 @@ async function remindByPacket(rows: any[], tag: string): Promise<number> {
     const r = g[0]
     try {
       const unitLabel = r.unit_number ? `Unit ${r.unit_number} — ${r.property_name}` : r.title
+      // S654: portalLink, never a localhost fallback (S641).
       const { url, needsSetup } = r.role === 'landlord'
-        ? { url: `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/sign/${r.token || r.doc_id}`, needsSetup: false }
-        : await tenantLeaseLink({ userId: r.user_id, documentId: r.doc_id, signerToken: r.token })
+        ? { url: portalLink('landlord', `sign/${r.token || r.doc_id}`), needsSetup: false }
+        : await tenantLeaseLink({ userId: r.user_id, documentId: r.doc_id, signerToken: r.token, sendTo: r.send_to })
       const title = g.length > 1 ? `your ${g.length} documents for ${unitLabel}` : r.title
-      await emailSigningReminder(r.email, r.name, title, unitLabel, r.landlord_name, url,
+      await emailSigningReminder(r.send_to, r.name, title, unitLabel, r.landlord_name, url,
         { landlordId: r.landlord_id, documentId: r.doc_id, needsSetup, documentCount: g.length })
       await query(
         `UPDATE lease_document_signers
@@ -450,12 +464,16 @@ export async function processEsignTimeouts() {
     // that is the case that used to go permanently silent after one
     // email. `landlordSigned` distinguishes them in a single query so
     // the relay ordering stays in one place.
+    // S654: send_to — the address on the signer's own account; the landlord's
+    // row keeps its own (see remindByPacket).
     const remind = await query<any>(`
       SELECT s.id, s.email, s.name, s.role, s.token, s.user_id,
+             CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS send_to,
              d.id as doc_id, d.title, d.landlord_id, d.package_group_id, d.package_sort_order,
              u.unit_number, p.name as property_name,
              lu.first_name || ' ' || lu.last_name as landlord_name
       FROM lease_document_signers s
+      LEFT JOIN users su ON su.id = s.user_id
       JOIN lease_documents d ON d.id = s.document_id
       LEFT JOIN units u ON u.id = d.unit_id
       LEFT JOIN properties p ON p.id = u.property_id
@@ -599,9 +617,13 @@ export async function processEsignTimeouts() {
         //
         // Only the person whose turn it actually is — lowest order_index still
         // unsigned. The same rule the submit gate and the signing view use.
+        // S654: send_to — the address on the signer's own account, never the
+        // signer row's (only tenants reach the resend below; see remindByPacket).
         const outstanding = await query<any>(`
-          SELECT s.id, s.name, s.email, s.role, s.token, s.user_id
+          SELECT s.id, s.name, s.email, s.role, s.token, s.user_id,
+                 CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS send_to
             FROM lease_document_signers s
+            LEFT JOIN users su ON su.id = s.user_id
            WHERE s.document_id = $1 AND s.status <> 'signed'
            ORDER BY s.order_index
            LIMIT 1`, [d.id])
@@ -624,8 +646,8 @@ export async function processEsignTimeouts() {
               // S647: tenant-only here (onlyTenantsLeft), so always the
               // one-link rule — set up the account and open the lease.
               const link = await tenantLeaseLink({
-                userId: s.user_id, documentId: d.id, signerToken: s.token })
-              await emailSigningRequest(s.email, s.name, d.title, unitLabel,
+                userId: s.user_id, documentId: d.id, signerToken: s.token, sendTo: s.send_to })
+              await emailSigningRequest(s.send_to, s.name, d.title, unitLabel,
                 ll?.name || 'Your landlord', link.url,
                 { landlordId: d.landlord_id, documentId: d.id, needsSetup: link.needsSetup })
               await query(
@@ -648,8 +670,12 @@ export async function processEsignTimeouts() {
           ['auto-voided: signers did not respond within 48 hours', d.id])
 
         const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
+        // S654: each signer at the address on their own account (the landlord's
+        // row keeps its own), never a signer row's possibly stale one.
         const recipients = await query<any>(`
-          SELECT email, name FROM lease_document_signers WHERE document_id=$1
+          SELECT CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS email, s.name
+            FROM lease_document_signers s LEFT JOIN users su ON su.id = s.user_id
+           WHERE s.document_id=$1
           UNION ALL
           SELECT lu.email, (lu.first_name || ' ' || lu.last_name) as name
           FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id=$2
@@ -727,8 +753,12 @@ export async function processEsignTimeouts() {
           vc.release()
         }
         const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
+        // S654: each signer at the address on their own account (the landlord's
+        // row keeps its own), never a signer row's possibly stale one.
         const recipients = await query<any>(`
-          SELECT email, name FROM lease_document_signers WHERE document_id=$1
+          SELECT CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS email, s.name
+            FROM lease_document_signers s LEFT JOIN users su ON su.id = s.user_id
+           WHERE s.document_id=$1
           UNION ALL
           SELECT lu.email, (lu.first_name || ' ' || lu.last_name) as name
           FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id=$2
@@ -756,10 +786,12 @@ export async function processEsignTimeouts() {
       const landlordPass = hour === 8
       const renewalRemind = await query<any>(`
         SELECT s.id, s.email, s.name, s.role, s.token, s.user_id,
+               CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS send_to,
                d.id as doc_id, d.title, d.landlord_id, d.package_group_id, d.package_sort_order,
                u.unit_number, p.name as property_name,
                lu.first_name || ' ' || lu.last_name as landlord_name
         FROM lease_document_signers s
+        LEFT JOIN users su ON su.id = s.user_id
         JOIN lease_documents d ON d.id = s.document_id
         LEFT JOIN units u ON u.id = d.unit_id
         LEFT JOIN properties p ON p.id = u.property_id

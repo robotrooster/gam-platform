@@ -26,6 +26,7 @@
 // ============================================================
 import { query } from '../db'
 import { platformFeesByProperty, platformFeesByPropertyForEntities } from './platformFee'
+import { landlordIncomeSql } from './landlordPL'
 
 /** Every month a range touches, as 'YYYY-MM-01' — the key format the
  *  platform-fee accrual lookup expects. A range landing mid-month still bills
@@ -69,6 +70,8 @@ export interface ReportRow {
   propertyName: string | null
   unitId:       string | null
   unitNumber:   string | null
+  /** S654: other = "Balances collected" (carried_balance: pre-platform arrears
+   *  and work-trade deficits), the one income kind without its own field. */
   income: {
     rent: number; fees: number; utilities: number; homeSale: number; other: number; total: number
   }
@@ -136,9 +139,11 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
   }
 
   // ── 1. INCOME — settled payments, dated by when money actually settled ────
-  // Categorized exactly as landlordPL does. Deposits are EXCLUDED from income:
-  // a deposit is the tenant's money held as a liability, not revenue. Counting
-  // it would inflate a T-12 and mislead a buyer or lender reading it.
+  // S654: the rows are landlordIncomeSql's, the one definition every landlord
+  // report uses. Deposits are EXCLUDED from income: a deposit is the tenant's
+  // money held as a liability, not revenue. Counting it would inflate a T-12
+  // and mislead a buyer or lender reading it. GAM's fees, held paid-ahead
+  // money and FlexPay pulls are not the landlord's money and are out too.
   const incomeSql = `
     SELECT ${bucketExpr(bucket, 'p.settled_at')} AS period,
            ${wantProperty ? 'u.property_id' : 'NULL::uuid'} AS property_id,
@@ -147,13 +152,12 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
            COALESCE(SUM(p.amount) FILTER (WHERE p.type IN ('late_fee','fee')), 0)::float AS fees,
            COALESCE(SUM(p.amount) FILTER (WHERE p.type='utility'), 0)::float           AS utilities,
            COALESCE(SUM(p.amount) FILTER (WHERE p.type='home_payment'), 0)::float      AS home_sale,
-           COALESCE(SUM(p.amount) FILTER (
-             WHERE p.type NOT IN ('rent','late_fee','fee','utility','home_payment','deposit')
-           ), 0)::float                                                                AS other
+           COALESCE(SUM(p.amount) FILTER (WHERE p.type='carried_balance'), 0)::float   AS other
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
      WHERE p.landlord_id = ANY($1::uuid[])
        AND p.status = 'settled'
+       AND ${landlordIncomeSql('p')}
        AND p.settled_at >= $2::date
        AND p.settled_at < ($3::date + INTERVAL '1 day')
        AND ($4::uuid[] IS NULL OR u.property_id = ANY($4))

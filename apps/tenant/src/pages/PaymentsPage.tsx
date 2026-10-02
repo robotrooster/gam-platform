@@ -86,20 +86,6 @@ const STATUS_BADGE: Record<string, string> = {
 // covering that and that they may choose to stop covering that at any time" — so
 // if a $10 ever does appear later, they recognize it as the landlord stopping
 // rather than a new charge nobody warned them about.
-// S654 (MH 25): the credit has to be visible before they pay (Nic, S638). The
-// bill email said $450 and this page said $460; now the page says $450 and shows
-// why: "Bill $460.00 · Paid-ahead credit −$10.00".
-function CreditNetLine({ gross, prepaid, credit }: { gross: number; prepaid: number; credit: number }) {
-  if (!(prepaid > 0.005 || credit > 0.005)) return null
-  return (
-    <div style={{ fontSize: '.78rem', color: 'var(--t2)', marginTop: 4 }}>
-      Bill {formatCurrency(gross)}
-      {prepaid > 0.005 && <> · Paid-ahead credit <span style={{ color: 'var(--green)' }}>−{formatCurrency(prepaid)}</span></>}
-      {credit > 0.005 && <> · Account credit <span style={{ color: 'var(--green)' }}>−{formatCurrency(credit)}</span></>}
-    </div>
-  )
-}
-
 function WaysToPay({ lease, reports = [], onReportDeposit, onWithdrawn }: {
   lease: any
   reports?: any[]
@@ -184,11 +170,6 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
       manualFeeCoveredByLandlord?: boolean
       manualFeeFirstFree?: boolean
       manualFeeAbsorbed?: number
-      // S654: the bill before credit, and what came off it — paid-ahead first,
-      // then the landlord's credit. `outstanding` is already net of both.
-      grossOutstanding?: number
-      prepaidApplied?: number
-      creditApplied?: number
     }[]
     rows: { id: string; amount: number; dueDate: string; type: string; entryDescription: string }[]
     // S616: what the payer owes on each utility service agreement — the same
@@ -461,10 +442,6 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                 <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--t0)' }}>
                   {formatCurrency(payableTotal)}
                 </div>
-                <CreditNetLine
-                  gross={r2(payable.reduce((s, l) => s + Number(l.grossOutstanding ?? l.outstanding), 0))}
-                  prepaid={r2(payable.reduce((s, l) => s + Number(l.prepaidApplied || 0), 0))}
-                  credit={r2(payable.reduce((s, l) => s + Number(l.creditApplied || 0), 0))} />
                 <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>
                   Everything you owe, in one payment — oldest charges first. Each space is
                   charged separately, so one clearing doesn&apos;t depend on the others.
@@ -518,10 +495,6 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                 <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--t0)' }}>
                   {formatCurrency(lg.outstanding)}
                 </div>
-                <CreditNetLine
-                  gross={Number(lg.grossOutstanding ?? lg.outstanding)}
-                  prepaid={Number(lg.prepaidApplied || 0)}
-                  credit={Number(lg.creditApplied || 0)} />
                 <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>
                   Rent is paid in full — this covers your entire balance on this lease,
                   oldest charges first.

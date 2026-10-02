@@ -12,7 +12,7 @@
  * QR named no space, so the landlord picks one — a body-supplied id that has
  * to be ownership-checked, because unit numbers repeat across parks.
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, beforeAll } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
@@ -66,7 +66,7 @@ async function seedFixture(opts: {
        VALUES ($1,$2,$3,$4,$5,'Walk','Up',$6,$7,$8) RETURNING id`,
       [landlordId, applicantUserId, opts.withUnit ? unitId : null, propertyId,
        opts.status ?? 'approved',
-       opts.moveIn === undefined ? '2026-10-01' : opts.moveIn,
+       opts.moveIn === undefined ? MOVE_IN : opts.moveIn,
        opts.term ?? null, !!opts.monthToMonth])
     if (opts.template !== false) {
       const t = await c.query<{ id: string }>(
@@ -98,6 +98,18 @@ const draft = (fx: Fx, body: any = {}) => request(buildApp())
   .set('Authorization', `Bearer ${llToken(fx.landlordUserId, fx.landlordId)}`)
   .send(body)
 
+// S654: the move-in was hard-coded to 2026-10-01; once that day passed the
+// drafter (correctly) never starts a lease in the past and moved it to today.
+// Take a future first-of-month from the database's own calendar instead.
+let MOVE_IN = ''
+let MOVE_IN_PLUS_6_END = ''
+beforeAll(async () => {
+  const r = await db.query<{ a: string; b: string }>(
+    `SELECT (date_trunc('month', CURRENT_DATE) + interval '2 months')::date::text AS a,
+            (date_trunc('month', CURRENT_DATE) + interval '8 months' - interval '1 day')::date::text AS b`)
+  MOVE_IN = r.rows[0].a; MOVE_IN_PLUS_6_END = r.rows[0].b
+})
+
 describe('POST /api/background/:id/draft-lease', () => {
   it('drafts the signing packet with the applicant as primary and the landlord first, carrying their dates', async () => {
     const fx = await seedFixture({ withUnit: true, term: 6 })
@@ -111,8 +123,8 @@ describe('POST /api/background/:id/draft-lease', () => {
     expect(s.map((x: any) => x.role)).toEqual(['landlord', 'primary'])
     expect(s[1].user_id).toBe(fx.applicantUserId)
     const vals = await fieldVals(docId)
-    expect(vals.start_date).toBe('2026-10-01')
-    expect(vals.end_date).toBe('2027-03-31')      // 6 months, month-end snapped
+    expect(vals.start_date).toBe(MOVE_IN)
+    expect(vals.end_date).toBe(MOVE_IN_PLUS_6_END)      // 6 months, month-end snapped
     expect(vals.lease_type).toBe('Fixed term')
     expect(vals.rent_amount).toBe('725.00')
 

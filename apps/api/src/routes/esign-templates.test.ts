@@ -30,7 +30,9 @@
  *   - POST /witnesses/provision enables email enumeration via
  *     `reused: true` flag in the response — any authenticated landlord
  *     with leases.create permission can probe whether a given email
- *     exists on the platform.
+ *     exists on the platform. S654 narrowed it: a landlord or staff login,
+ *     or another company's resident, now gets 409 with no id; only a
+ *     witness-only login or a contact is reused.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -143,18 +145,38 @@ describe('POST /witnesses/provision', () => {
     expect(u.rows[0].password_hash).toMatch(/placeholder/)
   })
 
-  it('FINDING (S393): existing email returns reused=true → enables email enumeration', async () => {
+  // S654: provision used to hand back the id of ANY account on the address —
+  // the first step of landlord B putting landlord A's invitee on B's lease. A
+  // landlord or staff login is now never a witness: 409, and no id.
+  it('S654: an existing landlord login → 409, no id', async () => {
     const f = await seed()
     const existingEmail = `existing-${randomUUID()}@test.dev`
-    await db.query(
-      `INSERT INTO users (email, password_hash, role, first_name, last_name) VALUES ($1, 'x', 'landlord', 'Pre', 'Existing')`,
+    const pre = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name) VALUES ($1, 'x', 'landlord', 'Pre', 'Existing') RETURNING id`,
       [existingEmail])
     const res = await request(buildApp())
       .post('/api/esign/witnesses/provision')
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ email: existingEmail, firstName: 'X' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.reused).toBe(true)  // the enumeration signal — flagged
+      .send({ email: existingEmail.toUpperCase(), firstName: 'X' })
+    expect(res.status).toBe(409)
+    expect(res.body.data).toBeUndefined()
+    expect(JSON.stringify(res.body)).not.toContain(pre.rows[0].id)
+  })
+
+  it('S654: an existing witness-only login (no tenant profile) is reused — the id and nothing else', async () => {
+    const f = await seed()
+    const email = `witness-${randomUUID()}@test.dev`
+    const first = await request(buildApp())
+      .post('/api/esign/witnesses/provision')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ email, firstName: 'Wit' })
+    expect(first.status).toBe(201)
+    const again = await request(buildApp())
+      .post('/api/esign/witnesses/provision')
+      .set('Authorization', `Bearer ${f.tokenB}`)
+      .send({ email: email.toUpperCase(), firstName: 'Wit' })
+    expect(again.status).toBe(200)
+    expect(again.body.data).toEqual({ userId: first.body.data.userId, reused: true })
   })
 })
 

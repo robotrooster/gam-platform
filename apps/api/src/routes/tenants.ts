@@ -15,6 +15,7 @@ import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
 import { applyScreeningWaive } from '../services/onboardingWindow'
 import { landlordScopeIds } from '../lib/landlordScope'
+import { portalLink } from '../lib/portalUrls'
 
 export const tenantsRouter = Router()
 
@@ -64,6 +65,32 @@ tenantsRouter.get('/', requireAuth, async (req: any, res, next) => {
 // S654: the only accounts an invite link may activate.
 const INVITE_ACCOUNT_ROLES: readonly string[] = ['tenant', 'contact']
 
+const PLACEHOLDER_HASH = '$2b$10$placeholder_invite_pending'
+
+/**
+ * S654: accept-invite is FIRST-TIME SETUP only. The link sets the account's
+ * password, so it works only on an account still waiting for its first one:
+ * the placeholder password every invite door writes. Landlord B's utility
+ * agreement once minted a token on a resident who had signed up through
+ * screening with a password of their own (so had never "accepted" an invite),
+ * and this route took that token and replaced their working password.
+ *
+ * One other shape is still first-time: an e-sign contact minted by
+ * services/signerAccounts (S568) carries an unguessable random hash instead of
+ * the placeholder. Contacts are only ever created that way, and every route
+ * that sets a password (this one, reset-password, change-password) stamps
+ * sessions_valid_from, so a contact with none — and no sign-in — has never had
+ * a password anyone knows.
+ *
+ * Mirrored in SQL by FIRST_TIME_SETUP_SQL for /invite-info.
+ */
+function stillFirstTimeSetup(u: { password_hash: string; role: string; sessions_valid_from: Date | null; last_login_at: Date | null }): boolean {
+  if (u.password_hash === PLACEHOLDER_HASH) return true
+  return u.role === 'contact' && !u.sessions_valid_from && !u.last_login_at
+}
+const FIRST_TIME_SETUP_SQL = `(password_hash = '${PLACEHOLDER_HASH}'
+   OR (role = 'contact' AND sessions_valid_from IS NULL AND last_login_at IS NULL))`
+
 tenantsRouter.post('/accept-invite', async (req, res, next) => {
   try {
     const { token, password, phone, ssiSsdi, acceptedTerms } = req.body
@@ -105,10 +132,14 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
     try {
       await client.query('BEGIN')
 
+      // S654: a live link has a clock. An unaccepted token with no expiry is
+      // dead (every invite door writes one); the NULL case is kept only for a
+      // link already spent, whose expiry activation clears, so its holder
+      // still hears ALREADY_ACCEPTED below.
       user = (await client.query(
         `SELECT * FROM users
           WHERE tenant_invite_token = $1
-            AND (tenant_invite_expires_at IS NULL OR tenant_invite_expires_at > NOW())
+            AND (tenant_invite_expires_at > NOW() OR tenant_invite_accepted_at IS NOT NULL)
           FOR UPDATE`,
         [token])).rows[0]
 
@@ -117,6 +148,12 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // login is an invalid link: a token that reached a landlord's or staff
       // account must never set its password.
       if (user && !INVITE_ACCOUNT_ROLES.includes(user.role)) user = undefined
+
+      // S654: and only while the account still needs its first password. An
+      // account that finished setup through this link is told so just below
+      // (ALREADY_ACCEPTED); any other account with a password of its own gets
+      // the same answer as a link that never existed, and nothing is written.
+      if (user && !user.tenant_invite_accepted_at && !stillFirstTimeSetup(user)) user = undefined
 
       // ── S637: "ALREADY DONE" IS NOT "EXPIRED" ──────────────────────────
       //
@@ -360,11 +397,14 @@ tenantsRouter.get('/invite-info', async (req, res, next) => {
     if (!token) return res.status(400).json({ success: false, error: 'Token required' })
 
     // S410 (S377): read tenant_invite_token + enforce expiry.
+    // S654: the same accounts accept-invite would take — first-time setup, or
+    // one that finished setup through this link (the page then says so).
     const user = await queryOne<any>(
       `SELECT id, email, first_name, last_name FROM users
         WHERE tenant_invite_token = $1
-          AND (tenant_invite_expires_at IS NULL OR tenant_invite_expires_at > NOW())
-          AND role = ANY($2::text[])`,
+          AND (tenant_invite_expires_at > NOW() OR tenant_invite_accepted_at IS NOT NULL)
+          AND role = ANY($2::text[])
+          AND (tenant_invite_accepted_at IS NOT NULL OR ${FIRST_TIME_SETUP_SQL})`,
       [token as string, INVITE_ACCOUNT_ROLES])
     if (!user) return res.status(404).json({ success: false, error: 'Invalid or expired invite' })
 
@@ -1827,6 +1867,146 @@ tenantsRouter.get('/payments', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// ── S654: every tie an account has to a company, read from the schema ──────
+//
+// Round 8, reproduced: landlord B re-addressed a never-set-up account whose
+// only ties to company A were a cancelled invite, A's background check on them
+// and a $250 one-off charge. The hand-written list here counted leases, open
+// invites, drafts, utility agreements, payments and signer seats, so it said
+// "not tied": the address moved to B's mailbox, the setup link mailed there
+// set the password, and A's screening decision came with the login.
+//
+// So the list is no longer written by hand. Every column in the database that
+// points at a person (a foreign key to users or tenants) is a tie to the
+// company on that row: its landlord_id, any column that references landlords,
+// businesses or pm_companies, or a company table's own id. A row with no
+// company of its own ties through the row it hangs off (a signer seat through
+// its document, a lease's tenant row through the lease, a work-trade log
+// through its agreement). Cancelled, voided and finished rows count the same
+// as live ones. A table added later counts the day it exists. The query is
+// built once per process from the catalog.
+const COMPANY_TABLES = new Set(['landlords', 'businesses', 'pm_companies'])
+// Person columns the schema gives no foreign key; named so they count too.
+const UNKEYED_PERSON_COLUMNS: Array<[table: string, column: string, refers: 'users' | 'tenants']> = [
+  ['payment_reversals', 'tenant_id', 'tenants'],
+  ['landlord_member_history', 'user_id', 'users'],
+  ['product_events', 'user_id', 'users'],
+]
+const SQL_IDENT = /^[a-z_][a-z0-9_]*$/
+
+interface TieQuery { sql: string; sources: string[] }
+let tieQuery: Promise<TieQuery> | null = null
+
+async function buildTieQuery(): Promise<TieQuery> {
+  const fks = await query<{ tbl: string; col: string; reftbl: string; refcol: string }>(
+    `SELECT cl.relname AS tbl, a.attname AS col, rcl.relname AS reftbl, ra.attname AS refcol
+       FROM pg_constraint c
+       JOIN pg_class cl ON cl.oid = c.conrelid
+       JOIN pg_namespace n ON n.oid = cl.relnamespace AND n.nspname = 'public'
+       JOIN pg_class rcl ON rcl.oid = c.confrelid
+       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+       JOIN pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = c.confkey[1]
+      WHERE c.contype = 'f' AND cardinality(c.conkey) = 1
+        AND c.conparentid = 0 AND NOT cl.relispartition`)
+  const cols = await query<{ tbl: string; col: string; type: string }>(
+    `SELECT c.table_name AS tbl, c.column_name AS col, c.udt_name AS type
+       FROM information_schema.columns c
+       JOIN information_schema.tables t
+         ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE'
+      WHERE c.table_schema = 'public'`)
+  const uuidCols = new Set(cols.filter(c => c.type === 'uuid').map(c => `${c.tbl}.${c.col}`))
+  const safe = (...names: string[]) => names.every(n => SQL_IDENT.test(n))
+
+  // The company columns a table carries itself.
+  const companyCols = (tbl: string): string[] => {
+    const out = new Set<string>()
+    if (COMPANY_TABLES.has(tbl)) out.add('id')
+    if (uuidCols.has(`${tbl}.landlord_id`)) out.add('landlord_id')
+    for (const f of fks) if (f.tbl === tbl && COMPANY_TABLES.has(f.reftbl)) out.add(f.col)
+    return [...out].filter(c => safe(c))
+  }
+
+  const people: Array<{ tbl: string; col: string; refers: string }> = fks
+    .filter(f => (f.reftbl === 'users' || f.reftbl === 'tenants') && f.refcol === 'id' && f.tbl !== 'users')
+    .map(f => ({ tbl: f.tbl, col: f.col, refers: f.reftbl }))
+  for (const [tbl, col, refers] of UNKEYED_PERSON_COLUMNS) {
+    if (uuidCols.has(`${tbl}.${col}`)) people.push({ tbl, col, refers })
+  }
+
+  const branches: string[] = []
+  const sources: string[] = []
+  for (const p of people) {
+    if (!safe(p.tbl, p.col)) continue
+    const who = p.refers === 'users'
+      ? `x."${p.col}" = $1::uuid`
+      : `x."${p.col}" IN (SELECT id FROM mine)`
+    const own = companyCols(p.tbl)
+    if (own.length > 0) {
+      for (const c of own) {
+        const source = `${p.tbl}.${p.col}`
+        branches.push(`SELECT x."${c}"::text AS company_id, '${source}' AS source FROM "${p.tbl}" x WHERE ${who}`)
+        sources.push(source)
+      }
+      continue
+    }
+    for (const f of fks) {
+      if (f.tbl !== p.tbl || f.col === p.col || f.reftbl === 'users' || f.reftbl === 'tenants') continue
+      if (!safe(f.col, f.reftbl, f.refcol)) continue
+      for (const c of companyCols(f.reftbl)) {
+        const source = `${p.tbl}.${p.col} > ${f.reftbl}`
+        branches.push(
+          `SELECT r."${c}"::text AS company_id, '${source}' AS source FROM "${p.tbl}" x ` +
+          `JOIN "${f.reftbl}" r ON r."${f.refcol}" = x."${f.col}" WHERE ${who}`)
+        sources.push(source)
+      }
+    }
+  }
+  const sql =
+    `WITH mine AS MATERIALIZED (SELECT id FROM tenants WHERE user_id = $1::uuid)
+     SELECT company_id, source FROM (
+       ${branches.join('\n       UNION ALL ')}
+     ) ties
+     WHERE company_id IS NOT NULL AND NOT (company_id = ANY($2::text[]))
+     LIMIT $3`
+  return { sql, sources: Array.from(new Set(sources)).sort() }
+}
+
+function tieQueryOnce(): Promise<TieQuery> {
+  if (!tieQuery) tieQuery = buildTieQuery().catch(e => { tieQuery = null; throw e })
+  return tieQuery
+}
+
+/** S654: where the tie check looks (table.column, "> parent" when it ties through the row it hangs off). */
+export async function companyTieSources(): Promise<string[]> {
+  return (await tieQueryOnce()).sources
+}
+
+/**
+ * S654: the ties this account has to companies outside `own`, of ANY kind
+ * (see above). `limit` 1 answers "is there one" without reading the rest.
+ */
+export async function companyTiesOutside(
+  userId: string, own: Iterable<string>, limit = 1000,
+): Promise<Array<{ companyId: string; source: string }>> {
+  const { sql } = await tieQueryOnce()
+  const rows = await query<{ company_id: string; source: string }>(
+    sql, [userId, Array.from(new Set(own)), limit])
+  const seen = new Set<string>()
+  return rows
+    .filter(r => { const k = `${r.company_id} ${r.source}`; if (seen.has(k)) return false; seen.add(k); return true })
+    .map(r => ({ companyId: r.company_id, source: r.source }))
+}
+
+// S654: does this account belong to a company outside `own`? Any tie at all
+// counts (companyTiesOutside): a lease, an invite (cancelled ones too), a
+// draft, a signer seat on any of its documents, a background check, a charge,
+// an invoice, a document, a booking, a staff or owner seat. Such an account is
+// never re-addressed, renamed or handed a fresh password link by another
+// company. accountTiedElsewhere (resolveIntent.ts) asks this first.
+export async function residentTiedElsewhere(userId: string, own: Iterable<string>): Promise<boolean> {
+  return (await companyTiesOutside(userId, own, 1)).length > 0
+}
+
 // POST /api/tenants/invite — landlord invites a tenant.
 // S81: gated by tenants.create. Pre-S81 the route had bare requireAuth
 // (router-level), so any authenticated user including the tenant being
@@ -1875,24 +2055,45 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
     if (!canAccessLandlordResource(req.user, inviteLandlordId)) {
       return res.status(403).json({ success: false, error: 'Forbidden' })
     }
-    const crypto = require('crypto')
-    const inviteToken = crypto.randomBytes(32).toString('hex')
     const tempHash = '$2b$10$placeholder_invite_pending'
 
-    // Create or find user
-    let user = await queryOne<any>('SELECT id, role FROM users WHERE email=$1', [email])
-    // S654: this route hands the activation link back to the inviter, so it
-    // may only ever land on a resident's account, never a landlord's, staff's
-    // or an e-sign contact's.
-    if (user && user.role !== 'tenant') {
+    // S654: one account per address, whatever its letter case. An exact match
+    // missed 'LANDLORD@X.DEV' for a landlord stored lowercase, and a second
+    // login was made on their address with its link handed to the inviter.
+    const emailNorm = typeof email === 'string' ? email.trim().toLowerCase() : ''
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+      return res.status(400).json({ success: false, error: 'Invalid email format' })
+    }
+    const matches = await query<{ id: string; role: string; email: string; needs_setup: boolean }>(
+      `SELECT id, role, email,
+              (password_hash = $2 AND tenant_invite_accepted_at IS NULL) AS needs_setup
+         FROM users WHERE lower(email) = $1
+        ORDER BY (email = lower(email)) DESC, created_at`,
+      [emailNorm, tempHash])
+    // S654: only a resident's account can be invited, never a landlord's,
+    // staff's or an e-sign contact's.
+    if (matches.some(m => m.role !== 'tenant')) {
       return res.status(409).json({ success: false,
         error: "This email belongs to a GAM account that isn't a resident's, so it can't be invited as a tenant. Use the resident's own email." })
     }
+    let user: { id: string; email: string } | null = matches[0] ?? null
+    let createdHere = false
+
+    // S654: a password link is minted only for an account that still needs
+    // setting up and belongs to no other landlord. Anyone else is already on
+    // GAM (S616): no link, the lease is drafted, and an existing link another
+    // landlord sent keeps working.
+    let mintToken = false
+    if (user && matches[0].needs_setup) {
+      mintToken = !(await residentTiedElsewhere(user.id, [inviteLandlordId, ...landlordScopeIds(req.user!)]))
+    }
     if (!user) {
-      user = await queryOne<any>(`
+      user = await queryOne<{ id: string; email: string }>(`
         INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
-        VALUES ($1,$2,'tenant',$3,$4,$5) RETURNING id`,
-        [email, tempHash, firstName, lastName || '', phone || null])
+        VALUES ($1,$2,'tenant',$3,$4,$5) RETURNING id, email`,
+        [emailNorm, tempHash, firstName, lastName || '', phone || null])
+      createdHere = true
+      mintToken = true
     }
 
     // Create the tenant record — but only if there is not one already.
@@ -1940,6 +2141,7 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
     // Front Desk deliberately hides) and nothing else — so the desk had no
     // work item for him at all. An invite to a UNIT is the work item; it gets
     // the same unit-bound row the onboarding page's invite writes.
+    let leaseDrafted = false
     if (unitId && tenantId) {
       await query(
         `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, property_id)
@@ -1958,6 +2160,7 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
         const { createDocumentRecord, autoSendDraftedDocument } = await import('./esign')
         const out = await autoDraftLeasesForUnit(draftClient as any, unitId, createDocumentRecord)
         await draftClient.query('COMMIT')
+        leaseDrafted = out.draftedDocumentIds.length > 0
         for (const docId of out.draftedDocumentIds) {
           await autoSendDraftedDocument(docId).catch(err =>
             logger.error({ err, docId }, '[INVITE] auto-send after draft failed'))
@@ -2004,15 +2207,20 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
     // overloaded across email-verification + tenant invites + landlord
     // invites). The accept route below now reads tenant_invite_token
     // and enforces tenant_invite_expires_at > NOW().
-    await query(
-      `UPDATE users
-          SET tenant_invite_token = $1,
-              tenant_invite_expires_at = NOW() + INTERVAL '7 days'
-        WHERE id = $2`,
-      [inviteToken, user!.id])
+    let inviteToken: string | null = null
+    if (mintToken) {
+      inviteToken = crypto.randomBytes(32).toString('hex')
+      await query(
+        `UPDATE users
+            SET tenant_invite_token = $1,
+                tenant_invite_expires_at = NOW() + INTERVAL '7 days'
+          WHERE id = $2`,
+        [inviteToken, user!.id])
+    }
 
-    const acceptUrl = `${process.env.TENANT_APP_URL || 'http://localhost:3002'}/accept-invite?token=${inviteToken}`
-    logger.info(`[INVITE] Tenant invite: ${email}`)
+    // S654: portalLink, never a localhost fallback (S641 rule).
+    const acceptUrl = inviteToken ? portalLink('tenant', `accept-invite?token=${inviteToken}`) : null
+    logger.info(`[INVITE] Tenant invite: ${emailNorm}`)
 
     // S628: SEND IT. The landlord's screen says "Invite Sent" and "they will
     // receive an email to set up their account", and until now nothing was
@@ -2040,18 +2248,40 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
            LEFT JOIN properties p ON p.id = COALESCE(un.property_id, $3::uuid)
           WHERE la.id = $1`,
         [inviteLandlordId, unitId ?? null, inviterPropertyId])
-      await emailTenantInvite(
-        email,
-        firstName,
-        ctxRow?.landlord_name || 'Your landlord',
-        ctxRow?.property_name || 'their property',
-        ctxRow?.unit_number ? `Unit ${ctxRow.unit_number}` : null,
-        acceptUrl,
-        !unitId,
-        { landlordId: inviteLandlordId, tenantId },
-      )
+      const landlordName = ctxRow?.landlord_name || 'Your landlord'
+      const propertyName = ctxRow?.property_name || 'their property'
+      if (acceptUrl) {
+        // S654: to the address on the account, never the one typed.
+        await emailTenantInvite(
+          user!.email,
+          firstName,
+          landlordName,
+          propertyName,
+          ctxRow?.unit_number ? `Unit ${ctxRow.unit_number}` : null,
+          acceptUrl,
+          !unitId,
+          { landlordId: inviteLandlordId, tenantId },
+        )
+      } else if (!leaseDrafted) {
+        // S616/S654: already on GAM. Tell them in the account they have; a
+        // drafted lease reaches them when the landlord signs.
+        const { createNotification } = await import('../services/notifications')
+        await createNotification({
+          userId: user!.id,
+          landlordId: inviteLandlordId,
+          type: unitId ? 'lease_drafted' : 'invited_to_apply',
+          title: unitId
+            ? `${landlordName} added you to ${propertyName}${ctxRow?.unit_number ? ` — Unit ${ctxRow.unit_number}` : ''}`
+            : `${landlordName} invited you to apply at ${propertyName}`,
+          body: unitId
+            ? 'Your lease will be ready for you here. Sign in to your GAM account as usual.'
+            : 'Sign in to your GAM account as usual to continue.',
+          data: { unitId: unitId ?? null, propertyId: inviterPropertyId, tenantId },
+          actionUrl: unitId ? '/lease' : '/',
+        })
+      }
     } catch (emailErr) {
-      logger.error({ err: emailErr, ctx: email }, '[INVITE] invite email failed for')
+      logger.error({ err: emailErr, ctx: emailNorm }, '[INVITE] invite notice failed for')
     }
 
     res.json({
@@ -2059,9 +2289,14 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
       data: {
         userId: user!.id,
         tenantId,
-        email,
-        inviteToken,
-        acceptUrl,
+        email: user!.email,
+        // S654: the link goes back to the inviter only for an account this
+        // invite created. Anyone else's link goes only to their own inbox.
+        inviteToken: createdHere ? inviteToken : null,
+        acceptUrl: createdHere ? acceptUrl : null,
+        inviteSent: !!acceptUrl,
+        // S616: so the screen never says "invite sent" for someone already on GAM.
+        alreadyOnPlatform: !mintToken,
       }
     })
   } catch (e) { next(e) }

@@ -76,10 +76,16 @@ describe('co-owner invitations', () => {
 
   it('accepting adds membership ALONGSIDE the invitee\'s own entity', async () => {
     const f = await seedTwoLandlords()
-    await request(buildApp()).post('/api/landlords/members')
+    const sent = await request(buildApp()).post('/api/landlords/members')
       .set('Authorization', `Bearer ${f.tokenA}`).send({ email: f.bEmail })
-    // B already had an account, so that path adds directly; re-check via invite
-    // for the case where they didn't:
+    // S654: an existing landlord gets an invitation too (never a direct add),
+    // and accepts it from their own session.
+    expect(sent.status).toBe(202)
+    const { rows: inv } = await db.query<any>(
+      `SELECT token FROM landlord_member_invitations WHERE lower(email)=lower($1)`, [f.bEmail])
+    const acc = await request(buildApp()).post(`/api/landlords/member-invite/${inv[0].token}/accept`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+    expect(acc.status).toBe(200)
     const { rows: mem } = await db.query<any>(
       `SELECT landlord_id FROM landlord_members WHERE user_id=$1 ORDER BY created_at`, [f.b.userId])
     const ids = mem.map((r: any) => r.landlord_id)
@@ -161,5 +167,19 @@ describe('co-owner invitations', () => {
     const { rows: [l] } = await db.query<any>(
       `SELECT onboarding_complete FROM landlords WHERE id=$1`, [f.b.landlordId])
     expect(l.onboarding_complete).toBe(false)   // their own setup still owed
+  })
+})
+
+describe('S654 only an owner adds an owner', () => {
+  it('a bookkeeper or manager of the company cannot invite an owner', async () => {
+    const f = await seedTwoLandlords()
+    for (const role of ['bookkeeper', 'property_manager', 'onsite_manager', 'maintenance']) {
+      const team = sign({ userId: f.b.userId, role, email: 'staff@mailer-test.co', landlordId: f.a.landlordId, profileId: null, permissions: {} })
+      const res = await request(buildApp()).post('/api/landlords/members')
+        .set('Authorization', `Bearer ${team}`).send({ email: 'staffs-own-landlord@mailer-test.co', landlordId: f.a.landlordId })
+      expect([401, 403]).toContain(res.status)
+    }
+    const { rows } = await db.query(`SELECT 1 FROM landlord_member_invitations WHERE lower(email)='staffs-own-landlord@mailer-test.co'`)
+    expect(rows).toHaveLength(0)
   })
 })

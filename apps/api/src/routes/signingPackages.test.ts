@@ -210,9 +210,16 @@ async function seedSignableUnit() {
       `INSERT INTO pending_tenant_intents (landlord_id, unit_id, tenant_id)
        VALUES ($1,$2,$3)`, [f.a.landlordId, f.unitA, ten.rows[0].id])
     await c.query(`UPDATE units SET dwelling_ownership='landlord' WHERE id=$1`, [f.unitA])
+    // S654: the landlord's seat goes only to the login's own address (or the
+    // property's lease-signing one), and a resident's row always holds the
+    // address on their account, whatever the request typed.
+    const emails = await c.query<{ id: string; email: string }>(
+      `SELECT id, email FROM users WHERE id = ANY($1::uuid[])`, [[f.a.userId, tu.rows[0].id]])
+    const emailOf = (id: string) => emails.rows.find(r => r.id === id)!.email
     await c.query('COMMIT')
     return { ...f, rules: rules.rows[0].id, inst: inst.rows[0].id,
-             tenantUserId: tu.rows[0].id, tenantId: ten.rows[0].id }
+             tenantUserId: tu.rows[0].id, tenantId: ten.rows[0].id,
+             landlordEmail: emailOf(f.a.userId), tenantEmail: emailOf(tu.rows[0].id) }
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
 
@@ -228,7 +235,7 @@ describe('drafting a package as one bundle', () => {
                     annualInterestRate: 0, termMonths: 55, startMonth: '2026-11-01' },
         signers: [
           { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
-          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: f.landlordEmail },
         ],
       })
     expect(res.status).toBe(201)
@@ -252,7 +259,7 @@ describe('drafting a package as one bundle', () => {
         homeSale: { tenantId: f.tenantId, salePrice: 24000, downPayment: 2000,
                     annualInterestRate: 0, termMonths: 55, startMonth: '2026-11-01' },
         signers: [
-          { userId: f.a.userId, role: 'landlord', name: 'Landlord', email: 'l@x.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Landlord', email: f.landlordEmail },
           { userId: f.tenantUserId, role: 'primary', name: 'Tenant', email: 't@x.dev' },
         ],
       })
@@ -283,7 +290,7 @@ describe('drafting a package as one bundle', () => {
                     annualInterestRate: 0, termMonths: 55, startMonth: '2026-11-01' },
         signers: [
           { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
-          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: f.landlordEmail },
         ],
       })
     expect(res.status).toBe(201)
@@ -314,7 +321,7 @@ describe('drafting a package as one bundle', () => {
         homeSale: { selling: true },
         signers: [
           { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
-          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: f.landlordEmail },
         ],
       })
     expect(res.status, JSON.stringify(res.body)).toBe(201)
@@ -333,7 +340,7 @@ describe('drafting a package as one bundle', () => {
         homeSale: { selling: true },
         signers: [
           { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
-          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: f.landlordEmail },
         ],
       })
     expect(res.status, JSON.stringify(res.body)).toBe(201)
@@ -377,7 +384,7 @@ describe('drafting a package as one bundle', () => {
                     annualInterestRate: 0, termMonths: 55, startMonth: '2026-11-01' },
         signers: [
           { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
-          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: f.landlordEmail },
         ],
       })
     expect(res.status).toBe(400)
@@ -393,7 +400,7 @@ describe('drafting a package as one bundle', () => {
         packageTemplateIds: [f.tplB],
         signers: [
           { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
-          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: f.landlordEmail },
         ],
       })
     expect(res.status).toBe(403)
@@ -410,7 +417,7 @@ describe('drafting a package as one bundle', () => {
         templateId: f.tplA, unitId: f.unitA, title: 'Just A Lease',
         signers: [
           { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
-          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: f.landlordEmail },
         ],
       })
     expect(res.status).toBe(201)
@@ -646,7 +653,7 @@ describe('advancePacket — one invitation per packet (S652)', () => {
         homeSale: { tenantId: f.tenantId, salePrice: 24000, downPayment: 2000,
                     annualInterestRate: 0, termMonths: 55, startMonth: '2026-11-01' },
         signers: [
-          { userId: f.a.userId, role: 'landlord', name: 'Landlord', email: 'l@x.dev', orderIndex: 1 },
+          { userId: f.a.userId, role: 'landlord', name: 'Landlord', email: f.landlordEmail, orderIndex: 1 },
           { userId: f.tenantUserId, role: 'primary', name: 'Tenant', email: 't@x.dev', orderIndex: 2 },
         ],
       })
@@ -665,7 +672,9 @@ describe('advancePacket — one invitation per packet (S652)', () => {
 
     // Landlord finishes the packet → the tenant is invited, once, to all of it.
     await db.query(`UPDATE lease_document_signers SET status='signed', signed_at=NOW() WHERE document_id = ANY($1::uuid[]) AND user_id=$2`, [docs, f.a.userId])
-    expect((await advancePacket(group)).invited).toBe('t@x.dev')
+    // S654: to the address on the tenant's account — the 't@x.dev' typed into
+    // the request is never where a resident's signing link goes.
+    expect((await advancePacket(group)).invited).toBe(f.tenantEmail)
     expect((await tenantStates()).every(r => r.status === 'sent' && r.invite_sent)).toBe(true)
     // A later signature in the packet does not invite them again.
     expect((await advancePacket(group)).invited).toBeNull()

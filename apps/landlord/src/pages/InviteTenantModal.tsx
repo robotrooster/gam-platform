@@ -38,8 +38,11 @@ export function InviteTenantModal({ onClose }: Props) {
   const [residents, setResidents] = useState<Resident[]>([blankResident()])
   const [form, setForm] = useState({ unitId: '' })
   const [errors, setErrors] = useState<Record<string, string>>({})
-  const [inviteResult, setInviteResult] = useState<{ acceptUrl: string; email: string; screened: boolean; sent?: { email: string; acceptUrl: string }[]; draft?: { drafted: boolean; reason?: string } | null } | null>(null)
-  const [copied, setCopied] = useState(false)
+  // S654: acceptUrl comes back only for an account this invite created. Someone
+  // already on GAM gets no email and no link (alreadyOnPlatform).
+  type InviteOutcome = { email: string; acceptUrl: string | null; inviteSent: boolean; alreadyOnPlatform: boolean }
+  const [inviteResult, setInviteResult] = useState<{ screened: boolean; sent: InviteOutcome[]; draft?: { drafted: boolean; reason?: string } | null } | null>(null)
+  const [copied, setCopied] = useState<string | null>(null)
   // S579: a person invited to a vacant unit is a NEW applicant by default — they
   // create an account + complete a background check before a unit is assigned
   // (property-level invite). Uncheck only for someone who doesn't need screening.
@@ -78,11 +81,17 @@ export function InviteTenantModal({ onClose }: Props) {
 
   const inviteMut = useMutation(
     async (payloads: any[]) => {
-      const out: any[] = []
+      const out: InviteOutcome[] = []
       for (const [i, payload] of payloads.entries()) {
         try {
           const res: any = await apiPost('/tenants/invite', payload)
-          out.push({ email: payload.email, acceptUrl: res.data.acceptUrl })
+          const d = res?.data ?? {}
+          out.push({
+            email: payload.email,
+            acceptUrl: typeof d.acceptUrl === 'string' && d.acceptUrl ? d.acceptUrl : null,
+            inviteSent: d.inviteSent !== false,
+            alreadyOnPlatform: d.alreadyOnPlatform === true,
+          })
         } catch (e: any) {
           const msg = e?.response?.data?.error || e?.message || 'Invite failed'
           // Name WHICH resident failed — "invite failed" on a four-person
@@ -93,7 +102,7 @@ export function InviteTenantModal({ onClose }: Props) {
       return out
     },
     {
-      onSuccess: async (out: any[]) => {
+      onSuccess: async (out: InviteOutcome[]) => {
         qc.invalidateQueries('tenants')
         qc.invalidateQueries('units')
         // S605: draft the lease for the whole household off the unit type's
@@ -110,8 +119,7 @@ export function InviteTenantModal({ onClose }: Props) {
             draft = r?.data ?? r
           } catch { draft = null }
         }
-        setInviteResult({ acceptUrl: out[0].acceptUrl, email: out[0].email,
-          screened: requireScreening, sent: out, draft })
+        setInviteResult({ screened: requireScreening, sent: out, draft })
       },
       onError: (e: any) => setErrors(er => ({ ...er, submit: e?.message || 'Could not send the invites' })),
     }
@@ -179,15 +187,17 @@ export function InviteTenantModal({ onClose }: Props) {
     }))
   }
 
-  const copyLink = () => {
-    if (!inviteResult) return
-    navigator.clipboard.writeText(inviteResult.acceptUrl)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+  const copyLink = (url: string | null) => {
+    if (!url) return
+    navigator.clipboard.writeText(url)
+    setCopied(url)
+    setTimeout(() => setCopied(c => (c === url ? null : c)), 2000)
   }
 
   // Success screen
   if (inviteResult) {
+    const anySent = inviteResult.sent.some(r => r.inviteSent)
+    const links = inviteResult.sent.filter(r => r.acceptUrl)
     return (
       <div className="modal-overlay" onClick={onClose}>
         <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
@@ -195,25 +205,40 @@ export function InviteTenantModal({ onClose }: Props) {
             <div style={{ width: 56, height: 56, borderRadius: '50%', background: 'rgba(30,219,122,.12)', border: '2px solid var(--green)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
               <Check size={24} style={{ color: 'var(--green)' }} />
             </div>
-            <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.15rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>Invite Sent</div>
-            <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>
-              {inviteResult.email} will receive an email to set up their account.
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.15rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>
+              {anySent ? 'Invite Sent' : 'Already on GAM'}
             </div>
+            {inviteResult.sent.map(r => (
+              <div key={r.email} style={{ fontSize: '.82rem', color: 'var(--text-3)', marginTop: 4 }}>
+                {r.inviteSent
+                  ? <>{r.email} will receive an email to set up their account.</>
+                  : <>{r.email}: They already have a GAM account — {inviteResult.screened
+                      ? 'your invite is waiting for them there.'
+                      : 'the lease is waiting for them there.'}</>}
+              </div>
+            ))}
           </div>
 
-          <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10, padding: 14, marginBottom: 16 }}>
-            <div style={{ fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: 8 }}>
-              Invite Link — share directly if needed
-            </div>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <div style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: '.68rem', color: 'var(--text-2)', background: 'var(--bg-3)', border: '1px solid var(--border-0)', borderRadius: 6, padding: '7px 10px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {inviteResult.acceptUrl}
+          {links.length > 0 && (
+            <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10, padding: 14, marginBottom: 16 }}>
+              <div style={{ fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: 8 }}>
+                Invite Link{links.length > 1 ? 's' : ''} — share directly if needed
               </div>
-              <button className="btn btn-ghost btn-sm" onClick={copyLink} style={{ flexShrink: 0, gap: 5 }}>
-                {copied ? <><Check size={13} style={{ color: 'var(--green)' }} /> Copied</> : <><Copy size={13} /> Copy</>}
-              </button>
+              {links.map(r => (
+                <div key={r.email} style={{ marginTop: 6 }}>
+                  {links.length > 1 && <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>{r.email}</div>}
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <div style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: '.68rem', color: 'var(--text-2)', background: 'var(--bg-3)', border: '1px solid var(--border-0)', borderRadius: 6, padding: '7px 10px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {r.acceptUrl}
+                    </div>
+                    <button className="btn btn-ghost btn-sm" onClick={() => copyLink(r.acceptUrl)} style={{ flexShrink: 0, gap: 5 }}>
+                      {copied === r.acceptUrl ? <><Check size={13} style={{ color: 'var(--green)' }} /> Copied</> : <><Copy size={13} /> Copy</>}
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
-          </div>
+          )}
 
           <div style={{ fontSize: '.75rem', color: 'var(--text-3)', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.15)', borderRadius: 8, padding: '10px 12px', marginBottom: 20, lineHeight: 1.6 }}>
             {inviteResult.screened

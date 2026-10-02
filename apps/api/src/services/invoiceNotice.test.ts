@@ -72,11 +72,11 @@ async function seedInvoice(opts: {
        TZ, opts.dueDaysAgo ?? 0, rent, opts.total ?? (rent - (opts.workTradeCredit ?? 0)), opts.workTradeCredit ?? 0])
 
     await c.query(
-      `INSERT INTO payments (landlord_id, unit_id, lease_id, tenant_id, type, amount, status,
+      `INSERT INTO payments (landlord_id, unit_id, lease_id, type, amount, status,
                              entry_description, due_date, invoice_id, work_trade_suspended_at)
-       VALUES ($1,$2,$3,$8,'rent',$4,'pending','RENT',(NOW() AT TIME ZONE $5)::date, $6, $7)`,
+       VALUES ($1,$2,$3,'rent',$4,'pending','RENT',(NOW() AT TIME ZONE $5)::date, $6, $7)`,
       [ll.landlordId, unitId, leaseId, rent, TZ, inv.rows[0].id,
-       opts.suspendedRent ? new Date() : null, tenantId])
+       opts.suspendedRent ? new Date() : null])
     if (opts.utilityOwed) {
       await c.query(
         `INSERT INTO payments (landlord_id, unit_id, lease_id, tenant_id, type, amount, status,
@@ -238,27 +238,6 @@ describe('the headline is what they will actually pay', () => {
     expect(mail.subject).toContain('$389.00')            // 589 − 200
     expect(mail.html).toContain('Your paid-ahead credit')
     expect(mail.html).toContain('$200.00')
-  })
-
-  // S654: with two bills open the older takes its share first — the same plan
-  // the portal and the charge use. Reading only this bill's month netted $460
-  // off October and told the resident they owed nothing.
-  it('two open bills: October’s headline takes only what September leaves of the paid-ahead money', async () => {
-    const f = await seedInvoice({ rent: 460 })
-    const oct = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
-    const { rows: [sept] } = await db.query<{ id: string }>(
-      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, sent_at)
-       VALUES ($1,$2,$3,$4,'INV-S654-SEPT',(NOW() AT TIME ZONE $5)::date - 30,460,460,'pending',NOW()) RETURNING id`,
-      [oct.landlord_id, f.tenantId, oct.lease_id, oct.unit_id, TZ])
-    await db.query(
-      `INSERT INTO payments (landlord_id, unit_id, lease_id, tenant_id, type, amount, status, entry_description, due_date, invoice_id)
-       VALUES ($1,$2,$3,$4,'rent',460,'pending','RENT',(NOW() AT TIME ZONE $5)::date - 30,$6)`,
-      [oct.landlord_id, oct.unit_id, oct.lease_id, f.tenantId, TZ, sept.id])
-    await db.query(`INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining) VALUES ($1,$2,470,470)`,
-      [oct.lease_id, f.tenantId])
-    const r = await sendPendingInvoiceNotices()
-    expect(r.sent).toBe(1)
-    expect(lastSend().subject).toContain('$450.00')       // 460 − the $10 September leaves
   })
 
   it('a line already covered when the bill was made is listed as covered, not due', async () => {

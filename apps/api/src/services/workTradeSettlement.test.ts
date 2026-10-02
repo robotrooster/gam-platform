@@ -282,6 +282,18 @@ describe('the landlord ends the agreement by hand', () => {
     expect(r.billedAmount).toBe(225)
   })
 
+  // S654: hours worked in the month being ended in were never counted by a close.
+  it('counts a period\'s uncounted hours on it first, and banks the surplus', () => {
+    const r = settleOnEnd([
+      period({ periodMonth: '2026-09-01', hoursApplied: 60 }),                  // 20 owed
+      period({ periodMonth: '2026-10-01', hoursApplied: 0 }),                   // unclosed
+    ], 0, { '2026-10-01': 90 })
+    expect(r.periods[1]).toMatchObject({ status: 'settled', hoursAppliedNow: 80 })
+    // The 10-hour surplus catches September up by 10; 10 hours still billed.
+    expect(r.periods[0]).toMatchObject({ status: 'billed', hoursAppliedNow: 10 })
+    expect(r.billedAmount).toBe(62.5)
+  })
+
   it('does not pay out leftover banked hours — a trade is not wages', () => {
     const r = settleOnEnd([period({ periodMonth: '2026-09-01', hoursApplied: 80 })], 40)
     expect(r.billedAmount).toBe(0)

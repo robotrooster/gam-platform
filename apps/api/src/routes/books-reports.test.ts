@@ -434,3 +434,91 @@ describe('GET /rent-roll', () => {
     expect(res.body.data.units).toEqual([])
   })
 })
+
+// ───────────────────────────────────────────────────────────────────
+// S654: ONE DEFINITION OF LANDLORD INCOME (services/landlordPL.ts)
+// $700 rent + $400 home-sale payment + $50 carried balance = 1,150 of income.
+// A $6 GAM fee is GAM's, a $500 deposit is held (never income), and a FlexPay
+// pull is GAM reimbursing its own front.
+// ───────────────────────────────────────────────────────────────────
+
+async function seedIncomeRows(f: PortfolioFixture, dueDate: string, settledAt: string) {
+  const rows: Array<[string, number, string, string]> = [
+    ['rent',            700, 'landlord', 'RENT'],
+    ['home_payment',    400, 'landlord', 'HOMEPMT'],
+    ['carried_balance',  50, 'landlord', 'BALANCE'],
+    ['fee',               6, 'gam',      'DECLINEFEE'],
+    ['deposit',         500, 'landlord', 'DEPOSIT'],
+  ]
+  for (const [type, amount, owner, entry] of rows) {
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description,
+         due_date, settled_at, revenue_owner)
+       VALUES ($1, $2, $3, $4, $5, 'settled', $6, $7::date, $8::timestamptz, $9)`,
+      [f.unitAId, f.tenantAId, f.landlordAId, type, amount, entry, dueDate, settledAt, owner])
+  }
+  // A FlexPay pull dated the cycle's 15th so it cannot collide with the rent row.
+  await db.query(
+    `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description,
+       due_date, settled_at)
+     VALUES ($1, $2, $3, 'rent', 725, 'settled', 'FLEXPAY', ($4::date + 14), $5::timestamptz)`,
+    [f.unitAId, f.tenantAId, f.landlordAId, dueDate, settledAt])
+}
+
+describe('S654: Books reports use the one landlord income definition', () => {
+  it('/reports/pl: the landlord P&L and the all-landlords total both say 1,150', async () => {
+    const f = await seedPortfolio()
+    await seedIncomeRows(f, '2026-09-01', '2026-09-03T10:00:00-07:00')
+    const mine = await request(buildApp())
+      .get('/api/books/reports/pl?startDate=2026-09-01&endDate=2026-09-30')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+    expect(mine.status).toBe(200)
+    expect(mine.body.data.gamRentIncome).toBe(1150)
+    expect(mine.body.data.gamPL.gross.balances).toBe(50)
+    expect(mine.body.data.gamPL.gross.homeSale).toBe(400)
+    expect(mine.body.data.gamPL.depositsHeld).toBe(500)
+    const all = await request(buildApp())
+      .get('/api/books/reports/pl?startDate=2026-09-01&endDate=2026-09-30')
+      .set('Authorization', `Bearer ${f.adminToken}`)
+    expect(all.status).toBe(200)
+    expect(all.body.data.gamRentIncome).toBe(1150)
+  })
+
+  it('/reports/cash-flow: rent collected 1,150, the deposit reported as held outside the totals', async () => {
+    const f = await seedPortfolio()
+    await seedIncomeRows(f, '2026-09-01', '2026-09-03T10:00:00-07:00')
+    const res = await request(buildApp())
+      .get('/api/books/reports/cash-flow?startDate=2026-09-01&endDate=2026-09-30')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.operating.inflows.rentCollected).toBe(1150)
+    expect(res.body.data.operating.inflows.total).toBe(1150)
+    expect(res.body.data.depositsHeld).toBe(500)
+  })
+
+  it('/reports/owner-statements: collected 1,150 per property, deposits held 500', async () => {
+    const f = await seedPortfolio()
+    await seedIncomeRows(f, '2026-09-01', '2026-09-03T10:00:00-07:00')
+    const res = await request(buildApp())
+      .get('/api/books/reports/owner-statements?startDate=2026-09-01&endDate=2026-09-30')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+    expect(res.status).toBe(200)
+    const st = res.body.data[0]
+    expect(Number(st.properties[0].collected)).toBe(1150)
+    expect(Number(st.properties[0].deposits_held)).toBe(500)
+    expect(st.totalCollected).toBe(1150)
+    expect(st.totalDepositsHeld).toBe(500)
+  })
+
+  it('/rent-roll: the unit collected 1,150 this month', async () => {
+    const f = await seedPortfolio()
+    const { rows: [{ d }] } = await db.query<{ d: string }>(`SELECT CURRENT_DATE::text AS d`)
+    await seedIncomeRows(f, d, new Date().toISOString())
+    const res = await request(buildApp())
+      .get('/api/books/rent-roll')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+    expect(res.status).toBe(200)
+    expect(Number(res.body.data.units[0].collected_mtd)).toBe(1150)
+    expect(res.body.data.totalCollected).toBe(1150)
+  })
+})

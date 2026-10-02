@@ -2,14 +2,30 @@
  * S553 — multi-owner landlord entities: membership CRUD, JWT-carried
  * landlordIds scope acceptance, and the aggregated portfolio list
  * (Oak Park case: one user sees their own entity AND the shared LLC).
+ *
+ * S654 — adding an owner is always an invitation the person accepts from
+ * their own session. Landlord B used to post landlord A's owner's address and
+ * get a direct add: A's company joined B's account and A's owner became B's
+ * commission downline, with no say from anybody at A.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+const { emailCoOwnerInviteMock } = vi.hoisted(() => ({
+  emailCoOwnerInviteMock: vi.fn(async (..._a: any[]) => undefined),
+}))
+vi.mock('../services/email', async (orig) => ({
+  ...(await orig() as any),
+  emailLandlordCoOwnerInvitation: emailCoOwnerInviteMock,
+}))
+
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { db, getClient } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
+import { processCommissionAccrual } from '../jobs/commissionAccrual'
+import { _clearMembershipCache } from '../middleware/auth'
 import { landlordsRouter } from './landlords'
 import { propertiesRouter } from './properties'
 import { errorHandler } from '../middleware/errorHandler'
@@ -25,6 +41,7 @@ function buildApp() {
 
 beforeEach(async () => {
   await cleanupAllSchema()
+  emailCoOwnerInviteMock.mockClear()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_members'
 })
 
@@ -52,18 +69,37 @@ const tokenFor = (fx: Fx, landlordIds?: string[]) =>
     { userId: fx.userId, role: 'landlord', email: fx.email, profileId: fx.landlordId, landlordIds: landlordIds ?? [fx.landlordId], permissions: {} },
     process.env.JWT_SECRET!, { expiresIn: '1h' })
 
+/** The live invitation `owner`'s company holds for `email`, if any. */
+const pendingInvite = async (company: Fx, email: string) => (await db.query<{ token: string; email: string }>(
+  `SELECT token, email FROM landlord_member_invitations
+    WHERE landlord_id = $1 AND lower(email) = lower($2) AND status = 'pending'`,
+  [company.landlordId, email])).rows[0]
+
+/**
+ * S654: how an owner joins now. The company invites them; they accept from
+ * their own session.
+ */
+async function addOwner(app: express.Express, company: Fx, co: Fx) {
+  const add = await request(app).post('/api/landlords/members')
+    .set('Authorization', `Bearer ${tokenFor(company)}`).send({ email: co.email })
+  expect(add.status).toBe(202)
+  const inv = await pendingInvite(company, co.email)
+  const accept = await request(app).post(`/api/landlords/member-invite/${inv.token}/accept`)
+    .set('Authorization', `Bearer ${tokenFor(co)}`)
+  expect(accept.status).toBe(200)
+  // Accepting asks them to sign in again; the session's company list is
+  // cached for 15 seconds, which a real re-login outlasts.
+  _clearMembershipCache()
+}
+
 describe('landlord members CRUD', () => {
   it('add by email, list shows both, founding member is flagged and irremovable', async () => {
     const oakPark = await seedEntity('Oak Park LLC')
     const friend = await seedEntity('Friend WY Holdings')
 
     const app = buildApp()
-    // founding owner adds the friend by email
-    const add = await request(app)
-      .post('/api/landlords/members')
-      .set('Authorization', `Bearer ${tokenFor(oakPark)}`)
-      .send({ email: friend.email })
-    expect(add.status).toBe(201)
+    // founding owner invites the friend by email; the friend accepts (S654)
+    await addOwner(app, oakPark, friend)
 
     const list = await request(app)
       .get('/api/landlords/members')
@@ -88,30 +124,24 @@ describe('landlord members CRUD', () => {
     expect(rmAdded.status).toBe(200)
   })
 
-  // S592: a co-owner with no upline of their own is captured as the founder's
-  // downline (dormant until they later go solo); an existing upline is untouched.
-  it('adding a co-owner sets their person-upline to the founder (first-touch wins)', async () => {
+  // S654: replaces S592's capture. Adding an owner never sets their referral
+  // upline: B posting A's owner's address made A's owner B's downline, and the
+  // commission run then paid B the closing share on A's company.
+  it('adding a co-owner never touches their upline, whether they had one or not', async () => {
     const oakPark = await seedEntity('Oak Park LLC')
-    const friend = await seedEntity('Friend WY Holdings')       // organic — no upline
+    const friend = await seedEntity('Friend WY Holdings')       // organic, no upline
     const priorUpline = await seedEntity('Prior Upline Co')
     const alreadyReferred = await seedEntity('Already Referred Co')
-    // alreadyReferred already has an upline → first-touch must leave it alone
     await db.query(`UPDATE users SET referred_by_user_id=$1 WHERE id=$2`, [priorUpline.userId, alreadyReferred.userId])
 
     const app = buildApp()
-    const a1 = await request(app).post('/api/landlords/members')
-      .set('Authorization', `Bearer ${tokenFor(oakPark)}`).send({ email: friend.email })
-    expect(a1.status).toBe(201)
-    const a2 = await request(app).post('/api/landlords/members')
-      .set('Authorization', `Bearer ${tokenFor(oakPark)}`).send({ email: alreadyReferred.email })
-    expect(a2.status).toBe(201)
+    await addOwner(app, oakPark, friend)
+    await addOwner(app, oakPark, alreadyReferred)
 
-    // friend (no prior upline) → captured under Oak Park's founder
-    const f = await db.query<{ referred_by_user_id: string }>(`SELECT referred_by_user_id FROM users WHERE id=$1`, [friend.userId])
-    expect(f.rows[0].referred_by_user_id).toBe(oakPark.userId)
-    // alreadyReferred keeps their prior upline
-    const a = await db.query<{ referred_by_user_id: string }>(`SELECT referred_by_user_id FROM users WHERE id=$1`, [alreadyReferred.userId])
-    expect(a.rows[0].referred_by_user_id).toBe(priorUpline.userId)
+    const up = async (id: string) => (await db.query<{ referred_by_user_id: string | null }>(
+      `SELECT referred_by_user_id FROM users WHERE id=$1`, [id])).rows[0].referred_by_user_id
+    expect(await up(friend.userId)).toBeNull()
+    expect(await up(alreadyReferred.userId)).toBe(priorUpline.userId)
   })
 
   it('invites unknown emails and rejects duplicate adds', async () => {
@@ -130,8 +160,9 @@ describe('landlord members CRUD', () => {
     expect(missing.status).toBe(202)
     expect(missing.body.data.invited).toBe(true)
 
-    await request(app).post('/api/landlords/members')
-      .set('Authorization', `Bearer ${t}`).send({ email: friend.email })
+    // S654: a second add while the first is still waiting refreshes that one
+    // invitation; once they are an owner, adding them again is a 409.
+    await addOwner(app, oakPark, friend)
     const dup = await request(app).post('/api/landlords/members')
       .set('Authorization', `Bearer ${t}`).send({ email: friend.email })
     expect(dup.status).toBe(409)
@@ -144,11 +175,8 @@ describe('landlord members CRUD', () => {
     const app = buildApp()
     const founderToken = tokenFor(oakPark)
 
-    // founder adds both co-owners
-    for (const co of [brother, friend]) {
-      await request(app).post('/api/landlords/members')
-        .set('Authorization', `Bearer ${founderToken}`).send({ email: co.email })
-    }
+    // founder invites both co-owners and each accepts (S654)
+    for (const co of [brother, friend]) await addOwner(app, oakPark, co)
     const list = await request(app).get('/api/landlords/members')
       .set('Authorization', `Bearer ${founderToken}`)
     const brotherRow = list.body.data.find((m: any) => m.user_id === brother.userId)
@@ -189,6 +217,77 @@ describe('landlord members CRUD', () => {
       .get(`/api/landlords/members?landlordId=${oakPark.landlordId}`)
       .set('Authorization', `Bearer ${tokenFor(stranger)}`)
     expect(res.status).toBe(403)
+  })
+})
+
+// ── S654: nobody attaches another company's person without their consent ──
+//
+// Reproduced in round 8: landlord B posted A's owner's address and got 201.
+// account_companies(B) then held A's company, A's owner's referral upline
+// became B's owner, and the commission run wrote the closing accrual on A's
+// company to B.
+describe("S654: POST /members on another company's owner", () => {
+  it("B adding A's owner is an invitation only; nothing changes until A's owner accepts from their own session", async () => {
+    const a = await seedEntity('A Holdings')
+    const b = await seedEntity('B Holdings')
+    // A has an occupied space, so the commission run has something to accrue on A.
+    const c = await db.connect()
+    try {
+      const unitId = await seedUnit(c, { propertyId: a.propertyId, landlordId: a.landlordId })
+      await c.query(`UPDATE units SET status = 'active' WHERE id = $1`, [unitId])
+    } finally { c.release() }
+
+    const app = buildApp()
+    const res = await request(app).post('/api/landlords/members')
+      .set('Authorization', `Bearer ${tokenFor(b)}`)
+      .send({ email: a.email.toUpperCase() })
+    expect(res.status).toBe(202)
+    expect(res.body.data.invited).toBe(true)
+    // The secret goes only by email, to the address on A's owner's account.
+    const inv = await pendingInvite(b, a.email)
+    expect(inv.email).toBe(a.email)
+    expect(JSON.stringify(res.body)).not.toContain(inv.token)
+    expect(emailCoOwnerInviteMock).toHaveBeenCalledTimes(1)
+    expect(emailCoOwnerInviteMock.mock.calls[0]![0]).toBe(a.email)
+    expect(emailCoOwnerInviteMock.mock.calls[0]![3]).toMatch(new RegExp(`/accept-owner-invite/${inv.token}$`))
+
+    const companiesOf = async (userId: string) => (await db.query<{ landlord_id: string }>(
+      `SELECT landlord_id FROM landlord_members WHERE user_id = $1 ORDER BY landlord_id`, [userId]))
+      .rows.map(r => r.landlord_id)
+    const accountOf = async (landlordId: string) => (await db.query<{ id: string }>(
+      `SELECT account_companies AS id FROM account_companies($1) ORDER BY 1`, [landlordId])).rows.map(r => r.id)
+    const uplineOf = async (userId: string) => (await db.query<{ referred_by_user_id: string | null }>(
+      `SELECT referred_by_user_id FROM users WHERE id = $1`, [userId])).rows[0].referred_by_user_id
+    const accrualsTo = async (userId: string) => (await db.query(
+      `SELECT landlord_id, role FROM commission_accruals WHERE manager_id = $1`, [userId])).rows
+
+    expect(await companiesOf(a.userId)).toEqual([a.landlordId])
+    expect(await accountOf(b.landlordId)).toEqual([b.landlordId])
+    expect(await accountOf(a.landlordId)).toEqual([a.landlordId])
+    expect(await uplineOf(a.userId)).toBeNull()
+    await processCommissionAccrual()
+    expect(await accrualsTo(b.userId)).toEqual([])
+
+    // B can't accept it on A's owner's behalf.
+    const forged = await request(app).post(`/api/landlords/member-invite/${inv.token}/accept`)
+      .set('Authorization', `Bearer ${tokenFor(b)}`)
+    expect(forged.status).toBe(403)
+    expect(await companiesOf(a.userId)).toEqual([a.landlordId])
+
+    // A's owner accepts from their own session: now, and only now, an owner of B.
+    const ok = await request(app).post(`/api/landlords/member-invite/${inv.token}/accept`)
+      .set('Authorization', `Bearer ${tokenFor(a)}`)
+    expect(ok.status).toBe(200)
+    expect(await companiesOf(a.userId)).toEqual([a.landlordId, b.landlordId].sort())
+    const added = (await db.query<{ added_by_user_id: string | null }>(
+      `SELECT added_by_user_id FROM landlord_members WHERE landlord_id = $1 AND user_id = $2`,
+      [b.landlordId, a.userId])).rows[0]
+    expect(added.added_by_user_id).toBe(b.userId)
+    // Accepting never makes A's owner anybody's downline, and pays B nothing on A.
+    expect(await uplineOf(a.userId)).toBeNull()
+    await db.query(`DELETE FROM commission_accruals`)
+    await processCommissionAccrual()
+    expect(await accrualsTo(b.userId)).toEqual([])
   })
 })
 

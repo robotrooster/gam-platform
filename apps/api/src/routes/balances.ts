@@ -22,9 +22,8 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
     // entity showed half the money owed and looked like the rest was paid.
     const landlordIds = landlordScopeIds(req.user!)
     const scopedIds = await getScopedPropertyIds(req.user)
-    // S654: the per-person math lives in services/openBalances so the 7am
-    // overdue digest reads exactly this list. It also nets paid-ahead credit
-    // now, first, so MH 25's $10 no longer shows as owed here.
+    // S654: one line per person, every dollar counted once (S648) — the same
+    // math the 7am overdue digest reads (services/openBalances).
     const out: any[] = await listOpenTenantBalances({ landlordIds, propertyIds: scopedIds })
     // S649 (Nic): "make sure POS pay links and outstanding tickets show in
     // outstanding. That way we can follow through on collecting." An emailed

@@ -15,8 +15,7 @@ import { createAdminNotification } from '../services/adminNotifications'
 import { computeTenantGamOutstandingTotal } from '../services/supersedence'
 import { chargeLeaseBalance, chargeLeaseBalanceSchema, resolveTargetLease,
          suggestedPayAheadFor } from '../services/rentCharge'
-import { netTenantLeaseBalances } from '../services/openBalances'
-import { allocateOldestFirst } from '@gam/shared'
+import { allocateOldestFirst, allocateCredits } from '@gam/shared'
 import { getClient } from '../db'
 import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
@@ -724,15 +723,6 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
               p.entry_description, p.notes, p.lease_id, u.payment_block,
               u.unit_number, pr.name AS property_name, p.landlord_id,
-              -- S654: paid-ahead credit is planned bill by bill (prepaidPlan),
-              -- and never against a failed attempt.
-              p.invoice_id, p.status,
-              -- S654: the lease whose charge collects this row. A neighbor's
-              -- utility on a converged bill has no lease of its own and is paid
-              -- with the bill's lease (S616) — rentCharge.openLeaseGroups keys
-              -- the same way, so this screen and the charge see one set of rows.
-              COALESCE(p.lease_id, inv.lease_id) AS group_lease_id,
-              COALESCE(gl.landlord_id, p.landlord_id) AS group_landlord_id,
               -- S615: the ONLY reliable mark of a utility-service charge. A
               -- NULL lease_id is not it: ordinary tenants have lease-less
               -- payment rows too, and treating those as service charges pulled
@@ -759,7 +749,6 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
          JOIN units u ON u.id = p.unit_id
          JOIN properties pr ON pr.id = u.property_id
          LEFT JOIN invoices inv ON inv.id = p.invoice_id
-         LEFT JOIN leases gl ON gl.id = COALESCE(p.lease_id, inv.lease_id)
          LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.tenant_id = $1
           -- S637 (Nic): "Work trade is still showing people they owe a full
@@ -794,13 +783,13 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     const leaseRows   = rows.filter((r: any) => r.service_agreement_id == null)
 
     for (const r of leaseRows) {
-      let g = byLease.get(r.group_lease_id)
+      let g = byLease.get(r.lease_id)
       if (!g) {
-        g = { leaseId: r.group_lease_id, propertyName: r.property_name, unitNumber: r.unit_number,
-              landlordId: r.group_landlord_id,
+        g = { leaseId: r.lease_id, propertyName: r.property_name, unitNumber: r.unit_number,
+              landlordId: r.landlord_id,
               paymentBlocked: !!r.payment_block, outstanding: 0, carriedBalance: 0, rows: [],
               manualFeePayer: r.manual_fee_payer, manualFirstFree: !!r.manual_first_free }
-        byLease.set(r.group_lease_id, g)
+        byLease.set(r.lease_id, g)
       }
       g.outstanding = Math.round((g.outstanding + r.amount) * 100) / 100
       // S622: arrears carried in from the landlord's previous system are the one
@@ -829,24 +818,39 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     // netted. Credits are read here and subtracted from the lease's total —
     // never by settling a line item, which is what chopped her credit into a
     // water row, a trash row and five late fees.
-    // S654: paid-ahead money comes off first (MH 25: the bill email netted the
-    // $10, this screen did not), then the landlord's credit, spent once across
-    // that landlord's leases, oldest bill first (S648). One helper, shared with
-    // the tenant agent, so the two never quote different figures.
-    const net = await netTenantLeaseBalances(req.user!.profileId, [...byLease.values()])
-    const creditApplied_ = (leaseId: string) => net.get(leaseId)?.creditApplied ?? 0
-    const prepaidApplied_ = (leaseId: string) => net.get(leaseId)?.prepaidApplied ?? 0
-    const creditLeft = new Map<string, number>(
-      [...byLease.values()].map(g => [g.leaseId, net.get(g.leaseId)?.creditRemaining ?? 0]))
+    const creditRows = await query<{ lease_id: string | null; landlord_id: string; credit: string }>(
+      `SELECT lease_id, landlord_id, SUM(amount_remaining)::text AS credit
+         FROM tenant_credits
+        WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
+        GROUP BY lease_id, landlord_id`,
+      [req.user!.profileId])
+    // ── S648 (Nic): "every dollar should only be counted once." ─────────────
+    // A general credit was added to EVERY lease here, so a resident with two
+    // spaces saw it come off both bills. Spent once now, oldest bill first,
+    // and only against the landlord who gave it.
+    const creditApplied = new Map<string, number>()
+    const creditLeft = new Map<string, number>()
+    for (const landlordId of new Set([...byLease.values()].map(g => g.landlordId))) {
+      const groups = [...byLease.values()].filter(g => g.landlordId === landlordId)
+      const alloc = allocateCredits(
+        creditRows.filter(c => c.landlord_id === landlordId)
+          .map(c => ({ leaseId: c.lease_id, amount: Number(c.credit) })),
+        groups.map(g => ({ key: g.leaseId, leaseId: g.leaseId, total: g.outstanding,
+                           earliestDue: g.rows[0]?.due_date ?? null })))
+      for (const g of groups) creditApplied.set(g.leaseId, alloc.applied[g.leaseId] ?? 0)
+      // What is still on the account after these bills, shown once (on the
+      // first of this landlord's leases), never repeated per lease.
+      if (groups[0]) creditLeft.set(groups[0].leaseId, alloc.remaining)
+    }
 
+    const creditApplied_ = (leaseId: string) => creditApplied.get(leaseId) ?? 0
     const leases = await Promise.all([...byLease.values()].map(async l => {
       const landlordCovers = l.manualFeePayer === 'landlord'
       // Never below zero: a credit larger than the bill leaves the rest on the
       // account for next month, it does not hand out change.
       const creditApplied = creditApplied_(l.leaseId)
-      const prepaidApplied = prepaidApplied_(l.leaseId)
       const grossOutstanding = l.outstanding
-      l.outstanding = Math.max(0, Math.round((l.outstanding - prepaidApplied - creditApplied) * 100) / 100)
+      l.outstanding = Math.round((l.outstanding - creditApplied) * 100) / 100
       const manualFee = (landlordCovers || l.manualFirstFree) ? 0 : MANUAL_PAYMENT_FEE
       return {
         ...l,
@@ -854,7 +858,6 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
         // Shown as a line so the resident SEES the credit, not just a smaller
         // number they have to take on faith.
         grossOutstanding,
-        prepaidApplied,
         creditApplied,
         creditRemaining: creditLeft.get(l.leaseId) ?? 0,
         manualFeeCoveredByLandlord: landlordCovers,
@@ -870,10 +873,9 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
         suggestedPayAhead: Math.round((l.outstanding + await suggestedPayAheadFor(l.leaseId)) * 100) / 100,
         // S622: the floor. Everything the lease itself billed, which stays
         // all-or-nothing; the carried balance above it may be paid down in any
-        // amount. S654: the charge's own figure (rentCharge.netLease), not a
-        // second subtraction here — so the screen is never stricter or looser
-        // than the server.
-        requiredNow: net.get(l.leaseId)?.requiredNow ?? Math.max(0, Math.round((l.outstanding - l.carriedBalance) * 100) / 100),
+        // amount. Matches rentCharge's `requiredInFull` exactly — one rule, two
+        // places, and the screen must not be stricter than the server.
+        requiredNow: Math.round((l.outstanding - l.carriedBalance) * 100) / 100,
       }
     }))
 
@@ -1489,7 +1491,6 @@ async function rentReaderLines(pmt: any, quote: Awaited<ReturnType<typeof reader
     ? { ...l, description: `${l.description} — ${name}${who?.unit_number ? ` (${who.unit_number})` : ''}` }
     : l)
   if (quote.cardFee > 0) lines.push({ description: 'Card processing fee', amountCents: Math.round(quote.cardFee * 100), quantity: 1 })
-  if (quote.platformFee > 0) lines.push({ description: 'Platform fee', amountCents: Math.round(quote.platformFee * 100), quantity: 1 })
   return lines
 }
 async function sendToReader(pmt: any, quote: Awaited<ReturnType<typeof readerQuote>>, paymentIntentId: string, stripeReaderId: string, cartOnReader = false) {
@@ -1565,10 +1566,8 @@ async function readerQuote(pmt: any) {
   return {
     outstanding: q.outstanding ?? 0,
     creditApplied: q.creditNetted ?? 0,
-    // S654: the card fee and a platform fee the landlord passes on, each by name.
-    balance: Math.round((q.chargeAmount - q.processingFee - q.platformFeePassthrough) * 100) / 100,
+    balance: Math.round((q.chargeAmount - q.processingFee) * 100) / 100,
     cardFee: q.processingFee,
-    platformFee: q.platformFeePassthrough,
     total: q.chargeAmount,
     lineItems,
   }

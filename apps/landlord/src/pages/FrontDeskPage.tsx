@@ -39,10 +39,6 @@ type Balance = {
   propertyName: string | null
   balance: string
   creditOnAccount: string
-  // S654: paid-ahead money still held for later bills — not taken off.
-  prepaidHeld?: number | string | null
-  // Each space's credit taken off its bills (landlord credit + paid-ahead).
-  spaces?: Array<{ creditApplied: number | string }> | null
   oldestDueDate: string | null
   openInvoices: number
   // S652: money owed outside a rent ledger — an emailed pay link, or a
@@ -166,12 +162,7 @@ const localDate = (s: string) => {
 function classifyBalance(b: Balance): { phase: PhaseId; say: string } | null {
   const first = (b.firstName || 'They').trim()
   const owed = Number(b.balance || 0)
-  // S654: what came off this figure, and — separately — what is still on the
-  // account. With $1,000 paid ahead and a $100 monthly draw only $100 came off;
-  // the desk said $1,000.
-  const takenOff = Math.round((b.spaces ?? []).reduce((s, x) => s + Number(x.creditApplied || 0), 0) * 100) / 100
-  const stillHeld = Math.max(0, Math.round(
-    (Number(b.creditOnAccount || 0) - takenOff + Number(b.prepaidHeld || 0)) * 100) / 100)
+  const credit = Number(b.creditOnAccount || 0)
   // S652 (Nic, Blu): "why is it saying they owe rent on September 30th?" The
   // bill was due October 1st. A date-only string parsed as a Date is midnight
   // UTC, which is the evening before in Phoenix. Read it as a calendar date.
@@ -184,9 +175,9 @@ function classifyBalance(b: Balance): { phase: PhaseId; say: string } | null {
   const when = due
     ? due.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
     : null
-  const creditLine =
-    (takenOff > 0 ? ` Their ${money(takenOff)} credit is already taken off this figure.` : '')
-    + (stillHeld > 0 ? ` Another ${money(stillHeld)} is still on their account for later bills.` : '')
+  const creditLine = credit > 0
+    ? ` Their ${money(credit)} credit is already taken off this figure.`
+    : ''
   // S652 (Nic): "put the pay links as an open ticket as well. That way they can
   // be resolved in person when somebody comes in." Both are settled at the
   // register, from its open list — never a rent payment.

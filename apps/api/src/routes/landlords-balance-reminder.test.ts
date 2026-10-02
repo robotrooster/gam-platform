@@ -115,13 +115,12 @@ describe('POST /api/landlords/me/tenants/:tenantId/balance-reminder', () => {
   })
 })
 
-// ── S654: paid-ahead credit is spent bill by bill, as in the portal ────────
+// ── S654: the reminder counts only what this landlord is owed ─────────────
 //
-// The reminder read the paid-ahead draw for the OLDEST bill's month only and
-// took it off the whole total. With a $100 monthly draw over a September and
-// an October bill that is $100 off, while the portal and the charge take $100
-// from each month: the email asked $820 when the resident owed $720.
-describe('S654: the reminder\'s figure is the portal\'s figure', () => {
+// The rows are the ones the resident's portal counts (a payment already in
+// flight is not owed), the landlord's own credit comes off the total, and
+// another landlord's bills and credit never enter this landlord's email.
+describe('S654: the reminder\'s rows and credit are this landlord\'s own', () => {
   async function seedBills(f: { landlordId: string; tenantId: string }, leaseId: string, unitId: string,
                            bills: [string, number][]) {
     let n = 0
@@ -149,26 +148,9 @@ describe('S654: the reminder\'s figure is the portal\'s figure', () => {
     } finally { c.release() }
   }
 
-  it('a $100 monthly draw over two open bills takes $100 off each: $720, not $820', async () => {
-    const f = await seedResident()
-    await seedBills(f, f.leaseId, f.unitId, [['2026-09-01', 460], ['2026-10-01', 460]])
-    await db.query(`INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
-                    VALUES ($1,$2,1000,1000)`, [f.leaseId, f.tenantId])
-    await db.query(`UPDATE leases SET prepaid_monthly_draw = 100 WHERE id = $1`, [f.leaseId])
-
-    const res = await remind(f)
-    expect(res.status).toBe(200)
-    expect(res.body.data).toMatchObject({ sent: true, total: 720, prepaidApplied: 200, creditApplied: 0 })
-    const [, args] = emailBalanceDueSpy.mock.calls[0] as [string, { total: number; creditApplied: number }]
-    expect(args.total).toBe(720)
-    expect(args.creditApplied).toBe(200)
-  })
-
-  it('paid-ahead first, then the landlord\'s credit; a payment already in flight is not owed', async () => {
+  it('the landlord\'s credit comes off the total; a payment already in flight is not owed', async () => {
     const f = await seedResident()
     await seedBills(f, f.leaseId, f.unitId, [['2026-10-01', 460]])
-    await db.query(`INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
-                    VALUES ($1,$2,10,10)`, [f.leaseId, f.tenantId])
     await db.query(`INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
                     VALUES ($1,$2,$3,50,50,'goodwill')`, [f.landlordId, f.tenantId, f.leaseId])
     // A card payment already started on an older row: in flight, not owed.
@@ -178,7 +160,28 @@ describe('S654: the reminder\'s figure is the portal\'s figure', () => {
       [f.landlordId, f.unitId, f.leaseId, f.tenantId])
 
     const res = await remind(f)
-    expect(res.body.data).toMatchObject({ sent: true, total: 400, prepaidApplied: 10, creditApplied: 50, lines: 1 })
+    expect(res.body.data).toMatchObject({ sent: true, total: 410, creditApplied: 50, lines: 1 })
+    const [, args] = emailBalanceDueSpy.mock.calls[0] as [string, { total: number; creditApplied: number; lines: any[] }]
+    expect(args.total).toBe(410)
+    expect(args.creditApplied).toBe(50)
+    expect(args.lines).toHaveLength(1)
+  })
+
+  it('a resident who owes only another landlord: nothing owed here, no email, no 403', async () => {
+    const mine = await seedResident()
+    const theirs = await seedResident()
+    const c = await db.connect()
+    let theirLease: string
+    try {
+      theirLease = await seedLease(c, { unitId: theirs.unitId, landlordId: theirs.landlordId, rentAmount: 300 })
+      await seedLeaseTenant(c, { leaseId: theirLease, tenantId: mine.tenantId })
+    } finally { c.release() }
+    await seedBills({ landlordId: theirs.landlordId, tenantId: mine.tenantId }, theirLease!, theirs.unitId, [['2026-08-01', 300]])
+
+    const res = await remind(mine)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual({ sent: false, reason: 'They do not owe anything right now.' })
+    expect(emailBalanceDueSpy).not.toHaveBeenCalled()
   })
 
   it('another landlord\'s charges and credit stay out of this landlord\'s reminder', async () => {

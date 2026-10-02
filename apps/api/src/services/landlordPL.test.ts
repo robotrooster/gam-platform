@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
-import { computeLandlordPL } from './landlordPL'
+import { computeLandlordPL, landlordIncomeSql, landlordDepositSql } from './landlordPL'
 
 beforeEach(cleanupAllSchema)
 
@@ -85,7 +85,7 @@ describe('computeLandlordPL — only the landlord\'s own money is income (S654)'
       `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at, revenue_owner)
        VALUES ($1, $2, $3, $4, $5, 'settled', $8, '2026-09-01', $6::timestamptz, $7)`,
       [f.unitId, f.tenantId, f.landlordId, type, amount, settledAt, owner,
-       ({ rent: 'RENT', deposit: 'DEPOSIT', late_fee: 'LATEFEE' } as Record<string, string>)[type] ?? 'OTHERFEE'])
+       ({ rent: 'RENT', deposit: 'DEPOSIT', late_fee: 'LATEFEE', home_payment: 'HOMEPMT', carried_balance: 'BALANCE' } as Record<string, string>)[type] ?? 'OTHERFEE'])
   }
 
   it('$700 rent, a $6 GAM fee and a $500 held deposit → rent 700, fees 0, deposits held 500', async () => {
@@ -98,6 +98,45 @@ describe('computeLandlordPL — only the landlord\'s own money is income (S654)'
     expect(pl.gross.fees).toBe(0)
     expect(pl.gross.total).toBe(700)
     expect(pl.depositsHeld).toBe(500)
+  })
+
+  it('S654: $700 rent + $400 home-sale + $50 carried balance = 1,150; a GAM fee and a deposit are not income', async () => {
+    const f = await seed()
+    await settled(f, 'rent', 700, 'landlord', '2026-09-03T10:00:00-07:00')
+    await settled(f, 'home_payment', 400, 'landlord', '2026-09-04T10:00:00-07:00')
+    await settled(f, 'carried_balance', 50, 'landlord', '2026-09-06T10:00:00-07:00')
+    await settled(f, 'fee', 6, 'gam', '2026-09-05T10:00:00-07:00')
+    await settled(f, 'deposit', 500, 'landlord', '2026-09-02T10:00:00-07:00')
+    const pl = await computeLandlordPL(f.landlordId, '2026-09-01', '2026-09-30', ['2026-09-01'])
+    expect(pl.gross).toMatchObject({ rent: 700, fees: 0, homeSale: 400, balances: 50, other: 450, total: 1150 })
+    expect(pl.depositsHeld).toBe(500)
+  })
+
+  it('S654: a FlexPay pull (GAM reimbursing its own front) is not the landlord\'s rent', async () => {
+    const f = await seed()
+    await settled(f, 'rent', 700, 'landlord', '2026-09-06T10:00:00-07:00')
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at)
+       VALUES ($1, $2, $3, 'rent', 725, 'settled', 'FLEXPAY', '2026-09-15', '2026-09-12T10:00:00-07:00')`,
+      [f.unitId, f.tenantId, f.landlordId])
+    const pl = await computeLandlordPL(f.landlordId, '2026-09-01', '2026-09-30', ['2026-09-01'])
+    expect(pl.gross.rent).toBe(700)
+    expect(pl.gross.total).toBe(700)
+  })
+
+  it('S654: landlordIncomeSql reads the same rows with or without a table alias', async () => {
+    const f = await seed()
+    await settled(f, 'rent', 700, 'landlord', '2026-09-03T10:00:00-07:00')
+    await settled(f, 'carried_balance', 50, 'landlord', '2026-09-06T10:00:00-07:00')
+    await settled(f, 'fee', 6, 'gam', '2026-09-05T10:00:00-07:00')
+    await settled(f, 'fee', 700, 'held', '2026-09-07T10:00:00-07:00')
+    await settled(f, 'deposit', 500, 'landlord', '2026-09-02T10:00:00-07:00')
+    const bare = await db.query(`SELECT COALESCE(SUM(amount),0)::float AS t FROM payments WHERE ${landlordIncomeSql()}`)
+    const aliased = await db.query(`SELECT COALESCE(SUM(p.amount),0)::float AS t FROM payments p WHERE ${landlordIncomeSql('p')}`)
+    const deposits = await db.query(`SELECT COALESCE(SUM(amount),0)::float AS t FROM payments WHERE ${landlordDepositSql()}`)
+    expect(bare.rows[0].t).toBe(750)
+    expect(aliased.rows[0].t).toBe(750)
+    expect(deposits.rows[0].t).toBe(500)
   })
 
   it('a landlord fee counts; a held paid-ahead fee does not', async () => {

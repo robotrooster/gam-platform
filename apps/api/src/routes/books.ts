@@ -5,6 +5,7 @@ import { requireAuth, requireLandlord, requireBooksRead, requireBooksWrite } fro
 import { AppError } from '../middleware/errorHandler'
 import { isDisposableEmail } from '../lib/email'
 import { todayIn, monthStartOf } from '../lib/timezone'
+import { landlordIncomeSql, landlordDepositSql } from '../services/landlordPL'
 
 export const booksRouter = Router()
 booksRouter.use(requireAuth)
@@ -1253,9 +1254,14 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
       gamPL = await computeLandlordPL(lid, String(start), String(end), monthKeys)
       rentIncome = [{ total: gamPL.gross.total }]
     } else {
+      // S654: the shared income definition and the shared P&L's window (settled
+      // in the range, the whole last day), not every settled row by due date,
+      // which counted deposits, GAM's fees and held paid-ahead money as rent.
       const r = await db.query(
-        `SELECT COALESCE(SUM(amount), 0) AS total FROM payments
-          WHERE (landlord_id=$1 OR $1 IS NULL) AND status='settled' AND due_date BETWEEN $2 AND $3`,
+        `SELECT COALESCE(SUM(p.amount), 0) AS total FROM payments p
+          WHERE (p.landlord_id=$1 OR $1 IS NULL) AND p.status='settled'
+            AND ${landlordIncomeSql('p')}
+            AND p.settled_at >= $2::date AND p.settled_at < ($3::date + 1)`,
         [lid, start, end]
       ).catch(() => ({ rows: [{ total: 0 }] }))
       rentIncome = r.rows
@@ -1486,12 +1492,15 @@ booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) =
     const end   = (endDate   as string) || today
 
     const [rentRows, incomeRows, expenseRows, payrollRows, billRows, disbRows] = await Promise.all([
+      // S654: rent collected is the landlord's income by the shared definition;
+      // deposits are held, not income, and are reported apart (depositsHeld).
       db.query(
-        `SELECT COALESCE(SUM(p.amount),0) AS total
+        `SELECT COALESCE(SUM(p.amount) FILTER (WHERE ${landlordIncomeSql('p')}),0) AS total,
+                COALESCE(SUM(p.amount) FILTER (WHERE ${landlordDepositSql('p')}),0) AS deposits
          FROM payments p JOIN units u ON u.id=p.unit_id JOIN landlords l ON l.id=u.landlord_id
          WHERE (l.id=$1::uuid OR $1 IS NULL) AND p.status='settled' AND p.due_date BETWEEN $2 AND $3`,
         [lid, start, end]
-      ).catch(() => ({ rows: [{ total: 0 }] })),
+      ).catch(() => ({ rows: [{ total: 0, deposits: 0 }] })),
       db.query(
         `SELECT COALESCE(SUM(amount),0) AS total FROM books_transactions
          WHERE (${col}=$1 OR $1 IS NULL) AND type='income' AND date BETWEEN $2 AND $3`,
@@ -1523,6 +1532,7 @@ booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) =
     ])
 
     const rentCollected = +rentRows.rows[0]?.total || 0
+    const depositsHeld  = +rentRows.rows[0]?.deposits || 0
     const otherIncome   = +incomeRows.rows[0]?.total || 0
     const expenses      = +expenseRows.rows[0]?.total || 0
     const payroll       = +payrollRows.rows[0]?.total || 0
@@ -1543,6 +1553,9 @@ booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) =
         },
         financing: { disbursements, total: disbursements },
         netCashFlow: opNet - disbursements,
+        // S654: deposits collected in the range — held for tenants, not income,
+        // so outside every total above.
+        depositsHeld,
       }
     })
   } catch (e) { next(e) }
@@ -1576,13 +1589,22 @@ booksRouter.get('/reports/owner-statements', requireBooksRead, blockBusinessOwne
                 COUNT(u.id) AS unit_count,
                 COUNT(u.id) FILTER (WHERE u.status='active') AS occupied,
                 COALESCE(SUM(u.rent_amount) FILTER (WHERE u.status='active'), 0) AS expected_rent,
+                -- S654: collected = the shared income definition; deposits
+                -- are held, not collected income, and are listed apart.
                 COALESCE(
                   (SELECT SUM(py.amount) FROM payments py
                    JOIN units u2 ON u2.id = py.unit_id
                    WHERE u2.property_id = p.id
-                     AND py.status='settled'
+                     AND py.status='settled' AND ${landlordIncomeSql('py')}
                      AND py.due_date BETWEEN $2 AND $3), 0
-                ) AS collected
+                ) AS collected,
+                COALESCE(
+                  (SELECT SUM(py.amount) FROM payments py
+                   JOIN units u2 ON u2.id = py.unit_id
+                   WHERE u2.property_id = p.id
+                     AND py.status='settled' AND ${landlordDepositSql('py')}
+                     AND py.due_date BETWEEN $2 AND $3), 0
+                ) AS deposits_held
          FROM properties p
          LEFT JOIN units u ON u.property_id = p.id
          WHERE p.landlord_id = $1
@@ -1597,9 +1619,10 @@ booksRouter.get('/reports/owner-statements', requireBooksRead, blockBusinessOwne
 
       const totalExpected  = properties.reduce((s: number, p: any) => s + +p.expected_rent, 0)
       const totalCollected = properties.reduce((s: number, p: any) => s + +p.collected, 0)
+      const totalDepositsHeld = properties.reduce((s: number, p: any) => s + +p.deposits_held, 0)
       const totalDisbursed = +disbRows[0]?.total || 0
 
-      return { landlord, properties, totalExpected, totalCollected, totalDisbursed, variance: totalCollected - totalExpected }
+      return { landlord, properties, totalExpected, totalCollected, totalDepositsHeld, totalDisbursed, variance: totalCollected - totalExpected }
     }))
 
     res.json({ success: true, data: statements })
@@ -1695,9 +1718,10 @@ booksRouter.get('/rent-roll', requireBooksRead, blockBusinessOwner, async (req, 
           vuo.primary_first_name AS tenant_first, vuo.primary_last_name AS tenant_last,
           vuo.primary_email AS tenant_email,
           ten.ach_verified, ten.on_time_pay_enrolled,
-          (SELECT SUM(amount) FROM payments
-           WHERE unit_id=u.id AND status='settled'
-           AND due_date >= date_trunc('month', CURRENT_DATE)) AS collected_mtd,
+          -- S654: the shared income definition (no deposits, GAM fees or held money).
+          (SELECT SUM(py.amount) FROM payments py
+           WHERE py.unit_id=u.id AND py.status='settled' AND ${landlordIncomeSql('py')}
+           AND py.due_date >= date_trunc('month', CURRENT_DATE)) AS collected_mtd,
           (SELECT COUNT(*) FROM payments
            WHERE unit_id=u.id AND status='pending') AS pending_count
         FROM units u

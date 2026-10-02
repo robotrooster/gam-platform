@@ -401,6 +401,23 @@ describe('POST /accept-invite — tenant activates account', () => {
     expect(u.rows[0].accepted_privacy_at).not.toBeNull()
   })
 
+  // S654: a token with no clock was treated as live for ever. Every invite
+  // door writes an expiry, and activation clears it only once the link is
+  // spent, so an unaccepted token with none is dead, never a way in.
+  it('S654: an unaccepted token with no expiry is refused, and nothing is written', async () => {
+    const { token, userId } = await seedPendingInvite()
+    await db.query(`UPDATE users SET tenant_invite_expires_at = NULL WHERE id = $1`, [userId])
+    const before = (await db.query(`SELECT password_hash, tenant_invite_accepted_at FROM users WHERE id=$1`, [userId])).rows[0]
+    const res = await request(buildApp())
+      .post('/api/tenants/accept-invite')
+      .send({ token, password: 'newpass8chars', acceptedTerms: true })
+    expect(res.status).toBe(404)
+    expect((await db.query(`SELECT password_hash, tenant_invite_accepted_at FROM users WHERE id=$1`, [userId])).rows[0])
+      .toEqual(before)
+    const info = await request(buildApp()).get(`/api/tenants/invite-info?token=${token}`)
+    expect(info.status).toBe(404)
+  })
+
   it('happy with ssiSsdi=true: flips tenants.ssi_ssdi flag', async () => {
     const { token, userId } = await seedPendingInvite()
     const res = await request(buildApp())
@@ -431,11 +448,13 @@ describe('GET /invite-info — unauthenticated preview', () => {
   it('happy without active lease: returns user, unit=null', async () => {
     // S410 (S377): seed on tenant_invite_token + 7d expiry, not the
     // overloaded email_verify_token column.
+    // S654: seeded as a never-set-up invitee (the placeholder password every
+    // invite door writes); the preview is shown only for one of those.
     const inviteToken = 'preview_' + randomUUID().replace(/-/g, '')
     await db.query(
       `INSERT INTO users (email, password_hash, role, first_name, last_name,
                           tenant_invite_token, tenant_invite_expires_at)
-       VALUES ($1, 'x', 'tenant', 'Preview', 'User', $2, NOW() + INTERVAL '7 days')`,
+       VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'Preview', 'User', $2, NOW() + INTERVAL '7 days')`,
       ['preview@test.dev', inviteToken])
 
     const res = await request(buildApp())

@@ -21,7 +21,18 @@ import { emailSigningRequest, emailSigningCompleted } from './email'
 import { createNotification } from './notifications'
 
 type Doc = { id: string; title: string; status: string; sort_order: number; landlord_id: string; unit_id: string | null }
-type SignerRow = { id: string; document_id: string; user_id: string; role: string; name: string; email: string; token: string | null; order_index: number; status: string; invite_sent: boolean | null }
+type SignerRow = { id: string; document_id: string; user_id: string; role: string; name: string; email: string; send_to: string; token: string | null; order_index: number; status: string; invite_sent: boolean | null }
+
+/**
+ * S654: where a signer's mail goes. A signing token is a full stand-in for
+ * that signer (S629), so anyone but the landlord is reached only at the
+ * address on their own account — never the signer row's, which can be stale
+ * (the email correction moved only the lease's row; older rows carry what the
+ * sender typed). The landlord's row may hold the property's on-site signing
+ * address (services/landlordSigningContact), so it keeps its own. The same
+ * rule as signerDeliveryAddress in routes/esign.ts.
+ */
+const SEND_TO = `CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS send_to`
 
 async function packetDocs(groupId: string): Promise<Doc[]> {
   return query<Doc>(
@@ -62,8 +73,10 @@ export async function advancePacket(groupId: string): Promise<{ invited: string 
   if (!open.length) return { invited: null }
 
   const signers = await query<SignerRow>(
-    `SELECT s.id, s.document_id, s.user_id, s.role, s.name, s.email, s.token, s.order_index, s.status, s.invite_sent
+    `SELECT s.id, s.document_id, s.user_id, s.role, s.name, s.email, ${SEND_TO},
+            s.token, s.order_index, s.status, s.invite_sent
        FROM lease_document_signers s
+       LEFT JOIN users su ON su.id = s.user_id
       WHERE s.document_id = ANY($1::uuid[])
       ORDER BY s.order_index, s.document_id`, [docs.map(d => d.id)])
 
@@ -93,12 +106,13 @@ export async function advancePacket(groupId: string): Promise<{ invited: string 
     url = signingUrlFor(first, firstDoc.id, u)
   } else {
     const { tenantLeaseLink } = await import('./tenantLeaseLink')
-    const link = await tenantLeaseLink({ userId: first.user_id, documentId: firstDoc.id, signerToken: first.token ?? undefined })
+    const link = await tenantLeaseLink({
+      userId: first.user_id, documentId: firstDoc.id, signerToken: first.token ?? undefined, sendTo: first.send_to })
     url = link.url
     needsSetup = link.needsSetup
   }
 
-  await emailSigningRequest(first.email, first.name, `${title} (${docs.map(d => d.title.replace(/ — .*$/, '')).join(', ')})`,
+  await emailSigningRequest(first.send_to, first.name, `${title} (${docs.map(d => d.title.replace(/ — .*$/, '')).join(', ')})`,
     unitLabel, landlordName, url, { landlordId: firstDoc.landlord_id, documentId: firstDoc.id, needsSetup })
   await createNotification({
     userId: first.user_id,
@@ -111,8 +125,8 @@ export async function advancePacket(groupId: string): Promise<{ invited: string 
   await query(
     `UPDATE lease_document_signers SET status='sent', invite_sent=TRUE, invite_sent_at=NOW()
       WHERE id = ANY($1::uuid[]) AND status = 'pending'`, [mine.map(s => s.id)])
-  logger.info({ groupId, signer: first.email, documents: docs.length }, '[packet] next signer invited once for the whole packet')
-  return { invited: first.email }
+  logger.info({ groupId, signer: first.send_to, documents: docs.length }, '[packet] next signer invited once for the whole packet')
+  return { invited: first.send_to }
 }
 
 /**
@@ -128,10 +142,12 @@ export async function announcePacketIfComplete(groupId: string, portalHomeFor: (
   if (Number(already?.n ?? 0) > 0) return false
   const { unitLabel, title } = await packetLabel(docs)
   const signers = await query<SignerRow>(
-    `SELECT DISTINCT ON (s.user_id) s.* FROM lease_document_signers s
+    `SELECT DISTINCT ON (s.user_id) s.*, ${SEND_TO}
+       FROM lease_document_signers s
+       LEFT JOIN users su ON su.id = s.user_id
       WHERE s.document_id = ANY($1::uuid[]) ORDER BY s.user_id, s.order_index`, [docs.map(d => d.id)])
   for (const s of signers) {
-    await emailSigningCompleted(s.email, s.name, title, unitLabel, undefined, portalHomeFor(s.role),
+    await emailSigningCompleted(s.send_to, s.name, title, unitLabel, undefined, portalHomeFor(s.role),
       { landlordId: docs[0].landlord_id, documentId: docs[0].id })
     await createNotification({
       userId: s.user_id,

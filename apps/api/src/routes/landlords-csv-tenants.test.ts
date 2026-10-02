@@ -524,20 +524,98 @@ describe('S654: tenant CSV commit never trusts account ids from the browser', ()
     expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
   })
 
-  it('an existing resident is found by email in any case, and the link goes to the address on their account', async () => {
+  it('an existing resident who never set up is found by email in any case, and the link goes to the address on their account', async () => {
     const f = await seedTFixture()
     const stored = `Kim.Harland-${randomUUID().slice(0, 6)}@Test.dev`
     let tenantId: string
     const c = await db.connect()
     try { tenantId = await seedTenant(c, { email: stored }) } finally { c.release() }
+    await db.query(
+      `UPDATE users SET password_hash='$2b$10$placeholder_invite_pending', email_verified=FALSE
+        WHERE LOWER(email)=LOWER($1)`, [stored])
 
     const res = await commit(f, [row(f, { email: stored.toLowerCase(), resolvedExistingUserId: f.landlordUserId })])
     expect(res.status).toBe(200)
     expect(res.body.data.tenants[0].tenantId).toBe(tenantId!)
     expect((await db.query(`SELECT id FROM users WHERE LOWER(email)=LOWER($1)`, [stored])).rows).toHaveLength(1)
+    const token = (await db.query(`SELECT tenant_invite_token FROM users WHERE email=$1`, [stored])).rows[0].tenant_invite_token
+    expect(token).toMatch(/^[0-9a-f]{64}$/)
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
     expect(emailTenantOnboardedMock.mock.calls[0]![0]).toBe(stored)
+    expect(emailTenantOnboardedMock.mock.calls[0]![5]).toMatch(new RegExp(`/accept-invite\\?token=${token}$`))
+    expect(JSON.stringify(res.body)).not.toMatch(/accept-invite/)
     const landlordUser = await db.query(`SELECT tenant_invite_token FROM users WHERE id=$1`, [f.landlordUserId])
     expect(landlordUser.rows[0].tenant_invite_token).toBeNull()
+  })
+
+  // The two-logins-on-one-address case this replaced can no longer be set up:
+  // ux_users_email_lower allows one login per address in any letter case. What
+  // remains is a landlord login stored in a different case from the row.
+  it('a landlord\'s login on the same address in a different case refuses the row (409), nothing created', async () => {
+    const victim = await seedTFixture()
+    const me = await seedTFixture()
+    const stored = `Victim.${randomUUID().slice(0, 6)}@Test.dev`
+    await db.query(`UPDATE users SET email=$1 WHERE id=$2`, [stored, victim.landlordUserId])
+    const before = await victimState(victim.landlordUserId)
+
+    const res = await commit(me, [row(me, { email: stored.toLowerCase() })])
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/Row 1: This email belongs to a GAM account that isn't a resident's/)
+    expect(await victimState(victim.landlordUserId)).toEqual(before)
+    expect((await db.query(`SELECT id FROM users WHERE LOWER(email)=LOWER($1)`, [stored])).rows)
+      .toEqual([{ id: victim.landlordUserId }])
+    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [me.unitId])).rows).toEqual([])
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  // ── S654: the one rule for the CSV door ─────────────────────────────────
+  //
+  // Round 6 reproduced: X is landlord A's invitee with A's live link. B's CSV
+  // row carried X's address in capitals; the commit replaced X's token (A's
+  // emailed link died) and emailed X "set up your account". An account with
+  // its own password got the same set-password email, which S616 forbids.
+  it('another company\'s invitee keeps that company\'s link and gets no setup email, only a notice in their account', async () => {
+    const a = await seedTFixture()
+    const b = await seedTFixture()
+    const email = `x-${randomUUID().slice(0, 6)}@test.dev`
+    const x = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, tenant_invite_token, tenant_invite_expires_at)
+       VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'Ex', 'Ample', 'a-live-link', NOW() + INTERVAL '7 days')
+       RETURNING id`, [email])).rows[0]
+    const xt = (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [x.id])).rows[0]
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status) VALUES ($1, $2, 'not_uploaded')`,
+      [a.landlordId, xt.id])
+
+    const res = await commit(b, [row(b, { email: email.toUpperCase() })])
+    expect(res.status).toBe(200)
+    expect(res.body.data.tenants[0].tenantId).toBe(xt.id)
+    expect(JSON.stringify(res.body)).not.toMatch(/accept-invite|a-live-link/)
+    const after = (await db.query(
+      `SELECT password_hash, tenant_invite_token, tenant_invite_expires_at > NOW() AS live FROM users WHERE id=$1`,
+      [x.id])).rows[0]
+    expect(after).toEqual({ password_hash: '$2b$10$placeholder_invite_pending', tenant_invite_token: 'a-live-link', live: true })
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+    const notes = (await db.query(`SELECT landlord_id, type FROM notifications WHERE user_id=$1`, [x.id])).rows
+    expect(notes).toEqual([{ landlord_id: b.landlordId, type: 'lease_drafted' }])
+  })
+
+  it('a resident with their own password gets no set-password email and no link, only a notice in their account', async () => {
+    const f = await seedTFixture()
+    const email = `active-${randomUUID().slice(0, 6)}@test.dev`
+    let tenantId: string
+    const c = await db.connect()
+    try { tenantId = await seedTenant(c, { email }) } finally { c.release() }
+    const userId = (await db.query(`SELECT id FROM users WHERE email=$1`, [email])).rows[0].id
+
+    const res = await commit(f, [row(f, { email })])
+    expect(res.status).toBe(200)
+    expect(res.body.data.tenants[0].tenantId).toBe(tenantId!)
+    expect((await db.query(`SELECT tenant_invite_token FROM users WHERE id=$1`, [userId])).rows[0].tenant_invite_token)
+      .toBeNull()
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+    const notes = (await db.query(`SELECT landlord_id, type, action_url FROM notifications WHERE user_id=$1`, [userId])).rows
+    expect(notes).toEqual([{ landlord_id: f.landlordId, type: 'lease_drafted', action_url: '/lease' }])
   })
 
   it('someone already on an active lease with you is skipped by the server, as validate promised', async () => {

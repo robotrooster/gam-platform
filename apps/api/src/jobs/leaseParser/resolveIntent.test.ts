@@ -11,9 +11,12 @@ import { db } from '../../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant } from '../../test/dbHelpers'
 
 // Don't send a real activation email when the confirmed supersede builds a lease.
+const { emailTenantOnboardedMock } = vi.hoisted(() => ({
+  emailTenantOnboardedMock: vi.fn(async (..._a: any[]) => undefined),
+}))
 vi.mock('../../services/email', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  emailTenantOnboarded: vi.fn(async () => {}),
+  emailTenantOnboarded: emailTenantOnboardedMock,
 }))
 
 import { streetNumbersConflict, pickCandidateByAddress, resolveIntent } from './resolveIntent'
@@ -120,5 +123,163 @@ describe('resolveIntent — supersede confirm gate', () => {
     expect(old.rows[0].status).toBe('terminated')
     const n = await db.query<{ n: number }>(`SELECT count(*)::int n FROM leases WHERE unit_id=$1 AND status='active'`, [s.unitId])
     expect(n.rows[0].n).toBe(1) // only the new one is active
+  })
+})
+
+// S654: resolve takes the tenant's email from the landlord's own overrides, so
+// it is a door onto any account on GAM. It follows the same rules as the other
+// doors: only a resident's login is used, a password link is made only for an
+// account that still needs setting up and belongs to no other company, and the
+// link goes only by email to the address on the account, never back to the
+// caller.
+describe('S654: resolveIntent and existing accounts', () => {
+  const PLACEHOLDER = '$2b$10$placeholder_invite_pending'
+  beforeEach(async () => {
+    await cleanupAllSchema()
+    emailTenantOnboardedMock.mockClear()
+  })
+
+  async function company(email?: string) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c, email ? { email } : {})
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId, withLateFeeDecision: true })
+      await c.query('COMMIT')
+      const unitNumber = (await db.query(`SELECT unit_number FROM units WHERE id=$1`, [unitId])).rows[0].unit_number
+      return { userId, landlordId, unitId, propertyName: 'Test Property', unitNumber }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+  type Company = Awaited<ReturnType<typeof company>>
+
+  /** The attack's setup: B's own intent for a throwaway address, in 'error'. */
+  async function errorIntent(b: Company, email = `throwaway-${randomUUID().slice(0, 6)}@test.dev`) {
+    const u = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ($1, $2, 'tenant', 'Throw', 'Away') RETURNING id`, [email, PLACEHOLDER])
+    const t = await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.rows[0].id])
+    const i = await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status) VALUES ($1, $2, 'error') RETURNING id`,
+      [b.landlordId, t.rows[0].id])
+    return i.rows[0].id
+  }
+
+  const overridesFor = (b: Company, email: string): any => ({
+    tenants: [{ firstName: { value: 'Vic' }, lastName: { value: 'Tim' }, email: { value: email } }],
+    unit: { propertyName: { value: b.propertyName }, unitNumber: { value: b.unitNumber } },
+    lease: { leaseStart: { value: '2026-02-01' }, monthlyRent: { value: 900 } },
+  })
+
+  const account = async (id: string) => (await db.query(
+    `SELECT email, password_hash, tenant_invite_token, tenant_invite_expires_at FROM users WHERE id=$1`, [id])).rows[0]
+
+  it("a resident with their own password gets no link, and their password is untouched", async () => {
+    const b = await company()
+    const email = `resident-${randomUUID().slice(0, 6)}@test.dev`
+    const v = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ($1, '$2b$10$their.own.real.password.hash', 'tenant', 'Vic', 'Tim') RETURNING id`, [email])).rows[0]
+    await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [v.id])
+    const before = await account(v.id)
+
+    const res: any = await resolveIntent(await errorIntent(b), [b.landlordId], overridesFor(b, email.toUpperCase()))
+    expect(res.userId).toBe(v.id)
+    expect('activationUrl' in res).toBe(false)
+    expect(res.alreadyOnPlatform).toBe(true)
+    expect(res.inviteSent).toBe(false)
+    expect(await account(v.id)).toEqual(before)
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  it("another landlord's invitee gets no new link, and the first landlord's link keeps working", async () => {
+    const a = await company()
+    const b = await company()
+    const email = `invitee-${randomUUID().slice(0, 6)}@test.dev`
+    const v = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, tenant_invite_token, tenant_invite_expires_at)
+       VALUES ($1, $2, 'tenant', 'In', 'Vitee', 'first-live-link', NOW() + INTERVAL '7 days') RETURNING id`,
+      [email, PLACEHOLDER])).rows[0]
+    const t = (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [v.id])).rows[0]
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
+       VALUES ($1, $2, 'not_uploaded', $3)`, [a.landlordId, t.id, a.unitId])
+    const before = await account(v.id)
+
+    const res: any = await resolveIntent(await errorIntent(b), [b.landlordId], overridesFor(b, email))
+    expect('activationUrl' in res).toBe(false)
+    expect(res.alreadyOnPlatform).toBe(true)
+    expect(await account(v.id)).toEqual(before)
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  it("an e-sign witness another landlord set up gets no link", async () => {
+    const a = await company()
+    const b = await company()
+    const email = `witness-${randomUUID().slice(0, 6)}@test.dev`
+    const w = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ($1, $2, 'tenant', 'Wit', 'Ness') RETURNING id`, [email, PLACEHOLDER])).rows[0]
+    const d = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status)
+       VALUES ($1, $2, 'A lease', 'original_lease', 'sent') RETURNING id`, [a.landlordId, a.unitId])).rows[0]
+    await db.query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
+       VALUES ($1, $2, 'witness', 'Wit Ness', $3, 3, $4, 'pending')`, [d.id, w.id, email, randomUUID()])
+
+    const res: any = await resolveIntent(await errorIntent(b), [b.landlordId], overridesFor(b, email))
+    expect(res.alreadyOnPlatform).toBe(true)
+    expect((await account(w.id)).tenant_invite_token).toBeNull()
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  it("a landlord's login, in any letter case, is refused and never made a resident", async () => {
+    const a = await company(`Owner.${randomUUID().slice(0, 6)}@Test.dev`)
+    const b = await company()
+    const stored = (await account(a.userId)).email
+    const before = await account(a.userId)
+
+    await expect(resolveIntent(await errorIntent(b), [b.landlordId], overridesFor(b, stored.toLowerCase())))
+      .rejects.toMatchObject({ statusCode: 409, message: expect.stringMatching(/isn't a resident's/) })
+    expect((await db.query(`SELECT id FROM tenants WHERE user_id=$1`, [a.userId])).rows).toEqual([])
+    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [b.unitId])).rows).toEqual([])
+    expect(await account(a.userId)).toEqual(before)
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  it("the landlord's own invitee who never set up gets the link by email, at the address on the account", async () => {
+    const b = await company()
+    const stored = `Kim.${randomUUID().slice(0, 6)}@Example.test`
+    const u = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ($1, $2, 'tenant', 'Kim', 'H') RETURNING id`, [stored, PLACEHOLDER])).rows[0]
+    const t = (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.id])).rows[0]
+    const intent = (await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status) VALUES ($1, $2, 'error') RETURNING id`,
+      [b.landlordId, t.id])).rows[0]
+
+    const res: any = await resolveIntent(intent.id, [b.landlordId], overridesFor(b, stored.toLowerCase()))
+    expect(res.userId).toBe(u.id)
+    expect('activationUrl' in res).toBe(false)
+    expect(res.inviteSent).toBe(true)
+    const token = (await account(u.id)).tenant_invite_token
+    expect(token).toMatch(/^[0-9a-f]{64}$/)
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+    const [to, , , , , url] = emailTenantOnboardedMock.mock.calls[0]!
+    expect(to).toBe(stored)
+    expect(url).toMatch(new RegExp(`/accept-invite\\?token=${token}$`))
+  })
+
+  it('a brand-new address gets an account, and the link only by email', async () => {
+    const b = await company()
+    const email = `brand-new-${randomUUID().slice(0, 6)}@test.dev`
+    const res: any = await resolveIntent(await errorIntent(b), [b.landlordId], overridesFor(b, email))
+    expect('activationUrl' in res).toBe(false)
+    expect(res.inviteSent).toBe(true)
+    const u = (await db.query(`SELECT id, role, tenant_invite_token FROM users WHERE email=$1`, [email])).rows[0]
+    expect(u.role).toBe('tenant')
+    expect(u.tenant_invite_token).toMatch(/^[0-9a-f]{64}$/)
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+    expect(emailTenantOnboardedMock.mock.calls[0]![0]).toBe(email)
   })
 })

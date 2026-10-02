@@ -6,6 +6,16 @@ import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { logger } from '../lib/logger'
+import { landlordScopeIds } from '../lib/landlordScope'
+import { portalLink } from '../lib/portalUrls'
+import { accountTiedElsewhere, NOT_A_RESIDENT_ACCOUNT } from '../jobs/leaseParser/resolveIntent'
+
+const PLACEHOLDER_HASH = '$2b$10$placeholder_invite_pending'
+
+/** S654: one fixed sentence for any account this door won't attach. It names
+ *  nobody and says nothing about which company the person belongs to. */
+const ALREADY_ON_GAM =
+  'This person already has a GAM account. Ask them to add the service from their own portal.'
 
 // ============================================================
 // S615 — creating and managing a utility service agreement.
@@ -30,9 +40,11 @@ utilityServiceAgreementsRouter.get('/',
   requirePerm('properties.edit', 'units.edit', 'units.view_status'),
   async (req, res, next) => {
     try {
-      const landlordId = req.user!.role === 'landlord'
-        ? req.user!.profileId : req.user!.landlordId
-      if (!landlordId) return res.json({ success: true, data: [] })
+      // S654: every company the account holds (S633: a landlord session's
+      // profileId names no company, so reading it returned an empty list to
+      // every landlord). A team member's one company; nobody else's.
+      const landlordIds = landlordScopeIds(req.user!)
+      if (!landlordIds.length) return res.json({ success: true, data: [] })
 
       const rows = await query<any>(`
         SELECT sa.id, sa.status, sa.service_address, sa.note,
@@ -47,7 +59,11 @@ utilityServiceAgreementsRouter.get('/',
                -- Has the payer actually taken up their portal account? An
                -- outstanding invite is the difference between "they can pay
                -- online" and "you are still collecting cash".
-               (usr.tenant_invite_token IS NOT NULL) AS invite_pending,
+               -- S654: still to be set up, not "holds a token": a resident with
+               -- their own password is never sent a setup link from here, and a
+               -- leftover token said nothing about whether they can sign in.
+               (usr.password_hash = '$2b$10$placeholder_invite_pending'
+                  AND usr.tenant_invite_accepted_at IS NULL) AS invite_pending,
                -- S616: has this person agreed to be billed at all? Until they
                -- have, charges accrue but nothing is issued — and the landlord
                -- needs to see that rather than wonder why no bill went out.
@@ -67,9 +83,9 @@ utilityServiceAgreementsRouter.get('/',
           JOIN properties p ON p.id = u.property_id
           JOIN tenants t    ON t.id = sa.tenant_id
           JOIN users usr    ON usr.id = t.user_id
-         WHERE sa.landlord_id = $1
+         WHERE sa.landlord_id = ANY($1::uuid[])
          ORDER BY sa.status, p.name, u.unit_number
-      `, [landlordId])
+      `, [landlordIds])
       res.json({ success: true, data: rows })
     } catch (e) { next(e) }
   })
@@ -118,17 +134,49 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
       }
       const landlordId = property.landlord_id
 
-      // The payer may already have an account — the neighbor could be an
-      // existing tenant of this landlord, and S614 is explicit that when their
+      // The payer may already have an account. S614 is explicit that when their
       // space is later onboarded it must be the SAME person, same login, no
-      // duplicate account. Reuse rather than collide.
-      const existingUser = await queryOne<any>(
-        `SELECT u.id, t.id AS tenant_id, u.role
+      // duplicate account. Reuse rather than collide, but only an account this
+      // door may attach (S654, below).
+      // S654: in any letter case (one login per address, ux_users_email_lower).
+      // The exact-case match missed 'Mixed.X@Test.dev', and the INSERT below
+      // then hit the unique index and returned a raw 500. A login that isn't a
+      // resident's (landlord, staff, admin) is never a payer.
+      const existingUser = await queryOne<{
+        id: string; tenant_id: string | null; role: string; email: string; needs_setup: boolean
+      }>(
+        `SELECT u.id, t.id AS tenant_id, u.role, u.email,
+                (u.password_hash = $2 AND u.tenant_invite_accepted_at IS NULL) AS needs_setup
            FROM users u LEFT JOIN tenants t ON t.user_id = u.id
-          WHERE u.email = $1`, [emailNorm])
+          WHERE lower(u.email) = $1
+          ORDER BY t.created_at NULLS LAST
+          LIMIT 1`, [emailNorm, PLACEHOLDER_HASH])
       if (existingUser && existingUser.role !== 'tenant') {
-        throw new AppError(409,
-          'That email already belongs to a non-tenant account. Use a different address for the payer.')
+        throw new AppError(409, NOT_A_RESIDENT_ACCOUNT)
+      }
+
+      // S654 (THE RULE): nobody attaches another company's person, or acts on
+      // an account someone already holds, without that person's own consent
+      // from their own session.
+      //
+      // Round 8, reproduced: any landlord typed a GAM resident's email here,
+      // got 201 and alreadyOnPlatform (so the account exists), and the list
+      // then showed that person's real first name, last name and phone. With
+      // payerAlreadyAgreed the landlord could start billing them. And an
+      // agreement on another company's never-set-up invitee tied that invitee
+      // to this company, which then blocked the inviting company from
+      // correcting its own invite.
+      //
+      // So this door attaches only an account it creates, or one that still
+      // needs setup (placeholder password, invite never accepted) and is tied
+      // to no other company. An account with its own password, or tied
+      // elsewhere, is refused with one fixed sentence that names nobody, before
+      // anything is written. Attaching such an account needs the payer's own
+      // yes from their own session; the tenant portal has no flow for that
+      // yet, so this door refuses rather than attach without it.
+      if (existingUser && (!existingUser.needs_setup
+        || await accountTiedElsewhere(existingUser.id, [landlordId, ...landlordScopeIds(req.user!)]))) {
+        throw new AppError(409, ALREADY_ON_GAM)
       }
 
       await client.query('BEGIN')
@@ -155,17 +203,37 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
       } else {
         const u = await client.query<{ id: string }>(
           `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
-           VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', $2, $3, $4)
+           VALUES ($1, $5, 'tenant', $2, $3, $4)
            RETURNING id`,
-          [emailNorm, body.payer.firstName, body.payer.lastName, body.payer.phone])
+          [emailNorm, body.payer.firstName, body.payer.lastName, body.payer.phone, PLACEHOLDER_HASH])
         userId = u.rows[0].id
       }
-      const inviteToken = crypto.randomBytes(32).toString('hex')
-      await client.query(
-        `UPDATE users SET tenant_invite_token = $1,
-                          tenant_invite_expires_at = NOW() + INTERVAL '7 days',
-                          updated_at = NOW()
-          WHERE id = $2`, [inviteToken, userId])
+      // S654: a link only for the account just made or this company's own
+      // still-to-be-set-up one (checked above). A live token is kept, not
+      // replaced: the same company may already have emailed it (the "set up
+      // and sign your lease" email from tenantLeaseLink), and minting a fresh
+      // one killed that link. tenantLeaseLink reuses a live token for the same
+      // reason. Whatever is stored is what gets mailed, so both emails work.
+      const freshToken = crypto.randomBytes(32).toString('hex')
+      const stored = await client.query<{ tenant_invite_token: string }>(
+        `UPDATE users
+            SET tenant_invite_token = CASE
+                  WHEN tenant_invite_token IS NOT NULL AND tenant_invite_expires_at > NOW()
+                  THEN tenant_invite_token ELSE $1 END,
+                tenant_invite_expires_at = CASE
+                  WHEN tenant_invite_token IS NOT NULL AND tenant_invite_expires_at > NOW()
+                  THEN tenant_invite_expires_at ELSE NOW() + INTERVAL '7 days' END,
+                updated_at = NOW()
+          WHERE id = $2
+            -- S654: still to be set up at the moment of writing, not only when
+            -- checked above. If the person set their password in between,
+            -- nothing is touched and the whole call is undone.
+            AND password_hash = $3 AND tenant_invite_accepted_at IS NULL
+          RETURNING tenant_invite_token`, [freshToken, userId, PLACEHOLDER_HASH])
+      if (!stored.rows.length) throw new AppError(409, ALREADY_ON_GAM)
+      const inviteToken = stored.rows[0].tenant_invite_token
+      // S654: the address on the account is the only place a link goes.
+      const accountEmail = existingUser?.email ?? emailNorm
 
       let tenantId: string
       const existingTenant = await client.query<{ id: string }>(
@@ -211,23 +279,25 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
       await client.query('COMMIT')
 
       // Invite email, post-commit — a mail failure must not undo the agreement.
-      const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-      const activationUrl = `${tenantAppUrl}/accept-invite?token=${inviteToken}`
+      // S654: portalLink, never a localhost fallback (S641).
       try {
-        const { emailUtilityServiceInvite } = await import('../services/email')
         const landlord = await queryOne<any>(
           `SELECT u.first_name, u.last_name FROM landlords l
              JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [landlordId])
+        const providerName = landlord ? `${landlord.first_name} ${landlord.last_name}`.trim() : 'Your utility provider'
+        const { emailUtilityServiceInvite } = await import('../services/email')
         await emailUtilityServiceInvite(
-          emailNorm, body.payer.firstName,
-          landlord ? `${landlord.first_name} ${landlord.last_name}`.trim() : 'Your utility provider',
+          accountEmail, body.payer.firstName,
+          providerName,
           body.serviceAddress || body.label,
-          activationUrl,
+          portalLink('tenant', `accept-invite?token=${inviteToken}`),
           { landlordId, tenantId })
       } catch (err) {
+        // S654: never the link itself: it is a password-setting key.
         logger.error({ err, tenantId }, '[utility-service-invite] email failed — agreement created')
       }
 
+      // S654: the response never carries a link.
       res.status(201).json({
         success: true,
         data: { id: saRes.rows[0].id, unitId, tenantId },

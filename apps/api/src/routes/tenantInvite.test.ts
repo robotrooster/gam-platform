@@ -71,6 +71,8 @@ async function seed() {
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
 
+const PLACEHOLDER = '$2b$10$placeholder_invite_pending'
+
 const post = (app: any, token: string, body: any) =>
   request(app).post('/api/tenants/invite').set('Authorization', `Bearer ${token}`).send(body)
 
@@ -112,16 +114,20 @@ describe('POST /api/tenants/invite — what it actually does', () => {
   it('creates the user, the tenant, and a seven-day activation token', async () => {
     const { token, unitId } = await seed()
     const res = await post(buildApp(), token, {
-      email: 'Nadia@example.test', firstName: 'Nadia', lastName: 'Reyes', unitId,
+      email: ' Nadia@example.test ', firstName: 'Nadia', lastName: 'Reyes', unitId,
     })
     expect(res.status).toBe(200)
     expect(res.body.data.tenantId).toBeTruthy()
     expect(res.body.data.acceptUrl).toContain('https://tenants.example.test/accept-invite?token=')
+    expect(res.body.data.alreadyOnPlatform).toBe(false)
+    expect(res.body.data.inviteSent).toBe(true)
+    // S654: stored the way every lookup reads it.
+    expect(res.body.data.email).toBe('nadia@example.test')
 
     const u = (await db.query(
       `SELECT role, first_name, last_name, tenant_invite_token,
               tenant_invite_expires_at > NOW() + INTERVAL '6 days' AS long_dated
-         FROM users WHERE email = $1`, ['Nadia@example.test'])).rows[0]
+         FROM users WHERE email = $1`, ['nadia@example.test'])).rows[0]
     expect(u.role).toBe('tenant')
     expect(u.first_name).toBe('Nadia')
     expect(u.tenant_invite_token).toBeTruthy()
@@ -177,12 +183,22 @@ describe('POST /api/tenants/invite — what it actually does', () => {
     const { token, unitId } = await seed()
     const app = buildApp()
     const first  = await post(app, token, { email: 'a@b.test', firstName: 'Al', unitId })
-    const second = await post(app, token, { email: 'a@b.test', firstName: 'Al', unitId })
+    const second = await post(app, token, { email: 'A@B.test', firstName: 'Al', unitId })
 
     expect(second.body.data.userId).toBe(first.body.data.userId)
     expect(second.body.data.tenantId).toBe(first.body.data.tenantId)
-    expect(second.body.data.inviteToken).not.toBe(first.body.data.inviteToken)
-    expect((await db.query(`SELECT id FROM users WHERE email = $1`, ['a@b.test'])).rows)
+    // S654: a fresh link goes to their inbox, but only the invite that made
+    // the account hands it back.
+    expect(second.body.data.inviteToken).toBeNull()
+    expect(second.body.data.acceptUrl).toBeNull()
+    expect(second.body.data.inviteSent).toBe(true)
+    const dbToken = (await db.query(`SELECT tenant_invite_token FROM users WHERE email = $1`, ['a@b.test'])).rows[0].tenant_invite_token
+    expect(dbToken).toBeTruthy()
+    expect(dbToken).not.toBe(first.body.data.inviteToken)
+    expect(sentInvites).toHaveLength(2)
+    expect(sentInvites[1][0]).toBe('a@b.test')
+    expect(sentInvites[1][5]).toContain(dbToken)
+    expect((await db.query(`SELECT id FROM users WHERE lower(email) = $1`, ['a@b.test'])).rows)
       .toHaveLength(1)
     // And the second invite does not double up the household.
     expect((await db.query(`SELECT id FROM pending_lease_drafts`)).rows).toHaveLength(1)
@@ -235,14 +251,14 @@ describe('POST /api/tenants/invite — what it actually does', () => {
 // import (since fixed there), and accept-invite never looked at whose account
 // the token sat on: whoever held the link could set that landlord's password.
 describe('S654: accept-invite refuses any account that is not a resident\'s or a contact\'s', () => {
-  async function tokenOn(role: string) {
+  async function tokenOn(role: string, hash = 'original-hash') {
     const token = `tok-${Math.random().toString(16).slice(2)}${Date.now()}`
     const email = `${role}-${Math.random().toString(16).slice(2)}@example.test`
     const u = (await db.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name,
                           tenant_invite_token, tenant_invite_expires_at)
-       VALUES ($1, 'original-hash', $2, 'Pat', 'Lee', $3, NOW() + INTERVAL '7 days') RETURNING id`,
-      [email, role, token])).rows[0]
+       VALUES ($1, $4, $2, 'Pat', 'Lee', $3, NOW() + INTERVAL '7 days') RETURNING id`,
+      [email, role, token, hash])).rows[0]
     return { userId: u.id, email, token }
   }
   const accept = (token: string) => request(buildApp()).post('/api/tenants/accept-invite')
@@ -269,12 +285,12 @@ describe('S654: accept-invite refuses any account that is not a resident\'s or a
   }
 
   it('a resident account still activates', async () => {
-    const v = await tokenOn('tenant')
+    const v = await tokenOn('tenant', PLACEHOLDER)
     await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [v.userId])
     const res = await accept(v.token)
     expect(res.status).toBe(200)
     const u = (await db.query(`SELECT password_hash, tenant_invite_accepted_at FROM users WHERE id=$1`, [v.userId])).rows[0]
-    expect(u.password_hash).not.toBe('original-hash')
+    expect(u.password_hash).not.toBe(PLACEHOLDER)
     expect(u.tenant_invite_accepted_at).not.toBeNull()
   })
 
@@ -300,3 +316,199 @@ describe('S654: accept-invite refuses any account that is not a resident\'s or a
   })
 })
 
+// ── S654: accept-invite is first-time setup only ─────────────────────────
+//
+// A token that reaches an account which already has its own password must not
+// set a new one. Landlord B's utility-service agreement minted a token on X, a
+// resident who signed up through screening with a password of their own and so
+// never "accepted" an invite; accept-invite took that token and replaced X's
+// working password. The link now works only on an account still waiting for
+// its first password.
+describe('S654: accept-invite refuses an account that already has its own password', () => {
+  const accept = (token: string, password = 'a-long-new-password') =>
+    request(buildApp()).post('/api/tenants/accept-invite').send({ token, password, acceptedTerms: true })
+  const state = async (id: string) => (await db.query(
+    `SELECT password_hash, sessions_valid_from, tenant_invite_token, tenant_invite_expires_at,
+            tenant_invite_accepted_at, accepted_tos_at, email_verified, email_2fa_enabled
+       FROM users WHERE id=$1`, [id])).rows[0]
+  async function resident(hash: string, token: string) {
+    const u = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name,
+                          tenant_invite_token, tenant_invite_expires_at)
+       VALUES ($1, $2, 'tenant', 'Pat', 'Lee', $3, NOW() + INTERVAL '7 days') RETURNING id`,
+      [`r-${Math.random().toString(16).slice(2)}@example.test`, hash, token])).rows[0]
+    await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [u.id])
+    return u.id
+  }
+
+  it('a resident with their own password who never accepted: the link reads as invalid, nothing changes', async () => {
+    const id = await resident('$2b$10$their.own.real.password.hash', 'minted-by-another-door')
+    const before = await state(id)
+    const res = await accept('minted-by-another-door')
+    expect(res.status).toBe(404)
+    expect(res.body.error).toBe('Invalid or expired invite link')
+    expect(res.body.data).toBeUndefined()
+    expect(await state(id)).toEqual(before)
+
+    const info = await request(buildApp()).get('/api/tenants/invite-info?token=minted-by-another-door')
+    expect(info.status).toBe(404)
+  })
+
+  it('a contact who has set a password since (Forgot password) is refused the same way', async () => {
+    const token = `c-${Date.now()}`
+    const id = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name,
+                          tenant_invite_token, tenant_invite_expires_at, sessions_valid_from)
+       VALUES ($1, '$2b$12$a.password.they.set', 'contact', 'Pat', 'Lee', $2, NOW() + INTERVAL '7 days', NOW())
+       RETURNING id`, [`c-${Date.now()}@example.test`, token])).rows[0].id
+    const before = await state(id)
+    const res = await accept(token)
+    expect(res.status).toBe(404)
+    expect(res.body.error).toBe('Invalid or expired invite link')
+    expect(await state(id)).toEqual(before)
+  })
+
+  it('an account that already finished setup still hears it is set up, not that the link is bad', async () => {
+    const id = await resident(PLACEHOLDER, 'their-own-link')
+    expect((await accept('their-own-link')).status).toBe(200)
+    const before = await state(id)
+    const again = await accept('their-own-link', 'a-different-password')
+    expect(again.status).toBe(409)
+    expect(again.body.code).toBe('ALREADY_ACCEPTED')
+    expect(await state(id)).toEqual(before)
+  })
+
+  it('a resident still waiting on their first password activates', async () => {
+    const id = await resident(PLACEHOLDER, 'first-time')
+    const info = await request(buildApp()).get('/api/tenants/invite-info?token=first-time')
+    expect(info.status).toBe(200)
+    const res = await accept('first-time')
+    expect(res.status).toBe(200)
+    const after = await state(id)
+    expect(after.password_hash).not.toBe(PLACEHOLDER)
+    expect(after.tenant_invite_accepted_at).not.toBeNull()
+  })
+
+  it('an e-sign contact minted with an unguessable stand-in password (S568) still activates', async () => {
+    // services/signerAccounts stores a random hash, never the placeholder, and
+    // nobody has ever set a password on it.
+    const token = `contact-${Date.now()}`
+    await db.query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified,
+                          tenant_invite_token, tenant_invite_expires_at)
+       VALUES ($1, '$2b$10$random.unguessable.stand.in.hash', 'contact', 'Ann', 'Activator', FALSE, $2,
+               NOW() + INTERVAL '14 days')`, [`ann-${Date.now()}@ext.test`, token])
+    const res = await accept(token)
+    expect(res.status).toBe(200)
+    expect(res.body.data.user.role).toBe('contact')
+  })
+})
+
+// ── S654: an invite never hands anyone a key to an account they didn't make ──
+//
+// The route looked accounts up by exact email, so 'LANDLORD@X.DEV' missed a
+// landlord stored lowercase and made a second login on their address. And it
+// minted a password link on ANY existing resident's account and returned it to
+// whoever sent the invite: an existing resident with their own password, or
+// another landlord's invitee, could have their password set by a stranger.
+describe('S654: the invite route and existing accounts', () => {
+  async function account(email: string, hash: string, extra: { phone?: string } = {}) {
+    const u = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
+       VALUES ($1, $2, 'tenant', 'Pat', 'Lee', $3) RETURNING id`,
+      [email, hash, extra.phone ?? null])).rows[0]
+    const t = (await db.query<{ id: string }>(
+      `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.id])).rows[0]
+    return { userId: u.id, tenantId: t.id }
+  }
+  const stateOf = async (userId: string) => (await db.query(
+    `SELECT email, password_hash, phone, tenant_invite_token, tenant_invite_expires_at,
+            tenant_invite_accepted_at, sessions_valid_from, accepted_tos_at
+       FROM users WHERE id = $1`, [userId])).rows[0]
+
+  it('a landlord\'s address in another letter case: 409, no second login, no link', async () => {
+    const { token, unitId } = await seed()
+    const other = await seed()
+    const otherEmail = (await db.query(`SELECT email FROM users WHERE id=$1`, [other.userId])).rows[0].email
+    const res = await post(buildApp(), token, { email: otherEmail.toUpperCase(), firstName: 'Al', unitId })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/isn't a resident's/)
+    expect(res.body.data).toBeUndefined()
+    expect((await db.query(`SELECT id, role FROM users WHERE lower(email) = lower($1)`, [otherEmail])).rows)
+      .toEqual([{ id: other.userId, role: 'landlord' }])
+    expect((await db.query(`SELECT tenant_invite_token FROM users WHERE id=$1`, [other.userId])).rows[0].tenant_invite_token)
+      .toBeNull()
+    expect(sentInvites).toHaveLength(0)
+  })
+
+  it('an existing resident with their own password: no link, nothing about their login changes', async () => {
+    const { token, unitId } = await seed()
+    const email = 'screened@example.test'
+    const r = await account(email, '$2b$10$their.own.real.password.hash', { phone: '555-0101' })
+    const before = await stateOf(r.userId)
+
+    const res = await post(buildApp(), token, { email, firstName: 'Pat', unitId, phone: '999-999-9999' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.userId).toBe(r.userId)
+    expect(res.body.data.inviteToken).toBeNull()
+    expect(res.body.data.acceptUrl).toBeNull()
+    expect(res.body.data.alreadyOnPlatform).toBe(true)
+    expect(res.body.data.inviteSent).toBe(false)
+    expect(await stateOf(r.userId)).toEqual(before)
+    expect(sentInvites).toHaveLength(0)
+    // The invite still lands: the unit is waiting on them.
+    expect((await db.query(`SELECT unit_id FROM pending_tenant_intents WHERE tenant_id=$1`, [r.tenantId])).rows)
+      .toEqual([{ unit_id: unitId }])
+  })
+
+  it('another landlord\'s invitee: no link to the inviter, and the first landlord\'s link keeps working', async () => {
+    const first = await seed()
+    const second = await seed()
+    const email = 'theirs@example.test'
+    const r = await account(email, '$2b$10$placeholder_invite_pending')
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
+       VALUES ($1, $2, 'not_uploaded', $3)`, [first.landlordId, r.tenantId, first.unitId])
+    await db.query(
+      `UPDATE users SET tenant_invite_token = 'first-landlords-live-link',
+                        tenant_invite_expires_at = NOW() + INTERVAL '7 days' WHERE id = $1`, [r.userId])
+    const before = await stateOf(r.userId)
+
+    const res = await post(buildApp(), second.token, { email: email.toUpperCase(), firstName: 'Pat', unitId: second.unitId })
+    expect(res.status).toBe(200)
+    expect(res.body.data.inviteToken).toBeNull()
+    expect(res.body.data.acceptUrl).toBeNull()
+    expect(res.body.data.alreadyOnPlatform).toBe(true)
+    expect(await stateOf(r.userId)).toEqual(before)
+    expect(sentInvites).toHaveLength(0)
+    expect((await db.query(`SELECT id FROM users WHERE lower(email) = $1`, [email])).rows).toHaveLength(1)
+
+    const info = await request(buildApp()).get('/api/tenants/invite-info?token=first-landlords-live-link')
+    expect(info.status).toBe(200)
+  })
+
+  it('a resident stored in mixed case is found, not duplicated, and the link goes to their own address', async () => {
+    const { token, unitId } = await seed()
+    const stored = 'Kim.Harland@Example.test'
+    const r = await account(stored, '$2b$10$placeholder_invite_pending')
+
+    const res = await post(buildApp(), token, { email: 'kim.harland@example.test', firstName: 'Kim', unitId })
+    expect(res.status).toBe(200)
+    expect(res.body.data.userId).toBe(r.userId)
+    expect(res.body.data.acceptUrl).toBeNull()      // this invite didn't make the account
+    expect(res.body.data.inviteSent).toBe(true)
+    expect((await db.query(`SELECT id FROM users WHERE lower(email) = lower($1)`, [stored])).rows).toHaveLength(1)
+    expect(sentInvites).toHaveLength(1)
+    expect(sentInvites[0][0]).toBe(stored)
+  })
+
+  it('a brand-new address still gets its link, emailed and handed back', async () => {
+    const { token, unitId } = await seed()
+    const res = await post(buildApp(), token, { email: 'fresh@example.test', firstName: 'Fresh', unitId })
+    expect(res.status).toBe(200)
+    expect(res.body.data.inviteToken).toMatch(/^[0-9a-f]{64}$/)
+    expect(res.body.data.acceptUrl).toBe(`https://tenants.example.test/accept-invite?token=${res.body.data.inviteToken}`)
+    expect(sentInvites).toHaveLength(1)
+    expect(sentInvites[0][5]).toBe(res.body.data.acceptUrl)
+  })
+})

@@ -1,20 +1,32 @@
 /**
- * S654 — the tenant agent quotes the figure the portal shows.
+ * S654 — the tenant agent counts a bounced payment once.
  *
- * MH 25: a $460 October bill with $10 paid ahead. The bill email and the portal
- * say $450; this tool summed the open rows and said $460. It now nets the same
- * way the portal does (one helper): paid-ahead first, then landlord credit.
+ * A settled payment that bounces is reopened by paymentReversal as two rows:
+ * the original flips to 'returned' and a fresh 'pending' row carries the debt.
+ * The tool summed both, so a $300 bounce was quoted as $600 owed.
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+vi.mock('../../../jobs/lateFees', () => ({
+  generateLateFeesForInvoice: vi.fn(async () => ({ invoicesScanned: 0, rowsWritten: 0, capsHit: 0, errors: [] })),
+}))
+vi.mock('../../notifications', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()), notifyRentReversed: vi.fn(async () => undefined),
+}))
+vi.mock('../../adminNotifications', () => ({ createAdminNotification: vi.fn(async () => undefined) }))
+vi.mock('../../reversalRecovery', () => ({ decideReversalRecovery: vi.fn(async () => null) }))
+vi.mock('../../responsibleParty', () => ({ getPropertyResponsibleParty: vi.fn(async () => null) }))
+
 import { db, getClient } from '../../../db'
 import { getMyBalanceBreakdown } from './getMyBalanceBreakdown'
+import { handlePaymentReversal } from '../../paymentReversal'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
 } from '../../../test/dbHelpers'
 
 beforeEach(cleanupAllSchema)
 
-async function mh25() {
+async function seed() {
   const client = await getClient()
   try {
     const { userId, landlordId } = await seedLandlord(client)
@@ -23,69 +35,62 @@ async function mh25() {
     const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 460 })
     const leaseId = await seedLease(client, { unitId, landlordId, rentAmount: 460 })
     await seedLeaseTenant(client, { leaseId, tenantId, role: 'primary' })
+    // October: open.
+    await client.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',460,'pending','2026-10-01','RENT')`,
+      [unitId, leaseId, tenantId, landlordId])
+    // September: paid by bank, settled.
     const { rows: [inv] } = await client.query<{ id: string }>(
       `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status)
-       VALUES ($1,$2,$3,$4,'INV-S654-AGENT','2026-10-01',460,'pending') RETURNING id`,
+       VALUES ($1,$2,$3,$4,'INV-S654-BOUNCE','2026-09-01',300,'settled') RETURNING id`,
       [landlordId, tenantId, leaseId, unitId])
-    await client.query(
-      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
-       VALUES ($1,$2,$3,$4,$5,'rent',460,'pending','2026-10-01','RENT')`,
+    const { rows: [sept] } = await client.query<{ id: string }>(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+                             due_date, entry_description, stripe_payment_intent_id, settled_at)
+       VALUES ($1,$2,$3,$4,$5,'rent',300,'settled','2026-09-01','RENT','pi_s654_sept',NOW()) RETURNING id`,
       [inv.id, unitId, leaseId, tenantId, landlordId])
-    await client.query(
-      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
-       VALUES ($1,$2,10,10)`, [leaseId, tenantId])
     return {
-      landlordId, tenantId, unitId, leaseId,
+      landlordId, tenantId, unitId, leaseId, septPaymentId: sept.id,
       actor: { userId, role: 'tenant' as const, profileId: tenantId, landlordIds: [] },
     }
   } finally { client.release() }
 }
 
-describe('get_my_balance_breakdown — the figure the portal shows', () => {
-  it('MH 25: $460 bill, $10 paid ahead → $450 owed', async () => {
-    const s = await mh25()
-    const r: any = await getMyBalanceBreakdown.execute({}, s.actor)
-    expect(r.totalOwed).toBe(450)
-    expect(r.totalBeforeCredits).toBe(460)
-    expect(r.paidAheadApplied).toBe(10)
-    expect(r.accountCreditApplied).toBe(0)
-    expect(r.openChargesOldestFirst).toHaveLength(1)
+describe('get_my_balance_breakdown — a bounced payment is owed once', () => {
+  it('the returned row and the row the reversal reopened are not both counted', async () => {
+    const s = await seed()
+    const r = await handlePaymentReversal({
+      paymentId: s.septPaymentId, reversalType: 'ach_return', reversedAmount: 300, reversalFee: 4,
+      stripeEventId: 'evt_s654_bounce', rawEvent: {},
+    })
+    expect(r.handled).toBe(true)
+
+    const out: any = await getMyBalanceBreakdown.execute({}, s.actor)
+    // October $460 + September reopened $300 + the $4 return fee.
+    expect(out.totalOwed).toBe(764)
+    expect(out.openChargesOldestFirst.filter((c: any) => c.status === 'returned')).toHaveLength(0)
+    expect(out.openChargesOldestFirst.filter((c: any) => c.type === 'rent' && c.due_date === '2026-09-01'))
+      .toEqual([expect.objectContaining({ amount: 300, status: 'pending' })])
   })
 
-  it('paid-ahead first, then the landlord credit on what is left', async () => {
-    const s = await mh25()
-    await db.query(
-      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
-       VALUES ($1,$2,$3,50,50,'goodwill')`, [s.landlordId, s.tenantId, s.leaseId])
-    const r: any = await getMyBalanceBreakdown.execute({}, s.actor)
-    expect(r.totalOwed).toBe(400)
-    expect(r.paidAheadApplied).toBe(10)
-    expect(r.accountCreditApplied).toBe(50)
+  it('S626: a return with no reopened row is still owed', async () => {
+    const s = await seed()
+    await db.query(`UPDATE payments SET status = 'returned', return_code = 'R01' WHERE id = $1`, [s.septPaymentId])
+    const out: any = await getMyBalanceBreakdown.execute({}, s.actor)
+    expect(out.totalOwed).toBe(760)
+    expect(out.openChargesOldestFirst.filter((c: any) => c.status === 'returned')).toHaveLength(1)
   })
+})
 
-  // A bounced payment reopens as a fresh pending row (paymentReversal). The
-  // dollars are owed once — on that row — and the bounce is listed.
-  it('a bounced payment is owed again, once', async () => {
-    const s = await mh25()
-    await db.query(
-      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
-       VALUES ($1,$2,$3,$4,'rent',300,'returned','2026-09-01','RENT'),
-              ($1,$2,$3,$4,'rent',300,'pending','2026-09-01','RENT')`,
-      [s.unitId, s.leaseId, s.tenantId, s.landlordId])
-    const r: any = await getMyBalanceBreakdown.execute({}, s.actor)
-    expect(r.totalBeforeCredits).toBe(760)
-    expect(r.totalOwed).toBe(750)
-    expect(r.bouncedPaymentsOwedAgain).toEqual([{ amount: 300, due_date: '2026-09-01', type: 'rent' }])
-  })
-
-  it('a work-trade line is never quoted as owed', async () => {
-    const s = await mh25()
+describe('get_my_balance_breakdown — work trade is not owed (S637)', () => {
+  it('a work-trade-covered line is left out of what the tenant is told they owe', async () => {
+    const s = await seed()
     await db.query(
       `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, work_trade_suspended_at)
-       VALUES ($1,$2,$3,$4,'utility',75,'pending','2026-10-01','UTILITY', NOW())`,
+       VALUES ($1,$2,$3,$4,'utility',35,'pending','2026-10-01','UTILITY',NOW())`,
       [s.unitId, s.leaseId, s.tenantId, s.landlordId])
-    const r: any = await getMyBalanceBreakdown.execute({}, s.actor)
-    expect(r.totalOwed).toBe(450)
-    expect(r.totalBeforeCredits).toBe(460)
+    const out: any = await getMyBalanceBreakdown.execute({}, s.actor)
+    expect(out.totalOwed).toBe(460)
   })
 })

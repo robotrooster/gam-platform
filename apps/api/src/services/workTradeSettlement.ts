@@ -315,26 +315,42 @@ export function settleMonth(input: SettlementInput): SettlementResult {
  * and there is no more time. Banked hours ARE spent first — they were earned,
  * and refusing to let them cover a debt at the one moment it matters would take
  * work someone already did and throw it away.
+ *
+ * S654: so are approved hours no close has counted yet — the month the
+ * agreement ends in, mostly. `uncountedHours` (by periodMonth) lands on its own
+ * period first, as at a close; any surplus joins the bank. Without it, ending
+ * mid-month billed the whole month however much of it had been worked.
  */
 export function settleOnEnd(
   periods: SettlementPeriod[], bankedHours: number,
+  uncountedHours: Record<string, number> = {},
 ): SettlementResult {
   let bank = round2h(Math.max(0, bankedHours))
   let billedAmount = 0
   const billedPeriods: string[] = []
 
+  const state = periods.map(p => ({ p, applied: round2h(p.hoursApplied), now: 0 }))
+  const give = (s: typeof state[number], hours: number): number => {
+    const used = Math.min(round2h(hours), Math.max(0, round2h(s.p.targetHours - s.applied)))
+    if (used <= 0) return 0
+    s.applied = round2h(s.applied + used)
+    s.now = round2h(s.now + used)
+    return used
+  }
+  // Each period's own uncounted hours first; the surplus is banked.
+  for (const s of state) {
+    const own = round2h(Math.max(0, uncountedHours[s.p.periodMonth] ?? 0))
+    bank = round2h(bank + own - give(s, own))
+  }
+
   // Oldest first. Which month a banked hour lands on is not cosmetic — periods
   // carry different frozen rates, so the order changes what the tenant is
   // billed. Oldest-first is the same order catch-up uses during a normal close,
   // and it clears the debt that has been outstanding longest.
-  const outcomes: PeriodOutcome[] = periods.map(p => {
-    let applied = round2h(p.hoursApplied)
-    const wanted = Math.max(0, round2h(p.targetHours - applied))
-    const drawn = Math.min(bank, wanted)
-    if (drawn > 0) {
-      applied = round2h(applied + drawn)
-      bank = round2h(bank - drawn)
-    }
+  const outcomes: PeriodOutcome[] = state.map(s => {
+    const p = s.p
+    if (bank > 0) bank = round2h(bank - give(s, bank))
+    const applied = s.applied
     const outstanding = Math.max(0, round2h(p.targetHours - applied))
     const creditTotal = periodCredit(p.basisAmount, p.targetHours, applied, p.hourRate)
     const uncovered = round2(Math.max(0, p.basisAmount - creditTotal))
@@ -345,7 +361,7 @@ export function settleOnEnd(
     }
     return {
       periodMonth: p.periodMonth,
-      hoursAppliedNow: drawn,
+      hoursAppliedNow: s.now,
       hoursAppliedTotal: applied,
       hoursOutstanding: outstanding,
       creditTotal,

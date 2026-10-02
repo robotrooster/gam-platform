@@ -22,10 +22,11 @@ vi.mock('../services/email', async (orig) => ({
   ...(await orig() as any),
   emailSigningReminder:    vi.fn(async () => undefined),
   emailDocumentAutoVoided: vi.fn(async () => undefined),
+  emailSigningRequest:     vi.fn(async () => undefined),
 }))
 
 import { processEsignTimeouts } from './scheduler'
-import { emailSigningReminder } from '../services/email'
+import { emailSigningReminder, emailSigningRequest, emailDocumentAutoVoided } from '../services/email'
 
 // Comfortably after the grandfather cutover, so these fixtures are
 // governed by their own timestamps rather than floored to it.
@@ -333,5 +334,138 @@ describe('S638 a timeout resend targets only the current signer', () => {
     // The one behind them is still waiting — no mail, no stamp, no false start.
     expect(co.status).toBe('pending')
     expect(co.invite_sent_at).toBeNull()
+  })
+})
+
+// ─── S654: a signing link goes only to the address on the signer's account ───
+//
+// A signing token is a full stand-in for that signer (S629). The reminders and
+// the 48-hour resend mailed it to the signer ROW's address. Rows can hold an
+// old address: the landlord's email correction moved only the lease's row, so
+// a packet's second document still pointed at the mistyped mailbox, and the
+// reminder sent that mailbox a token whose signing page lists the lease too.
+describe('S654 — reminders and resends go to the account, not the signer row', () => {
+  const PLACEHOLDER = '$2b$10$placeholder_invite_pending'
+  const TYPO = 'y.typo@exampel.test'
+  const RIGHT = 'y.right@example.test'
+
+  /** Landlord B's unit, and Y: B's own invitee, never set up, now at the corrected address. */
+  async function companyAndResident() {
+    const c = await db.connect()
+    let landlordId: string, llUser: string, unitId: string, tenantId: string
+    try {
+      await c.query('BEGIN')
+      const l = await seedLandlord(c)
+      landlordId = l.landlordId; llUser = l.userId
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: llUser, managedByUserId: llUser })
+      unitId = await seedUnit(c, { propertyId, landlordId })
+      tenantId = await seedTenant(c)
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const y = (await db.query<{ id: string }>(
+      `UPDATE users SET email=$2, password_hash=$3, tenant_invite_token=NULL, tenant_invite_expires_at=NULL,
+                        tenant_invite_accepted_at=NULL
+        WHERE id = (SELECT user_id FROM tenants WHERE id=$1) RETURNING id`,
+      [tenantId!, RIGHT, PLACEHOLDER])).rows[0].id
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
+       VALUES ($1, $2, 'not_uploaded', $3)`, [landlordId!, tenantId!, unitId!])
+    return { landlordId: landlordId!, llUser: llUser!, unitId: unitId!, yUser: y }
+  }
+
+  /** A document the landlord has signed, with Y waiting on it at `rowEmail`. */
+  async function signedByLandlord(f: Awaited<ReturnType<typeof companyAndResident>>, o: {
+    title: string; rowEmail: string; packet?: string; sort?: number
+    landlordSignedHoursAgo: number; yInvitedHoursAgo: number; yRemindedHoursAgo?: number | null
+  }) {
+    const id = randomUUID()
+    await db.query(
+      `INSERT INTO lease_documents (id, landlord_id, unit_id, title, document_type, status, sent_at, created_at,
+                                    package_group_id, package_sort_order)
+       VALUES ($1,$2,$3,$4,'original_lease','in_progress', ${HOURS_AGO(o.landlordSignedHoursAgo + 1)}, NOW(), $5, $6)`,
+      [id, f.landlordId, f.unitId, o.title, o.packet ?? null, o.sort ?? 0])
+    await db.query(
+      `INSERT INTO lease_document_signers
+         (document_id, user_id, role, name, email, order_index, token, status, invite_sent, invite_sent_at, signed_at)
+       VALUES ($1,$2,'landlord','LL','ll@b.test',1,$3,'signed',TRUE, ${HOURS_AGO(o.landlordSignedHoursAgo + 1)}, ${HOURS_AGO(o.landlordSignedHoursAgo)})`,
+      [id, f.llUser, randomUUID()])
+    const token = randomUUID()
+    await db.query(
+      `INSERT INTO lease_document_signers
+         (document_id, user_id, role, name, email, order_index, token, status, invite_sent, invite_sent_at, reminder_sent_at)
+       VALUES ($1,$2,'primary','Y',$3,2,$4,'sent',TRUE, ${HOURS_AGO(o.yInvitedHoursAgo)},
+               ${o.yRemindedHoursAgo != null ? HOURS_AGO(o.yRemindedHoursAgo) : 'NULL'})`,
+      [id, f.yUser, o.rowEmail, token])
+    return { id, token }
+  }
+
+  it('the reminder: one email for the packet, to the account, never to the stale row', async () => {
+    const f = await companyAndResident()
+    const packet = randomUUID()
+    // The correction moved the lease's row; the second document still holds the typo.
+    await signedByLandlord(f, { title: 'Lease', rowEmail: RIGHT, packet, sort: 0,
+      landlordSignedHoursAgo: 30, yInvitedHoursAgo: 30, yRemindedHoursAgo: 25 })
+    const second = await signedByLandlord(f, { title: 'Pet addendum', rowEmail: TYPO, packet, sort: 1,
+      landlordSignedHoursAgo: 30, yInvitedHoursAgo: 30, yRemindedHoursAgo: 25 })
+
+    await processEsignTimeouts()
+
+    const calls = (emailSigningReminder as any).mock.calls
+    expect(calls.map((c: any[]) => c[0])).toEqual([RIGHT])
+    expect(calls[0][6].documentCount).toBe(2)
+    expect(JSON.stringify(calls)).not.toContain(second.token)
+    // Both of Y's rows were stamped by that one email.
+    const { rows } = await db.query<any>(
+      `SELECT reminder_count FROM lease_document_signers WHERE user_id = $1`, [f.yUser])
+    expect(rows.map(r => Number(r.reminder_count))).toEqual([1, 1])
+  })
+
+  it('the reminder carries the setup link once it goes to the account itself', async () => {
+    const f = await companyAndResident()
+    await signedByLandlord(f, { title: 'Lease', rowEmail: TYPO,
+      landlordSignedHoursAgo: 30, yInvitedHoursAgo: 30, yRemindedHoursAgo: 25 })
+    await processEsignTimeouts()
+    const calls = (emailSigningReminder as any).mock.calls
+    expect(calls).toHaveLength(1)
+    expect(calls[0][0]).toBe(RIGHT)
+    expect(calls[0][5]).toMatch(/\/accept-invite\?token=[0-9a-f]{64}&next=/)
+    expect(calls[0][6].needsSetup).toBe(true)
+  })
+
+  it('the 48-hour resend goes to the account, never to the stale row', async () => {
+    const f = await companyAndResident()
+    const doc = await signedByLandlord(f, { title: 'Lease', rowEmail: TYPO,
+      landlordSignedHoursAgo: 60, yInvitedHoursAgo: 59 })
+
+    await processEsignTimeouts()
+
+    const calls = (emailSigningRequest as any).mock.calls
+    expect(calls.map((c: any[]) => c[0])).toEqual([RIGHT])
+    expect(calls[0][5]).toMatch(/\/accept-invite\?token=[0-9a-f]{64}&next=/)
+    expect(calls[0][6].needsSetup).toBe(true)
+    expect(JSON.stringify((emailSigningReminder as any).mock.calls)).not.toContain(TYPO)
+    expect(await statusOf(doc.id)).toBe('in_progress')
+  })
+
+  it('an auto-void notice goes to the account too', async () => {
+    const f = await companyAndResident()
+    const id = randomUUID()
+    // Waiting on the landlord past window A, with Y's row at the typo.
+    await db.query(
+      `INSERT INTO lease_documents (id, landlord_id, unit_id, title, document_type, status, sent_at, created_at)
+       VALUES ($1,$2,$3,'Lease','original_lease','sent', ${HOURS_AGO(60)}, NOW())`, [id, f.landlordId, f.unitId])
+    await db.query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
+       VALUES ($1,$2,'primary','Y',$3,2,$4,'pending')`, [id, f.yUser, TYPO, randomUUID()])
+    await db.query(
+      `UPDATE pending_tenant_intents SET draft_document_id=$1, accepted_at=${HOURS_AGO(60)} WHERE landlord_id=$2`,
+      [id, f.landlordId])
+
+    await processEsignTimeouts()
+
+    expect(await statusOf(id)).toBe('voided')
+    const to = (emailDocumentAutoVoided as any).mock.calls.map((c: any[]) => c[0])
+    expect(to).toContain(RIGHT)
+    expect(to).not.toContain(TYPO)
   })
 })

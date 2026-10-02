@@ -1929,7 +1929,11 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'If the landlord has not said which they mean, ASK — do not pick. Sending an applicant invite ' +
       'to somebody already living there puts a background check in front of a sitting resident, and ' +
       'sending a unit invite to an applicant skips the screening the landlord wanted.\n' +
-      'They get an email with a link that expires in seven days. Invite one person at a time and ' +
+      // S654: someone already on GAM is never sent a new link.
+      'Somebody new gets an email with a link that expires in seven days. Somebody who already has a ' +
+      'GAM account gets no new link and no setup email: the lease (or the invite to apply) waits in ' +
+      'the account they already have, and they sign in as usual. The reply says which happened; for ' +
+      'someone already on GAM, never tell the landlord a link was sent. Invite one person at a time and ' +
       'invite the person who holds the lease FIRST — the order is kept, and the first one invited is ' +
       'the primary resident.',
     params: {
@@ -3720,7 +3724,8 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'is $650".\n' +
       'S630 (Nic): DO NOT PROMISE THAT THE INVITE FINISHES THIS. It creates the account and the lease TERMS from what they tell you, and that is all — the signed lease DOCUMENT is not in GAM until the landlord uploads a scan of the one in their folder, or sends the tenant a digital one to sign (their existing template is fine, same terms). Say that plainly as the next step, in the same breath as the invite. Telling a landlord their four-year tenant is onboarded when no lease document exists is how they find out at the worst possible moment.' +
       'This creates the tenant AND an imported lease from the terms they give you, and emails the ' +
-      'person an activation link. No background check and no application — they already live there.\n' +
+      'person an activation link (someone already on GAM gets no link; the lease waits in their ' +
+      'account). No background check and no application — they already live there.\n' +
       'THE TERMS COME FROM THE PAPER LEASE, not from you. Rent, dates, deposit, late-fee terms: read ' +
       'each one back as they give it, and if they do not know a figure, ask rather than filling in ' +
       'something reasonable. This lease becomes what the tenant is billed on.\n' +
