@@ -86,6 +86,7 @@ import {
   seedLandlord, seedTenant, seedProperty, seedUnit,
   seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
+import { todayIn } from '../lib/timezone'
 
 const stripeMocks: {
   transfersCreate:      ReturnType<typeof vi.fn>
@@ -937,7 +938,8 @@ describe('repriceFlexPayRetryPayment', () => {
 
   it('recomputes fee to the retry day + passes through the ACH-return fee; updates PI + advance + payment', async () => {
     const seed = await seedFailedFlexPayPull()
-    const retryDay = Math.min(Math.max(new Date().getUTCDate(), 1), FLEXPAY_MAX_PULL_DAY)
+    // S654: the retry day is the property's calendar day (Phoenix here), not UTC's.
+    const retryDay = Math.min(Math.max(Number(todayIn(null).slice(8, 10)), 1), FLEXPAY_MAX_PULL_DAY)
     const newFee = calculateFlexPayFee(retryDay)
     const expectedTotal = 1000 + newFee + FLEXPAY_ACH_RETURN_FEE  // boost 0 (no outstanding GAM balances)
 

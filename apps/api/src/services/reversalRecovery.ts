@@ -101,8 +101,11 @@ export async function anticipatedLeaseInflux(
   windowDays: number = REVERSAL_NETTING_WINDOW_DAYS,
   asOf?: string,
 ): Promise<number> {
-  // S654: "today" is GAM's day (Phoenix) — netting rides GAM's payout batch,
-  // a platform date, and UTC is already tomorrow after 5 pm in Phoenix.
+  // S654: "today" is GAM's day (Phoenix), not each lease's property zone.
+  // Netting is one decision per landlord that rides GAM's payout batch, and
+  // one landlord can hold properties in several zones; a per-lease zone would
+  // only move the window edge a few hours near midnight. Not UTC: UTC is
+  // already tomorrow after 5 pm in Phoenix.
   const anchor = new Date((asOf ?? todayIn(null)) + 'T00:00:00Z')
   const leases = await query<{ rent_amount: string; rent_due_day: number }>(
     `SELECT rent_amount::text AS rent_amount, rent_due_day

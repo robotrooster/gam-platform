@@ -1,6 +1,7 @@
 import type { PoolClient } from 'pg'
 import { appendEvent } from './creditLedger'
 import type { CreditEventType, CreditAttestationSource } from '@gam/shared'
+import { dateIn, addDaysTo } from '../lib/timezone'
 
 // ============================================================
 // Credit-ledger emitters: thin wrappers that compute the right
@@ -16,32 +17,36 @@ const DEFAULT_GRACE_DAYS = 5
 
 /**
  * Classify a settled rent/utility payment into one of the five
- * payment-event tiers. Comparison basis: end-of-day Phoenix-local
- * for due_date (we treat due_date as a calendar day, not a moment).
+ * payment-event tiers. Comparison basis: CALENDAR DAYS where the property
+ * is. due_date is a calendar day, so the payment's settle instant is turned
+ * into the property's own date before it is compared.
  *
- * Tier boundaries:
- *   on_time:    settled <= due_date end-of-day
- *   late_grace: due_date < settled <= due_date + grace_days
- *   late_minor: 0 < (settled - grace_end) <= 72h
- *   late_major: 72h < (settled - grace_end) <= 15d
- *   late_severe: > 15d past grace_end
+ * S654: this used to end the due day at 23:59:59 UTC — 4:59 pm in Phoenix —
+ * so rent that settled between 5 pm and midnight on its due date was put on
+ * the tenant's credit record one tier late.
+ *
+ * Tier boundaries (all in days on the property's calendar):
+ *   on_time:     paid on or before due_date
+ *   late_grace:  paid after due_date, on or before due_date + grace_days
+ *   late_minor:  1–3 days past the last grace day
+ *   late_major:  4–15 days past the last grace day
+ *   late_severe: more than 15 days past the last grace day
  */
 export function classifyPaymentTier(args: {
-  dueDate: Date
+  /** 'YYYY-MM-DD' (preferred — select due_date::text), or a Date read by its UTC day. */
+  dueDate: Date | string
   settledAt: Date
   graceDays: number
+  /** The property's zone (properties.timezone). Missing → Phoenix. */
+  propertyTz?: string | null
 }): CreditEventType {
-  const dueEnd = endOfUtcDay(args.dueDate)
-  if (args.settledAt.getTime() <= dueEnd.getTime()) {
-    return 'payment_received_on_time'
-  }
-  const graceEnd = endOfUtcDay(addDays(args.dueDate, args.graceDays))
-  if (args.settledAt.getTime() <= graceEnd.getTime()) {
-    return 'payment_received_late_grace'
-  }
-  const hoursPastGrace = (args.settledAt.getTime() - graceEnd.getTime()) / 3_600_000
-  if (hoursPastGrace <= 72) return 'payment_received_late_minor'
-  const daysPastGrace = hoursPastGrace / 24
+  const due = calendarDay(args.dueDate)
+  const paid = dateIn(args.propertyTz, args.settledAt)
+  if (paid <= due) return 'payment_received_on_time'
+  const lastGraceDay = addDaysTo(due, args.graceDays)
+  if (paid <= lastGraceDay) return 'payment_received_late_grace'
+  const daysPastGrace = daysBetween(lastGraceDay, paid)
+  if (daysPastGrace <= 3) return 'payment_received_late_minor'
   if (daysPastGrace <= 15) return 'payment_received_late_major'
   return 'payment_received_late_severe'
 }
@@ -57,16 +62,18 @@ async function isOnboardingMonthCharge(client: PoolClient, paymentId: string): P
   return rows[0]?.onboarding === true
 }
 
-function addDays(d: Date, days: number): Date {
-  const out = new Date(d)
-  out.setUTCDate(out.getUTCDate() + days)
-  return out
+/**
+ * S654: a due date as 'YYYY-MM-DD'. A string is taken as is. A Date is read
+ * by its UTC day: that is the right day for node-pg's local-midnight DATE on
+ * GAM's hosts (Phoenix and UTC) and for `new Date('YYYY-MM-DD')`.
+ */
+function calendarDay(d: Date | string): string {
+  return typeof d === 'string' ? d.slice(0, 10) : d.toISOString().slice(0, 10)
 }
 
-function endOfUtcDay(d: Date): Date {
-  const out = new Date(d)
-  out.setUTCHours(23, 59, 59, 999)
-  return out
+/** Whole calendar days from one 'YYYY-MM-DD' to a later one. */
+function daysBetween(fromYmd: string, toYmd: string): number {
+  return Math.round((Date.parse(`${toYmd}T00:00:00Z`) - Date.parse(`${fromYmd}T00:00:00Z`)) / 86_400_000)
 }
 
 /**
@@ -82,10 +89,14 @@ export async function emitPaymentSettledEvent(
     paymentId: string
     paymentType: 'rent' | 'utility'
     amount: string | number
-    dueDate: Date
+    /** 'YYYY-MM-DD' preferred (S654); a Date is read by its UTC day. */
+    dueDate: Date | string
     settledAt: Date
     graceDays: number | null
     stripePaymentIntentId: string | null
+    /** S654: the property's zone, so "paid on the due date" means that day
+     *  where the property is. Missing → Phoenix. */
+    propertyTz?: string | null
     /** S652: a cash/check settlement the landlord recorded at the desk is
      *  landlord-attested with the check number as evidence; default Stripe. */
     attestationSource?: CreditAttestationSource
@@ -96,6 +107,7 @@ export async function emitPaymentSettledEvent(
     dueDate: args.dueDate,
     settledAt: args.settledAt,
     graceDays: args.graceDays ?? DEFAULT_GRACE_DAYS,
+    propertyTz: args.propertyTz,
   })
 
   const positive =
@@ -119,7 +131,8 @@ export async function emitPaymentSettledEvent(
         payment_id: args.paymentId,
         payment_type: args.paymentType,
         amount: typeof args.amount === 'string' ? args.amount : String(args.amount),
-        due_date: args.dueDate.toISOString(),
+        // S654: the due date is a calendar day, recorded as one.
+        due_date: calendarDay(args.dueDate),
         paid_at: args.settledAt.toISOString(),
         grace_days: args.graceDays ?? DEFAULT_GRACE_DAYS,
       },
@@ -147,7 +160,8 @@ export async function emitPaymentFailedEvent(
     paymentId: string
     paymentType: 'rent' | 'utility'
     amount: string | number
-    dueDate: Date
+    /** 'YYYY-MM-DD' preferred (S654); a Date is read by its UTC day. */
+    dueDate: Date | string
     failedAt: Date
     stripePaymentIntentId: string | null
     failureCode: string | null
@@ -163,7 +177,7 @@ export async function emitPaymentFailedEvent(
         payment_id: args.paymentId,
         payment_type: args.paymentType,
         amount: typeof args.amount === 'string' ? args.amount : String(args.amount),
-        due_date: args.dueDate.toISOString(),
+        due_date: calendarDay(args.dueDate),
         failed_at: args.failedAt.toISOString(),
         failure_code: args.failureCode,
         failure_message: args.failureMessage,

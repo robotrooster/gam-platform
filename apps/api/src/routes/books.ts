@@ -1507,9 +1507,11 @@ booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) =
          WHERE (${col}=$1 OR $1 IS NULL) AND status='approved' AND pay_date BETWEEN $2 AND $3`,
         [lid, start, end]
       ),
+      // S654: paid_at is a timestamp; compare its day, as /reports/pl does.
+      // A bare end date read as midnight dropped every bill paid that day.
       db.query(
         `SELECT COALESCE(SUM(amount_paid),0) AS total FROM books_bills
-         WHERE (${col}=$1 OR $1 IS NULL) AND status IN ('paid','partial') AND paid_at BETWEEN $2 AND $3`,
+         WHERE (${col}=$1 OR $1 IS NULL) AND status IN ('paid','partial') AND paid_at::date BETWEEN $2 AND $3`,
         [lid, start, end]
       ),
       db.query(

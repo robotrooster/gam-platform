@@ -281,12 +281,14 @@ describe('GET /api/reports/monthly-statement', () => {
       .get('/api/reports/monthly-statement')
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
     expect(res.status).toBe(200)
-    const now = new Date()
-    const currentMonth1Idx = now.getMonth() + 1
-    // Pre-fix behavior: returns prior month (currentMonth-1 when called
-    // mid-current-month). January edge case wraps to December of prior
-    // year via the Date constructor.
-    expect(res.body.data.period.month).toBe(currentMonth1Idx - 1)
+    // S654: "last month" is on the database's (Phoenix) calendar, the same one
+    // the route reads. Node's local getMonth() was wrong every January (0, not
+    // 12) and on the last evening of a month when Node runs in UTC.
+    const last = (await db.query<{ y: number; m: number }>(
+      `SELECT extract(year FROM CURRENT_DATE - interval '1 month')::int AS y,
+              extract(month FROM CURRENT_DATE - interval '1 month')::int AS m`)).rows[0]
+    expect(res.body.data.period.year).toBe(last.y)
+    expect(res.body.data.period.month).toBe(last.m)
   })
 
   it('summary.totalPlatformFees uses the launch fee model ($2/occupied unit, $10/property min)', async () => {
@@ -431,7 +433,10 @@ describe('GET /api/reports/property-pl', () => {
     const res = await request(buildApp()).get('/api/reports/property-pl')
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.year).toBe(new Date().getFullYear())
+    // S654: "this year" on the database's (Phoenix) calendar, as the route reads it.
+    const thisYear = (await db.query<{ y: number }>(
+      `SELECT extract(year FROM CURRENT_DATE)::int AS y`)).rows[0].y
+    expect(res.body.data.year).toBe(thisYear)
     expect(res.body.data.month).toBeNull()
     expect(res.body.data.properties).toHaveLength(1)
     expect(res.body.data.properties[0].id).toBe(f.aPropId)

@@ -365,10 +365,13 @@ subleasesRouter.patch('/:id/decision', requirePerm('subleases.decide'), async (r
       master_lease_id: string
       status: string
       landlord_id: string
+      timezone: string | null
     }>(
-      `SELECT s.id, s.master_lease_id, s.status, l.landlord_id
+      `SELECT s.id, s.master_lease_id, s.status, l.landlord_id, p.timezone
          FROM subleases s
          JOIN leases l ON l.id = s.master_lease_id
+         JOIN units u ON u.id = l.unit_id
+         JOIN properties p ON p.id = u.property_id
         WHERE s.id = $1`,
       [req.params.id],
     )
@@ -389,13 +392,14 @@ subleasesRouter.patch('/:id/decision', requirePerm('subleases.decide'), async (r
       ? await queryOne<any>(
           `UPDATE subleases
               SET status = 'awaiting_signatures',
-                  landlord_consent_date = CURRENT_DATE,
+                  landlord_consent_date = $3::date,
                   notes = COALESCE(notes || E'\\n', '') ||
                           'Approved: ' || COALESCE($2, '(no note)'),
                   updated_at = NOW()
             WHERE id = $1
             RETURNING *`,
-          [row.id, body.notes ?? null],
+          // S654: consent is dated on the PROPERTY's calendar, as on create.
+          [row.id, body.notes ?? null, todayIn(row.timezone)],
         )
       : await queryOne<any>(
           `UPDATE subleases

@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { query, queryOne } from '../db'
+import { query, queryOne, db } from '../db'
 import { chargeLandlord } from '../services/landlordGamAccount'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { landlordScopeIds } from '../lib/landlordScope'
@@ -14,7 +14,7 @@ import { computePlatformCut, createRentPlatformCharge } from '../services/stripe
 import { createAdminNotification } from '../services/adminNotifications'
 import { computeTenantGamOutstandingTotal } from '../services/supersedence'
 import { chargeLeaseBalance, chargeLeaseBalanceSchema, resolveTargetLease,
-         suggestedPayAheadFor } from '../services/rentCharge'
+         suggestedPayAheadFor, prepaidNettable } from '../services/rentCharge'
 import { allocateOldestFirst, allocateCredits } from '@gam/shared'
 import { getClient } from '../db'
 import { logger } from '../lib/logger'
@@ -234,9 +234,8 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
         )
     `)
 
-    // S654: the 1st as a plain calendar string. A local-midnight Date is cast to
-    // DATE in the database's zone, so on a host whose clock is not Phoenix
-    // (UTC) it landed on the last day of the month before.
+    // S654: the 1st as a plain calendar string, so the due date never depends
+    // on the host clock or the database session's zone.
     const dueDate = `${targetMonth}-01` // 1st of target month
 
     let initiated = 0
@@ -724,6 +723,8 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
               p.entry_description, p.notes, p.lease_id, u.payment_block,
               u.unit_number, pr.name AS property_name, p.landlord_id,
+              -- S654: the oldest bill's month decides how much paid-ahead credit applies.
+              p.invoice_id,
               -- S615: the ONLY reliable mark of a utility-service charge. A
               -- NULL lease_id is not it: ordinary tenants have lease-less
               -- payment rows too, and treating those as service charges pulled
@@ -825,6 +826,21 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
         WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
         GROUP BY lease_id, landlord_id`,
       [req.user!.profileId])
+    // ── S654: PAID-AHEAD MONEY COMES OFF FIRST ──────────────────────────────
+    //
+    // MH 25 held $10 paid ahead. The bill email netted it ($450); this screen
+    // did not ($460), and the tenant paid $460 with the $10 still unspent. The
+    // charge path (rentCharge) already nets it, so the screen now asks the same
+    // figure. Paid-ahead is lease-bound and comes off before landlord credit, so
+    // a landlord credit is never spent on dollars already covered.
+    const prepaidApplied = new Map<string, number>()
+    for (const g of byLease.values()) {
+      if (!g.leaseId || !g.rows[0]) continue
+      const avail = await prepaidNettable(db, g.leaseId, g.rows[0])
+      prepaidApplied.set(g.leaseId, Math.round(Math.min(g.outstanding, avail) * 100) / 100)
+    }
+    const prepaidApplied_ = (leaseId: string) => prepaidApplied.get(leaseId) ?? 0
+
     // ── S648 (Nic): "every dollar should only be counted once." ─────────────
     // A general credit was added to EVERY lease here, so a resident with two
     // spaces saw it come off both bills. Spent once now, oldest bill first,
@@ -836,7 +852,8 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       const alloc = allocateCredits(
         creditRows.filter(c => c.landlord_id === landlordId)
           .map(c => ({ leaseId: c.lease_id, amount: Number(c.credit) })),
-        groups.map(g => ({ key: g.leaseId, leaseId: g.leaseId, total: g.outstanding,
+        groups.map(g => ({ key: g.leaseId, leaseId: g.leaseId,
+                           total: Math.round((g.outstanding - prepaidApplied_(g.leaseId)) * 100) / 100,
                            earliestDue: g.rows[0]?.due_date ?? null })))
       for (const g of groups) creditApplied.set(g.leaseId, alloc.applied[g.leaseId] ?? 0)
       // What is still on the account after these bills, shown once (on the
@@ -850,8 +867,9 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       // Never below zero: a credit larger than the bill leaves the rest on the
       // account for next month, it does not hand out change.
       const creditApplied = creditApplied_(l.leaseId)
+      const prepaidApplied = prepaidApplied_(l.leaseId)
       const grossOutstanding = l.outstanding
-      l.outstanding = Math.round((l.outstanding - creditApplied) * 100) / 100
+      l.outstanding = Math.max(0, Math.round((l.outstanding - prepaidApplied - creditApplied) * 100) / 100)
       const manualFee = (landlordCovers || l.manualFirstFree) ? 0 : MANUAL_PAYMENT_FEE
       return {
         ...l,
@@ -859,6 +877,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
         // Shown as a line so the resident SEES the credit, not just a smaller
         // number they have to take on faith.
         grossOutstanding,
+        prepaidApplied,
         creditApplied,
         creditRemaining: creditLeft.get(l.leaseId) ?? 0,
         manualFeeCoveredByLandlord: landlordCovers,
@@ -876,7 +895,9 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
         // all-or-nothing; the carried balance above it may be paid down in any
         // amount. Matches rentCharge's `requiredInFull` exactly — one rule, two
         // places, and the screen must not be stricter than the server.
-        requiredNow: Math.round((l.outstanding - l.carriedBalance) * 100) / 100,
+        // S654: never below zero — credit larger than the lease's own charges
+        // leaves nothing required now (rentCharge clamps the same way).
+        requiredNow: Math.max(0, Math.round((l.outstanding - l.carriedBalance) * 100) / 100),
       }
     }))
 
@@ -1100,7 +1121,9 @@ paymentsRouter.post('/post-payment', requirePerm('take_payment'), async (req: an
     const r = await postTenantPayment(client, {
       tenantId: body.tenantId, landlordIds, method: body.method, amount: body.amount,
       reference: body.reference ?? null, notes: body.notes ?? null,
-      receivedAt: body.receivedAt ? new Date(body.receivedAt + 'T12:00:00') : null,
+      // S654: noon UTC is the same calendar day in every US zone, so the date
+      // the desk typed survives whatever clock the host runs on.
+      receivedAt: body.receivedAt ? new Date(body.receivedAt + 'T12:00:00Z') : null,
       postedBy: req.user!.userId,
     })
     await client.query('COMMIT')

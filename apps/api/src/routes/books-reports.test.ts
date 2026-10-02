@@ -298,6 +298,38 @@ describe('GET /reports/cash-flow', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.operating.inflows.rentCollected).toBe(1500)
   })
+
+  // S654: paid_at is a timestamp. Against a bare end date it was compared to
+  // midnight at the START of that day, so a bill paid on the last day of the
+  // range — or today, on the default range — dropped out of the outflows.
+  it('a bill paid on the last day of the range counts; one paid the next day does not', async () => {
+    const f = await seedPortfolio()
+    await db.query(
+      `INSERT INTO books_bills (landlord_id, date, description, amount, amount_paid, status, paid_at) VALUES
+        ($1, '2026-09-15', 'paid on the 30th', 400, 400, 'paid', '2026-09-30T15:00:00-07:00'),
+        ($1, '2026-09-15', 'paid on Oct 1',    90,  90,  'paid', '2026-10-01T09:00:00-07:00')`,
+      [f.landlordAId])
+    const res = await request(buildApp())
+      .get('/api/books/reports/cash-flow?startDate=2026-09-01&endDate=2026-09-30')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.operating.outflows.bills).toBe(400)
+  })
+})
+
+describe('GET /reports/pl — the last day of the range (S654)', () => {
+  it('rent settled at 3 pm on the end date is in the GAM P&L', async () => {
+    const f = await seedPortfolio()
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at)
+       VALUES ($1, $2, $3, 'rent', 1500, 'settled', 'RENT', '2026-09-01', '2026-09-30T15:00:00-07:00')`,
+      [f.unitAId, f.tenantAId, f.landlordAId])
+    const res = await request(buildApp())
+      .get('/api/books/reports/pl?startDate=2026-09-01&endDate=2026-09-30')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.gamRentIncome).toBe(1500)
+  })
 })
 
 // ───────────────────────────────────────────────────────────────────

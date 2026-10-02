@@ -3,8 +3,8 @@ import { DateTime } from 'luxon'
 import { notifyLeaseExpiring, notifyLowStock } from '../services/notifications'
 import {
   emailSigningReminder, emailDocumentAutoVoided, emailSigningRequest,
-  sendLatePaymentDigest,
 } from '../services/email'
+import { runLateBalanceDigest } from './lateBalanceDigest'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { query, queryOne, getClient } from '../db'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
@@ -1447,7 +1447,9 @@ export function schedulerInit() {
     } catch (e) {
       logger.error({ err: e }, '[scheduled-lease-change] fatal')
     }
-  })
+    // S654: 04:30 Phoenix on any host, so the run time and the park-calendar
+    // "today" it applies changes for (Phoenix by default) agree.
+  }, { timezone: 'America/Phoenix' })
 
   // S582 (Nic): tenant invite nudge — remind tenants BEFORE their 7-day invite
   // lapses (reduces onboarding drop-off; the control tower alerts the landlord
@@ -1525,7 +1527,8 @@ export function schedulerInit() {
       await reconcileAllHomeSaleContracts()
       if (billed) logger.info({ billed, asOf }, '[home-sale-billing]')
     } catch (e) { logger.error({ err: e }, '[home-sale-billing] fatal') }
-  })
+    // S654: 04:20 Phoenix, so the run and its Phoenix month agree on any host.
+  }, { timezone: 'America/Phoenix' })
 
   // S568 (Nic): investor-operator lot rent. Daily accrue this month's lot-rent
   // obligations for homes on homes-only external parks (one per unit/month,
@@ -1543,7 +1546,8 @@ export function schedulerInit() {
       const accrued = await accrueLotRentCharges(asOf)
       if (accrued) logger.info({ accrued, asOf }, '[lot-rent-accrual]')
     } catch (e) { logger.error({ err: e }, '[lot-rent-accrual] fatal') }
-  })
+    // S654: 04:25 Phoenix, so the run and its Phoenix month agree on any host.
+  }, { timezone: 'America/Phoenix' })
 
   cron.schedule('45 1 * * *', async () => {
     try {
@@ -2607,10 +2611,8 @@ export function schedulerInit() {
   // Run daily at 7am — detect failed/missing ACH pulls
   cron.schedule('0 7 * * *', async () => {
     try {
-      // Payments due 5+ days ago that haven't settled. SELECT pulls
-      // everything the email senders need so each row is self-sufficient
-      // (one round trip per payment for the increment + status update,
-      // no per-row joins for email payloads).
+      // Rent due 5+ days ago that hasn't settled. S654: these rows only mark
+      // units delinquent now; the morning email reads the Outstanding list.
       const overdue = await query<any>(`
         SELECT p.*, u.unit_number, u.id AS unit_id,
           t.id AS tenant_id, t.ssi_ssdi,
@@ -2642,11 +2644,6 @@ export function schedulerInit() {
           AND p.work_trade_suspended_at IS NULL
       `)
 
-      // S652 (Nic): "The landlord doesn't need one email per person that's
-      // outstanding... I don't need 15 emails. I know when people haven't paid."
-      // One morning email per landlord, every overdue balance in it. Fifteen
-      // separate alerts to one person is also how a sending domain gets flagged.
-      const digests = new Map<string, { landlordName: string; landlordId: string; items: any[] }>()
       for (const payment of overdue) {
         // S652 (Nic): the "late payments" number is no longer kept here. This
         // added one every MORNING a balance stayed open, so thirty days late
@@ -2659,29 +2656,18 @@ export function schedulerInit() {
           `UPDATE units SET status = 'delinquent' WHERE id = $1 AND status = 'active'`,
           [payment.unit_id]
         )
+      }
 
-        const daysLate = Math.max(
-          0,
-          Math.floor((Date.now() - new Date(payment.due_date).getTime()) / (24 * 60 * 60 * 1000))
-        )
-        if (payment.landlord_email) {
-          const key = String(payment.landlord_email).toLowerCase()
-          if (!digests.has(key)) digests.set(key, { landlordName: payment.landlord_name || 'there', landlordId: payment.landlord_id, items: [] })
-          digests.get(key)!.items.push({
-            tenantName:   `${payment.tenant_first || ''} ${payment.tenant_last || ''}`.trim() || 'Tenant',
-            unitNumber:   payment.unit_number || '—',
-            propertyName: payment.property_name || '—',
-            daysLate,
-            amount:       Number(payment.amount || 0),
-            paymentId:    payment.id,
-          })
-        }
-      }
-      for (const [landlordEmail, d] of digests) {
-        try {
-          await sendLatePaymentDigest({ landlordEmail, landlordName: d.landlordName, items: d.items, ctx: { landlordId: d.landlordId } })
-        } catch (e) { logger.error({ err: e, landlordEmail }, '[EMAIL late_payment digest]') }
-      }
+      // S652 (Nic): "The landlord doesn't need one email per person that's
+      // outstanding... I don't need 15 emails." S654: the email now reads the
+      // Outstanding list — every overdue dollar (rent, utilities, fees), one
+      // line per person, one email per account. The rent rows above only drive
+      // the unit's delinquent status. Its own try/catch, so a mail failure never
+      // stops the delinquency clear below.
+      try {
+        const d = await runLateBalanceDigest()
+        if (d.sent > 0 || d.failed > 0) logger.info(d, '[late-balance-digest]')
+      } catch (e) { logger.error({ err: e }, '[late-balance-digest] fatal') }
 
       // ── S638 (Nic): DELINQUENCY HAS TO BE ABLE TO END ─────────────────────
       //

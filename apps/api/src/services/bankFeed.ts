@@ -212,8 +212,10 @@ export async function upsertTransactions(
 ): Promise<number> {
   // S605: anything before the landlord's books start date is still stored, but
   // lands as `ignored` so pre-GAM history never clutters the review queue.
+  // S654: ::text — node-pg hands a DATE back as a JS Date, and a string < Date
+  // comparison is always false, so the cutoff never applied.
   const [ll] = await query<{ books_start_date: string | null }>(
-    `SELECT books_start_date FROM landlords WHERE id = $1`, [landlordId])
+    `SELECT books_start_date::text AS books_start_date FROM landlords WHERE id = $1`, [landlordId])
   const cutoff = ll?.books_start_date ?? null
 
   // S605: re-linking the SAME bank is now an expected action — granting balances
@@ -228,8 +230,10 @@ export async function upsertTransactions(
   // engages for the re-link case, and a genuine duplicate charge — same merchant,
   // same amount, same day, same account — is rare enough that silently importing
   // it twice is the worse error.
+  // S654: posted_date::text — as a JS Date the key began 'Wed Sep 30' and never
+  // matched the incoming 'YYYY-MM-DD', so a relink imported the history twice.
   const siblings = await query<{ posted_date: string; amount: string; description: string | null }>(
-    `SELECT t.posted_date, t.amount, t.description
+    `SELECT t.posted_date::text AS posted_date, t.amount, t.description
        FROM bank_transactions t
        JOIN bank_connections c ON c.id = t.bank_connection_id
       WHERE t.landlord_id = $1

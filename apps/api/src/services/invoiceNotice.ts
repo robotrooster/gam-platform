@@ -28,7 +28,9 @@ import { signEmailFactorToken } from '../routes/emailOtp'
 // Opening it proves the inbox, which is what the emailed code was for — so no
 // leaving the app to go find a code, which is where phones were losing people.
 // Lands on Payments. A row with no portal account keeps the plain link.
-function payNowLink(inv: { tenant_user_id: string | null; tenant_email: string | null }): string {
+// Exported (S654) so every tenant email that sends someone to pay uses this one
+// link, not a hand-built /payments URL that still asks for the code.
+export function payNowLink(inv: { tenant_user_id: string | null; tenant_email: string | null }): string {
   if (!inv.tenant_user_id || !inv.tenant_email) return portalLink('tenant', 'payments')
   const ef = signEmailFactorToken({ userId: inv.tenant_user_id, email: inv.tenant_email })
   return portalLink('tenant', `login?ef=${encodeURIComponent(ef)}&to=${encodeURIComponent('/payments')}`)

@@ -40,6 +40,7 @@ import { logger } from '../lib/logger'
 // authorize one — see services/landlordGamDebit.ts.
 import { bankCostFor } from '../services/landlordGamDebit'
 import { portalLink } from '../lib/portalUrls'
+import { payNowLink } from '../services/invoiceNotice'
 import { randomUUID } from 'crypto'
 import { unitNumberNeedsPrefix } from '@gam/shared'
 import { checkAgainstStatute } from '../services/stateLaw'
@@ -2368,8 +2369,8 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
     await client.query('COMMIT')
 
     // --- Send activation email (post-commit; failure here doesn't roll back tenant) ---
-    const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-    const activationUrl = inviteToken ? `${tenantAppUrl}/accept-invite?token=${inviteToken}` : null
+    // S654: portalLink, never a localhost fallback (S641 rule).
+    const activationUrl = inviteToken ? portalLink('tenant', `accept-invite?token=${inviteToken}`) : null
 
     const landlord = await queryOne<any>(
       `SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
@@ -2704,8 +2705,8 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     // Only if drafting did NOT happen — the unit's template is missing or
     // refused — does the old invite still go, so nobody is left with nothing.
     // Accepting it retries the draft.
-    const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-    const activationUrl = inviteToken ? `${tenantAppUrl}/accept-invite?token=${inviteToken}` : null
+    // S654: portalLink, never a localhost fallback (S641 rule).
+    const activationUrl = inviteToken ? portalLink('tenant', `accept-invite?token=${inviteToken}`) : null
     if (draftedDocumentIds.length === 0) {
       // Post-commit; a mail failure never rolls back the onboarding.
       const landlord = await queryOne<any>(
@@ -4880,7 +4881,6 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
     await client.query('BEGIN')
 
     const created: { tenantId: string; leaseId: string; email: string; activationUrl: string; firstName: string; unitId: string }[] = []
-    const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
 
     for (const [unitId, groupRows] of groups.entries()) {
       const primary = groupRows[0]
@@ -5026,7 +5026,8 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
           [leaseId, tenantId, role]
         )
 
-        const activationUrl = `${tenantAppUrl}/accept-invite?token=${inviteToken}`
+        // S654: portalLink, never a localhost fallback (S641 rule).
+        const activationUrl = portalLink('tenant', `accept-invite?token=${inviteToken}`)
         created.push({ tenantId, leaseId, email: row.email, activationUrl, firstName: row.firstName, unitId })
       }
     }
@@ -6027,11 +6028,11 @@ landlordsRouter.get('/me/otp/advances', requireAuth, requireLandlord, async (req
 //
 // PM-side endpoints live in routes/pm.ts. Same business logic in services/pm.ts.
 
-const PM_PROPERTY_INVITE_ACCEPT_URL_BASE_LL = process.env.PM_PROPERTY_INVITE_ACCEPT_URL_BASE
-  || `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/pm-property-invitations/accept`
-
+// S654: resolved per call through portalLink — no localhost fallback (S641).
 function buildPropertyInviteAcceptUrlLL(token: string): string {
-  return `${PM_PROPERTY_INVITE_ACCEPT_URL_BASE_LL}?token=${encodeURIComponent(token)}`
+  const base = process.env.PM_PROPERTY_INVITE_ACCEPT_URL_BASE
+    || portalLink('landlord', 'pm-property-invitations/accept')
+  return `${base}?token=${encodeURIComponent(token)}`
 }
 
 // PATCH /api/landlords/me/default-pm-company — set/clear landlord-level default
@@ -6732,7 +6733,7 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
         SELECT p.id, p.type, p.amount::float AS amount, p.notes, p.landlord_id, p.lease_id,
                to_char(p.due_date, 'YYYY-MM-DD') AS due_date,
                to_char(p.due_date, 'Mon D, YYYY') AS due_label,
-               u.email, u.first_name,
+               u.id AS tenant_user_id, u.email, u.first_name,
                TRIM(CONCAT_WS(' ', u.first_name, u.last_name)) AS tenant_name,
                un.unit_number, pr.name AS property_name,
                COALESCE(NULLIF(la.business_name, ''),
@@ -6794,7 +6795,9 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
         total,
         creditApplied: Math.round((creditApplied + prepaidApplied) * 100) / 100,
         lines: rows.map((r: any) => ({ label: label(r), amount: Number(r.amount), dueDate: r.due_label })),
-        portalUrl: `${(process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com').replace(/\/$/, '')}/payments`,
+        // S654: the same Pay now link the bill carries, so opening it from the
+        // tenant's own inbox skips the emailed code (password still required).
+        portalUrl: payNowLink({ tenant_user_id: rows[0].tenant_user_id, tenant_email: rows[0].email }),
         landlordName: rows[0].landlord_name,
       }, { landlordId: rows[0].landlord_id, tenantId })
 

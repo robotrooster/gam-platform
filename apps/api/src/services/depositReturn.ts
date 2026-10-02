@@ -577,7 +577,9 @@ export async function finalizeDepositReturn(
          LEFT JOIN properties p ON p.id = u.property_id
         WHERE l.id = $1`, [row.lease_id])).rows[0]
     const leaseUnitId = leaseUnit.unit_id
-    try { await ensureBillsForUnit(leaseUnitId, todayIn(leaseUnit.timezone)) }
+    // S654: one property-calendar "today" for every row this finalize writes.
+    const propertyToday = todayIn(leaseUnit.timezone)
+    try { await ensureBillsForUnit(leaseUnitId, propertyToday) }
     catch { /* a generation hiccup must not block finalize */ }
     const finalBillRows = await client.query<{
       id: string; utility_type: string; amount: string
@@ -677,12 +679,13 @@ export async function finalizeDepositReturn(
         `INSERT INTO payments (
            unit_id, lease_id, tenant_id, landlord_id,
            type, amount, status, due_date, entry_description, notes, settled_at
-         ) VALUES ($1, $2, $3, $4, 'utility', $5, 'paid_via_deposit', CURRENT_DATE, 'UTILITY', $6, NOW())
+         ) VALUES ($1, $2, $3, $4, 'utility', $5, 'paid_via_deposit', $7::date, 'UTILITY', $6, NOW())
          RETURNING id`,
         [
           leaseUnitId, row.lease_id, row.tenant_id, row.landlord_id,
           Number(fb.amount).toFixed(2),
           `S548: final ${fb.utility_type} settled from security deposit on deposit_return ${draftId}${readNote}`,
+          propertyToday,
         ],
       )
       await client.query(
@@ -753,7 +756,7 @@ export async function finalizeDepositReturn(
         `INSERT INTO payments (
            landlord_id, tenant_id, lease_id, unit_id,
            type, amount, status, entry_description, due_date, notes
-         ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'DEPOSIT', CURRENT_DATE, $6)
+         ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'DEPOSIT', $7::date, $6)
          RETURNING id`,
         [
           row.landlord_id,
@@ -762,6 +765,7 @@ export async function finalizeDepositReturn(
           unitId,
           -refund, // negative = landlord owes tenant
           `Deposit refund for lease ${row.lease_id} — ${(row.damage_lines as any[]).length} damage line(s) + cleaning fee deducted`,
+          propertyToday,
         ],
       )
       refundPaymentId = ins.rows[0].id
@@ -773,7 +777,7 @@ export async function finalizeDepositReturn(
         `INSERT INTO payments (
            landlord_id, tenant_id, lease_id, unit_id,
            type, amount, status, entry_description, due_date, notes
-         ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'DEPOSIT', CURRENT_DATE, $6)
+         ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'DEPOSIT', $7::date, $6)
          RETURNING id`,
         [
           row.landlord_id,
@@ -782,6 +786,7 @@ export async function finalizeDepositReturn(
           unitId,
           gap,
           `Move-out balance owed for lease ${row.lease_id} — deposit was insufficient`,
+          propertyToday,
         ],
       )
       gapPaymentId = ins.rows[0].id

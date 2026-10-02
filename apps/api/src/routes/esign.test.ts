@@ -2943,7 +2943,8 @@ describe('POST /sign/:documentId — sublease_agreement completion', () => {
     // Sublease row flipped
     const sub = await db.query<{
       status: string; sublease_document_url: string | null; landlord_consent_date: string | null
-    }>(`SELECT status, sublease_document_url, landlord_consent_date FROM subleases WHERE id = $1`, [subleaseId])
+    }>(`SELECT status, sublease_document_url, landlord_consent_date::text AS landlord_consent_date
+          FROM subleases WHERE id = $1`, [subleaseId])
     expect(sub.rows[0].status).toBe('active')
     expect(sub.rows[0].sublease_document_url).toBe('/api/esign/files/sublease-base.pdf')
     expect(sub.rows[0].landlord_consent_date).toBeTruthy()
@@ -2953,7 +2954,8 @@ describe('POST /sign/:documentId — sublease_agreement completion', () => {
     // local clock straddles UTC midnight; pre-S454 used `new Date()`).
     const { rows: [{ today }] } = await db.query<{ today: string }>(
       `SELECT CURRENT_DATE::text AS today`)
-    expect(new Date(sub.rows[0].landlord_consent_date!).toISOString().slice(0, 10)).toBe(today)
+    // S654: compared as text — a pg DATE comes back as local midnight.
+    expect(sub.rows[0].landlord_consent_date).toBe(today)
 
     // Doc flips completed
     const doc = await db.query<{ status: string }>(
@@ -2992,9 +2994,9 @@ describe('POST /sign/:documentId — sublease_agreement completion', () => {
       .send({ fieldValues: [] })
     expect(res.status).toBe(200)
     const sub = await db.query<{ status: string; landlord_consent_date: string | null }>(
-      `SELECT status, landlord_consent_date FROM subleases WHERE id = $1`, [subleaseId])
+      `SELECT status, landlord_consent_date::text AS landlord_consent_date FROM subleases WHERE id = $1`, [subleaseId])
     expect(sub.rows[0].status).toBe('active')
-    expect(new Date(sub.rows[0].landlord_consent_date!).toISOString().slice(0, 10)).toBe('2025-04-15')
+    expect(sub.rows[0].landlord_consent_date).toBe('2025-04-15')
   })
 
   it('no sublease row references the document → execution_failed', async () => {
@@ -3288,6 +3290,86 @@ describe("S535 '-' end date convention", () => {
     expect(lease.rows).toHaveLength(1)
     expect(lease.rows[0].end_date).toBeNull()
     expect(lease.rows[0].lease_type).toBe('month_to_month')
+  })
+})
+
+// ─── S654: the overlap check compares calendar days ─────────────────────
+//
+// It mixed document dates read at UTC midnight with pg dates at local
+// midnight, and the build path handed it a '-' (month-to-month) end date that
+// became an Invalid Date — which overlapped nothing, so an open-ended lease
+// sailed past an existing one. These go through the finalizer directly: the
+// sign route's own pre-check already maps '-' to no end date.
+async function seedOtherLandlordLease(tenantId: string, start: string, end: string | null): Promise<void> {
+  const client = await db.connect()
+  try {
+    await client.query('BEGIN')
+    const { userId, landlordId } = await seedLandlord(client)
+    const propertyId = await seedProperty(client, { landlordId, ownerUserId: userId, managedByUserId: userId })
+    const unitId = await seedUnit(client, { propertyId, landlordId })
+    const r = await client.query<{ id: string }>(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date)
+       VALUES ($1, $2, 1000, 'fixed_term', 'active', $3, $4) RETURNING id`,
+      [unitId, landlordId, start, end])
+    await client.query(
+      `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_at, added_reason, financial_responsibility)
+       VALUES ($1, $2, 'primary', 'active', NOW(), 'original', 'joint_several')`,
+      [r.rows[0].id, tenantId])
+    await client.query('COMMIT')
+  } catch (e) { await client.query('ROLLBACK'); throw e }
+  finally { client.release() }
+}
+
+describe('S654 lease overlap on calendar days', () => {
+  it("a month-to-month new lease ('-' end) overlapping another landlord's lease is refused at build", async () => {
+    const f = await seedFixture()
+    await seedOtherLandlordLease(f.tenantId, '2025-01-01', '2025-12-31')
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ start_date: '6/1/2025', end_date: '-', lease_type: 'month_to_month' }),
+    })
+    await expect(buildLeaseFromDocument(documentId)).rejects.toThrow(/overlap/i)
+    const leases = await db.query(`SELECT id FROM leases WHERE unit_id = $1`, [f.unitId])
+    expect(leases.rows).toHaveLength(0)
+  })
+
+  it('a lease starting the day another ends still overlaps (the rule is inclusive, as before)', async () => {
+    const f = await seedFixture()
+    await seedOtherLandlordLease(f.tenantId, '2025-01-01', '2025-12-31')
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ start_date: '12/31/2025', end_date: '12/31/2027' }),
+    })
+    await expect(buildLeaseFromDocument(documentId)).rejects.toThrow(/overlap/i)
+  })
+
+  it('a lease starting the day after another ends does not overlap', async () => {
+    const f = await seedFixture()
+    await seedOtherLandlordLease(f.tenantId, '2025-01-01', '2025-12-31')
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ start_date: '1/1/2026', end_date: '-', lease_type: 'month_to_month' }),
+    })
+    const built = await buildLeaseFromDocument(documentId)
+    expect(built.alreadyBuilt).toBe(false)
+    const lease = await db.query<{ start_date: string; end_date: string | null }>(
+      `SELECT start_date::text AS start_date, end_date::text AS end_date FROM leases WHERE unit_id = $1`, [f.unitId])
+    expect(lease.rows).toEqual([{ start_date: '2026-01-01', end_date: null }])
+  })
+})
+
+// S654: a move_in_day property dues each lease on its start day. The build
+// read the start as `String(start).slice(0, 10)`, which for the document's
+// M/D/YYYY ("3/15/2025") is not a date, so every lease fell back to the 1st.
+describe('S654 move-in-day due day reads the document date', () => {
+  it('a 3/15/2025 start on a move_in_day property is due on the 15th', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE properties SET rent_due_mode = 'move_in_day' WHERE id = $1`, [f.propertyId])
+    const fields = defaultLeaseFields({ start_date: '3/15/2025' })
+    delete fields.rent_due_day
+    const { documentId } = await seedCompleteableDoc(f, { fields })
+    await buildLeaseFromDocument(documentId)
+    const lease = await db.query<{ rent_due_day: number }>(
+      `SELECT rent_due_day FROM leases WHERE unit_id = $1`, [f.unitId])
+    expect(lease.rows).toHaveLength(1)
+    expect(Number(lease.rows[0].rent_due_day)).toBe(15)
   })
 })
 

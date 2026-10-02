@@ -36,8 +36,15 @@ vi.mock('../lib/stripe', () => ({
   }),
 }))
 vi.mock('../services/notifications', () => ({ createNotification: vi.fn(async () => undefined) }))
+// S654: lets one test run the REAL charge path end to end without Stripe.
+vi.mock('../services/stripeConnect', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return { ...actual, createRentPlatformCharge: vi.fn(async () => ({ id: 'pi_autopay_real', status: 'processing' })) }
+})
 
 import { runAutopayForTimezone, isPullDayToday, AUTOPAY_DISARM_AFTER_FAILURES } from './autopayRunner'
+import { AppError } from '../middleware/errorHandler'
+import { CREDIT_COVERS_BALANCE } from '../services/rentCharge'
 
 const TZ = 'America/Phoenix'
 
@@ -254,6 +261,77 @@ describe('S609 autopay runner', () => {
     const r = await runAutopayForTimezone(TZ, runAt())
     expect(r.considered).toBe(0)
     expect(chargeMock).not.toHaveBeenCalled()
+  })
+
+  // ── S654: autopay charges what the server says is owed ─────────────────────
+  it('S654: asks for the server’s pay-in-full figure, not its own gross sum', async () => {
+    await armForToday(f)
+    await seedCharge(f, 1000)
+    await runAutopayForTimezone(TZ, runAt())
+    expect(chargeMock.mock.calls[0][0]).toMatchObject({ chargeRequiredOnly: true, source: 'autopay' })
+  })
+
+  it('S654: a work-trade suspended line is never pulled', async () => {
+    await armForToday(f)
+    await seedCharge(f, 1000)
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, work_trade_suspended_at)
+       VALUES ($1,$2,$3,$4,'utility',200,'pending', CURRENT_DATE, 'UTILITY', NOW())`,
+      [f.unitId, f.leaseId, f.tenantId, f.landlordId])
+    await runAutopayForTimezone(TZ, runAt())
+    expect(chargeMock.mock.calls[0][0]).toMatchObject({ amount: 1000 })
+  })
+
+  it('S654: a month entirely covered by work trade is skipped, not charged', async () => {
+    await armForToday(f)
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, work_trade_suspended_at)
+       VALUES ($1,$2,$3,$4,'rent',1000,'pending', CURRENT_DATE, 'RENT', NOW())`,
+      [f.unitId, f.leaseId, f.tenantId, f.landlordId])
+    const r = await runAutopayForTimezone(TZ, runAt())
+    expect(r).toMatchObject({ charged: 0, skipped: 1, failed: 0 })
+    expect(chargeMock).not.toHaveBeenCalled()
+  })
+
+  it('S654: credit covering the whole bill is a skip, not a failure', async () => {
+    await armForToday(f)
+    await seedCharge(f, 1000)
+    chargeMock.mockImplementationOnce(async () => { throw new AppError(409, CREDIT_COVERS_BALANCE) })
+    const r = await runAutopayForTimezone(TZ, runAt())
+    expect(r).toMatchObject({ charged: 0, skipped: 1, failed: 0 })
+    const row = await autopayRow(f.leaseId)
+    expect(row.consecutive_failures).toBe(0)
+    expect(row.last_success_cycle).toBe(row.last_run_cycle)
+  })
+
+  it('S654 (MH 25): $460 bill, $10 paid ahead — autopay pulls $450 and the bill closes', async () => {
+    const real = await vi.importActual<typeof import('../services/rentCharge')>('../services/rentCharge')
+    chargeMock.mockImplementationOnce(async (input: any) => real.chargeLeaseBalance(input) as any)
+    await armForToday(f)
+    const inv = await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
+       VALUES ($1,$2,$3,$4,'INV-S654-AP','2026-10-01',460,460,'pending') RETURNING id`,
+      [f.landlordId, f.tenantId, f.leaseId, f.unitId])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'rent',460,'pending','2026-10-01','RENT')`,
+      [inv.rows[0].id, f.unitId, f.leaseId, f.tenantId, f.landlordId])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1,$2,10,10)`, [f.leaseId, f.tenantId])
+
+    const r = await runAutopayForTimezone(TZ, runAt())
+    expect(r.charged).toBe(1)
+    const rem = await db.query<{ amount: string; unapplied_amount: string }>(
+      `SELECT amount::text, unapplied_amount::text FROM tenant_remittances WHERE lease_id = $1`, [f.leaseId])
+    expect(rem.rows).toEqual([{ amount: '450.00', unapplied_amount: '0.00' }])
+    const open = await db.query<{ owed: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS owed FROM payments
+        WHERE invoice_id = $1 AND status IN ('pending','failed')`, [inv.rows[0].id])
+    expect(Number(open.rows[0].owed)).toBe(0)
+    const credit = await db.query<{ r: string }>(
+      `SELECT amount_remaining::text AS r FROM lease_prepaid_credits WHERE lease_id = $1`, [f.leaseId])
+    expect(Number(credit.rows[0].r)).toBe(0)
   })
 
   describe('which day it fires', () => {

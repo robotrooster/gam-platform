@@ -34,7 +34,7 @@ vi.mock('../lib/stripe', () => ({
   getStripe: () => ({ paymentMethods: { retrieve: vi.fn(async () => ({ card: { country: 'US' } })) } }),
 }))
 
-import { chargeLeaseBalance, suggestedPayAheadFor } from './rentCharge'
+import { chargeLeaseBalance, suggestedPayAheadFor, prepaidNettable, CREDIT_COVERS_BALANCE } from './rentCharge'
 import * as stripeConnect from './stripeConnect'
 
 interface Fixture {
@@ -432,4 +432,104 @@ describe('S622 arrears wait for every space to be current', () => {
       return { unitId, leaseId, landlordId: ll.landlordId }
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
   }
+})
+
+// ── S654: MH 25 — the $10 paid ahead comes off what the tenant is asked ──────
+//
+// The bill email said $450 (a $460 bill less $10 paid ahead by check); the
+// portal asked $460 and took it, leaving the $10 unspent. One rule now —
+// prepaidNettable — feeds the charge, the portal and the outstanding list.
+describe('S654 paid-ahead credit nets the ask (MH 25)', () => {
+  let f: Fixture
+  beforeEach(async () => {
+    await cleanupAllSchema()
+    ;(stripeConnect.createRentPlatformCharge as any).mockClear()
+    f = await fixture()
+  })
+
+  /** One $460 October bill on an invoice, and $10 paid ahead by check. */
+  async function mh25(f: Fixture) {
+    const inv = await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
+                             due_date, subtotal_rent, total_amount, status)
+       VALUES ($1,$2,$3,$4,'INV-S654-MH25','2026-10-01',460,460,'pending') RETURNING id`,
+      [f.landlordId, f.tenantId, f.leaseId, f.unitId])
+    const invoiceId = inv.rows[0].id
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'rent',460,'pending','2026-10-01','RENT')`,
+      [invoiceId, f.unitId, f.leaseId, f.tenantId, f.landlordId])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, note)
+       VALUES ($1,$2,10,10,'check over the September bill')`, [f.leaseId, f.tenantId])
+    return invoiceId
+  }
+
+  it('prepaidNettable reads the credit for the oldest bill’s month', async () => {
+    const invoiceId = await mh25(f)
+    expect(await prepaidNettable(db, f.leaseId, { invoice_id: invoiceId, due_date: '2026-10-01' })).toBe(10)
+    expect(await prepaidNettable(db, f.leaseId, { due_date: '2026-10-01' })).toBe(10)
+  })
+
+  it('a monthly draw cap limits what comes off', async () => {
+    await mh25(f)
+    await db.query(`UPDATE leases SET prepaid_monthly_draw = 4 WHERE id = $1`, [f.leaseId])
+    expect(await prepaidNettable(db, f.leaseId, { due_date: '2026-10-01' })).toBe(4)
+  })
+
+  it('paying $450 settles the $460 bill, with the $10 drawn', async () => {
+    const invoiceId = await mh25(f)
+    const r = await charge(f, 450)
+    expect(r.appliedTotal).toBeCloseTo(450, 2)
+    expect(r.payAhead).toBeCloseTo(0, 2)
+
+    // Nothing left open on the bill: $450 in flight, $10 settled from the credit.
+    const open = await db.query<{ owed: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS owed FROM payments
+        WHERE invoice_id = $1 AND status IN ('pending','failed')`, [invoiceId])
+    expect(Number(open.rows[0].owed)).toBe(0)
+    const settledByCredit = await db.query<{ amount: string; platform_held: boolean }>(
+      `SELECT amount::text, platform_held FROM payments
+        WHERE invoice_id = $1 AND status = 'settled'`, [invoiceId])
+    expect(settledByCredit.rows.map(x => Number(x.amount))).toEqual([10])
+    // A check the landlord deposited: settles like cash, nothing paid out (S654).
+    expect(settledByCredit.rows[0].platform_held).toBe(false)
+
+    const credit = await db.query<{ r: string }>(
+      `SELECT amount_remaining::text AS r FROM lease_prepaid_credits WHERE lease_id = $1`, [f.leaseId])
+    expect(Number(credit.rows[0].r)).toBe(0)
+    const draws = await db.query<{ amount: string; billing_month: string }>(
+      `SELECT amount::text, billing_month::text FROM lease_prepaid_credit_draws WHERE lease_id = $1`, [f.leaseId])
+    expect(draws.rows).toEqual([{ amount: '10.00', billing_month: '2026-10-01' }])
+  })
+
+  it('still refuses below the netted figure', async () => {
+    await mh25(f)
+    await expect(charge(f, 449.99)).rejects.toMatchObject({ statusCode: 422 })
+  })
+
+  it('chargeRequiredOnly charges the server’s figure, whatever amount was passed', async () => {
+    await mh25(f)
+    const r = await chargeLeaseBalance({
+      tenantId: f.tenantId, leaseId: f.leaseId, amount: 460, chargeRequiredOnly: true,
+      paymentMethodId: 'pm_test', paymentMethodType: 'ach', source: 'autopay',
+    })
+    expect(r.appliedTotal).toBeCloseTo(450, 2)
+    expect(r.payAhead).toBeCloseTo(0, 2)
+    // 450 + the flat $6 tenant-borne bank fee — never the gross 460.
+    const sent = (stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount
+    expect(sent).toBeCloseTo(456, 2)
+  })
+
+  it('chargeRequiredOnly refuses with 409 and writes nothing when credit covers the bill', async () => {
+    await mh25(f)
+    await db.query(`UPDATE lease_prepaid_credits SET amount_original = 500, amount_remaining = 500 WHERE lease_id = $1`, [f.leaseId])
+    await expect(chargeLeaseBalance({
+      tenantId: f.tenantId, leaseId: f.leaseId, amount: 460, chargeRequiredOnly: true,
+      paymentMethodId: 'pm_test', paymentMethodType: 'ach', source: 'autopay',
+    })).rejects.toMatchObject({ statusCode: 409, message: CREDIT_COVERS_BALANCE })
+    const rem = await db.query(`SELECT 1 FROM tenant_remittances WHERE tenant_id = $1`, [f.tenantId])
+    expect(rem.rows).toHaveLength(0)
+    expect(stripeConnect.createRentPlatformCharge).not.toHaveBeenCalled()
+  })
 })

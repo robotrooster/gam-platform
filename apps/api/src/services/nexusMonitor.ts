@@ -153,7 +153,7 @@ export async function getNexusDashboard(nowYear?: number): Promise<{
       t.count_rule,
       COALESCE(tax.taxable, false) AS taxable,
       COALESCE(reg.registered, false) AS registered,
-      reg.registered_date,
+      reg.registered_date::text AS registered_date, -- S654: 'YYYY-MM-DD', not a JS Date
       COALESCE(cur.revenue_usd, 0)::numeric AS rev_current,
       COALESCE(pri.revenue_usd, 0)::numeric AS rev_prior,
       COALESCE(cur.txn_count, 0) AS txn_current,

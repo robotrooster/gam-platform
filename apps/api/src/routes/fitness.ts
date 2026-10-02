@@ -199,12 +199,14 @@ router.get('/stats', auth, async (req: Request, res: Response) => {
       pool.query('SELECT COALESCE(SUM(weight_lbs * reps), 0) as total_lbs_lifted, COALESCE(SUM(reps), 0) as total_reps, COUNT(*) as total_sets FROM fitness_set_logs WHERE user_id = $1 AND is_counted = TRUE', [userId]),
       pool.query("SELECT DATE_TRUNC('week', logged_at) as week, COALESCE(SUM(weight_lbs * reps), 0) as volume FROM fitness_set_logs WHERE user_id = $1 AND is_counted = TRUE AND logged_at >= NOW() - INTERVAL '12 weeks' GROUP BY DATE_TRUNC('week', logged_at) ORDER BY week", [userId]),
       pool.query('SELECT COUNT(*) as count FROM fitness_workout_logs WHERE user_id = $1 AND completed_at IS NOT NULL', [userId]),
-      pool.query('SELECT logged_date FROM fitness_workout_logs WHERE user_id = $1 AND completed_at IS NOT NULL ORDER BY logged_date DESC LIMIT 30', [userId]),
+      // S654: one row per DAY — two workouts on one day stopped the walk below
+      // (the second copy didn't match the day before). ::text = the calendar day.
+      pool.query('SELECT DISTINCT logged_date::text AS logged_date FROM fitness_workout_logs WHERE user_id = $1 AND completed_at IS NOT NULL ORDER BY logged_date DESC LIMIT 30', [userId]),
       pool.query('SELECT * FROM fitness_milestones WHERE user_id = $1 ORDER BY achieved_at', [userId]),
       pool.query('SELECT * FROM fitness_body_weight_logs WHERE user_id = $1 ORDER BY logged_date DESC LIMIT 90', [userId])
     ]);
     let streak = 0;
-    const dates = streakData.rows.map((r: any) => r.logged_date.toISOString().split('T')[0]);
+    const dates: string[] = streakData.rows.map((r: any) => r.logged_date);
     // S654: the streak counts back from GAM's home-zone today (Phoenix, the
     // same day /logs/today reads as CURRENT_DATE), not UTC's, which is already
     // tomorrow after 5 pm and broke the streak every evening.

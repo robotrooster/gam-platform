@@ -288,6 +288,17 @@ describe('processPlatformFeeAccrual', () => {
     expect(accrual.rows[0].payer).toBe('landlord')
   })
 
+  // S654: the billing month comes from the Phoenix calendar. 1 am UTC on
+  // Oct 1 is 6 pm Sep 30 in Phoenix, so a run then bills September.
+  it('a run on the evening of Sep 30 in Phoenix bills September, not October', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    const result = await processPlatformFeeAccrual(new Date('2026-10-01T01:00:00Z'))
+    expect(result.monthScanned).toBe('2026-09-01')
+    const accrual = await db.query<{ accrual_month: string }>(
+      `SELECT accrual_month::text FROM platform_fee_accruals WHERE property_id=$1`, [stack.propertyId])
+    expect(accrual.rows.map((r) => r.accrual_month)).toEqual(['2026-09-01'])
+  })
+
   it('idempotent: re-running the same month returns skippedAlreadyAccrued and writes no extra rows', async () => {
     const stack = await buildPlatformStack({
       unitCount: 1, platformFeePayer: 'landlord',

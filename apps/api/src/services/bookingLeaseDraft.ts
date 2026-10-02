@@ -29,11 +29,13 @@ async function guestScreeningContext(
        FROM users u LEFT JOIN tenants t ON t.user_id = u.id
       WHERE LOWER(u.email) = LOWER($1) LIMIT 1`, [guestEmail])
 
+  // S654: a stay is "prior" once its check-out is before the park's today —
+  // the same calendar the continuity walk below counts from.
   const stays = await queryOne<{ n: string }>(
     `SELECT COUNT(*) AS n FROM unit_bookings
       WHERE LOWER(guest_email) = LOWER($1) AND landlord_id = $2
         AND status IN ('checked_out', 'confirmed', 'checked_in')
-        AND check_out < CURRENT_DATE`, [guestEmail, landlordId])
+        AND check_out < $3::date`, [guestEmail, landlordId, todayIn(tz)])
   out.priorStays = Number(stays?.n ?? 0)
   if (!person) return out
 

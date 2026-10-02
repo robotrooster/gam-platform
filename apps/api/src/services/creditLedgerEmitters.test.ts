@@ -203,6 +203,80 @@ describe('classifyPaymentTier', () => {
   })
 })
 
+// S654: the tier compares calendar days where the property is. The due day
+// used to end at 23:59:59 UTC (4:59 pm Phoenix), so rent paid that evening
+// was recorded one tier late.
+describe('classifyPaymentTier — the property calendar decides the day (S654)', () => {
+  it('rent due Oct 1, paid 6:30 pm Oct 1 in Phoenix → on time', () => {
+    expect(classifyPaymentTier({
+      dueDate: '2026-10-01',
+      settledAt: new Date('2026-10-02T01:30:00Z'),   // 6:30 pm Oct 1 Phoenix
+      graceDays: 5,
+      propertyTz: 'America/Phoenix',
+    })).toBe('payment_received_on_time')
+  })
+
+  it('a Date due date (node-pg local midnight) reads the same day', () => {
+    expect(classifyPaymentTier({
+      dueDate: new Date('2026-10-01T07:00:00Z'),     // Oct 1 00:00 Phoenix
+      settledAt: new Date('2026-10-02T01:30:00Z'),
+      graceDays: 5,
+    })).toBe('payment_received_on_time')
+  })
+
+  it('paid the evening of the last grace day → still within grace', () => {
+    expect(classifyPaymentTier({
+      dueDate: '2026-10-01',
+      settledAt: new Date('2026-10-07T05:00:00Z'),   // 10 pm Oct 6 Phoenix
+      graceDays: 5,
+    })).toBe('payment_received_late_grace')
+  })
+
+  it('uses the property zone, not Phoenix, when one is given', () => {
+    const settledAt = new Date('2026-10-02T05:30:00Z') // 10:30 pm Oct 1 Phoenix, 1:30 am Oct 2 New York
+    expect(classifyPaymentTier({ dueDate: '2026-10-01', settledAt, graceDays: 5, propertyTz: 'America/Phoenix' }))
+      .toBe('payment_received_on_time')
+    expect(classifyPaymentTier({ dueDate: '2026-10-01', settledAt, graceDays: 5, propertyTz: 'America/New_York' }))
+      .toBe('payment_received_late_grace')
+  })
+
+  it('late tiers count whole days past the last grace day', () => {
+    const tier = (paidPhoenixEvening: string) => classifyPaymentTier({
+      dueDate: '2026-10-01', graceDays: 5, propertyTz: 'America/Phoenix',
+      // 7 pm Phoenix on the given day is 02:00Z the next day.
+      settledAt: new Date(Date.parse(`${paidPhoenixEvening}T19:00:00-07:00`)),
+    })
+    expect(tier('2026-10-09')).toBe('payment_received_late_minor')   // 3 days past Oct 6
+    expect(tier('2026-10-10')).toBe('payment_received_late_major')   // 4 days
+    expect(tier('2026-10-21')).toBe('payment_received_late_major')   // 15 days
+    expect(tier('2026-10-22')).toBe('payment_received_late_severe')  // 16 days
+  })
+
+  it('emitPaymentSettledEvent records the evening payment on time, with the due day as a date', async () => {
+    const tenantId = randomUUID()
+    await withTx(c => emitPaymentSettledEvent(c, {
+      tenantId, paymentId: randomUUID(), paymentType: 'rent', amount: '1000',
+      dueDate: '2026-10-01', settledAt: new Date('2026-10-02T01:30:00Z'),
+      graceDays: 5, stripePaymentIntentId: null, propertyTz: 'America/Phoenix',
+    }))
+    const e = await readSoleEvent('tenant', tenantId)
+    expect(e.event_type).toBe('payment_received_on_time')
+    expect(e.network_visibility).toBe('visible_to_current_landlord')
+    expect(e.event_data.due_date).toBe('2026-10-01')
+  })
+
+  it('emitPaymentFailedEvent records the due day as a date', async () => {
+    const tenantId = randomUUID()
+    await withTx(c => emitPaymentFailedEvent(c, {
+      tenantId, paymentId: randomUUID(), paymentType: 'rent', amount: '1000',
+      dueDate: '2026-10-01', failedAt: new Date('2026-10-02T01:30:00Z'),
+      stripePaymentIntentId: null, failureCode: 'R01', failureMessage: null,
+    }))
+    const e = await readSoleEvent('tenant', tenantId)
+    expect(e.event_data.due_date).toBe('2026-10-01')
+  })
+})
+
 // ─── emitPaymentSettledEvent ───────────────────────────────────
 
 describe('emitPaymentSettledEvent', () => {

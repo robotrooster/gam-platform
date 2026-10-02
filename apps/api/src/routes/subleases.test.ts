@@ -40,6 +40,7 @@ import {
   cleanupAllSchema,
   seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
+import { todayIn } from '../lib/timezone'
 
 const {
   appendEventMock,
@@ -399,6 +400,28 @@ describe('PATCH /subleases/:id/decision', () => {
     const ev = (appendEventMock.mock.calls[0] as unknown as any[])[0]
     expect(ev.eventType).toBe('sublease_approved')
     expect(ev.eventData.decision_note).toBe('Okay with us')
+  })
+
+  // S654: approval was dated CURRENT_DATE (the database's day) while the
+  // auto-approve path on create used the property's. A park in a zone far from
+  // the server's shows the difference most of the day.
+  it("approve dates the consent on the PROPERTY's calendar", async () => {
+    const f = await seedFixture({ subleasingAllowed: 'with_consent' })
+    await db.query(`UPDATE properties SET timezone = 'Pacific/Kiritimati' WHERE id = $1`, [f.propertyId])
+    const sl = await db.query<{ id: string }>(
+      `INSERT INTO subleases (master_lease_id, sublessor_tenant_id, sublessee_tenant_id,
+                              status, start_date, end_date, sub_monthly_amount, master_share_amount)
+       VALUES ($1, $2, $3, 'pending', '2026-07-01', '2026-12-31', 1200, 1200) RETURNING id`,
+      [f.leaseId, f.sublessorTenantId, f.sublesseeTenantId],
+    )
+    const res = await request(buildApp())
+      .patch(`/api/subleases/${sl.rows[0].id}/decision`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ decision: 'approve' })
+    expect(res.status).toBe(200)
+    const row = await db.query<{ d: string }>(
+      `SELECT landlord_consent_date::text AS d FROM subleases WHERE id = $1`, [sl.rows[0].id])
+    expect(row.rows[0].d).toBe(todayIn('Pacific/Kiritimati'))
   })
 
   it('deny flips pending → terminated, sets reason, no doc generated, emits sublease_denied event', async () => {

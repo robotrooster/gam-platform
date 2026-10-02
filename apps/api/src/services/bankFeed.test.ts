@@ -87,6 +87,45 @@ describe('bank feed sync', () => {
     const matched = await db.query(`SELECT count(*)::int AS n FROM bank_transactions WHERE landlord_id=$1 AND status='matched'`, [f.landlordId])
     expect(matched.rows[0].n).toBe(1)
   })
+
+  // S654: the sibling key read posted_date as a JS Date ('Wed Sep 30 …'), so it
+  // never matched an incoming 'YYYY-MM-DD' and a relink imported the history twice.
+  it('a relink of the same bank does not import the same history again', async () => {
+    const f = await seed()
+    await db.query(`UPDATE bank_connections SET account_last4 = '1111' WHERE id = $1`, [f.connectionId])
+    const relink = (await db.query<{ id: string }>(
+      `INSERT INTO bank_connections (landlord_id, provider, stripe_fc_account_id, institution_name, account_last4, display_name)
+       VALUES ($1, 'stripe_fc', 'fca_relink_2', 'Test Bank', '1111', 'Test Bank ••1111') RETURNING id`,
+      [f.landlordId])).rows[0].id
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'old_1', postedDate: '2026-09-30', amount: -120.5, description: 'HOME DEPOT #9 AZ' },
+    ])
+    const inserted = await upsertTransactions(relink, f.landlordId, [
+      { externalId: 'new_1', postedDate: '2026-09-30', amount: -120.5, description: 'HOME DEPOT #9 AZ' }, // same row, new link
+      { externalId: 'new_2', postedDate: '2026-10-01', amount: -120.5, description: 'HOME DEPOT #9 AZ' }, // a new day
+    ])
+    expect(inserted).toBe(1)
+    const onRelink = await db.query<{ external_id: string }>(
+      `SELECT external_id FROM bank_transactions WHERE bank_connection_id = $1`, [relink])
+    expect(onRelink.rows.map((r) => r.external_id)).toEqual(['new_2'])
+  })
+
+  // S654: books_start_date came back as a JS Date and `'2026-07-31' < Date` is
+  // always false, so pre-start rows landed in the review queue.
+  it('rows dated before the books start date land ignored; on/after it, for review', async () => {
+    const f = await seed()
+    await db.query(`UPDATE landlords SET books_start_date = '2026-08-01' WHERE id = $1`, [f.landlordId])
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'pre_1', postedDate: '2026-07-31', amount: -50, description: 'LOWES 0057 MESA' },
+      { externalId: 'on_1',  postedDate: '2026-08-01', amount: -60, description: 'LOWES 0057 MESA' },
+    ])
+    const rows = await db.query<{ external_id: string; status: string }>(
+      `SELECT external_id, status FROM bank_transactions WHERE landlord_id = $1 ORDER BY external_id`, [f.landlordId])
+    expect(rows.rows).toEqual([
+      { external_id: 'on_1', status: 'needs_review' },
+      { external_id: 'pre_1', status: 'ignored' },
+    ])
+  })
 })
 
 describe('categorize', () => {

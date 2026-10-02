@@ -22,7 +22,6 @@ import { db, query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { requireBusinessAccess } from '../middleware/businessAccess'
-import { todayIn } from '../lib/timezone'
 import {
   type RecurringInvoiceFrequency,
   isMonthlyRecurrence,
@@ -35,12 +34,6 @@ const requireWrite = async (req: any) => (await requireBusinessAccess(req, { per
 const requireSend  = async (req: any) => (await requireBusinessAccess(req, { permission: 'invoices.send',  feature: 'invoicing' })).businessId
 
 // ── helpers ────────────────────────────────────────────────────
-
-// S654: GAM's home-zone calendar day (Phoenix, same as CURRENT_DATE used by
-// pause/resume/end below), never UTC — UTC is already tomorrow after 5 pm.
-function todayIso(): string {
-  return todayIn(null)
-}
 
 // Compute the first next_due_date >= start_date that matches the
 // cadence. Used at create time.
@@ -354,5 +347,3 @@ businessRecurringInvoicesRouter.post('/:id/generate-now', requireAuth, async (re
     res.json({ success: true, data: inv })
   } catch (e) { next(e) }
 })
-
-void todayIso  // reserved for future "include start_date in current cycle" logic

@@ -139,6 +139,8 @@ webhooksRouter.post('/stripe', async (req, res) => {
           // S609: needed to decide whether this row carries an owner share.
           revenue_owner: string
           unit_id: string | null
+          // S654: the credit tier compares calendar days where the property is.
+          property_tz: string | null
         }>(
           `UPDATE payments
               SET status='settled', settled_at=NOW(),
@@ -146,8 +148,10 @@ webhooksRouter.post('/stripe', async (req, res) => {
                   stripe_charge_id = COALESCE($2, stripe_charge_id)
             WHERE stripe_payment_intent_id=$1
               AND status != 'settled'
-            RETURNING id, type, tenant_id, due_date, lease_id, amount, settled_at, reversal_id,
-                      revenue_owner, unit_id`,
+            RETURNING id, type, tenant_id, due_date::text AS due_date, lease_id, amount, settled_at,
+                      reversal_id, revenue_owner, unit_id,
+                      (SELECT pr.timezone FROM units u JOIN properties pr ON pr.id = u.property_id
+                        WHERE u.id = payments.unit_id) AS property_tz`,
           [pi.id, stripeChargeId]
         )
         // S561: reopened-after-reversal rows are handled in the loop below and
@@ -262,10 +266,11 @@ webhooksRouter.post('/stripe', async (req, res) => {
                 paymentId:              row.id,
                 paymentType:            row.type as 'rent' | 'utility',
                 amount:                 row.amount,
-                dueDate:                new Date(row.due_date),
+                dueDate:                row.due_date,
                 settledAt:              new Date(row.settled_at),
                 graceDays,
                 stripePaymentIntentId:  pi.id,
+                propertyTz:             row.property_tz,
               })
 
               // OTP reconciliation (S155): when a rent payment settles,
@@ -819,7 +824,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
             amount: string
             due_date: string
           }>(
-            `SELECT id, tenant_id, type, amount, due_date FROM payments WHERE id=$1`,
+            `SELECT id, tenant_id, type, amount, due_date::text AS due_date FROM payments WHERE id=$1`,
             [updatedRow.id],
           )
           const p = pinfo[0]
@@ -831,7 +836,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
                 paymentId:              p.id,
                 paymentType:            p.type as 'rent' | 'utility',
                 amount:                 p.amount,
-                dueDate:                new Date(p.due_date),
+                dueDate:                p.due_date,
                 failedAt:               new Date(),
                 stripePaymentIntentId:  pi.id,
                 failureCode:            returnCode ?? null,

@@ -47,7 +47,7 @@
  *    deposit-return path, so an over-estimate was never stuck anyway.
  */
 
-import type { PoolClient } from 'pg'
+import type { Pool, PoolClient } from 'pg'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
@@ -84,6 +84,10 @@ export interface ChargeLeaseBalanceInput {
   chargeEverything?: boolean
   /** S654: compute the quote (what the payer is charged, fee included) and write nothing. */
   dryRun?:           boolean
+  /** S654: charge exactly the server's pay-in-full figure (the lease's own
+   *  charges less paid-ahead and landlord credit). `amount` is ignored. Autopay
+   *  uses it so a scheduled pull never takes dollars a credit already covers. */
+  chargeRequiredOnly?: boolean
   /** S654: the reader already holds an authorization for exactly `amountCents`;
    *  book against it instead of creating a charge. 409 if the balance moved. */
   existingIntent?: { id: string; amountCents: number; capture?: boolean }
@@ -118,6 +122,28 @@ export type BalanceScope =
    *  more than one utility through this subsystem." One agreement is one bill,
    *  however many utilities are on it. */
   | { kind: 'service'; serviceAgreementId: string }
+
+/**
+ * S654: the paid-ahead credit that comes off a lease's balance right now — the
+ * month the oldest open bill belongs to, capped by the resident's monthly draw.
+ * One rule for the charge, the tenant's balance screen and the landlord's
+ * outstanding list, so the three never disagree (MH 25: the bill said $450, the
+ * portal asked $460 because only the charge knew about this credit).
+ */
+export async function prepaidNettable(
+  client: PoolClient | Pool,
+  leaseId: string,
+  oldest: { invoice_id?: string | null; due_date: string },
+): Promise<number> {
+  // Both only call .query(); a Pool serves a read just as well as a client.
+  const c = client as PoolClient
+  const month = oldest.invoice_id ? await billingMonthOfInvoice(c, oldest.invoice_id)
+    : `${String(oldest.due_date).slice(0, 7)}-01`
+  return (await prepaidDrawAvailable(c, leaseId, month)).available
+}
+
+/** S654: the 409 a charge throws when credit already covers everything owed. */
+export const CREDIT_COVERS_BALANCE = 'The credit on the account covers this balance'
 
 export async function fetchOutstandingRows(tenantId: string, scope: BalanceScope | string) {
   // Back-compat: every existing caller passes a lease id string.
@@ -342,9 +368,7 @@ export async function chargeLeaseBalance(
     // month may draw when the resident set a monthly cap ("she still pays a
     // little out of pocket each month"). The month is the one the oldest open
     // bill belongs to.
-    const payMonth = ctx.invoice_id ? await billingMonthOfInvoice(client, ctx.invoice_id)
-      : `${String(ctx.due_date).slice(0, 7)}-01`
-    const prepaidPart = leaseId ? (await prepaidDrawAvailable(client, leaseId, payMonth)).available : 0
+    const prepaidPart = leaseId ? await prepaidNettable(client, leaseId, ctx) : 0
     const creditAvailable = Math.round((Number(creditRow.rows[0]?.credit ?? 0) + prepaidPart) * 100) / 100
     // S654: the counter takes what is OWED — the balance less the credit on the
     // account, the same figure the portal and the desk show — whatever the
@@ -353,7 +377,7 @@ export async function chargeLeaseBalance(
     const creditNetted = input.chargeEverything ? Math.min(creditAvailable, totalOutstanding) : 0
     if (input.chargeEverything) {
       amount = Math.round((totalOutstanding - creditNetted) * 100) / 100
-      if (amount < 0.005) throw new AppError(409, 'The credit on the account covers this balance — there is nothing to take on a card.')
+      if (amount < 0.005) throw new AppError(409, `${CREDIT_COVERS_BALANCE} — there is nothing to take on a card.`)
     }
 
     // The credit covers the lease's own charges first — those are what the
@@ -363,6 +387,12 @@ export async function chargeLeaseBalance(
     const requiredBeforeCredit = Math.round((totalOutstanding - carriedOutstanding) * 100) / 100
     const creditToRequired = Math.min(creditAvailable, requiredBeforeCredit)
     const requiredInFull = Math.round((requiredBeforeCredit - creditToRequired) * 100) / 100
+    // S654: autopay takes the server's own figure, never a gross sum it added
+    // up itself — otherwise a covered dollar is pulled and banked as paid-ahead.
+    if (input.chargeRequiredOnly) {
+      amount = requiredInFull
+      if (amount < 0.005) throw new AppError(409, CREDIT_COVERS_BALANCE)
+    }
 
     // UNDER-PAYMENT IS BLOCKED (Nic, standing directive). Rent is pay-in-full:
     // a partial can reset a landlord's eviction clock. This branch is the

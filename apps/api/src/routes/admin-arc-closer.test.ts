@@ -29,7 +29,9 @@ import {
 } from '../test/dbHelpers'
 import { OWNER_EMAIL } from '../middleware/auth'
 
-const { fireOtpAdvanceTransferMock, retryFlexChargeStatementMock } = vi.hoisted(() => ({
+const { fireOtpAdvanceTransferMock, retryFlexChargeStatementMock, emailTenantAchSetupSpy } = vi.hoisted(() => ({
+  // S654: wraps the real sender so the ACH nudge's link can be read.
+  emailTenantAchSetupSpy: vi.fn(async (..._args: any[]): Promise<void> => {}),
   fireOtpAdvanceTransferMock:   vi.fn(async (..._args: any[]) => ({
     transferId: 'tr_mock', advanceId: 'adv_mock', amount: 1500,
   })),
@@ -43,9 +45,16 @@ vi.mock('../services/flexCharge', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
   return { ...actual, retryFlexChargeStatement: retryFlexChargeStatementMock }
 })
+vi.mock('../services/email', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, any>>()
+  emailTenantAchSetupSpy.mockImplementation(actual.emailTenantAchSetup)
+  return { ...actual, emailTenantAchSetup: emailTenantAchSetupSpy }
+})
 
 import { adminRouter } from './admin'
 import { errorHandler } from '../middleware/errorHandler'
+import { verifyEmailFactorToken } from './emailOtp'
+import { portalLink } from '../lib/portalUrls'
 
 function buildApp() {
   const app = express()
@@ -63,6 +72,7 @@ beforeEach(async () => {
   } as any)
   retryFlexChargeStatementMock.mockClear()
   retryFlexChargeStatementMock.mockResolvedValue({ ok: true, status: 'open' } as any)
+  emailTenantAchSetupSpy.mockClear()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_admin_close'
 })
 
@@ -334,22 +344,29 @@ describe('POST /api/admin/onboarding/resend', () => {
     expect(log.rows.map(r => r.action_type)).toContain('resend_bank_verification')
   })
 
-  it('ach_enrollment: nudges the tenant + logs resend_ach_enrollment', async () => {
-    const f = await seedAFixture()
+  // S609: a tenant belongs to a landlord only THROUGH a lease, and the
+  // portfolio gate rightly checks that link. Attach them, or this is a tenant
+  // with no landlord at all — which no admin should be able to act on.
+  async function seedLeasedTenant(f: AFixture): Promise<{ tenantId: string; userId: string; email: string }> {
     const client = await db.connect()
-    let tenantId = ''
-    // S609: a tenant belongs to a landlord only THROUGH a lease, and the
-    // portfolio gate rightly checks that link. Attach them, or this is a tenant
-    // with no landlord at all — which no admin should be able to act on.
     try {
       await client.query('BEGIN')
-      tenantId = await seedTenant(client)
+      const tenantId = await seedTenant(client)
       const unitId = await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId })
       const leaseId = await seedLease(client, { unitId, landlordId: f.landlordId })
       await seedLeaseTenant(client, { leaseId, tenantId })
+      const u = (await client.query<{ user_id: string; email: string }>(
+        `SELECT t.user_id, u.email FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`,
+        [tenantId])).rows[0]
       await client.query('COMMIT')
-    }
+      return { tenantId, userId: u.user_id, email: u.email }
+    } catch (e) { await client.query('ROLLBACK'); throw e }
     finally { client.release() }
+  }
+
+  it('ach_enrollment: nudges the tenant + logs resend_ach_enrollment', async () => {
+    const f = await seedAFixture()
+    const { tenantId } = await seedLeasedTenant(f)
     const res = await request(buildApp())
       .post('/api/admin/onboarding/resend')
       .set('Authorization', `Bearer ${f.adminToken}`)
@@ -359,6 +376,53 @@ describe('POST /api/admin/onboarding/resend', () => {
     const log = await db.query<{ action_type: string }>(
       `SELECT action_type FROM admin_action_log WHERE admin_user_id=$1 AND target_type='tenant'`, [f.adminUserId])
     expect(log.rows.map(r => r.action_type)).toContain('resend_ach_enrollment')
+  })
+
+  // S654: the nudge carries the bill's Pay now link, so opening it from the
+  // tenant's own inbox skips the emailed code (password still required).
+  it('ach_enrollment: the link vouches for the tenant\'s own login and lands on Payments', async () => {
+    const f = await seedAFixture()
+    const t = await seedLeasedTenant(f)
+    const res = await request(buildApp())
+      .post('/api/admin/onboarding/resend')
+      .set('Authorization', `Bearer ${f.adminToken}`)
+      .send({ type: 'ach_enrollment', targetId: t.tenantId })
+    expect(res.status).toBe(200)
+    expect(emailTenantAchSetupSpy).toHaveBeenCalledTimes(1)
+    const args = (emailTenantAchSetupSpy.mock.calls[0] as any[])[0] as { to: string; paymentsUrl: string }
+    expect(args.to).toBe(t.email)
+    expect(args.paymentsUrl.startsWith(portalLink('tenant', 'login?ef='))).toBe(true)
+    const u = new URL(args.paymentsUrl)
+    expect(u.searchParams.get('to')).toBe('/payments')
+    expect(verifyEmailFactorToken(u.searchParams.get('ef')!)).toEqual({ userId: t.userId, email: t.email })
+  })
+
+  // S654: the old link fell back to http://localhost:3002 when the tenant
+  // portal address was unset. In production that is now the real host.
+  it('ach_enrollment: never a localhost link, even with the portal address unset in production', async () => {
+    const f = await seedAFixture()
+    const t = await seedLeasedTenant(f)
+    const saved = { url: process.env.TENANT_APP_URL, env: process.env.NODE_ENV }
+    // Production mode must not reach the real sender: capture only.
+    emailTenantAchSetupSpy.mockImplementationOnce(async () => {})
+    let res: any
+    try {
+      delete process.env.TENANT_APP_URL
+      process.env.NODE_ENV = 'production'
+      res = await request(buildApp())
+        .post('/api/admin/onboarding/resend')
+        .set('Authorization', `Bearer ${f.adminToken}`)
+        .send({ type: 'ach_enrollment', targetId: t.tenantId })
+    } finally {
+      if (saved.url === undefined) delete process.env.TENANT_APP_URL
+      else process.env.TENANT_APP_URL = saved.url
+      if (saved.env === undefined) delete process.env.NODE_ENV
+      else process.env.NODE_ENV = saved.env
+    }
+    expect(res.status).toBe(200)
+    const args = (emailTenantAchSetupSpy.mock.calls[0] as any[])[0] as { paymentsUrl: string }
+    expect(args.paymentsUrl).not.toContain('localhost')
+    expect(args.paymentsUrl.startsWith('https://tenant.goldassetmanagement.com/login?ef=')).toBe(true)
   })
 
   it('landlord_setup (self-register, no invite) → honest 501', async () => {

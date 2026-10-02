@@ -1854,3 +1854,107 @@ describe('S639 GET /api/payments — paging is stable when every due_date ties',
     expect(huge.body.totalPages).toBe(1)
   })
 })
+
+// ─── S654: MH 25 — the portal asks what the bill email said ──────────────────
+//
+// The October bill was $460 and $10 was paid ahead (a $470 check against a $460
+// September bill). The email said $450; GET /balance-context netted only
+// landlord credits, so the portal asked $460, took it, and left the $10 unspent.
+describe('S654 balance-context nets paid-ahead credit first (MH 25)', () => {
+  async function mh25(f: Fixture) {
+    const { rows: [inv] } = await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
+                             due_date, subtotal_rent, total_amount, status)
+       VALUES ($1,$2,$3,$4,'INV-S654-MH25','2026-10-01',460,460,'pending') RETURNING id`,
+      [f.aLid, f.tenant1Id, f.lease1Id, f.aUnitId])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'rent',460,'pending','2026-10-01','RENT')`,
+      [inv.id, f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1,$2,10,10)`, [f.lease1Id, f.tenant1Id])
+    return inv.id
+  }
+  const ctx = async (f: Fixture) => {
+    const res = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(res.status).toBe(200)
+    return res.body.data.leases.find((l: any) => l.leaseId === f.lease1Id)
+  }
+
+  it('a $460 bill with $10 paid ahead shows $450, with the credit as its own line', async () => {
+    const f = await seed()
+    await mh25(f)
+    const lease = await ctx(f)
+    expect(lease.outstanding).toBeCloseTo(450, 2)
+    expect(lease.grossOutstanding).toBeCloseTo(460, 2)
+    expect(lease.prepaidApplied).toBeCloseTo(10, 2)
+    expect(lease.creditApplied).toBe(0)
+    expect(lease.requiredNow).toBeCloseTo(450, 2)
+    // The price per method follows the net figure.
+    const manual = lease.methodCosts.find((m: any) => m.method === 'manual')
+    expect(manual.total).toBeCloseTo(450, 2)
+  })
+
+  it('paid-ahead comes off before landlord credit — the landlord credit is not spent on covered dollars', async () => {
+    const f = await seed()
+    await mh25(f)
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,500,500,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+    const lease = await ctx(f)
+    expect(lease.prepaidApplied).toBeCloseTo(10, 2)
+    expect(lease.creditApplied).toBeCloseTo(450, 2)
+    expect(lease.outstanding).toBe(0)
+    expect(lease.requiredNow).toBe(0)
+    // $50 of the landlord credit stays on the account — counted once.
+    expect(lease.creditRemaining).toBeCloseTo(50, 2)
+  })
+
+  it('paying the $450 it shows settles the bill, with the $10 drawn', async () => {
+    const f = await seed()
+    const invoiceId = await mh25(f)
+    await db.query(`UPDATE tenants SET stripe_customer_id = 'cus_mh25' WHERE id = $1`, [f.tenant1Id])
+    const lease = await ctx(f)
+    const res = await request(buildApp()).post('/api/payments/pay-balance')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+      .send({ amount: lease.outstanding, paymentMethodId: 'pm_x', paymentMethodType: 'ach', leaseId: f.lease1Id })
+    expect(res.status).toBe(200)
+    expect(res.body.data.appliedTotal).toBeCloseTo(450, 2)
+    expect(res.body.data.payAhead).toBeCloseTo(0, 2)
+
+    const { rows: [open] } = await db.query<{ owed: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS owed FROM payments
+        WHERE invoice_id = $1 AND status IN ('pending','failed')`, [invoiceId])
+    expect(Number(open.owed)).toBe(0)
+    const { rows: [c] } = await db.query<{ r: string }>(
+      `SELECT amount_remaining::text AS r FROM lease_prepaid_credits WHERE lease_id = $1`, [f.lease1Id])
+    expect(Number(c.r)).toBe(0)
+    // And the portal now has nothing left to ask for.
+    const after = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(after.body.data.leases.find((l: any) => l.leaseId === f.lease1Id)).toBeUndefined()
+  })
+})
+
+// S654: the date the desk types is the date that lands, on any host. A bare
+// 'YYYY-MM-DDT12:00:00' was read in the HOST's zone; noon UTC is the same
+// calendar day in every US zone.
+describe('S654 POST /post-payment — receivedAt keeps its calendar day', () => {
+  it('a check received 2026-09-09 is dated 2026-09-09, noon UTC', async () => {
+    const f = await seed()
+    const token = sign({ userId: f.aUid, role: 'landlord', email: 'a@t.dev',
+                         profileId: null, landlordIds: [f.aLid], permissions: {} })
+    const res = await request(buildApp()).post('/api/payments/post-payment')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ tenantId: f.tenant1Id, method: 'check', amount: 100, receivedAt: '2026-09-09' })
+    expect(res.status).toBe(200)
+    const { rows: [r] } = await db.query<{ phx: string; utc: string }>(
+      `SELECT (settled_at AT TIME ZONE 'America/Phoenix')::date::text AS phx,
+              to_char(settled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') AS utc
+         FROM tenant_remittances WHERE id = $1`, [res.body.data.remittanceId])
+    expect(r.phx).toBe('2026-09-09')
+    expect(r.utc).toBe('2026-09-09 12:00')
+  })
+})

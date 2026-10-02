@@ -1,6 +1,7 @@
 import os from 'os'
 // S641: portal links resolve in one place — never localhost in production.
 import { portalLink } from '../lib/portalUrls'
+import { payNowLink } from '../services/invoiceNotice'
 import path from 'path'
 import fs from 'fs'
 import { Router, type Request } from 'express'
@@ -1434,8 +1435,8 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
       await query(
         `UPDATE users SET tenant_invite_token=$1, tenant_invite_expires_at=now()+interval '7 days', updated_at=now() WHERE id=$2`,
         [inviteToken, t.user_id])
-      const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-      const activationUrl = `${tenantAppUrl}/accept-invite?token=${inviteToken}`
+      // S654: portalLink, never a localhost fallback (S641 rule).
+      const activationUrl = portalLink('tenant', `accept-invite?token=${inviteToken}`)
       const propertyAddress = [t.street1, t.city, t.state, t.zip].filter(Boolean).join(', ')
       const unitLabel = t.property_name ? `${t.property_name} — Unit ${t.unit_number}` : 'your unit'
       await emailTenantOnboarded(
@@ -1456,7 +1457,7 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
         `SELECT l.id AS landlord_id, u.email, (u.first_name || ' ' || u.last_name) AS name
            FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [targetId])
       if (!ll?.email) throw new AppError(404, 'Landlord not found')
-      const bankingUrl = `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/banking`
+      const bankingUrl = portalLink('landlord', 'banking')
       await emailLandlordBankingSetup({ to: ll.email, landlordName: ll.name || 'there', bankingUrl, ctx: { landlordId: ll.landlord_id } })
       await logAdminAction({
         adminUserId: req.user!.userId, actionType: 'resend_bank_verification',
@@ -1469,7 +1470,7 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
     // bank account so they can pay rent online.
     if (type === 'ach_enrollment') {
       const t = await queryOne<any>(
-        `SELECT u.email, u.first_name AS name, p.landlord_id
+        `SELECT u.id AS user_id, u.email, u.first_name AS name, p.landlord_id
            FROM tenants t
            JOIN users u ON u.id = t.user_id
            LEFT JOIN lease_tenants lt ON lt.tenant_id = t.id AND lt.status IN ('active','pending_add')
@@ -1478,7 +1479,9 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
            LEFT JOIN properties p ON p.id = un.property_id
           WHERE t.id = $1 ORDER BY lt.added_at DESC NULLS LAST LIMIT 1`, [targetId])
       if (!t?.email) throw new AppError(404, 'Tenant not found')
-      const paymentsUrl = `${process.env.TENANT_APP_URL || 'http://localhost:3002'}/payments`
+      // S654: the bill's own Pay now link (signs them in with just the password,
+      // and never a localhost address).
+      const paymentsUrl = payNowLink({ tenant_user_id: t.user_id, tenant_email: t.email })
       await emailTenantAchSetup({ to: t.email, tenantName: t.name || 'there', paymentsUrl, ctx: { landlordId: t.landlord_id ?? null, tenantId: targetId } })
       await logAdminAction({
         adminUserId: req.user!.userId, actionType: 'resend_ach_enrollment',

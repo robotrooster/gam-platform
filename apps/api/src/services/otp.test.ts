@@ -30,6 +30,7 @@ import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
+import { todayIn } from '../lib/timezone'
 import {
   isOtpVisibleForLandlord,
   getQualificationStatus,
@@ -412,23 +413,36 @@ describe('cycleMonthForRentDue', () => {
 })
 
 describe('isLastBusinessDayOfMonth', () => {
+  // S654: takes a 'YYYY-MM-DD' calendar day (GAM's Phoenix today by default).
   it('weekend → false', () => {
     // 2026-04-04 = Saturday
-    expect(isLastBusinessDayOfMonth(new Date(Date.UTC(2026, 3, 4)))).toBe(false)
+    expect(isLastBusinessDayOfMonth('2026-04-04')).toBe(false)
   })
 
   it('last weekday of month → true', () => {
-    // 2026-04-30 = Thursday; May 1 is Friday so April 30 is NOT the
-    // last business day. Use 2026-05-29 (Friday); May 30+31 are Sat/Sun.
-    expect(isLastBusinessDayOfMonth(new Date(Date.UTC(2026, 4, 29)))).toBe(true)
+    // 2026-05-29 is a Friday; May 30 and 31 are Sat/Sun.
+    expect(isLastBusinessDayOfMonth('2026-05-29')).toBe(true)
   })
 
   it('mid-month weekday → false', () => {
-    expect(isLastBusinessDayOfMonth(new Date(Date.UTC(2026, 4, 15)))).toBe(false)
+    expect(isLastBusinessDayOfMonth('2026-05-15')).toBe(false)
   })
 
-  it('month ending Sunday → the Friday before is last business day', () => {
+  it('month ending on a weekday → that day is the last business day', () => {
     // 2026-06: last day is Tue 30. So June 30 itself is last business day.
-    expect(isLastBusinessDayOfMonth(new Date(Date.UTC(2026, 5, 30)))).toBe(true)
+    expect(isLastBusinessDayOfMonth('2026-06-30')).toBe(true)
+  })
+
+  it('a Date is read on the Phoenix calendar, not UTC', () => {
+    // The scheduler's shape: noon UTC on the Phoenix date.
+    expect(isLastBusinessDayOfMonth(new Date('2026-05-29T12:00:00Z'))).toBe(true)
+    // Fri May 29, 6 pm Phoenix. UTC already reads Sat May 30 and said false.
+    expect(isLastBusinessDayOfMonth(new Date('2026-05-30T01:00:00Z'))).toBe(true)
+    // Thu Apr 30 (April's last day), 6 pm Phoenix. UTC reads Fri May 1 and said false.
+    expect(isLastBusinessDayOfMonth(new Date('2026-05-01T01:00:00Z'))).toBe(true)
+  })
+
+  it('no argument → GAM\'s today, matching the explicit Phoenix date', () => {
+    expect(isLastBusinessDayOfMonth()).toBe(isLastBusinessDayOfMonth(todayIn(null)))
   })
 })

@@ -1115,14 +1115,19 @@ export async function sendPosCustomerOnboarding({
 
 // S652 (Nic): the morning late-rent email is ONE per landlord — every overdue
 // balance in a table — never one per tenant. "I don't need 15 emails."
+// S654: one line per PERSON with their whole open balance (rent, utilities,
+// fees), so it is "overdue balances", not "overdue rent".
 export async function sendLatePaymentDigest({ landlordEmail, landlordName, items, ctx }: {
   landlordEmail: string; landlordName: string
-  items: Array<{ tenantName: string; unitNumber: string; propertyName: string; daysLate: number; amount: number; paymentId?: string }>
+  items: Array<{ tenantName: string; unitNumber: string; propertyName: string; daysLate: number; amount: number; paymentId?: string; tenantId?: string }>
   ctx?: { landlordId?: string }
 }) {
   if (!items.length) return
   const sorted = [...items].sort((a, b) => b.daysLate - a.daysLate)
-  const total = sorted.reduce((s, i) => s + i.amount, 0)
+  // S654: summed in cents — a raw float sum is not a dollar figure.
+  const total = Math.round(sorted.reduce((s, i) => s + Math.round(i.amount * 100), 0)) / 100
+  const paymentIds = sorted.map(i => i.paymentId).filter(Boolean)
+  const tenantIds = sorted.map(i => i.tenantId).filter(Boolean)
   const properties = [...new Set(sorted.map(i => i.propertyName))]
   const where = properties.length === 1 ? properties[0] : `${properties.length} properties`
   const td = (v: string, extra = '') => `<td style="padding:7px 8px;border-bottom:1px solid #1f2733;font-size:.82rem;color:#eef1f8;${extra}">${v}</td>`
@@ -1130,10 +1135,10 @@ export async function sendLatePaymentDigest({ landlordEmail, landlordName, items
     `<tr>${td(escapeHtml(i.tenantName))}${td(escapeHtml(i.unitNumber))}${properties.length > 1 ? td(escapeHtml(i.propertyName)) : ''}${td(`$${i.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, 'text-align:right;font-variant-numeric:tabular-nums')}${td(`${i.daysLate}`, 'text-align:right')}</tr>`).join('')
   const th = (v: string, extra = '') => `<th style="padding:6px 8px;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:#b8c4d8;border-bottom:1px solid #2a3442;${extra}">${v}</th>`
   await send(landlordEmail,
-    `${sorted.length} overdue rent balance${sorted.length === 1 ? '' : 's'} — ${where}`,
+    `${sorted.length} overdue balance${sorted.length === 1 ? '' : 's'} — ${where}`,
     base(
-      `<div style="margin-bottom:14px;padding:10px 14px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;color:#f59e0b;font-size:.85rem">⚠️ ${sorted.length} overdue rent balance${sorted.length === 1 ? '' : 's'} — $${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} outstanding</div>` +
-      h('Overdue Rent — This Morning') +
+      `<div style="margin-bottom:14px;padding:10px 14px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;color:#f59e0b;font-size:.85rem">⚠️ ${sorted.length} overdue balance${sorted.length === 1 ? '' : 's'} — $${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} outstanding</div>` +
+      h('Overdue Balances — This Morning') +
       p(`Hi ${landlordName},`) +
       p(`These balances are five or more days past due. This is the only email about them today.`) +
       `<table style="width:100%;border-collapse:collapse;margin:12px 0;background:#0a0f14;border-radius:8px">
@@ -1147,7 +1152,11 @@ export async function sendLatePaymentDigest({ landlordEmail, landlordName, items
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: null,
       relatedEntityId: null,
-      metadata: { count: sorted.length, total, payment_ids: sorted.map(i => i.paymentId).filter(Boolean) },
+      metadata: {
+        count: sorted.length, total,
+        ...(tenantIds.length ? { tenant_ids: tenantIds } : {}),
+        ...(paymentIds.length ? { payment_ids: paymentIds } : {}),
+      },
     }
   )
 }

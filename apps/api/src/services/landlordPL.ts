@@ -28,6 +28,10 @@ export async function computeLandlordPL(
   periodMonthKeys: string[],
 ): Promise<LandlordPL> {
   // Income — categorized from settled payments by actual settle date.
+  // S654: the end is a whole day. `settled_at <= '2026-09-30'` meant midnight
+  // at the START of the 30th, so a bare-date end dropped the last day's money.
+  // `< end::date + 1` takes the whole day, for a bare date and for monthRange's
+  // '...T23:59:59-07:00' alike.
   const inc = await queryOne<any>(`
     SELECT
       COALESCE(SUM(amount) FILTER (WHERE type='rent'), 0)::float           AS rent,
@@ -37,7 +41,7 @@ export async function computeLandlordPL(
       COALESCE(SUM(amount) FILTER (WHERE type='deposit'), 0)::float        AS deposits
       -- platform_fee / float_fee excluded: GAM revenue, not landlord income.
     FROM payments
-   WHERE landlord_id = $1 AND status = 'settled' AND settled_at >= $2 AND settled_at <= $3`,
+   WHERE landlord_id = $1 AND status = 'settled' AND settled_at >= $2 AND settled_at < ($3::date + 1)`,
     [landlordId, start, end])
 
   const rent = round2(+inc?.rent || 0)
@@ -64,7 +68,7 @@ export async function computeLandlordPL(
 
   const maintRow = await queryOne<any>(`
     SELECT COALESCE(SUM(actual_cost), 0)::float AS c FROM maintenance_requests
-     WHERE landlord_id = $1 AND completed_at >= $2 AND completed_at <= $3 AND actual_cost IS NOT NULL`,
+     WHERE landlord_id = $1 AND completed_at >= $2 AND completed_at < ($3::date + 1) AND actual_cost IS NOT NULL`,
     [landlordId, start, end])
   const maintenance = round2(+maintRow?.c || 0)
 

@@ -2,7 +2,7 @@ import { query, queryOne, getClient } from '../db'
 import { isFeatureEnabled } from './systemFeatures'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
-import { dateIn, addDaysTo, monthStartOf } from '../lib/timezone'
+import { dateIn, todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 
 // ============================================================
 // OTP (On-Time Pay) — landlord rent-advance product.
@@ -654,22 +654,26 @@ export function cycleMonthForRentDue(due: Date): string {
 }
 
 /**
- * Returns TRUE when `now` is the last business day of its month
+ * Returns TRUE when `day` is the last business day of its month
  * (Mon-Fri). Used by the daily scheduler tick to decide whether
  * to run processMonthlyAdvance.
+ *
+ * S654: works on a 'YYYY-MM-DD' calendar day, defaulting to GAM's (Phoenix)
+ * today. The old default read new Date() in UTC, which is already tomorrow
+ * after 5 pm Phoenix. A Date is read on the Phoenix calendar, the same as
+ * cycleMonthFor, so the run day and the cycle month always agree.
  */
-export function isLastBusinessDayOfMonth(now: Date = new Date()): boolean {
-  const dow = now.getUTCDay() // 0=Sun, 1=Mon, ..., 5=Fri, 6=Sat
+export function isLastBusinessDayOfMonth(day: string | Date = todayIn(null)): boolean {
+  const ymd = typeof day === 'string' ? day.slice(0, 10) : dateIn(null, day)
+  // Weekday math on the plain calendar date; UTC midnight carries no zone shift.
+  const weekday = (d: string) => new Date(`${d}T00:00:00Z`).getUTCDay() // 0=Sun..6=Sat
+  const dow = weekday(ymd)
   if (dow === 0 || dow === 6) return false // weekend can never be last business day
 
   // Walk forward day-by-day; if any later day in this month is also
   // a weekday, today is not the last business day.
-  const month = now.getUTCMonth()
-  const year = now.getUTCFullYear()
-  for (let d = now.getUTCDate() + 1; d <= 31; d++) {
-    const candidate = new Date(Date.UTC(year, month, d))
-    if (candidate.getUTCMonth() !== month) break
-    const cdow = candidate.getUTCDay()
+  for (let d = addDaysTo(ymd, 1); d.slice(0, 7) === ymd.slice(0, 7); d = addDaysTo(d, 1)) {
+    const cdow = weekday(d)
     if (cdow !== 0 && cdow !== 6) return false
   }
   return true

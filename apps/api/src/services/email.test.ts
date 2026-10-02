@@ -405,13 +405,35 @@ describe('late payment sender', () => {
     })
     expect(resendSendMock).toHaveBeenCalledTimes(1)
     const call = (resendSendMock.mock.calls[0] as any[])[0]
-    expect(call.subject).toBe('2 overdue rent balances — Sunset')
+    // S654: the lines are whole balances (rent, utilities, fees), not rent.
+    expect(call.subject).toBe('2 overdue balances — Sunset')
+    expect(call.html).toContain('Overdue Balances — This Morning')
     expect(call.html).toContain('T One')
     expect(call.html).toContain('T Two')
     expect(call.html).toContain('1,650.50')
     const log = await logRowFor('l@mailer-test.co')
     expect(log.category).toBe('late_payment_notice')
     expect(log.metadata).toEqual({ count: 2, total: 1650.5, payment_ids: ['p2', 'p1'] })
+  })
+
+  // S654: one line per person (tenant ids in the log), and the total in cents —
+  // Oak Park's log carried a raw float sum.
+  it('sendLatePaymentDigest: per-person lines log tenant ids and a cents total', async () => {
+    await email.sendLatePaymentDigest({
+      landlordEmail: 'l@mailer-test.co', landlordName: 'L',
+      items: [
+        { tenantName: 'Billy Miranda', unitNumber: 'RV 34, RV 35', propertyName: 'Oak Park', daysLate: 30, amount: 902.29, tenantId: 't1' },
+        { tenantName: 'Jay Jones', unitNumber: 'RV 25', propertyName: 'Oak Park', daysLate: 30, amount: 484.33, tenantId: 't2' },
+        { tenantName: 'A B', unitNumber: 'RV 1', propertyName: 'Oak Park', daysLate: 6, amount: 0.1, tenantId: 't3' },
+        { tenantName: 'C D', unitNumber: 'RV 2', propertyName: 'Oak Park', daysLate: 6, amount: 0.2, tenantId: 't4' },
+      ],
+    })
+    const call = (resendSendMock.mock.calls[0] as any[])[0]
+    expect(call.subject).toBe('4 overdue balances — Oak Park')
+    expect(call.html).toContain('RV 34, RV 35')
+    expect(call.html).toContain('1,386.92')
+    const log = await logRowFor('l@mailer-test.co')
+    expect(log.metadata).toEqual({ count: 4, total: 1386.92, tenant_ids: ['t1', 't2', 't3', 't4'] })
   })
 })
 

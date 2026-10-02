@@ -68,8 +68,11 @@ export async function assertUnitCanAcceptNewLease(client: Client, unitId: string
  * today; end = month-end snap of the template's default_term_months (null → M2M).
  * Rules live in services/leaseDates.ts.
  */
-function termPrefill(defaultTermMonths: number | null, availableDate: string | Date | null): Record<string, string> {
-  const start = computeLeaseStart(availableDate)
+function termPrefill(
+  defaultTermMonths: number | null, availableDate: string | Date | null, tz: string | null,
+): Record<string, string> {
+  // S654: "today" is the park's day, not the server's (a UTC server rolls over at 5 pm Phoenix).
+  const start = computeLeaseStart(availableDate, new Date(), tz)
   const out: Record<string, string> = { start_date: start }
   const end = computeLeaseEnd(start, defaultTermMonths)
   if (end) { out.end_date = end; out.lease_type = 'fixed_term' }
@@ -133,7 +136,9 @@ export async function autoDraftLeasesForUnit(
   terms?: DraftTermOverride,
 ): Promise<{ draftedDocumentIds: string[] }> {
   const unit = await client.query(
-    `SELECT u.id, u.occupancy_mode, u.unit_number, u.available_date, p.landlord_id, p.name AS property_name
+    // S654: available_date as text — a pg DATE arrives as local midnight, not a calendar day.
+    `SELECT u.id, u.occupancy_mode, u.unit_number, u.available_date::text AS available_date,
+            p.landlord_id, p.name AS property_name, p.timezone
        FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id=$1`, [unitId]).then(r => r.rows[0])
   if (!unit) throw new AppError(404, 'Unit not found')
 
@@ -156,8 +161,8 @@ export async function autoDraftLeasesForUnit(
   if (!tmpl) { await notifyNeedsTemplate(); return { draftedDocumentIds: [] } }
 
   const term = terms
-    ? termPrefill(terms.monthToMonth ? null : (terms.termMonths ?? tmpl.default_term_months), terms.startDate ?? unit.available_date)
-    : termPrefill(tmpl.default_term_months, unit.available_date)
+    ? termPrefill(terms.monthToMonth ? null : (terms.termMonths ?? tmpl.default_term_months), terms.startDate ?? unit.available_date, unit.timezone)
+    : termPrefill(tmpl.default_term_months, unit.available_date, unit.timezone)
   const roster = await loadRoster(client, unitId)
   const drafted: string[] = []
 

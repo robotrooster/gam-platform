@@ -38,6 +38,7 @@ import {
   seedSecurityDeposit, seedDepositReturnDraft,
   seedRentPayment, seedUtilityMeter, seedUtilityBill,
 } from '../test/dbHelpers'
+import { todayIn } from '../lib/timezone'
 
 // Pool lifecycle: don't end the singleton in afterAll. Multiple test
 // files share the same process under vitest singleFork — whichever
@@ -471,6 +472,55 @@ describe('finalizeDepositReturn — workflow', () => {
 })
 
 // ─── S550: conditional fees never auto-sweep until assessed FAILED ──
+
+// S654: the rows finalize writes were due CURRENT_DATE — the database's day,
+// not the park's. A park in a zone far from the server's (Kiritimati is a day
+// ahead of Phoenix most of the day) shows the difference.
+describe("S654 finalize dates its rows on the property's calendar", () => {
+  const TZ = 'Pacific/Kiritimati'
+
+  it('final utility settlement and the refund row are due the property\'s today', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 150 })
+    await db.query(`UPDATE properties SET timezone = $2 WHERE id = $1`, [stack.propertyId, TZ])
+    let billId: string
+    const client = await getClient()
+    try {
+      const meterId = await seedUtilityMeter(client, { propertyId: stack.propertyId, utilityType: 'electric' })
+      billId = await seedUtilityBill(client, {
+        meterId, unitId: stack.unitId, tenantId: stack.tenantId,
+        leaseId: stack.leaseId, landlordId: stack.landlordId,
+        chargeAmount: 87.50, status: 'billed', utilityType: 'electric',
+      })
+    } finally { client.release() }
+    const draftId = await makeDraft(stack, { totalDeposit: 150 })
+    const final = await finalizeDepositReturn(draftId, stack.ownerUserId)
+    expect(final.status).toBe('sent_refund')
+
+    const rows = await db.query<{ type: string; due: string }>(
+      `SELECT type, due_date::text AS due FROM payments
+        WHERE id IN ((SELECT payment_id FROM utility_bills WHERE id = $1), $2)
+        ORDER BY type`,
+      [billId!, final.refund_payment_id])
+    expect(rows.rows).toEqual([
+      { type: 'fee', due: todayIn(TZ) },
+      { type: 'utility', due: todayIn(TZ) },
+    ])
+  })
+
+  it('a move-out balance is due the property\'s today', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 300, cleaningFeeAmount: 500 })
+    await db.query(`UPDATE properties SET timezone = $2 WHERE id = $1`, [stack.propertyId, TZ])
+    const draftId = await makeDraft(stack, {
+      totalDeposit: 300, cleaningFeeAmount: 500,
+      totalDeductions: 500, refundAmount: 0, gapAmount: 200,
+    })
+    const final = await finalizeDepositReturn(draftId, stack.ownerUserId)
+    expect(final.status).toBe('sent_gap')
+    const gap = await db.query<{ due: string }>(
+      `SELECT due_date::text AS due FROM payments WHERE id = $1`, [final.gap_payment_id])
+    expect(gap.rows[0].due).toBe(todayIn(TZ))
+  })
+})
 
 describe('S550 — conditional lease fees in the sweep', () => {
   async function addConditionalFee(leaseId: string, amount: number, result: string | null) {

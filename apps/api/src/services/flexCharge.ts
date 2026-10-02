@@ -15,7 +15,7 @@ import {
   type FlexChargeAccountStatus,
 } from '@gam/shared'
 import { logger } from '../lib/logger'
-import { dateIn } from '../lib/timezone'
+import { dateIn, addDaysTo, monthStartOf } from '../lib/timezone'
 
 const LANDLORD_DISPUTE_THRESHOLD_COUNT = 3       // distinct customers
 const LANDLORD_DISPUTE_THRESHOLD_DAYS = 90        // rolling window
@@ -821,9 +821,12 @@ export interface StatementGenerationResult {
  * with created_at between Jan 1 and Feb 1 aggregate together.
  */
 export async function processFlexChargeStatementGeneration(now: Date = new Date()): Promise<StatementGenerationResult> {
-  // Previous month's first-of-month UTC.
-  const prevMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1))
-  const cycle = prevMonth.toISOString().slice(0, 10)
+  // S654: the month that just closed, on GAM's (Phoenix) calendar, not UTC's.
+  // Phoenix rather than the property's zone because generateMonthlyStatement
+  // cuts its purchase window with $2::date in the database's Phoenix zone; a
+  // cycle from another zone could close before Phoenix does and strand late
+  // purchases. UTC is already next month after 5 pm on the last day.
+  const cycle = monthStartOf(addDaysTo(monthStartOf(dateIn(null, now)), -1))
 
   const out: StatementGenerationResult = {
     cycle_month:        cycle,

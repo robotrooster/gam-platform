@@ -3,7 +3,8 @@
  * Stage 2: GET profile + GET availability (unauthenticated, slug-keyed).
  */
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { Settings } from 'luxon'
 import express from 'express'
 import request from 'supertest'
 import { db, getClient } from '../db'
@@ -153,5 +154,38 @@ describe('GET availability', () => {
     const res = await request(buildApp())
       .get(`/api/public/property/sunny-rv-park/availability?siteTypeId=general&checkIn=${plusDays(-5)}&checkOut=${plusDays(2)}&stayType=nightly`)
     expect(res.status).toBe(400)
+  })
+})
+
+// ── S654: "past" is the park's calendar, not the server's ────
+describe('same-day check-in on the property calendar', () => {
+  it('a check-in for today, booked at 6 pm Phoenix on a UTC server, is not "in the past"', async () => {
+    await seedSite()
+    const today = todayIn('America/Phoenix')
+    // 6 pm Phoenix = 01:00 UTC the next day. The server runs on UTC, so its
+    // own "today" has already turned over; the park's has not.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(`${today}T18:00:00-07:00`))
+    const prevZone = Settings.defaultZone
+    Settings.defaultZone = 'UTC'
+    try {
+      const res = await request(buildApp())
+        .post('/api/public/property/sunny-rv-park/waitlist')
+        .send({ siteTypeId: 'general', guestName: 'Pat Guest', guestEmail: 'pat@example.com',
+                checkIn: today, checkOut: addDaysTo(today, 2) })
+      expect(res.status).toBe(200)
+      expect(res.body.data.position).toBe(1)
+
+      // Yesterday on the park's calendar is still refused.
+      const past = await request(buildApp())
+        .post('/api/public/property/sunny-rv-park/waitlist')
+        .send({ siteTypeId: 'general', guestName: 'Pat Guest', guestEmail: 'pat@example.com',
+                checkIn: addDaysTo(today, -1), checkOut: addDaysTo(today, 2) })
+      expect(past.status).toBe(400)
+      expect(JSON.stringify(past.body)).toMatch(/in the past/)
+    } finally {
+      Settings.defaultZone = prevZone
+      vi.useRealTimers()
+    }
   })
 })

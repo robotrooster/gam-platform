@@ -15,7 +15,8 @@ vi.mock('resend', () => ({ Resend: class { emails = { send: resendSendMock } } }
 
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant } from '../test/dbHelpers'
-import { sendPendingInvoiceNotices } from './invoiceNotice'
+import { sendPendingInvoiceNotices, payNowLink } from './invoiceNotice'
+import { portalLink } from '../lib/portalUrls'
 import { verifyEmailFactorToken } from '../routes/emailOtp'
 
 const TZ = 'America/Phoenix'
@@ -253,5 +254,23 @@ describe('the headline is what they will actually pay', () => {
     const mail = lastSend()
     expect(mail.subject).toContain('$589.00')            // the water is not owed
     expect(mail.html).toContain('covered (paid-ahead credit)')
+  })
+})
+
+// S654: payNowLink is shared by every tenant email that sends someone to pay
+// (the bill, the landlord's balance reminder, the bank-setup nudge).
+describe('payNowLink', () => {
+  it('signs the token for the account and its login email, landing on Payments', () => {
+    const userId = randomUUID()
+    const link = payNowLink({ tenant_user_id: userId, tenant_email: 'pat@mailer-test.co' })
+    const u = new URL(link)
+    expect(link.startsWith(portalLink('tenant', 'login?ef='))).toBe(true)
+    expect(u.searchParams.get('to')).toBe('/payments')
+    expect(verifyEmailFactorToken(u.searchParams.get('ef')!)).toEqual({ userId, email: 'pat@mailer-test.co' })
+  })
+
+  it('no portal account (no user or no login email) gets the plain Payments link', () => {
+    expect(payNowLink({ tenant_user_id: null, tenant_email: 'pat@mailer-test.co' })).toBe(portalLink('tenant', 'payments'))
+    expect(payNowLink({ tenant_user_id: randomUUID(), tenant_email: null })).toBe(portalLink('tenant', 'payments'))
   })
 })

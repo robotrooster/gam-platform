@@ -13,6 +13,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease } from '../test/dbHelpers'
+import { todayIn } from '../lib/timezone'
 import { payAnnualDepositInterest, outstandingDepositInterest, landlordHeldInterestAdvisory } from './depositInterestPayout'
 
 beforeEach(async () => { await cleanupAllSchema() })
@@ -193,7 +194,9 @@ describe('S642 landlord-held deposits are flagged, never paid', () => {
    * the code under test. Seed the two Arizona rules the cases below rely on.
    */
   async function seedAzRules() {
-    const year = new Date().getUTCFullYear()
+    // S654: the source looks the rule up by the property's year (Phoenix here);
+    // UTC is already next year after 5 pm on Dec 31.
+    const year = Number(todayIn(null).slice(0, 4))
     await db.query(`DELETE FROM state_deposit_interest_rates WHERE state_code='AZ'`)
     await db.query(
       `INSERT INTO state_deposit_interest_rates

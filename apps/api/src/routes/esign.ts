@@ -97,20 +97,34 @@ function bucketFor(unitType: UnitType): Bucket {
 async function canTenantsSignNewLease(
   tenantIds: string[],
   newUnitId: string,
-  newStartDate: string,
-  newEndDate: string | null,
+  newStartDate: string | Date,
+  newEndDate: string | Date | null,
   excludeLeaseId?: string
 ): Promise<{ ok: boolean; reason?: string; conflictingTenantId?: string; conflictingLeaseId?: string }> {
   if (!tenantIds.length) return { ok: false, reason: 'No tenants provided' }
+  // S654: compare calendar days as 'YYYY-MM-DD'. This mixed a field read at
+  // UTC midnight with pg dates at local midnight, and a '-' (month-to-month)
+  // end became an Invalid Date that never overlapped anything. '-' and blank
+  // mean no end date. A pg DATE (callers pass lease rows) is local midnight.
+  const day = (v: string | Date | null): string | null =>
+    v instanceof Date
+      ? (Number.isNaN(v.getTime()) ? null
+          : `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`)
+      : leaseFieldDate(v)
+  const bStart = day(newStartDate)
+  const bEnd   = day(newEndDate)
   const newUnit = await queryOne<any>(
     `SELECT u.unit_type, p.landlord_id FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
     [newUnitId])
   if (!newUnit) return { ok: false, reason: 'Unit not found' }
+  // No readable start: nothing to compare (the build refuses it elsewhere).
+  if (!bStart) return { ok: true }
   const newBucket = bucketFor(newUnit.unit_type)
 
   for (const tenantId of tenantIds) {
     const actives = await query<any>(`
-      SELECT l.id, l.start_date, l.end_date, l.landlord_id, l.unit_id, u.unit_type, u.unit_number,
+      SELECT l.id, l.start_date::text AS start_date, l.end_date::text AS end_date,
+        l.landlord_id, l.unit_id, u.unit_type, u.unit_number,
         tu.first_name || ' ' || tu.last_name as tenant_name
       FROM lease_tenants lt
       JOIN leases l ON l.id = lt.lease_id
@@ -132,10 +146,9 @@ async function canTenantsSignNewLease(
       // guard's real targets stay blocked: cross-landlord double-booking,
       // and two active leases on the SAME unit.
       if (l.landlord_id === newUnit.landlord_id && l.unit_id !== newUnitId) continue
-      const aStart = new Date(l.start_date)
-      const aEnd   = l.end_date ? new Date(l.end_date) : null
-      const bStart = new Date(newStartDate)
-      const bEnd   = newEndDate ? new Date(newEndDate) : null
+      const aStart: string = l.start_date
+      const aEnd: string | null = l.end_date
+      // Inclusive: a lease ending the day another starts still overlaps.
       const overlaps =
         (aEnd === null || aEnd >= bStart) &&
         (bEnd === null || bEnd >= aStart)
@@ -443,7 +456,8 @@ export async function createDocumentRecord(client: any, opts: {
       pv.rent_due_day = dueDayLabel(rule?.invite_day != null ? Number(rule.invite_day) : leaseDueDay({
         mode: rule?.existing ? 'fixed_day' : (rule?.rent_due_mode ?? 'fixed_day'),
         propertyDay: rule?.rent_due_day ?? 1,
-        startIso: pv.start_date ?? null,
+        // S654: a caller-supplied start can be M/D/YYYY — read it as a calendar day.
+        startIso: leaseFieldDate(pv.start_date),
       }))
     }
   }
@@ -1145,7 +1159,9 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
 
   // Overlap check across EVERY tenant
   const allTenantIds = tenantSigners.map((t:any) => t.tenant_id)
-  const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startDate, vals.end_date || null)
+  // S654: '-' is month to month (no end date), as on the send and sign paths.
+  const endForOverlap = vals.end_date && String(vals.end_date).trim() !== '-' ? vals.end_date : null
+  const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startDate, endForOverlap)
   if (!ov.ok) throw new AppError(409, ov.reason || 'Lease overlap detected')
 
   // Status: future start → pending, today/past → active.
@@ -1187,7 +1203,8 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     writableValues.push(intentRule?.invite_day != null ? Number(intentRule.invite_day) : leaseDueDay({
       mode: existingRule ? 'fixed_day' : (rule?.rent_due_mode ?? 'fixed_day'),
       propertyDay: rule?.rent_due_day ?? 1,
-      startIso: vals.start_date ? String(vals.start_date).slice(0, 10) : null,
+      // S654: the field is M/D/YYYY; slicing it gave move_in_day leases a garbage day.
+      startIso: leaseFieldDate(vals.start_date),
     }))
     paramIdx++
   }

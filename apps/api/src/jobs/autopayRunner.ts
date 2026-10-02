@@ -29,7 +29,8 @@
 
 import { query, queryOne } from '../db'
 import { getStripe } from '../lib/stripe'
-import { chargeLeaseBalance } from '../services/rentCharge'
+import { chargeLeaseBalance, CREDIT_COVERS_BALANCE, type ChargeLeaseBalanceResult } from '../services/rentCharge'
+import { AppError } from '../middleware/errorHandler'
 import { createNotification } from '../services/notifications'
 import { logger } from '../lib/logger'
 import { registerEngine } from './timezoneCronManager'
@@ -144,15 +145,18 @@ export async function runAutopayForTimezone(tz: string, now: Date = new Date()):
       //
       // Paying arrears down stays a deliberate act by the tenant, in whatever
       // amount they can manage, through Pay Now.
+      // S654: a work-trade suspended line is labor's to pay, not the bank's —
+      // summed here it was pulled and then banked as paid-ahead.
       const balance = await queryOne<{ total: string }>(
         `SELECT COALESCE(SUM(amount), 0)::text AS total FROM payments
           WHERE lease_id = $1 AND tenant_id = $2
             AND type <> 'carried_balance'
+            AND work_trade_suspended_at IS NULL
             AND ((status = 'pending' AND stripe_payment_intent_id IS NULL)
                  OR status = 'failed')`,
         [c.lease_id, c.tenant_id])
-      const amount = Math.round(Number(balance?.total ?? 0) * 100) / 100
-      if (amount <= 0) {
+      const gross = Math.round(Number(balance?.total ?? 0) * 100) / 100
+      const nothingOwed = async () => {
         // Nothing owed — a tenant who is paid ahead, or who already paid by
         // hand this month. Not a failure and not worth a notification.
         result.skipped++
@@ -160,17 +164,33 @@ export async function runAutopayForTimezone(tz: string, now: Date = new Date()):
           `UPDATE tenant_autopay SET last_success_cycle = $2::date, consecutive_failures = 0,
                   last_error = NULL, updated_at = NOW() WHERE id = $1`,
           [c.autopay_id, cycle])
-        continue
       }
+      if (gross <= 0) { await nothingOwed(); continue }
 
-      await chargeLeaseBalance({
-        tenantId:          c.tenant_id,
-        leaseId:           c.lease_id,
-        amount,
-        paymentMethodId:   method.id,
-        paymentMethodType: method.type,
-        source:            'autopay',
-      })
+      // S654: charge the server's own pay-in-full figure — the lease's charges
+      // less paid-ahead and landlord credit — exactly what the Pay button asks.
+      // Charging the gross took dollars a credit already covered and banked
+      // them as paid-ahead.
+      let charged: ChargeLeaseBalanceResult
+      try {
+        charged = await chargeLeaseBalance({
+          tenantId:          c.tenant_id,
+          leaseId:           c.lease_id,
+          amount:            gross,
+          chargeRequiredOnly: true,
+          paymentMethodId:   method.id,
+          paymentMethodType: method.type,
+          source:            'autopay',
+        })
+      } catch (e) {
+        // Credit covers the whole bill: nothing to pull, and not a failure.
+        if (e instanceof AppError && e.statusCode === 409 && e.message.startsWith(CREDIT_COVERS_BALANCE)) {
+          await nothingOwed(); continue
+        }
+        throw e
+      }
+      // What the bank or card actually sees: the bill plus any fee the tenant bears.
+      const amount = charged.chargeAmount ?? Math.round((charged.appliedTotal + charged.payAhead) * 100) / 100
 
       await query(
         `UPDATE tenant_autopay

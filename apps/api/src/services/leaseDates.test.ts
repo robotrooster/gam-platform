@@ -2,26 +2,34 @@
 import { describe, it, expect } from 'vitest'
 import { serverTodayYmd, computeLeaseStart, computeLeaseEnd } from './leaseDates'
 
-// Fixed "now" = local Aug 5, 2026 (noon, so no tz edge).
-const NOW = new Date(2026, 7, 5, 12, 0, 0)
+// Fixed "now" = noon Aug 5, 2026 in Phoenix, as an absolute instant (S654: a
+// server-local Date meant the test's "today" moved with the machine's zone).
+const NOW = new Date('2026-08-05T19:00:00Z')
+const TZ = 'America/Phoenix'
 
 describe('leaseDates', () => {
   it('serverTodayYmd formats local Y-M-D', () => {
-    expect(serverTodayYmd(NOW)).toBe('2026-08-05')
+    const local = new Date(2026, 7, 5, 12, 0, 0)
+    expect(serverTodayYmd(local)).toBe('2026-08-05')
   })
 
   describe('computeLeaseStart', () => {
     it('future available_date → uses it', () => {
-      expect(computeLeaseStart('2026-09-01', NOW)).toBe('2026-09-01')
+      expect(computeLeaseStart('2026-09-01', NOW, TZ)).toBe('2026-09-01')
     })
     it('past available_date → today (never backdated)', () => {
-      expect(computeLeaseStart('2026-01-10', NOW)).toBe('2026-08-05')
+      expect(computeLeaseStart('2026-01-10', NOW, TZ)).toBe('2026-08-05')
     })
     it('no available_date → today', () => {
-      expect(computeLeaseStart(null, NOW)).toBe('2026-08-05')
+      expect(computeLeaseStart(null, NOW, TZ)).toBe('2026-08-05')
+    })
+    it('today is the property\'s day: 6 pm Phoenix is still Aug 5 though UTC is Aug 6 (S654)', () => {
+      const evening = new Date('2026-08-06T01:00:00Z')
+      expect(computeLeaseStart(null, evening, TZ)).toBe('2026-08-05')
+      expect(computeLeaseStart('2026-08-05', evening, TZ)).toBe('2026-08-05')
     })
     it('accepts a Date object', () => {
-      expect(computeLeaseStart(new Date(Date.UTC(2026, 8, 15, 12)), NOW)).toBe('2026-09-15')
+      expect(computeLeaseStart(new Date(Date.UTC(2026, 8, 15, 12)), NOW, TZ)).toBe('2026-09-15')
     })
   })
 

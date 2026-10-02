@@ -8,6 +8,7 @@ import { recordHeldItem } from './heldPayouts'
 import { maybeDraftLeaseFromBooking } from './bookingLeaseDraft'
 import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, SHORT_STAY_LOCKED_UNIT_TYPES, processingFeeFor, cardFeeSplit, type CardFeePayer } from '@gam/shared'
 
 // ============================================================
@@ -82,6 +83,7 @@ interface PropertyRow {
   booking_card_fee_payer: CardFeePayer
   nightly_rate: string | null; weekly_rate: string | null; monthly_rate: string | null
   short_term_tax_rate: string | null
+  timezone: string | null
 }
 interface UnitRow {
   id: string; unit_number: string
@@ -92,7 +94,7 @@ interface UnitRow {
 async function resolvePropertyBySlug(slug: string): Promise<PropertyRow> {
   const prop = await queryOne<PropertyRow>(
     `SELECT id, landlord_id, name, booking_slug, booking_deposit_pct, booking_monthly_deposit, booking_card_fee_payer,
-            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate
+            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate, timezone
        FROM properties WHERE booking_slug=$1 AND public_booking_enabled=TRUE`, [slug])
   if (!prop) throw new AppError(404, 'Booking site not found')
   return prop
@@ -127,7 +129,9 @@ function quoteStay(unit: UnitRow, prop: PropertyRow, checkIn: string, checkOut: 
   if (!ci.isValid || !co.isValid) throw new AppError(400, 'Invalid dates')
   const nights = Math.round(co.startOf('day').diff(ci.startOf('day'), 'days').days)
   if (nights <= 0) throw new AppError(400, 'Check-out must be after check-in')
-  if (ci < DateTime.now().startOf('day')) throw new AppError(400, 'Check-in is in the past')
+  // S654: "past" on the park's calendar, not the server's. A UTC server called a
+  // same-day check-in booked at 6 pm Phoenix "yesterday".
+  if (ci.toISODate()! < todayIn(prop.timezone)) throw new AppError(400, 'Check-in is in the past')
   if (unit.min_stay_nights != null && nights < unit.min_stay_nights) throw new AppError(400, `Minimum stay is ${unit.min_stay_nights} nights`)
   if (unit.max_stay_nights != null && nights > unit.max_stay_nights) throw new AppError(400, `Maximum stay is ${unit.max_stay_nights} nights`)
   // Rate resolution mirrors the availability quote exactly: the unit's rate,
@@ -510,7 +514,8 @@ async function emailClaimLink(w: any, token: string): Promise<void> {
 
 export async function getWaitlistClaim(token: string): Promise<any | null> {
   return queryOne<any>(
-    `SELECT w.*, p.name AS property_name, p.booking_slug, u.unit_number
+    `SELECT w.*, w.check_in::text AS check_in_ymd, w.check_out::text AS check_out_ymd,
+            p.name AS property_name, p.booking_slug, u.unit_number
        FROM unit_booking_waitlists w
        JOIN properties p ON p.id=w.property_id
        JOIN units u ON u.id=w.unit_id
@@ -527,8 +532,10 @@ export async function claimWaitlistSpot(token: string, _stayType?: 'nightly' | '
   const result = await bookStay({
     slug: w.booking_slug, unitId: w.unit_id,
     guestName: w.guest_name, guestEmail: w.guest_email, guestPhone: w.guest_phone,
-    checkIn: w.check_in instanceof Date ? w.check_in.toISOString().slice(0, 10) : String(w.check_in).slice(0, 10),
-    checkOut: w.check_out instanceof Date ? w.check_out.toISOString().slice(0, 10) : String(w.check_out).slice(0, 10),
+    // S654: the calendar days as text — a pg DATE arrives as local midnight,
+    // and its UTC string is the day before on any server east of UTC.
+    checkIn: w.check_in_ymd,
+    checkOut: w.check_out_ymd,
   })
   await query(`UPDATE unit_booking_waitlists SET status='claimed', claimed_booking_id=$1, updated_at=now() WHERE id=$2`,
     [result.bookingId, w.id])

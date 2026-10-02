@@ -29,7 +29,10 @@ export async function suggestUnitPrefill(
   exec: Exec = null,
   templateId: string | null = null,
 ): Promise<Record<string, string>> {
-  const sql = `SELECT u.rent_amount, u.unit_number, u.display_label, u.unit_type, u.property_id, u.available_date,
+  // S654: available_date as text (a pg DATE arrives as local midnight); timezone
+  // so "today" for the start date is the park's day, not the server's.
+  const sql = `SELECT u.rent_amount, u.unit_number, u.display_label, u.unit_type, u.property_id,
+                      u.available_date::text AS available_date, p.timezone,
                       p.name AS property_name, p.street1, p.street2, p.city, p.state, p.zip
                  FROM units u JOIN properties p ON p.id = u.property_id
                 WHERE u.id = $1`
@@ -59,7 +62,7 @@ export async function suggestUnitPrefill(
   // S582: start/end date defaults (same platform rules as the auto-draft path).
   // start = the unit's available_date if future, else today; end snaps to
   // month-end from the template's default_term_months (blank → month-to-month).
-  const start = computeLeaseStart(u.available_date)
+  const start = computeLeaseStart(u.available_date, new Date(), u.timezone)
   out.start_date = start
   if (templateId) {
     const trow = exec

@@ -40,6 +40,18 @@ vi.mock('../services/email', async (importOriginal) => {
   }
 })
 
+// S654: pass-through spy on the credit emitters so a test can see the
+// calendar day and the property zone the webhook hands them. Behavior is the
+// real emitter's.
+vi.mock('../services/creditLedgerEmitters', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/creditLedgerEmitters')>()
+  return {
+    ...actual,
+    emitPaymentSettledEvent: vi.fn(actual.emitPaymentSettledEvent),
+    emitPaymentFailedEvent: vi.fn(actual.emitPaymentFailedEvent),
+  }
+})
+
 vi.mock('stripe', () => {
   const transfersCreate = vi.fn(async () => ({ id: 'tr_mock' }))
   const customersRetrieve = vi.fn(async () => ({}))
@@ -66,6 +78,7 @@ vi.mock('stripe', () => {
 
 import Stripe from 'stripe'
 import { webhooksRouter } from './webhooks'
+import { emitPaymentSettledEvent, emitPaymentFailedEvent } from '../services/creditLedgerEmitters'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema,
@@ -506,6 +519,49 @@ describe('POST /webhooks/stripe — payment_intent.succeeded rent', () => {
     )
     expect(notif.rows).toHaveLength(1)
   })
+
+  // S654: the credit tier compares calendar days where the PROPERTY is. The
+  // webhook hands the emitter the due day as 'YYYY-MM-DD' and the property's
+  // zone; rent paid on its due date by that property's clock is on time at
+  // any hour (it used to turn late at 5 pm Phoenix, when UTC rolled over).
+  it('rent paid on its due date in the property\'s zone is recorded on time', async () => {
+    const tz = 'Pacific/Honolulu'
+    const client = await getClient()
+    let paymentId: string, tenantId: string
+    try {
+      const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+      tenantId = await seedTenant(client)
+      const propertyId = await seedProperty(client, { landlordId, ownerUserId, managedByUserId: ownerUserId })
+      await client.query(`UPDATE properties SET timezone = $2 WHERE id = $1`, [propertyId, tz])
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+      await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
+      paymentId = await seedRentPayment(client, {
+        unitId, tenantId, landlordId, amount: 1000, status: 'pending', stripePaymentIntentId: 'pi_rent_tz_1',
+      })
+      await client.query(
+        `UPDATE payments SET due_date = (NOW() AT TIME ZONE $2)::date WHERE id = $1`, [paymentId, tz])
+    } finally { client.release() }
+    const due = (await db.query<{ d: string }>(
+      `SELECT due_date::text AS d FROM payments WHERE id = $1`, [paymentId!])).rows[0].d
+
+    vi.mocked(emitPaymentSettledEvent).mockClear()
+    const res = await request(buildApp())
+      .post('/webhooks/stripe').set('Content-Type', 'application/json').set('stripe-signature', 't=1,v1=stub')
+      .send(buildPaymentIntentSucceeded({ paymentIntentId: 'pi_rent_tz_1', paymentMethod: 'us_bank_account' }))
+    expect(res.status).toBe(200)
+
+    expect(vi.mocked(emitPaymentSettledEvent)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(emitPaymentSettledEvent).mock.calls[0][1]).toMatchObject({
+      paymentId: paymentId!, dueDate: due, propertyTz: tz,
+    })
+    const ev = await db.query<{ event_type: string; event_data: any }>(
+      `SELECT ce.event_type, ce.event_data FROM credit_events ce
+         JOIN credit_subjects cs ON cs.id = ce.subject_id
+        WHERE cs.subject_type = 'tenant' AND cs.subject_ref_id = $1`, [tenantId!])
+    expect(ev.rows).toHaveLength(1)
+    expect(ev.rows[0].event_type).toBe('payment_received_on_time')
+    expect(ev.rows[0].event_data.due_date).toBe(due)
+  })
 })
 
 describe('POST /webhooks/stripe — payment_intent.payment_failed', () => {
@@ -613,6 +669,12 @@ describe('POST /webhooks/stripe — payment_intent.payment_failed', () => {
     )
     expect(events.rows.map((r) => r.event_type))
       .toContain('payment_failed_nsf')
+
+    // S654: the due day goes to the ledger as a calendar date, not a Date.
+    const due = (await db.query<{ d: string }>(
+      `SELECT due_date::text AS d FROM payments WHERE id = $1`, [paymentId])).rows[0].d
+    const nsfCall = vi.mocked(emitPaymentFailedEvent).mock.calls.find((c) => c[1].paymentId === paymentId)
+    expect(nsfCall?.[1].dueDate).toBe(due)
   })
 
   it('zero-tolerance code (R05 unauthorized): permanent failure, no retry scheduled', async () => {

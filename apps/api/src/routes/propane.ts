@@ -26,14 +26,6 @@ import { validateFillLine, recordFill } from '../services/propaneFill'
 export const propaneRouter = Router()
 propaneRouter.use(requireAuth)
 
-const monthStart = (d: Date) =>
-  `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`
-const addMonths = (iso: string, n: number) => {
-  const d = new Date(iso + 'T00:00:00Z')
-  d.setUTCMonth(d.getUTCMonth() + n)
-  return monthStart(d)
-}
-
 // ── FILLS ────────────────────────────────────────────────────
 propaneRouter.get('/fills', requirePerm('units.edit', 'units.view_status', 'properties.edit'), async (req, res, next) => {
   try {
@@ -73,7 +65,8 @@ propaneRouter.get('/fills', requirePerm('units.edit', 'units.view_status', 'prop
 const UNIT_FILL_COLS = `u.id, u.landlord_id, u.property_id, u.unit_number,
               u.has_propane_tank,
               p.propane_allow_installments,
-              p.propane_split_min_gallons, p.propane_split_four_min_gallons`
+              p.propane_split_min_gallons, p.propane_split_four_min_gallons,
+              p.timezone`
 
 // PUT /api/propane/tanks — S613 (Nic): set which spaces have a tank, all at once.
 //
