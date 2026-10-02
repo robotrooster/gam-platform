@@ -123,13 +123,15 @@ export async function processIntentOnReader(args: {
 /**
  * S654 (Nic): "Can the tap happen in the background while the display is still
  * up for the breakdown? Can you just leave it going for like thirty to
- * forty-five seconds?" … "change it to just thirty seconds." After Charge the
- * breakdown stays up this long for the
- * tap; the reader keeps a card tapped on it and the charge goes through with
- * it. Stripe sends no word of the tap, so "They tapped — finish now" ends the
- * wait early.
+ * forty-five seconds?" … "change it to just thirty seconds." Then (10/2):
+ * "Nobody needs to look at their breakdown for a full 30 seconds... the screen
+ * is populating as the [cashier] is updating the register... 10 seconds is
+ * probably fine." After Charge the breakdown stays up this long for the tap;
+ * the reader keeps a card tapped on it and the charge goes through with it. A
+ * customer who hasn't tapped by then still can: the charge goes to the reader,
+ * which keeps asking for the card. "They tapped — finish now" ends it early.
  */
-export const TAP_WINDOW_SECONDS = 30
+export const TAP_WINDOW_SECONDS = 10
 
 /**
  * S654 (Nic): "link it to be always on the screen until the payment is
