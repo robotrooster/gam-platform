@@ -69,6 +69,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!sessionRenewalDue(current)) return
     try {
       const r = await apiPost<{ token: string }>('/auth/refresh')
+      // S654 (review): a sign-out (or another sign-in) while this was in flight wins.
+      if (localStorage.getItem('gam_business_token') !== current) return
       localStorage.setItem('gam_business_token', r.data.token)
       setToken(r.data.token)
     } catch (e) { if (isAuthRejection(e)) logout() }

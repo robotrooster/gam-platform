@@ -53,7 +53,8 @@ export function BankPage() {
               of the tab drives the month check AND the deposit matching below. */}
           <EntityPicker value={entityId} onChange={setEntityId} label="Company"
             note="Each company has its own bank, so its month is checked and its deposits matched on their own." />
-          <BankReconciliationPage embedded entityId={entityId} />
+          {/* S654 (review): keyed by company, so typed figures never carry over to another company's books. */}
+          <BankReconciliationPage key={entityId || 'none'} embedded entityId={entityId} />
           <div style={{ marginTop: 28 }}>
             <div className="card-title" style={{ marginBottom: 8 }}>Deposits that may be rent</div>
             <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>

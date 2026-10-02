@@ -46,7 +46,9 @@ async function companyOfExpense(req: any): Promise<string> {
   const row = /^[0-9a-f-]{36}$/i.test(id)
     ? await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM landlord_expenses WHERE id = $1`, [id])
     : null
-  if (!row || !ownsLandlord(req.user, row.landlord_id)) throw new AppError(404, 'Expense not found')
+  // S654 (review): a GAM admin acting from the landlord screens keeps the access it had.
+  const admin = req.user?.role === 'admin' || req.user?.role === 'super_admin'
+  if (!row || !(ownsLandlord(req.user, row.landlord_id) || admin)) throw new AppError(404, 'Expense not found')
   return row.landlord_id
 }
 

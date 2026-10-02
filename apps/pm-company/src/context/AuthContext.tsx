@@ -86,6 +86,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!sessionRenewalDue(current)) return
     try {
       const r = await apiPost<{ token: string }>('/auth/refresh')
+      // S654 (review): a sign-out (or another sign-in) while this was in flight wins.
+      if (localStorage.getItem('gam_token') !== current) return
       localStorage.setItem('gam_token', r.data.token)
       setToken(r.data.token)
     } catch (e) { if (isAuthRejection(e)) logout() }
@@ -100,14 +102,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const me = await fetchAuthMeWithRetry(() => apiGet<AuthUser>('/auth/me'))
       setUser(me)
-      await renewSession()
       // Load the user's pm_staff memberships
       try {
         const companies = await apiGet<ActivePmCompany[]>('/pm/companies')
         setPmCompanies(companies)
         if (companies.length > 0) {
           const stored = localStorage.getItem('gam_active_pm_company')
-          const match = companies.find(c => c.id === stored) ?? companies[0]
+          // S654 (Nic, DIRECTIVE): no default company. One company is simply
+          // the company; with several, the person chooses (the app asks).
+          const match = companies.find(c => c.id === stored) ?? (companies.length === 1 ? companies[0] : null)
           setActivePmCompanyState(match)
         } else {
           setActivePmCompanyState(null)
@@ -117,6 +120,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setPmCompanies([])
         setActivePmCompanyState(null)
       }
+      // Renewed last, so a refused renewal signs out without a request still in flight.
+      await renewSession()
     } catch (e) {
       // S540: only a real auth rejection ends the session. API
       // restarts / network blips keep the token; next load recovers.

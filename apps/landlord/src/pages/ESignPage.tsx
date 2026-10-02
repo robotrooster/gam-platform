@@ -19,7 +19,6 @@ import { SearchBox } from '../components/ListControls'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, Printer, MoreVertical, Undo2, Redo2, PenLine } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { toast, appConfirm } from '../components/dialogs'
-import { EntityPicker, useEntities } from '../components/EntityPicker'
 import { downloadAuthedFile, printAuthedFile } from '../lib/downloadFile'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -1196,14 +1195,17 @@ function SendDocumentModal({ onClose }) {
   const existingTenants = units.filter(u => u.tenantEmail).map(u => ({ email: u.tenantEmail, name: u.tenantFirst + ' ' + u.tenantLast, unit: u.unitNumber, unitId: u.id, propertyName: u.propertyName }))
   const properties = Array.from(new Map((units as any[]).map(u => [u.propertyId, { id: u.propertyId, name: u.propertyName }])).values())
   const selectedTemplate = templates.find(t => t.id === templateId)
-  // S654 (Nic, DIRECTIVE): no default company. Typed emails that match no
-  // tenant name no unit, so nothing says which company is sending; an account
-  // with several picks one BEFORE any invite goes out.
-  const [entityId, setEntityId] = useState('')
-  const { data: entities = [] } = useEntities()
+  // S654: typed emails that match no tenant name no unit, so nothing says where
+  // the person is being invited. An invite always belongs to a PROPERTY (its
+  // screening and onboarding rules come from there, and the property says which
+  // company is sending) — so the landlord picks the property BEFORE any invite
+  // goes out. Never a default; this also fixed the send for one-company accounts,
+  // which the invite route refused without a unit or property.
+  const [manualPropertyId, setManualPropertyId] = useState('')
+  const { data: allProperties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
   const manualFirstEmail = (tenantEmails.find(e => e.trim()) || '').trim()
-  const manualNoUnit = mode === 'manual' && !existingTenants.find(t => t.email === manualFirstEmail)
-  const manualCompanyMissing = manualNoUnit && entities.length >= 2 && !entityId
+  const manualNoUnit = mode === 'manual' && !!manualFirstEmail && !existingTenants.find(t => t.email === manualFirstEmail)
+  const manualPropertyMissing = manualNoUnit && !manualPropertyId
 
   // S535 auto-pull: picking a unit selects the template written for its
   // type (newest exact-type match, else universal) unless the current
@@ -1352,10 +1354,10 @@ function SendDocumentModal({ onClose }) {
     const validEmails = tenantEmails.filter(e => e.trim())
     if (!validEmails.length) { setError('Please enter at least one email'); return }
     const firstTenant = existingTenants.find(t => t.email === validEmails[0].trim())
-    if (!firstTenant && entities.length >= 2 && !entityId) {
-      setError('Choose which company is sending this document.'); return
+    if (!firstTenant && !manualPropertyId) {
+      setError('Choose which property this document is for.'); return
     }
-    const company = !firstTenant && entityId ? { landlordId: entityId } : {}
+    const company = !firstTenant ? { propertyId: manualPropertyId } : {}
     setSending(true)
     try {
       const signers = []
@@ -1399,7 +1401,7 @@ function SendDocumentModal({ onClose }) {
   const canSend = !!templateId && (
     mode === 'unit' ? !!selectedUnitId && recipientGroups.length > 0 :
     mode === 'property' ? !!selectedPropertyId && recipientGroups.length > 0 :
-    tenantEmails.some(e => e.trim()) && !manualCompanyMissing
+    tenantEmails.some(e => e.trim()) && !manualPropertyMissing
   )
 
   return (
@@ -1500,8 +1502,12 @@ function SendDocumentModal({ onClose }) {
             <button className='btn btn-ghost btn-sm' onClick={() => { setTenantEmails(prev => [...prev,'']); setSearches(prev => [...prev,'']) }}><Plus size={12} /> Add Another Signer</button>
             {manualNoUnit && (
               <div style={{ marginTop:10 }}>
-                <EntityPicker value={entityId} onChange={setEntityId} label="Sent by"
-                  note="No unit matches these emails, so choose the company sending it." />
+                <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', display:'block', marginBottom:6 }}>Which property is this for?</label>
+                <select className='form-select' value={manualPropertyId} onChange={e => setManualPropertyId(e.target.value)} style={{ width:'100%' }}>
+                  <option value=''>Choose a property…</option>
+                  {(allProperties as any[]).map((p: any) => <option key={p.id} value={p.id}>{p.name || p.street1 || p.address1 || 'Property'}</option>)}
+                </select>
+                <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:4 }}>No unit matches these emails, so the invite goes to the property you choose.</div>
               </div>
             )}
           </div>

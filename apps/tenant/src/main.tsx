@@ -220,7 +220,8 @@ function AuthProvider({children}:{children:React.ReactNode}) {
   const renewSession = useCallback(async()=>{
     const current = localStorage.getItem('gam_tenant_token')
     if(!sessionRenewalDue(current)) return
-    try{ const r = await post<{token:string}>('/auth/refresh'); localStorage.setItem('gam_tenant_token', r.data.token); setToken(r.data.token) }
+    // S654 (review): a sign-out (or another sign-in) while this was in flight wins.
+    try{ const r = await post<{token:string}>('/auth/refresh'); if (localStorage.getItem('gam_tenant_token') !== current) return; localStorage.setItem('gam_tenant_token', r.data.token); setToken(r.data.token) }
     catch(e){ if (isAuthRejection(e)) logout() }
   },[logout])
   useEffect(()=>{

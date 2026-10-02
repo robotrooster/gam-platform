@@ -99,6 +99,21 @@ describe('compliance archive: every live column has a home in its archive', () =
         .filter(c => !liveNames.has(c.column_name) && c.is_nullable === 'NO' && c.column_default == null)
         .map(c => c.column_name)
       expect(unfillable).toEqual([])
+
+      // S654 (review): the 10/1 failure needed a CHECK change too ('undeliverable'
+      // was allowed live but not in the archive). Every CHECK on the live table
+      // must exist, word for word, on the archive; sizes must match as well.
+      const checks = async (t: string) => (await db.query<{ def: string }>(
+        `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+          WHERE conrelid = $1::regclass AND contype = 'c' ORDER BY 1`, [t])).rows.map(r => r.def)
+      const archiveChecks = new Set(await checks(`${table}_archive`))
+      expect((await checks(table)).filter(d => !archiveChecks.has(d))).toEqual([])
+      const sizes = async (t: string) => new Map((await db.query<any>(
+        `SELECT column_name, numeric_precision, numeric_scale, character_maximum_length
+           FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`, [t]))
+        .rows.map((c: any) => [c.column_name, `${c.numeric_precision}/${c.numeric_scale}/${c.character_maximum_length}`]))
+      const liveSizes = await sizes(table), archiveSizes = await sizes(`${table}_archive`)
+      expect([...liveSizes].filter(([n, v]) => archiveSizes.get(n) !== v).map(([n]) => n)).toEqual([])
     })
   }
 })

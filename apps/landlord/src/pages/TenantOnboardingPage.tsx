@@ -105,6 +105,9 @@ const CHOOSE_COMPANY_FIRST = 'Choose the company this file belongs to first.'
 function OnboardingWindowsBanner() {
   const qc = useQueryClient()
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
+  // S654 (review): a closed-window property answered here stays on screen with
+  // its answer marked, so a mistaken tap can be switched — no other screen sets it.
+  const [answeredHere, setAnsweredHere] = useState<Set<string>>(new Set())
   const { data: windows = [] } = useQuery<any[]>('onboarding-windows', () => apiGet('/landlords/me/onboarding-windows'))
   const completeMut = useMutation(
     (propertyId: string) => apiPost(`/properties/${propertyId}/onboarding-complete`, {}),
@@ -119,10 +122,10 @@ function OnboardingWindowsBanner() {
     {
       onSuccess: (_d, { propertyId, waive }) => {
         qc.invalidateQueries('onboarding-windows')
-        // A closed-window row leaves the list once answered; say what was saved.
         const w = all.find(x => x.propertyId === propertyId)
         if (w && !w.open) {
-          toast(`${w.propertyName}: ${waive ? 'late fees waived' : 'late fees apply'} on each resident's first bill.`)
+          setAnsweredHere(prev => new Set(prev).add(propertyId))
+          toast(`${w.propertyName}: ${waive ? 'late fees waived' : 'late fees apply'} on each resident's first bill. You can still switch it here.`)
         }
       },
       onError: (e: any) => toast(serverReason(e, 'Could not save that answer. Try again.')),
@@ -133,7 +136,7 @@ function OnboardingWindowsBanner() {
   // never be answered and its residents' first bills would carry late fees by
   // default. An unanswered property keeps the question after its window closes;
   // "Mark onboarding complete" stays limited to open windows.
-  const unansweredClosed = all.filter(w => !w.open && w.lateFeeWaiver == null)
+  const unansweredClosed = all.filter(w => !w.open && (w.lateFeeWaiver == null || answeredHere.has(w.propertyId)))
   if (openWins.length === 0 && unansweredClosed.length === 0) return null
 
   const waiverQuestion = (w: any) => (
@@ -141,10 +144,11 @@ function OnboardingWindowsBanner() {
       <span style={{ color: w.lateFeeWaiver == null ? 'var(--gold)' : 'var(--text-2)' }}>
         Waive late fees on each resident&apos;s first bill while they move over?
       </span>
-      <button className={`btn btn-sm ${w.lateFeeWaiver === true ? 'btn-primary' : 'btn-ghost'}`}
+      {/* Unanswered: both are actions (gold). Answered: the saved one gold, the other the switch. */}
+      <button className={`btn btn-sm ${w.lateFeeWaiver === true || w.lateFeeWaiver == null ? 'btn-primary' : 'btn-ghost'}`}
         disabled={waiverMut.isLoading}
         onClick={() => waiverMut.mutate({ propertyId: w.propertyId, waive: true })}>Yes, waive</button>
-      <button className={`btn btn-sm ${w.lateFeeWaiver === false ? 'btn-primary' : 'btn-ghost'}`}
+      <button className={`btn btn-sm ${w.lateFeeWaiver === false || w.lateFeeWaiver == null ? 'btn-primary' : 'btn-ghost'}`}
         disabled={waiverMut.isLoading}
         onClick={() => waiverMut.mutate({ propertyId: w.propertyId, waive: false })}>No, charge them</button>
       {w.lateFeeWaiver == null && (
@@ -184,7 +188,7 @@ function OnboardingWindowsBanner() {
           Late fees on residents&apos; first bill
         </div>
         <div style={{ fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5, marginBottom: 10 }}>
-          The onboarding window has closed at {unansweredClosed.length === 1 ? 'this property' : 'these properties'}, but this question was never answered.
+          This question was never answered for {unansweredClosed.length === 1 ? 'this property' : 'these properties'}. Until it is, late fees apply.
         </div>
         {unansweredClosed.map(w => (
           <div key={w.propertyId} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 0', borderTop: '1px solid var(--border-0)', flexWrap: 'wrap' }}>
@@ -1233,6 +1237,10 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
   const [pendingDecisions, setPendingDecisions] = useState<NonNullable<ValidateResponse['missingLateFeeDecisions']>>([])
   const [decisionInputs, setDecisionInputs] = useState<Record<string, { noLateFee: boolean; amount: string; grace: string; kind: 'flat' | 'percent_of_rent' }>>({})
   const [savingDecisions, setSavingDecisions] = useState(false)
+  // S654 (review): unit cards being onboarded right now. The company can't be
+  // switched under a card whose import is still in flight.
+  const [cardsBusy, setCardsBusy] = useState(0)
+  const cardBusy = (on: boolean) => setCardsBusy(n => Math.max(0, n + (on ? 1 : -1)))
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Limbo state — rows missing only lease data routed to pending pool.
@@ -1483,7 +1491,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
       <button onClick={onBack} className="btn btn-ghost" style={{ marginBottom: 16 }}>&larr; Back</button>
 
       <EntityPicker value={landlordId} onChange={chooseCompany}
-        disabled={validateMut.isLoading || savingDecisions}
+        disabled={validateMut.isLoading || savingDecisions || cardsBusy > 0}
         note="Every tenant in this file is onboarded under this company." />
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
@@ -1709,7 +1717,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
       {validateSummary && <ValidateSummary summary={validateSummary} hasPunchList={!!(punchListRows && punchListRows.length > 0)} />}
 
       {punchListRows && punchListRows.length > 0 && (
-        <PunchList rows={punchListRows} source={source} claimedPlatformName={claimedPlatformName} landlordId={landlordId} companyMissing={companyMissing} onUnitCommitted={handleUnitCommitted} />
+        <PunchList rows={punchListRows} source={source} claimedPlatformName={claimedPlatformName} landlordId={landlordId} companyMissing={companyMissing} onUnitCommitted={handleUnitCommitted} onBusy={cardBusy} />
       )}
 
       {punchListRows && punchListRows.length === 0 && validateSummary && validateSummary.total > 0 && !fastPathBanner && (
@@ -1756,7 +1764,7 @@ function SummaryStat({ label, value, color, icon }: { label: string; value: numb
 // S633: landlordId is threaded down rather than re-resolved here — the company
 // was chosen once, at the top of the import, and every row in the file belongs
 // to it. Re-deriving per card would let one file straddle two companies.
-function PunchList({ rows, source, claimedPlatformName, landlordId, companyMissing, onUnitCommitted }: { rows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; companyMissing: boolean; onUnitCommitted: (unitId: string) => void }) {
+function PunchList({ rows, source, claimedPlatformName, landlordId, companyMissing, onUnitCommitted, onBusy }: { rows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; companyMissing: boolean; onUnitCommitted: (unitId: string) => void; onBusy: (on: boolean) => void }) {
   // Group by resolvedUnitId. Rows without a resolved unit get a synthetic key per row
   // (so each unmatched row appears as its own card with a clear "add property first" message).
   const groups = useMemo(() => {
@@ -1786,13 +1794,14 @@ function PunchList({ rows, source, claimedPlatformName, landlordId, companyMissi
           landlordId={landlordId}
           companyMissing={companyMissing}
           onCommitted={() => { if (groupRows[0].resolvedUnitId) onUnitCommitted(groupRows[0].resolvedUnitId) }}
+          onBusy={onBusy}
         />
       ))}
     </div>
   )
 }
 
-function UnitCard({ initialRows, source, claimedPlatformName, landlordId, companyMissing, onCommitted }: { initialRows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; companyMissing: boolean; onCommitted: () => void }) {
+function UnitCard({ initialRows, source, claimedPlatformName, landlordId, companyMissing, onCommitted, onBusy }: { initialRows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; companyMissing: boolean; onCommitted: () => void; onBusy: (on: boolean) => void }) {
   const [groupRows, setGroupRows] = useState<CsvRow[]>(initialRows)
   const [submitErr, setSubmitErr] = useState<string>('')
   const [submitting, setSubmitting] = useState<boolean>(false)
@@ -1846,6 +1855,8 @@ function UnitCard({ initialRows, source, claimedPlatformName, landlordId, compan
     if (companyMissing) { setSubmitErr(CHOOSE_COMPANY_FIRST); return }
     setSubmitErr('')
     setSubmitting(true)
+    onBusy(true)
+    let landed = false
     try {
       // S177: re-classify groupRows at submit time. Pre-S177 the punch-list
       // resubmit always hit /commit, which rejects on any remaining lease
@@ -1883,12 +1894,14 @@ function UnitCard({ initialRows, source, claimedPlatformName, landlordId, compan
         setRoutedTo('commit')
       }
       setCommitted(true)
+      landed = true
       // Brief pause so the green confirmation flashes before the parent unmounts the card.
-      setTimeout(() => onCommitted(), 600)
+      setTimeout(() => { onCommitted(); onBusy(false) }, 600)
     } catch (e: any) {
       setSubmitErr(serverReason(e, 'Submission failed. Check the highlighted fields.'))
     } finally {
       setSubmitting(false)
+      if (!landed) onBusy(false)
     }
   }
 

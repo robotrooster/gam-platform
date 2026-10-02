@@ -62,7 +62,9 @@ lotRentRouter.post('/charges/:id/record-paid', requireLandlord, async (req: any,
     const rows = /^[0-9a-f-]{36}$/i.test(id)
       ? await query<{ landlord_id: string }>(`SELECT landlord_id FROM lot_rent_charges WHERE id = $1`, [id])
       : []
-    if (!rows.length || !ownsLandlord(req.user, rows[0].landlord_id)) {
+    // S654 (review): a GAM admin acting from the landlord screens keeps the access it had.
+    const admin = req.user?.role === 'admin' || req.user?.role === 'super_admin'
+    if (!rows.length || !(ownsLandlord(req.user, rows[0].landlord_id) || admin)) {
       throw new AppError(404, 'Lot-rent charge not found, already paid, or not yours')
     }
     await recordLotRentPaid(id, rows[0].landlord_id)
