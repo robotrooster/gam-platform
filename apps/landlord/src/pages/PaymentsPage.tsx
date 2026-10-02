@@ -515,13 +515,16 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, live, onDone }: {
     } catch (e: any) {
       if (!live()) return
       const msg = e?.response?.data?.error || e?.message || 'The reader did not complete the payment'
-      setStage('idle')
       if (piId) {
         // S654 (Nic): clear the reader; keep the charge. "Send again" resends it.
+        // Cleared FIRST, so the breakdown that goes back up is not cleared with it.
         await apiPost(`/payments/reader/intents/${piId}/clear-reader`, { stripeReaderId: readerId }).catch(() => {})
+        if (!live()) return
+        setStage('idle')
         livePi.current = piId; setCanResend(true)
         setErr(/timed out/i.test(msg) ? 'No card was presented. Send it to the reader again when they are ready.' : `${msg} — send again to try another card.`)
       } else {
+        setStage('idle')
         setErr(msg)
       }
     }

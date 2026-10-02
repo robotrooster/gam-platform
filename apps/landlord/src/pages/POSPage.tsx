@@ -632,10 +632,20 @@ export function POSPage() {
   const liveCartLines = cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
   const liveCartSig = liveReaderId && registerProperty && cart.length
     ? JSON.stringify([liveReaderId, registerProperty, liveCartLines, discountAmt, tenantId, posCustomerId, readerCartNonce]) : ''
+  // Every call to the reader goes in one line, in order: a take-down can never
+  // land before a display that was already on its way, and it reads what is up
+  // only after that display has landed.
+  const queueReader = <T,>(fn: () => Promise<T>): Promise<T> => {
+    const run = (liveCartCall.current ?? Promise.resolve()).then(fn)
+    liveCartCall.current = run.catch(() => {})
+    return run
+  }
   const takeDownLiveCart = () => {
-    const was = shownOnReader.current
-    shownOnReader.current = null
-    if (was) liveCartCall.current = showCartLive({ stripeReaderId: was.readerId, propertyId: was.propertyId, items: [] }).catch(() => {})
+    void queueReader(async () => {
+      const was = shownOnReader.current
+      shownOnReader.current = null
+      if (was) await showCartLive({ stripeReaderId: was.readerId, propertyId: was.propertyId, items: [] }).catch(() => {})
+    })
   }
   useEffect(() => {
     if (terminalStatus === 'collecting' || terminalStatus === 'capturing') return
@@ -643,16 +653,25 @@ export function POSPage() {
     if (shownOnReader.current && shownOnReader.current.readerId !== liveReaderId) takeDownLiveCart()
     if (readerCart?.shown && readerCart.sig === liveCartSig && shownOnReader.current?.readerId === liveReaderId) return
     let cancelled = false
+    let retry: ReturnType<typeof setTimeout> | undefined
+    // A reader still busy (the last customer's question) or a display that
+    // failed is tried again every few seconds while this cart is on screen.
+    const tryAgain = () => { retry = setTimeout(() => setReaderCartNonce(n => n + 1), 3000) }
+    const target = { readerId: liveReaderId!, propertyId: registerProperty }
     const timer = setTimeout(() => {
-      const call = showCartLive({ stripeReaderId: liveReaderId!, propertyId: registerProperty, items: liveCartLines,
-        discountAmount: discountAmt, tenantId: tenantId || null, posCustomerId: posCustomerId || null })
-      liveCartCall.current = call.catch(() => {})
-      call.then(r => {
-        if (r.shown) shownOnReader.current = { readerId: liveReaderId!, propertyId: registerProperty }
-        if (!cancelled) setReaderCart({ sig: liveCartSig, shown: !!r.shown, busy: r.busy })
-      }).catch(() => { if (!cancelled) setReaderCart({ sig: liveCartSig, shown: false }) })
+      queueReader(async () => {
+        if (cancelled) return null   // the cart moved on before this one was sent
+        const r = await showCartLive({ stripeReaderId: target.readerId, propertyId: target.propertyId, items: liveCartLines,
+          discountAmount: discountAmt, tenantId: tenantId || null, posCustomerId: posCustomerId || null })
+        if (r.shown) shownOnReader.current = target
+        return r
+      }).then(r => {
+        if (!r || cancelled) return
+        setReaderCart({ sig: liveCartSig, shown: !!r.shown, busy: r.busy })
+        if (!r.shown) tryAgain()
+      }).catch(() => { if (!cancelled) { setReaderCart({ sig: liveCartSig, shown: false }); tryAgain() } })
     }, 500)
-    return () => { cancelled = true; clearTimeout(timer) }
+    return () => { cancelled = true; clearTimeout(timer); clearTimeout(retry) }
   }, [liveCartSig, terminalStatus])   // eslint-disable-line react-hooks/exhaustive-deps
   // Leaving the register takes the breakdown off the reader.
   useEffect(() => () => takeDownLiveCart(), [])   // eslint-disable-line react-hooks/exhaustive-deps
@@ -908,9 +927,10 @@ export function POSPage() {
         await liveCartCall.current?.catch(() => {})
         if (!breakdownUp) {
           const l = latest.current
-          const r = await showCartLive({ stripeReaderId: activeReader.stripeReaderId, propertyId: registerProperty,
+          const rid = activeReader.stripeReaderId
+          const r = await queueReader(() => showCartLive({ stripeReaderId: rid, propertyId: registerProperty,
             items: l.cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax })),
-            discountAmount: l.discountAmt, tenantId: l.tenantId || null, posCustomerId: l.posCustomerId || null }).catch(() => null)
+            discountAmount: l.discountAmt, tenantId: l.tenantId || null, posCustomerId: l.posCustomerId || null })).catch(() => null)
           breakdownUp = !!r?.shown
           if (breakdownUp) shownOnReader.current = { readerId: activeReader.stripeReaderId, propertyId: registerProperty }
         }
@@ -1493,7 +1513,7 @@ export function POSPage() {
                 total={discountedSubtotal + taxAmount}
                 customerPaysFee={!absorbsCardFee}
                 onClose={()=>setPayLinkOpen(false)}
-                onSent={()=>{ setPayLinkOpen(false); abandonPendingIntent(); setCart([]); setAppliedDiscount(null); setOpenTicketId(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets') }}
+                onSent={()=>{ setPayLinkOpen(false); abandonPendingIntent(); setCart([]); setTenantId(''); setPosCustomerId(''); setAppliedDiscount(null); setOpenTicketId(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets') }}
               />
             )}
           </div>
