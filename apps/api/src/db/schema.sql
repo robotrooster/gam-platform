@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict APaiX1lv2RSg22XcSmrQo44sImL4aA2hyXDKqoTX1UnXYzLzRfgLKkYfgq1hSSM
+\restrict gdrh39oQZWNGdedUJSJKJvrCHnE8wU5WhpR6vkJBn5iEL7T8PoHWM3BiadwMsk1
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3938,7 +3938,10 @@ CREATE TABLE public.email_send_log_archive (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     archived_at timestamp with time zone DEFAULT now() NOT NULL,
     body_text text,
-    CONSTRAINT email_send_log_archive_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text, 'suppressed'::text])))
+    provider_message_id text,
+    last_event text,
+    last_event_at timestamp with time zone,
+    CONSTRAINT email_send_log_archive_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text, 'suppressed'::text, 'undeliverable'::text])))
 );
 
 
@@ -28407,5 +28410,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict APaiX1lv2RSg22XcSmrQo44sImL4aA2hyXDKqoTX1UnXYzLzRfgLKkYfgq1hSSM
+\unrestrict gdrh39oQZWNGdedUJSJKJvrCHnE8wU5WhpR6vkJBn5iEL7T8PoHWM3BiadwMsk1
 
