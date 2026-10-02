@@ -400,3 +400,83 @@ describe('S655 the waiver belongs to the company that granted it', () => {
     }
   })
 })
+
+// ─── S655: a sister company's waiver is the account's ───────────────────────
+//
+// Until the post-deploy step drops the old person-wide no-unit index, a second
+// company's waiver row collides with the first one's. When that first row
+// belongs to ANOTHER COMPANY OF THE SAME ACCOUNT and already carries a waiver,
+// the account already holds it (every reader counts it account-wide) — so the
+// other park must not send a returning resident to "contact GAM support".
+describe('S655 a sister company already holding the waiver', () => {
+  async function sisterOf(f: { userId: string }) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { rows: [{ id: landlordId }] } = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`, [f.userId])
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: f.userId, managedByUserId: f.userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      await c.query('COMMIT')
+      const token = jwt.sign(
+        { userId: f.userId, role: 'landlord', email: 'll@test.dev', profileId: null, landlordIds: [landlordId], permissions: {} },
+        process.env.JWT_SECRET!, { expiresIn: '1h' })
+      return { userId: f.userId, landlordId, propertyId, unitId, token }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('a returning resident at the sister park goes through, the held waiver untouched and no allowance used', async () => {
+    const oak = await seedFixture()
+    const mv = await sisterOf(oak)
+    const tenantId = await seedTenant()
+    const email = (await db.query(`SELECT u.email FROM users u JOIN tenants t ON t.user_id = u.id WHERE t.id = $1`, [tenantId])).rows[0].email
+    // Oak Park already waived them (its live no-unit row).
+    const { rows: [oakRow] } = await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id,
+                                           screening_waived, screening_attested, screening_waived_at)
+       VALUES ($1, $2, 'not_uploaded', $3, NULL, true, true, NOW()) RETURNING id`, [oak.landlordId, tenantId, oak.propertyId])
+    const before = (await db.query(`SELECT * FROM pending_tenant_intents WHERE id = $1`, [oakRow.id])).rows[0]
+
+    const res = await request(buildApp()).post('/api/tenants/invite')
+      .set('Authorization', `Bearer ${mv.token}`)
+      .send({ email, firstName: 'Back', lastName: 'Again', unitId: mv.unitId, returningResident: true })
+    expect(res.status).toBe(200)
+    expect(res.body.data.people[0].screeningWaived).toBe(true)
+    expect((await db.query(`SELECT * FROM pending_tenant_intents WHERE id = $1`, [oakRow.id])).rows[0]).toEqual(before)
+    // Mountain View never wrote a returning-resident waiver of its own.
+    expect(Number((await db.query(
+      `SELECT COUNT(*) FROM pending_tenant_intents WHERE landlord_id = $1 AND waive_reason = 'returning_resident'`,
+      [mv.landlordId])).rows[0].count)).toBe(0)
+  })
+
+  it('a sister row WITHOUT a waiver on it is still refused, and left untouched', async () => {
+    const oak = await seedFixture()
+    const mv = await sisterOf(oak)
+    await openWindow(mv.propertyId)
+    const tenantId = await seedTenant()
+    const { rows: [oakRow] } = await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id)
+       VALUES ($1, $2, 'not_uploaded', $3, NULL) RETURNING id`, [oak.landlordId, tenantId, oak.propertyId])
+    const before = (await db.query(`SELECT * FROM pending_tenant_intents WHERE id = $1`, [oakRow.id])).rows[0]
+    const r = await applyScreeningWaive({
+      tenantId, landlordId: mv.landlordId, propertyId: mv.propertyId, unitId: mv.unitId, byUserId: mv.userId,
+    })
+    expect(r).toEqual({ waived: false, reason: 'not_recorded' })
+    expect((await db.query(`SELECT * FROM pending_tenant_intents WHERE id = $1`, [oakRow.id])).rows[0]).toEqual(before)
+  })
+
+  it("a waiver never touches the person's own 'waived' screening status (Nic: do not reset the 95)", async () => {
+    const f = await seedFixture()
+    await openWindow(f.propertyId)
+    const tenantId = await seedTenant()
+    await db.query(`UPDATE tenants SET background_check_status = 'waived' WHERE id = $1`, [tenantId])
+    await inviteToUnit(tenantId, f)
+    const r = await applyScreeningWaive({
+      tenantId, landlordId: f.landlordId, propertyId: f.propertyId, unitId: f.unitId, byUserId: f.userId,
+    })
+    expect(r.waived).toBe(true)
+    expect((await db.query(`SELECT background_check_status FROM tenants WHERE id = $1`, [tenantId])).rows[0].background_check_status)
+      .toBe('waived')
+  })
+})
+

@@ -5553,6 +5553,9 @@ CREATE TABLE public.lease_documents (
     package_id uuid,
     package_sort_order integer,
     issued_at timestamp with time zone,
+    renewal_unsigned_alert_14d_at timestamp with time zone,
+    renewal_unsigned_alert_start_at timestamp with time zone,
+    new_lease_cancel_held_at timestamp with time zone,
     CONSTRAINT lease_documents_addendum_fields_check CHECK ((((document_type = 'addendum_remove'::text) AND (target_lease_tenant_id IS NOT NULL)) OR ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_terms'::text, 'sublease_agreement'::text, 'purchase_agreement'::text, 'bill_of_sale'::text, 'general_contract'::text, 'work_trade_addendum'::text])) AND (target_lease_tenant_id IS NULL) AND (promote_lease_tenant_id IS NULL)))),
     CONSTRAINT lease_documents_delivery_mode_check CHECK ((delivery_mode = ANY (ARRAY['agreement'::text, 'notice'::text]))),
     CONSTRAINT lease_documents_document_type_check CHECK ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_remove'::text, 'addendum_terms'::text, 'sublease_agreement'::text, 'purchase_agreement'::text, 'bill_of_sale'::text, 'general_contract'::text, 'work_trade_addendum'::text]))),
@@ -5572,6 +5575,27 @@ COMMENT ON COLUMN public.lease_documents.deposit_already_held IS 'S604: TRUE = t
 --
 
 COMMENT ON COLUMN public.lease_documents.signing_window_restarted_at IS 'S637: when the 48h signing window was last restarted by resending to outstanding tenant signers. Anchors the auto-void clock alongside the landlord signature.';
+
+
+--
+-- Name: COLUMN lease_documents.renewal_unsigned_alert_14d_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_documents.renewal_unsigned_alert_14d_at IS 'S655: when the landlord was told, 14 days before a new lease for a sitting tenant starts, that the tenant has not signed it. Once per document.';
+
+
+--
+-- Name: COLUMN lease_documents.renewal_unsigned_alert_start_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_documents.renewal_unsigned_alert_start_at IS 'S655: when the landlord was told, on the day a new lease for a sitting tenant started, that the tenant still has not signed it. Once per document.';
+
+
+--
+-- Name: COLUMN lease_documents.new_lease_cancel_held_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_documents.new_lease_cancel_held_at IS 'S655: when the 15-minute job could not cancel this new lease (the lease it follows ended early and nobody signed it) because money had already been paid on it, and told the landlord side and GAM. Once per document. NULL = never held.';
 
 
 --
@@ -6100,6 +6124,7 @@ CREATE TABLE public.leases (
     move_out_notice_note text,
     move_out_notice_prev_end_date date,
     prepaid_monthly_draw numeric(12,2),
+    holdover_signed_end_date date,
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
     CONSTRAINT leases_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
@@ -6158,6 +6183,13 @@ COMMENT ON COLUMN public.leases.move_out_notice_prev_end_date IS 'S653: what end
 --
 
 COMMENT ON COLUMN public.leases.prepaid_monthly_draw IS 'S653: the most paid-ahead credit one billing month may use; NULL = no cap. The resident pays the rest of each bill themselves.';
+
+
+--
+-- Name: COLUMN leases.holdover_signed_end_date; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.leases.holdover_signed_end_date IS 'S655 (decisions 10/2 #7): the end date the household signed, kept when the lease holds over past it until its new lease starts (end_date then reads the held-over day). NULL = never held over.';
 
 
 --
@@ -7446,6 +7478,7 @@ CREATE TABLE public.pos_customers (
     archived_at timestamp with time zone,
     created_from text DEFAULT 'manual'::text NOT NULL,
     tenant_id uuid,
+    elsewhere_ref text,
     CONSTRAINT pos_customers_created_from_check CHECK ((created_from = ANY (ARRAY['manual'::text, 'card_reader'::text])))
 );
 
@@ -10378,6 +10411,78 @@ COMMENT ON COLUMN public.tenant_remittances.reference IS 'S652: the check or mon
 --
 
 COMMENT ON COLUMN public.tenant_remittances.received_by IS 'S652: who at the office posted this manual receipt.';
+
+
+--
+-- Name: tenant_roster_drafts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_roster_drafts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid,
+    unit_id uuid,
+    household_order integer DEFAULT 0 NOT NULL,
+    first_name text NOT NULL,
+    last_name text NOT NULL,
+    email text NOT NULL,
+    phone text,
+    rent_due_day integer,
+    existing_resident boolean DEFAULT true NOT NULL,
+    package_template_ids uuid[],
+    home_sale boolean DEFAULT false NOT NULL,
+    opening_balance numeric(12,2),
+    file_values jsonb DEFAULT '{}'::jsonb NOT NULL,
+    source_platform text,
+    import_attempt_id uuid,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    confirmed_at timestamp with time zone,
+    confirmed_by uuid,
+    intent_id uuid,
+    discarded_at timestamp with time zone,
+    discarded_by uuid,
+    opening_balance_posted_at timestamp with time zone,
+    opening_balance_invoice_id uuid,
+    CONSTRAINT tenant_roster_drafts_opening_balance_positive CHECK (((opening_balance IS NULL) OR (opening_balance > (0)::numeric))),
+    CONSTRAINT tenant_roster_drafts_rent_due_day_range CHECK (((rent_due_day IS NULL) OR ((rent_due_day >= 1) AND (rent_due_day <= 28))))
+);
+
+
+--
+-- Name: TABLE tenant_roster_drafts; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.tenant_roster_drafts IS 'S655: people from a tenant CSV waiting for the landlord to review and confirm. No account, intent or lease exists for a live row.';
+
+
+--
+-- Name: COLUMN tenant_roster_drafts.unit_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_roster_drafts.unit_id IS 'NULL = not placed yet. Confirming refuses while any live row of the property is unplaced.';
+
+
+--
+-- Name: COLUMN tenant_roster_drafts.file_values; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_roster_drafts.file_values IS 'What the old system''s file said (rent, dates, deposit, late fee, raw names). Reference only; the lease drafts from the landlord''s setup.';
+
+
+--
+-- Name: COLUMN tenant_roster_drafts.opening_balance; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_roster_drafts.opening_balance IS 'Old-system balance owed. Posts once, as a carried-balance charge on the household''s lease when it issues. The household''s first person carries it.';
+
+
+--
+-- Name: COLUMN tenant_roster_drafts.opening_balance_posted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_roster_drafts.opening_balance_posted_at IS 'When the household''s old balance posted. Set on every row of the household; once set, no later lease posts it again.';
 
 
 --
@@ -15028,6 +15133,14 @@ ALTER TABLE ONLY public.tenant_remittances
 
 
 --
+-- Name: tenant_roster_drafts tenant_roster_drafts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_roster_drafts
+    ADD CONSTRAINT tenant_roster_drafts_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: tenant_walkthrough_media tenant_walkthrough_media_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -18975,6 +19088,27 @@ CREATE INDEX idx_tenant_remittances_tenant ON public.tenant_remittances USING bt
 
 
 --
+-- Name: idx_tenant_roster_drafts_intent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_roster_drafts_intent ON public.tenant_roster_drafts USING btree (intent_id) WHERE (intent_id IS NOT NULL);
+
+
+--
+-- Name: idx_tenant_roster_drafts_property_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_roster_drafts_property_live ON public.tenant_roster_drafts USING btree (property_id) WHERE ((confirmed_at IS NULL) AND (discarded_at IS NULL));
+
+
+--
+-- Name: tenant_roster_drafts_live_email_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX tenant_roster_drafts_live_email_key ON public.tenant_roster_drafts USING btree (landlord_id, lower(email)) WHERE ((confirmed_at IS NULL) AND (discarded_at IS NULL));
+
+
+--
 -- Name: idx_tenant_walkthrough_media_tenant; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -19990,6 +20124,13 @@ CREATE UNIQUE INDEX pos_customers_email_landlord_uniq ON public.pos_customers US
 
 
 --
+-- Name: pos_customers_landlord_elsewhere_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pos_customers_landlord_elsewhere_uniq ON public.pos_customers USING btree (landlord_id, elsewhere_ref) WHERE ((archived_at IS NULL) AND (elsewhere_ref IS NOT NULL));
+
+
+--
 -- Name: pos_customers_landlord_tenant_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -20225,6 +20366,20 @@ CREATE UNIQUE INDEX units_property_building_number_uniq ON public.units USING bt
 --
 
 CREATE UNIQUE INDEX uq_business_wo_time_entries_one_running ON public.business_work_order_time_entries USING btree (work_order_id, user_id) WHERE (ended_at IS NULL);
+
+
+--
+-- Name: uq_disbursements_stripe_payout_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_disbursements_stripe_payout_id ON public.disbursements USING btree (stripe_payout_id) WHERE (stripe_payout_id IS NOT NULL);
+
+
+--
+-- Name: INDEX uq_disbursements_stripe_payout_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON INDEX public.uq_disbursements_stripe_payout_id IS 'S655: one disbursements row per Stripe payout. autoPayouts and connectPayoutSync both insert with ON CONFLICT (stripe_payout_id).';
 
 
 --
@@ -21226,6 +21381,13 @@ CREATE TRIGGER audit_tenant_one_off_charges AFTER DELETE OR UPDATE ON public.ten
 --
 
 CREATE TRIGGER audit_tenant_questionnaires AFTER DELETE OR UPDATE ON public.tenant_questionnaires FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: tenant_roster_drafts audit_tenant_roster_drafts; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_tenant_roster_drafts AFTER DELETE OR UPDATE ON public.tenant_roster_drafts FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -27681,6 +27843,78 @@ ALTER TABLE ONLY public.tenant_remittances
 
 ALTER TABLE ONLY public.tenant_remittances
     ADD CONSTRAINT tenant_remittances_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: tenant_roster_drafts tenant_roster_drafts_confirmed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_roster_drafts
+    ADD CONSTRAINT tenant_roster_drafts_confirmed_by_fkey FOREIGN KEY (confirmed_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_roster_drafts tenant_roster_drafts_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_roster_drafts
+    ADD CONSTRAINT tenant_roster_drafts_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_roster_drafts tenant_roster_drafts_discarded_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_roster_drafts
+    ADD CONSTRAINT tenant_roster_drafts_discarded_by_fkey FOREIGN KEY (discarded_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_roster_drafts tenant_roster_drafts_import_attempt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_roster_drafts
+    ADD CONSTRAINT tenant_roster_drafts_import_attempt_id_fkey FOREIGN KEY (import_attempt_id) REFERENCES public.csv_import_attempts(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_roster_drafts tenant_roster_drafts_intent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_roster_drafts
+    ADD CONSTRAINT tenant_roster_drafts_intent_id_fkey FOREIGN KEY (intent_id) REFERENCES public.pending_tenant_intents(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_roster_drafts tenant_roster_drafts_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_roster_drafts
+    ADD CONSTRAINT tenant_roster_drafts_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_roster_drafts tenant_roster_drafts_opening_balance_invoice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_roster_drafts
+    ADD CONSTRAINT tenant_roster_drafts_opening_balance_invoice_id_fkey FOREIGN KEY (opening_balance_invoice_id) REFERENCES public.invoices(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_roster_drafts tenant_roster_drafts_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_roster_drafts
+    ADD CONSTRAINT tenant_roster_drafts_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_roster_drafts tenant_roster_drafts_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_roster_drafts
+    ADD CONSTRAINT tenant_roster_drafts_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
 
 
 --

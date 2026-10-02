@@ -9,9 +9,11 @@
  *
  * Rebuilds the link with the same rule the live code uses
  * (services/payoutComposition.stampPayoutTransfers), payout by payout, OLDEST
- * FIRST: each payout takes its Connect account's transfers that landed before
- * it (and after the account's previous GAM sweep) and are not yet in an earlier
- * payout, oldest first, while they fit.
+ * FIRST. Each payout looks at its Connect account's transfers that landed
+ * before it, after the account's previous GAM sweep, and are not yet in an
+ * earlier payout. GAM's own sweeps (auto_friday / catch_up) pay out the whole
+ * balance, so they take every one of those transfers; a payout made in the
+ * Stripe dashboard takes them oldest first, while they fit.
  *
  * Production, verified read-only (exact sums):
  *   65d0a4a4 $2,638.11 (9/10)  ← 9450b8c1 $589.00 + 201b3a4a $2,049.11
@@ -37,6 +39,12 @@
  * If a payout lands between steps 2 and 3, run this again just before the
  * deploy: it only touches payouts with nothing linked, so a second run links
  * the new one and leaves the verified mapping alone.
+ * After the deploy the nightly payout sync (services/connectPayoutSync.ts) also
+ * re-records any payout that did not fail and still has nothing linked, with
+ * this same rule, oldest payout first — the net under a recording that failed.
+ * That is not a substitute for this script: it raises an admin notice for any
+ * payout that does not tie out, and it never checks production's result
+ * against the verified mapping above.
  *
  * DRY RUN BY DEFAULT. DRY=0 applies (one transaction).
  *   cd apps/api && npx ts-node -T src/scripts/oct2_payout_transfer_backfill.ts
@@ -82,6 +90,8 @@ const STAYS_UNLINKED = ['a448278d-c1bd-4b53-8e05-f9f0abae6288']
       const r = await stampPayoutTransfers({
         disbursementId: p.id, connectAccountId: p.account, payoutAmount: p.amount,
         payoutAt: new Date(p.payout_at), client: c, notifyOnGap: false,
+        // A dry run is rolled back: it logs no take-back that never happened.
+        trial: !apply,
       })
       linked += r.intentIds.length
       console.log(`  ${new Date(p.payout_at).toLocaleDateString('en-CA', { timeZone: 'America/Phoenix' })} ${p.id} $${p.amount.toFixed(2)} (${p.trigger_type}, ${p.status})` +

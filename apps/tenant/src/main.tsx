@@ -83,6 +83,7 @@ function TelemetryPing() {
   return null
 }
 import { DialogHost, toast } from './components/dialogs'
+import { leaseReachedMe, pendingDocHome, showsSigningNotice, signingNoticeHeading, waitingLeaseNavItem } from './lib/pendingLease'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import { useForm } from 'react-hook-form'
 import axios from 'axios'
@@ -403,16 +404,36 @@ html{font-size:17px}
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 30000 } } })
 
 // ── LAYOUT ────────────────────────────────────────────────────
-function LeaseNavLink() {
-  const { data: pendingDocs = [] } = useQuery('pending-docs', () =>
-    fetch((import.meta as any).env?.VITE_API_URL + '/api/esign/pending', {
-      headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
-    }).then(r=>r.json()).then(r=>r.data||[])
-  )
-  const pendingDocId = (pendingDocs as any[])[0]?.documentId
-  return pendingDocId
-    ? <NavLink to={'/sign/'+pendingDocId} className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
-    : <NavLink to="/lease" className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
+// The documents waiting on this person's signature (GET /esign/pending). One
+// fetcher for every reader of the 'pending-docs' cache key, so they share it.
+const fetchPendingDocs = () =>
+  fetch((import.meta as any).env?.VITE_API_URL + '/api/esign/pending', {
+    headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
+  }).then(r=>r.json()).then(r=>r.data||[])
+
+function LeaseNavLink({ hasLease, me }: { hasLease: boolean; me: any }) {
+  const { data: pendingDocs = [] } = useQuery('pending-docs', fetchPendingDocs)
+  const rows = pendingDocs as any[]
+  // S655: a NEW LEASE for the home they already live in is not "the lease" —
+  // the Lease page shows it as their next lease, with its own Sign button.
+  const pendingDocId = rows.find((d: any) => !d.renewsLeaseId)?.documentId
+  const leaseLink = <NavLink to="/lease" className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
+  if (!pendingDocId) return leaseLink
+  // S655: somebody who already lives under a lease — including another
+  // company's resident a new landlord has sent a lease to (nobody is attached
+  // without their own signature) — keeps "Lease" on the lease they live under.
+  //
+  // The document waiting for them gets its own item, and only that one, once
+  // it has reached them, labeled with its own title (waitingLeaseNavItem).
+  if (hasLease) {
+    const waiting = waitingLeaseNavItem(rows, me)
+    if (!waiting) return leaseLink
+    return <>
+      {leaseLink}
+      <NavLink to={'/sign/'+waiting.documentId} className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>{waiting.label}</NavLink>
+    </>
+  }
+  return <NavLink to={'/sign/'+pendingDocId} className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
 }
 
 const FONTS: Record<string, string> = {
@@ -672,8 +693,19 @@ function Layout() {
   // co-tenant, or whose landlord has not signed yet, has nothing to do there.
   // The signing page lives outside this shell, so it has no nav and no sign-out;
   // every portal route sends them back to it until their signature is in.
+  //
+  // S655 (Nic, 10/2): NOT FOR ANOTHER COMPANY'S RESIDENT. Nobody is attached
+  // to a company without their own signature, so a lease from a new landlord
+  // can reach a person who already lives somewhere on GAM — a tenant of
+  // another park, a neighbor paying another company's utilities. Taking their
+  // portal over would stop them paying the rent and bills they owe THERE; they
+  // see the lease as a notice with a Sign button instead. The server decides
+  // (pendingLeaseLocks: false only for a tenancy with another account). A new
+  // tenant whose lease the landlord's signature already issued has a unit
+  // now, and that is no reason to let them skip signing — they stay locked in.
   const mustSign = !!(tenantMe as any)?.pendingLeaseDocumentId
     && (tenantMe as any)?.pendingLeaseWaitingOnIsMe === true
+    && (tenantMe as any)?.pendingLeaseLocks !== false
   if (mustSign) return <Navigate to={'/sign/' + (tenantMe as any).pendingLeaseDocumentId} replace />
 
   return (
@@ -691,6 +723,11 @@ function Layout() {
           {serviceOnly && <>
             <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}><Home size={16}/>Home</NavLink>
             <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={16}/>Billing</NavLink>
+            {/* S655: a new lease waiting on their signature (they only take
+                utilities here, so it does not take their portal over). */}
+            {(tenantMe as any)?.pendingLeaseDocumentId && (tenantMe as any)?.pendingLeaseWaitingOnIsMe === true && (
+              <NavLink to={'/sign/' + (tenantMe as any).pendingLeaseDocumentId} className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
+            )}
             <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>
           </>}
           {isRenterPoolOnly && !serviceOnly && <>
@@ -714,7 +751,7 @@ function Layout() {
               <NavLink to="/meter-readings" className={({isActive})=>`ni${isActive?' active':''}`}><Gauge size={16}/>Meter Readings</NavLink>}
             {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}><BarChart3 size={16}/>My Record</NavLink>}
             {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>My Disputes</NavLink>}
-            <LeaseNavLink/>
+            <LeaseNavLink hasLease={isExistingTenant || (tenantMe as any)?.pendingLeaseLocks === false} me={tenantMe}/>
             {/* S652 (Nic): the landlord-tenant act for their home, from the
                 government library, by state and unit type — automatic. */}
             <NavLink to="/laws" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>Landlord-Tenant Act</NavLink>
@@ -745,7 +782,7 @@ function Layout() {
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
         </header>
-        <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <Outlet />}</div>
+        <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <><NewLeaseBanner me={tenantMe} /><Outlet /></>}</div>
         <DialogHost />
       </div>
       {showFullNav && !serviceOnly && !isRenterPoolOnly && <FlexsuiteReAcceptanceGate />}
@@ -1149,6 +1186,13 @@ function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) 
         </div>
       </div>
 
+      {/* S655: a lease from a new landlord can reach someone who only takes
+          utilities here (nobody is attached without their own signature, so
+          their portal is not taken over). Once it reaches them, this is their
+          way in. The header names their utility address, so the notice names
+          the home the lease is for. */}
+      {leaseReachedMe(me) && <LeaseSigningTurnNotice me={me} nameTheHome />}
+
       <div className="grid3" style={{marginBottom:24}}>
         <a href="/payments" style={{textDecoration:'none'}} className="kpi"
           onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
@@ -1253,13 +1297,89 @@ function joinNames(list: string[]): string {
 // Naming them hands the chase to the people who can actually do something about
 // it. A tenant who has already signed still sees this: knowing they are done and
 // who is next is the whole point.
-function LeaseSigningTurnNotice({ me }: { me: any }) {
+// ── S655 (Nic, 10/2): A NEW LEASE FOR THE HOME THEY ALREADY LIVE IN ─────────
+//
+// A sitting tenant with a new lease waiting sees a banner — never the signing
+// lock-in, which stays for brand-new tenants. They keep paying rent and using
+// the portal while it waits. The words are a new lease / a rent update: their
+// current lease stays as it is until the new one starts. It never reads as
+// "your lease is ending".
+function NewLeaseBanner({ me }: { me: any }) {
+  const location = useLocation()
+  const docId = me?.pendingRenewalDocumentId
+  if (!docId || me?.pendingRenewalWaitingOnIsMe !== true) return null
+  if (location.pathname.startsWith('/sign')) return null
+  const start: string | null = me.pendingRenewalStartDate ?? null
+  const when = start
+    ? new Date(start + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+    : null
+  const before = start
+    ? new Date(new Date(start + 'T12:00:00Z').getTime() - 86400000)
+        .toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: 'UTC' })
+    : null
+  const rent = me.pendingRenewalRent != null
+    ? '$' + Number(me.pendingRenewalRent).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : null
+  // The tenant's own calendar day (not UTC's, which turns over at 5 pm in Phoenix).
+  const now = new Date()
+  const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  const started = !!start && start <= todayLocal
+  return (
+    <div style={{
+      background: 'rgba(201,162,39,.10)', border: '1px solid rgba(201,162,39,.35)',
+      borderRadius: 10, padding: '14px 16px', marginBottom: 18, lineHeight: 1.6,
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap',
+    }}>
+      <div>
+        <div style={{ fontWeight: 700, color: 'var(--gold)', marginBottom: 2 }}>
+          Your new lease is ready to sign{when ? (started ? ` — it started ${when}` : ` — it starts ${when}`) : ''}
+        </div>
+        <div style={{ fontSize: '.88rem', color: 'var(--text-1)' }}>
+          {started
+            ? <>It is your lease now{rent ? <>, at {rent} a month</> : null}. Please read it and add your signature.</>
+            : <>Nothing changes before then — your current lease stays as it is{before ? <> through {before}</> : null}.
+               {rent ? <> From {when}, your rent is {rent} a month.</> : null} Please read it and sign it.</>}
+        </div>
+      </div>
+      <Link to={'/sign/' + docId} className="btn btn-primary" style={{ whiteSpace: 'nowrap' }}>Review &amp; sign</Link>
+    </div>
+  )
+}
+
+/**
+ * S655: which home the waiting lease is for, e.g. "Mountain View RV Ranch,
+ * Unit RV 47". Someone who already lives somewhere on GAM gets a lease from a
+ * new landlord as a notice on the Home page they already have — whose header
+ * names the home they live in NOW. So the notice names the new one.
+ *
+ * Their pending list carries it while the lease waits on them; once they have
+ * signed it leaves that list, and the document itself (which every signer may
+ * read) still does.
+ */
+function usePendingLeaseHome(me: any, enabled: boolean): string | null {
+  const docId: string | undefined = me?.pendingLeaseDocumentId || undefined
+  const on = enabled && !!docId
+  const { data: pendingDocs } = useQuery('pending-docs', fetchPendingDocs, { enabled: on })
+  const listed = Array.isArray(pendingDocs) ? pendingDocs : null
+  const row = listed?.find((d: any) => d.documentId === docId) ?? null
+  const { data: doc } = useQuery(['pending-lease-home', docId],
+    () => get<any>('/esign/documents/' + docId),
+    { enabled: on && !!listed && !row, staleTime: 300000, retry: false })
+  if (!on) return null
+  return pendingDocHome(row) ?? pendingDocHome(doc)
+}
+
+function LeaseSigningTurnNotice({ me, nameTheHome = false }: { me: any; nameTheHome?: boolean }) {
+  const home = usePendingLeaseHome(me, nameTheHome)
   const who = me?.pendingLeaseWaitingOnName
   if (!me?.pendingLeaseDocumentId || !who) return null
   const mine = !!me.pendingLeaseWaitingOnIsMe
   const roster: any[] = Array.isArray(me.pendingLeaseSigners) ? me.pendingLeaseSigners : []
   const landlordTurn = me.pendingLeaseWaitingOnRole === 'landlord'
     || me.pendingLeaseWaitingOnRole === 'witness'
+  // The landlord signs first (S647), so a landlord's turn usually means they
+  // have not signed either — "your part is done" would be untrue for them.
+  const iSigned = roster.some((r: any) => r.isMe && r.signed)
   return (
     <div style={{
       background: mine ? 'rgba(201,162,39,.10)' : 'rgba(38,167,90,.07)',
@@ -1267,15 +1387,23 @@ function LeaseSigningTurnNotice({ me }: { me: any }) {
       borderRadius: 10, padding: '14px 16px', marginBottom: 18, lineHeight: 1.6,
     }}>
       <div style={{ fontWeight: 700, color: mine ? 'var(--gold)' : 'var(--text-0)', marginBottom: 4 }}>
-        {mine ? 'Your lease is ready for your signature' : 'Your lease is waiting on someone else'}
+        {signingNoticeHeading(mine, home)}
       </div>
       <div style={{ fontSize: '.88rem', color: 'var(--text-1)' }}>
         {mine ? (
           <>You're next to sign. Everyone after you is waiting on this, so the sooner it's
-          done the sooner your lease is final.</>
-        ) : landlordTurn ? (
+          done the sooner your lease is final.
+          {/* S655: someone who already lives somewhere on GAM is not taken
+              over by the signing page; this is their way in. */}
+          <div style={{ marginTop: 10 }}>
+            <Link to={'/sign/' + me.pendingLeaseDocumentId} className="btn btn-primary">Sign your lease</Link>
+          </div></>
+        ) : landlordTurn && iSigned ? (
           <>Your part is done. It's with your landlord now for their signature — nothing
           further is needed from you.</>
+        ) : landlordTurn ? (
+          <>Your landlord signs it first. You'll get an email when it's your turn to sign —
+          nothing is needed from you yet.</>
         ) : (
           <>It's <strong>{who}</strong>'s turn to sign next. Signing goes in order, so the
           lease reaches everyone after them once they're done — a nudge from you will move it
@@ -1383,7 +1511,15 @@ function HomePage() {
 
       <ServiceOutageBanner />
       <OnboardingWaitingNotice me={me} />
-      <LeaseSigningTurnNotice me={me} />
+      {/* S655: a lease from ANOTHER company (pendingLeaseLocks false — they
+          live somewhere else on GAM, so it does not take their portal over)
+          shows only once it has reached them, like UtilityServiceHome: the
+          landlord signs first (S647) and nothing was sent to them before
+          that. The header above names the home they live in now, so the
+          notice names the home the new lease is for. */}
+      {showsSigningNotice(me) && (
+        <LeaseSigningTurnNotice me={me} nameTheHome={me?.pendingLeaseLocks === false} />
+      )}
       <HomeAlerts />
 
       {/* S542: private platform questionnaire — landlord never sees it. */}

@@ -1,18 +1,20 @@
 /**
  * landlords.ts tenants-CSV slice — S360 (landlords slice 5 of N).
  *
- * Companion to S359's properties-CSV slice. Onboarding triad for
- * existing tenants: template / validate / commit. 3 routes, ~700 LoC.
+ * S655 (Nic, 10/2): the tenant CSV is a DRAFT ROSTER. template / validate /
+ * draft; /commit is retired (410). Validate only checks the file; draft saves
+ * who lives where and creates no user, tenant, invite, lease or invoice, and
+ * emails nobody. The roster review and confirm live in tenantRosterDrafts.test.ts.
  *
  * Coverage focus:
- *   - Template returns CSV with canonical first_name column
- *   - Validate: required-field blockers, email format, unit
- *     resolution (no match / occupied / co-tenant + dup-email
- *     warning), auto_renew + auto_renew_mode pairing
- *   - Commit: empty-rows guard, generic-without-claim guard,
- *     defense-in-depth cross-landlord unit (403), blockers-still-
- *     present (400), happy path (creates users + tenants + lease +
- *     lease_tenants + emails)
+ *   - Template: roster columns first
+ *   - Validate: what blocks a row (name, email, a login that isn't a
+ *     resident's, an unreadable balance, no property) and what only notes it
+ *     (unit not found or taken → not placed, rent differs, repeated email,
+ *     already with you); another company's resident is saved with no note
+ *     (the check is not a lookup of who belongs where); lease columns never block
+ *   - Draft: nothing created or sent; re-upload updates; blocked rows listed
+ *   - Commit: retired
  *
  * Out of scope (future sessions):
  *   - Payment-history CSV (template + validate + commit, 3 routes)
@@ -173,496 +175,285 @@ describe('GET /api/landlords/me/onboard-tenants-csv/template', () => {
   })
 })
 
-describe('POST /api/landlords/me/onboard-tenants-csv/validate', () => {
+describe('POST /api/landlords/me/onboard-tenants-csv/validate — checks the file only', () => {
+  const validate = (f: TFixture, csv: string, source = 'generic') => request(buildApp())
+    .post('/api/landlords/me/onboard-tenants-csv/validate')
+    .set('Authorization', `Bearer ${f.landlordToken}`)
+    .send({ csv, source })
+
   it('headers only (no data rows) → 400', async () => {
     const f = await seedTFixture()
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ csv: CANONICAL_HEADERS, source: 'generic' })
+    const res = await validate(f, CANONICAL_HEADERS)
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/no data rows/)
+    expect(res.body.error).toMatch(/no rows/)
   })
 
-  it('happy: 1 row with matching unit → resolvedUnitId stamped, ready=1', async () => {
+  it('a row on a real unit is ready, with its unit and property found', async () => {
     const f = await seedTFixture()
-    const csv = CANONICAL_HEADERS + '\n' + rowFor(f)
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ csv, source: 'generic' })
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f))
     expect(res.status).toBe(200)
     expect(res.body.data.summary).toMatchObject({ total: 1, blockers: 0, ready: 1 })
     expect(res.body.data.rows[0].resolvedUnitId).toBe(f.unitId)
-    // S609: the importer now WARNS on a bare unit number ("101" with no prefix)
-    // under the unit numbering standard. Deliberate and non-blocking — an
-    // imported number is kept as-is, and blockers is still 0 above, which is
-    // what "happy" means here. The row must carry no ERRORS; a warning about
-    // legacy numbering is information, not a problem to fix.
-    const issues = res.body.data.rows[0].issues as any[]
-    expect(issues.filter((i) => i.severity !== 'warn')).toEqual([])
+    expect(res.body.data.rows[0].resolvedPropertyId).toBe(f.propertyId)
+    expect(res.body.data.rows[0].issues.filter((i: any) => i.severity === 'block')).toEqual([])
+  })
+
+  it('checking the file creates nobody and sends nothing', async () => {
+    const f = await seedTFixture()
+    const email = `nobody-${randomUUID().slice(0, 6)}@test.dev`
+    await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f, { email }))
+    expect((await db.query(`SELECT id FROM users WHERE email=$1`, [email])).rows).toEqual([])
+    expect((await db.query(`SELECT id FROM tenant_roster_drafts`)).rows).toEqual([])
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
   })
 
   it('invalid email format → blocker on email field', async () => {
     const f = await seedTFixture()
-    const csv = CANONICAL_HEADERS + '\n' + rowFor(f, { email: 'not-an-email' })
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ csv, source: 'generic' })
-    expect(res.status).toBe(200)
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f, { email: 'not-an-email' }))
     const issues = res.body.data.rows[0].issues
-    expect(issues.some((i: any) => i.field === 'email' && i.severity === 'block' && /Invalid email/.test(i.message))).toBe(true)
+    expect(issues.some((i: any) => i.field === 'email' && i.severity === 'block' && /valid address/.test(i.message))).toBe(true)
   })
 
-  it('no matching unit in landlord portfolio → blocker', async () => {
+  it('a property that is not in the company blocks the row and says the name must match', async () => {
     const f = await seedTFixture()
-    const csv = CANONICAL_HEADERS + '\n' + rowFor(f, { property_name: 'Nonexistent', unit_number: '999' })
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ csv, source: 'generic' })
-    expect(res.status).toBe(200)
+    // A second property so the company has more than one (with one, the file's
+    // rows are simply that property's).
+    await db.query(
+      `INSERT INTO properties (landlord_id, name, street1, city, state, zip, owner_user_id, managed_by_user_id)
+       VALUES ($1, 'Other Park', '1 Elm', 'Phoenix', 'AZ', '85001', $2, $2)`, [f.landlordId, f.landlordUserId])
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f, { property_name: 'Nonexistent', unit_number: '999' }))
     const issues = res.body.data.rows[0].issues
-    expect(issues.some((i: any) => i.field === 'unit_number' && i.severity === 'block' && /No unit/.test(i.message))).toBe(true)
+    expect(issues.some((i: any) => i.field === 'property_name' && i.severity === 'block' && /No property named/.test(i.message))).toBe(true)
     expect(res.body.data.rows[0].resolvedUnitId).toBeUndefined()
   })
 
-  it('unit already occupied → blocker on first new row', async () => {
+  it('a unit the file names that does not exist is NOT a blocker — they are saved as not placed', async () => {
     const f = await seedTFixture()
-    // Pre-seed an active lease + lease_tenant linking a primary tenant to f.unitId,
-    // so v_unit_occupancy reports it occupied.
-    const client = await db.connect()
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f, { unit_number: '999' }))
+    const row = res.body.data.rows[0]
+    expect(row.issues.some((i: any) => i.severity === 'block')).toBe(false)
+    expect(row.issues.some((i: any) => i.field === 'unit_number' && /not placed/.test(i.message))).toBe(true)
+    expect(row.resolvedUnitId).toBeUndefined()
+    expect(row.resolvedPropertyId).toBe(f.propertyId)
+    expect(res.body.data.summary.ready).toBe(1)
+  })
+
+  it('a unit that already has an active lease places the person nowhere (noted, not blocked)', async () => {
+    const f = await seedTFixture()
+    const c = await db.connect()
     try {
-      await client.query('BEGIN')
-      const u = await client.query<{ id: string }>(
-        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
-         VALUES ($1, 'x', 'tenant', 'Existing', 'Tenant', TRUE) RETURNING id`,
-        [`existing-${randomUUID()}@test.dev`])
-      const t = await client.query<{ id: string }>(
-        `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.rows[0].id])
-      const l = await client.query<{ id: string }>(
-        `INSERT INTO leases (unit_id, landlord_id, status, start_date, rent_amount, lease_type)
-         VALUES ($1, $2, 'active', CURRENT_DATE, 1500, 'fixed_term') RETURNING id`,
-        [f.unitId, f.landlordId])
-      await client.query(
-        `INSERT INTO lease_tenants (lease_id, tenant_id, role, status)
-         VALUES ($1, $2, 'primary', 'active')`,
-        [l.rows[0].id, t.rows[0].id])
-      await client.query('COMMIT')
-    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
-
-    const csv = CANONICAL_HEADERS + '\n' + rowFor(f)
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ csv, source: 'generic' })
-    expect(res.status).toBe(200)
-    const issues = res.body.data.rows[0].issues
-    expect(issues.some((i: any) => i.field === 'unit_number' && i.severity === 'block' && /already occupied/.test(i.message))).toBe(true)
+      await c.query('BEGIN')
+      const t = await seedTenant(c)
+      const l = await seedLease(c, { unitId: f.unitId, landlordId: f.landlordId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId: l, tenantId: t, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f))
+    const row = res.body.data.rows[0]
+    expect(row.issues.some((i: any) => i.severity === 'block')).toBe(false)
+    expect(row.issues.some((i: any) => /already has an active lease/.test(i.message))).toBe(true)
+    expect(row.resolvedUnitId).toBeUndefined()
   })
 
-  it('duplicate email in batch → warn on second row', async () => {
+  it('the same email twice: only the first row is saved, and the second says so', async () => {
     const f = await seedTFixture()
-    const sharedEmail = `dup-${randomUUID().slice(0,6)}@test.dev`
-    const csv = CANONICAL_HEADERS + '\n'
-      + rowFor(f, { email: sharedEmail }) + '\n'
-      + rowFor(f, { email: sharedEmail, first_name: 'Bob' })
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ csv, source: 'generic' })
-    expect(res.status).toBe(200)
-    // Second row has the duplicate-email warn
-    const secondIssues = res.body.data.rows[1].issues
-    expect(secondIssues.some((i: any) => i.field === 'email' && i.severity === 'warn' && /Duplicate/.test(i.message))).toBe(true)
+    const shared = `dup-${randomUUID().slice(0, 6)}@test.dev`
+    const res = await validate(f, CANONICAL_HEADERS + '\n'
+      + rowFor(f, { email: shared }) + '\n' + rowFor(f, { email: shared, first_name: 'Bob' }))
+    const second = res.body.data.rows[1]
+    expect(second.skip).toBe(true)
+    expect(second.issues.some((i: any) => i.field === 'email' && i.severity === 'warn' && /Same email as row 1/.test(i.message))).toBe(true)
+    expect(res.body.data.summary.ready).toBe(1)
   })
 
-  it('auto_renew=yes without auto_renew_mode → blocker', async () => {
+  it('lease columns are reference only: no phone, no rent, no start date or a half-filled auto-renew never block', async () => {
     const f = await seedTFixture()
-    const csv = CANONICAL_HEADERS + '\n' + rowFor(f, { auto_renew: 'yes' })
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ csv, source: 'generic' })
-    expect(res.status).toBe(200)
-    const issues = res.body.data.rows[0].issues
-    expect(issues.some((i: any) => i.field === 'auto_renew_mode' && i.severity === 'block')).toBe(true)
+    const res = await validate(f, CANONICAL_HEADERS + '\n'
+      + rowFor(f, { phone: '', monthly_rent: '', lease_start: '', lease_end: 'whenever', auto_renew: 'yes' }))
+    expect(res.body.data.rows[0].issues.filter((i: any) => i.severity === 'block')).toEqual([])
+    expect(res.body.data.summary.ready).toBe(1)
   })
-})
 
-describe('POST /api/landlords/me/onboard-tenants-csv/commit', () => {
-  function baseRow(f: TFixture, overrides: any = {}) {
-    return {
-      rowIndex: 0,
-      firstName: 'Alice', lastName: 'Smith',
-      email: `alice-${randomUUID().slice(0,6)}@test.dev`,
-      phone: '555-1234',
-      propertyName: f.propertyName, unitNumber: f.unitNumber,
-      leaseStart: '2026-01-01', leaseEnd: '2027-01-01',
-      monthlyRent: '1500', securityDeposit: '1000',
-      lateFeeAmount: '', lateFeeGraceDays: '',
-      autoRenew: '', autoRenewMode: '', noticeDaysRequired: '',
-      outstandingBalance: '',
-      resolvedUnitId: f.unitId,
-      issues: [],
-      ...overrides,
-    }
-  }
-
-  it('empty rows → 400', async () => {
+  it("a file rent that differs from the unit's rent is flagged with both amounts", async () => {
     const f = await seedTFixture()
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ rows: [], source: 'generic', claimedPlatformName: 'X' })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/rows array required/)
+    await db.query(`UPDATE units SET rent_amount = 900 WHERE id = $1`, [f.unitId])
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f, { monthly_rent: '1500' }))
+    const note = res.body.data.rows[0].issues.find((i: any) => i.field === 'monthly_rent')
+    expect(note.severity).toBe('warn')
+    expect(note.message).toMatch(/\$1500/)
+    expect(note.message).toMatch(/\$900/)
+    expect(res.body.data.rows[0].unitRent).toBe(900)
   })
 
-  it('generic source without claimedPlatformName → 400', async () => {
-    const f = await seedTFixture()
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ rows: [baseRow(f)], source: 'generic' })  // no claimedPlatformName
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/claimedPlatformName is required/)
-  })
-
-  it('defense-in-depth: cross-landlord unit → 403', async () => {
-    const a = await seedTFixture()
-    const b = await seedTFixture()
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${a.landlordToken}`)
-      .send({
-        rows: [baseRow(a, { resolvedUnitId: b.unitId })],  // b's unit, a's token
-        source: 'generic', claimedPlatformName: 'TestPlatform',
-      })
-    expect(res.status).toBe(403)
-    expect(res.body.error).toMatch(/not owned by this landlord/)
-  })
-
-  it('defense-in-depth: commit into an already-leased unit → 409, no double-booking', async () => {
-    const f = await seedTFixture()
-    // First import creates the lease → the unit is now occupied.
-    const first = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ rows: [baseRow(f)], source: 'generic', claimedPlatformName: 'TestPlatform' })
-    expect(first.status).toBe(200)
-    // A second commit for the SAME whole-unit must be refused server-side even
-    // though the client skipped re-/validate (which would have blocked it).
-    const second = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ rows: [baseRow(f)], source: 'generic', claimedPlatformName: 'TestPlatform' })
-    expect(second.status).toBe(409)
-    // Exactly ONE active lease on the unit — no double-booking.
-    const leases = await db.query(`SELECT id FROM leases WHERE unit_id=$1 AND status='active'`, [f.unitId])
-    expect(leases.rows.length).toBe(1)
-  })
-
-  it('rows with remaining blockers → 400 + nothing committed', async () => {
-    const f = await seedTFixture()
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({
-        rows: [baseRow(f, { issues: [{ severity: 'block', field: 'foo', message: 'still bad' }] })],
-        source: 'generic', claimedPlatformName: 'TestPlatform',
-      })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/Row 1 still has blockers: still bad/)
-    // No tenant created
-    const tenants = await db.query(`SELECT id FROM tenants`)
-    expect(tenants.rows.length).toBe(0)
-  })
-
-  it('happy path: creates user + tenant + lease + lease_tenant + fires email', async () => {
-    const f = await seedTFixture()
-    const email = `alice-${randomUUID().slice(0,6)}@test.dev`
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({
-        rows: [baseRow(f, { email })],
-        source: 'generic', claimedPlatformName: 'TestPlatform',
-      })
-    expect(res.status).toBe(200)
-    expect(res.body.data.committed).toBe(1)
-    expect(res.body.data.leases).toBe(1)
-
-    const u = await db.query<{ id: string; role: string }>(
-      `SELECT id, role FROM users WHERE email=$1`, [email])
-    expect(u.rows.length).toBe(1)
-    expect(u.rows[0].role).toBe('tenant')
-
-    const t = await db.query<{ id: string; user_id: string }>(
-      `SELECT id, user_id FROM tenants WHERE user_id=$1`, [u.rows[0].id])
-    expect(t.rows.length).toBe(1)
-
-    const l = await db.query<{ id: string; status: string; rent_amount: string; lease_source: string }>(
-      `SELECT id, status, rent_amount::text, lease_source FROM leases WHERE unit_id=$1`, [f.unitId])
-    expect(l.rows.length).toBe(1)
-    expect(l.rows[0].status).toBe('active')
-    expect(Number(l.rows[0].rent_amount)).toBe(1500)
-    expect(l.rows[0].lease_source).toBe('imported')
-
-    const lt = await db.query<{ role: string; status: string }>(
-      `SELECT role, status FROM lease_tenants WHERE lease_id=$1 AND tenant_id=$2`,
-      [l.rows[0].id, t.rows[0].id])
-    expect(lt.rows.length).toBe(1)
-    expect(lt.rows[0].role).toBe('primary')
-    expect(lt.rows[0].status).toBe('active')
-
-    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
-    const callArgs = emailTenantOnboardedMock.mock.calls[0]!
-    expect(callArgs[0]).toBe(email)  // first arg is recipient email
-  })
-})
-
-// ── S654: the commit decides who each row is, from its email ──────────────
-//
-// It used to take resolvedExistingUserId / resolvedExistingTenantId straight
-// from the body. Landlord B posted landlord A's own user id with an email B
-// chose: A's login got a tenant invite token, was tied to B's lease, and the
-// activation link (which sets a password) went to B's address.
-describe('S654: tenant CSV commit never trusts account ids from the browser', () => {
-  function row(f: TFixture, overrides: any = {}) {
-    return {
-      rowIndex: 0, firstName: 'Mal', lastName: 'Lory', phone: '555-0000',
-      email: `row-${randomUUID().slice(0, 6)}@test.dev`,
-      propertyName: f.propertyName, unitNumber: f.unitNumber,
-      leaseStart: '2026-01-01', leaseEnd: '', monthlyRent: '700', securityDeposit: '',
-      lateFeeAmount: '', lateFeeGraceDays: '', autoRenew: '', autoRenewMode: '',
-      noticeDaysRequired: '', outstandingBalance: '',
-      resolvedUnitId: f.unitId, issues: [], ...overrides,
-    }
-  }
-  const commit = (f: TFixture, rows: any[]) => request(buildApp())
-    .post('/api/landlords/me/onboard-tenants-csv/commit')
-    .set('Authorization', `Bearer ${f.landlordToken}`)
-    .send({ rows, source: 'generic', claimedPlatformName: 'TestPlatform' })
-  const victimState = async (userId: string) => ({
-    user: (await db.query(
-      `SELECT email, role, password_hash, tenant_invite_token, tenant_invite_expires_at, sessions_valid_from
-         FROM users WHERE id=$1`, [userId])).rows[0],
-    tenants: (await db.query(`SELECT id FROM tenants WHERE user_id=$1`, [userId])).rows,
-  })
-
-  it('the takeover attempt: another landlord\'s user id with the attacker\'s email touches nothing of theirs', async () => {
-    const victim = await seedTFixture()
-    const attacker = await seedTFixture()
-    const before = await victimState(victim.landlordUserId)
-
-    const res = await commit(attacker, [row(attacker, {
-      email: 'attacker@evil.test',
-      resolvedExistingUserId: victim.landlordUserId,
-      resolvedExistingTenantId: randomUUID(),
-    })])
-    expect(res.status).toBe(200)
-
-    // The victim's login is exactly as it was: no token, no resident profile.
-    expect(await victimState(victim.landlordUserId)).toEqual(before)
-    expect(before.user.tenant_invite_token).toBeNull()
-    // The row became a NEW resident account at the address it named, and that
-    // is the only place an activation link went.
-    const made = (await db.query(`SELECT id, role FROM users WHERE email='attacker@evil.test'`)).rows
-    expect(made).toHaveLength(1)
-    expect(made[0].id).not.toBe(victim.landlordUserId)
-    expect(made[0].role).toBe('tenant')
-    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
-    expect(emailTenantOnboardedMock.mock.calls[0]![0]).toBe('attacker@evil.test')
-    const onLease = (await db.query(
-      `SELECT t.user_id FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id
-         JOIN leases l ON l.id = lt.lease_id WHERE l.unit_id = $1`, [attacker.unitId])).rows
-    expect(onLease).toEqual([{ user_id: made[0].id }])
-  })
-
-  it('a landlord\'s own email is refused at commit (409) and at validate, with nothing written or sent', async () => {
-    const victim = await seedTFixture()
-    const attacker = await seedTFixture()
-    const victimEmail = (await db.query(`SELECT email FROM users WHERE id=$1`, [victim.landlordUserId])).rows[0].email
-    const before = await victimState(victim.landlordUserId)
-
-    const res = await commit(attacker, [row(attacker, { email: victimEmail.toUpperCase() })])
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/Row 1: This email belongs to a GAM account that isn't a resident's/)
-    expect(await victimState(victim.landlordUserId)).toEqual(before)
-    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [attacker.unitId])).rows).toEqual([])
-    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
-
-    const v = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${attacker.landlordToken}`)
-      .send({ csv: CANONICAL_HEADERS + '\n' + rowFor(attacker, { email: victimEmail }), source: 'generic' })
-    expect(v.status).toBe(200)
-    const r0 = v.body.data.rows[0]
-    expect(r0.issues.some((i: any) => i.severity === 'block' && /isn't a resident's/.test(i.message))).toBe(true)
-    // Validate no longer hands out anyone's account ids.
-    expect(r0.resolvedExistingUserId).toBeUndefined()
-    expect(r0.resolvedExistingTenantId).toBeUndefined()
-  })
-
-  it('a resident on another landlord\'s active lease is refused at commit even with no blocker sent', async () => {
+  it("another company's resident is never blocked, and the file check never says who belongs to another company", async () => {
     const other = await seedTFixture()
-    const me = await seedTFixture()
-    const tenantEmail = `held-${randomUUID().slice(0, 6)}@test.dev`
+    const f = await seedTFixture()
+    const email = `elsewhere-${randomUUID().slice(0, 6)}@test.dev`
     const c = await db.connect()
     try {
-      const tenantId = await seedTenant(c, { email: tenantEmail })
-      const leaseId = await seedLease(c, { unitId: other.unitId, landlordId: other.landlordId })
-      await seedLeaseTenant(c, { leaseId, tenantId })
-    } finally { c.release() }
-
-    const res = await commit(me, [row(me, { email: tenantEmail })])
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/Row 1: This email is a tenant of another landlord/)
-    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [me.unitId])).rows).toEqual([])
-    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+      await c.query('BEGIN')
+      const t = await seedTenant(c, { email })
+      const l = await seedLease(c, { unitId: other.unitId, landlordId: other.landlordId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId: l, tenantId: t, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f, { email }))
+    const row = res.body.data.rows[0]
+    expect(row.issues.some((i: any) => i.severity === 'block')).toBe(false)
+    // Uploading a list of addresses must not reveal which belong to other
+    // companies' people: this row reads exactly like a stranger's.
+    expect(row.issues.filter((i: any) => i.field === 'email')).toEqual([])
+    expect(JSON.stringify(res.body)).not.toMatch(/another company/i)
+    expect(res.body.data.summary.ready).toBe(1)
   })
 
-  it('an existing resident who never set up is found by email in any case, and the link goes to the address on their account', async () => {
+  it("a one-property company's file naming ANOTHER park is blocked, never placed on this park's units", async () => {
     const f = await seedTFixture()
-    const stored = `Kim.Harland-${randomUUID().slice(0, 6)}@Test.dev`
-    let tenantId: string
-    const c = await db.connect()
-    try { tenantId = await seedTenant(c, { email: stored }) } finally { c.release() }
-    await db.query(
-      `UPDATE users SET password_hash='$2b$10$placeholder_invite_pending', email_verified=FALSE
-        WHERE LOWER(email)=LOWER($1)`, [stored])
-
-    const res = await commit(f, [row(f, { email: stored.toLowerCase(), resolvedExistingUserId: f.landlordUserId })])
-    expect(res.status).toBe(200)
-    expect(res.body.data.tenants[0].tenantId).toBe(tenantId!)
-    expect((await db.query(`SELECT id FROM users WHERE LOWER(email)=LOWER($1)`, [stored])).rows).toHaveLength(1)
-    const token = (await db.query(`SELECT tenant_invite_token FROM users WHERE email=$1`, [stored])).rows[0].tenant_invite_token
-    expect(token).toMatch(/^[0-9a-f]{64}$/)
-    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
-    expect(emailTenantOnboardedMock.mock.calls[0]![0]).toBe(stored)
-    expect(emailTenantOnboardedMock.mock.calls[0]![5]).toMatch(new RegExp(`/accept-invite\\?token=${token}$`))
-    expect(JSON.stringify(res.body)).not.toMatch(/accept-invite/)
-    const landlordUser = await db.query(`SELECT tenant_invite_token FROM users WHERE id=$1`, [f.landlordUserId])
-    expect(landlordUser.rows[0].tenant_invite_token).toBeNull()
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f, { property_name: 'Pine Hollow (not in GAM yet)' }))
+    const row = res.body.data.rows[0]
+    expect(row.resolvedUnitId).toBeUndefined()
+    const block = row.issues.find((i: any) => i.field === 'property_name')
+    expect(block.severity).toBe('block')
+    expect(block.message).toMatch(/No property named "Pine Hollow \(not in GAM yet\)"/)
+    expect(block.message).toContain(f.propertyName)
+    expect(res.body.data.summary.ready).toBe(0)
   })
 
-  // The two-logins-on-one-address case this replaced can no longer be set up:
-  // ux_users_email_lower allows one login per address in any letter case. What
-  // remains is a landlord login stored in a different case from the row.
-  it('a landlord\'s login on the same address in a different case refuses the row (409), nothing created', async () => {
+  it("a one-property company may leave the property column blank", async () => {
+    const f = await seedTFixture()
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f, { property_name: '' }))
+    const row = res.body.data.rows[0]
+    expect(row.resolvedUnitId).toBe(f.unitId)
+    expect(row.issues.some((i: any) => i.severity === 'block')).toBe(false)
+  })
+
+  it("a landlord's own login is refused at validate (isn't a resident's)", async () => {
     const victim = await seedTFixture()
-    const me = await seedTFixture()
-    const stored = `Victim.${randomUUID().slice(0, 6)}@Test.dev`
-    await db.query(`UPDATE users SET email=$1 WHERE id=$2`, [stored, victim.landlordUserId])
-    const before = await victimState(victim.landlordUserId)
-
-    const res = await commit(me, [row(me, { email: stored.toLowerCase() })])
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/Row 1: This email belongs to a GAM account that isn't a resident's/)
-    expect(await victimState(victim.landlordUserId)).toEqual(before)
-    expect((await db.query(`SELECT id FROM users WHERE LOWER(email)=LOWER($1)`, [stored])).rows)
-      .toEqual([{ id: victim.landlordUserId }])
-    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [me.unitId])).rows).toEqual([])
-    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
-  })
-
-  // ── S654: the one rule for the CSV door ─────────────────────────────────
-  //
-  // Round 6 reproduced: X is landlord A's invitee with A's live link. B's CSV
-  // row carried X's address in capitals; the commit replaced X's token (A's
-  // emailed link died) and emailed X "set up your account". An account with
-  // its own password got the same set-password email, which S616 forbids.
-  it('another company\'s invitee keeps that company\'s link and gets no setup email, only a notice in their account', async () => {
-    const a = await seedTFixture()
-    const b = await seedTFixture()
-    const email = `x-${randomUUID().slice(0, 6)}@test.dev`
-    const x = (await db.query<{ id: string }>(
-      `INSERT INTO users (email, password_hash, role, first_name, last_name, tenant_invite_token, tenant_invite_expires_at)
-       VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'Ex', 'Ample', 'a-live-link', NOW() + INTERVAL '7 days')
-       RETURNING id`, [email])).rows[0]
-    const xt = (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [x.id])).rows[0]
-    await db.query(
-      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status) VALUES ($1, $2, 'not_uploaded')`,
-      [a.landlordId, xt.id])
-
-    const res = await commit(b, [row(b, { email: email.toUpperCase() })])
-    expect(res.status).toBe(200)
-    expect(res.body.data.tenants[0].tenantId).toBe(xt.id)
-    expect(JSON.stringify(res.body)).not.toMatch(/accept-invite|a-live-link/)
-    const after = (await db.query(
-      `SELECT password_hash, tenant_invite_token, tenant_invite_expires_at > NOW() AS live FROM users WHERE id=$1`,
-      [x.id])).rows[0]
-    expect(after).toEqual({ password_hash: '$2b$10$placeholder_invite_pending', tenant_invite_token: 'a-live-link', live: true })
-    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
-    const notes = (await db.query(`SELECT landlord_id, type FROM notifications WHERE user_id=$1`, [x.id])).rows
-    expect(notes).toEqual([{ landlord_id: b.landlordId, type: 'lease_drafted' }])
-  })
-
-  it('a resident with their own password gets no set-password email and no link, only a notice in their account', async () => {
     const f = await seedTFixture()
-    const email = `active-${randomUUID().slice(0, 6)}@test.dev`
-    let tenantId: string
+    const victimEmail = (await db.query(`SELECT email FROM users WHERE id=$1`, [victim.landlordUserId])).rows[0].email
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f, { email: victimEmail.toUpperCase() }))
+    expect(res.body.data.rows[0].issues.some((i: any) => i.severity === 'block' && /isn't a resident's/.test(i.message))).toBe(true)
+  })
+
+  it('someone already on an active lease with you is noted and left out', async () => {
+    const f = await seedTFixture()
+    const email = `mine-${randomUUID().slice(0, 6)}@test.dev`
     const c = await db.connect()
-    try { tenantId = await seedTenant(c, { email }) } finally { c.release() }
-    const userId = (await db.query(`SELECT id FROM users WHERE email=$1`, [email])).rows[0].id
-
-    const res = await commit(f, [row(f, { email })])
-    expect(res.status).toBe(200)
-    expect(res.body.data.tenants[0].tenantId).toBe(tenantId!)
-    expect((await db.query(`SELECT tenant_invite_token FROM users WHERE id=$1`, [userId])).rows[0].tenant_invite_token)
-      .toBeNull()
-    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
-    const notes = (await db.query(`SELECT landlord_id, type, action_url FROM notifications WHERE user_id=$1`, [userId])).rows
-    expect(notes).toEqual([{ landlord_id: f.landlordId, type: 'lease_drafted', action_url: '/lease' }])
-  })
-
-  it('someone already on an active lease with you is skipped by the server, as validate promised', async () => {
-    const f = await seedTFixture()
-    const second = await db.connect()
-    let unit2: string
-    const tenantEmail = `here-${randomUUID().slice(0, 6)}@test.dev`
+    let unit2 = ''
     try {
-      unit2 = await seedUnit(second, { propertyId: f.propertyId, landlordId: f.landlordId, withLateFeeDecision: false })
-      const tenantId = await seedTenant(second, { email: tenantEmail })
-      const leaseId = await seedLease(second, { unitId: f.unitId, landlordId: f.landlordId })
-      await seedLeaseTenant(second, { leaseId, tenantId })
-    } finally { second.release() }
-
-    // No "Already onboarded" warning in the body: the server decides.
-    const res = await commit(f, [row(f, { email: tenantEmail, resolvedUnitId: unit2! })])
-    expect(res.status).toBe(200)
-    expect(res.body.data.committed).toBe(0)
-    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [unit2!])).rows).toEqual([])
-    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
-  })
-
-  it('a repeated email in the file is skipped, not a failed import', async () => {
-    const f = await seedTFixture()
-    const email = `twice-${randomUUID().slice(0, 6)}@test.dev`
-    const res = await commit(f, [row(f, { email }), row(f, { email, rowIndex: 1, firstName: 'Bob' })])
-    expect(res.status).toBe(200)
-    expect(res.body.data.committed).toBe(1)
-    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
-  })
-
-  it('a failed activation email never writes the link or its token to the logs', async () => {
-    const f = await seedTFixture()
-    const email = `logs-${randomUUID().slice(0, 6)}@test.dev`
-    emailTenantOnboardedMock.mockRejectedValueOnce(new Error('resend down'))
-    const info = vi.spyOn(logger, 'info')
-    const error = vi.spyOn(logger, 'error')
-    try {
-      const res = await commit(f, [row(f, { email })])
-      expect(res.status).toBe(200)
-      const token = (await db.query(`SELECT tenant_invite_token FROM users WHERE email=$1`, [email])).rows[0].tenant_invite_token
-      expect(token).toBeTruthy()
-      const logged = JSON.stringify([...info.mock.calls, ...error.mock.calls], (_k, v) => v instanceof Error ? v.message : v)
-      expect(logged).not.toContain(token)
-      expect(logged).not.toContain('accept-invite')
-      expect(error).toHaveBeenCalled()
-    } finally { info.mockRestore(); error.mockRestore() }
+      await c.query('BEGIN')
+      unit2 = await seedUnit(c, { propertyId: f.propertyId, landlordId: f.landlordId })
+      const t = await seedTenant(c, { email })
+      const l = await seedLease(c, { unitId: unit2, landlordId: f.landlordId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId: l, tenantId: t, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const res = await validate(f, CANONICAL_HEADERS + '\n' + rowFor(f, { email }))
+    expect(res.body.data.rows[0].skip).toBe(true)
+    expect(res.body.data.rows[0].issues.some((i: any) => /Already on an active lease with you/.test(i.message))).toBe(true)
   })
 })
 
+describe('POST /api/landlords/me/onboard-tenants-csv/draft — saves a draft roster', () => {
+  const draft = (f: TFixture, csv: string, extra: any = {}) => request(buildApp())
+    .post('/api/landlords/me/onboard-tenants-csv/draft')
+    .set('Authorization', `Bearer ${f.landlordToken}`)
+    .send({ csv, source: 'generic', claimedPlatformName: 'TestPlatform', ...extra })
+
+  it('saves who lives where and creates NO user, tenant, invite, lease or invoice — and emails nobody', async () => {
+    const f = await seedTFixture()
+    const email = `roster-${randomUUID().slice(0, 6)}@test.dev`
+    const res = await draft(f, CANONICAL_HEADERS + '\n' + rowFor(f, { email, outstanding_balance: '125.50' }))
+    expect(res.status).toBe(200)
+    expect(res.body.data.saved).toBe(1)
+    expect(res.body.data.properties).toEqual([{ propertyId: f.propertyId, propertyName: f.propertyName, count: 1 }])
+
+    const rows = (await db.query(
+      `SELECT unit_id, email, opening_balance::float AS opening_balance, confirmed_at, file_values
+         FROM tenant_roster_drafts WHERE landlord_id=$1`, [f.landlordId])).rows
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ unit_id: f.unitId, email, opening_balance: 125.5, confirmed_at: null })
+    expect(rows[0].file_values.monthlyRent).toBe('1500')
+
+    expect((await db.query(`SELECT id FROM users WHERE email=$1`, [email])).rows).toEqual([])
+    expect((await db.query(`SELECT id FROM pending_tenant_intents`)).rows).toEqual([])
+    expect((await db.query(`SELECT id FROM leases WHERE landlord_id=$1`, [f.landlordId])).rows).toEqual([])
+    expect((await db.query(`SELECT id FROM invoices WHERE landlord_id=$1`, [f.landlordId])).rows).toEqual([])
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+    expect(recordCommitAttemptMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('uploading the file again updates the same person instead of adding them twice', async () => {
+    const f = await seedTFixture()
+    const email = `again-${randomUUID().slice(0, 6)}@test.dev`
+    await draft(f, CANONICAL_HEADERS + '\n' + rowFor(f, { email, first_name: 'Ann' }))
+    const res = await draft(f, CANONICAL_HEADERS + '\n' + rowFor(f, { email: email.toUpperCase(), first_name: 'Anne' }))
+    expect(res.body.data.saved).toBe(0)
+    expect(res.body.data.updated).toBe(1)
+    const rows = (await db.query(`SELECT first_name FROM tenant_roster_drafts WHERE landlord_id=$1`, [f.landlordId])).rows
+    expect(rows).toEqual([{ first_name: 'Anne' }])
+  })
+
+  it('a row that cannot be saved is listed with why, and everyone else is saved', async () => {
+    const f = await seedTFixture()
+    const ok = `ok-${randomUUID().slice(0, 6)}@test.dev`
+    const res = await draft(f, CANONICAL_HEADERS + '\n'
+      + rowFor(f, { email: ok }) + '\n' + rowFor(f, { email: 'broken', first_name: 'Bad' }))
+    expect(res.body.data.saved).toBe(1)
+    expect(res.body.data.notSaved).toHaveLength(1)
+    expect(res.body.data.notSaved[0].rowIndex).toBe(1)
+    expect(res.body.data.notSaved[0].reasons.join(' ')).toMatch(/valid address/)
+  })
+
+  it('a generic file must name the platform it came from first', async () => {
+    const f = await seedTFixture()
+    const res = await draft(f, CANONICAL_HEADERS + '\n' + rowFor(f), { claimedPlatformName: '' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/platform/)
+  })
+
+  it("another company's resident is saved like anyone else (imports are never blocked)", async () => {
+    const other = await seedTFixture()
+    const f = await seedTFixture()
+    const email = `elsewhere-${randomUUID().slice(0, 6)}@test.dev`
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const t = await seedTenant(c, { email })
+      const l = await seedLease(c, { unitId: other.unitId, landlordId: other.landlordId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId: l, tenantId: t, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const res = await draft(f, CANONICAL_HEADERS + '\n' + rowFor(f, { email }))
+    expect(res.body.data.saved).toBe(1)
+  })
+
+  it('ids the browser sends about rows are ignored — the server re-reads the file', async () => {
+    const victim = await seedTFixture()
+    const f = await seedTFixture()
+    const res = await draft(f, CANONICAL_HEADERS + '\n' + rowFor(f), {
+      rows: [{ rowIndex: 0, resolvedUnitId: victim.unitId, email: 'x@y.z' }],
+    })
+    expect(res.status).toBe(200)
+    expect((await db.query(`SELECT id FROM tenant_roster_drafts WHERE unit_id=$1`, [victim.unitId])).rows).toEqual([])
+  })
+})
+
+describe('POST /api/landlords/me/onboard-tenants-csv/commit — retired', () => {
+  it('answers 410 with the next step and writes nothing', async () => {
+    const f = await seedTFixture()
+    const email = `commit-${randomUUID().slice(0, 6)}@test.dev`
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenants-csv/commit')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ rows: [{ rowIndex: 0, firstName: 'A', lastName: 'B', email, resolvedUnitId: f.unitId, issues: [] }],
+              source: 'generic', claimedPlatformName: 'TestPlatform' })
+    expect(res.status).toBe(410)
+    expect(res.body.error).toMatch(/draft roster/)
+    expect((await db.query(`SELECT id FROM users WHERE email=$1`, [email])).rows).toEqual([])
+    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [f.unitId])).rows).toEqual([])
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+    // Never logs a setup link either.
+    void logger
+  })
+})

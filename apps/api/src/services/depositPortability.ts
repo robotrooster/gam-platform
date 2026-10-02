@@ -107,6 +107,11 @@ export async function detectPortabilityEligible(args: {
         AND lt.status = 'active'
         AND l.id <> $2
         AND l.status IN ('pending', 'active')
+        -- S655: a new lease of this same home is the same tenancy — the
+        -- deposit already moves onto it when the landlord signs it. It is never
+        -- a place to "carry the deposit forward" to.
+        AND l.supersedes_lease_id IS DISTINCT FROM $2
+        AND l.id IS DISTINCT FROM (SELECT supersedes_lease_id FROM leases WHERE id = $2)
       ORDER BY l.created_at DESC
       LIMIT 1`,
     [tenantId, args.leaseId],
@@ -213,8 +218,13 @@ export async function authorizeDepositPortability(args: {
       WHERE lt.lease_id = $1
         AND lt.tenant_id = $2
         AND lt.status = 'active'
-        AND l.status IN ('pending', 'active')`,
-    [args.targetLeaseId, args.tenantId],
+        AND l.status IN ('pending', 'active')
+        -- S655: never the household's own new lease (or the one it follows).
+        AND NOT EXISTS (
+          SELECT 1 FROM security_deposits sd2 JOIN leases cur ON cur.id = sd2.lease_id
+           WHERE sd2.id = $3
+             AND (l.supersedes_lease_id = cur.id OR cur.supersedes_lease_id = l.id))`,
+    [args.targetLeaseId, args.tenantId, args.depositId],
   )
   if (!onTarget) {
     throw new AppError(400, 'Target lease is no longer eligible (tenant not on it, or lease not in pending/active state)')

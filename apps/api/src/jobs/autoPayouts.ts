@@ -45,6 +45,7 @@ import { isUsFederalHoliday } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { firePayoutForConnectAccount, getAvailableUsdBalance } from '../services/connectPayouts'
 import { stampPayoutTransfers } from '../services/payoutComposition'
+import { takePayoutCut } from '../services/payoutCut'
 import { createAdminNotification } from '../services/adminNotifications'
 import { reconcilePlatformHeldPayments, recoverPendingPlatformTransfers } from '../services/landlordPassthrough'
 import { reconcileBusinessHeldFunds } from '../services/heldPayouts'
@@ -603,6 +604,22 @@ async function processOneCandidate(
   }
 
   // 2. Read live Stripe available USD balance.
+  //
+  // S655 review: THE CUT COMES FIRST. A GAM sweep pays out the whole balance it
+  // reads, so it carries the transfers that landed before that read and none
+  // after it. The cut is taken here, just before the read, under the account's
+  // cut lock (services/payoutCut.ts): a transfer being confirmed right now is
+  // waited for and lands inside this payout; one confirmed after is dated after
+  // the cut and waits for the next. Taken when Stripe answered the payout, it
+  // came after the read: a transfer confirmed in between was listed in a payout
+  // whose amount did not include it, and the next payout showed the same money
+  // as "not traced". What is left: a transfer whose money was on the balance
+  // when it was read, but which GAM confirmed only after the cut, is listed on
+  // the next payout instead of this one. Stripe may have made it during the
+  // balance read below (that call's length), or GAM's confirm may have failed
+  // and the recovery job confirmed it later (any length). Display only: no
+  // money moves differently.
+  const cut = await takePayoutCut(cand.stripe_connect_account_id)
   const available = await getAvailableUsdBalance(cand.stripe_connect_account_id)
   if (available <= 0) return 'zero_balance'
 
@@ -672,25 +689,33 @@ async function processOneCandidate(
   if (cand.kind === 'user') {
     const triggerType = catchUpRun ? 'catch_up' : 'auto_friday'
     // S655: the Connect webhook files every payout it hears about (as
-    // 'stripe_dashboard' when no row exists yet). If it beat this insert, that
-    // row is this payout — claim it rather than write a second one.
-    const filedByWebhook = await queryOne<{ id: string }>(
-      `UPDATE disbursements
-          SET trigger_type = $2, user_id = $3,
-              landlord_id = COALESCE(landlord_id,
-                (SELECT id FROM landlords WHERE stripe_connect_account_id = $4 ORDER BY created_at LIMIT 1)),
-              notes = NULL
-        WHERE stripe_payout_id = $1 AND trigger_type = 'stripe_dashboard'
-        RETURNING id`,
-      [stripePayoutId, triggerType, cand.entity_id, cand.stripe_connect_account_id])
-    const disb = filedByWebhook ?? await queryOne<{ id: string }>(
+    // 'stripe_dashboard' when no row exists yet). If it beat this insert —
+    // even by a moment, mid-statement — that row is this payout: claim it
+    // rather than write a second one. One payout, one row: stripe_payout_id is
+    // unique (migration 20261003001000), and a row GAM already filed for this
+    // payout is left exactly as it is (nothing returned, nothing re-linked).
+    //
+    // initiated_at is the cut — the same one the sweep below is stamped with —
+    // never the moment this row happens to be written. The NEXT sweep starts
+    // where this row's initiated_at says this one ended (stampPayoutTransfers'
+    // lastSweep), so a transfer confirmed between the cut and this insert
+    // would otherwise fall in neither: too late for this sweep, too early for
+    // the next, and never listed in any payout. A row the webhook filed is
+    // claimed onto the same cut (its own time is Stripe's clock).
+    const disb = await queryOne<{ id: string }>(
       `INSERT INTO disbursements
          (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, landlord_id)
-       VALUES ($1, $4, $2, 'processing', $3, NOW(), 0,
+       VALUES ($1, $4, $2, 'processing', $3, $6::timestamptz, 0,
                -- S652: the company whose Connect account this is, so the row says who
                (SELECT id FROM landlords WHERE stripe_connect_account_id = $5 ORDER BY created_at LIMIT 1))
+       ON CONFLICT (stripe_payout_id) WHERE stripe_payout_id IS NOT NULL
+       DO UPDATE SET trigger_type = EXCLUDED.trigger_type, user_id = EXCLUDED.user_id,
+                     landlord_id = COALESCE(disbursements.landlord_id, EXCLUDED.landlord_id),
+                     initiated_at = EXCLUDED.initiated_at,
+                     notes = NULL
+               WHERE disbursements.trigger_type = 'stripe_dashboard'
        RETURNING id`,
-      [cand.entity_id, available, stripePayoutId, triggerType, cand.stripe_connect_account_id]
+      [cand.entity_id, available, stripePayoutId, triggerType, cand.stripe_connect_account_id, cut]
     )
     // S655 (Nic): "$2,638.11 from GAM" has to say which payments it was. Record
     // the transfers this payout swept off the balance, so the bank row and the
@@ -702,6 +727,7 @@ async function processOneCandidate(
           disbursementId: disb.id,
           connectAccountId: cand.stripe_connect_account_id,
           payoutAmount: available,
+          payoutAt: cut,
         })
       } catch (e) {
         logger.error({ err: e, disbursementId: disb.id }, '[auto_payouts] could not record what the payout carried')

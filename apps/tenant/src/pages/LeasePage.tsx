@@ -196,11 +196,54 @@ function PdfViewer({ url, token }: { url:string; token:string }) {
   )
 }
 
+/** "January 1, 2027" from 'YYYY-MM-DD', read as that calendar day. */
+function longDate(iso: string): string {
+  return new Date(String(iso).slice(0, 10) + 'T12:00:00Z')
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
+
+// S655 (Nic, 10/2): a new lease for the home they already live in. It reads as
+// what comes next — never as their lease ending.
+function NextLeaseCard({ next, onOpen }: { next: any; onOpen: (docId: string) => void }) {
+  const rent = next.rentAmount != null
+    ? '$' + Number(next.rentAmount).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : null
+  const now = new Date()
+  const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  const started = String(next.startDate).slice(0, 10) <= todayLocal
+  const signed = !!next.signedByTenant
+  return (
+    <div style={{ background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.3)', borderRadius:12, padding:'16px 20px', marginBottom:20, display:'flex', alignItems:'center', justifyContent:'space-between', gap:16, flexWrap:'wrap' as const }}>
+      <div>
+        <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>
+          {started ? 'Your new lease started' : 'Your next lease starts'} {longDate(next.startDate)}{rent ? ` — ${rent} a month` : ''}
+        </div>
+        <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>
+          {signed
+            ? 'Signed by everyone. Nothing more is needed from you.'
+            : started
+              ? 'It is your lease now. Please read it and add your signature.'
+              : 'Your current lease stays as it is until then. Please read the new one and sign it.'}
+        </div>
+      </div>
+      {next.documentId && (
+        <button onClick={() => onOpen(next.documentId)}
+          style={{ padding:'10px 20px', borderRadius:8, border: signed ? '1px solid var(--border-0)' : 'none', background: signed ? 'transparent' : 'var(--gold, #c9a227)', color: signed ? 'var(--text-1)' : '#060809', fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' as const, flexShrink:0 }}>
+          {signed ? 'View it' : 'Review & sign →'}
+        </button>
+      )}
+    </div>
+  )
+}
+
 export function LeasePage() {
   const navigate = useNavigate()
-  const { data: pendingDocs = [] } = useQuery('pending-docs', () =>
+  const { data: allPendingDocs = [] } = useQuery('pending-docs', () =>
     get('/esign/pending?t=' + Date.now()).then((r: any) => r)
   )
+  // S655: a NEW LEASE for the home they already live in shows as their next
+  // lease (below), not as a generic "document awaiting your signature".
+  const pendingDocs = (allPendingDocs as any[]).filter((d: any) => !d.renewsLeaseId)
   const qc = useQueryClient()
   const [signMode, setSignMode] = useState<'type'|'draw'>('type')
   const [typedSig, setTypedSig] = useState('')
@@ -300,7 +343,10 @@ export function LeasePage() {
   // until it is too late for either side to act on it.
   //
   // The offer is still a real event — it just no longer gates the question.
-  const showRenewalSurvey = daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && !renewalSubmitted && !lease.tenantRenewalIntent && fullyExecuted
+  // S655: a lease with a NEW LEASE to follow it is not ending — the household
+  // is staying on the new one. No countdown, no "are you staying?".
+  const nextLease = (lease as any).nextLease ?? null
+  const showRenewalSurvey = !nextLease && daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && !renewalSubmitted && !lease.tenantRenewalIntent && fullyExecuted
 
   return (
     <div>
@@ -325,10 +371,12 @@ export function LeasePage() {
           <h1 style={{ fontFamily:'var(--font-display)', fontSize:'1.4rem', fontWeight:800, color:'var(--text-0)', marginBottom:4 }}>Lease Agreement</h1>
           <p style={{ fontSize:'.82rem', color:'var(--text-3)' }}>
             {lease.propertyName} · Unit {lease.unitNumber}
-            {lease.startDate && ` · ${new Date(lease.startDate).toLocaleDateString()} – ${new Date(lease.endDate).toLocaleDateString()}`}
+            {lease.startDate && ` · ${new Date(lease.startDate).toLocaleDateString()} – ${lease.endDate ? new Date(lease.endDate).toLocaleDateString() : 'month to month'}`}
           </p>
         </div>
-        {fullyExecuted && lease.id && (lease.status === 'active' || lease.status === 'pending') && (
+        {/* S655: not while a new lease for this home waits to follow it — the
+            household is staying on that one (the server refuses it too). */}
+        {fullyExecuted && lease.id && !nextLease && (lease.status === 'active' || lease.status === 'pending') && (
           <EarlyTerminationSurface leaseId={lease.id} />
         )}
       </div>
@@ -438,8 +486,12 @@ export function LeasePage() {
         </div>
       )}
 
+      {/* S655: the next lease — a new lease for this home, signed by the
+          landlord. It takes over on its start date. */}
+      {nextLease && <NextLeaseCard next={nextLease} onOpen={(id: string) => navigate('/sign/' + id)} />}
+
       {/* Expiry countdown */}
-      {lease.endDate && daysToExpiry !== null && daysToExpiry > 0 && (
+      {!nextLease && lease.endDate && daysToExpiry !== null && daysToExpiry > 0 && (
         <div style={{ padding:'16px 20px', background: daysToExpiry <= 30 ? 'rgba(239,68,68,.06)' : daysToExpiry <= 60 ? 'rgba(245,158,11,.06)' : 'rgba(201,162,39,.04)', border:`1px solid ${daysToExpiry<=30?'rgba(239,68,68,.25)':daysToExpiry<=60?'rgba(245,158,11,.25)':'rgba(201,162,39,.2)'}`, borderRadius:12, marginBottom:20 }}>
           <div style={{ fontSize:'.65rem', color:'var(--t3)', textTransform:'uppercase', letterSpacing:'.1em', fontWeight:600, marginBottom:10 }}>
             {daysToExpiry <= 30 ? '🚨 Lease Expires Soon' : daysToExpiry <= 60 ? '⚠️ Lease Expiring' : '📅 Lease Term Remaining'}

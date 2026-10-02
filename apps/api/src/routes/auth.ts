@@ -362,9 +362,26 @@ const LOGIN_LOCK_MINUTES = 15
 // use now, so a stolen signed-in device would otherwise keep renewing forever;
 // a pass minted before the change is refused here and at /auth/me (which every
 // portal calls on load), so the device is out at its next load.
-function assertPassPostdatesPasswordChange(pass: any, sessionsValidFrom: string | Date | null | undefined) {
+// S655: exported — the authenticator enrollment endpoints (routes/totp.ts)
+// mint a pass too and apply the same rule.
+//
+// S655: { wholeSecond: true } compares at the pass's own precision (iat is
+// whole seconds). For the emailed-code step's /verify and /resend (both through
+// liveAccountForPendingPass in routes/emailOtp.ts): the tenant invite activation
+// stamps sessions_valid_from and mints the email-code pass in the SAME request,
+// so that pass's iat usually reads as a fraction of a second "before" the stamp.
+// Everywhere else keeps the exact comparison.
+export function assertPassPostdatesPasswordChange(
+  pass: any,
+  sessionsValidFrom: string | Date | null | undefined,
+  opts?: { wholeSecond?: boolean },
+) {
   if (!sessionsValidFrom || typeof pass?.iat !== 'number') return
-  if (pass.iat * 1000 < new Date(sessionsValidFrom).getTime()) {
+  const validFromMs = new Date(sessionsValidFrom).getTime()
+  const mintedBefore = opts?.wholeSecond
+    ? pass.iat < Math.floor(validFromMs / 1000)
+    : pass.iat * 1000 < validFromMs
+  if (mintedBefore) {
     throw new AppError(401, 'Your password was changed. Please sign in again.')
   }
 }
@@ -1097,8 +1114,10 @@ authRouter.post('/forgot-password', async (req, res, next) => {
 // S655: an address just proven by a link from its own inbox (reset or
 // verification) — the same moment the emailed code is. A landlord account with
 // no company accepts the invitations waiting for that address here
-// (services/coOwnerInvites.ts). Best-effort: it never fails the request, and
-// the invite link and the next code sign-in both still do it.
+// (services/coOwnerInvites.ts). Best-effort: it never fails the request. Only
+// the address's FIRST proof claims, so if this claim fails nothing retries it
+// at a later sign-in; the person accepts from the invitation link while
+// signed in.
 async function claimOnProvenAddress(userId: string, firstVerification: boolean): Promise<void> {
   try { await claimInvitationsOnProvenAddress(userId, { firstVerification }) }
   catch (err) { logger.error({ err, userId }, '[auth] co-owner invitation claim failed') }

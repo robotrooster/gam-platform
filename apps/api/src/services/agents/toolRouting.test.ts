@@ -299,10 +299,20 @@ describe('portfolio analytics', () => {
     for (const m of [
       'what percentage of my tenants pay late',
       "what's my average rent",
-      'how many of my tenants are on fixed income',
       'what percent of people break their lease early',
       'how old are my tenants',
       'how am I doing',
+    ]) expect(landlord(m), m).toBe('get_portfolio_stats')
+  })
+
+  // S655 (Nic, 10/2): source of income is GAM's check for the flex products.
+  // The question still goes to the stats tool, whose answer is that it is
+  // private — never a count (services/agents/tools/tools.test.ts).
+  it('sends source-of-income questions to get_portfolio_stats, which says they are private', () => {
+    for (const m of [
+      'how many of my tenants are on fixed income',
+      'which of my tenants get SSI or SSDI',
+      'how many of my renters are on social security',
     ]) expect(landlord(m), m).toBe('get_portfolio_stats')
   })
 

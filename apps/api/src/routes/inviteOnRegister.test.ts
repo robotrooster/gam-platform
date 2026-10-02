@@ -366,6 +366,71 @@ describe('S655 only invitations already waiting at registration are claimed', ()
   })
 })
 
+// S655 review: a re-send refreshes the pending row IN PLACE (new token, new
+// expiry, same created_at), and nothing ever moves a lapsed invitation out of
+// 'pending'. So an invitation that lapsed before a login was even made came
+// back to life on a re-send, still "older than the account", and that login's
+// next ordinary code sign-in accepted it without the link ever being opened.
+// Only the address's FIRST proof claims now.
+describe('S655 only the first proof of the address claims an invitation', () => {
+  it('a lapsed invitation older than the login, re-sent, stays pending at an ordinary code sign-in', async () => {
+    const email = `lapsed-${randomUUID().slice(0, 8)}@mailer-test.co`
+    // The company invited this address 30 days ago; it lapsed after a week.
+    await db.query(
+      `INSERT INTO landlord_member_invitations
+         (landlord_id, email, invited_by_user_id, status, token, expires_at, created_at)
+       VALUES ($1, $2, $3, 'pending', $4, now() - interval '23 days', now() - interval '30 days')`,
+      [entityId, email, inviterUserId, randomUUID().replace(/-/g, '')])
+    // A login made 20 days ago, its address long since proven, owning no company.
+    const { rows: [u] } = await db.query<{ id: string; created_at: Date }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name,
+                          email_verified, email_verified_at, created_at)
+       VALUES ($1, $2, 'landlord', 'Bob', 'Nocompany', TRUE, now() - interval '20 days', now() - interval '20 days')
+       RETURNING id, created_at`,
+      [email, await bcrypt.hash(PASSWORD, 10)])
+
+    // The company re-sends, through the real route.
+    const ownerToken = jwt.sign(
+      { userId: inviterUserId, role: 'landlord', email: 'owner@mailer-test.co', profileId: entityId, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const resend = await request(buildApp()).post('/api/landlords/members')
+      .set('Authorization', `Bearer ${ownerToken}`).send({ email })
+    expect(resend.status).toBe(202)
+    const { rows: [inv] } = await db.query<any>(
+      `SELECT status, created_at, expires_at FROM landlord_member_invitations WHERE LOWER(email) = LOWER($1)`, [email])
+    expect(inv.status).toBe('pending')
+    expect(new Date(inv.expires_at).getTime()).toBeGreaterThan(Date.now())                  // live again
+    expect(new Date(inv.created_at).getTime()).toBeLessThan(new Date(u.created_at).getTime()) // and still "older"
+
+    const login = await request(buildApp()).post('/api/auth/login').send({ email, password: PASSWORD })
+    expect(login.body.data.requiresEmailOtp).toBe(true)
+    const done = await enterCode(login.body.data.emailOtpSession, email)
+    expect(done.status).toBe(200)
+
+    expect((await inviteRow(email)).status).toBe('pending')
+    expect(await membershipsFor(email)).toEqual([])
+    expect(await companiesFoundedBy(email)).toEqual([])
+    const { rows: [after] } = await db.query<any>(`SELECT referred_by_user_id FROM users WHERE id = $1`, [u.id])
+    expect(after.referred_by_user_id).toBeNull()
+    expect((jwt.decode(done.body.data.token) as any).landlordIds ?? []).not.toContain(entityId)
+  })
+
+  it('a later proof claims nothing, even an invitation that was waiting at registration — that one is accepted from its link', async () => {
+    const { claimInvitationsOnProvenAddress } = await import('../services/coOwnerInvites')
+    const email = `later-${randomUUID().slice(0, 8)}@mailer-test.co`
+    await invite(email)
+    await register(email)
+    const uid = await userIdFor(email)
+    expect(await claimInvitationsOnProvenAddress(uid, { firstVerification: false })).toEqual([])
+    expect((await inviteRow(email)).status).toBe('pending')
+    expect(await membershipsFor(email)).toEqual([])
+    expect(await companiesFoundedBy(email)).toEqual([])
+    // The first proof still does it.
+    expect(await claimInvitationsOnProvenAddress(uid, { firstVerification: true })).toEqual([entityId])
+    expect((await inviteRow(email)).accepted_user_id).toBe(uid)
+  })
+})
+
 // S655 review: requireAuth keeps each account's companies for 15 seconds
 // (S629). A session already open elsewhere filled that before the code was
 // entered; the claim has to drop it, or that session — and the cache hit that

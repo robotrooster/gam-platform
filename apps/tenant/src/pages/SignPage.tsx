@@ -4,8 +4,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
-import { humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso, startVersionWatch,
-  renewalSchedule, renewalBillingSummary, dayBefore, parseDueDay, moneyBoxValue } from '@gam/shared'
+import { humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso, startVersionWatch } from '@gam/shared'
 import { TypedDateInput } from '../components/TypedDateInput'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -358,15 +357,6 @@ export function SignPage() {
     { retry:false }
   )
 
-  // RENEWAL (Nic: "people get billed on their due date according to how the
-  // landlord sets the property"). The lease this one renews — the resident's
-  // own current lease — decides when the new rent starts. Read with their
-  // session; a signing link opened without one states the rule rather than a
-  // date it cannot know.
-  const priorLeaseId: string | null = data?.document?.renewsLeaseId ?? null
-  const { data: priorLease } = useQuery(['renewal-prior', priorLeaseId],
-    () => authFetch('/leases/' + priorLeaseId).then(r => r.ok ? r.json() : null).then((r: any) => r?.success ? r.data : null),
-    { enabled: !!priorLeaseId && !!tok() && !SIGNER_TOKEN_RE.test(documentId || ''), retry: false })
 
   // S234: tenant draft persistence. Save in-progress field values to
   // localStorage keyed by document id so an accidental refresh / nav-
@@ -614,28 +604,24 @@ export function SignPage() {
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
   const allFilled = unfilledRequired.length === 0
 
-  // RENEWAL: the first bill under the new lease, from the terms the landlord
-  // signed — the same arithmetic the bill run uses.
-  const renewalLine: string | null = (() => {
-    if (!doc?.renewsLeaseId) return null
-    const valOf = (col: string) => allFields.find((x:any) => x.leaseColumn === col && String(x.value ?? '').trim() !== '')?.value ?? null
-    const startRaw = valOf('start_date')
-    const start = startRaw ? (/^\d{4}-\d{2}-\d{2}/.test(startRaw) ? startRaw.slice(0, 10) : documentDateToIso(startRaw)) : null
-    const rent = moneyBoxValue(valOf('rent_amount'))
-    if (!start || !(rent > 0)) return null
-    // The first bill depends on the current lease's last day and due day.
-    // Without them (a signing link opened with no session) a specific date
-    // could be wrong — a changed due day makes a bridge this page cannot see —
-    // so the note states only the rule.
-    if (!priorLease) return null
-    const priorDay = priorLease.rentDueDay != null ? Number(priorLease.rentDueDay) : null
-    const newDay = parseDueDay(valOf('rent_due_day')) ?? priorDay ?? 1
-    const sched = renewalSchedule({
-      oldEnd: priorLease.endDate ? String(priorLease.endDate).slice(0, 10) : dayBefore(start),
-      oldDueDay: priorDay ?? newDay, newStart: start, newDueDay: newDay, rent,
-    })
-    return renewalBillingSummary(sched, rent, newDay)
-  })()
+  // S655: A NEW LEASE for the home they already live in. The server works out
+  // the first bill under it (GET /sign renewal_billing — the bill run's own
+  // arithmetic), so a tenant who opened the emailed link with no session sees
+  // the real date and amount, not a general rule.
+  const renewalBilling: any = (data as any)?.renewalBilling ?? null
+  const renewalLine: string | null = doc?.renewsLeaseId ? (renewalBilling?.summary ?? null) : null
+  const newLeaseStart: string | null = renewalBilling?.startDate ?? null
+  const longDay = (iso: string, year = true) => new Date(iso.slice(0, 10) + 'T12:00:00Z')
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', ...(year ? { year: 'numeric' } : {}), timeZone: 'UTC' } as any)
+  const dayBeforeStart = newLeaseStart
+    ? longDay(new Date(new Date(newLeaseStart.slice(0, 10) + 'T12:00:00Z').getTime() - 86400000).toISOString(), false)
+    : null
+  // Its start date has come: it is their lease now (it took over whether or not
+  // they had signed). The server says so by the park's calendar; the tenant's
+  // own clock is the fallback for an older response.
+  const nowLocal = new Date()
+  const todayLocal = `${nowLocal.getFullYear()}-${String(nowLocal.getMonth() + 1).padStart(2, '0')}-${String(nowLocal.getDate()).padStart(2, '0')}`
+  const newLeaseStarted: boolean = !!newLeaseStart && (renewalBilling?.started ?? (newLeaseStart.slice(0, 10) <= todayLocal))
 
   const handleFieldClick = (field:any) => {
     if (field.fieldType==='signature' && savedSig) {
@@ -805,7 +791,12 @@ export function SignPage() {
 
       {doc?.renewsLeaseId && (
         <div style={{ background:'var(--bg-2,#151a22)', border:'1px solid var(--border-0)', borderLeft:'3px solid var(--gold,#c9a227)', borderRadius:8, padding:'10px 12px', marginBottom:12, fontSize:'.8rem', color:'var(--text-1,#ddd)', lineHeight:1.5 }}>
-          <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>Your new lease</div>
+          <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>
+            Your new lease{newLeaseStart ? (newLeaseStarted ? ` — it started ${longDay(newLeaseStart)}` : ` — starts ${longDay(newLeaseStart)}`) : ''}
+          </div>
+          {newLeaseStarted
+            ? <>It is your lease now. Please read it and sign it. </>
+            : newLeaseStart && dayBeforeStart && <>Nothing changes before then: your current lease stays as it is through {dayBeforeStart}. </>}
           {renewalLine ?? 'Your rent picks up where your current lease\'s bills leave off, so no stretch is billed twice.'}
           {' '}Signing it bills no rent — only one-time money on it, like a deposit increase.
         </div>

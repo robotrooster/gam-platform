@@ -99,7 +99,9 @@ describe('POST /me/onboard-tenant — single-tenant manual onboarding', () => {
       })
     expect(res.status).toBe(200)
     expect(res.body.data.email).toBe(email)
-    expect(res.body.data.activationUrl).toMatch(/\/accept-invite\?token=[0-9a-f]{64}$/)
+    // S655 (Nic, 10/2): email-only — the setup link is never in the response.
+    expect(res.body.data).not.toHaveProperty('activationUrl')
+    expect(JSON.stringify(res.body)).not.toMatch(/accept-invite/)
 
     // Full chain landed
     const u = await db.query<{ role: string }>(
@@ -123,6 +125,8 @@ describe('POST /me/onboard-tenant — single-tenant manual onboarding', () => {
 
     expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
     expect(emailTenantOnboardedMock.mock.calls[0]![0]).toBe(email)
+    const token = (await db.query(`SELECT tenant_invite_token FROM users WHERE email=$1`, [email])).rows[0].tenant_invite_token
+    expect(emailTenantOnboardedMock.mock.calls[0]![5]).toMatch(new RegExp(`/accept-invite\\?token=${token}$`))
   })
 
   it('no leaseEnd → lease_type defaults to month_to_month', async () => {
@@ -267,40 +271,83 @@ describe('POST /me/onboard-tenant-pending — limbo entry', () => {
   })
 })
 
-describe('POST /me/onboard-tenants-csv/commit-pending — batch limbo', () => {
-  it('empty rows → 400', async () => {
+// S629 (Nic): "I don't have everybody's phone number, just emails." Phone is
+// optional on every resident door, including these two.
+describe('a phone number is optional', () => {
+  const phoneOf = async (email: string) =>
+    (await db.query(`SELECT phone FROM users WHERE email=$1`, [email])).rows[0]?.phone
+
+  it('Add One Tenant (onboard-tenant-pending) takes a name and email; no phone, or a blank one, is stored as none', async () => {
     const f = await seedTOFixture()
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit-pending')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ rows: [] })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/rows array required/)
+    const none = `nophone-${randomUUID().slice(0, 6)}@test.dev`
+    const blank = `blank-${randomUUID().slice(0, 6)}@test.dev`
+    const r1 = await request(buildApp()).post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ firstName: 'No', lastName: 'Phone', email: none })
+    expect(r1.status).toBe(200)
+    expect(await phoneOf(none)).toBeNull()
+    const r2 = await request(buildApp()).post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ firstName: 'Blank', lastName: 'Phone', email: blank, phone: '   ' })
+    expect(r2.status).toBe(200)
+    expect(await phoneOf(blank)).toBeNull()
   })
 
-  it('mixed batch: 1 valid + 1 missing-fields → per-row results; valid row landed', async () => {
+  it('a missing name or email is still refused, in plain words', async () => {
+    const f = await seedTOFixture()
+    const res = await request(buildApp()).post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ firstName: 'Only', phone: '555' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('Add their first name, last name and email.')
+  })
+
+  it('the paper-lease door (onboard-tenant) takes no phone too', async () => {
+    const f = await seedTOFixture()
+    const email = `paper-${randomUUID().slice(0, 6)}@test.dev`
+    const res = await request(buildApp()).post('/api/landlords/me/onboard-tenant')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ firstName: 'Pa', lastName: 'Per', email, unitId: f.unitId, leaseStart: '2026-01-01', monthlyRent: 900 })
+    expect(res.status).toBe(200)
+    expect(await phoneOf(email)).toBeNull()
+  })
+})
+
+describe('Add One Tenant with no unit, for a person another company has parked without one', () => {
+  it('says what to do in plain words and never names the other company', async () => {
+    const a = await seedTOFixture()
+    const b = await seedTOFixture()
+    const email = `parked-${randomUUID().slice(0, 6)}@test.dev`
+    expect((await request(buildApp()).post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${a.landlordToken}`).send({ firstName: 'P', lastName: 'K', email })).status).toBe(200)
+    const res = await request(buildApp()).post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${b.landlordToken}`).send({ firstName: 'P', lastName: 'K', email })
+    // Until the post-deploy step drops the old tenant-only index the second
+    // company's no-unit row collides with the first; after it, each company
+    // keeps its own.
+    const oldIndex = (await db.query(
+      `SELECT 1 FROM pg_indexes WHERE indexname = 'pending_tenant_intents_tenant_nounit_live_key'`)).rows.length > 0
+    if (oldIndex) {
+      expect(res.status).toBe(409)
+      expect(res.body.error).toBe("This person can't be added without a unit yet. Pick the unit they live in and add them again.")
+      expect(res.body.error).not.toMatch(/company/i)
+    } else {
+      expect(res.status).toBe(200)
+    }
+  })
+})
+
+// S655: the tenant CSV is a draft roster now; the old "limbo" batch route
+// that made users, tenants and invites the moment a file validated is retired.
+describe('POST /me/onboard-tenants-csv/commit-pending — retired', () => {
+  it('answers 410 with the next step and creates nobody', async () => {
     const f = await seedTOFixture()
     const okEmail = `ok-${randomUUID().slice(0,6)}@test.dev`
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-tenants-csv/commit-pending')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({
-        rows: [
-          { rowIndex: 0, firstName: 'Good', lastName: 'Row', email: okEmail, phone: '555-1111' },
-          { rowIndex: 1, firstName: 'Bad', lastName: '', email: '', phone: '' },  // missing fields
-        ],
-      })
-    expect(res.status).toBe(200)
-    expect(res.body.data.created).toBe(1)
-    expect(res.body.data.skipped).toBe(1)
-    expect(res.body.data.results[0].status).toBe('created')
-    expect(res.body.data.results[1].status).toBe('error')
-    expect(res.body.data.results[1].message).toMatch(/required/)
-
-    // The good row's intent persisted (rollback isolation)
-    const intents = await db.query(
-      `SELECT id FROM pending_tenant_intents WHERE landlord_id=$1`, [f.landlordId])
-    expect(intents.rows.length).toBe(1)
+      .send({ rows: [{ rowIndex: 0, firstName: 'Good', lastName: 'Row', email: okEmail, phone: '555-1111' }] })
+    expect(res.status).toBe(410)
+    expect(res.body.error).toMatch(/draft roster/)
+    expect((await db.query(`SELECT id FROM users WHERE email=$1`, [okEmail])).rows).toEqual([])
+    expect((await db.query(`SELECT id FROM pending_tenant_intents WHERE landlord_id=$1`, [f.landlordId])).rows).toEqual([])
   })
 })
 
@@ -610,8 +657,9 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
       })
     expect(res.status).toBe(200)
     expect(res.body.data.alreadyOnPlatform).toBe(true)
-    // No activation link, because there is nothing to activate.
-    expect(res.body.data.activationUrl).toBeNull()
+    // No activation link, because there is nothing to activate (and S655:
+    // never one in a response at all).
+    expect(res.body.data).not.toHaveProperty('activationUrl')
 
     // And no invite token was minted against their live account — that token is
     // what makes the "set a password" mail possible in the first place.
@@ -624,7 +672,7 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
     expect(res.body.data.leaseId).toBeTruthy()
   })
 
-  it('a brand-new person still gets the invite, unchanged', async () => {
+  it('a brand-new person still gets the invite — by email only (S655)', async () => {
     const f = await seedTOFixture()
     const email = `brand-new-${randomUUID().slice(0,6)}@test.dev`
     const res = await request(buildApp())
@@ -638,7 +686,9 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
       })
     expect(res.status).toBe(200)
     expect(res.body.data.alreadyOnPlatform).toBe(false)
-    expect(res.body.data.activationUrl).toMatch(/\/accept-invite\?token=[0-9a-f]{64}$/)
+    expect(res.body.data).not.toHaveProperty('activationUrl')
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+    expect(emailTenantOnboardedMock.mock.calls[0]![5]).toMatch(/\/accept-invite\?token=[0-9a-f]{64}$/)
   })
 
   // An invite that was SENT but never accepted still needs re-sending — that
@@ -670,7 +720,7 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
       })
     expect(res.status).toBe(200)
     expect(res.body.data.alreadyOnPlatform).toBe(false)
-    expect(res.body.data.activationUrl).toBeNull()
+    expect(res.body.data).not.toHaveProperty('activationUrl')
     expect(JSON.stringify(res.body)).not.toMatch(/accept-invite/)
 
     const token = (await db.query<{ tenant_invite_token: string | null }>(

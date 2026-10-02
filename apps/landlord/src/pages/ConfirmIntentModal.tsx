@@ -55,13 +55,27 @@ type IntentDetail = {
 
 type OverridesMap = Record<string, string | number | boolean>
 
-type ResolveResponseData = {
+// S654/S655: no setup link in the result — it goes only to the person's own
+// email. The resolve route never returned one here anyway.
+export type ResolveResponseData = {
   leaseId: string
   tenantId: string
   userId: string
   email: string
-  activationUrl: string
   supersededLeaseId?: string | null
+} | {
+  // S655 (Nic, 10/2): imports are never blocked. Someone who already has a GAM
+  // account with another company isn't attached by the import: their lease is
+  // drafted from your setup and sent to them to sign, and starts when they do.
+  sentToSign: true
+  tenantId: string
+  userId: string
+  email: string
+  unitId: string
+  unitNumber: string
+  draftedDocumentIds: string[]
+  draftBlocked: string[]
+  message: string
 }
 // S582: resolving into an already-leased unit returns this instead of silently
 // ending the sitting lease — the landlord confirms, then we re-submit.
@@ -731,7 +745,8 @@ export function ConfirmIntentModal({
       }
       onResolved(data)
     } catch (e: any) {
-      setSubmitError(e?.response?.data?.message || e?.message || 'Build lease failed')
+      // S654: the API's reason lives in `error`.
+      setSubmitError(e?.response?.data?.error || e?.response?.data?.message || e?.message || 'The lease could not be built. Try again.')
     } finally {
       setSubmitting(false)
     }

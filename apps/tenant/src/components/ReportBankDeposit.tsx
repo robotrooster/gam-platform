@@ -19,13 +19,26 @@
 //    saying: a corroborated report earns them the date THEY paid rather than the
 //    date the bank got round to posting, which over a weekend is several days of
 //    late fees.
+//
+// S655 review — AND IT MUST ONLY PROMISE WHAT GAM CAN DO. All of the above is
+// true only while GAM is reading the landlord's bank. Without that (no bank
+// linked, or a link in error) nothing matches the report and nothing expires
+// it: the landlord checks their own bank and marks the bill paid by hand. The
+// window asks before the tenant reports, and every line here — the form, the
+// confirmation and the list of reports — says which of the two it is
+// (./reportBankDepositCopy.ts).
 
 import { useState } from 'react'
+import { useQuery } from 'react-query'
 import {
   MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, formatCurrency,
   type ManualPaymentMethod,
 } from '@gam/shared'
-import { apiPost, apiDelete } from '../lib/api'
+import { apiGet, apiPost, apiDelete } from '../lib/api'
+import {
+  ONLY_AFTER_YOU_PAID, alreadyReportedMessage, bankWatch, pendingReportStatus, reportDepositCopy,
+  reportStandsNow,
+} from './reportBankDepositCopy'
 
 interface Props {
   leaseId: string
@@ -50,8 +63,21 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
   const [done, setDone] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
+  // Asked fresh every time the window opens: whether GAM is reading this
+  // landlord's bank decides what the window may promise.
+  const feed = useQuery(
+    ['declared-deposit-feed', leaseId],
+    () => apiGet<{ leaseId: string; bankFeedLinked: boolean; expiresInDays?: number }>(
+      `/declared-deposits/feed/${leaseId}`),
+    { staleTime: 0, retry: 1 },
+  )
+  const watch = bankWatch({
+    bankFeedLinked: feed.data?.bankFeedLinked, loading: feed.isLoading, failed: feed.isError,
+  })
+  const copy = reportDepositCopy(watch, feed.data?.expiresInDays)
+
   const amount = Number(amountText)
-  const canSubmit = confirmed && amount > 0 && !!declaredDate && !submitting
+  const canSubmit = confirmed && amount > 0 && !!declaredDate && !submitting && copy.canReport
 
   async function submit() {
     setError(null); setSubmitting(true)
@@ -60,7 +86,10 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
         leaseId, amount, declaredDate, method,
         reference: reference.trim() || undefined,
       })
-      setDone(res?.data?.message ?? 'Reported.')
+      // The server's own sentence is the authority: it checks the bank link
+      // at the moment of reporting.
+      setDone(res?.data?.message
+        ?? (res?.data?.alreadyReported ? alreadyReportedMessage(watch) : 'Reported.'))
       onReported()
     } catch (e: any) {
       setError(e?.message || 'We could not record that. Try again.')
@@ -97,9 +126,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
         ) : (
           <>
             <div style={{ fontSize: '.8rem', color: 'var(--t2)', lineHeight: 1.55, marginTop: 6 }}>
-              If you deposited rent straight into your landlord's account, tell us and
-              we'll watch for it. When it appears we'll apply it automatically — and
-              date it to the day <em>you</em> paid, not the day the bank posted it.
+              {copy.intro}
             </div>
 
             {/* Nic's warning, given its own weight rather than buried in help text. */}
@@ -109,9 +136,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
               border: '1px solid var(--warn-bd, rgba(200,150,40,.35))',
               fontSize: '.78rem', lineHeight: 1.55, color: 'var(--t1)',
             }}>
-              <strong>Only after you've actually paid.</strong> Give the bank a few hours
-              to show the deposit — if you report it before you've been, there'll be
-              nothing for us to match and the report will expire.
+              <strong>{ONLY_AFTER_YOU_PAID}</strong> {copy.warning}
             </div>
 
             <label style={{ display: 'block', marginTop: 14, fontSize: '.75rem', color: 'var(--t3)' }}>
@@ -158,10 +183,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
             }}>
               <input type="checkbox" checked={confirmed} style={{ marginTop: 3 }}
                 onChange={(e) => setConfirmed(e.target.checked)} />
-              <span>
-                I've already made this deposit, and I understand my balance stays the
-                same until it shows up in the bank.
-              </span>
+              <span>{copy.confirm}</span>
             </label>
 
             {error && (
@@ -193,22 +215,47 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
  * tenant needs to see and act on, and a confirmed one is the reassurance that
  * the thing they did worked.
  */
-export function ReportedDeposits({ reports, onWithdrawn }: {
+/** The server's answer to an "I hadn't paid" it would not do. */
+export interface WithdrawRefusal { id: string; message: string }
+
+export function ReportedDeposits({ reports, onWithdrawn, refusal, onRefusal, standalone }: {
   reports: any[]
   onWithdrawn: () => void
+  /**
+   * S655 review: a page can hold the refusal itself (pass both). The refused
+   * report was usually just applied to the bill, often paying it off, and the
+   * reload that follows takes away the balance card this list sits in — held
+   * in here, the answer went with the card. Without these, the list holds it.
+   */
+  refusal?: WithdrawRefusal | null
+  onRefusal?: (r: WithdrawRefusal | null) => void
+  /** Its own block on the page rather than a section of a card. */
+  standalone?: boolean
 }) {
   const [busy, setBusy] = useState<string | null>(null)
+  const [ownRefusal, setOwnRefusal] = useState<WithdrawRefusal | null>(null)
+  const withdrawError = onRefusal ? (refusal ?? null) : ownRefusal
+  const setWithdrawError = onRefusal ?? setOwnRefusal
   const open = reports.filter(r => r.status === 'pending' || r.status === 'unconfirmed')
-  if (open.length === 0) return null
+  // A refused "I hadn't paid" is usually a report matched or closed in the
+  // meantime, which has just left the open list: when it was the only one,
+  // the list stays up to say what happened rather than vanishing.
+  if (open.length === 0 && !withdrawError) return null
+  const standing = withdrawError ? reportStandsNow(reports.find(r => r.id === withdrawError.id)) : null
 
   async function withdraw(id: string) {
-    setBusy(id)
-    try { await apiDelete(`/declared-deposits/${id}`); onWithdrawn() }
-    finally { setBusy(null) }
+    setBusy(id); setWithdrawError(null)
+    try { await apiDelete(`/declared-deposits/${id}`) }
+    catch (e: any) {
+      // Said once, in the server's words. The list reloads below, and the line
+      // under it says where the report stands now.
+      setWithdrawError({ id, message: e?.message || 'We could not take that report back. Try again.' })
+    }
+    finally { setBusy(null); onWithdrawn() }
   }
 
   return (
-    <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--bd)' }}>
+    <div style={standalone ? undefined : { marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--bd)' }}>
       <div style={{
         fontSize: '.7rem', fontWeight: 700, color: 'var(--t3)',
         textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6,
@@ -222,10 +269,12 @@ export function ReportedDeposits({ reports, onWithdrawn }: {
         }}>
           <span style={{ color: 'var(--t2)', lineHeight: 1.5 }}>
             {formatCurrency(Number(r.amount))} on {r.declaredDate}
-            <span style={{ color: 'var(--t3)' }}> · {r.method.replace('_', ' ')}</span>
+            <span style={{ color: 'var(--t3)' }}>
+              {' · '}{MANUAL_PAYMENT_METHOD_LABELS[r.method as ManualPaymentMethod] ?? 'Other'}
+            </span>
             <div style={{ color: 'var(--t3)', fontSize: '.72rem', marginTop: 2 }}>
               {r.status === 'pending'
-                ? 'Waiting for it to appear in the bank. Your balance is unchanged until it does.'
+                ? pendingReportStatus(r.bankFeedLinked)
                 : (r.resolutionNote || 'We could not find a matching deposit.')}
             </div>
           </span>
@@ -238,6 +287,16 @@ export function ReportedDeposits({ reports, onWithdrawn }: {
           )}
         </div>
       ))}
+      {withdrawError && (
+        <div role="status" style={{ marginTop: 6, fontSize: '.74rem', lineHeight: 1.5 }}>
+          <div style={{ color: 'var(--danger, #d66)' }}>{withdrawError.message}</div>
+          {standing && <div style={{ color: 'var(--t2)', marginTop: 2 }}>{standing}</div>}
+          <button className="btn-ghost" style={{ fontSize: '.72rem', padding: '4px 10px', marginTop: 6 }}
+            onClick={() => setWithdrawError(null)}>
+            OK
+          </button>
+        </div>
+      )}
     </div>
   )
 }

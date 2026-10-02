@@ -50,7 +50,14 @@ export function UnitDetailPage() {
   const [schedLocal, setSchedLocal] = useState('')  // yyyy-MM-ddTHH:mm local to unit's state tz
   const fileRef = useRef<HTMLInputElement>(null)
 
-  const { data: unit, isLoading } = useQuery(['unit', id], () => apiGet<any>('/units/' + id))
+  const { data: unit, isLoading, error: unitError, refetch: refetchUnit, isFetching: unitFetching } = useQuery(
+    ['unit', id], () => apiGet<any>('/units/' + id), {
+      // A refusal or a missing unit will not change on a retry: say it once.
+      retry: (count: number, e: any) => {
+        const status = e?.response?.status
+        return !(status >= 400 && status < 500) && count < 2
+      },
+    })
   // S630: which physical facts this unit's TAGS decide. Same query key the
   // subtype row uses, so react-query serves one request. A fact the tags own is
   // shown here rather than offered as an editable field — two places to set one
@@ -225,7 +232,29 @@ export function UnitDetailPage() {
   )
 
   if (isLoading) return <div style={{ color: 'var(--text-3)', padding: 32 }}>Loading...</div>
-  if (!unit) return <div className="empty-state"><h3>Unit not found</h3></div>
+  if (!unit) {
+    // S655: say why in plain words, with the way out — a staff member assigned
+    // to particular properties cannot open a unit at another property.
+    const status = (unitError as any)?.response?.status
+    const reason: string | undefined = (unitError as any)?.response?.data?.error
+    const title = status === 403 ? "You can't open this unit"
+      : status === 404 || !unitError ? 'Unit not found'
+      : "This unit's page didn't load"
+    return (
+      <div className="empty-state">
+        <h3>{title}</h3>
+        {status === 403 && reason && <p>{reason}</p>}
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 12 }}>
+          {unitError && status !== 403 && status !== 404 && (
+            <button className="btn btn-primary btn-sm" disabled={unitFetching} onClick={() => refetchUnit()}>
+              {unitFetching ? 'Trying again…' : 'Try again'}
+            </button>
+          )}
+          <button className="btn btn-ghost btn-sm" onClick={() => navigate('/units')}>Back to units</button>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div>
@@ -567,7 +596,8 @@ export function UnitDetailPage() {
               <div className="data-row"><span className="data-key">Name</span><span className="data-val">{unit.tenantFirst} {unit.tenantLast}</span></div>
               <div className="data-row"><span className="data-key">Email</span><span className="data-val">{unit.tenantEmail}</span></div>
               <div className="data-row"><span className="data-key">ACH</span><span className={'badge ' + (unit.achVerified ? 'badge-green' : 'badge-amber')}>{unit.achVerified ? 'Verified' : 'Pending'}</span></div>
-              <div className="data-row"><span className="data-key">SSI/SSDI</span><span className="data-val">{unit.ssiSsdi ? 'Yes' : 'No'}</span></div>
+              {/* S655 (Nic, 10/2): no SSI/SSDI row. "That's our check for the
+                  flex products" — GAM-side only; the server no longer sends it. */}
             </>
           ) : (
             <div style={{ color: 'var(--text-3)', fontSize: '.875rem', padding: '16px 0' }}>No tenant assigned.</div>

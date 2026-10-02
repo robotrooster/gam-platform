@@ -710,6 +710,9 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
       /\bhow (?:many|much)\b[^?]{0,30}\b(on average|typically|usually)\b/i,
       /\b(am i|are we) averaging\b/i,
       /\bhow am i doing\b/i,
+      // S655 (Nic, 10/2): source of income is GAM's check for the flex
+      // products and is never shared with a landlord. Still routed here so the
+      // agent reads the tool's plain "that is private" instead of guessing.
       /\b(fixed income|ssi|ssdi|disability|social security)\b/i,
       /\bhow old are (my|the) (tenants|renters)\b/i,
       /\b(break|breaking|broke|end|ending|ended)\b[^?]{0,20}\blease(s)? early\b/i,

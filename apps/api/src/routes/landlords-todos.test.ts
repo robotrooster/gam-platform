@@ -136,6 +136,31 @@ describe('GET /api/landlords/me/todos', () => {
     expect(res.body.data.leases[0].title).toMatch(/Lease needs review/)
   })
 
+  // S655: once the landlord has signed a new lease to follow it, there is
+  // nothing to decide. It used to fall back to "Lease expiring — decide: renew
+  // or not" the moment a renewal was signed by everyone.
+  it('a lease with a new lease signed by the landlord to follow it is not "expiring"', async () => {
+    const f = await seedTFixture()
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const leaseId = await seedLease(client, { unitId: f.unitId, landlordId: f.landlordId })
+      await client.query(
+        `UPDATE leases SET end_date=CURRENT_DATE + INTERVAL '30 days', expiration_notice_days=60 WHERE id=$1`, [leaseId])
+      await seedLeaseTenant(client, { leaseId, tenantId: f.tenantId, role: 'primary' })
+      await client.query(
+        `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, rent_due_day,
+                             supersedes_lease_id, signed_by_landlord, signed_by_tenant)
+         VALUES ($1,$2,1050,'month_to_month','pending',CURRENT_DATE + 31,1,$3,TRUE,FALSE)`,
+        [f.unitId, f.landlordId, leaseId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const res = await getTodos(f.landlordToken)
+    expect(res.status).toBe(200)
+    expect(res.body.data.leases.filter((l: any) => l.type === 'expiring_soon')).toEqual([])
+  })
+
   it('lease expiring within expiration_notice_days window → expiring_soon todo', async () => {
     const f = await seedTFixture()
     const client = await db.connect()

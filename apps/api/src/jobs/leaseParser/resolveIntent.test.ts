@@ -206,11 +206,65 @@ describe('S654: resolveIntent and existing accounts', () => {
        VALUES ($1, $2, 'not_uploaded', $3)`, [a.landlordId, t.id, a.unitId])
     const before = await account(v.id)
 
-    const res: any = await resolveIntent(await errorIntent(b), [b.landlordId], overridesFor(b, email))
+    const uploaded = await errorIntent(b)
+    const res: any = await resolveIntent(uploaded, [b.landlordId], overridesFor(b, email))
     expect('activationUrl' in res).toBe(false)
-    expect(res.alreadyOnPlatform).toBe(true)
+    // S655 (Nic, 10/2): not refused, not attached — a lease sent to them to sign.
+    expect(res.sentToSign).toBe(true)
+    expect(res.message).toMatch(/another company/)
     expect(await account(v.id)).toEqual(before)
     expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [b.unitId])).rows).toEqual([])
+    // The upload's own invite was made for a different address (the landlord
+    // corrected it): it is closed, never drafted into the household beside them.
+    expect((await db.query(`SELECT cancelled_at FROM pending_tenant_intents WHERE id=$1`, [uploaded])).rows[0].cancelled_at).not.toBeNull()
+    expect((await db.query(
+      `SELECT tenant_id FROM pending_tenant_intents WHERE unit_id=$1 AND cancelled_at IS NULL`, [b.unitId])).rows)
+      .toEqual([{ tenant_id: t.id }])
+  })
+
+  // A build that fails (the unit has no rent, or is already someone's) used to
+  // leave the PDF's invite bound to the unit with no lease — and the hourly
+  // sweep then drafted that household on its own, after the landlord was told
+  // it had failed.
+  it.each([
+    ['the unit has no rent', async (b: Company) => { await db.query(`UPDATE units SET rent_amount = 0 WHERE id = $1`, [b.unitId]) }],
+    ['the unit already has a lease', async (b: Company) => {
+      const c = await db.connect()
+      try {
+        await c.query('BEGIN')
+        const other = await seedTenant(c)
+        const leaseId = await seedLease(c, { unitId: b.unitId, landlordId: b.landlordId, status: 'active' })
+        await seedLeaseTenant(c, { leaseId, tenantId: other, role: 'primary' })
+        await c.query('COMMIT')
+      } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    }],
+  ])("a failed build for another company's resident leaves their invite exactly as it was (%s)", async (_why, breakUnit) => {
+    const a = await company()
+    const b = await company()
+    const email = `resident-${randomUUID().slice(0, 6)}@test.dev`
+    const v = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ($1, '$2b$10$their.own.real.password.hash', 'tenant', 'Vic', 'Tim') RETURNING id`, [email])).rows[0]
+    const t = (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [v.id])).rows[0]
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
+       VALUES ($1, $2, 'not_uploaded', $3)`, [a.landlordId, t.id, a.unitId])
+    const intentId = (await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status) VALUES ($1, $2, 'error') RETURNING id`,
+      [b.landlordId, t.id])).rows[0].id
+    await breakUnit(b)
+    const snapshot = async () => (await db.query(
+      `SELECT unit_id, property_id, draft_document_id, cancelled_at, resolved_at FROM pending_tenant_intents WHERE id=$1`,
+      [intentId])).rows[0]
+    const before = await snapshot()
+
+    await expect(resolveIntent(intentId, [b.landlordId], overridesFor(b, email))).rejects.toThrow()
+    expect(await snapshot()).toEqual(before)
+    expect(before.unit_id).toBeNull()
+    expect((await db.query(
+      `SELECT id FROM pending_tenant_intents WHERE unit_id=$1 AND tenant_id=$2`, [b.unitId, t.id])).rows).toEqual([])
+    expect((await db.query(`SELECT id FROM lease_documents WHERE unit_id=$1`, [b.unitId])).rows).toEqual([])
   })
 
   it("an e-sign witness another landlord set up gets no link", async () => {
@@ -228,8 +282,42 @@ describe('S654: resolveIntent and existing accounts', () => {
        VALUES ($1, $2, 'witness', 'Wit Ness', $3, 3, $4, 'pending')`, [d.id, w.id, email, randomUUID()])
 
     const res: any = await resolveIntent(await errorIntent(b), [b.landlordId], overridesFor(b, email))
-    expect(res.alreadyOnPlatform).toBe(true)
+    expect(res.sentToSign).toBe(true)
     expect((await account(w.id)).tenant_invite_token).toBeNull()
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  // S655 (Nic, 10/2): "Imports are NEVER blocked." This used to refuse a
+  // tenant of another landlord outright ("Cross-landlord onboarding requires
+  // a separate flow"). Their paper lease now becomes a lease they sign: the
+  // intent is bound to the unit, nothing active is written in their name,
+  // and pressing Build again does not draft a second copy.
+  it("another company's ACTIVE tenant is never refused: their PDF import becomes a lease sent to them to sign", async () => {
+    const a = await company()
+    const b = await company()
+    await db.query(`UPDATE units SET rent_amount = 900 WHERE id = $1`, [b.unitId])
+    const email = `resident-${randomUUID().slice(0, 6)}@test.dev`
+    const v = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ($1, '$2b$10$their.own.real.password.hash', 'tenant', 'Vic', 'Tim') RETURNING id`, [email])).rows[0]
+    const t = (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [v.id])).rows[0]
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const leaseId = await seedLease(c, { unitId: a.unitId, landlordId: a.landlordId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId, tenantId: t.id, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const intentId = (await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status) VALUES ($1, $2, 'error') RETURNING id`,
+      [b.landlordId, t.id])).rows[0].id
+
+    const res: any = await resolveIntent(intentId, [b.landlordId], overridesFor(b, email))
+    expect(res.sentToSign).toBe(true)
+    expect(res.tenantId).toBe(t.id)
+    expect((await db.query(`SELECT id FROM leases WHERE unit_id=$1`, [b.unitId])).rows).toEqual([])
+    const bound = (await db.query(`SELECT unit_id, cancelled_at FROM pending_tenant_intents WHERE id=$1`, [intentId])).rows[0]
+    expect(bound).toEqual({ unit_id: b.unitId, cancelled_at: null })
     expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
   })
 

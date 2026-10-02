@@ -248,6 +248,7 @@ const UNTOUCHED_SQL = (t: string) => `(NOT ${FILED_SQL(t)}
 interface StoredRow {
   id: string; external_id: string; posted_date: string; amount: string; description: string | null
   status: string; ignored_reason: string | null; bank_status: string | null; filed: boolean
+  duplicate_of_id: string | null
 }
 interface Sibling { id: string; posted_date: string; amount: string; description: string | null; filed: boolean; day: number }
 
@@ -282,7 +283,8 @@ interface Sibling { id: string; posted_date: string; amount: string; description
  *     is untouched, the new link's copy is kept (it is the one the bank keeps
  *     updating) and the old one becomes `duplicate` pointing at it. If the old
  *     copy was already filed, it stays and the new copy lands as the duplicate.
- *     Nothing is deleted; every hidden copy points at the one kept.
+ *     Nothing is deleted; every hidden copy points at the one kept, and a void
+ *     the bank reports on a copy is carried to the one kept.
  *
  * Rows before the books start date land ignored as `before_books` on every
  * path, so pre-GAM history never enters review (S605/S654).
@@ -320,15 +322,20 @@ export async function upsertTransactions(
       : { status: 'needs_review', reason: null as string | null }
 
     // Lock every row this sync may change before reading any of them: this
-    // link's own rows, and the rows on the account's other links within reach
-    // of a pairing (a superset of the copies step 2 reads). One statement, in
-    // id order, so it can't deadlock with another ordered locker (the books
-    // start date). A filing in progress finishes first and is read as filed;
-    // a filing that starts now waits for this sync and then sees its result.
+    // link's own rows, the rows on the account's other links within reach
+    // of a pairing (a superset of the copies step 2 reads), and the originals
+    // this link's own copies point at (a void follows a copy to its original).
+    // One statement, in id order, so it can't deadlock with another ordered
+    // locker (the books start date). A filing in progress finishes first and
+    // is read as filed; a filing that starts now waits for this sync and then
+    // sees its result.
     const postedDates = rows.filter(r => (r.status ?? 'posted') === 'posted').map(r => r.postedDate).sort()
     await client.query(
       `SELECT t.id FROM bank_transactions t
         WHERE (t.bank_connection_id = $1 AND t.external_id = ANY($2::text[]))
+           OR t.id IN (SELECT d.duplicate_of_id FROM bank_transactions d
+                        WHERE d.bank_connection_id = $1 AND d.external_id = ANY($2::text[])
+                          AND d.duplicate_of_id IS NOT NULL)
            OR ($4::text IS NOT NULL AND $5::date IS NOT NULL
                AND t.landlord_id = $3
                AND t.bank_connection_id IN (
@@ -344,7 +351,8 @@ export async function upsertTransactions(
     // 1. What this link already holds: follow the bank.
     const stored = new Map<string, StoredRow>((await client.query<StoredRow>(
       `SELECT t.id, t.external_id, t.posted_date::text AS posted_date, t.amount::text AS amount,
-              t.description, t.status, t.ignored_reason, t.bank_status, ${FILED_SQL('t')} AS filed
+              t.description, t.status, t.ignored_reason, t.bank_status, t.duplicate_of_id,
+              ${FILED_SQL('t')} AS filed
          FROM bank_transactions t
         WHERE t.bank_connection_id = $1 AND t.external_id = ANY($2::text[])`,
       [connectionId, rows.map(r => r.externalId)])).rows.map(r => [r.external_id, r]))
@@ -446,6 +454,12 @@ async function followTheBank(
         logger.warn({ transactionId: s.id, status: s.status }, '[bank-feed] the bank voided a transaction that was already filed')
       }
     }
+    // S655 review: a copy voided means the transaction it copies was voided.
+    // After a relink whose old copy was already filed, that filed original
+    // stays on the retired link, which is never synced again — only its hidden
+    // copy on the live link still hears from the bank. Carry the void over, or
+    // the landlord is never told the money they filed never moved.
+    if (s.ignored_reason === 'duplicate' && s.duplicate_of_id) await voidTheOriginal(client, s.duplicate_of_id)
     return true
   }
 
@@ -468,6 +482,27 @@ async function followTheBank(
     return true
   }
   return false
+}
+
+/**
+ * The bank voided a transaction whose kept copy (the original a hidden copy
+ * points at) is this row. Untouched, it is hidden as voided — under the same
+ * re-check every sync change makes. Filed, it stays in the books and is
+ * flagged, so the page warns the landlord. The row is already locked by
+ * upsertTransactions.
+ */
+async function voidTheOriginal(client: PoolClient, id: string): Promise<void> {
+  const hidden = (await client.query(
+    `UPDATE bank_transactions t
+        SET status = 'ignored', ignored_reason = 'bank_void', bank_status = 'void', updated_at = now()
+      WHERE t.id = $1 AND t.bank_status IS DISTINCT FROM 'void' AND ${UNTOUCHED_SQL('t')}`, [id])).rowCount
+  if (hidden) return
+  const flagged = (await client.query<{ status: string }>(
+    `UPDATE bank_transactions SET bank_status = 'void', updated_at = now()
+      WHERE id = $1 AND bank_status IS DISTINCT FROM 'void' RETURNING status`, [id])).rows[0]
+  if (flagged && (flagged.status === 'categorized' || flagged.status === 'matched')) {
+    logger.warn({ transactionId: id, status: flagged.status }, '[bank-feed] the bank voided a transaction that was already filed (seen on its copy)')
+  }
 }
 
 /**
@@ -668,32 +703,67 @@ export async function refreshBalance(conn: any): Promise<void> {
  * disbursement that produced them (same amount, posted date within the window).
  * Matched rows drop out of the review queue — the landlord never re-categorizes
  * money GAM already moved. Amounts GAM did NOT move stay needs_review.
+ *
+ * S655 review: the candidates are read without a lock, so by the time a match
+ * is written the landlord may have filed the row as income, a tenant's deposit
+ * may have been confirmed against it, or a sync may have hidden it as a copy.
+ * The write re-checks, on the row itself, that it is still an untouched deposit
+ * in review — and a match only counts when it landed. One matcher per company
+ * at a time, so two syncs finishing together cannot hand one payout to two
+ * deposits. (A NULL bank_status is a row stored before S655, read as posted.)
  */
+const AUTO_MATCHABLE_SQL = (t: string) => `(${t}.status = 'needs_review' AND ${t}.amount > 0
+  AND COALESCE(${t}.bank_status, 'posted') = 'posted'
+  AND ${t}.expense_id IS NULL AND ${t}.landlord_other_income_id IS NULL
+  AND ${t}.matched_payment_id IS NULL AND ${t}.matched_disbursement_id IS NULL)`
+
 export async function autoMatchLandlord(landlordId: string): Promise<number> {
-  const candidates = await query<any>(
-    `SELECT id, amount, posted_date FROM bank_transactions
-      WHERE landlord_id = $1 AND status = 'needs_review' AND amount > 0
-        -- S655: only once the bank has posted it (NULL = stored before S655)
-        AND COALESCE(bank_status, 'posted') = 'posted'`, [landlordId])
+  const client = await getClient()
   let matched = 0
-  for (const t of candidates) {
-    const disb = await queryOne<{ id: string }>(
-      `SELECT d.id FROM disbursements d
-        WHERE d.landlord_id = $1 AND d.status = 'settled'
-          AND d.amount = $2
-          AND d.settled_at IS NOT NULL
-          AND ABS(d.settled_at::date - $3::date) <= $4
-          AND NOT EXISTS (SELECT 1 FROM bank_transactions bt
-                           WHERE bt.matched_disbursement_id = d.id)
-        ORDER BY ABS(d.settled_at::date - $3::date) ASC
-        LIMIT 1`,
-      [landlordId, Number(t.amount).toFixed(2), t.posted_date, MATCH_DATE_WINDOW_DAYS])
-    if (disb?.id) {
-      await query(
-        `UPDATE bank_transactions SET status='matched', matched_disbursement_id=$2, updated_at=now() WHERE id=$1`,
-        [t.id, disb.id])
-      matched++
+  try {
+    await client.query('BEGIN')
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`bank_feed_auto_match:${landlordId}`])
+    const candidates = (await client.query<{ id: string; amount: string; posted_date: string }>(
+      `SELECT t.id, t.amount::text AS amount, to_char(t.posted_date, 'YYYY-MM-DD') AS posted_date
+         FROM bank_transactions t
+        WHERE t.landlord_id = $1
+          -- an untouched deposit in review, once the bank has posted it
+          AND ${AUTO_MATCHABLE_SQL('t')}
+        -- id order, the order every other bank-row locker takes (the sync, the
+        -- books start date), so a match landing mid-save waits, never deadlocks
+        ORDER BY t.id`, [landlordId])).rows
+    for (const t of candidates) {
+      const disb = (await client.query<{ id: string }>(
+        `SELECT d.id FROM disbursements d
+          WHERE d.landlord_id = $1 AND d.status = 'settled'
+            AND d.amount = $2
+            AND d.settled_at IS NOT NULL
+            AND ABS(d.settled_at::date - $3::date) <= $4
+            AND NOT EXISTS (SELECT 1 FROM bank_transactions bt
+                             WHERE bt.matched_disbursement_id = d.id)
+          ORDER BY ABS(d.settled_at::date - $3::date) ASC
+          LIMIT 1`,
+        [landlordId, Number(t.amount).toFixed(2), t.posted_date, MATCH_DATE_WINDOW_DAYS])).rows[0]
+      if (!disb?.id) continue
+      // Waits for a filing in progress on this row, then re-checks it — and
+      // that it is still the deposit the payout was chosen for. The matcher
+      // runs after the sync commits, outside its lock, so the next sync on the
+      // link can follow the bank and change an untouched row's amount or date
+      // in between; a payout picked for the old amount must not land on it.
+      // That sync's own matcher looks again with the new figures.
+      const res = await client.query(
+        `UPDATE bank_transactions t SET status = 'matched', matched_disbursement_id = $2, updated_at = now()
+          WHERE t.id = $1 AND ${AUTO_MATCHABLE_SQL('t')}
+            AND t.amount = $3::numeric AND t.posted_date = $4::date`,
+        [t.id, disb.id, t.amount, t.posted_date])
+      if (res.rowCount) matched++
     }
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
   }
   return matched
 }
@@ -899,6 +969,9 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
         // Retiring the duplicate value needs its own migration + backfill.
       }
       // createLandlordExpense checks the unit/property belong to this landlord.
+      // S655 review: on THIS transaction's client, so the expense and the row
+      // marked filed commit together or not at all — never an expense booked
+      // with the row still in review, waiting to be filed (and booked) again.
       const expense = await createLandlordExpense({
         landlordId,
         propertyId,
@@ -909,7 +982,7 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
         vendor: input.vendor ?? txn.normalized_merchant ?? null,
         expenseDate: txn.posted_date_str,
         isCommon,
-      })
+      }, client)
       await client.query(
         `UPDATE bank_transactions
             SET status='categorized', ignored_reason=NULL, expense_id=$2, categorized_at=now(), updated_at=now()
@@ -1160,14 +1233,18 @@ export async function refreshAllBalances(): Promise<{ refreshed: number; failed:
  * landlord dismissed, a copy from an earlier link to the same bank, a charge the
  * bank voided — because a bare `ignored` could not say which was which. Re-saving
  * Oak Park's date would have put 35 hidden PNC copies straight back in review.
+ *
+ * Pass `outer` to run inside the caller's transaction (a one-time script's dry
+ * run); otherwise it runs in its own.
  */
 export async function setBooksStartDate(
   landlordId: string,
   date: string | null,
+  outer?: PoolClient,
 ): Promise<{ ignored: number; restored: number }> {
-  const client = await getClient()
+  const client = outer ?? await getClient()
   try {
-    await client.query('BEGIN')
+    if (!outer) await client.query('BEGIN')
     await client.query('UPDATE landlords SET books_start_date = $2 WHERE id = $1', [landlordId, date])
     // Lock what may move in id order — the order a bank sync locks in — so a
     // save that lands mid-sync waits for it instead of deadlocking with it.
@@ -1191,13 +1268,13 @@ export async function setBooksStartDate(
           AND ($2::date IS NULL OR posted_date >= $2::date)
         RETURNING id`, [landlordId, date])).rowCount ?? 0
 
-    await client.query('COMMIT')
+    if (!outer) await client.query('COMMIT')
     return { ignored, restored }
   } catch (e) {
-    await client.query('ROLLBACK').catch(() => {})
+    if (!outer) await client.query('ROLLBACK').catch(() => {})
     throw e
   } finally {
-    client.release()
+    if (!outer) client.release()
   }
 }
 

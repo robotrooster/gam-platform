@@ -15,7 +15,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import { toast, appConfirm } from '../components/dialogs'
-import { EntityPicker, useEntities } from '../components/EntityPicker'
+import { useEntities } from '../components/EntityPicker'
 import { ArrowRightLeft, Check, X, AlertTriangle } from 'lucide-react'
 
 // S655: a transfer to ANOTHER account now waits for that account to accept
@@ -48,14 +48,25 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
   const invalidate = () => qc.invalidateQueries(['transfer-request', propertyId])
 
   // Another company of yours to move it to — only offered when the account
-  // owns one besides the company that holds this property.
-  const otherCompanies = (entities as any[]).filter(en => en.id !== property?.landlordId)
+  // owns one besides the company that holds this property. S655: the company
+  // that already holds it is never offered (picking it only earned a refusal),
+  // and nothing is offered until we know which company that is.
+  const otherCompanies = property?.landlordId
+    ? (entities as any[]).filter(en => en.id !== property.landlordId)
+    : []
+  // One other company is not a choice — it is simply where the property goes.
+  const onlyOther = otherCompanies.length === 1 ? otherCompanies[0] : null
+  const moveTo = onlyOther ? onlyOther.id
+    : otherCompanies.some(en => en.id === toCompany) ? toCompany : ''
+  // The move form is on screen only while there is another company to move
+  // to; the request, the button and the confirmation all follow what is shown.
+  const companyMode = mode === 'company' && otherCompanies.length > 0
   const companyName = (id: string) =>
     (entities as any[]).find(en => en.id === id)?.businessName || 'your other company'
 
   const start = useMutation(
-    () => apiPost(`/properties/${propertyId}/transfer`, mode === 'company'
-      ? { toLandlordId: toCompany, note: note.trim() || undefined }
+    () => apiPost(`/properties/${propertyId}/transfer`, companyMode
+      ? { toLandlordId: moveTo, note: note.trim() || undefined }
       : { toEmail: email.trim(), note: note.trim() || undefined }),
     { onSuccess: (r: any) => {
         invalidate(); setEmail(''); setNote(''); setToCompany('')
@@ -257,8 +268,26 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
 
       {mode === 'company' && otherCompanies.length > 0 ? (
         <div style={{ marginBottom: 12 }}>
-          <EntityPicker value={toCompany} onChange={id => { setToCompany(id); setErr('') }} label="Move to"
-            note="A company you own — no acceptance step. Every owner of this company still confirms." />
+          <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Move to</label>
+          {onlyOther ? (
+            <div style={{ fontSize: '.88rem', color: 'var(--text-0)', fontWeight: 600 }}>
+              {onlyOther.businessName || 'Your other company'}
+            </div>
+          ) : (
+            <select className="input" style={{ width: '100%' }} value={moveTo}
+              onChange={e => { setToCompany(e.target.value); setErr('') }}>
+              <option value="">Choose a company…</option>
+              {otherCompanies.map((en: any) => (
+                <option key={en.id} value={en.id}>
+                  {en.businessName || 'Unnamed company'}
+                  {en.propertyCount ? ` — ${en.propertyCount} propert${en.propertyCount === 1 ? 'y' : 'ies'}` : ''}
+                </option>
+              ))}
+            </select>
+          )}
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+            A company you own — no acceptance step. Every owner of this company still confirms.
+          </div>
         </div>
       ) : (
         <div style={{ marginBottom: 12 }}>
@@ -283,11 +312,11 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
       )}
 
       <button className="btn btn-primary"
-        disabled={(mode === 'company' && otherCompanies.length > 0 ? !toCompany : !email.trim()) || start.isLoading}
+        disabled={(mode === 'company' && otherCompanies.length > 0 ? !moveTo : !email.trim()) || start.isLoading}
         onClick={async () => {
           const toCompanyMode = mode === 'company' && otherCompanies.length > 0
           const message = toCompanyMode
-            ? `Move ${propertyName} to ${companyName(toCompany)}? Every owner of this company will be emailed a confirmation code.`
+            ? `Move ${propertyName} to ${companyName(moveTo)}? Every owner of this company will be emailed a confirmation code.`
             : `Propose transferring ${propertyName} to ${email.trim()}? Every owner will be emailed a confirmation code, and the buyer must accept with their own code before anything moves.`
           if (await appConfirm(message, { confirmLabel: toCompanyMode ? 'Propose move' : 'Propose sale' })) {
             setErr(''); start.mutate()

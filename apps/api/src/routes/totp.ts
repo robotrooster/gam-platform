@@ -40,6 +40,10 @@ import {
   verifyRecoveryCode,
 } from '../lib/totp'
 import { signSessionToken, renewSessionToken, policyOfPass } from '../lib/sessionToken'
+// S655: the same rule /auth/refresh and /auth/me apply — a pass minted before
+// the account's last password change is dead. Used at call time only, so the
+// auth.ts <-> totp.ts import cycle is harmless.
+import { assertPassPostdatesPasswordChange } from './auth'
 import type { SessionPolicy } from '@gam/shared'
 
 export const totpRouter = Router()
@@ -123,9 +127,12 @@ totpRouter.post('/enroll-start', requireEnrollable, async (req, res, next) => {
   try {
     const userId = (req as any).user.userId as string
     const user = await queryOne<{
-      email: string; totp_enabled: boolean
-    }>(`SELECT email, totp_enabled FROM users WHERE id = $1`, [userId])
+      email: string; totp_enabled: boolean; sessions_valid_from: Date | null
+    }>(`SELECT email, totp_enabled, sessions_valid_from FROM users WHERE id = $1`, [userId])
     if (!user) throw new AppError(404, 'User not found')
+    // S655: a pass from before a password change may not set up an
+    // authenticator (and so take the account's second factor) either.
+    assertPassPostdatesPasswordChange((req as any).user, user.sessions_valid_from)
     if (user.totp_enabled) {
       throw new AppError(409, 'Two-factor authentication is already enabled. Disable it first to re-enroll.')
     }
@@ -191,9 +198,16 @@ totpRouter.post('/enroll-confirm', requireEnrollable, async (req, res, next) => 
     const userId = sess.userId as string
     const { token } = enrollConfirmSchema.parse(req.body)
     const user = await queryOne<{
-      totp_secret: string | null; totp_enabled: boolean
-    }>(`SELECT totp_secret, totp_enabled FROM users WHERE id = $1`, [userId])
+      totp_secret: string | null; totp_enabled: boolean; sessions_valid_from: Date | null
+    }>(`SELECT totp_secret, totp_enabled, sessions_valid_from FROM users WHERE id = $1`, [userId])
     if (!user) throw new AppError(404, 'User not found')
+    // S655: this mints a pass (a fresh rolling one, for a rolling sign-in), so
+    // it applies the rule /auth/refresh does. A full pass from before a
+    // password change used to enroll an authenticator its holder controls and
+    // come away with a renewed pass that /auth/refresh would have refused. An
+    // enrollment pass is held to it too: it is the tail of a sign-in, and a
+    // password change after that sign-in ends it like any other.
+    assertPassPostdatesPasswordChange(sess, user.sessions_valid_from)
     if (user.totp_enabled) {
       throw new AppError(409, 'Two-factor authentication is already enabled.')
     }
@@ -305,11 +319,14 @@ totpRouter.post('/verify', async (req, res, next) => {
     }
     const userId = session.userId as string
     const user = await queryOne<{
-      totp_secret: string | null; totp_enabled: boolean; email: string
-    }>(`SELECT totp_secret, totp_enabled, email FROM users WHERE id = $1`, [userId])
+      totp_secret: string | null; totp_enabled: boolean; email: string; sessions_valid_from: Date | null
+    }>(`SELECT totp_secret, totp_enabled, email, sessions_valid_from FROM users WHERE id = $1`, [userId])
     if (!user || !user.totp_enabled || !user.totp_secret) {
       throw new AppError(401, 'Two-factor authentication is not active on this account.')
     }
+    // S655: the pending pass proves the password as it was when it was
+    // minted. After a change, that proof is spent — no full pass from it.
+    assertPassPostdatesPasswordChange(session, user.sessions_valid_from)
 
     // Try TOTP first; fall through to recovery code only if it's
     // not a 6-digit token shape (recovery codes are 10 hex with a

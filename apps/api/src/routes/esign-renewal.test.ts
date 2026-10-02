@@ -48,6 +48,7 @@ import { processLeaseEnds, activatePendingLeases } from '../jobs/scheduler'
 import { invoiceEndedLeaseBills } from '../services/utilityBilling'
 import { voidDocument } from '../lib/voidDocument'
 import { getLandlordRenewalTendency } from '../services/landlordRenewalTendency'
+import { holdOverUntilNewLeaseStarts, closePredecessorOfStartedRenewals } from '../services/renewalSuccessor'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -408,14 +409,63 @@ describe('the renewal rule — the rest of the cases', () => {
     expect(await newLease(f)).toBeUndefined()
   })
 
-  it('refuses a start typed over the lease being renewed, while the landlord can still fix it', async () => {
+  // A signed FIXED TERM runs to its end: a new lease cannot start inside it.
+  // Cutting a signed term short, at a new rent, on the landlord's signature
+  // alone would override the lease the household signed (lease is law).
+  // Refused while the landlord can still fix it, naming the first day the new
+  // lease can start. From the day after the term the takeover rule applies
+  // (decisions 10/2 #7), and a LATER start holds the household over at the old
+  // rent until then — accepted (below).
+  it('refuses a start typed inside a signed fixed term, naming the day after it ends, while the landlord can still fix it', async () => {
     const f = await fixture({ oldEnd: '2026-06-14' })
     const doc = await renewalDoc(f, { start_date: '6/15/2026', end_date: '6/14/2027', rent_due_day: '1st' }, { page8: false })
     const start = (await db.query<{ id: string }>(
       `SELECT id FROM lease_document_fields WHERE document_id=$1 AND lease_column='start_date'`, [doc])).rows[0].id
     const res = await signAs(doc, f.landlordToken, [{ fieldId: start, value: '6/10/2026' }])
     expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/overlapping/i)
+    expect(res.body.error).toMatch(/is on a signed lease through June 14, 2026, so a new lease can start June 15, 2026 or later\. Change the start date\./)
+    const ll = await db.query<{ status: string }>(
+      `SELECT status FROM lease_document_signers WHERE document_id=$1 AND role='landlord'`, [doc])
+    expect(ll.rows[0].status).toBe('sent')
+    expect(await newLease(f)).toBeUndefined()
+    const old = await db.query<{ end_date: string }>(
+      `SELECT to_char(end_date,'YYYY-MM-DD') AS end_date FROM leases WHERE id=$1`, [f.oldLeaseId])
+    expect(old.rows[0].end_date).toBe('2026-06-14')
+  })
+
+  it('a start the day after the signed term ends is accepted', async () => {
+    const f = await fixture({ oldEnd: '2026-06-14' })
+    const doc = await renewalDoc(f, { start_date: '6/15/2026', end_date: '6/14/2027', rent_due_day: '1st' }, { page8: false })
+    const res = await signAs(doc, f.landlordToken, [])
+    expect(res.status).toBe(200)
+    expect((await newLease(f)).start_date).toBe('2026-06-15')
+  })
+
+  it('a start a month after the signed term ends is accepted — the household holds over until then (decisions 10/2 #7)', async () => {
+    // Dates still to come, so the term is running when the landlord signs.
+    const f = await fixture({ oldEnd: '2099-06-14' })
+    const doc = await renewalDoc(f, { start_date: '6/15/2099', end_date: '6/14/2100', rent_due_day: '1st' }, { page8: false })
+    const start = (await db.query<{ id: string }>(
+      `SELECT id FROM lease_document_fields WHERE document_id=$1 AND lease_column='start_date'`, [doc])).rows[0].id
+    const res = await signAs(doc, f.landlordToken, [{ fieldId: start, value: '7/15/2099' }])
+    expect(res.status).toBe(200)
+    expect((await newLease(f))).toMatchObject({ start_date: '2099-07-15', status: 'pending' })
+    // Nothing is written on the term while it is still running.
+    const old = await db.query<{ end_date: string }>(`SELECT to_char(end_date,'YYYY-MM-DD') AS end_date FROM leases WHERE id=$1`, [f.oldLeaseId])
+    expect(old.rows[0].end_date).toBe('2099-06-14')
+  })
+
+  it('refuses a start on or before the day the current lease began, while the landlord can still fix it', async () => {
+    const f = await fixture({ oldEnd: '2026-06-14' })
+    const doc = await renewalDoc(f, { start_date: '6/15/2026', end_date: '6/14/2027', rent_due_day: '1st' }, { page8: false })
+    const start = (await db.query<{ id: string }>(
+      `SELECT id FROM lease_document_fields WHERE document_id=$1 AND lease_column='start_date'`, [doc])).rows[0].id
+    const res = await signAs(doc, f.landlordToken, [{ fieldId: start, value: '6/1/2025' }])
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/has to start after June 15, 2025/)
+    const ll = await db.query<{ status: string }>(
+      `SELECT status FROM lease_document_signers WHERE document_id=$1 AND role='landlord'`, [doc])
+    expect(ll.rows[0].status).toBe('sent')
     expect(await newLease(f)).toBeUndefined()
   })
 
@@ -478,11 +528,68 @@ describe('the old lease never bills on or after a signed renewal starts', () => 
     ])
   })
 
-  it('a renewal the tenant has not signed yet does not stop the old lease — it can still be cancelled', async () => {
+  // Decisions 10/2 #7: THERE IS NEVER A STRETCH WITH NO LEASE. A term that
+  // ends 9/30 with its new lease starting 10/31 holds over: the old lease bills
+  // 10/1 at the old rent (that bill covers October), and the new rent starts on
+  // 11/1 — no bridge for 10/31, and no month billed by nobody.
+  it('a signed term that ends before its new lease starts holds over: the old rent for the month between, then the new rent', async () => {
+    const f = await fixture({ oldEnd: '2026-09-30' })
+    const nlId = await seedRenewal(f, '2026-10-31', false)
+    await billRunOn('2026-09-01')
+    await billRunOn('2026-10-01')
+    await billRunOn('2026-10-31')
+    expect((await bills(f)).map(b => [b.lease, b.due, b.rent])).toEqual([
+      ['old', '2026-09-01', 1000],
+      ['old', '2026-10-01', 1000],
+    ])
+    // The night of 10/31 the household is handed over (as the jobs do it).
+    await db.query(`UPDATE leases SET status='expired', end_date='2026-10-30' WHERE id=$1`, [f.oldLeaseId])
+    await db.query(`UPDATE leases SET status='active' WHERE id=$1`, [nlId])
+    await billRunOn('2026-11-01')
+    expect((await bills(f)).map(b => [b.lease, b.due, b.rent])).toEqual([
+      ['old', '2026-09-01', 1000],
+      ['old', '2026-10-01', 1000],
+      ['new', '2026-11-01', 1050],
+    ])
+  })
+
+  it('the holdover is written the night the term runs out — not while the term is still running, and only until the new start', async () => {
+    const f = await fixture({ oldEnd: '2026-09-30' })
+    const nlId = await seedRenewal(f, '2026-10-31', false)
+    const end = async () => (await db.query<{ e: string }>(
+      `SELECT to_char(end_date,'YYYY-MM-DD') AS e FROM leases WHERE id=$1`, [f.oldLeaseId])).rows[0].e
+    const q = async (sql: string, params?: any[]) => ({ rows: (await db.query(sql, params)).rows })
+    // On its last day the term stands as signed.
+    expect(await holdOverUntilNewLeaseStarts(q, { today: '2026-09-30' })).toEqual([])
+    expect(await end()).toBe('2026-09-30')
+    // The day after: it carries on to the day before the new start.
+    expect(await holdOverUntilNewLeaseStarts(q, { today: '2026-10-01' })).toEqual([
+      { leaseId: f.oldLeaseId, renewalId: nlId, termEnded: '2026-09-30', holdsOverTo: '2026-10-30' }])
+    expect(await end()).toBe('2026-10-30')
+    // Once is enough; and a new lease starting the day after the term needs none.
+    expect(await holdOverUntilNewLeaseStarts(q, { today: '2026-10-02' })).toEqual([])
+    // On the start date the old lease's last day is the day before (no change here).
+    expect(await closePredecessorOfStartedRenewals(q, { today: '2026-10-31' })).toEqual([])
+    expect(await end()).toBe('2026-10-30')
+  })
+
+  it('a held-over end that was never written is closed on the start date — the day before, whichever way it moves', async () => {
+    const f = await fixture({ oldEnd: '2026-09-30' })
+    const nlId = await seedRenewal(f, '2026-10-31', false)
+    const q = async (sql: string, params?: any[]) => ({ rows: (await db.query(sql, params)).rows })
+    expect(await closePredecessorOfStartedRenewals(q, { today: '2026-10-31' })).toEqual([
+      { predecessorId: f.oldLeaseId, renewalId: nlId, endDate: '2026-10-30' }])
+  })
+
+  // S655 (Nic, 10/2): "they always get charged the new rent, whether or not
+  // they sign it... the old one is expired." The landlord's signature is what
+  // counts; the tenant's stays open.
+  it('a renewal the tenant has not signed yet still takes over: the old lease stops the day before', async () => {
     const f = await fixture({ oldEnd: null })
     await seedRenewal(f, '2026-09-01', false)
+    await billRunOn('2026-08-01')
     await billRunOn('2026-09-01')
-    expect((await bills(f)).filter(b => b.lease === 'old').map(b => b.due)).toEqual(['2026-09-01'])
+    expect((await bills(f)).filter(b => b.lease === 'old').map(b => b.due)).toEqual(['2026-08-01'])
   })
 })
 

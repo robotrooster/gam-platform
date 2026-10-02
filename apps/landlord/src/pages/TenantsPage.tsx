@@ -118,8 +118,10 @@ export function TenantsPage() {
 
       {isLoading ? <div style={{color:'var(--text-3)',padding:32}}>Loading…</div> : (
         <div className="card" style={{padding:0,overflowX:'auto'}}>
+          {/* S655 (Nic, 10/2): no SSI/SSDI column. "That's our check for the
+              flex products" — GAM-side only. */}
           <table className="data-table" style={{minWidth:880}}>
-            <thead><tr><th style={{width:'22%'}}>Tenant</th><th>Unit</th><th>Property</th><th title="Charges paid on time, work trade counted as paid">Payment health</th><th>Rent</th><th>ACH</th><th>SSI/SSDI</th></tr></thead>
+            <thead><tr><th style={{width:'22%'}}>Tenant</th><th>Unit</th><th>Property</th><th title="Charges paid on time, work trade counted as paid">Payment health</th><th>Rent</th><th>ACH</th></tr></thead>
             <tbody>
               {tenants.length ? tenants.map((u: any) => (
                 <tr key={u.id} onClick={() => u.tenantId && navigate(`/tenants/${u.tenantId}`)} style={{ cursor: u.tenantId ? 'pointer' : 'default' }}>
@@ -139,10 +141,9 @@ export function TenantsPage() {
                   <td>{u.workTradeRent
                     ? <span className="badge badge-gold">Work trade</span>
                     : <span className={`badge ${u.achVerified?'badge-green':'badge-amber'}`}>{u.achVerified?'Verified':'Pending'}</span>}</td>
-                  <td>{u.ssiSsdi ? <span className="badge badge-gold">SSI/SSDI</span> : <span style={{color:'var(--text-3)'}}>—</span>}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>{allTenants.length ? 'No tenants match your filters.' : 'No tenants yet.'}</td></tr>
+                <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>{allTenants.length ? 'No tenants match your filters.' : 'No tenants yet.'}</td></tr>
               )}
             </tbody>
           </table>

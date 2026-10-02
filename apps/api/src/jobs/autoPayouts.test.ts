@@ -47,6 +47,7 @@ vi.mock('../services/adminNotifications', () => ({
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
 import { shouldRunToday, processAutoPayouts, nextPayoutDateUtc, isMonthEndSweepDay } from './autoPayouts'
+import { stampPayoutTransfers } from '../services/payoutComposition'
 
 // Phoenix is UTC-7 year-round (no DST). Noon at -07:00 pins the calendar day.
 const phx = (isoDate: string) => new Date(`${isoDate}T12:00:00-07:00`)
@@ -370,6 +371,70 @@ describe('a payout records what it carried', () => {
     expect(adminNotifyMock.mock.calls.filter((c: any) => c[0]?.category === 'payout_composition_gap')).toHaveLength(0)
   })
 
+  // S655 review: a GAM sweep carries every transfer waiting before it, and the
+  // next sweep starts where this one's row says it ended. Both have to be the
+  // same cut (services/payoutCut.ts): a transfer confirmed between the payout
+  // leaving and its row being written was otherwise too late for this payout
+  // and too early for the next — listed in none, for good.
+  it('a transfer that lands after the payout left waits for the next payout, and the next payout carries it', async () => {
+    const userId = await seedConnectReadyLandlord('acct_after')
+    const ll = (await db.query(`SELECT id FROM landlords WHERE user_id=$1`, [userId])).rows[0].id
+    const before = (await db.query(
+      `INSERT INTO platform_transfer_intents
+         (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, status,
+          stripe_transfer_id, transferred_at)
+       VALUES ($1,$2,'acct_after',100,100,'transferred','tr_before', NOW() - interval '1 day') RETURNING id`,
+      [ll, userId])).rows[0].id
+    getBalanceMock.mockResolvedValue(100)
+    // Stripe answers; then, before the run gets a connection to write the
+    // payout's row, a transfer to the account is confirmed. Holding every
+    // pooled connection is what makes the run wait there.
+    let landed: Promise<void> = Promise.resolve()
+    let answeredAt = new Date()
+    firePayoutMock.mockImplementationOnce(async () => {
+      const max = (db as any).options.max as number
+      const held: any[] = []
+      while (db.totalCount < max || db.idleCount > 0) held.push(await db.connect())
+      landed = new Promise<void>((resolve, reject) => setTimeout(async () => {
+        try {
+          await held[0].query(
+            `INSERT INTO platform_transfer_intents
+               (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, status,
+                stripe_transfer_id, transferred_at)
+             VALUES ($1,$2,'acct_after',40,40,'transferred','tr_after', clock_timestamp())`, [ll, userId])
+          resolve()
+        } catch (e) { reject(e) } finally { for (const c of held) c.release() }
+      }, 100))
+      answeredAt = new Date()
+      return { id: 'po_after' } as any
+    })
+
+    await processAutoPayouts(THURSDAY)
+    await landed
+
+    const d = (await db.query(`SELECT id FROM disbursements WHERE stripe_payout_id='po_after'`)).rows[0]
+    const link = async (ref: string) => (await db.query(
+      `SELECT disbursement_id FROM platform_transfer_intents WHERE stripe_transfer_id=$1`, [ref])).rows[0].disbursement_id
+    expect((await db.query(`SELECT disbursement_id FROM platform_transfer_intents WHERE id=$1`, [before])).rows[0].disbursement_id).toBe(d.id)
+    // It really did land after Stripe answered, and before the payout's row was written.
+    const t = (await db.query(
+      `SELECT (i.transferred_at > $2::timestamptz) AS after_payout, (i.transferred_at < d.created_at) AS before_row
+         FROM platform_transfer_intents i, disbursements d
+        WHERE i.stripe_transfer_id = 'tr_after' AND d.id = $1`, [d.id, answeredAt])).rows[0]
+    expect(t).toEqual({ after_payout: true, before_row: true })
+    expect(await link('tr_after')).toBeNull()
+
+    // The following week's sweep carries it.
+    const next = (await db.query(
+      `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged)
+       VALUES ($1,'auto_friday',40,'processing','po_next',NOW(),0) RETURNING id`, [userId])).rows[0].id
+    const r = await stampPayoutTransfers({
+      disbursementId: next, connectAccountId: 'acct_after', payoutAmount: 40, payoutAt: new Date(),
+    })
+    expect(await link('tr_after')).toBe(next)
+    expect(r.residual).toBe(0)
+  })
+
   it('claims the row the Connect webhook filed first, instead of writing a second one', async () => {
     const userId = await seedConnectReadyLandlord('acct_race')
     firePayoutMock.mockResolvedValue({ id: 'po_race' } as any)
@@ -383,5 +448,154 @@ describe('a payout records what it carried', () => {
     await processAutoPayouts(THURSDAY)
     const rows = (await db.query(`SELECT trigger_type, notes FROM disbursements WHERE stripe_payout_id='po_race'`)).rows
     expect(rows).toEqual([{ trigger_type: 'auto_friday', notes: null }])
+  })
+
+  // The webhook dates its row by Stripe's clock. Claimed, the row takes the
+  // run's own cut — or a Stripe clock running ahead would make the next sweep
+  // start after a transfer this sweep did not carry.
+  it('a payout the webhook filed first is claimed onto the run’s own cut, so the next sweep starts where this one ended', async () => {
+    const userId = await seedConnectReadyLandlord('acct_clock')
+    firePayoutMock.mockResolvedValue({ id: 'po_clock' } as any)
+    await db.query(
+      `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, notes, created_at)
+       VALUES ($1,'stripe_dashboard',100,'processing','po_clock',NOW() + interval '1 minute',0,
+               'Paid out from the Stripe dashboard; recorded by GAM from Stripe.', NOW() - interval '10 days')`,
+      [userId])
+    const ranAt = new Date()
+    await processAutoPayouts(THURSDAY)
+    const claimed = (await db.query(
+      `SELECT id, (initiated_at <= NOW()) AS on_our_clock, (initiated_at >= $1::timestamptz) AS after_start
+         FROM disbursements WHERE stripe_payout_id='po_clock'`, [ranAt])).rows[0]
+    expect(claimed).toMatchObject({ on_our_clock: true, after_start: true })
+
+    // A transfer confirmed just after the payout: not this sweep's, the next one's.
+    const ll = (await db.query(`SELECT id FROM landlords WHERE user_id=$1`, [userId])).rows[0].id
+    await db.query(
+      `INSERT INTO platform_transfer_intents
+         (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, status,
+          stripe_transfer_id, transferred_at)
+       VALUES ($1,$2,'acct_clock',25,25,'transferred','tr_clock', clock_timestamp())`, [ll, userId])
+    const next = (await db.query(
+      `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged)
+       VALUES ($1,'auto_friday',25,'processing','po_clock_next',NOW() + interval '2 minutes',0) RETURNING id`, [userId])).rows[0].id
+    await stampPayoutTransfers({
+      disbursementId: next, connectAccountId: 'acct_clock', payoutAmount: 25,
+      payoutAt: new Date(Date.now() + 120_000),
+    })
+    expect((await db.query(`SELECT disbursement_id FROM platform_transfer_intents WHERE stripe_transfer_id='tr_clock'`))
+      .rows[0].disbursement_id).toBe(next)
+  })
+})
+
+// S655 review: a GAM sweep pays out the balance it READ. Its cut used to be the
+// moment Stripe answered, after the read — so a transfer confirmed between the
+// read and the answer was listed in a payout whose amount did not include it,
+// and the next payout showed the same money as "not traced". The cut is now
+// taken just before the read, and the row and the sweep both use it.
+describe('the payout’s cut comes before its balance is read', () => {
+  it('a transfer confirmed after the balance was read is carried by the next payout, not this one', async () => {
+    const userId = await seedConnectReadyLandlord('acct_read')
+    const ll = (await db.query(`SELECT id FROM landlords WHERE user_id=$1`, [userId])).rows[0].id
+    const before = (await db.query(
+      `INSERT INTO platform_transfer_intents
+         (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, status,
+          stripe_transfer_id, transferred_at)
+       VALUES ($1,$2,'acct_read',100,100,'transferred','tr_read_before', NOW() - interval '1 day') RETURNING id`,
+      [ll, userId])).rows[0].id
+    // (Each step a few milliseconds apart, so the order is visible at the
+    // millisecond a payout's cut is kept to.)
+    const pause = () => new Promise(r => setTimeout(r, 5))
+    let readAt: Date | null = null
+    getBalanceMock.mockImplementationOnce(async () => {
+      await pause()
+      readAt = (await db.query(`SELECT clock_timestamp() AS at`)).rows[0].at
+      await pause()
+      return 100
+    })
+    // After the read and before Stripe answers, a transfer lands on the account.
+    firePayoutMock.mockImplementationOnce(async () => {
+      await pause()
+      await db.query(
+        `INSERT INTO platform_transfer_intents
+           (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, status,
+            stripe_transfer_id, transferred_at)
+         VALUES ($1,$2,'acct_read',30,30,'transferred','tr_read_mid', clock_timestamp())`, [ll, userId])
+      await pause()
+      return { id: 'po_read' } as any
+    })
+
+    await processAutoPayouts(THURSDAY)
+
+    const d = (await db.query(
+      `SELECT id, initiated_at <= $1::timestamptz AS cut_before_read FROM disbursements WHERE stripe_payout_id='po_read'`,
+      [readAt])).rows[0]
+    expect(d.cut_before_read).toBe(true)
+    const link = async (ref: string) => (await db.query(
+      `SELECT disbursement_id FROM platform_transfer_intents WHERE stripe_transfer_id=$1`, [ref])).rows[0].disbursement_id
+    expect((await db.query(`SELECT disbursement_id FROM platform_transfer_intents WHERE id=$1`, [before])).rows[0].disbursement_id).toBe(d.id)
+    expect(await link('tr_read_mid')).toBeNull()
+
+    // The following sweep carries it, and ties out.
+    const nextAt = (await db.query(`SELECT clock_timestamp() AS at`)).rows[0].at
+    const next = (await db.query(
+      `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged)
+       VALUES ($1,'auto_friday',30,'processing','po_read_next',$2,0) RETURNING id`, [userId, nextAt])).rows[0].id
+    const r = await stampPayoutTransfers({
+      disbursementId: next, connectAccountId: 'acct_read', payoutAmount: 30, payoutAt: nextAt,
+    })
+    expect(await link('tr_read_mid')).toBe(next)
+    expect(r.residual).toBe(0)
+  })
+})
+
+// S655 review: disbursements.stripe_payout_id was not unique, and the Connect
+// webhook and the payout run each looked first, then inserted — interleaved,
+// one payout got two rows (the second traced to nothing and raised a gap
+// notice). The payout run now files with ON CONFLICT on a unique index.
+describe('one payout, one row', () => {
+  async function untilSomeoneWaitsOnALock() {
+    for (let i = 0; i < 200; i++) {
+      const r = await db.query(
+        `SELECT count(*)::int AS n FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`)
+      if (r.rows[0].n > 0) return
+      await new Promise(res => setTimeout(res, 25))
+    }
+    throw new Error('nothing ever waited on the lock')
+  }
+
+  it('the webhook filing the payout mid-run is claimed, not doubled', async () => {
+    const userId = await seedConnectReadyLandlord('acct_race2')
+    firePayoutMock.mockResolvedValue({ id: 'po_race2' } as any)
+    const webhook = await db.connect()
+    let run: Promise<any>
+    try {
+      await webhook.query('BEGIN')
+      await webhook.query(
+        `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, notes)
+         VALUES ($1,'stripe_dashboard',100,'processing','po_race2',NOW(),0,'Paid out from the Stripe dashboard; recorded by GAM from Stripe.')`,
+        [userId])
+      run = processAutoPayouts(THURSDAY)
+      run.catch(() => {})
+      await untilSomeoneWaitsOnALock()          // the run's insert, waiting on the webhook's
+      await webhook.query('COMMIT')
+    } finally { webhook.release() }
+    const res = await run!
+    expect(res.payoutsFired).toBe(1)
+    const rows = (await db.query(`SELECT trigger_type, notes FROM disbursements WHERE stripe_payout_id='po_race2'`)).rows
+    expect(rows).toEqual([{ trigger_type: 'auto_friday', notes: null }])
+  })
+
+  it('a payout GAM already filed is never written a second time', async () => {
+    const userId = await seedConnectReadyLandlord('acct_once')
+    firePayoutMock.mockResolvedValue({ id: 'po_once' } as any)
+    await db.query(
+      // dated back so the engine's spacing rule does not skip the run
+      `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, created_at)
+       VALUES ($1,'catch_up',100,'settled','po_once',NOW() - interval '10 days',0,NOW() - interval '10 days')`,
+      [userId])
+    await processAutoPayouts(THURSDAY)
+    const rows = (await db.query(`SELECT trigger_type, status FROM disbursements WHERE stripe_payout_id='po_once'`)).rows
+    expect(rows).toEqual([{ trigger_type: 'catch_up', status: 'settled' }])
   })
 })

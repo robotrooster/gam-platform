@@ -1105,6 +1105,17 @@ propertiesRouter.post('/:id/onboarding-complete', requirePerm('properties.edit')
     const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
     if (!prop) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    // S655 (decisions 10/2): not while this property's tenant-CSV draft roster
+    // still has people nobody has confirmed. Closing the window first would
+    // send every one of those sitting residents to a background check.
+    const { liveRosterCount } = await import('../services/newLeaseInvite')
+    const waiting = await liveRosterCount(req.params.id)
+    if (waiting > 0) {
+      throw new AppError(409,
+        `${waiting} ${waiting === 1 ? 'person' : 'people'} in this property's draft roster ` +
+        `${waiting === 1 ? "isn't" : "aren't"} confirmed yet. Confirm or remove them first ` +
+        `(Tenant Onboarding → Draft roster), then mark onboarding complete.`)
+    }
     await closeOnboardingWindow(req.params.id)
     res.json({ success: true, data: await getOnboardingWindow(req.params.id) })
   } catch (e) { next(e) }
@@ -1203,68 +1214,62 @@ propertiesRouter.patch('/:id/onboarding-late-fee-waiver', requirePerm('propertie
 
 /**
  * S655 — record a change to a property's owner-signing routing and re-route
- * the owner's open signing seats. One transaction: the audit row, the address
- * move and the new tokens land together or not at all.
+ * the owner's open signing seats. Runs on the CALLER's transaction — the same
+ * one that saves the new address on the property (PATCH /:id) — so the stored
+ * address, the audit row, the seat move and the new tokens land together or
+ * not at all. Saving the address first and moving the seats in a second
+ * transaction left a window where the new address was stored with no audit
+ * row and the old inbox's link still signed as the owner.
  */
-async function applyLeaseSigningChange(a: {
+async function applyLeaseSigningChange(client: Awaited<ReturnType<typeof getClient>>, a: {
   propertyId: string; landlordId: string; byUserId: string
   oldEmail: string | null; newEmail: string | null
   oldName: string | null; newName: string | null
   emailChanged: boolean
 }): Promise<{ seatsMoved: number }> {
-  const client = await getClient()
-  try {
-    await client.query('BEGIN')
-    await client.query(
-      `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
-       VALUES ($1, 'property_lease_signing_changed', 'property', $2, $3::jsonb, $4::jsonb)`,
-      [a.byUserId, a.propertyId,
-       JSON.stringify({ leaseSigningEmail: a.oldEmail, leaseSigningName: a.oldName }),
-       JSON.stringify({ leaseSigningEmail: a.newEmail, leaseSigningName: a.newName })])
-    let seatsMoved = 0
-    if (a.emailChanged) {
-      // The owner seat is the company's founding login (landlordSigningContact).
-      // An address that was never delegated means the account email.
-      const owner = (await client.query<{ user_id: string; email: string }>(
-        `SELECT u.id AS user_id, LOWER(u.email) AS email
-           FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [a.landlordId])).rows[0]
-      if (owner) {
-        const from = (a.oldEmail || owner.email).toLowerCase()
-        const to = (a.newEmail || owner.email).toLowerCase()
-        if (from !== to) {
-          const moved = await client.query(
-            `UPDATE lease_document_signers s
-                SET email = $4, token = encode(gen_random_bytes(32), 'hex')
-               FROM lease_documents d
-               JOIN units u ON u.id = d.unit_id
-              WHERE d.id = s.document_id
-                AND u.property_id = $1
-                AND d.landlord_id = $2
-                AND d.status IN ('pending', 'sent', 'in_progress')
-                AND s.role = 'landlord'
-                AND s.user_id = $3
-                AND s.status NOT IN ('signed', 'declined')
-                AND LOWER(s.email) = $5`,
-            [a.propertyId, a.landlordId, owner.user_id, to, from])
-          seatsMoved = moved.rowCount ?? 0
-        }
+  await client.query(
+    `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
+     VALUES ($1, 'property_lease_signing_changed', 'property', $2, $3::jsonb, $4::jsonb)`,
+    [a.byUserId, a.propertyId,
+     JSON.stringify({ leaseSigningEmail: a.oldEmail, leaseSigningName: a.oldName }),
+     JSON.stringify({ leaseSigningEmail: a.newEmail, leaseSigningName: a.newName })])
+  let seatsMoved = 0
+  if (a.emailChanged) {
+    // The owner seat is the company's founding login (landlordSigningContact).
+    // An address that was never delegated means the account email.
+    const owner = (await client.query<{ user_id: string; email: string }>(
+      `SELECT u.id AS user_id, LOWER(u.email) AS email
+         FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [a.landlordId])).rows[0]
+    if (owner) {
+      const from = (a.oldEmail || owner.email).toLowerCase()
+      const to = (a.newEmail || owner.email).toLowerCase()
+      if (from !== to) {
+        const moved = await client.query(
+          `UPDATE lease_document_signers s
+              SET email = $4, token = encode(gen_random_bytes(32), 'hex')
+             FROM lease_documents d
+             JOIN units u ON u.id = d.unit_id
+            WHERE d.id = s.document_id
+              AND u.property_id = $1
+              AND d.landlord_id = $2
+              AND d.status IN ('pending', 'sent', 'in_progress')
+              AND s.role = 'landlord'
+              AND s.user_id = $3
+              AND s.status NOT IN ('signed', 'declined')
+              AND LOWER(s.email) = $5`,
+          [a.propertyId, a.landlordId, owner.user_id, to, from])
+        seatsMoved = moved.rowCount ?? 0
       }
     }
-    await client.query('COMMIT')
-    return { seatsMoved }
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw e
-  } finally {
-    client.release()
   }
+  return { seatsMoved }
 }
 
 propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const raw = req.body as any
-    // S655: authorize FIRST. The address-change block below writes an audit
-    // row and raises an admin notification; it ran before this check, so any
+    // S655: authorize FIRST. The address-change block below can raise an admin
+    // notification (and used to write an audit row); it ran before this check, so any
     // landlord could trigger both on another company's property id and only
     // then get a 403. A property-scoped staff member was also never held to
     // the properties they are assigned to.
@@ -1293,16 +1298,25 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // password. Only an owner of this company (or GAM admin) may change them —
     // never a property manager, whose "Edit properties" permission covers
     // every other field here. An unchanged value arriving on an ordinary save
-    // is not a change. Decided HERE, before anything below writes (the
-    // address block logs an audit row), so a refused request leaves no trace
-    // of a change that never happened.
-    const storedSigningEmail = prop.lease_signing_email ? String(prop.lease_signing_email).trim().toLowerCase() || null : null
-    const storedSigningName = prop.lease_signing_name ? String(prop.lease_signing_name).trim() || null : null
-    const signingEmailChanged = signingEmailSent && signingEmail !== storedSigningEmail
-    const signingNameChanged = signingNameSent && signingName !== storedSigningName
-    if ((signingEmailChanged || signingNameChanged) && !canManageLandlordResource(req.user, prop.landlord_id, [])) {
+    // is not a change. Decided HERE, before anything below writes (a blocked
+    // address move raises an admin notice), so a refused request leaves no
+    // trace of a change that never happened.
+    const storedSigningEmailOf = (row: any): string | null =>
+      row?.lease_signing_email ? String(row.lease_signing_email).trim().toLowerCase() || null : null
+    const storedSigningNameOf = (row: any): string | null =>
+      row?.lease_signing_name ? String(row.lease_signing_name).trim() || null : null
+    const mayRouteSigning = canManageLandlordResource(req.user, prop.landlord_id, [])
+    if (!mayRouteSigning && (
+        (signingEmailSent && signingEmail !== storedSigningEmailOf(prop)) ||
+        (signingNameSent && signingName !== storedSigningNameOf(prop)))) {
       throw new AppError(403, "Only the property owner can change where the owner's signing requests go.")
     }
+    // Only an owner's save ever writes these two. A manager's form carries the
+    // unchanged values back (checked just above); leaving them unwritten means
+    // a manager's save can never put back an address an owner changed a moment
+    // earlier.
+    const writeSigningEmail = signingEmailSent && mayRouteSigning
+    const writeSigningName = signingNameSent && mayRouteSigning
 
     const name    = raw.name    !== undefined ? formatName(raw.name)       : undefined
     const street1 = raw.street1 !== undefined ? formatStreet(raw.street1)  : undefined
@@ -1327,53 +1341,35 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     //
     // super_admin can still correct one, which is the escape hatch for a real
     // typo, and it leaves an audit row naming who changed it.
-    let addressChangedState: string | null = null
     const addressFieldsSent = ['street1', 'street2', 'city', 'state', 'zip']
       .filter(f => raw[f] !== undefined)
-    if (addressFieldsSent.length) {
-      const cur = await queryOne<any>(
-        `SELECT street1, street2, city, state, zip FROM properties WHERE id = $1`,
-        [req.params.id])
-      const proposed: Record<string, any> = { street1, street2, city, state, zip }
-      const norm = (v: any) => String(v ?? '').trim().toLowerCase()
-      const changed = addressFieldsSent.filter(f => norm(proposed[f]) !== norm(cur?.[f]))
-      // S649 (Nic): "edit property window needs to be able to change property
-      // address" — the landlord may now change it, WITH the safeguards the lock
-      // stood in for (S631): it may not land on another landlord's property,
-      // the timezone follows a new state, and the old address is kept in the
-      // audit log. (An unchanged address arrives on every save — ignored.)
-      if (changed.length) {
-        const own = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id = $1`, [req.params.id])
-        const clash = await queryOne<{ id: string; landlord_id: string; name: string }>(
-          `SELECT id, landlord_id, name FROM properties
-            WHERE id <> $1 AND landlord_id <> $2
-              AND LOWER(TRIM(street1)) = LOWER(TRIM($3)) AND LOWER(TRIM(city)) = LOWER(TRIM($4))
-              AND LOWER(TRIM(state)) = LOWER(TRIM($5))
-              AND COALESCE(LOWER(TRIM(street2)), '') = COALESCE(LOWER(TRIM($6)), '')
-            LIMIT 1`,
-          [req.params.id, own?.landlord_id, proposed.street1 ?? cur?.street1, proposed.city ?? cur?.city,
-           proposed.state ?? cur?.state, proposed.street2 ?? cur?.street2 ?? ''])
-        if (clash) {
-          const { createAdminNotification } = await import('../services/adminNotifications')
-          await createAdminNotification({
-            severity: 'warn', category: 'duplicate_property_claim',
-            title: `Blocked address change onto another landlord's property`,
-            body: `Property ${req.params.id} tried to move to an address already registered as "${clash.name}" ` +
-                  `under landlord ${clash.landlord_id} (property ${clash.id}).`,
-            context: { propertyId: req.params.id, existingPropertyId: clash.id },
-          }).catch(() => {})
-          throw new AppError(409,
-            'That address is already registered on GAM to another account. If it\'s a different suite or ' +
-            'building, include its suite/unit line — or contact support if you believe this is an error.')
-        }
-        await query(
-          `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
-           VALUES ($1, 'property_address_changed', 'property', $2, $3::jsonb, $4::jsonb)`,
-          [req.user!.userId, req.params.id, JSON.stringify(cur ?? {}),
-           JSON.stringify(Object.fromEntries(addressFieldsSent.map(f => [f, proposed[f]])))]).catch(() => {})
-        addressChangedState = changed.includes('state') ? (proposed.state as string) : null
-      }
+    const normAddr = (v: any) => String(v ?? '').trim().toLowerCase()
+    // S655: the address this save will actually STORE over a given row. A blank
+    // street, city, state or zip keeps the current one (the UPDATE COALESCEs
+    // them); a suite line that is sent replaces it, blank or null clearing it;
+    // anything not sent stays. The duplicate check, the change test and the
+    // audit row all read this. Reading the request as sent let {street2: null}
+    // pass the duplicate check as "suite unchanged" and then clear the suite —
+    // which put the property on another landlord's address.
+    const storedAddressOf = (row: any): Record<string, string | null> => ({
+      street1: street1 || row?.street1 || null,
+      street2: raw.street2 !== undefined ? (street2 || null) : (row?.street2 ?? null),
+      city:    city    || row?.city    || null,
+      state:   state   || row?.state   || null,
+      zip:     zip     || row?.zip     || null,
+    })
+    const addressChangesFrom = (row: any) => {
+      const stored = storedAddressOf(row)
+      return addressFieldsSent.filter(f => normAddr(stored[f]) !== normAddr(row?.[f]))
     }
+    // S649 (Nic): "edit property window needs to be able to change property
+    // address" — the landlord may now change it, WITH the safeguards the lock
+    // stood in for (S631): it may not land on another landlord's property,
+    // the timezone follows a new state, and the old address is kept in the
+    // audit log. (An unchanged address arrives on every save — ignored.)
+    // S655: all three happen inside the save's transaction below, against the
+    // locked row, so the address checked is exactly the address stored, and a
+    // save that fails leaves no record of a move that never happened.
 
     // S179 / B3: per-property booking acknowledgment toggle. Sent only when
     // the form actually changed; preserves COALESCE semantics on the others.
@@ -1455,68 +1451,8 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     const defaultOccupancyMode =
       (OCCUPANCY_MODES as readonly string[]).includes(raw.defaultOccupancyMode) ? raw.defaultOccupancyMode : undefined
 
-    let updated = await queryOne<any>(`
-      UPDATE properties SET
-        name        = COALESCE($1, name),
-        street1     = COALESCE($2, street1),
-        street2     = COALESCE($3, street2),
-        city        = COALESCE($4, city),
-        state       = COALESCE($5, state),
-        zip         = COALESCE($6, zip),
-        type        = COALESCE($7, type),
-        requires_booking_acknowledgment = COALESCE($8, requires_booking_acknowledgment),
-        late_fee_enabled        = COALESCE($9,  late_fee_enabled),
-        late_fee_grace_days     = COALESCE($10, late_fee_grace_days),
-        late_fee_initial_amount = COALESCE($11, late_fee_initial_amount),
-        late_fee_initial_type   = COALESCE($12, late_fee_initial_type),
-        subleasing_allowed      = COALESCE($13, subleasing_allowed),
-        flexcharge_enabled      = COALESCE($14, flexcharge_enabled),
-        weekly_lease_mode       = COALESCE($15, weekly_lease_mode),
-        default_occupancy_mode  = COALESCE($17, default_occupancy_mode),
-        operator_owns_land      = COALESCE($18, operator_owns_land),
-        lease_signing_email = CASE WHEN $19::boolean THEN $20 ELSE lease_signing_email END,
-        lease_signing_name  = CASE WHEN $21::boolean THEN $22 ELSE lease_signing_name  END,
-        updated_at  = NOW()
-      WHERE id=$16 RETURNING *`,
-      [name||null, street1||null, street2||null, city||null, state||null,
-       zip||null, type||null,
-       reqAck === undefined ? null : reqAck,
-       lateFeeEnabled === undefined ? null : lateFeeEnabled,
-       lateFeeGraceDays === undefined ? null : lateFeeGraceDays,
-       lateFeeInitialAmount === undefined ? null : lateFeeInitialAmount,
-       lateFeeInitialType ?? null,
-       subleasingAllowed === undefined ? null : subleasingAllowed,
-       flexchargeEnabled === undefined ? null : flexchargeEnabled,
-       weeklyLeaseMode === undefined ? null : weeklyLeaseMode,
-       req.params.id,
-       defaultOccupancyMode ?? null,
-       typeof raw.operatorOwnsLand === 'boolean' ? raw.operatorOwnsLand : null,
-       signingEmailSent, signingEmail, signingNameSent, signingName]
-    )
-    // S649: a property that moved states is due in the new state's timezone.
-    if (addressChangedState) {
-      await query(`UPDATE properties SET timezone = $2 WHERE id = $1`,
-        [req.params.id, timezoneForState(addressChangedState)])
-    }
-
-    // S655: a change to the owner's signing routing is recorded (who, from
-    // what, to what) and takes effect on links ALREADY mailed. Every unsigned
-    // owner seat on an open document at this property that still points at
-    // the old address moves to the new one (the owner's account email when it
-    // is cleared) with a fresh signing token, so a link sitting in an inbox
-    // the owner just revoked stops signing as them. Same pattern as a
-    // resident's corrected address (S654). Reminders send the new link.
-    if (signingEmailChanged || signingNameChanged) {
-      await applyLeaseSigningChange({
-        propertyId: req.params.id, landlordId: prop.landlord_id, byUserId: req.user!.userId,
-        oldEmail: prop.lease_signing_email ?? null, newEmail: signingEmailChanged ? signingEmail : (prop.lease_signing_email ?? null),
-        oldName: prop.lease_signing_name ?? null, newName: signingNameChanged ? signingName : (prop.lease_signing_name ?? null),
-        emailChanged: signingEmailChanged,
-      })
-    }
-
     // S226: separate dynamic UPDATE for accrual + cap. The COALESCE
-    // pattern above can't distinguish "preserve" from "clear", and
+    // pattern below can't distinguish "preserve" from "clear", and
     // these columns are nullable on properties — so we need direct
     // assignment with undefined-skip semantics.
     const lfFields: Record<string, any> = {
@@ -1533,26 +1469,172 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
       lfSetParts.push(col + '=$' + (lfValues.length + 1))
       lfValues.push(val)
     }
-    if (lfSetParts.length > 0) {
-      // All-or-nothing validation against the post-update final state.
-      const finalAccrualAmount = lateFeeAccrualAmount === undefined ? updated.late_fee_accrual_amount : lateFeeAccrualAmount
-      const finalAccrualType   = lateFeeAccrualType   === undefined ? updated.late_fee_accrual_type   : lateFeeAccrualType
-      const finalAccrualPeriod = lateFeeAccrualPeriod === undefined ? updated.late_fee_accrual_period : lateFeeAccrualPeriod
-      const accrualSetCount = [finalAccrualAmount, finalAccrualType, finalAccrualPeriod].filter(v => v !== null && v !== undefined).length
-      if (accrualSetCount !== 0 && accrualSetCount !== 3) {
-        throw new AppError(400, 'late-fee accrual requires all of amount, type, and period — or none')
+
+    // S655: the whole save is ONE transaction: the property's fields, the
+    // late-fee accrual and cap, the timezone that follows a new state, the
+    // address-change audit row, and a change to the owner's signing routing
+    // (its audit row and the move of the owner's open seats). Before, the
+    // signing address was stored first and the seats moved in a second
+    // transaction (a failure there left the new address saved, no audit row,
+    // and the revoked inbox's link still signing as the owner); the accrual
+    // check ran after the save committed (its 400 came back for a change that
+    // had already taken effect); and the address audit row was written before
+    // the save, so it stayed even when the save failed.
+    //
+    // The row is locked and re-read FIRST, and every "from what" below is
+    // taken from that locked row, never from the read at the top of the
+    // handler. Two owners saving different signing addresses at the same
+    // moment (A to B and A to C) would otherwise both believe the address was
+    // A: the second would look for seats still at A, find none (the first had
+    // moved them to B), and leave the owner's live links in inbox B while the
+    // property pointed at C.
+    const saveClient = await getClient()
+    let updated: any
+    try {
+      await saveClient.query('BEGIN')
+      const locked = (await saveClient.query<any>(
+        `SELECT * FROM properties WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0]
+      if (!locked) throw new AppError(404, 'Property not found')
+
+      // All-or-nothing accrual and cap, against the row as it will be after
+      // this save. The main UPDATE below never touches these columns, so the
+      // locked row holds the values this save does not send.
+      if (lfSetParts.length > 0) {
+        const finalAccrualAmount = lateFeeAccrualAmount === undefined ? locked.late_fee_accrual_amount : lateFeeAccrualAmount
+        const finalAccrualType   = lateFeeAccrualType   === undefined ? locked.late_fee_accrual_type   : lateFeeAccrualType
+        const finalAccrualPeriod = lateFeeAccrualPeriod === undefined ? locked.late_fee_accrual_period : lateFeeAccrualPeriod
+        const accrualSetCount = [finalAccrualAmount, finalAccrualType, finalAccrualPeriod].filter(v => v !== null && v !== undefined).length
+        if (accrualSetCount !== 0 && accrualSetCount !== 3) {
+          throw new AppError(400, 'late-fee accrual requires all of amount, type, and period — or none')
+        }
+        const finalCapAmount = lateFeeCapAmount === undefined ? locked.late_fee_cap_amount : lateFeeCapAmount
+        const finalCapType   = lateFeeCapType   === undefined ? locked.late_fee_cap_type   : lateFeeCapType
+        const capSetCount = [finalCapAmount, finalCapType].filter(v => v !== null && v !== undefined).length
+        if (capSetCount !== 0 && capSetCount !== 2) {
+          throw new AppError(400, 'late-fee cap requires both amount and type — or neither')
+        }
       }
-      const finalCapAmount = lateFeeCapAmount === undefined ? updated.late_fee_cap_amount : lateFeeCapAmount
-      const finalCapType   = lateFeeCapType   === undefined ? updated.late_fee_cap_type   : lateFeeCapType
-      const capSetCount = [finalCapAmount, finalCapType].filter(v => v !== null && v !== undefined).length
-      if (capSetCount !== 0 && capSetCount !== 2) {
-        throw new AppError(400, 'late-fee cap requires both amount and type — or neither')
+
+      const signingEmailChanged = writeSigningEmail && signingEmail !== storedSigningEmailOf(locked)
+      const signingNameChanged = writeSigningName && signingName !== storedSigningNameOf(locked)
+
+      // S631/S649: a changed address may not land on another landlord's
+      // property, and the old address is kept in the audit log (an unchanged
+      // address arrives on every save and is not a change).
+      const addressChanged = addressChangesFrom(locked)
+      const nextAddress = storedAddressOf(locked)
+      if (addressChanged.length) {
+        const clash = (await saveClient.query<{ id: string; landlord_id: string; name: string }>(
+          `SELECT id, landlord_id, name FROM properties
+            WHERE id <> $1 AND landlord_id <> $2
+              AND LOWER(TRIM(street1)) = LOWER(TRIM($3)) AND LOWER(TRIM(city)) = LOWER(TRIM($4))
+              AND LOWER(TRIM(state)) = LOWER(TRIM($5))
+              AND COALESCE(LOWER(TRIM(street2)), '') = COALESCE(LOWER(TRIM($6)), '')
+            LIMIT 1`,
+          [req.params.id, locked.landlord_id, nextAddress.street1, nextAddress.city,
+           nextAddress.state, nextAddress.street2 ?? ''])).rows[0]
+        if (clash) {
+          // The notice records a refused attempt, so it is written on its own
+          // connection and stays after this save rolls back.
+          const { createAdminNotification } = await import('../services/adminNotifications')
+          await createAdminNotification({
+            severity: 'warn', category: 'duplicate_property_claim',
+            title: `Blocked address change onto another landlord's property`,
+            body: `Property ${req.params.id} tried to move to an address already registered as "${clash.name}" ` +
+                  `under landlord ${clash.landlord_id} (property ${clash.id}).`,
+            context: { propertyId: req.params.id, existingPropertyId: clash.id },
+          }).catch(() => {})
+          throw new AppError(409,
+            'That address is already registered on GAM to another account. If it\'s a different suite or ' +
+            'building, include its suite/unit line — or contact support if you believe this is an error.')
+        }
+        await saveClient.query(
+          `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
+           VALUES ($1, 'property_address_changed', 'property', $2, $3::jsonb, $4::jsonb)`,
+          [req.user!.userId, req.params.id,
+           JSON.stringify({ street1: locked.street1, street2: locked.street2, city: locked.city,
+                            state: locked.state, zip: locked.zip }),
+           JSON.stringify(Object.fromEntries(addressFieldsSent.map(f => [f, nextAddress[f]])))])
       }
-      lfValues.push(req.params.id)
-      updated = await queryOne<any>(
-        'UPDATE properties SET ' + lfSetParts.join(', ') + ' WHERE id=$' + lfValues.length + ' RETURNING *',
-        lfValues,
-      )
+      const addressChangedState = addressChanged.includes('state') ? nextAddress.state : null
+
+      updated = (await saveClient.query<any>(`
+        UPDATE properties SET
+          name        = COALESCE($1, name),
+          street1     = COALESCE($2, street1),
+          street2     = CASE WHEN $23::boolean THEN $3 ELSE street2 END,
+          city        = COALESCE($4, city),
+          state       = COALESCE($5, state),
+          zip         = COALESCE($6, zip),
+          type        = COALESCE($7, type),
+          requires_booking_acknowledgment = COALESCE($8, requires_booking_acknowledgment),
+          late_fee_enabled        = COALESCE($9,  late_fee_enabled),
+          late_fee_grace_days     = COALESCE($10, late_fee_grace_days),
+          late_fee_initial_amount = COALESCE($11, late_fee_initial_amount),
+          late_fee_initial_type   = COALESCE($12, late_fee_initial_type),
+          subleasing_allowed      = COALESCE($13, subleasing_allowed),
+          flexcharge_enabled      = COALESCE($14, flexcharge_enabled),
+          weekly_lease_mode       = COALESCE($15, weekly_lease_mode),
+          default_occupancy_mode  = COALESCE($17, default_occupancy_mode),
+          operator_owns_land      = COALESCE($18, operator_owns_land),
+          lease_signing_email = CASE WHEN $19::boolean THEN $20 ELSE lease_signing_email END,
+          lease_signing_name  = CASE WHEN $21::boolean THEN $22 ELSE lease_signing_name  END,
+          updated_at  = NOW()
+        WHERE id=$16 RETURNING *`,
+        [name||null, street1||null, street2||null, city||null, state||null,
+         zip||null, type||null,
+         reqAck === undefined ? null : reqAck,
+         lateFeeEnabled === undefined ? null : lateFeeEnabled,
+         lateFeeGraceDays === undefined ? null : lateFeeGraceDays,
+         lateFeeInitialAmount === undefined ? null : lateFeeInitialAmount,
+         lateFeeInitialType ?? null,
+         subleasingAllowed === undefined ? null : subleasingAllowed,
+         flexchargeEnabled === undefined ? null : flexchargeEnabled,
+         weeklyLeaseMode === undefined ? null : weeklyLeaseMode,
+         req.params.id,
+         defaultOccupancyMode ?? null,
+         typeof raw.operatorOwnsLand === 'boolean' ? raw.operatorOwnsLand : null,
+         writeSigningEmail, signingEmail, writeSigningName, signingName,
+         // The suite line is optional, so a blank (or null) one sent on
+         // purpose clears it; COALESCE could never clear a wrong suite line.
+         // Not sent = left alone. storedAddressOf above reads it the same way,
+         // so the duplicate check and the audit row see what is stored.
+         raw.street2 !== undefined]
+      )).rows[0]
+      // S649: a property that moved states is due in the new state's timezone.
+      if (addressChangedState) {
+        await saveClient.query(`UPDATE properties SET timezone = $2 WHERE id = $1`,
+          [req.params.id, timezoneForState(addressChangedState)])
+      }
+      if (lfSetParts.length > 0) {
+        lfValues.push(req.params.id)
+        updated = (await saveClient.query<any>(
+          'UPDATE properties SET ' + lfSetParts.join(', ') + ' WHERE id=$' + lfValues.length + ' RETURNING *',
+          lfValues,
+        )).rows[0]
+      }
+
+      // S655: a change to the owner's signing routing is recorded (who, from
+      // what, to what) and takes effect on links ALREADY mailed. Every unsigned
+      // owner seat on an open document at this property that still points at
+      // the old address moves to the new one (the owner's account email when it
+      // is cleared) with a fresh signing token, so a link sitting in an inbox
+      // the owner just revoked stops signing as them. Same pattern as a
+      // resident's corrected address (S654). Reminders send the new link.
+      if (signingEmailChanged || signingNameChanged) {
+        await applyLeaseSigningChange(saveClient, {
+          propertyId: req.params.id, landlordId: prop.landlord_id, byUserId: req.user!.userId,
+          oldEmail: locked.lease_signing_email ?? null, newEmail: signingEmailChanged ? signingEmail : (locked.lease_signing_email ?? null),
+          oldName: locked.lease_signing_name ?? null, newName: signingNameChanged ? signingName : (locked.lease_signing_name ?? null),
+          emailChanged: signingEmailChanged,
+        })
+      }
+      await saveClient.query('COMMIT')
+    } catch (e) {
+      await saveClient.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      saveClient.release()
     }
 
     // S481: state-law mismatches against the property state's

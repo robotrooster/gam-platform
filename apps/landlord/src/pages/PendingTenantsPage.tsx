@@ -7,7 +7,7 @@ import {
 } from 'lucide-react'
 import { api, apiGet, apiDelete, apiPatch } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
-import { ConfirmIntentModal } from './ConfirmIntentModal'
+import { ConfirmIntentModal, type ResolveResponseData } from './ConfirmIntentModal'
 import {
   PARSER_STATUS_META,
   PARSER_FLAG_CATEGORY_META,
@@ -609,7 +609,10 @@ function IntentCard({
   const fullName = `${intent.firstName} ${intent.lastName}`.trim() || '(no name)'
   const status = intent.parserStatus
   const isBusy = status === 'parsing' || uploading
-  const canOpen = status === 'parsed' || status === 'mismatch'
+  // S655: once a lease is drafted for them (another company's resident whose
+  // paper lease became a lease they sign), there is nothing left to build here.
+  const leaseOut = !!(intent as any).leaseDocStatus && (intent as any).leaseDocStatus !== 'voided'
+  const canOpen = (status === 'parsed' || status === 'mismatch') && !leaseOut
   const canViewPdf = !!intent.importedPdfUrl && status !== 'parsing'
   const canReupload = status === 'error' || status === 'mismatch'
 
@@ -645,6 +648,11 @@ function IntentCard({
               )
               if (st === 'accepted') return (
                 <span style={{ color: 'var(--green)' }}>Accepted</span>
+              )
+              // S655: a lease drafted and waiting on YOUR signature has sent
+              // them nothing on purpose — their one email goes when you sign.
+              if (st === 'not_invited' && (intent as any).leaseDocStatus && (intent as any).leaseDocStatus !== 'voided') return (
+                <span style={{ color: 'var(--text-2)' }}>Nothing sent yet — they get one email when you sign</span>
               )
               if (st === 'not_invited') return (
                 <span style={{ color: 'var(--red)', fontWeight: 600 }}>No invite sent yet</span>
@@ -1071,10 +1079,13 @@ export function PendingTenantsPage() {
         <ConfirmIntentModal
           intentId={confirmingId}
           onClose={() => setConfirmingId(null)}
-          onResolved={(result: { leaseId: string; tenantId: string; userId: string; email: string; activationUrl: string }) => {
+          onResolved={(result: ResolveResponseData) => {
             setConfirmingId(null)
             setReviewIntentId(null)
-            setResolvedToast(`Lease built for ${result.email}.`)
+            // S655: another company's resident gets the lease to sign instead.
+            setResolvedToast('sentToSign' in result
+              ? (result.draftBlocked?.[0] ?? result.message)
+              : `Lease built for ${result.email}.`)
             qc.invalidateQueries('pending-tenants')
             qc.invalidateQueries('pending-tenants-count')
             qc.invalidateQueries('leases')

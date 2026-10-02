@@ -145,3 +145,40 @@ describe('the knowledge base does not deny what shipped', () => {
     expect(offenders).toEqual([])
   })
 })
+
+/**
+ * S655 review — "I paid at the bank" is matched, expired and flagged ONLY while
+ * GAM is reading the landlord's bank (an active, synced link). Without one
+ * (TruBlu and Country Acres today) nothing matches a report and nothing expires
+ * it: the landlord checks their own bank and marks the bill paid. The screens,
+ * the route and the agent action all say so; the articles told a TruBlu tenant
+ * their deposit "will be applied automatically", and the agents repeated it.
+ */
+describe('a reported bank deposit is promised only what GAM can do', () => {
+  // Every sentence in a section that offers "I paid at the bank".
+  const sections = ARTICLES.flatMap((a) => a.text.split(/^## /m)
+    .filter((s) => /paid at the bank/i.test(s))
+    .map((s) => ({ path: a.path, text: s })))
+  const sentences = sections.flatMap((s) => s.text.split(/(?<=[.!?])\s+/)
+    .map((sentence) => ({ path: s.path, sentence: sentence.trim() })))
+
+  it('has the sections to check (tenant and landlord)', () => {
+    const paths = new Set(sections.map((s) => s.path.split('/')[0]))
+    expect([...paths].sort()).toEqual(['landlord', 'tenant'])
+  })
+
+  it('never promises it is applied automatically, expires or is flagged without the bank being connected', () => {
+    const PROMISE = /\bautomatic|\bexpires? after|you'll be told|they are told|flagged to you/i
+    const offenders = sentences
+      .filter((x) => PROMISE.test(x.sentence) && !/\bconnected\b/i.test(x.sentence))
+      .map((x) => `${x.path}: ${x.sentence.slice(0, 110)}`)
+    expect(offenders, offenders.join('\n')).toEqual([])
+  })
+
+  it('tells a tenant what happens when the bank is not connected: the landlord marks it paid, keep the slip', () => {
+    for (const s of sections.filter((x) => x.path.startsWith('tenant/'))) {
+      expect(s.text, s.path).toMatch(/isn't connected, your landlord checks their own bank and marks your bill paid/)
+      expect(s.text, s.path).toMatch(/keep your deposit slip/)
+    }
+  })
+})

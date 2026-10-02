@@ -1517,3 +1517,24 @@ describe('request_booking_change — a paid night is quoted before it is booked'
     expect(res?.quoteOnly).toBeUndefined()
   })
 })
+
+// S655 (Nic, 10/2): "That's our check for the flex products." The SSI/SSDI flag
+// stays GAM-side, so the landlord's stats tool never reads it — not even as a
+// count, which at a small park names the person — and says plainly that source
+// of income is private.
+describe('get_portfolio_stats never tells a landlord who is on SSI/SSDI', () => {
+  beforeEach(() => { mockQuery.mockReset(); mockQueryOne.mockReset() })
+
+  it('reads no income flag and answers that source of income is private', async () => {
+    const { getPortfolioStats } = await import('./getPortfolioStats')
+    mockQuery.mockResolvedValue([{ tenants: 7, avg_age: null, with_dob: 0 }])
+    const out: any = await getPortfolioStats.execute({ topic: 'tenants' }, LANDLORD_ACTOR)
+    const sql = mockQuery.mock.calls.map((c: any[]) => String(c[0])).join('\n')
+    expect(sql).not.toMatch(/ssi_ssdi/i)
+    expect(out.tenants.currentTenants).toBe(7)
+    expect(out.tenants).not.toHaveProperty('onFixedIncome')
+    expect(out.tenants).not.toHaveProperty('onFixedIncomePct')
+    expect(out.tenants.sourceOfIncome).toMatch(/private/i)
+    expect(JSON.stringify(out)).not.toMatch(/fixed.?income/i)
+  })
+})

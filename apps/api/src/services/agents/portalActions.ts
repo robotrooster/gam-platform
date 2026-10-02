@@ -410,10 +410,14 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     description:
       'Report that the tenant paid at the bank — walked in and deposited cash, or handed over a ' +
       'check or money order. Use when they say "I already paid it in at the bank on Tuesday".\n' +
-      'This does NOT settle the charge on its own. It tells their landlord what they say they paid ' +
-      'and when, and it is matched against the bank record when the money shows up. Say that plainly: ' +
-      'they should not walk away thinking the balance is cleared. Take the reference number if the ' +
-      'deposit or the money order has one — it is what makes the match work.\n' +
+      'This does NOT settle the charge on its own. Say that plainly: they should not walk away thinking ' +
+      'the balance is cleared. If their landlord\u2019s bank is connected to GAM, the report is matched ' +
+      'to the deposit when it shows up. If it is not, nothing matches it: the landlord checks their own ' +
+      'bank and marks the bill paid. The reply says which — relay its message as it is, and when the ' +
+      'bank is not connected tell them to let their landlord know they paid and keep their slip — never ' +
+      'say GAM tells the landlord. A reply with alreadyReported means they reported this deposit before ' +
+      'and nothing new was filed; its message says so, with the same next step — relay that too. ' +
+      'Take the reference number if the deposit or the money order has one.\n' +
       'declaredDate is the day THEY went to the bank, in their own timezone, which can legitimately ' +
       'be later than the date at the property. Never tell them a date they give you is in the future.',
     params: {
@@ -3710,13 +3714,27 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Bring a tenant who is ALREADY LIVING THERE onto the platform, with the lease they already ' +
       'signed on paper. Use for "the Alvarez family are in 12, their lease runs to next March, rent ' +
       'is $650".\n' +
-      'S630 (Nic): DO NOT PROMISE THAT THE INVITE FINISHES THIS. It creates the account and the lease TERMS from what they tell you, and that is all — the signed lease DOCUMENT is not in GAM until the landlord uploads a scan of the one in their folder, or sends the tenant a digital one to sign (their existing template is fine, same terms). Say that plainly as the next step, in the same breath as the invite. Telling a landlord their four-year tenant is onboarded when no lease document exists is how they find out at the worst possible moment.' +
-      'This creates the tenant AND an imported lease from the terms they give you, and emails the ' +
-      'person an activation link (someone already on GAM gets no link; the lease waits in their ' +
-      'account). No background check and no application — they already live there.\n' +
+      'What happens depends on who they are, and the result tells you which. Say what it says.\n' +
+      '- Somebody new to GAM: this creates their account and an imported lease from the terms they give ' +
+      'you, and emails them one link to set up their account (someone who already signs in to GAM gets a ' +
+      'notice in that account instead). S630 (Nic): DO NOT PROMISE THAT THIS FINISHES IT. The signed lease ' +
+      'DOCUMENT is not in GAM until the landlord uploads a scan of the one in their folder, or sends the ' +
+      'tenant a digital one to sign (their existing template is fine, same terms). Say that plainly as the ' +
+      'next step. Telling a landlord their four-year tenant is onboarded when no lease document exists is ' +
+      'how they find out at the worst possible moment.\n' +
+      '- Somebody who already has a GAM account with another company: nobody is attached to a company ' +
+      'without their own signature, so NO lease is created and nothing is billed yet. The result comes back ' +
+      'with sentToSign and a message. The order is: the lease drafts now from this landlord’s own setup ' +
+      'for that unit (the unit’s rent and default lease, not the paper’s terms; the landlord checks ' +
+      'the terms when he signs), it waits for his signature in Front Desk, then the person gets ONE email to ' +
+      'sign it, and it starts when they sign. Read that message to the landlord as it is, and never say the ' +
+      'lease was created or that they are onboarded.\n' +
+      'No background check and no application — they already live there.\n' +
       'THE TERMS COME FROM THE PAPER LEASE, not from you. Rent, dates, deposit, late-fee terms: read ' +
       'each one back as they give it, and if they do not know a figure, ask rather than filling in ' +
       'something reasonable. This lease becomes what the tenant is billed on.\n' +
+      'Ask for their first name, last name and email before you send anything; phone is optional. Never ' +
+      'guess an email.\n' +
       'If they are signing a NEW lease rather than moving one over, that is ' +
       'invite_tenant_to_sign_lease. If the landlord does not have the lease terms to hand, ' +
       'park_pending_tenant holds the person until they do.',
@@ -3724,8 +3742,8 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       firstName: { type: 'string', description: 'Their first name.' },
       lastName: { type: 'string', description: 'Their last name.' },
       email: { type: 'string', description: 'Their email. Read it back — a typo goes to a stranger.' },
-      phone: { type: 'string', description: 'Their phone number.' },
-      unitId: { type: 'string', description: 'The unit they live in — the unit NUMBER is fine ("12", "RV 07"). Never ask the landlord for an id.' },
+      phone: { type: 'string', description: 'Their phone number, if the landlord has it. Optional.' },
+      unitId: { type: 'string', description: 'The unit they live in, from a lookup by its number ("12", "RV 07"). Never ask the landlord for an id.' },
       leaseStart: { type: 'string', description: 'When the existing lease started, YYYY-MM-DD.' },
       leaseEnd: { type: 'string', description: 'When it ends, YYYY-MM-DD. Leave out for month-to-month.' },
       monthlyRent: { type: 'number', description: 'The rent on the signed lease.' },
@@ -3735,59 +3753,72 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       noticeDaysRequired: { type: 'integer', description: 'Notice either side must give, per the lease.' },
       autoRenew: { type: 'boolean', description: 'Whether the paper lease renews on its own.' },
     },
-    required: ['firstName', 'lastName', 'email', 'phone', 'unitId', 'leaseStart', 'monthlyRent'],
+    required: ['firstName', 'lastName', 'email', 'unitId', 'leaseStart', 'monthlyRent'],
     confirmFirst: true,
   },
   {
     id: 'invite_tenant_to_sign_lease',
     audience: 'landlord', method: 'POST', path: '/api/landlords/me/onboard-new-lease-tenant',
     description:
-      'Invite somebody to a unit for a lease they are going to SIGN. Use for "the Reyes family are ' +
-      'taking 204, send them the paperwork".\n' +
-      'NO lease is created here — the signed document becomes the lease, which is the GAM standard. ' +
-      'The draft fills itself in from the unit and its default template when they accept, so the ' +
-      'unit needs a rent amount set first; the system refuses without one and that is the thing to ' +
-      'fix.\n' +
-      'For a household, call this again for the same unit before anybody signs. Adding somebody voids ' +
-      'the unsigned draft so the whole roster re-drafts together — that is correct, not a fault, and ' +
-      'worth saying if they see it happen.\n' +
+      'Invite somebody, or a whole household, to a unit for a NEW lease they are going to SIGN. Use for ' +
+      '"the Reyes family are taking 204, send them the paperwork".\n' +
+      'The order (S647), and say it in this order: the lease drafts RIGHT NOW from the unit’s own ' +
+      'setup (its rent and its default lease) and waits in Front Desk under "Waiting on you to sign". ' +
+      'When it drafts, nobody is emailed yet. When the landlord signs it, each person gets ONE email to set up their ' +
+      'account and sign. So the honest report is "their lease is drafted and waiting for your signature; ' +
+      'they hear from GAM once you sign it", never "I sent them the paperwork".\n' +
+      'The unit needs a rent amount and a late-fee decision first; the system refuses without them, and ' +
+      'that is the thing to fix. If draftedDocumentIds is empty and draftBlocked is present, the lease did ' +
+      'not draft: tell them each reason as it reads. The usual invite was tried instead. Only people whose ' +
+      'notified is "email" (an email to set up their account) or "notice" (a notice in the GAM account they ' +
+      'already use) were contacted; notified null means that person was NOT contacted (Re-send invite is on ' +
+      'the Front Desk). Say who was contacted and who was not, by name; never say someone was contacted when ' +
+      'they were not. If some leases drafted and others are blocked (a by-room unit gives each person their ' +
+      'own lease, and each blocked reason names whose it is), say which drafted and which did not: nobody was ' +
+      'contacted yet, the drafted ones wait for the landlord’s signature, and each blocked reason says how ' +
+      'that lease gets drafted.\n' +
+      'A HOUSEHOLD goes in ONE call: the person who holds the lease in firstName, lastName and email, and ' +
+      'everyone else moving in with them in people. One call drafts one lease with all of them on it.\n' +
+      'If someone comes back with needsOwnSignature, they already have a GAM account with another company: ' +
+      'the landlord still signs first, but that lease starts, and bills, only when that person signs it ' +
+      'themselves. Say so.\n' +
       'If the tenant is already living there on a paper lease, migrate_existing_tenant is the one.\n' +
-      'You need their first name, last name, email AND phone before you can send anything. A '  +
-      'landlord who says "the Reyes family are taking 204" has given you a surname and a unit and '  +
-      'nothing else \u2014 ask for the rest in one go, and never guess an email. This mails a real '  +
-      'person real paperwork: a guessed address sends somebody\u2019s lease to a stranger and reports '  +
-      'it back to the landlord as done.',
+      'Ask for each person’s first name, last name and email before you send anything; phone is ' +
+      'optional. A landlord who says "the Reyes family are taking 204" has given you a surname and a unit ' +
+      'and nothing else — ask for the rest in one go, and never guess an email. Once the landlord ' +
+      'signs, a guessed address sends somebody’s lease to a stranger.',
     params: {
-      firstName: { type: 'string', description: 'Their first name.' },
+      firstName: { type: 'string', description: 'The first name of the person who holds the lease.' },
       lastName: { type: 'string', description: 'Their last name.' },
-      email: { type: 'string', description: 'Their email.' },
-      phone: { type: 'string', description: 'Their phone number.' },
-      unitId: { type: 'string', description: 'The unit they are moving into, from a lookup.' },
+      email: { type: 'string', description: 'Their email. Read it back — a typo goes to a stranger.' },
+      phone: { type: 'string', description: 'Their phone number, if the landlord has it. Optional.' },
+      unitId: { type: 'string', description: 'The unit they are moving into, from a lookup by its number. Never ask the landlord for an id.' },
+      people: { type: 'array', description: 'Everyone else moving in with them on the same lease, each with firstName, lastName and email (phone optional). Leave out for one person.' },
     },
-    required: ['firstName', 'lastName', 'email', 'phone', 'unitId'],
+    required: ['firstName', 'lastName', 'email', 'unitId'],
     confirmFirst: true,
   },
   {
     id: 'park_pending_tenant',
     audience: 'landlord', method: 'POST', path: '/api/landlords/me/onboard-tenant-pending',
     description:
-      'Put a tenant on the books with just their name, email and phone, when the landlord does not ' +
-      'have the lease to hand yet. Use for "I know they are in 14, I will have to dig the lease out".\n' +
+      'Put a tenant on the books with just their name and email, when the landlord does not have the ' +
+      'lease to hand yet. Use for "I know they are in 14, I will have to dig the lease out".\n' +
       'NOTHING is sent to the tenant. No account activation, no email — they sit in the pending pool ' +
       'until the landlord uploads the lease and it becomes real, and only then does the tenant hear ' +
       'anything. Say that, because "I added them" sounds like they were contacted.\n' +
       'Naming the unit reserves it: that spot stops being offered for guest bookings while the ' +
       'person is pending, which is what protects a permanent RV tenant mid-migration.\n' +
-      'All four \u2014 first name, last name, email, phone \u2014 are required. If the landlord has only '  +
-      'some of them, ask for the rest rather than parking a half-identified person on their books.',
+      'First name, last name and email are required; phone is optional. If the landlord has only some ' +
+      'of them, ask for the rest rather than parking a half-identified person on their books.',
     params: {
       firstName: { type: 'string', description: 'Their first name.' },
       lastName: { type: 'string', description: 'Their last name.' },
       email: { type: 'string', description: 'Their email.' },
-      phone: { type: 'string', description: 'Their phone number.' },
+      phone: { type: 'string', description: 'Their phone number, if the landlord has it. Optional.' },
       unitId: { type: 'string', description: 'The unit they already occupy, from a lookup.' },
     },
-    required: ['firstName', 'lastName', 'email', 'phone'],
+    required: ['firstName', 'lastName', 'email'],
     confirmFirst: true,
   },
   {

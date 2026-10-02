@@ -169,6 +169,64 @@ describe('GET /api/tenants/me', () => {
   })
 })
 
+// S655 (Nic, 10/2) + S648: the signing lock-in. A tenant with an unsigned
+// lease sees only the signing flow — unless they already rent or take
+// utilities from ANOTHER company on GAM, whose bills they must still be able
+// to pay. A unit of their own from THIS lease (the landlord's signature issued
+// it) is no reason to skip signing.
+describe('GET /api/tenants/me — pending_lease_locks (the signing lock-in)', () => {
+  async function waitingOn(f: TFixture, landlordId: string, unitId: string, leaseId: string | null) {
+    const doc = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status)
+       VALUES ($1,$2,$3,'Lease','original_lease','in_progress') RETURNING id`,
+      [landlordId, unitId, leaseId])).rows[0].id
+    await db.query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
+       VALUES ($1,$2,'primary','T T','t@test.dev',2,$3,'sent')`,
+      [doc, f.tenantUserId, randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')])
+    return doc
+  }
+  const me = (f: TFixture) => request(buildApp()).get('/api/tenants/me').set('Authorization', `Bearer ${f.tenantToken}`)
+
+  it("a new tenant whose lease the landlord's signature already issued is still locked into signing", async () => {
+    const f = await seedTFixture()   // the issued lease: active, on this unit
+    const doc = await waitingOn(f, f.landlordId, f.unitId, f.leaseId!)
+    const res = await me(f)
+    expect(res.body.data.unit_id).toBe(f.unitId)
+    expect(res.body.data.pending_lease_document_id).toBe(doc)
+    expect(res.body.data.pending_lease_locks).toBe(true)
+  })
+
+  it("another company's resident is not locked in — they keep paying what they owe there", async () => {
+    const f = await seedTFixture()   // lives at company A
+    const c = await db.connect()
+    let b: { landlordId: string; unitId: string }
+    try {
+      await c.query('BEGIN')
+      const ll = await seedLandlord(c)
+      const pid = await seedProperty(c, { landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
+      b = { landlordId: ll.landlordId, unitId: await seedUnit(c, { propertyId: pid, landlordId: ll.landlordId }) }
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    await waitingOn(f, b!.landlordId, b!.unitId, null)
+    expect((await me(f)).body.data.pending_lease_locks).toBe(false)
+  })
+
+  it('a second lease with the same company keeps the lock-in', async () => {
+    const f = await seedTFixture()
+    const c = await db.connect()
+    let unit2: string
+    try { unit2 = await seedUnit(c, { propertyId: f.propertyId, landlordId: f.landlordId }) } finally { c.release() }
+    await waitingOn(f, f.landlordId, unit2!, null)
+    expect((await me(f)).body.data.pending_lease_locks).toBe(true)
+  })
+
+  it('nothing waiting: no lock-in flag at all', async () => {
+    const f = await seedTFixture()
+    expect((await me(f)).body.data.pending_lease_locks).toBeNull()
+  })
+})
+
 describe('GET /api/tenants/me/payment-health', () => {
   it('computes on-time rate from the tenant\'s own payments', async () => {
     const f = await seedTFixture()

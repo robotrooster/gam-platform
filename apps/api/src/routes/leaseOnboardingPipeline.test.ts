@@ -358,14 +358,19 @@ describe('S647 the front desk after drafting moved to invite time', () => {
     return r.body.data as any[]
   }
 
-  it('an invited, unaccepted person reads as invited — not accepted — and waits on the landlord', async () => {
+  it('an invited, unaccepted person is not read as accepted, has been sent nothing, and waits on the landlord', async () => {
     const f = await seedBase('whole_unit')
     await seedDefaultTemplate(f.landlordId, 1, 12)
     await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
 
     const [row] = await pending(f)
     // Being named on a draft used to count as proof of acceptance. It isn't now.
-    expect(row.inviteState).toBe('invited')
+    // S655: and nothing — not even a silent setup link — exists for them until
+    // the landlord signs; their one email is minted and sent then.
+    expect(row.inviteState).toBe('not_invited')
+    expect((await db.query(
+      `SELECT u.tenant_invite_token FROM users u JOIN tenants t ON t.user_id = u.id WHERE t.id = $1`,
+      [row.tenantId])).rows[0].tenant_invite_token).toBeNull()
     expect(row.leaseDocStatus).toBeTruthy()
     expect(row.leaseWaitingOnRole).toBe('landlord')
   })
@@ -420,5 +425,58 @@ describe('S647 onboarding sends the tenant nothing until the landlord signs', ()
     expect(res.status).toBe(200)
     expect(res.body.data.draftedDocumentIds).toEqual([])
     expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+    expect(res.body.data.fallbackSent).toBe(true)
+    expect(res.body.data.people[0].notified).toBe('email')
+  })
+
+  // S655 review: the agent was told "each person was sent the usual invite
+  // instead" whenever the lease did not draft — but a setup email that fails
+  // leaves that person uncontacted, and the result has to say so.
+  it('a setup email that fails leaves that person marked not contacted', async () => {
+    const f = await seedBase('whole_unit')   // no default template
+    emailTenantOnboardedMock.mockImplementationOnce(async () => { throw new Error('mail provider down') })
+    const res = await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    expect(res.status).toBe(200)
+    expect(res.body.data.draftedDocumentIds).toEqual([])
+    expect(res.body.data.draftBlocked.length).toBeGreaterThan(0)
+    expect(res.body.data.fallbackSent).toBe(false)
+    expect(res.body.data.people[0].notified).toBeNull()
+  })
+})
+
+// S655 review: a by-room unit drafts a lease per person, so one person's can
+// draft while another's is refused, and no fallback invite goes (a lease did
+// draft). The refusal names whose lease it is, so the screen and the agent
+// can say which drafted and which did not.
+describe('by-room: one lease drafts, another is refused', () => {
+  it("names the person whose lease was refused, and drafts the other person's", async () => {
+    const f = await seedBase('by_room', 2)
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `good-${randomUUID().slice(0, 6)}@x.dev`, 'Goodie')
+    await onboard(f, `bad-${randomUUID().slice(0, 6)}@x.dev`, 'Baddie')
+    // Clear what the invites drafted, so the per-person draft runs again here.
+    await db.query(`UPDATE lease_documents SET status='voided' WHERE unit_id=$1`, [f.unitId])
+    await db.query(`UPDATE pending_tenant_intents SET draft_document_id=NULL WHERE unit_id=$1`, [f.unitId])
+
+    const { createDocumentRecord } = await import('./esign')
+    const refuseBaddie = async (c: any, opts: any) => {
+      if ((opts.signers ?? []).some((x: any) => x.name === 'Baddie Tester')) {
+        throw new Error('the default lease is missing a required field')
+      }
+      return createDocumentRecord(c, opts)
+    }
+    const client = await db.connect()
+    let out: { draftedDocumentIds: string[]; blocked: string[] }
+    try {
+      await client.query('BEGIN')
+      out = await autoDraftLeasesForUnit(client as any, f.unitId, refuseBaddie, undefined, { quiet: true })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    expect(out!.draftedDocumentIds).toHaveLength(1)
+    expect(out!.blocked).toHaveLength(1)
+    expect(out!.blocked[0]).toMatch(/\(Baddie Tester\) could not be drafted/)
+    expect(out!.blocked[0]).not.toMatch(/Goodie/)
+    expect(out!.blocked[0]).toMatch(/drafts on its own/)
   })
 })

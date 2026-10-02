@@ -86,11 +86,11 @@ describe('linking a payout to the transfers it swept', () => {
     expect(await gapNotices()).toHaveLength(0)
   })
 
-  it('oldest first: a transfer that does not fit waits, and the gap is shown and raised to an admin', async () => {
+  it('a payout made in the Stripe dashboard takes them oldest first: one that does not fit waits, and the gap is shown and raised to an admin', async () => {
     const f = await seed()
     const first = await transfer(f, { amount: 500, transferredAt: '2026-09-01T18:00:00Z' })
     const second = await transfer(f, { amount: 300, transferredAt: '2026-09-02T18:00:00Z' })
-    const disb = await payout(f, 600, '2026-09-03T18:00:00Z')
+    const disb = await payout(f, 600, '2026-09-03T18:00:00Z', { trigger: 'stripe_dashboard' })
     const r = await stampPayoutTransfers({
       disbursementId: disb, connectAccountId: ACCOUNT, payoutAmount: 600, payoutAt: new Date('2026-09-03T18:00:00Z'),
     })
@@ -104,6 +104,78 @@ describe('linking a payout to the transfers it swept', () => {
     expect(comp!.adjustments).toContainEqual({ kind: 'residual', label: 'Not traced to a payment GAM moved', amount: 100 })
   })
 
+  // S655 review: a GAM sweep pays out the whole balance, so it carried every
+  // transfer waiting before it — even when they come to more than the payout
+  // (the instant-withdrawal margin autoPayouts collects off the balance first).
+  // Taking them oldest first while they fit left the newest one unlinked
+  // forever and blamed the gap on "not traced".
+  it('a GAM sweep carries every transfer waiting before it, and a shortfall is its own line', async () => {
+    const f = await seed()
+    await ownsAccount(f)
+    const first = await transfer(f, { amount: 500, transferredAt: '2026-09-01T18:00:00Z' })
+    const second = await transfer(f, { amount: 300, transferredAt: '2026-09-02T18:00:00Z' })
+    const sweep = await payout(f, 600, '2026-09-03T18:00:00Z', { trigger: 'auto_friday' })
+    const r = await stampPayoutTransfers({
+      disbursementId: sweep, connectAccountId: ACCOUNT, payoutAmount: 600, payoutAt: new Date('2026-09-03T18:00:00Z'),
+    })
+    expect(r).toMatchObject({ transfersTotal: 800, residual: -200 })
+    expect(await linkedTo(first)).toBe(sweep)
+    expect(await linkedTo(second)).toBe(sweep)
+    const [notice] = await gapNotices()
+    expect(notice.context).toMatchObject({ residual: -200 })
+    const comp = await payoutComposition(sweep)
+    expect(comp!.adjustments).toContainEqual({ kind: 'residual', label: 'In these transfers but not in this payout', amount: -200 })
+
+    // The next sweep starts clean: nothing it could wrongly claim.
+    const next = await payout(f, 50, '2026-09-10T18:00:00Z', { trigger: 'auto_friday' })
+    const r2 = await stampPayoutTransfers({
+      disbursementId: next, connectAccountId: ACCOUNT, payoutAmount: 50, payoutAt: new Date('2026-09-10T18:00:00Z'), notifyOnGap: false,
+    })
+    expect(r2.intentIds).toEqual([])
+  })
+
+  it('a catch-up sweep is a full sweep too', async () => {
+    const f = await seed()
+    const a = await transfer(f, { amount: 413, transferredAt: '2026-09-21T18:00:01Z' })
+    const b = await transfer(f, { amount: 20, transferredAt: '2026-09-21T18:00:02Z' })
+    const sweep = await payout(f, 413, '2026-09-21T18:00:04Z', { trigger: 'catch_up' })
+    const r = await stampPayoutTransfers({
+      disbursementId: sweep, connectAccountId: ACCOUNT, payoutAmount: 413, payoutAt: new Date('2026-09-21T18:00:04Z'), notifyOnGap: false,
+    })
+    expect(r.intentIds.sort()).toEqual([a, b].sort())
+    expect(r.residual).toBe(-20)
+  })
+
+  // The nightly sync can hear of a payout made in the Stripe dashboard after a
+  // later GAM sweep already linked everything. Same answer either way round.
+  it('a dashboard payout filed after a later sweep takes back what it carried, whatever order they were filed in', async () => {
+    const run = async (dashboardFirst: boolean) => {
+      await cleanupAllSchema()
+      const f = await seed()
+      await ownsAccount(f)
+      const t1 = await transfer(f, { amount: 4154.89, transferredAt: '2026-09-19T16:29:45Z' })
+      const t2 = await transfer(f, { amount: 413, transferredAt: '2026-09-21T18:00:01Z' })
+      const dash = await payout(f, 4154.89, '2026-09-21T12:18:07Z', { trigger: 'stripe_dashboard' })
+      const sweep = await payout(f, 413, '2026-09-21T18:00:04Z', { trigger: 'catch_up' })
+      const stampDash = () => stampPayoutTransfers({
+        disbursementId: dash, connectAccountId: ACCOUNT, payoutAmount: 4154.89, payoutAt: new Date('2026-09-21T12:18:07Z'), notifyOnGap: false,
+      })
+      const stampSweep = () => stampPayoutTransfers({
+        disbursementId: sweep, connectAccountId: ACCOUNT, payoutAmount: 413, payoutAt: new Date('2026-09-21T18:00:04Z'), notifyOnGap: false,
+      })
+      if (dashboardFirst) { await stampDash(); await stampSweep() } else { await stampSweep(); await stampDash() }
+      return {
+        t1: (await linkedTo(t1)) === dash ? 'dashboard' : (await linkedTo(t1)) === sweep ? 'sweep' : null,
+        t2: (await linkedTo(t2)) === dash ? 'dashboard' : (await linkedTo(t2)) === sweep ? 'sweep' : null,
+        dashResidual: (await payoutComposition(dash))!.residual,
+        sweepResidual: (await payoutComposition(sweep))!.residual,
+      }
+    }
+    const inOrder = await run(true)
+    expect(inOrder).toEqual({ t1: 'dashboard', t2: 'sweep', dashResidual: 0, sweepResidual: 0 })
+    expect(await run(false)).toEqual(inOrder)
+  })
+
   it('never takes another account’s transfers, or one already in a payout', async () => {
     const f = await seed()
     const mine = await transfer(f, { amount: 100, transferredAt: '2026-09-01T18:00:00Z' })
@@ -112,6 +184,94 @@ describe('linking a payout to the transfers it swept', () => {
     const r = await stampPayoutTransfers({ disbursementId: disb, connectAccountId: ACCOUNT, payoutAmount: 100, notifyOnGap: false })
     expect(r.intentIds).toEqual([])
     expect(await linkedTo(mine)).toBeNull()
+  })
+})
+
+/**
+ * S655 review: a gap notice is raised when a payout is filed. When its
+ * transfers later move — a dashboard payout filed late taking its transfers
+ * back from a sweep, or GAM claiming a row the webhook filed — the payout's
+ * standing changes, and the admin list must not keep saying the old thing.
+ */
+describe('an admin is told where a payout stands now, not where it stood when filed', () => {
+  const openGapNotices = async () =>
+    (await db.query(`SELECT context FROM admin_notifications
+                      WHERE category = 'payout_composition_gap' AND acknowledged_at IS NULL
+                      ORDER BY created_at`)).rows.map(r => r.context)
+
+  it('a sweep’s gap notice is closed once a dashboard payout filed late takes back what it carried and the sweep ties out', async () => {
+    const f = await seed()
+    await ownsAccount(f)
+    await transfer(f, { amount: 4154.89, transferredAt: '2026-09-19T16:29:45Z' })
+    await transfer(f, { amount: 413, transferredAt: '2026-09-21T18:00:01Z' })
+    const dash = await payout(f, 4154.89, '2026-09-21T12:18:07Z', { trigger: 'stripe_dashboard' })
+    const sweep = await payout(f, 413, '2026-09-21T18:00:04Z', { trigger: 'catch_up' })
+
+    // The sweep is filed first and carries both: $4,154.89 more than it paid out.
+    await stampPayoutTransfers({
+      disbursementId: sweep, connectAccountId: ACCOUNT, payoutAmount: 413, payoutAt: new Date('2026-09-21T18:00:04Z'),
+    })
+    expect(await openGapNotices()).toEqual([expect.objectContaining({ disbursementId: sweep, residual: -4154.89 })])
+
+    // The nightly sync then hears of the dashboard payout.
+    const r = await stampPayoutTransfers({
+      disbursementId: dash, connectAccountId: ACCOUNT, payoutAmount: 4154.89, payoutAt: new Date('2026-09-21T12:18:07Z'),
+    })
+    expect(r.retied).toEqual([{ disbursementId: sweep, payoutAmount: 413, transfersTotal: 413, residual: 0 }])
+    expect(await openGapNotices()).toEqual([])
+    // Closed, not deleted — GAM keeps everything.
+    expect((await gapNotices())).toHaveLength(1)
+  })
+
+  it('a sweep whose gap changed gets one notice with the new numbers in place of the old', async () => {
+    const f = await seed()
+    await ownsAccount(f)
+    await transfer(f, { amount: 4154.89, transferredAt: '2026-09-19T16:29:45Z' })
+    await transfer(f, { amount: 413, transferredAt: '2026-09-21T18:00:01Z' })
+    await transfer(f, { amount: 20, transferredAt: '2026-09-21T18:00:02Z' })
+    const dash = await payout(f, 4154.89, '2026-09-21T12:18:07Z', { trigger: 'stripe_dashboard' })
+    const sweep = await payout(f, 413, '2026-09-21T18:00:04Z', { trigger: 'catch_up' })
+    await stampPayoutTransfers({
+      disbursementId: sweep, connectAccountId: ACCOUNT, payoutAmount: 413, payoutAt: new Date('2026-09-21T18:00:04Z'),
+    })
+    await stampPayoutTransfers({
+      disbursementId: dash, connectAccountId: ACCOUNT, payoutAmount: 4154.89, payoutAt: new Date('2026-09-21T12:18:07Z'),
+    })
+    expect(await openGapNotices()).toEqual([expect.objectContaining({ disbursementId: sweep, residual: -20, transfersTotal: 433 })])
+  })
+
+  it('GAM claiming a payout the webhook filed closes the notice the webhook raised once it ties out', async () => {
+    const f = await seed()
+    await ownsAccount(f)
+    await transfer(f, { amount: 500, transferredAt: '2026-09-22T18:00:00Z' })
+    await transfer(f, { amount: 300, transferredAt: '2026-09-22T18:00:02Z' })
+    // The webhook files it first, dated by Stripe's clock — before the second transfer.
+    const disb = await payout(f, 800, '2026-09-22T18:00:01Z', { trigger: 'stripe_dashboard', status: 'processing' })
+    await stampPayoutTransfers({
+      disbursementId: disb, connectAccountId: ACCOUNT, payoutAmount: 800, payoutAt: new Date('2026-09-22T18:00:01Z'),
+    })
+    expect(await openGapNotices()).toEqual([expect.objectContaining({ disbursementId: disb, residual: 300 })])
+
+    // The weekly run claims it as its own sweep, cut when Stripe answered.
+    await db.query(`UPDATE disbursements SET trigger_type = 'auto_friday', initiated_at = '2026-09-22T18:00:03Z' WHERE id = $1`, [disb])
+    const r = await stampPayoutTransfers({
+      disbursementId: disb, connectAccountId: ACCOUNT, payoutAmount: 800, payoutAt: new Date('2026-09-22T18:00:03Z'),
+    })
+    expect(r.residual).toBe(0)
+    expect(await openGapNotices()).toEqual([])
+  })
+
+  it('a notice that already says where the payout stands is left alone', async () => {
+    const f = await seed()
+    await transfer(f, { amount: 500, transferredAt: '2026-09-01T18:00:00Z' })
+    const disb = await payout(f, 600, '2026-09-03T18:00:00Z', { trigger: 'stripe_dashboard' })
+    const stamp = () => stampPayoutTransfers({
+      disbursementId: disb, connectAccountId: ACCOUNT, payoutAmount: 600, payoutAt: new Date('2026-09-03T18:00:00Z'),
+    })
+    await stamp()
+    await stamp()
+    expect(await gapNotices()).toHaveLength(1)
+    expect(await openGapNotices()).toEqual([expect.objectContaining({ disbursementId: disb, residual: 100 })])
   })
 })
 

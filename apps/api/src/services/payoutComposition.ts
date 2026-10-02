@@ -79,18 +79,49 @@ export interface StampResult {
   transfersTotal: number
   /** payout − transfersTotal. Zero when the payout is fully traced. */
   residual: number
+  /**
+   * Later GAM sweeps this (dashboard) payout took transfers back from, with
+   * where each now stands — their gap notices are brought up to date too.
+   */
+  retied: PayoutTieOut[]
+}
+
+/** Where one payout stands against the transfers linked to it. */
+export interface PayoutTieOut {
+  disbursementId: string
+  payoutAmount: number
+  transfersTotal: number
+  residual: number
 }
 
 /**
  * Link a payout to the transfers it swept off the landlord's Stripe balance.
  *
- * Takes the account's transfers that landed before the payout and are not yet
- * in any payout, oldest first, while they fit inside the payout amount. A payout
- * sweeps the whole available balance, so in the normal case this is every
- * waiting transfer and the residual is zero. Whatever does not fit stays
- * unassigned for the next payout; whatever the payout carried beyond its
- * transfers is reported as the residual — and, unless told otherwise, raised as
- * an admin notice.
+ * WHICH TRANSFERS depends on who made the payout (the row's trigger_type):
+ *
+ *  • GAM's own weekly / catch-up payout pays out the WHOLE available balance,
+ *    so it carried every transfer waiting before it — all of them are linked,
+ *    whether or not they add up to the payout. When they come to more (money
+ *    left the balance some other way first, e.g. the instant-withdrawal margin
+ *    autoPayouts collects from the Connect balance just before reading it), the
+ *    shortfall is shown as "In these transfers but not in this payout". (S655
+ *    review: taking them oldest first while they fit left the newest transfer
+ *    unlinked forever — no later payout may claim it — and blamed the gap on
+ *    the wrong line.)
+ *
+ *  • A payout made in the Stripe dashboard may be for any amount, so it takes
+ *    the waiting transfers oldest first, while they fit; the rest wait for the
+ *    next payout. Filed late — the nightly sync can hear of it after a later
+ *    GAM sweep already linked everything — it takes its transfers back from
+ *    that sweep, so the result is the same in whatever order the two were
+ *    filed.
+ *
+ * Whatever the payout carried beyond its transfers is reported as the residual
+ * — and, unless told otherwise, raised as an admin notice. A payout keeps at
+ * most one open notice, and it always states where the payout stands now: a
+ * payout that ties out once its transfers move (a late dashboard payout taking
+ * them back from a sweep, or GAM claiming a row the webhook filed) has its
+ * notice closed; one whose gap changed gets a fresh notice in its place.
  *
  * Never a transfer an earlier GAM sweep already carried. GAM's own weekly and
  * catch-up payouts pay out the whole available balance, so every transfer that
@@ -112,8 +143,18 @@ export async function stampPayoutTransfers(o: {
   payoutAt?: Date | null
   client?: Queryable
   notifyOnGap?: boolean
+  /**
+   * A trial the caller rolls back (connectPayoutSync asks "would this link
+   * anything?"): log nothing and raise no notice. The API logs are kept and
+   * searched, and a take-back logged by a trial never happened — the real
+   * call logs its own.
+   */
+  trial?: boolean
 }): Promise<StampResult> {
   const run = async (c: Queryable): Promise<StampResult> => {
+    const trigger = (await c.query<{ trigger_type: string | null }>(
+      `SELECT trigger_type FROM disbursements WHERE id = $1`, [o.disbursementId])).rows[0]?.trigger_type ?? null
+    const fullSweep = (FULL_SWEEP_TRIGGERS as readonly string[]).includes(trigger ?? '')
     // The last full sweep of this account before this payout (see above).
     const lastSweep = (await c.query<{ at: Date | null }>(
       `SELECT MAX(COALESCE(d.initiated_at, d.created_at)) AS at
@@ -125,12 +166,13 @@ export async function stampPayoutTransfers(o: {
           AND COALESCE(d.initiated_at, d.created_at) < COALESCE($2::timestamptz, NOW())
           AND ${PAYOUT_ACCOUNT_SQL('d')} = $1`,
       [o.connectAccountId, o.payoutAt ?? null, o.disbursementId])).rows[0]?.at ?? null
-    const waiting = (await c.query<{ id: string; amount: string }>(
-      `SELECT i.id, i.amount::text AS amount
+    // Waiting: not yet in any payout. For a dashboard payout, also a transfer
+    // a LATER GAM sweep took because this payout had not been filed yet.
+    const waiting = (await c.query<{ id: string; amount: string; disbursement_id: string | null }>(
+      `SELECT i.id, i.amount::text AS amount, i.disbursement_id
          FROM platform_transfer_intents i
         WHERE i.destination_connect_account_id = $1
           AND i.status = 'transferred'
-          AND i.disbursement_id IS NULL
           AND i.transferred_at IS NOT NULL
           AND i.transferred_at <= COALESCE($2::timestamptz, NOW())
           AND ($3::timestamptz IS NULL
@@ -141,31 +183,63 @@ export async function stampPayoutTransfers(o: {
                              AND COALESCE(f.initiated_at, f.created_at) >= i.transferred_at
                              AND COALESCE(f.initiated_at, f.created_at) < $3::timestamptz
                              AND ${PAYOUT_ACCOUNT_SQL('f')} = $1))
+          AND (i.disbursement_id IS NULL
+               OR (NOT $4::boolean AND i.disbursement_id IN (
+                     SELECT s.id FROM disbursements s
+                      WHERE s.id <> $5
+                        AND s.status <> 'failed'
+                        AND s.trigger_type IN (${FULL_SWEEP_TRIGGERS.map(t => `'${t}'`).join(', ')})
+                        AND COALESCE(s.initiated_at, s.created_at) > COALESCE($2::timestamptz, NOW()))))
         ORDER BY i.transferred_at, i.created_at, i.id
           FOR UPDATE OF i`,
-      [o.connectAccountId, o.payoutAt ?? null, lastSweep])).rows
+      [o.connectAccountId, o.payoutAt ?? null, lastSweep, fullSweep, o.disbursementId])).rows
     // A webhook may already have filed this payout and linked part of it.
     const already = cents((await c.query<{ s: string }>(
       `SELECT COALESCE(SUM(amount), 0)::text AS s FROM platform_transfer_intents WHERE disbursement_id = $1`,
       [o.disbursementId])).rows[0]?.s)
-    let room = cents(o.payoutAmount) - already
     const take: string[] = []
-    for (const w of waiting) {
-      const a = cents(w.amount)
-      if (a > room) break      // oldest first: a later transfer never jumps the queue
-      take.push(w.id)
-      room -= a
+    if (fullSweep) {
+      // The whole balance went: everything waiting went with it.
+      for (const w of waiting) take.push(w.id)
+    } else {
+      let room = cents(o.payoutAmount) - already
+      for (const w of waiting) {
+        const a = cents(w.amount)
+        if (a > room) break      // oldest first: a later transfer never jumps the queue
+        take.push(w.id)
+        room -= a
+      }
     }
+    let sources: string[] = []
     if (take.length) {
+      const fromLaterSweep = waiting.filter(w => w.disbursement_id && take.includes(w.id))
+      sources = [...new Set(fromLaterSweep.map(w => w.disbursement_id!))]
+      if (fromLaterSweep.length && !o.trial) {
+        logger.info({ disbursementId: o.disbursementId, intents: fromLaterSweep.map(w => w.id),
+                      from: [...new Set(fromLaterSweep.map(w => w.disbursement_id))] },
+          '[payout-composition] a dashboard payout filed late took back the transfers it carried from a later sweep')
+      }
+      // The rows are locked above; a link is only ever moved off a later sweep.
       await c.query(
         `UPDATE platform_transfer_intents SET disbursement_id = $1, updated_at = NOW()
-          WHERE id = ANY($2::uuid[]) AND disbursement_id IS NULL`,
+          WHERE id = ANY($2::uuid[]) AND disbursement_id IS DISTINCT FROM $1`,
         [o.disbursementId, take])
     }
     const total = cents((await c.query<{ s: string }>(
       `SELECT COALESCE(SUM(amount), 0)::text AS s FROM platform_transfer_intents WHERE disbursement_id = $1`,
       [o.disbursementId])).rows[0]?.s)
-    return { intentIds: take, transfersTotal: dollars(total), residual: dollars(cents(o.payoutAmount) - total) }
+    // Each sweep that gave transfers back, as it stands now.
+    const retied: PayoutTieOut[] = sources.length ? (await c.query<{ id: string; amount: string; linked: string }>(
+      `SELECT d.id, d.amount::text AS amount,
+              (SELECT COALESCE(SUM(i.amount), 0) FROM platform_transfer_intents i
+                WHERE i.disbursement_id = d.id)::text AS linked
+         FROM disbursements d WHERE d.id = ANY($1::uuid[]) ORDER BY d.id`, [sources])).rows.map(r => ({
+      disbursementId: r.id,
+      payoutAmount: dollars(cents(r.amount)),
+      transfersTotal: dollars(cents(r.linked)),
+      residual: dollars(cents(r.amount) - cents(r.linked)),
+    })) : []
+    return { intentIds: take, transfersTotal: dollars(total), residual: dollars(cents(o.payoutAmount) - total), retied }
   }
 
   let result: StampResult
@@ -185,19 +259,58 @@ export async function stampPayoutTransfers(o: {
     }
   }
 
-  if (result.residual !== 0 && o.notifyOnGap !== false) {
-    await createAdminNotification({
-      severity: 'warn',
-      category: 'payout_composition_gap',
-      title: `A ${money(o.payoutAmount)} payout does not equal the transfers inside it`,
-      body: `GAM traced ${money(result.transfersTotal)} of this payout to its own transfers; ` +
-        `${money(result.residual)} is ${result.residual > 0 ? 'not traced to any payment GAM moved' : 'in those transfers but not in this payout'}. ` +
-        'The landlord sees the gap as its own line on the payout. Check the Connect account’s balance history.',
-      context: { disbursementId: o.disbursementId, account: o.connectAccountId,
-                 payoutAmount: o.payoutAmount, transfersTotal: result.transfersTotal, residual: result.residual },
-    }).catch(e => logger.warn({ err: e }, '[payout-composition] gap notice failed'))
+  if (o.notifyOnGap !== false && !o.trial) {
+    // Best-effort: the links are committed; a notice that fails to send must
+    // never make the caller think the payout went unrecorded.
+    const standing: PayoutTieOut[] = [
+      { disbursementId: o.disbursementId, payoutAmount: o.payoutAmount,
+        transfersTotal: result.transfersTotal, residual: result.residual },
+      ...result.retied,
+    ]
+    for (const t of standing) {
+      try { await bringGapNoticeUpToDate(t, o.connectAccountId) }
+      catch (e) { logger.warn({ err: e, disbursementId: t.disbursementId }, '[payout-composition] gap notice failed') }
+    }
   }
   return result
+}
+
+/**
+ * The admin notice for a payout that does not equal its transfers. Exported so
+ * connectPayoutSync asks about the same category: a copy renamed on one side
+ * only would make it believe no admin was ever told, and every nightly sync
+ * would raise an acknowledged gap again.
+ */
+export const PAYOUT_GAP_NOTICE = 'payout_composition_gap'
+
+/**
+ * One open notice per payout, saying where it stands now. Ties out → any open
+ * notice is closed (acknowledged by nobody: GAM closed it itself). Still a
+ * gap → the open notice stays if it already says this; otherwise it is closed
+ * and a fresh one raised with the current numbers.
+ */
+async function bringGapNoticeUpToDate(t: PayoutTieOut, account: string): Promise<void> {
+  const open = await query<{ id: string; residual: string | null }>(
+    `SELECT id, context->>'residual' AS residual FROM admin_notifications
+      WHERE category = $1 AND acknowledged_at IS NULL AND context->>'disbursementId' = $2`,
+    [PAYOUT_GAP_NOTICE, t.disbursementId])
+  if (t.residual !== 0 && open.length === 1 && cents(open[0].residual) === cents(t.residual)) return
+  if (open.length) {
+    await query(
+      `UPDATE admin_notifications SET acknowledged_at = NOW()
+        WHERE id = ANY($1::uuid[]) AND acknowledged_at IS NULL`, [open.map(n => n.id)])
+  }
+  if (t.residual === 0) return
+  await createAdminNotification({
+    severity: 'warn',
+    category: PAYOUT_GAP_NOTICE,
+    title: `A ${money(t.payoutAmount)} payout does not equal the transfers inside it`,
+    body: `GAM traced ${money(t.transfersTotal)} of this payout to its own transfers; ` +
+      `${money(t.residual)} is ${t.residual > 0 ? 'not traced to any payment GAM moved' : 'in those transfers but not in this payout'}. ` +
+      'The landlord sees the gap as its own line on the payout. Check the Connect account’s balance history.',
+    context: { disbursementId: t.disbursementId, account,
+               payoutAmount: t.payoutAmount, transfersTotal: t.transfersTotal, residual: t.residual },
+  })
 }
 
 export interface PayoutPaymentLine {

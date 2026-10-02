@@ -18,7 +18,8 @@
  */
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
-import { MIGRATION_WINDOW_DAYS } from '@gam/shared'
+import { MIGRATION_WINDOW_DAYS, ONBOARDING_LATE_MONTH_DAY, ONBOARDING_FIRST_BILL_NEAR_DAYS } from '@gam/shared'
+import { todayIn, addDaysTo } from '../lib/timezone'
 import type { PoolClient } from 'pg'
 
 export const ONBOARDING_WINDOW_BASE_DAYS = 14
@@ -113,6 +114,43 @@ export interface PropertyOnboardingWindow extends OnboardingWindowState {
   propertyName: string
   /** S648: waive late fees on each existing resident's first bill? null = not answered (no waiver). */
   lateFeeWaiver: boolean | null
+  /** S655: people in this property's tenant-CSV draft roster not confirmed yet. */
+  draftRosterCount: number
+  /**
+   * S655 (Nic, 10/2): onboarding late in the month — after the 20th in the
+   * property's own calendar, or its next rent due day is close. The late-fee
+   * question is flagged prominently then, because residents who take a few
+   * days to sign up land straight on a first bill.
+   */
+  lateInMonth: boolean
+  /** The property's next fixed rent due date (YYYY-MM-DD), when it bills on one fixed day. */
+  nextRentDueDate: string | null
+}
+
+/**
+ * S655: is it late in the month for onboarding at this property? Pure, so the
+ * rule is tested on its own: after ONBOARDING_LATE_MONTH_DAY in the property's
+ * calendar, or the next fixed due day is ONBOARDING_FIRST_BILL_NEAR_DAYS away
+ * or less. A property billing on each move-in day has no fixed bill date, so
+ * only the day-of-month half applies to it.
+ */
+export function onboardingLateInMonth(today: string, rentDueMode: string | null, rentDueDay: number | null):
+  { lateInMonth: boolean; nextRentDueDate: string | null } {
+  const dom = Number(today.slice(8, 10))
+  let next: string | null = null
+  if ((rentDueMode ?? 'fixed_day') === 'fixed_day') {
+    const day = Math.min(28, Math.max(1, Number(rentDueDay ?? 1)))
+    const thisMonth = `${today.slice(0, 7)}-${String(day).padStart(2, '0')}`
+    if (thisMonth >= today) next = thisMonth
+    else {
+      const [y, m] = today.slice(0, 7).split('-').map(Number)
+      const ny = m === 12 ? y + 1 : y
+      const nm = m === 12 ? 1 : m + 1
+      next = `${ny}-${String(nm).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+    }
+  }
+  const near = next != null && next <= addDaysTo(today, ONBOARDING_FIRST_BILL_NEAR_DAYS)
+  return { lateInMonth: dom > ONBOARDING_LATE_MONTH_DAY || near, nextRentDueDate: next }
 }
 
 /** Window state for every property a landlord owns — powers the onboarding banner. */
@@ -127,10 +165,16 @@ export async function listOnboardingWindowsForLandlord(landlordIds: string[]): P
     onboarding_completed_at: string | null
     unit_count: number
     onboarding_late_fee_waiver: boolean | null
+    timezone: string | null
+    rent_due_mode: string | null
+    rent_due_day: number | null
+    draft_roster_count: number
   }>(
     `SELECT p.id, p.name, p.onboarding_started_at, p.onboarding_completed_at,
-            p.onboarding_late_fee_waiver,
-            (SELECT COUNT(*)::int FROM units u WHERE u.property_id = p.id) AS unit_count
+            p.onboarding_late_fee_waiver, p.timezone, p.rent_due_mode, p.rent_due_day,
+            (SELECT COUNT(*)::int FROM units u WHERE u.property_id = p.id) AS unit_count,
+            (SELECT COUNT(*)::int FROM tenant_roster_drafts r
+              WHERE r.property_id = p.id AND r.confirmed_at IS NULL AND r.discarded_at IS NULL) AS draft_roster_count
        FROM properties p WHERE p.landlord_id = ANY($1::uuid[])
        ORDER BY p.created_at DESC`,
     [landlordIds],
@@ -150,7 +194,9 @@ export async function listOnboardingWindowsForLandlord(landlordIds: string[]): P
       open = Date.now() < until.getTime()
       daysRemaining = open ? Math.ceil((until.getTime() - Date.now()) / DAY_MS) : 0
     }
-    return { returningAllowanceLeft: left.get(r.id) ?? 0, propertyId: r.id, propertyName: r.name, open, startedAt, until, completedAt, windowDays, unitCount, daysRemaining, lateFeeWaiver: r.onboarding_late_fee_waiver }
+    const late = onboardingLateInMonth(todayIn(r.timezone), r.rent_due_mode, r.rent_due_day)
+    return { returningAllowanceLeft: left.get(r.id) ?? 0, propertyId: r.id, propertyName: r.name, open, startedAt, until, completedAt, windowDays, unitCount, daysRemaining, lateFeeWaiver: r.onboarding_late_fee_waiver,
+             draftRosterCount: r.draft_roster_count ?? 0, lateInMonth: late.lateInMonth, nextRentDueDate: late.nextRentDueDate }
   })
 }
 
@@ -203,10 +249,10 @@ export async function applyReturningResidentWaive(opts: {
   const a = await returningResidentAllowance(opts.propertyId)
   if (a.left <= 0) throw new AppError(409, RETURNING_ALLOWANCE_USED_MESSAGE)
   // The waiver lives on THIS company's record only — see recordWaiver.
-  if (!(await recordWaiver(opts, 'returning_resident'))) {
-    throw new AppError(409, WAIVER_NOT_RECORDED_MESSAGE)
-  }
-  return { waived: true, used: a.used + 1, allowance: a.allowance }
+  const rec = await recordWaiver(opts, 'returning_resident')
+  if (!rec) throw new AppError(409, WAIVER_NOT_RECORDED_MESSAGE)
+  // A waiver the account already held is not a new use of the allowance.
+  return { waived: true, used: a.used + (rec === 'recorded' ? 1 : 0), allowance: a.allowance }
 }
 
 export async function applyScreeningWaive(opts: {
@@ -267,7 +313,7 @@ export async function applyScreeningWaive(opts: {
 async function recordWaiver(
   opts: { tenantId: string; landlordId: string; propertyId: string; unitId: string; byUserId: string },
   waiveReason: 'returning_resident' | null,
-): Promise<boolean> {
+): Promise<'recorded' | 'held_by_account' | false> {
   try {
     await query(
       `INSERT INTO pending_tenant_intents
@@ -287,12 +333,27 @@ async function recordWaiver(
          updated_at = NOW()`,
       [opts.landlordId, opts.tenantId, opts.propertyId, opts.byUserId, opts.unitId, waiveReason],
     )
-    return true
+    return 'recorded'
   } catch (e: any) {
     // 23505 = the person's live no-unit row belongs to another company and the
-    // old tenant-only index still stands. Refuse rather than touch their row.
-    if (e?.code === '23505') return false
-    throw e
+    // old tenant-only index still stands (until the post-deploy step drops
+    // it). Their row is never touched.
+    if (e?.code !== '23505') throw e
+    // S655: a SISTER company — another company of the same account (Oak Park
+    // and Mountain View) — whose row already carries a waiver is this
+    // account's waiver: every reader counts it for the whole account
+    // (screeningWaivedByAccountSql). Refusing here sent a returning resident
+    // at the other park to "contact GAM support" for a waiver the account
+    // already holds. Anything else (another account, or a sister row with no
+    // waiver on it) is still refused.
+    const held = await queryOne<{ one: number }>(
+      `SELECT 1 AS one FROM pending_tenant_intents
+        WHERE tenant_id = $1 AND unit_id IS NULL AND cancelled_at IS NULL
+          AND screening_waived = true
+          AND landlord_id IN (SELECT public.account_companies($2::uuid))
+        LIMIT 1`,
+      [opts.tenantId, opts.landlordId])
+    return held ? 'held_by_account' : false
   }
 }
 

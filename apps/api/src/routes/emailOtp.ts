@@ -27,6 +27,9 @@ import { emailLoginCode } from '../services/email'
 import { logger } from '../lib/logger'
 import { signSessionToken, policyOfPass } from '../lib/sessionToken'
 import { claimInvitationsOnProvenAddress } from '../services/coOwnerInvites'
+// Circular with routes/auth.ts (which imports this file), same as
+// routes/totp.ts: used only inside a handler, never at load.
+import { assertPassPostdatesPasswordChange } from './auth'
 import type { SessionPolicy } from '@gam/shared'
 
 export const emailOtpRouter = Router()
@@ -114,12 +117,50 @@ function readPendingSession(token: string): EmailOtpClaims & { purpose: string }
   return session
 }
 
+/**
+ * S655: the account behind a pending pass, refused (401) when the pass was
+ * minted before the password last changed. A password change ends every pass
+ * minted before it (routes/auth.ts), and the code step turns a pending pass into
+ * a full one, so a pending pass must not outlive a password change either.
+ *
+ * Both /verify and /resend run this BEFORE touching the live code. /verify:
+ * a dead pass neither spends nor counts against the code the real person is
+ * about to type. /resend: a dead pass cannot retire that code and mail a new one
+ * (it could otherwise keep cancelling the real person's code, once a click).
+ *
+ * Whole-second precision: tenant invite activation stamps sessions_valid_from
+ * and mints this pass in the same request (routes/tenants.ts accept-invite).
+ *
+ * The pass is also bound to the login address it was minted for, the same way
+ * it is bound to the password. Every minting site copies users.email into the
+ * pass, and the code /login mailed went to that address. If the login address
+ * has changed since (a confirmed change of email, or a landlord correcting a
+ * resident's mistyped address, which also drops email_verified and kills every
+ * other key mailed to the old address), that code proves the OLD inbox, so it
+ * must not mark the new address verified or start a session naming it. The
+ * person signs in again and the code goes to the address they have now.
+ * Compared case-insensitively, as login matches addresses.
+ */
+async function liveAccountForPendingPass(
+  session: EmailOtpClaims & { purpose: string },
+): Promise<{ email: string }> {
+  const account = await queryOne<{ email: string; sessions_valid_from: Date | null }>(
+    `SELECT email, sessions_valid_from FROM users WHERE id = $1`, [session.userId])
+  if (!account) throw new AppError(401, 'Invalid sign-in session.')
+  assertPassPostdatesPasswordChange(session, account.sessions_valid_from, { wholeSecond: true })
+  if (String(account.email ?? '').toLowerCase() !== String(session.email ?? '').toLowerCase()) {
+    throw new AppError(401, 'Your sign-in email changed. Please sign in again.')
+  }
+  return account
+}
+
 // POST /api/auth/email-otp/verify
 emailOtpRouter.post('/verify', async (req, res, next) => {
   try {
     const { emailOtpSession, code } = verifySchema.parse(req.body)
     const session = readPendingSession(emailOtpSession)
     const userId = session.userId
+    const account = await liveAccountForPendingPass(session)
 
     const otp = await queryOne<{
       id: string; code_hash: string; expires_at: string; attempts: number
@@ -180,10 +221,13 @@ emailOtpRouter.post('/verify', async (req, res, next) => {
       }
     }
 
+    // The login address as stored (liveAccountForPendingPass has already
+    // refused a pass minted for a different one), so the pass and the user
+    // object name the same address /auth/me will.
     const token = signSessionToken({
       userId:      session.userId,
       role:        session.role,
-      email:       session.email,
+      email:       account.email,
       profileId:   session.profileId,
       landlordId:  session.landlordId ?? null,
       landlordIds,
@@ -196,7 +240,7 @@ emailOtpRouter.post('/verify', async (req, res, next) => {
       data: {
         token,
         user: {
-          id: session.userId, email: session.email, role: session.role,
+          id: session.userId, email: account.email, role: session.role,
           profileId: session.profileId, landlordId: session.landlordId ?? null,
           permissions: session.permissions ?? null,
         },
@@ -210,7 +254,12 @@ emailOtpRouter.post('/resend', async (req, res, next) => {
   try {
     const { emailOtpSession } = z.object({ emailOtpSession: z.string() }).parse(req.body)
     const session = readPendingSession(emailOtpSession)
-    await issueEmailOtp(session.userId, session.email)
+    const account = await liveAccountForPendingPass(session)
+    // The code goes to the account's login address as stored (see GET /status
+    // below), the same address /login mails. liveAccountForPendingPass has
+    // already refused a pass minted for a different address, so this differs
+    // from the pass's copy at most in letter case.
+    await issueEmailOtp(session.userId, account.email)
     res.json({ success: true })
   } catch (e) { next(e) }
 })

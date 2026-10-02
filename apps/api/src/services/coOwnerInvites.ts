@@ -154,12 +154,29 @@ export async function acceptCoOwnerInvitation(
  * attached to a company without their consent, and those people accept from
  * the link while signed in.
  *
+ * S655: ONLY THE ADDRESS'S FIRST PROOF CLAIMS. The registration that the claim
+ * stands in for ends at the first proof; every later sign-in is an ordinary
+ * sign-in, and ordinary sign-ins attach nobody. The created_at limit below is
+ * not enough on its own: re-sending an invitation refreshes its row in place
+ * (new token and expiry, same created_at), so a lapsed invitation that predates
+ * a company-less login came back to life on a re-send and that login's next
+ * ordinary code sign-in accepted it — owner row, invitation marked accepted,
+ * the inviter written in as referrer — without the link ever being opened.
+ * After the first proof, every invitation is accepted the S654 way: from its
+ * link, while signed in.
+ *
+ * (Local dev auto-verifies the address at /register, so there the first code
+ * is not a first proof and an invited signup accepts from the link. Production
+ * and the demo API run with NODE_ENV=production and always verify at the
+ * code.)
+ *
  * Returns the ids of the companies the account gained. Runs in its own
  * transaction; callers treat a failure as non-fatal (the link still works).
  */
 export async function claimInvitationsOnProvenAddress(
   userId: string, opts: { firstVerification: boolean },
 ): Promise<string[]> {
+  if (!opts.firstVerification) return []
   const client = await db.connect()
   try {
     await client.query('BEGIN')
@@ -191,7 +208,7 @@ export async function claimInvitationsOnProvenAddress(
     for (const inv of invites) await acceptCoOwnerInvitation(client, inv, userId)
     let gained = invites.map(i => i.landlord_id)
 
-    const laterInviteWaiting = gained.length === 0 && opts.firstVerification
+    const laterInviteWaiting = gained.length === 0
       && (await client.query(
         `SELECT 1 FROM landlord_member_invitations
           WHERE LOWER(email) = LOWER($1)
@@ -199,7 +216,7 @@ export async function claimInvitationsOnProvenAddress(
             AND expires_at > now()
           LIMIT 1`, [user.email])).rows.length > 0
 
-    if (gained.length === 0 && opts.firstVerification && !laterInviteWaiting) {
+    if (gained.length === 0 && !laterInviteWaiting) {
       // S567: who referred this person was recorded on the account at signup
       // (users.referred_by_user_id). A landlord's code makes them the
       // referrer; a rep's code makes the rep the closing manager.

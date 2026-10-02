@@ -1735,6 +1735,14 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
             l.end_date IS NOT NULL
             AND l.end_date <= CURRENT_DATE + (l.expiration_notice_days || ' days')::interval
             AND l.end_date >= CURRENT_DATE
+            -- S655: nothing to decide once the landlord has signed a new lease
+            -- to follow it — the household stays on that one. (It used to fall
+            -- back to "Lease expiring — decide: renew or not" right after a
+            -- renewal was signed by everyone.)
+            AND NOT EXISTS (
+              SELECT 1 FROM leases s
+               WHERE s.supersedes_lease_id = l.id AND s.status IN ('pending', 'active')
+                 AND s.signed_by_landlord = TRUE)
           )
         )
       ORDER BY
@@ -1761,7 +1769,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         subtitle: (l.days_remaining != null ? l.days_remaining + ' days' : 'Soon')
           + ' remaining — ' + tenantName + '. '
           + (l.renewal_in_progress
-              ? 'Renewal lease drafted — open it to finish signing.'
+              ? 'New lease drafted — open it to finish signing.'
               : 'Decide: renew or not.'),
         // W-7 (S531): opens the renewal decision form, not the lease editor.
         // S534: the same form opens the in-flight draft directly when one exists.
@@ -2232,10 +2240,11 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
       autoRenew, autoRenewMode, noticeDaysRequired,
     } = req.body
 
-    // --- Required fields ---
-    if (!firstName || !lastName || !email || !phone) {
-      throw new AppError(400, 'firstName, lastName, email, phone required')
+    // --- Required fields --- S629: phone is optional on every resident door.
+    if (!firstName || !lastName || !email) {
+      throw new AppError(400, 'Add their first name, last name and email.')
     }
+    const phoneOrNull = String(phone ?? '').trim() || null
     if (!unitId) throw new AppError(400, 'unitId required')
     if (!leaseStart) throw new AppError(400, 'leaseStart required')
     if (monthlyRent === undefined || monthlyRent === null || monthlyRent === '') {
@@ -2288,27 +2297,57 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
     // existing lease instead), by_room allows independent leases up to 2×bedrooms.
     await assertUnitCanAcceptNewLease(client, unitId)
 
-    // --- Cross-landlord conflict check ---
     // S654: any letter case; a non-resident login is refused (409).
     const existingUser = await findResidentAccount(emailNorm)
-    if (existingUser?.tenant_id) {
-      // Check if this tenant has an active lease with a DIFFERENT landlord.
-      const otherLease = await queryOne<any>(
-        `SELECT l.landlord_id FROM lease_tenants lt
-         JOIN leases l ON l.id = lt.lease_id
-         WHERE lt.tenant_id = $1 AND lt.status='active' AND l.status='active' AND l.landlord_id != $2
-         LIMIT 1`,
-        [existingUser.tenant_id, landlordId]
-      )
-      if (otherLease) {
-        throw new AppError(409, 'This email is already a tenant of another landlord. Cross-landlord onboarding requires a separate flow.')
-      }
-    }
     // S654: another company's resident (or e-sign signer) is never handed a
     // fresh password link.
     const tiedElsewhere = existingUser
       ? await accountTiedElsewhere(existingUser.id, [landlordId, ...landlordScopeIds(req.user!)])
       : false
+
+    // S655 (Nic, 10/2): "Imports are NEVER blocked" — and nobody is attached
+    // to a company without their OWN signature. This used to refuse an active
+    // tenant of another landlord and silently attach everyone else another
+    // company had on file (an invitee, a neighbor on its utilities) to an
+    // active lease billing in their name. Now that person's paper lease becomes
+    // a lease sent to them to sign: drafted from this landlord's setup, waiting
+    // for his signature, and starting when THEY sign.
+    if (existingUser && tiedElsewhere) {
+      const sent = await inviteHouseholdToNewLease({
+        unitId: unit.id,
+        people: [{ firstName, lastName, email: emailNorm, phone: phoneOrNull }],
+        authorize: () => {},   // checked above: this unit is the account's
+        ownCompanies: landlordScopeIds(req.user!),
+        byUserId: req.user!.userId,
+        existingResident: true,
+        source: 'import',
+      })
+      const person = sent.people[0]
+      const who = `${String(firstName).trim()} ${String(lastName).trim()}`.trim()
+      // Each draftBlocked reason already ends with how it gets drafted ("…Set
+      // one in E-Sign, then it drafts on its own."), so it is said once, as it
+      // reads, and only the step after it is added.
+      const blockedWhy = sent.draftBlocked[0] ?? `The lease for Unit ${unit.unit_number} is not ready to draft yet.`
+      // The usual invite went instead (inviteHouseholdToNewLease's fallback):
+      // say what actually reached them, and say so when nothing did.
+      const reached = person.notified === 'notice' ? ' They were sent a notice in their GAM account that you added them.'
+        : person.notified === 'email' ? ' They were sent an email to set up their account.'
+        : ' Nothing has reached them yet; they get one email once you sign it.'
+      return res.json({ success: true, data: {
+        sentToSign: true, userId: person.userId, tenantId: person.tenantId, leaseId: null,
+        email: person.email, unitId: sent.unitId, alreadyOnPlatform: true,
+        draftedDocumentIds: sent.draftedDocumentIds, draftBlocked: sent.draftBlocked,
+        // The order is S647's: drafted now, the landlord signs, then their one
+        // email. Said truthfully when the lease could not draft.
+        message: sent.draftedDocumentIds.length > 0
+          ? `${who} already has a GAM account with another company, so they sign this lease themselves. ` +
+            `It is drafted from your setup for Unit ${unit.unit_number} (the unit's rent and default lease, not the paper's terms; check them when you sign) ` +
+            `and is waiting for your signature in Front Desk. Once you sign, they get one email to sign it, and it starts when they do. Nothing is billed before then.`
+          : `${who} already has a GAM account with another company, so they sign this lease themselves, but it could not be drafted yet. ` +
+            `${blockedWhy} Once it is drafted, sign it in Front Desk.${reached}`,
+        fallbackSent: sent.fallbackSent,
+      } })
+    }
 
     // --- Lease type inference ---
     const leaseType = leaseEnd ? 'fixed_term' : 'month_to_month'
@@ -2326,7 +2365,7 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
         `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
          VALUES ($1, $2, 'tenant', $3, $4, $5)
          RETURNING id`,
-        [emailNorm, tempHash, firstName, lastName, phone]
+        [emailNorm, tempHash, firstName, lastName, phoneOrNull]
       )
       userId = u.rows[0].id
     }
@@ -2465,9 +2504,10 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
         tenantId,
         leaseId,
         email: emailNorm,
-        // S654: the link comes back only for an account this call created;
-        // anyone else's goes only to their own inbox.
-        activationUrl: existingUser ? null : activationUrl,
+        // S655 (Nic, 10/2): invites are email-only. A setup link sets the
+        // account's password, so it goes only to the person's own address and
+        // never comes back on anyone's screen — not even for an account this
+        // call just made.
         // S616: so the screen never says "invite sent" when what happened was
         // a lease drafted for someone who already has a login.
         alreadyOnPlatform,
@@ -2491,424 +2531,109 @@ landlordsRouter.get('/me/onboarding-windows', requireLandlord, async (req, res, 
   } catch (e) { next(e) }
 })
 
-// S652 (Nic): "they let their due date be whenever they come in." The day this
-// household's rent is due, stated on the invite. Absent or blank = follow the
-// property's rule; anything else must be a real day a lease can carry (1–28).
-function inviteRentDueDay(body: any): number | null {
-  const v = body?.rentDueDay
-  if (v == null || v === '') return null
-  const n = Number(v)
-  if (!Number.isInteger(n) || n < 1 || n > 28) {
-    throw new AppError(400, 'The rent due day has to be between the 1st and the 28th.')
-  }
-  return n
-}
-
 // POST /api/landlords/me/onboard-new-lease-tenant (S558, Flow B — new lease)
-// Invite a person to a UNIT for a lease they will SIGN (vs onboard-tenant, which
-// migrates an already-signed paper lease). Unit-linked invite: the unit rides on
-// pending_tenant_intents.unit_id, so on accept the lease auto-drafts pre-filled
-// from the unit + its default template. NO lease row is created here — the
-// SIGNED e-sign document becomes the lease (lease-is-law). Co-tenants: call
-// again for the same unit before anyone signs (whole_unit) or per person up to
-// the 2×bedrooms cap (by_room). Adding a co-tenant voids any unsigned draft so
-// the roster re-drafts complete.
+// Invite a household to a UNIT for a lease they will SIGN (vs onboard-tenant,
+// which migrates an already-signed paper lease). NO lease row is created here —
+// the SIGNED e-sign document becomes the lease (lease-is-law).
+//
+// S655: one function does this for every door now (services/newLeaseInvite):
+// the people get an account and a unit-bound invite, the household's lease
+// drafts at once and waits in "Waiting on you to sign", and nobody is emailed
+// until the landlord signs (S647). Send the whole household at once in
+// `people` — one draft, instead of a draft per person with the earlier ones
+// voided. One person in firstName/lastName/email still works.
+//
+// S629 (Nic): "I don't have everybody's phone number, just emails." Phone is
+// optional; the invite and the signature both travel by email.
 landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboard'), async (req, res, next) => {
-  const client = await getClient()
   try {
-    // S652 (Nic): "are you adding a home to the sale?" — asked on the invite for
-    // a park-owned home, carried on the intent so the packet drafts as a sale.
-    // S652 (Nic): the terms are typed on the contract at signing; the invite
-    // only says whether this household is buying the home. Numbers given here
-    // are kept as a prefill, nothing more.
-    const homeSaleTerms = req.body?.homeSale ? (typeof req.body.homeSale === 'object' ? req.body.homeSale : { selling: true }) : null
-    // S652: the packet as the landlord left it ticked on the invite.
-    const packageTemplateIds: string[] | null = Array.isArray(req.body?.packageTemplateIds)
-      ? req.body.packageTemplateIds.filter((t: any) => typeof t === 'string' && /^[0-9a-f-]{36}$/i.test(t)) : null
-    const { firstName, lastName, email, phone, unitId,
-            isWorkTrade, workTradeHoursTarget, workTradeDuties,
-            workTradeTracksHours } = req.body
-    // S629 (Nic): "I don't have everybody's phone number, just emails. Email has
-    // to be mandatory for the invite to work, I get that, and the electronic
-    // signature. Phone number, the tenant can update it on their contact
-    // information when they accept the portal invite."
-    //
-    // The invite and the signature both travel by EMAIL, so a phone number is
-    // not needed to onboard anyone — it was required here and nowhere else
-    // (users.phone has always been nullable). Demanding it blocked a landlord
-    // who had every address he needed from inviting a single tenant.
-    if (!firstName || !lastName || !email) throw new AppError(400, 'firstName, lastName and email are required')
-    if (!unitId) throw new AppError(400, 'unitId required')
-    const rentDueDay = inviteRentDueDay(req.body)
-    const emailNorm = String(email).trim().toLowerCase()
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) throw new AppError(400, 'Invalid email format')
-
-    // S633: the company is the one that owns the UNIT being onboarded into —
-    // derived from the unit, not from whichever company the session sat on.
-    // The old form compared the unit's landlord_id to `req.user.profileId` and
-    // 403'd when they differed, which is how an account that owns two companies
-    // was refused a unit it owns: signed into Oak Park, every Mountain View unit
-    // "belonged to another landlord". The ownership check is still here — it is
-    // just asked of the ACCOUNT now instead of one of its companies.
-    const unit = await queryOne<any>(
-      `SELECT u.id, u.unit_number, u.property_id, u.landlord_id, u.rent_amount, u.occupancy_mode,
-              p.name AS property_name, p.street1, p.city, p.state, p.zip
-         FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [unitId])
-    if (!unit) throw new AppError(404, 'Unit not found')
-    if (!canManageLandlordResource(req.user, unit.landlord_id)) {
-      throw new AppError(403, 'That unit is not yours to onboard into.')
-    }
-    const landlordId: string = unit.landlord_id
-    // Gate: unit metrics (rent) must be set before inviting anyone to the unit.
-    if (unit.rent_amount == null || Number(unit.rent_amount) <= 0) {
-      throw new AppError(400, 'Set the unit’s rent before inviting a tenant to it.')
-    }
-    // S537: late-fee decision required for the unit's class before onboarding.
-    await assertLateFeeDecisionForUnit(unit.id)
-
-    // Cross-landlord conflict — refuse if this email is an active tenant elsewhere.
-    // S654: any letter case; a non-resident login is refused (409).
-    const existingUser = await findResidentAccount(emailNorm)
-    if (existingUser?.tenant_id) {
-      const otherLease = await queryOne<any>(
-        `SELECT l.landlord_id FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id
-          WHERE lt.tenant_id = $1 AND lt.status='active' AND l.status='active' AND l.landlord_id != $2 LIMIT 1`,
-        [existingUser.tenant_id, landlordId])
-      if (otherLease) throw new AppError(409, 'This email is already a tenant of another landlord. Cross-landlord onboarding requires a separate flow.')
-    }
-    // S654: another company's resident (or e-sign signer) is never handed a
-    // fresh password link.
-    const tiedElsewhere = existingUser
-      ? await accountTiedElsewhere(existingUser.id, [landlordId, ...landlordScopeIds(req.user!)])
-      : false
-
-    await client.query('BEGIN')
-
-    // Occupancy-mode cap (whole_unit → 1 lease; by_room → 2×bedrooms leases).
-    await assertUnitCanAcceptNewLease(client, unitId)
-
-    // whole_unit repair: a new co-tenant invalidates any UNSIGNED draft for the
-    // unit (it's missing this person). Void it so the roster re-drafts complete
-    // on accept; block if a TENANT already signed (legally must supersede).
-    if (unit.occupancy_mode !== 'by_room') {
-      const draft = await client.query(
-        `SELECT draft_document_id FROM pending_tenant_intents
-          WHERE unit_id=$1 AND resolved_at IS NULL AND cancelled_at IS NULL AND draft_document_id IS NOT NULL LIMIT 1`,
-        [unitId]).then((r: any) => r.rows[0])
-      if (draft?.draft_document_id) {
-        const tenantSigned = await client.query(
-          `SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND signed_at IS NOT NULL AND role NOT IN ('landlord','witness') LIMIT 1`,
-          [draft.draft_document_id]).then((r: any) => r.rows[0])
-        if (tenantSigned) throw new AppError(409, 'A tenant has already signed the lease for this unit — void or supersede it before adding another person.')
-        // S647: YOUR signature counts too now. Since issuance, the landlord
-        // signing is what creates the lease and bills it — so voiding that
-        // document to re-draft with an extra person would orphan a live lease
-        // and its invoice. Same answer as a tenant signature: add them by
-        // addendum instead.
-        const issued = await client.query(
-          `SELECT 1 FROM lease_documents WHERE id=$1 AND issued_at IS NOT NULL`,
-          [draft.draft_document_id]).then((r: any) => r.rows[0])
-        if (issued) throw new AppError(409, 'You have already signed the lease for this unit, so it is live and billing. Add this person with an addendum instead.')
-        await client.query(`UPDATE lease_documents SET status='voided', updated_at=NOW() WHERE id=$1 AND status NOT IN ('completed','voided')`, [draft.draft_document_id])
-        await client.query(`UPDATE pending_tenant_intents SET draft_document_id=NULL, updated_at=NOW() WHERE unit_id=$1 AND draft_document_id=$2`, [unitId, draft.draft_document_id])
-      }
-    }
-
-    // User (create or reuse).
-    let userId: string
-    if (existingUser) {
-      userId = existingUser.id
+    const { unitId } = req.body ?? {}
+    if (!unitId || typeof unitId !== 'string') throw new AppError(400, 'Pick the unit they are moving into.')
+    // One person up top, the whole household in `people`, or both (the agent
+    // names the lease holder up top and everyone moving in with them in
+    // `people`): the person named up top holds the lease and is never dropped.
+    // Wherever `people` repeats them, they come FIRST (the holder), once — a
+    // repeat at people[1] made them a co-tenant. Anything left blank up top is
+    // filled from their own entry in the list. A name up top with no email is
+    // refused, never silently left out.
+    const top = { firstName: req.body?.firstName, lastName: req.body?.lastName, email: req.body?.email, phone: req.body?.phone }
+    const listed: any[] = Array.isArray(req.body?.people) ? req.body.people : []
+    const emailKey = (p: any) => String(p?.email ?? '').trim().toLowerCase()
+    const blank = (v: unknown) => String(v ?? '').trim() === ''
+    let people: any[]
+    if (listed.length === 0) {
+      people = [top]
+    } else if (emailKey(top)) {
+      const same = listed.find(p => emailKey(p) === emailKey(top))
+      const fill = (k: 'firstName' | 'lastName' | 'email' | 'phone') => (same && blank(top[k]) ? same[k] : top[k])
+      people = [{ firstName: fill('firstName'), lastName: fill('lastName'), email: top.email, phone: fill('phone') },
+                ...listed.filter(p => emailKey(p) !== emailKey(top))]
     } else {
-      const u = await client.query(
-        `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
-         VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', $2, $3, $4) RETURNING id`,
-        // S629: an empty string is not a phone number. Store NULL so the
-        // tenant's own contact form shows it as blank and asks for it, rather
-        // than looking like they already gave one.
-        [emailNorm, firstName, lastName, (phone ?? '').trim() || null])
-      userId = u.rows[0].id
+      const topName = [top.firstName, top.lastName].map(v => String(v ?? '').trim()).filter(Boolean).join(' ')
+      if (topName) throw new AppError(400, `Add an email for ${topName}.`)
+      people = listed
     }
-
-    // S616 (Nic): ALREADY ON THE PLATFORM — skip the invite entirely.
-    //
-    //   "When a landlord is onboarding a property and goes to send an invite and
-    //    lease to that person, it needs to be intercepted in the server that
-    //    that person already is on the platform. And instead of giving them the
-    //    tenant portal invite, it just drafts up the lease."
-    //
-    // The neighbor who has been paying for trash and electric for months
-    // already has a GAM login. This route reused their user row and then
-    // unconditionally issued a fresh invite token and mailed them "activate
-    // your account and set a password" — for an account they already use. If
-    // they followed it they would overwrite their working password, and the
-    // landlord would be told an invite was sent when what was needed was a
-    // lease.
-    //
-    // "Already on the platform" means they have finished setting up: a real
-    // password rather than the placeholder this route writes for a brand-new
-    // row. An invite that was sent but never accepted still needs re-sending.
-    // S654: an account tied to another company counts as on GAM too; the
-    // link that company sent stays the only one.
-    const activatedRow = await client.query<{ activated: boolean }>(
-      `SELECT password_hash <> '$2b$10$placeholder_invite_pending' AS activated
-         FROM users WHERE id = $1`, [userId])
-    const alreadyOnPlatform = activatedRow.rows[0]?.activated === true || tiedElsewhere
-
-    // Only mint an invite for someone who actually needs one. Issuing a token
-    // to an established account is what makes the "set a password" mail
-    // possible in the first place.
-    let inviteToken: string | null = null
-    if (!alreadyOnPlatform) {
-      inviteToken = require('crypto').randomBytes(32).toString('hex')
-      await client.query(
-        `UPDATE users SET tenant_invite_token=$1, tenant_invite_expires_at=NOW()+INTERVAL '7 days', updated_at=NOW() WHERE id=$2`,
-        [inviteToken, userId])
-    }
-
-    // Tenant (create or reuse).
-    let tenantId: string
-    const existingTenant = await client.query('SELECT id FROM tenants WHERE user_id=$1', [userId])
-    if (existingTenant.rows.length) {
-      tenantId = existingTenant.rows[0].id
-      await client.query(`UPDATE tenants SET onboarding_source='onboarded' WHERE id=$1 AND onboarding_source != 'onboarded'`, [tenantId])
-    } else {
-      const t = await client.query(`INSERT INTO tenants (user_id, onboarding_source) VALUES ($1, 'onboarded') RETURNING id`, [userId])
-      tenantId = t.rows[0].id
-    }
-
-    // Unit-bound intent (the roster slot). At most one LIVE intent per tenant
-    // (partial unique on tenant_id WHERE cancelled_at IS NULL). Re-inviting a
-    // tenant whose only prior intent was cancelled inserts a FRESH row — the
-    // cancelled one is retained as history and falls outside the arbiter; a
-    // tenant with an existing live intent updates it back to open on this unit.
-    // S629 (Nic): conflicts on (tenant, UNIT), not on the tenant alone.
-    //
-    // It used to key on tenant_id and DO UPDATE SET unit_id = EXCLUDED.unit_id,
-    // so inviting somebody to a second spot MOVED their existing invite off the
-    // first one. A person with two spots ended up with one lease and no sign
-    // that an invite had been lost. Re-inviting to the SAME unit still reopens
-    // that invite, which is the behavior this clause was written for.
-    await client.query(
-      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, home_sale_terms, package_template_ids, rent_due_day)
-       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6)
-       ON CONFLICT (tenant_id, unit_id) WHERE cancelled_at IS NULL AND unit_id IS NOT NULL
-       DO UPDATE SET resolved_at=NULL, accepted_at=NULL, draft_document_id=NULL,
-                     home_sale_terms=EXCLUDED.home_sale_terms, package_template_ids=EXCLUDED.package_template_ids,
-                     rent_due_day=COALESCE(EXCLUDED.rent_due_day, public.pending_tenant_intents.rent_due_day), updated_at=NOW()`,
-      // S652: the home sale, the ticked packet and the due day are decided on the invite and ride on the intent.
-      [landlordId, tenantId, unitId, homeSaleTerms ? JSON.stringify(homeSaleTerms) : null, packageTemplateIds, rentDueDay])
-
-    await client.query('COMMIT')
-
-    // S579: this flow onboards a SITTING tenant (the page is explicitly "tenants
-    // who already live in your units"). If the landlord attests they're an
-    // existing resident AND the property's onboarding window is open, grandfather
-    // them past the background check (per-occupied-unit, audited); otherwise they
-    // screen like any new applicant. Post-commit, best-effort — a waive hiccup
-    // never rolls back the onboarding; the landlord can re-attest from the roster.
-    let screeningWaived = false
-    if (req.body?.existingResident === true) {
-      try {
-        const wr = await applyScreeningWaive({
-          tenantId, landlordId, propertyId: unit.property_id, unitId, byUserId: req.user!.userId,
-        })
-        screeningWaived = wr.waived
-      } catch (waiveErr) {
-        logger.error({ err: waiveErr, ctx: tenantId }, '[ONBOARD-NEW-LEASE] grandfather waive failed')
-      }
-    }
-
-    // S647 (Nic, DIRECTIVE): "I want to sign my side of the lease for everybody
-    // even before they accept the portal invite."
-    //
-    // Draft the lease NOW rather than on acceptance, so the household lands in
-    // "Waiting on you to sign" the moment it is invited. After the screening
-    // waive on purpose: the send path's screening gate needs to see it.
-    //
-    // Best-effort and post-commit, like everything around it. The invite is
-    // done and must not be undone by a template problem — and a draft that
-    // fails here still gets retried by the sweep and on acceptance, and the
-    // failure is surfaced to the landlord by autoDraftLeasesForUnit itself.
-    let draftedDocumentIds: string[] = []
-    const draftClient = await getClient()
-    try {
-      await draftClient.query('BEGIN')
-      const { autoDraftLeasesForUnit } = await import('../services/leaseOnboarding')
-      const { createDocumentRecord, autoSendDraftedDocument } = await import('./esign')
-      const out = await autoDraftLeasesForUnit(draftClient as any, unitId, createDocumentRecord)
-      await draftClient.query('COMMIT')
-      draftedDocumentIds = out.draftedDocumentIds
-      // After commit — the sender reads through the pool (S636).
-      for (const docId of draftedDocumentIds) {
-        await autoSendDraftedDocument(docId, { emailFirstSigner: false }).catch(err =>
-          logger.error({ err, docId }, '[ONBOARD-NEW-LEASE] send after invite-time draft failed'))
-      }
-    } catch (draftErr) {
-      await draftClient.query('ROLLBACK').catch(() => {})
-      logger.error({ err: draftErr, ctx: unitId }, '[ONBOARD-NEW-LEASE] invite-time draft failed')
-    } finally {
-      draftClient.release()
-    }
-
-    // S647 (Nic, DIRECTIVE): "When I type in a bunch of names to send invites
-    // to, it doesn't send them. It drafts up a bunch of leases for me to sign.
-    // After I sign it, they click the email, and acceptance and signing all
-    // becomes one flow."
-    //
-    // So when a lease WAS drafted, the tenant hears nothing yet. Their one email
-    // goes out when the landlord signs (the relay in routes/esign.ts, through
-    // services/tenantLeaseLink). Mailing the portal invite now is exactly how a
-    // resident ends up accepting an invite, finding no lease, and believing the
-    // acceptance was the signature.
-    //
-    // Only if drafting did NOT happen — the unit's template is missing or
-    // refused — does the old invite still go, so nobody is left with nothing.
-    // Accepting it retries the draft.
-    // S654: portalLink, never a localhost fallback (S641 rule).
-    const activationUrl = inviteToken ? portalLink('tenant', `accept-invite?token=${inviteToken}`) : null
-    if (draftedDocumentIds.length === 0) {
-      // Post-commit; a mail failure never rolls back the onboarding.
-      const landlord = await queryOne<any>(
-        `SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [landlordId])
-      const landlordName = landlord ? `${landlord.first_name} ${landlord.last_name}`.trim() : 'Your landlord'
-      const propertyAddress = [unit.street1, unit.city, unit.state, unit.zip].filter(Boolean).join(', ')
-      const unitLabel = `${unit.property_name} — Unit ${unit.unit_number}`
-      try {
-        if (alreadyOnPlatform) {
-          // S616: they have a login. Tell them a lease is waiting, in the account
-          // they already use — never "set a password".
-          const { createNotification } = await import('../services/notifications')
-          await createNotification({
-            userId,
-            landlordId,
-            type: 'lease_drafted',
-            title: `${landlordName} added a lease for ${unitLabel}`,
-            body: `A lease for ${propertyAddress} is ready for you to review and sign. Sign in as usual — you already have an account.`,
-            data: { unitId, tenantId },
-            actionUrl: '/lease',
-          })
-        } else {
-          // S654: to the address on the account.
-          await emailTenantOnboarded(existingUser?.email ?? emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl!, { landlordId, tenantId })
-        }
-      } catch (emailErr) {
-        // S654: never the activation link: it is a password-setting key.
-        logger.error({ err: emailErr, ctx: emailNorm }, '[ONBOARD-NEW-LEASE] notify failed for')
-      }
-    }
-
+    // S652 (Nic): "are you adding a home to the sale?" — only whether this
+    // household is buying the home; the terms are typed on the contract.
+    const homeSale = req.body?.homeSale ? (typeof req.body.homeSale === 'object' ? req.body.homeSale : { selling: true }) : null
+    const out = await inviteHouseholdToNewLease({
+      unitId,
+      people,
+      // S633: the company is the one that owns the UNIT, asked of the ACCOUNT.
+      authorize: (lid) => { if (!canManageLandlordResource(req.user, lid)) throw new AppError(403, 'That unit is not yours to onboard into.') },
+      ownCompanies: landlordScopeIds(req.user!),
+      byUserId: req.user!.userId,
+      existingResident: req.body?.existingResident === true,
+      rentDueDay: inviteRentDueDay(req.body),
+      homeSale,
+      packageTemplateIds: packetIds(req.body?.packageTemplateIds),
+      source: 'invite',
+    })
+    const first = out.people[0]
     // S616: the landlord is told which of the two actually happened, so the
     // screen never claims an invite was sent when a lease was drafted instead.
-    // S654: the link comes back only for an account this call created.
+    // S655: no setup link in the response, ever — email-only.
     res.json({ success: true, data: {
-      userId, tenantId, email: emailNorm, unitId, activationUrl: existingUser ? null : activationUrl,
-      screeningWaived, alreadyOnPlatform, draftedDocumentIds,
+      userId: first.userId, tenantId: first.tenantId, email: first.email, unitId: out.unitId,
+      screeningWaived: first.screeningWaived, alreadyOnPlatform: first.alreadyOnPlatform,
+      needsOwnSignature: first.needsOwnSignature,
+      draftedDocumentIds: out.draftedDocumentIds, draftBlocked: out.draftBlocked,
+      // When the lease could not draft, the people were sent the usual invite
+      // instead (a setup email, or a notice in the GAM account they already
+      // use) — so the screen and the agent never say nobody was contacted.
+      fallbackSent: out.fallbackSent,
+      people: out.people.map(p => ({
+        userId: p.userId, tenantId: p.tenantId, email: p.email, name: `${p.firstName} ${p.lastName}`.trim(),
+        alreadyOnPlatform: p.alreadyOnPlatform, screeningWaived: p.screeningWaived, needsOwnSignature: p.needsOwnSignature,
+        notified: p.notified,
+      })),
     } })
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {})
-    next(e)
-  } finally {
-    client.release()
-  }
+  } catch (e) { next(e) }
 })
 
 
 // ── ONBOARDING CSV (S29c) ────────────────────────────────────────────────
-// Two-endpoint pattern: /validate parses + reports issues without committing.
-// /commit takes the (potentially landlord-corrected) row set and inserts.
+// S655: the tenant CSV fills a DRAFT ROSTER the landlord reviews and confirms
+// per property; nothing is emailed and no account is made by the import.
+// /validate checks the file; /draft saves the roster; /commit and
+// /commit-pending are retired (410). The rules live in services/newLeaseInvite,
+// together with the one invite function confirming uses.
 
 type CsvIssue = { severity: 'block' | 'warn'; field?: string; message: string }
-type CsvRow = {
-  rowIndex: number
-  firstName: string
-  lastName: string
-  email: string
-  phone: string
-  propertyName: string
-  unitNumber: string
-  leaseStart: string
-  leaseEnd: string
-  monthlyRent: string
-  securityDeposit: string
-  lateFeeAmount: string
-  lateFeeGraceDays: string
-  autoRenew: string
-  autoRenewMode: string
-  noticeDaysRequired: string
-  outstandingBalance: string
-  resolvedUnitId?: string
-  // S294: source-platform columns that aren't canonical-mapped and
-  // aren't on the platform's noise list. Stored on the lease's
-  // import_extra_data JSONB at commit time. Original-case keys
-  // preserved for review-queue clarity.
-  extra?: Record<string, any>
-  issues: CsvIssue[]
-}
 
+// S655: the one invite function and the roster, shared with /tenants/invite
+// and the PDF import. A static import placed with the code that uses it.
+import {
+  inviteHouseholdToNewLease, findResidentAccount, inviteRentDueDay, packetIds,
+  reviewTenantCsv, saveRosterRows, missingLateFeeDecisions, rosterSummary, loadRoster,
+  updateRosterRow, discardRosterRow, confirmRoster, RosterNotReady,
+} from '../services/newLeaseInvite'
 
-// S654: who a tenant-CSV email already is on GAM: the account (any letter
-// case), its role, and whether its resident holds an active lease here or with
-// another landlord. Validate shows it; commit decides with it. Commit never
-// takes an account id from the browser: one landlord's own login was attached
-// to another landlord's lease that way, and its activation link mailed to a
-// stranger.
-type ImportAccount = {
-  userId: string; email: string; role: string; tenantId: string | null
-  activeHere: boolean; activeElsewhere: boolean
-}
-const TENANT_OF_ANOTHER_LANDLORD =
-  'This email is a tenant of another landlord. Cross-landlord onboarding requires a separate flow.'
-
-async function lookupImportAccounts(emails: string[], landlordId: string): Promise<Map<string, ImportAccount>> {
-  const out = new Map<string, ImportAccount>()
-  if (emails.length === 0) return out
-  // other_role: any second login on the same address that isn't a resident's
-  // refuses the row too, whichever account is picked.
-  const found = await query<any>(
-    `SELECT DISTINCT ON (LOWER(u.email))
-            LOWER(u.email) AS email_key, u.id AS user_id, u.email, u.role, t.id AS tenant_id,
-            MAX(CASE WHEN u.role <> 'tenant' THEN u.role END)
-              OVER (PARTITION BY LOWER(u.email)) AS other_role
-       FROM users u
-       LEFT JOIN tenants t ON t.user_id = u.id
-      WHERE LOWER(u.email) = ANY($1::text[])
-      ORDER BY LOWER(u.email), (u.email = LOWER(u.email)) DESC, u.created_at, t.created_at`,
-    [emails])
-  const leases = found.length === 0 ? [] : await query<{ user_id: string; here: boolean }>(
-    `SELECT DISTINCT t.user_id, (l.landlord_id = $2) AS here
-       FROM tenants t
-       JOIN lease_tenants lt ON lt.tenant_id = t.id
-       JOIN leases l ON l.id = lt.lease_id
-      WHERE t.user_id = ANY($1::uuid[]) AND lt.status = 'active' AND l.status = 'active'`,
-    [found.map(f => f.user_id), landlordId])
-  for (const f of found) {
-    out.set(f.email_key, {
-      userId: f.user_id, email: f.email, role: f.other_role ?? f.role, tenantId: f.tenant_id ?? null,
-      activeHere: leases.some(l => l.user_id === f.user_id && l.here),
-      activeElsewhere: leases.some(l => l.user_id === f.user_id && !l.here),
-    })
-  }
-  return out
-}
-
-// S654: the one account on this address, in any letter case, for the
-// single-resident onboarding routes. An exact match missed a mixed-case
-// account and made a second login on the same address. A login that isn't a
-// resident's (landlord, staff, admin, e-sign contact) is refused, not reused.
-async function findResidentAccount(emailNorm: string): Promise<{ id: string; email: string; tenant_id: string | null } | null> {
-  const found = await query<{ id: string; email: string; role: string; tenant_id: string | null }>(
-    `SELECT u.id, u.email, u.role, t.id AS tenant_id
-       FROM users u
-       LEFT JOIN tenants t ON t.user_id = u.id
-      WHERE LOWER(u.email) = $1
-      ORDER BY (u.email = LOWER(u.email)) DESC, u.created_at, t.created_at`,
-    [emailNorm])
-  if (found.some(f => f.role !== 'tenant')) throw new AppError(409, NOT_A_RESIDENT_ACCOUNT)
-  return found[0] ? { id: found[0].id, email: found[0].email, tenant_id: found[0].tenant_id } : null
-}
+const TENANT_CSV_IS_A_ROSTER =
+  'The tenant import now saves a draft roster for you to review. Upload the file again from Tenant Onboarding → Bulk CSV Import.'
 
 // ── PENDING TENANT INTENTS (S29c-2-A: limbo-state onboarding) ──────────
-// Landlord types name + email + phone, no lease info. Creates user (no
+// Landlord types name + email (phone if they have it), no lease info. Creates user (no
 // activation token, no email send) + tenant + intent row. The tenant sits
 // in the pending pool until the landlord uploads a lease PDF and the parser
 // builds a real lease from it. Activation email fires only at lease creation.
@@ -2942,9 +2667,11 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
             isWorkTrade, workTradeHoursTarget, workTradeDuties,
             workTradeTracksHours } = req.body
 
-    if (!firstName || !lastName || !email || !phone) {
-      throw new AppError(400, 'firstName, lastName, email, phone required')
+    // S629: phone is optional on every resident door; blank is stored as none.
+    if (!firstName || !lastName || !email) {
+      throw new AppError(400, 'Add their first name, last name and email.')
     }
+    const phoneOrNull = String(phone ?? '').trim() || null
 
     const emailNorm = String(email).trim().toLowerCase()
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
@@ -2967,22 +2694,13 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       ? await landlordIdForUnit(req.user!, String(unitId), query)
       : await landlordForRequest(req, 'invite')
 
-    // Cross-landlord conflict — same rule as /onboard-tenant. If this email is
-    // already an active tenant of a DIFFERENT landlord, refuse.
     // S654: any letter case; a non-resident login is refused (409).
+    // S655 (Nic, 10/2): imports are NEVER blocked because the person belongs
+    // to another company. Parking them here attaches them to nothing; when
+    // their lease PDF is built, a person another company has on file gets the
+    // lease to sign themselves (jobs/leaseParser/resolveIntent).
     const existingUser = await findResidentAccount(emailNorm)
     if (existingUser?.tenant_id) {
-      const otherLease = await queryOne<any>(
-        `SELECT l.landlord_id FROM lease_tenants lt
-         JOIN leases l ON l.id = lt.lease_id
-         WHERE lt.tenant_id = $1 AND lt.status='active' AND l.status='active' AND l.landlord_id != $2
-         LIMIT 1`,
-        [existingUser.tenant_id, landlordId]
-      )
-      if (otherLease) {
-        throw new AppError(409, 'This email is already a tenant of another landlord. Cross-landlord onboarding requires a separate flow.')
-      }
-
       // Same-landlord active lease check — they're already onboarded with us.
       const sameLandlordLease = await queryOne<any>(
         `SELECT l.id FROM lease_tenants lt
@@ -2998,9 +2716,15 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       // Existing pending intent for this tenant — refuse a duplicate. Landlord
       // should resume the existing one or cancel it first. A cancelled invite
       // (cancelled_at set) is retained but not blocking — re-invite is allowed.
+      // S655: only THIS account's invites. Another company's open invite is
+      // that company's business; telling this landlord it was "already in your
+      // pending pool" was both wrong and a leak.
       const existingIntent = await queryOne<any>(
-        `SELECT id FROM pending_tenant_intents WHERE tenant_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL LIMIT 1`,
-        [existingUser.tenant_id]
+        `SELECT id FROM pending_tenant_intents
+          WHERE tenant_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL
+            AND landlord_id IN (SELECT public.account_companies($2::uuid))
+          LIMIT 1`,
+        [existingUser.tenant_id, landlordId]
       )
       if (existingIntent) {
         throw new AppError(409, 'This person is already in your pending pool. Open the pending list to continue or remove them.')
@@ -3038,7 +2762,7 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       const u = await client.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
          VALUES ($1, $2, 'tenant', $3, $4, $5) RETURNING id`,
-        [emailNorm, tempHash, firstName, lastName, phone]
+        [emailNorm, tempHash, firstName, lastName, phoneOrNull]
       )
       userId = u.rows[0].id
     }
@@ -3060,8 +2784,12 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       tenantId = t.rows[0].id
     }
 
-    // 3. Intent row. UNIQUE(tenant_id) protects against races; on conflict we
-    // already returned 409 above, so this insert should always succeed here.
+    // 3. Intent row. The per-company unique indexes protect against races; on
+    // conflict we already returned 409 above. S655: until the post-deploy step
+    // drops the old tenant-only no-unit index, a person whose open no-unit row
+    // belongs to ANOTHER company collides with it here (23505) — answered in
+    // plain words below, never a 500.
+    await client.query('SAVEPOINT pending_intent')
     const intent = await client.query(
       `INSERT INTO pending_tenant_intents
          (landlord_id, tenant_id, parser_status, unit_id,
@@ -3081,7 +2809,13 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
        homeSaleTerms, packageTemplateIds,
        // S652: their own due day, when the landlord stated one.
        unitId ? rentDueDay : null]
-    )
+    ).catch(async (err: any) => {
+      if (err?.code !== '23505') throw err
+      await client.query('ROLLBACK TO SAVEPOINT pending_intent').catch(() => {})
+      // Plain words, and nothing about whose: another company's invite is that
+      // company's business.
+      throw new AppError(409, 'This person can\'t be added without a unit yet. Pick the unit they live in and add them again.')
+    })
 
     await client.query('COMMIT')
 
@@ -3113,7 +2847,7 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
         email: emailNorm,
         firstName,
         lastName,
-        phone,
+        phone: phoneOrNull,
         parserStatus: intent.rows[0].parser_status,
         createdAt: intent.rows[0].created_at,
         screeningWaived,
@@ -3128,184 +2862,13 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
 })
 
 
-// POST /api/landlords/me/onboard-tenants-csv/commit-pending
-// Limbo route for CSV onboarding. Frontend classifies rows post-validate:
-// rows with only lease-only blockers (rent, dates, unit) but valid identity
-// fields (name/email/phone) are sent here instead of /commit. Each row
-// becomes a user + tenant + pending_tenant_intent — no lease, no email send.
-//
-// Per-row processing with per-row transaction (NOT all-or-nothing). If row 47
-// fails, rows 1-46 are committed and visible in the pool. Result list mirrors
-// input order so frontend can map errors back to specific rows.
-//
-// Re-validates identity server-side regardless of frontend classification —
-// trust nothing from the client. Same conflict checks as /onboard-tenant-pending.
-landlordsRouter.post('/me/onboard-tenants-csv/commit-pending', requirePerm('tenants.create'), async (req, res, next) => {
-  const client = await getClient()
-  try {
-    const { rows } = req.body
-    if (!Array.isArray(rows) || rows.length === 0) {
-      throw new AppError(400, 'rows array required')
-    }
-
-    // S633: an import lands in ONE named company. The account says which —
-    // silently when it owns only one. This used to be whichever company the
-    // session sat on, which would have filed Mountain View's residents into Oak
-    // Park's books on a single wrong click, with nothing on screen naming the
-    // company the rows were going to.
-    const landlordId = await landlordForRequest(req, 'import')
-
-    type RowResult = {
-      rowIndex: number
-      email: string
-      status: 'created' | 'error'
-      intentId?: string
-      message?: string
-    }
-    const results: RowResult[] = []
-
-    for (const row of rows) {
-      const rowIndex = typeof row.rowIndex === 'number' ? row.rowIndex : -1
-      const firstName = String(row.firstName || '').trim()
-      const lastName  = String(row.lastName  || '').trim()
-      const email     = String(row.email     || '').trim().toLowerCase()
-      const phone     = String(row.phone     || '').trim()
-
-      try {
-        // Identity validation — backend re-checks. Frontend classification
-        // is a hint, not a contract.
-        if (!firstName || !lastName || !email || !phone) {
-          throw new Error('firstName, lastName, email, phone required')
-        }
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-          throw new Error('Invalid email format')
-        }
-
-        // Conflict checks — read-side via pool, before opening row transaction.
-        // S654: any letter case; a non-resident login is refused.
-        const existingUser = await findResidentAccount(email)
-
-        if (existingUser?.tenant_id) {
-          // Cross-landlord active lease — refuse, same as /onboard-tenant-pending.
-          const otherLease = await queryOne<any>(
-            `SELECT l.landlord_id FROM lease_tenants lt
-               JOIN leases l ON l.id = lt.lease_id
-              WHERE lt.tenant_id = $1 AND lt.status='active'
-                AND l.status='active' AND l.landlord_id != $2
-              LIMIT 1`,
-            [existingUser.tenant_id, landlordId]
-          )
-          if (otherLease) {
-            throw new Error('Tenant has an active lease with another landlord. Cannot onboard to your portfolio.')
-          }
-
-          // Same-landlord active lease — already onboarded, refuse.
-          const sameLandlordLease = await queryOne<any>(
-            `SELECT l.id FROM lease_tenants lt
-               JOIN leases l ON l.id = lt.lease_id
-              WHERE lt.tenant_id = $1 AND lt.status='active'
-                AND l.status='active' AND l.landlord_id = $2
-              LIMIT 1`,
-            [existingUser.tenant_id, landlordId]
-          )
-          if (sameLandlordLease) {
-            throw new Error('This person is already onboarded with you on an active lease.')
-          }
-
-          // Pending intent already exists. This is also the catch for
-          // duplicate emails WITHIN a single CSV — row N+1 sees the intent
-          // that row N just inserted and rejects.
-          // S582: match the partial unique index (tenant_id WHERE cancelled_at
-          // IS NULL) so a RESOLVED-but-not-cancelled intent is caught with a
-          // friendly message instead of surfacing the raw unique-constraint
-          // violation the INSERT below would throw.
-          const existingIntent = await queryOne<any>(
-            `SELECT id, resolved_at FROM pending_tenant_intents WHERE tenant_id = $1 AND cancelled_at IS NULL LIMIT 1`,
-            [existingUser.tenant_id]
-          )
-          if (existingIntent) {
-            throw new Error(existingIntent.resolved_at
-              ? 'This person has already been onboarded with you.'
-              : 'This person is already in your pending pool.')
-          }
-        }
-
-        // Per-row transaction. ROLLBACK on failure isolates this row from
-        // siblings — row 47's failure does not undo rows 1-46.
-        await client.query('BEGIN')
-
-        // 1. User row (create or reuse). No email_verify_token — that fires
-        //    at lease creation, not at limbo entry.
-        let userId: string
-        if (existingUser) {
-          userId = existingUser.id
-        } else {
-          const tempHash = '$2b$10$placeholder_invite_pending'
-          const u = await client.query(
-            `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
-             VALUES ($1, $2, 'tenant', $3, $4, $5) RETURNING id`,
-            [email, tempHash, firstName, lastName, phone]
-          )
-          userId = u.rows[0].id
-        }
-
-        // 2. Tenant row (create or reuse). Stamp onboarding_source.
-        let tenantId: string
-        const existingTenantRow = await client.query('SELECT id FROM tenants WHERE user_id=$1', [userId])
-        if (existingTenantRow.rows.length) {
-          tenantId = existingTenantRow.rows[0].id
-          await client.query(
-            `UPDATE tenants SET onboarding_source='onboarded'
-              WHERE id=$1 AND onboarding_source != 'onboarded'`,
-            [tenantId]
-          )
-        } else {
-          const t = await client.query(
-            `INSERT INTO tenants (user_id, onboarding_source) VALUES ($1, 'onboarded') RETURNING id`,
-            [userId]
-          )
-          tenantId = t.rows[0].id
-        }
-
-        // 3. Intent. UNIQUE(tenant_id) is the race-condition backstop.
-        const intent = await client.query(
-          `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status)
-           VALUES ($1, $2, 'not_uploaded')
-           RETURNING id`,
-          [landlordId, tenantId]
-        )
-
-        await client.query('COMMIT')
-
-        results.push({
-          rowIndex,
-          email,
-          status: 'created',
-          intentId: intent.rows[0].id,
-        })
-      } catch (rowErr: any) {
-        await client.query('ROLLBACK').catch(() => {})
-        results.push({
-          rowIndex,
-          email: email || '(no email)',
-          status: 'error',
-          message: rowErr?.message || 'Row failed',
-        })
-      }
-    }
-
-    const created = results.filter(r => r.status === 'created').length
-    const skipped = results.filter(r => r.status === 'error').length
-
-    res.json({
-      success: true,
-      data: { created, skipped, results },
-    })
-  } catch (e) {
-    next(e)
-  } finally {
-    client.release()
-  }
+// POST /api/landlords/me/onboard-tenants-csv/commit-pending — RETIRED (S655).
+// It parked every row missing lease data as a user + tenant + intent the
+// moment a file validated. The tenant CSV now saves a draft roster instead
+// (POST /me/onboard-tenants-csv/draft), so nothing is created until the
+// landlord confirms. Answers 410 with the next step.
+landlordsRouter.post('/me/onboard-tenants-csv/commit-pending', requirePerm('tenants.create'), (_req, res) => {
+  res.status(410).json({ success: false, error: TENANT_CSV_IS_A_ROSTER })
 })
 
 
@@ -3903,7 +3466,9 @@ landlordsRouter.post(
       const confirmSupersede = req.body?.confirmSupersede === true
       // S654: no activation link in the response. The address comes from the
       // landlord's overrides, so a link here was a password key to any account.
-      const result = await resolveIntent(intentId, landlordIds, overrides, { confirmSupersede })
+      // S655: who pressed it — a paper lease for another company's resident
+      // becomes a lease sent to them to sign, and its waiver records the user.
+      const result = await resolveIntent(intentId, landlordIds, overrides, { confirmSupersede, byUserId: req.user!.userId })
       res.json({ success: true, data: result })
     } catch (e) { next(e) }
   }
@@ -4720,285 +4285,49 @@ landlordsRouter.get('/me/onboard-tenants-csv/template', requirePerm('tenants.cre
 
 
 // POST /api/landlords/me/onboard-tenants-csv/validate
-// Body: { csv: string, source: 'generic' }
-// Returns: { rows: CsvRow[], summary: { total, blockers, warnings, ready } }
+// Body: { csv: string, source: 'generic', claimedPlatformName?, landlordId? }
+// Returns: { rows, summary: { total, blockers, warnings, ready }, missingLateFeeDecisions }
+//
+// S655: CHECKS THE FILE AND NOTHING ELSE. It used to commit too: every clean
+// unit went straight to live imported leases and every new person was mailed
+// an activation link. Now nothing about a lease is required (the roster is
+// who lives where; the lease drafts from the landlord's setup), and a unit the
+// file can't match is placed on the review screen instead of blocking the row.
+function tenantCsvSource(source: any): CsvImportPlatform {
+  const sourceNorm = String(source || 'generic').toLowerCase()
+  if (!isCsvImportPlatform(sourceNorm)) throw new AppError(400, `Unknown source: ${sourceNorm}`)
+  if (!isPlatformEnabled(sourceNorm)) {
+    throw new AppError(400, `${sourceNorm} is not yet supported. Pick Generic and map your columns manually for now.`)
+  }
+  return sourceNorm as CsvImportPlatform
+}
+
 landlordsRouter.post('/me/onboard-tenants-csv/validate', requirePerm('tenants.create'), async (req, res, next) => {
   try {
     const { csv, source, claimedPlatformName } = req.body
-    if (!csv) throw new AppError(400, 'csv body required')
-    const sourceNorm = String(source || 'generic').toLowerCase()
-    if (!isCsvImportPlatform(sourceNorm)) {
-      throw new AppError(400, `Unknown source: ${sourceNorm}`)
-    }
-    if (!isPlatformEnabled(sourceNorm)) {
-      throw new AppError(400, `${sourceNorm} is not yet supported. Pick Generic and map your columns manually for now.`)
-    }
+    if (!csv) throw new AppError(400, 'Pick a CSV file first.')
+    const sourceNorm = tenantCsvSource(source)
     // S297: claim meaningful only on generic. Validate doesn't
     // require it — landlord may want to preview without typing.
     const claimName = sourceNorm === 'generic' && typeof claimedPlatformName === 'string'
       ? claimedPlatformName.trim() : null
 
-    let records: any[]
-    try {
-      records = parseCsv(csv, {
-        columns: true,
-        skip_empty_lines: true,
-        trim: true,
-      }) as any[]
-    } catch (e: any) {
-      throw new AppError(400, `CSV parse failed: ${e.message}`)
-    }
-
-    if (records.length === 0) throw new AppError(400, 'CSV has no data rows')
-
-    // S295: capture raw shape before applyMapping rewrites column names.
-    const tenantAttemptShape = extractAttemptShape(records)
-
-    // S231: rewrite the source platform's column headers to GAM's canonical
-    // names. Generic is identity — non-generic platforms map e.g. 'First
-    // Name' → 'first_name' before the validator runs against canonical keys.
-    records = applyMapping(records, sourceNorm as CsvImportPlatform)
-
     // S633: an import lands in ONE named company. The account says which —
-    // silently when it owns only one. This used to be whichever company the
-    // session sat on, which would have filed Mountain View's residents into Oak
-    // Park's books on a single wrong click, with nothing on screen naming the
-    // company the rows were going to.
+    // silently when it owns only one.
     const landlordId = await landlordForRequest(req, 'import')
-
-    const units = await query<any>(
-      `SELECT u.id, u.unit_number, u.property_id, p.name AS property_name
-       FROM units u JOIN properties p ON p.id = u.property_id
-       WHERE u.landlord_id = $1`,
-      [landlordId]
-    )
-
-    const occupiedUnitIds = new Set(
-      (await query<any>(
-        `SELECT unit_id FROM v_unit_occupancy WHERE is_occupied = TRUE AND unit_id = ANY($1::uuid[])`,
-        [units.map(u => u.id)]
-      )).map(r => r.unit_id)
-    )
-
-    const rows: CsvRow[] = []
-    const emailSeenInBatch = new Map<string, number>()
-    const unitToFirstRowIndex = new Map<string, number>()
-
-    for (let i = 0; i < records.length; i++) {
-      const r = records[i]
-      const issues: CsvIssue[] = []
-
-      const row: CsvRow = {
-        rowIndex: i,
-        firstName: String(r.first_name || '').trim(),
-        lastName: String(r.last_name || '').trim(),
-        email: String(r.email || '').trim().toLowerCase(),
-        phone: String(r.phone || '').trim(),
-        propertyName: String(r.property_name || '').trim(),
-        unitNumber: String(r.unit_number || '').trim(),
-        leaseStart: String(r.lease_start || '').trim(),
-        leaseEnd: String(r.lease_end || '').trim(),
-        monthlyRent: String(r.monthly_rent || '').trim(),
-        securityDeposit: String(r.security_deposit || '').trim(),
-        lateFeeAmount: String(r.late_fee_amount || '').trim(),
-        lateFeeGraceDays: String(r.late_fee_grace_days || '').trim(),
-        autoRenew: String(r.auto_renew || '').trim(),
-        autoRenewMode: String(r.auto_renew_mode || '').trim(),
-        noticeDaysRequired: String(r.notice_days_required || '').trim(),
-        outstandingBalance: String(r.outstanding_balance || '').trim(),
-        extra: r._extra,
-        issues,
-      }
-
-      if (!row.firstName) issues.push({ severity: 'block', field: 'first_name', message: 'Required' })
-      if (!row.lastName)  issues.push({ severity: 'block', field: 'last_name',  message: 'Required' })
-      if (!row.email)     issues.push({ severity: 'block', field: 'email',      message: 'Required' })
-      else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email)) {
-        issues.push({ severity: 'block', field: 'email', message: 'Invalid email format' })
-      }
-      if (!row.phone) issues.push({ severity: 'block', field: 'phone', message: 'Required' })
-
-      if (!row.leaseStart) issues.push({ severity: 'block', field: 'lease_start', message: 'Required' })
-      else if (isNaN(Date.parse(row.leaseStart))) issues.push({ severity: 'block', field: 'lease_start', message: 'Invalid date' })
-
-      if (!row.monthlyRent) issues.push({ severity: 'block', field: 'monthly_rent', message: 'Required' })
-      else {
-        const rent = parseFloat(row.monthlyRent)
-        if (isNaN(rent) || rent < 0) issues.push({ severity: 'block', field: 'monthly_rent', message: 'Must be a non-negative number' })
-      }
-
-      if (row.outstandingBalance) {
-        // Source platforms occasionally export balances as negative
-        // (credit on account) or with currency formatting. Strip the
-        // common decorations and accept negative; we'll skip writing an
-        // invoice for non-positive values on commit.
-        const bal = parseFloat(row.outstandingBalance.replace(/[$,\s]/g, ''))
-        if (isNaN(bal)) {
-          issues.push({ severity: 'block', field: 'outstanding_balance', message: 'Must be a number' })
-        }
-      }
-
-      if (row.leaseEnd && isNaN(Date.parse(row.leaseEnd))) {
-        issues.push({ severity: 'block', field: 'lease_end', message: 'Invalid date' })
-      }
-      if (row.leaseEnd && row.leaseStart && Date.parse(row.leaseEnd) < Date.parse(row.leaseStart)) {
-        issues.push({ severity: 'block', field: 'lease_end', message: 'Must be after lease_start' })
-      }
-      if (row.leaseEnd && Date.parse(row.leaseEnd) < Date.now()) {
-        issues.push({ severity: 'warn', field: 'lease_end', message: 'Lease end date is in the past' })
-      }
-
-      const arBool = parseBool(row.autoRenew)
-      if (row.autoRenew && arBool === null) {
-        issues.push({ severity: 'block', field: 'auto_renew', message: 'Must be yes/no' })
-      }
-      if (arBool === true && !(AUTO_RENEW_MODES as readonly string[]).includes(row.autoRenewMode)) {
-        issues.push({ severity: 'block', field: 'auto_renew_mode', message: 'Required when auto_renew=yes (extend_same_term or convert_to_month_to_month)' })
-      }
-
-      if (!row.propertyName) issues.push({ severity: 'block', field: 'property_name', message: 'Required' })
-      if (!row.unitNumber)   issues.push({ severity: 'block', field: 'unit_number',   message: 'Required' })
-      // S605 (Nic, DIRECTIVE): units created in GAM must carry a prefix — a bare
-      // "37" is the accident that rule exists to stop, and it collides when two
-      // unit types share a number.
-      //
-      // WARN here rather than BLOCK, deliberately. This is the MIGRATION path:
-      // the rent roll being imported already exists in the real world, and a
-      // landlord whose apartments have genuinely been called "101" for twenty
-      // years should not be refused entry to the platform over naming. They are
-      // told, and can rename on the way in or afterwards.
-      else if (unitNumberNeedsPrefix(row.unitNumber)) {
-        issues.push({ severity: 'warn', field: 'unit_number',
-          message: `"${row.unitNumber}" has no prefix. New units in GAM require one (e.g. "Apt ${row.unitNumber}") — ` +
-                   `imported numbers are kept as-is, but a bare number can collide if another unit type reuses it.` })
-      }
-
-      if (row.propertyName && row.unitNumber) {
-        const match = units.find(u =>
-          u.property_name.trim().toLowerCase() === row.propertyName.toLowerCase() &&
-          String(u.unit_number).trim().toLowerCase() === row.unitNumber.toLowerCase()
-        )
-        if (!match) {
-          issues.push({ severity: 'block', field: 'unit_number', message: `No unit "${row.unitNumber}" found at property "${row.propertyName}" in your portfolio` })
-        } else {
-          row.resolvedUnitId = match.id
-          const firstRowForUnit = unitToFirstRowIndex.get(match.id)
-          if (firstRowForUnit === undefined) {
-            unitToFirstRowIndex.set(match.id, i)
-            if (occupiedUnitIds.has(match.id)) {
-              issues.push({ severity: 'block', field: 'unit_number', message: 'Unit is already occupied. Co-tenant additions to occupied units require consent and are not yet supported in this flow.' })
-            }
-          } else {
-            const primary = rows[firstRowForUnit]
-            if (row.leaseStart && primary.leaseStart && row.leaseStart !== primary.leaseStart) {
-              issues.push({ severity: 'warn', field: 'lease_start', message: `Differs from primary tenant row (${primary.leaseStart}). Primary will be used.` })
-            }
-            if (row.leaseEnd && primary.leaseEnd && row.leaseEnd !== primary.leaseEnd) {
-              issues.push({ severity: 'warn', field: 'lease_end', message: `Differs from primary (${primary.leaseEnd}). Primary will be used.` })
-            }
-            if (row.monthlyRent && primary.monthlyRent && row.monthlyRent !== primary.monthlyRent) {
-              issues.push({ severity: 'warn', field: 'monthly_rent', message: `Differs from primary (${primary.monthlyRent}). Primary will be used.` })
-            }
-          }
-        }
-      }
-
-      if (row.email) {
-        const prev = emailSeenInBatch.get(row.email)
-        if (prev !== undefined) {
-          issues.push({ severity: 'warn', field: 'email', message: `Duplicate of row ${prev + 1} — will be skipped` })
-        } else {
-          emailSeenInBatch.set(row.email, i)
-        }
-      }
-
-      rows.push(row)
-    }
-
-    // S654: an existing account must be a resident's, and not one living
-    // under another landlord. The ids stay on the server.
-    const accounts = await lookupImportAccounts(
-      Array.from(new Set(rows.map(r => r.email).filter(Boolean))), landlordId)
-    for (const row of rows) {
-      const found = accounts.get(row.email)
-      if (!found) continue
-      if (found.role !== 'tenant') {
-        row.issues.push({ severity: 'block', field: 'email', message: NOT_A_RESIDENT_ACCOUNT })
-      } else if (found.activeElsewhere) {
-        row.issues.push({ severity: 'block', field: 'email', message: TENANT_OF_ANOTHER_LANDLORD })
-      } else if (found.activeHere) {
-        row.issues.push({ severity: 'warn', field: 'email', message: 'Already onboarded with you on an active lease. Row will be skipped on commit.' })
-      }
-    }
-
-    const blockers = rows.reduce((n, r) => n + r.issues.filter(i => i.severity === 'block').length, 0)
-    const warnings = rows.reduce((n, r) => n + r.issues.filter(i => i.severity === 'warn').length, 0)
-    const ready = rows.filter(r => !r.issues.some(i => i.severity === 'block')).length
-
-    // S537 (Nic): the tenant-CSV commit gates on a late-fee decision for
-    // every (property, unit_type) it touches. Report the UNDECIDED pairs
-    // here, each with a SUGGESTED prefill = the most frequent
-    // (late_fee_amount, grace_days) among this file's leases for that
-    // pair — a landlord who kept per-lease fees consistent on their old
-    // platform was expressing a de-facto property policy; surface it as
-    // the default they confirm (never auto-applied).
-    const missingLateFeeDecisions: any[] = []
-    {
-      const unitIdsAll = Array.from(new Set(rows.map(r => r.resolvedUnitId).filter(Boolean))) as string[]
-      if (unitIdsAll.length > 0) {
-        const pairRows = await query<any>(
-          `SELECT u.id AS unit_id, u.property_id, u.unit_type, p.name AS property_name
-             FROM units u JOIN properties p ON p.id = u.property_id
-            WHERE u.id = ANY($1::uuid[]) AND u.unit_type IS NOT NULL`, [unitIdsAll])
-        const unitPair = new Map(pairRows.map((r: any) => [r.unit_id, r]))
-        const decided = await query<any>(
-          `SELECT property_id, unit_type FROM property_unit_type_late_fees
-            WHERE property_id = ANY($1::uuid[])`,
-          [Array.from(new Set(pairRows.map((r: any) => r.property_id)))])
-        const decidedSet = new Set(decided.map((d: any) => `${d.property_id}|${d.unit_type}`))
-        // Tally (amount, grace) frequencies per undecided pair.
-        const tally = new Map<string, { info: any; counts: Map<string, { n: number; amount: number; graceDays: number }> }>()
-        for (const r of rows) {
-          const pr: any = r.resolvedUnitId ? unitPair.get(r.resolvedUnitId) : null
-          if (!pr) continue
-          const pairKey = `${pr.property_id}|${pr.unit_type}`
-          if (decidedSet.has(pairKey)) continue
-          if (!tally.has(pairKey)) tally.set(pairKey, { info: pr, counts: new Map() })
-          const amt = r.lateFeeAmount ? parseFloat(r.lateFeeAmount) : NaN
-          if (isNaN(amt) || amt <= 0) continue
-          const grace = r.lateFeeGraceDays ? parseInt(r.lateFeeGraceDays, 10) : 5
-          const vKey = `${amt}|${isNaN(grace) ? 5 : grace}`
-          const cur = tally.get(pairKey)!.counts.get(vKey) || { n: 0, amount: amt, graceDays: isNaN(grace) ? 5 : grace }
-          cur.n++
-          tally.get(pairKey)!.counts.set(vKey, cur)
-        }
-        for (const { info, counts } of tally.values()) {
-          let suggested: any = null
-          let best = 0
-          let total = 0
-          for (const c of counts.values()) {
-            total += c.n
-            if (c.n > best) { best = c.n; suggested = { initialAmount: c.amount, graceDays: c.graceDays, initialType: 'flat', leaseCount: c.n } }
-          }
-          if (suggested) suggested.leaseTotal = total
-          missingLateFeeDecisions.push({
-            propertyId: info.property_id, propertyName: info.property_name,
-            unitType: info.unit_type, suggested,
-          })
-        }
-      }
-    }
+    const review = await reviewTenantCsv({ csv, source: sourceNorm, landlordId, ownCompanies: landlordScopeIds(req.user!) })
+    const shape = extractAttemptShape(review.records)
 
     // S295: persist the validate attempt to the review queue.
     await recordValidateAttempt({
       landlordId,
       importType:    'tenant',
       platformKey:   sourceNorm,
-      columnHeaders: tenantAttemptShape.columnHeaders,
-      sampleRows:    tenantAttemptShape.sampleRows,
-      rowCount:      rows.length,
-      blockers,
-      warnings,
+      columnHeaders: shape.columnHeaders,
+      sampleRows:    shape.sampleRows,
+      rowCount:      review.rows.length,
+      blockers:      review.summary.blockers,
+      warnings:      review.summary.warnings,
       claimedPlatformName: claimName,
     })
     await notifyCsvReviewPendingIfNeeded({
@@ -5009,383 +4338,128 @@ landlordsRouter.post('/me/onboard-tenants-csv/validate', requirePerm('tenants.cr
     res.json({
       success: true,
       data: {
-        rows,
-        summary: { total: rows.length, blockers, warnings, ready },
-        missingLateFeeDecisions,
+        rows: review.rows,
+        summary: review.summary,
+        // S537: (property, unit type) pairs with no late-fee decision yet —
+        // the roster can't be confirmed onto them, so the screen asks first.
+        missingLateFeeDecisions: await missingLateFeeDecisions(review.rows),
       },
     })
   } catch (e) { next(e) }
 })
 
 
-// POST /api/landlords/me/onboard-tenants-csv/commit
-// Body: { rows: CsvRow[], source?: CsvImportPlatform } — landlord-
-// corrected rows from /validate. source is optional for backwards
-// compatibility; when present, the commit attempt is recorded with
-// the correct platform key in the S295 review queue.
-landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.create'), async (req, res, next) => {
-  const client = await getClient()
+// POST /api/landlords/me/onboard-tenants-csv/draft — S655.
+// Body: same as /validate. Re-checks the whole file on the server (nothing the
+// browser says about a row is trusted) and saves every row that can be saved
+// to the property's DRAFT ROSTER. Creates no user, tenant, invite, lease or
+// invoice, and sends nothing. A re-upload updates the live row for the same
+// address. The landlord reviews and confirms each property's roster after.
+landlordsRouter.post('/me/onboard-tenants-csv/draft', requirePerm('tenants.create'), async (req, res, next) => {
   try {
-    const { rows, source, claimedPlatformName } = req.body
-    if (!Array.isArray(rows) || rows.length === 0) {
-      throw new AppError(400, 'rows array required')
-    }
-    const tenantSourceNorm = source && isCsvImportPlatform(String(source).toLowerCase())
-      ? String(source).toLowerCase()
-      : 'generic'
-    // S297: generic commit requires the claim. See property-commit
-    // for full rationale.
-    const tenantClaimName = tenantSourceNorm === 'generic' && typeof claimedPlatformName === 'string'
+    const { csv, source, claimedPlatformName } = req.body
+    if (!csv) throw new AppError(400, 'Pick a CSV file first.')
+    const sourceNorm = tenantCsvSource(source)
+    // S297: a generic file names the platform it came from before it is saved.
+    const claimName = sourceNorm === 'generic' && typeof claimedPlatformName === 'string'
       ? claimedPlatformName.trim() : ''
-    if (tenantSourceNorm === 'generic' && !tenantClaimName) {
-      throw new AppError(400, 'claimedPlatformName is required for generic uploads')
+    if (sourceNorm === 'generic' && !claimName) {
+      throw new AppError(400, 'Enter the name of the platform this file came from first.')
     }
-
-    // S633: an import lands in ONE named company. The account says which —
-    // silently when it owns only one. This used to be whichever company the
-    // session sat on, which would have filed Mountain View's residents into Oak
-    // Park's books on a single wrong click, with nothing on screen naming the
-    // company the rows were going to.
     const landlordId = await landlordForRequest(req, 'import')
-
-    // Defense in depth: re-resolve unit ownership and check no blockers remain.
-    for (const row of rows as CsvRow[]) {
-      if (row.resolvedUnitId && (typeof row.resolvedUnitId !== 'string' || !UUID_RE.test(row.resolvedUnitId))) {
-        throw new AppError(403, `Row ${row.rowIndex + 1} references a unit not owned by this landlord`)
-      }
-    }
-    const unitIds = Array.from(new Set((rows as CsvRow[]).map(r => r.resolvedUnitId).filter(Boolean) as string[]))
-    const ownedUnits = await query<any>(
-      `SELECT id FROM units WHERE id = ANY($1::uuid[]) AND landlord_id = $2`,
-      [unitIds, landlordId]
-    )
-    const ownedSet = new Set(ownedUnits.map(u => u.id))
-    for (const row of rows as CsvRow[]) {
-      if (!row.resolvedUnitId || !ownedSet.has(row.resolvedUnitId)) {
-        throw new AppError(403, `Row ${row.rowIndex + 1} references a unit not owned by this landlord`)
-      }
-      const blockers = (row.issues || []).filter(i => i.severity === 'block')
-      if (blockers.length > 0) {
-        throw new AppError(400, `Row ${row.rowIndex + 1} still has blockers: ${blockers.map(b => b.message).join(', ')}`)
-      }
-    }
-
-    // S654: who each row is, decided here from its email. Any id the browser
-    // sends back for an existing account is ignored; see lookupImportAccounts.
-    for (const row of rows as CsvRow[]) {
-      row.email = String(row.email ?? '').trim().toLowerCase()
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email)) {
-        throw new AppError(400, `Row ${row.rowIndex + 1}: the email isn't a valid address`)
-      }
-    }
-    const accounts = await lookupImportAccounts(
-      Array.from(new Set((rows as CsvRow[]).map(r => r.email))), landlordId)
-    for (const row of rows as CsvRow[]) {
-      const found = accounts.get(row.email)
-      if (found && found.role !== 'tenant') {
-        throw new AppError(409, `Row ${row.rowIndex + 1}: ${NOT_A_RESIDENT_ACCOUNT}`)
-      }
-      if (found?.activeElsewhere) {
-        throw new AppError(409, `Row ${row.rowIndex + 1}: ${TENANT_OF_ANOTHER_LANDLORD}`)
-      }
-    }
-
-    // Group by unit. Skip, as validate said: someone already on an active
-    // lease with you, and a repeat of an email earlier in the file.
-    const groups = new Map<string, CsvRow[]>()
-    const emailsTaken = new Set<string>()
-    for (const row of rows as CsvRow[]) {
-      if (accounts.get(row.email)?.activeHere) continue
-      if (emailsTaken.has(row.email)) continue
-      emailsTaken.add(row.email)
-      if (!row.resolvedUnitId) continue
-      if (!groups.has(row.resolvedUnitId)) groups.set(row.resolvedUnitId, [])
-      groups.get(row.resolvedUnitId)!.push(row)
-    }
-
-    const unitDetails = await query<any>(
-      `SELECT u.id, u.unit_number, p.name AS property_name, p.street1, p.city, p.state, p.zip
-       FROM units u JOIN properties p ON p.id = u.property_id
-       WHERE u.id = ANY($1::uuid[])`,
-      [Array.from(groups.keys())]
-    )
-    const unitDetailMap = new Map(unitDetails.map(u => [u.id, u]))
-
-    // S537 gate: every distinct (property, unit_type) in the commit needs
-    // an explicit late-fee decision — bulk migration is exactly where
-    // unvetted classes would otherwise slip in.
-    {
-      const typePairs = await query<any>(
-        `SELECT DISTINCT property_id, unit_type FROM units
-         WHERE id = ANY($1::uuid[]) AND unit_type IS NOT NULL`,
-        [Array.from(groups.keys())]
-      )
-      for (const tp of typePairs) await assertLateFeeDecision(tp.property_id, tp.unit_type)
-    }
-
-    const landlord = await queryOne<any>(
-      `SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
-      [landlordId]
-    )
-    const landlordName = landlord ? `${landlord.first_name} ${landlord.last_name}`.trim() : 'Your landlord'
-
-    // S654 (the one rule for every door): a password-setting link is made
-    // only for an account that still needs setup (placeholder password, invite
-    // never accepted) and is not tied to another company, or one this import
-    // creates. This import used to mint a fresh link for EVERY existing
-    // account it attached: it killed the live link another company had
-    // emailed its invitee, and mailed "set a password" to residents who have
-    // signed in for months (S616 forbids that). Everyone else already on GAM
-    // is told in their own account and signs in as usual.
-    const mintFor = new Map<string, boolean>()
-    {
-      const own = [landlordId, ...landlordScopeIds(req.user!)]
-      const existing = Array.from(new Set(
-        (Array.from(groups.values()).flat())
-          .map(r => accounts.get(r.email)?.userId)
-          .filter(Boolean) as string[]))
-      const setup = existing.length === 0 ? [] : await query<{ id: string; needs_setup: boolean }>(
-        `SELECT id, (password_hash = '$2b$10$placeholder_invite_pending'
-                     AND tenant_invite_accepted_at IS NULL) AS needs_setup
-           FROM users WHERE id = ANY($1::uuid[])`, [existing])
-      for (const u of setup) {
-        mintFor.set(u.id, u.needs_setup === true && !(await accountTiedElsewhere(u.id, own)))
-      }
-    }
-
-    await client.query('BEGIN')
-
-    const created: {
-      tenantId: string; leaseId: string; email: string; activationUrl: string | null
-      firstName: string; unitId: string; userId: string
-    }[] = []
-
-    for (const [unitId, groupRows] of groups.entries()) {
-      const primary = groupRows[0]
-      // S582: server-side occupancy backstop. /validate blocks occupied units,
-      // but the commit must NOT trust the client ran it (same "trust nothing"
-      // principle as commit-pending). Without this, a direct call or a re-run
-      // that bypasses re-validation would create a SECOND active lease on a unit
-      // (whole_unit) — double-booking a 32-unit import. Mode-aware; throws +
-      // rolls back the whole import (all-or-nothing, like the late-fee gate above).
-      await assertUnitCanAcceptNewLease(client, unitId)
-      const leaseType = primary.leaseEnd ? 'fixed_term' : 'month_to_month'
-      const arBool = parseBool(primary.autoRenew) === true
-      const arMode = arBool ? primary.autoRenewMode : null
-
-      // S196: security_deposit removed from leases columns; written to
-      // lease_fees via syncSecurityDepositLeaseFee below.
-      // S294: extras from primary row land on the lease. Co-tenant rows'
-      // extras are dropped — they describe the same lease relationship,
-      // and reconciling per-tenant extras into one JSONB blob would risk
-      // collision. Acceptable: if both co-tenants share an extra column,
-      // it's the same value; if they differ, primary wins (same pattern
-      // as the lease itself, which uses primary.* for all fields).
-      const lease = await client.query(
-        `INSERT INTO leases (
-           unit_id, landlord_id, status, start_date, end_date, rent_amount,
-           late_fee_initial_amount, late_fee_grace_days,
-           lease_type, auto_renew, auto_renew_mode,
-           notice_days_required, needs_review, lease_source,
-           import_extra_data
-         ) VALUES (
-           $1, $2, 'active', $3, $4, $5,
-           $6, $7,
-           $8, $9, $10,
-           $11, TRUE, 'imported',
-           $12
-         ) RETURNING id`,
-        [
-          unitId, landlordId,
-          primary.leaseStart, primary.leaseEnd || null, parseFloat(primary.monthlyRent),
-          // S537: NEVER invent a late fee (see onboard-tenant note).
-          primary.lateFeeAmount ? parseFloat(primary.lateFeeAmount) : null,
-          primary.lateFeeAmount ? (primary.lateFeeGraceDays ? parseInt(primary.lateFeeGraceDays) : 5) : null,
-          leaseType, arBool, arMode,
-          primary.noticeDaysRequired ? parseInt(primary.noticeDaysRequired) : 30,
-          primary.extra && Object.keys(primary.extra).length > 0
-            ? JSON.stringify(primary.extra) : null,
-        ]
-      )
-      const leaseId = lease.rows[0].id
-
-      // S195 dual-write: mirror security_deposit into lease_fees.
-      {
-        const { syncSecurityDepositLeaseFee } = await import('../services/leaseFeesSync')
-        await syncSecurityDepositLeaseFee(
-          leaseId,
-          primary.securityDeposit ? parseFloat(primary.securityDeposit) : 0,
-          client,
-        )
-      }
-
-      // Opening balance — carry AR from prior platform as a single pending
-      // invoice on the imported lease. Skip if zero / unset / negative
-      // (credit balances aren't representable as an invoice; landlord can
-      // record them as adjustments post-import).
-      if (primary.outstandingBalance) {
-        const rawBal = parseFloat(primary.outstandingBalance.replace(/[$,\s]/g, ''))
-        if (!isNaN(rawBal) && rawBal > 0) {
-          const balance = Math.round(rawBal * 100) / 100
-          const today = new Date()
-          const year = today.getUTCFullYear()
-          const seqRes = await client.query(
-            `INSERT INTO invoice_sequences (landlord_id, year, next_number)
-             VALUES ($1, $2, 2)
-             ON CONFLICT (landlord_id, year)
-             DO UPDATE SET next_number = invoice_sequences.next_number + 1
-             RETURNING next_number`,
-            [landlordId, year]
-          )
-          const invoiceNumber = formatInvoiceNumber(year, (seqRes.rows[0].next_number as number) - 1)
-          await client.query(
-            `INSERT INTO invoices (
-               landlord_id, lease_id, unit_id,
-               invoice_number, due_date,
-               subtotal_rent, total_amount, status, notes
-             ) VALUES (
-               $1, $2, $3, $4, CURRENT_DATE,
-               $5, $5, 'pending', $6
-             ) ON CONFLICT (lease_id, due_date) DO NOTHING`,
-            [
-              landlordId, leaseId, unitId,
-              invoiceNumber,
-              balance.toFixed(2),
-              'Imported opening balance from prior platform.',
-            ]
-          )
-        }
-      }
-
-      for (let idx = 0; idx < groupRows.length; idx++) {
-        const row = groupRows[idx]
-        const role = idx === 0 ? 'primary' : 'co_tenant'
-
-        // S654: the account was found by email above. Its activation link
-        // goes only to the address that account holds.
-        const account = accounts.get(row.email)
-        let userId: string
-        let sendTo: string
-        if (account) {
-          userId = account.userId
-          sendTo = account.email
-        } else {
-          const tempHash = '$2b$10$placeholder_invite_pending'
-          const u = await client.query(
-            `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
-             VALUES ($1, $2, 'tenant', $3, $4, $5) RETURNING id`,
-            [row.email, tempHash, row.firstName, row.lastName, row.phone]
-          )
-          userId = u.rows[0].id
-          sendTo = row.email
-        }
-
-        // S410 (S377): tenant_invite_token + 7-day expiry. See note at
-        // line ~836 in this file for the rationale.
-        // S654: only for an account this import made, or one that still
-        // needs setup and is no other company's (mintFor, above).
-        let inviteToken: string | null = null
-        if (!account || mintFor.get(userId) === true) {
-          inviteToken = require('crypto').randomBytes(32).toString('hex')
-          await client.query(
-            `UPDATE users SET tenant_invite_token=$1,
-                              tenant_invite_expires_at=NOW() + INTERVAL '7 days'
-              WHERE id=$2`,
-            [inviteToken, userId])
-        }
-
-        let tenantId: string
-        if (account?.tenantId) {
-          tenantId = account.tenantId
-          await client.query(
-            `UPDATE tenants SET onboarding_source='onboarded' WHERE id=$1 AND onboarding_source != 'onboarded'`,
-            [tenantId]
-          )
-        } else {
-          const t = await client.query(
-            `INSERT INTO tenants (user_id, onboarding_source) VALUES ($1, 'onboarded') RETURNING id`,
-            [userId]
-          )
-          tenantId = t.rows[0].id
-        }
-
-        await client.query(
-          `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_at, added_reason, financial_responsibility)
-           VALUES ($1, $2, $3, 'active', NOW(), 'original', 'joint_several')`,
-          [leaseId, tenantId, role]
-        )
-
-        // S654: portalLink, never a localhost fallback (S641 rule).
-        const activationUrl = inviteToken ? portalLink('tenant', `accept-invite?token=${inviteToken}`) : null
-        created.push({ tenantId, leaseId, email: sendTo, activationUrl, firstName: row.firstName, unitId, userId })
-      }
-    }
-
-    await client.query('COMMIT')
-
-    // Send activation emails post-commit. One failure shouldn't block others.
-    for (const c of created) {
-      const unit = unitDetailMap.get(c.unitId)
-      const propertyAddress = [unit?.street1, unit?.city, unit?.state, unit?.zip].filter(Boolean).join(', ')
-      const unitLabel = `${unit?.property_name} — Unit ${unit?.unit_number}`
-      try {
-        if (c.activationUrl) {
-          await emailTenantOnboarded(
-            c.email, c.firstName, landlordName, propertyAddress, unitLabel, c.activationUrl,
-            { landlordId, tenantId: c.tenantId }
-          )
-        } else {
-          // S654/S616: already on GAM. Point them at the lease, in the account
-          // they have; never at "set a password". Same notice as
-          // /me/onboard-tenant.
-          const { createNotification } = await import('../services/notifications')
-          await createNotification({
-            userId: c.userId,
-            landlordId,
-            type: 'lease_drafted',
-            title: `${landlordName} added a lease for ${unitLabel}`,
-            body: `A lease for ${propertyAddress} is ready for you to review. Sign in as usual — you already have an account.`,
-            data: { unitId: c.unitId, tenantId: c.tenantId, leaseId: c.leaseId },
-            actionUrl: '/lease',
-          })
-        }
-      } catch (emailErr) {
-        // S654: never the activation link: it is a password-setting key.
-        logger.error({ err: emailErr, ctx: c.email }, '[ONBOARD CSV] Email send failed for')
-      }
-    }
-
-    // S295: record commit + compute first-5 position for banner.
-    await recordCommitAttempt({
+    const review = await reviewTenantCsv({ csv, source: sourceNorm, landlordId, ownCompanies: landlordScopeIds(req.user!) })
+    const shape = extractAttemptShape(review.records)
+    const attemptId = await recordCommitAttempt({
       landlordId,
       importType:  'tenant',
-      platformKey: tenantSourceNorm,
-      columnHeaders: [],
-      sampleRows:    [],
-      rowCount:      created.length,
-      claimedPlatformName: tenantClaimName || null,
+      platformKey: sourceNorm,
+      columnHeaders: shape.columnHeaders,
+      sampleRows:    shape.sampleRows,
+      rowCount:      review.summary.ready,
+      claimedPlatformName: claimName || null,
     })
     await notifyCsvReviewPendingIfNeeded({
-      landlordId, importType: 'tenant', platformKey: tenantSourceNorm,
-      source: 'commit', claimedPlatformName: tenantClaimName || null,
+      landlordId, importType: 'tenant', platformKey: sourceNorm,
+      source: 'commit', claimedPlatformName: claimName || null,
     })
-    const tenantStatus = await getPlatformReviewStatus(tenantSourceNorm, 'tenant')
-
+    const saved = await saveRosterRows({
+      landlordId, rows: review.rows, byUserId: req.user!.userId,
+      sourcePlatform: sourceNorm, importAttemptId: attemptId,
+    })
+    const names = await query<{ id: string; name: string }>(
+      `SELECT id, name FROM properties WHERE id = ANY($1::uuid[])`, [saved.byProperty.map(b => b.propertyId)])
+    const status = await getPlatformReviewStatus(sourceNorm, 'tenant')
     res.json({
       success: true,
       data: {
-        committed: created.length,
-        leases: groups.size,
-        tenants: created.map(c => ({ email: c.email, tenantId: c.tenantId, leaseId: c.leaseId })),
-        escalateToSuperAdmin: tenantStatus.escalateToSuperAdmin,
-        mappingStatus:        tenantStatus.mappingStatus,
+        saved: saved.saved,
+        updated: saved.updated,
+        properties: saved.byProperty.map(b => ({
+          propertyId: b.propertyId, propertyName: names.find(n => n.id === b.propertyId)?.name ?? '', count: b.count,
+        })),
+        // Every row that was NOT saved, with why, so nothing vanishes silently.
+        notSaved: review.rows
+          .filter(r => r.skip || r.issues.some(i => i.severity === 'block') || !r.resolvedPropertyId)
+          .map(r => ({
+            rowIndex: r.rowIndex, email: r.email, name: `${r.firstName} ${r.lastName}`.trim(),
+            reasons: r.issues.filter(i => i.severity === 'block' || r.skip).map(i => i.message),
+          })),
+        escalateToSuperAdmin: status.escalateToSuperAdmin,
+        mappingStatus:        status.mappingStatus,
       },
     })
+  } catch (e) { next(e) }
+})
+
+
+// POST /api/landlords/me/onboard-tenants-csv/commit — RETIRED (S655).
+// It wrote live 'imported' leases for every clean unit, with nobody signing,
+// and emailed every new person an activation link at once. The tenant CSV
+// saves a draft roster now; leases draft only when the landlord confirms it,
+// and each household hears from GAM once — when the landlord signs.
+landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.create'), (_req, res) => {
+  res.status(410).json({ success: false, error: TENANT_CSV_IS_A_ROSTER })
+})
+
+
+// ── S655: THE DRAFT ROSTER ────────────────────────────────────────────────
+// GET    /me/tenant-roster                 → { properties: [{ propertyId, propertyName, count }] }
+// GET    /me/tenant-roster?propertyId=     → one property's roster, by unit, with each unit's blockers
+// PATCH  /me/tenant-roster/:id             → fix one person (name, email, phone, unit, order,
+//                                            due day, existing resident, packet, home sale, old balance)
+// DELETE /me/tenant-roster/:id             → remove one person (kept, just hidden)
+// POST   /me/tenant-roster/confirm         → { propertyId } — draft every household's lease
+landlordsRouter.get('/me/tenant-roster', requirePerm('tenants.create'), async (req, res, next) => {
+  try {
+    const propertyId = typeof req.query.propertyId === 'string' ? req.query.propertyId : ''
+    if (!propertyId) {
+      return res.json({ success: true, data: { properties: await rosterSummary(landlordScopeIds(req.user!)) } })
+    }
+    res.json({ success: true, data: await loadRoster(req.user!, propertyId) })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.patch('/me/tenant-roster/:id', requirePerm('tenants.create'), async (req, res, next) => {
+  try {
+    res.json({ success: true, data: await updateRosterRow(req.user!, req.params.id, req.body) })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.delete('/me/tenant-roster/:id', requirePerm('tenants.create'), async (req, res, next) => {
+  try {
+    await discardRosterRow(req.user!, req.params.id)
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.post('/me/tenant-roster/confirm', requirePerm('tenants.onboard'), async (req, res, next) => {
+  try {
+    const out = await confirmRoster(req.user!, String(req.body?.propertyId ?? ''))
+    res.json({ success: true, data: out })
   } catch (e) {
-    await client.query('ROLLBACK').catch(() => {})
+    // Every problem, each with its next step, so the screen can list them.
+    if (e instanceof RosterNotReady) return res.status(409).json({ success: false, error: e.message, problems: e.problems })
     next(e)
-  } finally {
-    client.release()
   }
 })
 
@@ -6865,9 +5939,11 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
       // check, a one-off charge, an invoice, a document, a voided seat. Round 8
       // took over a login whose only ties to A were three of those.
       const tiedElsewhere =await accountTiedElsewhere(intent.user_id, [intent.landlord_id, ...landlordScopeIds(req.user!)])
+      // S655: the reason is theirs (their own account), never whose else it
+      // is — another company's people are that company's business.
       if (tiedElsewhere && (newEmail || body.firstName || body.lastName)) {
         throw new AppError(409,
-          "This person's GAM account is also with another company, so only they can change their name or email, " +
+          'This person already has their own GAM account, so only they can change their name or email, ' +
           'from their own portal. You can still re-send the invite to the address on file.')
       }
       if (newEmail && intent.activated) {
@@ -7036,7 +6112,7 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
         : null
       if (inviteNow && tiedElsewhere && intent.needs_setup && !live) {
         throw new AppError(409,
-          "This person's GAM account is also with another company, and the setup link they were sent has run out, " +
+          'This person already has their own GAM account, and the setup link they were sent has run out, ' +
           "so a new one can't be sent from here. They can choose 'Forgot password' on the GAM sign-in page, " +
           'with the email address on file, to get in.')
       }

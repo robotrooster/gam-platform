@@ -223,3 +223,157 @@ describe('the landlord’s view', () => {
     expect(res.body.data[0].prior_unconfirmed).toBe(0)
   })
 })
+
+// S655 review: with no bank linked nothing can match a report and it never
+// expires, so "we will apply it automatically — usually a day or two" with a
+// 7-day clock was a promise GAM could not keep (Country Acres / TruBlu).
+// "Linked" means GAM is reading the bank right now: an active link that has
+// synced at least once — the same thing the expiry job needs before it writes
+// a report off.
+async function linkBank(landlordId: string, opts: { status?: string; synced?: boolean } = {}) {
+  await db.query(
+    `INSERT INTO bank_connections (landlord_id, provider, stripe_fc_account_id, institution_name, display_name,
+                                   status, last_synced_at)
+     VALUES ($1,'stripe_fc','fca_' || substr(md5(random()::text), 1, 8),'Test Bank','Test Bank ••1111',$2,
+             CASE WHEN $3::boolean THEN NOW() END)`,
+    [landlordId, opts.status ?? 'active', opts.synced ?? true])
+}
+
+describe('what the tenant is told depends on whether GAM is reading the landlord’s bank', () => {
+  const report = (f: Fx) => request(buildApp()).post('/api/declared-deposits')
+    .set('Authorization', `Bearer ${f.token}`)
+    .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash' })
+
+  it('no bank linked: the landlord checks by hand, the tenant is told to let them know, and no expiry is promised', async () => {
+    const f = await fixture()
+    const res = await report(f)
+    expect(res.status).toBe(200)
+    expect(res.body.data.bankFeedLinked).toBe(false)
+    expect(res.body.data.message).toMatch(/isn’t connected to GAM right now/i)
+    expect(res.body.data.message).toMatch(/let your landlord know/i)
+    expect(res.body.data.message).toMatch(/balance stays the same/i)
+    expect(res.body.data.message).not.toMatch(/automatically|day or two|expire/i)
+    expect(res.body.data).not.toHaveProperty('expiresInDays')
+  })
+
+  it('a disconnected bank counts as no bank', async () => {
+    const f = await fixture()
+    await linkBank(f.landlordId, { status: 'disconnected' })
+    const res = await report(f)
+    expect(res.body.data.bankFeedLinked).toBe(false)
+    expect(res.body.data).not.toHaveProperty('expiresInDays')
+  })
+
+  it('a bank link whose sync is failing is told the same — and is not told the landlord never linked one', async () => {
+    const f = await fixture()
+    await linkBank(f.landlordId, { status: 'error' })
+    const res = await report(f)
+    expect(res.body.data.bankFeedLinked).toBe(false)
+    expect(res.body.data.message).not.toMatch(/hasn’t connected/i)
+    expect(res.body.data.message).toMatch(/right now/i)
+    expect(res.body.data).not.toHaveProperty('expiresInDays')
+  })
+
+  it('a bank linked but never read yet promises nothing automatic', async () => {
+    const f = await fixture()
+    await linkBank(f.landlordId, { synced: false })
+    const res = await report(f)
+    expect(res.body.data.bankFeedLinked).toBe(false)
+    expect(res.body.data.message).not.toMatch(/automatically/i)
+    expect(res.body.data).not.toHaveProperty('expiresInDays')
+  })
+
+  it('bank linked and read: GAM watches the feed and applies it automatically, with the 7-day window', async () => {
+    const f = await fixture()
+    await linkBank(f.landlordId)
+    const res = await report(f)
+    expect(res.body.data.bankFeedLinked).toBe(true)
+    expect(res.body.data.message).toMatch(/apply it automatically/i)
+    expect(res.body.data.expiresInDays).toBe(7)
+  })
+
+  // S655 review: the agent relays the reply. A double tap answered with only
+  // { id, alreadyReported } left it unable to tell a tenant at a company with
+  // no bank read to let the landlord know and keep the slip.
+  it('reported twice, no bank read: says it was already reported, with the same next step', async () => {
+    const f = await fixture()
+    const first = await report(f)
+    const again = await report(f)
+    expect(again.status).toBe(200)
+    expect(again.body.data).toMatchObject({ id: first.body.data.id, alreadyReported: true, bankFeedLinked: false })
+    expect(again.body.data.message).toMatch(/^You already reported this deposit\. /)
+    expect(again.body.data.message).toMatch(/let your landlord know you paid and keep your deposit slip/i)
+    expect(again.body.data.message).not.toMatch(/automatically|day or two|expire/i)
+    expect(again.body.data).not.toHaveProperty('expiresInDays')
+    expect((await db.query(`SELECT count(*)::int AS n FROM tenant_declared_deposits`)).rows[0].n).toBe(1)
+  })
+
+  it('reported twice, bank read: says it was already reported, and that GAM applies it, with the 7-day window', async () => {
+    const f = await fixture()
+    await linkBank(f.landlordId)
+    const first = await report(f)
+    const again = await report(f)
+    expect(again.body.data).toMatchObject({ id: first.body.data.id, alreadyReported: true, bankFeedLinked: true })
+    expect(again.body.data.message).toMatch(/^You already reported this deposit\. /)
+    expect(again.body.data.message).toMatch(/apply it automatically/i)
+    expect(again.body.data.message).not.toMatch(/Reported\./)
+    expect(again.body.data.expiresInDays).toBe(7)
+  })
+})
+
+describe('the report window knows before submitting whether GAM can watch', () => {
+  const ask = (f: Fx, leaseId = f.leaseId, token = f.token) =>
+    request(buildApp()).get(`/api/declared-deposits/feed/${leaseId}`).set('Authorization', `Bearer ${token}`)
+
+  it('no bank: says so, with no expiry window', async () => {
+    const f = await fixture()
+    const res = await ask(f)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual({ leaseId: f.leaseId, bankFeedLinked: false })
+  })
+
+  it('a bank GAM reads: says so, with the 7-day window', async () => {
+    const f = await fixture()
+    await linkBank(f.landlordId)
+    const res = await ask(f)
+    expect(res.body.data).toEqual({ leaseId: f.leaseId, bankFeedLinked: true, expiresInDays: 7 })
+  })
+
+  it('cannot ask about somebody else’s lease', async () => {
+    const mine = await fixture()
+    const theirs = await fixture()
+    await linkBank(theirs.landlordId)
+    const res = await ask(mine, theirs.leaseId)
+    expect(res.status).toBe(404)
+  })
+
+  it('only a tenant can ask', async () => {
+    const f = await fixture()
+    const res = await ask(f, f.leaseId, f.landlordToken)
+    expect(res.status).toBe(403)
+  })
+})
+
+describe('the tenant’s list of reports', () => {
+  it('says which lease each report is for, so the payments page can show it under that lease', async () => {
+    const f = await fixture()
+    await request(buildApp()).post('/api/declared-deposits')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash' })
+    const res = await request(buildApp()).get('/api/declared-deposits').set('Authorization', `Bearer ${f.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(1)
+    expect(res.body.data[0].lease_id).toBe(f.leaseId)
+  })
+
+  it('says whether GAM is watching that landlord’s bank for each report', async () => {
+    const f = await fixture()
+    await request(buildApp()).post('/api/declared-deposits')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash' })
+    const get = () => request(buildApp()).get('/api/declared-deposits').set('Authorization', `Bearer ${f.token}`)
+    expect((await get()).body.data[0].bank_feed_linked).toBe(false)
+    await linkBank(f.landlordId)
+    expect((await get()).body.data[0].bank_feed_linked).toBe(true)
+  })
+})

@@ -125,6 +125,11 @@ describe('ringing a stay at the register', () => {
     expect(Number(b.total_amount)).toBe(120)
     expect(Number(res.body.data.total)).toBe(120)
     expect(b.pos_transaction_id).toBe(res.body.data.id)
+    // 10/2 (review): paid in full at the counter — the arrival-day run has
+    // nothing left to bill (it billed the whole stay again before).
+    const [paid] = await query<any>(`SELECT balance_billed_at, balance_paid_at FROM unit_bookings WHERE unit_id = $1`, [f.unitId])
+    expect(paid.balance_billed_at).not.toBeNull()
+    expect(paid.balance_paid_at).not.toBeNull()
   })
 
   it('refuses a stay with no site or date, and takes no money', async () => {

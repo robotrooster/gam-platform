@@ -317,6 +317,12 @@ export function SignPage() {
   // packages/shared/src/standaloneScroll.ts for the whole story.
   useEffect(() => unlockScrollIfStandalone(), [])
   const navigate = useNavigate()
+  // S655: documents still to sign after this one, when the park-wide sender
+  // opened a batch (?queue=id,id,…) — document ids from the screen, or the
+  // landlord's own signing tokens from the morning reminder email (so its one
+  // link works without a session). Read on every document change.
+  const signingQueue: string[] = (new URLSearchParams(window.location.search).get('queue') || '')
+    .split(',').map(x => x.trim()).filter(x => /^([0-9a-f-]{36}|[0-9a-f]{64})$/i.test(x))
   const [stage, setStage]             = useState<Stage>('signing')
   const [fieldValues, setFieldValues] = useState<Record<string,string>>({})
   const [submitError, setSubmitError] = useState<string | null>(null)
@@ -407,30 +413,14 @@ export function SignPage() {
   useEffect(() => { if (data?.document?.basePdfUrl && setupDone) loadPdf(data.document.basePdfUrl) }, [data, setupDone])
 
   // RENEWAL (Nic: "people get billed on their due date according to how the
-  // landlord sets the property"). The lease this one renews: its last day and
-  // due day decide the renewal's first bill, and the deposits it holds are what
-  // page 8 does not bill again. Read with the landlord's session; a signing link
-  // opened without one states the rule rather than a date it cannot know.
-  const priorLeaseId: string | null = data?.document?.renewsLeaseId ?? null
-  const { data: priorLease } = useQuery(['renewal-prior', priorLeaseId],
-    () => authFetch('/leases/' + priorLeaseId).then(r => r.ok ? r.json() : null).then((r: any) => r?.success ? r.data : null),
-    { enabled: !!priorLeaseId && !!tok() && !isSignerToken(token), retry: false })
-  // How each money box on this form is tagged (deposit, prepaid or the
-  // landlord's fee). A renewal bills a deposit-type box only for its increase,
-  // and the tag decides which boxes those are — the same tag the server reads
-  // when it stamps page 8 and bills the increase. Without it (no session, or no
-  // access to the template) each box keeps the default for its type, as the
-  // server does for an untagged box.
-  const renewalTemplateId: string | null = priorLeaseId ? (data?.document?.templateId ?? null) : null
-  const { data: boxKinds } = useQuery(['renewal-box-kinds', renewalTemplateId],
-    () => authFetch('/esign/templates/' + renewalTemplateId).then(r => r.ok ? r.json() : null).then((r: any) => {
-      const kinds: Record<string, string> = {}
-      for (const f of (r?.success ? (r.data?.fields ?? []) : []) as any[]) {
-        if (f.leaseColumn && f.moneyKind) kinds[f.leaseColumn] = f.moneyKind
-      }
-      return kinds
-    }),
-    { enabled: !!renewalTemplateId && !!tok() && !isSignerToken(token), retry: false })
+  // landlord sets the property"). S655: a NEW LEASE for a household already
+  // living here. The lease it follows — its last day, due day and the deposits
+  // it holds — and how each money box on this form is tagged come from the
+  // server with the document (GET /sign renewal_billing), so the page is right
+  // whether it was opened signed in or from the emailed link. A deposit-type box
+  // bills only its increase, by the same tag the server reads when it stamps
+  // page 8 and bills the increase.
+  const renewalBilling: any = data?.renewalBilling ?? null
   useEffect(() => { if (pdfRef.current && setupDone) renderPageImperative(pdfRef.current, currentPage) }, [currentPage, setupDone])
 
   // ── S648 (Nic): PAGE 8 ADDS ITSELF UP AS YOU TYPE ─────────────────────
@@ -466,14 +456,16 @@ export function SignPage() {
     const carried: Record<string, number> = {}
     if (renewal) {
       carried['security_deposit'] = Number(data.carriedDeposit || 0)
-      for (const fee of (priorLease?.fees ?? []) as any[]) {
-        if (fee.dueTiming !== 'move_in' || !fee.isRefundable || fee.feeType === 'security_deposit') continue
-        carried[fee.feeType] = (carried[fee.feeType] ?? 0) + Number(fee.amount || 0)
+      for (const d of (data.renewalBilling?.carriedDeposits ?? []) as any[]) {
+        if (d.feeType === 'security_deposit') continue
+        carried[d.feeType] = (carried[d.feeType] ?? 0) + Number(d.amount || 0)
       }
     }
+    const kinds: Record<string, string> = Object.fromEntries(
+      ((data.renewalBilling?.boxMoneyKinds ?? []) as any[]).map((k: any) => [k.leaseColumn, k.moneyKind]))
     const billedOnRenewal = (tag: string, raw: string | null) => {
       const typed = moneyBoxValue(raw)
-      if (!renewal || ((boxKinds ?? {})[tag] ?? defaultMoneyKind(tag as FeeType)) === 'fee') return typed
+      if (!renewal || (kinds[tag] ?? defaultMoneyKind(tag as FeeType)) === 'fee') return typed
       return Math.max(0, Math.round((typed - (carried[tag] ?? 0)) * 100) / 100)
     }
     if (renewal) {
@@ -526,7 +518,7 @@ export function SignPage() {
       if ((fieldValues[f.id] ?? '') !== want[f.leaseColumn]) updates[f.id] = want[f.leaseColumn]
     }
     if (Object.keys(updates).length) setFieldValues(prev => ({ ...prev, ...updates }))
-  }, [data, fieldValues, priorLease, boxKinds])
+  }, [data, fieldValues])
   useEffect(() => {
     if (!data?.fields) return
     const today = new Date().toLocaleDateString()
@@ -653,9 +645,11 @@ export function SignPage() {
   const allFilled = unfilledRequired.length === 0
 
   // RENEWAL: what the first bill under this lease will be, from the terms as
-  // typed right now — the same arithmetic the bill run uses.
+  // typed right now — the same arithmetic the bill run uses, against the
+  // current lease's last day and due day from the server. A month-to-month has
+  // no last day yet: it ends the day before the new lease starts.
   const renewalLine: string | null = (() => {
-    if (!doc?.renewsLeaseId) return null
+    if (!doc?.renewsLeaseId || !renewalBilling) return null
     const valOf = (col: string) => {
       const f = allFields.find((x:any) => x.leaseColumn === col && (fieldValues[x.id] ?? x.value ?? '').trim() !== '')
       return f ? (fieldValues[f.id] ?? f.value) : null
@@ -664,15 +658,10 @@ export function SignPage() {
     const start = startRaw ? (/^\d{4}-\d{2}-\d{2}/.test(startRaw) ? startRaw.slice(0, 10) : documentDateToIso(startRaw)) : null
     const rent = moneyBoxValue(valOf('rent_amount'))
     if (!start || !(rent > 0)) return null
-    // The first bill depends on the current lease's last day and due day.
-    // Without them (a signing link opened with no session) a specific date
-    // could be wrong — a changed due day makes a bridge this page cannot see —
-    // so the note states only the rule.
-    if (!priorLease) return null
-    const priorDay = priorLease.rentDueDay != null ? Number(priorLease.rentDueDay) : null
+    const priorDay = renewalBilling.previousDueDay != null ? Number(renewalBilling.previousDueDay) : null
     const newDay = parseDueDay(valOf('rent_due_day')) ?? priorDay ?? 1
     const sched = renewalSchedule({
-      oldEnd: priorLease.endDate ? String(priorLease.endDate).slice(0, 10) : dayBefore(start),
+      oldEnd: renewalBilling.previousEndDate ? String(renewalBilling.previousEndDate).slice(0, 10) : dayBefore(start),
       oldDueDay: priorDay ?? newDay, newStart: start, newDueDay: newDay, rent,
     })
     return renewalBillingSummary(sched, rent, newDay)
@@ -798,10 +787,19 @@ export function SignPage() {
           This is part of a packet — {leftForMe} more document{leftForMe===1?'':'s'} in it still need your signature.
         </div>
       )}
+      {/* S655: the park-wide sender's one pass — the rest of the new leases it
+          drafted ride along in ?queue=, in space order. */}
+      {!nextForMe?.mine?.token && signingQueue.length > 0 && (
+        <div style={{ fontSize:'.85rem', color:'var(--text-2)', maxWidth:440, lineHeight:1.5 }}>
+          {signingQueue.length} more new lease{signingQueue.length===1?'':'s'} to sign in this batch.
+        </div>
+      )}
       <div style={{ display:'flex', gap:10, alignItems:'center', flexWrap:'wrap', justifyContent:'center' }}>
         {nextForMe && nextForMe.mine?.token
           ? <button className="btn btn-primary" onClick={()=>{ setStage('signing'); navigate('/sign/'+nextForMe.mine.token) }}>Next: {nextForMe.title} →</button>
-          : <button className="btn btn-primary" onClick={()=>navigate('/esign')}>Sign the next one</button>}
+          : signingQueue.length > 0
+            ? <button className="btn btn-primary" onClick={()=>{ setStage('signing'); navigate('/sign/'+signingQueue[0]+(signingQueue.length>1 ? '?queue='+signingQueue.slice(1).join(',') : '')) }}>Next new lease →</button>
+            : <button className="btn btn-primary" onClick={()=>navigate('/esign')}>Sign the next one</button>}
         <button className="btn btn-ghost" onClick={()=>navigate('/leases')}>Back to Leases</button>
       </div>
     </div>
@@ -882,7 +880,9 @@ export function SignPage() {
 
       {doc?.renewsLeaseId && (
         <div style={{ background:'var(--bg-2,#151a22)', border:'1px solid var(--border-0)', borderLeft:'3px solid var(--gold,#c9a227)', borderRadius:8, padding:'10px 12px', marginBottom:12, fontSize:'.8rem', color:'var(--text-1,#ddd)', lineHeight:1.5 }}>
-          <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>This is a renewal</div>
+          <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>A new lease for a household already living here</div>
+          The current lease keeps running until the day before this one starts, then ends on its own. From the start date
+          the household is billed this lease's rent whether or not they have signed; it stays open for their signature.{' '}
           {renewalLine ?? 'Rent picks up where the current lease\'s bills leave off, on the household\'s due dates, so no stretch is billed twice.'}
           {' '}Signing it bills no rent — only one-time money on it, like a deposit increase.
         </div>

@@ -38,10 +38,12 @@ import {
   documentDateToIso,
   isoToDocumentDate,
 } from '@gam/shared'
+// S655: new leases for a household already living there (renewals).
+import { NEW_LEASE_RENT_MODES, newLeaseRent, renewalSchedule, renewalBillingSummary, UNIT_TYPE_LABEL, humanize } from '@gam/shared'
 import { todayIn, dateIn } from '../lib/timezone'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth, requirePerm, userHasPerm } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { stampPdf } from '../services/pdfStamp'
@@ -317,9 +319,21 @@ async function canTenantsSignNewLease(
   newUnitId: string,
   newStartDate: string | Date,
   newEndDate: string | Date | null,
-  excludeLeaseId?: string
-): Promise<{ ok: boolean; reason?: string; conflictingTenantId?: string; conflictingLeaseId?: string }> {
+  // S655: one lease or several. A NEW LEASE for a household already living
+  // there passes the lease it follows too (renews_lease_id): that lease ends the
+  // day before the new one starts (services/renewalSuccessor), so it is not a
+  // double-booking — a month-to-month has no end date to compare until then.
+  // Every OTHER lease still counts, including a second new lease of the same one.
+  excludeLeaseIds?: string | Array<string | null | undefined>,
+  // S655 (Nic, 10/2: "imports are NEVER blocked"): tenants whose overlap with
+  // ANOTHER company's lease is theirs to settle when they sign — people whose
+  // own signature is what starts this lease (residentsWhoSignFirst). Their
+  // same-company overlaps still count.
+  opts: { residentDecides?: string[] } = {},
+): Promise<{ ok: boolean; reason?: string; conflictingTenantId?: string; conflictingLeaseId?: string; crossCompany?: boolean }> {
   if (!tenantIds.length) return { ok: false, reason: 'No tenants provided' }
+  const excluded = (Array.isArray(excludeLeaseIds) ? excludeLeaseIds : [excludeLeaseIds])
+    .filter((x): x is string => typeof x === 'string' && x.length > 0)
   // S654: compare calendar days as 'YYYY-MM-DD'. This mixed a field read at
   // UTC midnight with pg dates at local midnight, and a '-' (month-to-month)
   // end became an Invalid Date that never overlapped anything. '-' and blank
@@ -356,8 +370,8 @@ async function canTenantsSignNewLease(
       WHERE lt.tenant_id = $1
         AND lt.status IN ('active','pending_add')
         AND l.status IN ('active','pending')
-        AND ($2::uuid IS NULL OR l.id != $2)`,
-      [tenantId, excludeLeaseId || null])
+        AND NOT (l.id = ANY($2::uuid[]))`,
+      [tenantId, excluded])
 
     for (const l of actives as any[]) {
       if (bucketFor(l.unit_type) !== newBucket) continue
@@ -375,9 +389,17 @@ async function canTenantsSignNewLease(
         (aEnd === null || aEnd >= bStart) &&
         (bEnd === null || bEnd >= aStart)
       if (overlaps) {
+        // S655: another company's unit is that company's business — say there
+        // is an overlapping lease elsewhere, never which unit it is.
+        const sameAccount = l.landlord_id === newUnit.landlord_id || !!(await queryOne<{ one: number }>(
+          `SELECT 1 AS one FROM account_companies($1::uuid) c(id) WHERE c.id = $2`, [newUnit.landlord_id, l.landlord_id]))
+        if (!sameAccount && opts.residentDecides?.includes(tenantId)) continue
         return {
+          crossCompany: !sameAccount,
           ok: false,
-          reason: `Tenant ${l.tenant_name} has an overlapping ${newBucket} lease (Unit ${l.unit_number}).`,
+          reason: sameAccount
+            ? `Tenant ${l.tenant_name} has an overlapping ${newBucket} lease (Unit ${l.unit_number}).`
+            : `Tenant ${l.tenant_name} has an overlapping ${newBucket} lease with another company. It has to end before this lease starts.`,
           conflictingTenantId: tenantId,
           conflictingLeaseId: l.id
         }
@@ -385,6 +407,22 @@ async function canTenantsSignNewLease(
     }
   }
   return { ok: true }
+}
+
+/**
+ * S655 (Nic, 10/2): "Imports are NEVER blocked." The tenants on this document
+ * who sign their own lease first — another company's resident, whose own
+ * signature is what starts it (services/newLeaseInvite tenantsNeedingOwnSignature).
+ * A lease they still hold with that other company is theirs to settle when
+ * they sign; it never refuses the landlord's send or signature, because
+ * nothing issues before they sign. Their own signature still checks it. If the
+ * check fails, nobody is excused (the refusal stands).
+ */
+async function residentsWhoSignFirst(documentId: string, tenants: Array<{ userId: string; tenantId: string } | null>): Promise<string[]> {
+  const { tenantsNeedingOwnSignature } = await import('../services/newLeaseInvite')
+  const waiting = await tenantsNeedingOwnSignature(documentId).catch(() => [] as Array<{ userId: string }>)
+  const users = new Set(waiting.map(w => w.userId))
+  return tenants.filter((t): t is { userId: string; tenantId: string } => !!t && users.has(t.userId)).map(t => t.tenantId)
 }
 
 async function checkPlatformBlock(userId: string): Promise<{ ok: boolean; reason?: string }> {
@@ -1406,7 +1444,9 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   const allTenantIds = tenantSigners.map((t:any) => t.tenant_id)
   // S654: '-' is month to month (no end date), as on the send and sign paths.
   const endForOverlap = vals.end_date && String(vals.end_date).trim() !== '-' ? vals.end_date : null
-  const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startDate, endForOverlap)
+  // S655: a new lease for a household already living there is not an overlap
+  // with the lease it follows (renewalSuccessor ends that one the day before).
+  const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startDate, endForOverlap, [doc.renews_lease_id])
   if (!ov.ok) throw new AppError(409, ov.reason || 'Lease overlap detected')
 
   // Status: future start → pending, today/past → active.
@@ -1530,6 +1570,21 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // the open items over, and the renewal-tendency report to count it.
   if (doc.renews_lease_id) {
     await client.query('UPDATE leases SET supersedes_lease_id = $2 WHERE id = $1', [lease.id, doc.renews_lease_id])
+    // The landlord's cap on how much paid-ahead money each bill may use goes
+    // with the household: the hand-off moves the paid-ahead credit to this
+    // lease, and with no cap here the first bill would swallow all of it.
+    await client.query(
+      `UPDATE leases SET prepaid_monthly_draw = COALESCE(prepaid_monthly_draw,
+              (SELECT prepaid_monthly_draw FROM leases WHERE id = $2))
+        WHERE id = $1`, [lease.id, doc.renews_lease_id])
+    // S655 (Nic, 10/2): the lease it follows ends the day before this one
+    // starts. Normally that is written on the start date by the 2am job; a new
+    // lease signed on or after its own start date closes it now.
+    if (lease.status === 'active') {
+      const { closePredecessorOfStartedRenewals } = await import('../services/renewalSuccessor')
+      await closePredecessorOfStartedRenewals(client.query.bind(client),
+        { renewalLeaseId: lease.id, today: todayIn(doc.property_timezone) })
+    }
   }
 
   // ── S638 (Nic): A SIGNED LEASE CLOSES THE INVITE ────────────────────────
@@ -1684,6 +1739,19 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
            WHERE lt.lease_id = $1 AND lt.tenant_id = hsc.tenant_id)`,
     [lease.id, doc.unit_id])
 
+
+  // S655 (decisions 10/2): a balance owed on the landlord's OLD system, from
+  // the tenant CSV's draft roster, posts as ONE charge on this household's
+  // lease now that the lease exists — on the landlord's signature, or on the
+  // resident's own when they belong to another company. Same shape as a
+  // landlord-entered carried balance; nothing posts for anyone without one.
+  if (!doc.renews_lease_id) {
+    const { postRosterOpeningBalance } = await import('../services/newLeaseInvite')
+    await postRosterOpeningBalance(client, {
+      leaseId: lease.id, unitId: doc.unit_id, landlordId: doc.landlord_id,
+      tenantId: primarySigner.tenant_id, timezone: doc.property_timezone ?? null,
+    })
+  }
 
   // ────────────────────────────────────────────────────────────────────────
   // S111: PM company leasing fee. If this property is contracted to a PM
@@ -3690,6 +3758,107 @@ esignRouter.post('/standalone-documents', requireAuth, requirePerm('esign.templa
   }
 })
 
+/**
+ * S655: can this NEW LEASE (a document with renews_lease_id) still be canceled?
+ * Null when it can; otherwise the refusal, in plain words with the next step.
+ * ONE test for POST /documents/:id/void and for the new-lease window
+ * (GET /documents/renewal-context → can_cancel), so the window never shows a
+ * button the server refuses.
+ *
+ *   - From its START DATE it cannot be canceled: the 2am job has already ended
+ *     the lease before it (the day before the start), and the hand-off may still
+ *     be waiting on that lease's last bill. Canceling then left the old lease
+ *     ending with nothing to hand over to — the next night's lease-end job read
+ *     it as a MOVE-OUT: unit vacant, a deposit return drafted, work trade paused,
+ *     on a household that is staying. So the test is the start date itself (by
+ *     the property's calendar and by the database's, whichever has turned first —
+ *     the 2am job reads the database's), not whether the hand-off has finished.
+ *     From then on it ends like any lease in force, with a leaving date.
+ *   - The lease before it has already ended some other way (expired): canceling
+ *     would leave the household on no lease. Not when it ENDED EARLY
+ *     ('terminated' — the household ended it, or another lease replaced it):
+ *     nobody is staying on to take the new lease up, so canceling it is exactly
+ *     right (and the 15-minute job does it anyway when nobody has signed —
+ *     scheduler.processNewLeaseSignings).
+ *   - Anyone in the household has signed it: a document a tenant has signed is
+ *     never thrown away (S558 — lib/voidDocument refuses it too).
+ *   - Money has already been paid on it: lib/unwindIssuedLease refuses the void
+ *     (a refund, not a void). Without this the window offered Cancel and the
+ *     press came back "Create a superseding document instead" — no next step
+ *     for staff.
+ */
+async function newLeaseCancelRefusal(
+  q: (sql: string, params?: any[]) => Promise<{ rows: any[] }>,
+  doc: { id: string; status?: string | null; lease_id?: string | null; renews_lease_id?: string | null },
+): Promise<string | null> {
+  if (!doc.renews_lease_id) return null
+  if (doc.status === 'voided') return 'This new lease was already canceled. Nothing else to do.'
+  if (doc.status === 'completed') {
+    return 'Everyone has signed this new lease, so it can\'t be canceled. If they are leaving, write down the day they go ' +
+      'on the new lease once it starts (Leases → Change → They\'re leaving on…).'
+  }
+  let startWords: string | null = null
+  let unitLabel: string | null = null
+  let endedEarly = false
+  if (doc.lease_id) {
+    const nl = (await q(
+      `SELECT to_char(nl.start_date, 'YYYY-MM-DD') AS start_date, nl.status, nl.signed_by_landlord,
+              ol.status AS old_status, (nl.start_date <= CURRENT_DATE) AS reached_by_db,
+              COALESCE(p.timezone, 'America/Phoenix') AS tz,
+              COALESCE(u.display_label, u.unit_number) AS unit_label
+         FROM leases nl
+         JOIN leases ol ON ol.id = $2
+         LEFT JOIN units u ON u.id = nl.unit_id
+         LEFT JOIN properties p ON p.id = u.property_id
+        WHERE nl.id = $1`,
+      [doc.lease_id, doc.renews_lease_id])).rows[0]
+    const live = !!nl && (nl.status === 'pending' || nl.status === 'active')
+    // A new lease whose household ended the lease before it early never comes
+    // into force unless one of them signs it (activatePendingLeases), so its
+    // start date passing alone does not make it theirs.
+    const tookOver = live && (nl.status === 'active'
+      || (nl.signed_by_landlord === true && nl.old_status !== 'terminated' && (nl.reached_by_db === true
+            || (!!nl.start_date && nl.start_date <= todayIn(nl.tz)))))
+    if (tookOver) {
+      return `This new lease took over on ${longDateWords(nl.start_date)} — the lease before it ended the day before — ` +
+        `so it can't be canceled: the household would be left with no lease. If they are leaving, write down the day ` +
+        `they go on the new lease: Leases → Change → They're leaving on…`
+    }
+    if (live && nl.old_status !== 'active' && nl.old_status !== 'terminated') {
+      return `The lease before this one has already ended, so canceling this new lease would leave the household with no lease. ` +
+        `If they are leaving, write down the day they go on the new lease once it starts on ${longDateWords(nl.start_date)} ` +
+        `(Leases → Change → They're leaving on…).`
+    }
+    if (nl?.start_date) startWords = longDateWords(nl.start_date)
+    unitLabel = nl?.unit_label ?? null
+    endedEarly = nl?.old_status === 'terminated'
+  }
+  const tenantSigned = (await q(
+    `SELECT 1 FROM lease_document_signers
+      WHERE document_id = $1 AND signed_at IS NOT NULL AND role NOT IN ('landlord','witness') LIMIT 1`,
+    [doc.id])).rows[0]
+  if (tenantSigned) {
+    return 'Someone in the household has signed this new lease, so it can\'t be canceled — a lease a tenant has signed is ' +
+      `never thrown away. If they are leaving, write down the day they go on the new lease once it starts` +
+      `${startWords ? ` on ${startWords}` : ''} (Leases → Change → They're leaving on…).`
+  }
+  // Money that actually moved on it (a deposit top-up paid early, say):
+  // lib/unwindIssuedLease refuses the void over it, because undoing a payment is
+  // a refund, not a void. The same test (renewalSuccessor.moneyPaidOnLease), in
+  // words that say who can do it.
+  if (doc.lease_id) {
+    const { moneyPaidOnLease, sayMoney } = await import('../services/renewalSuccessor')
+    const paid = await moneyPaidOnLease(q, doc.lease_id)
+    if (paid) {
+      return `${sayMoney(paid.total)} has already been paid on this new lease, so it can't be canceled until that money is ` +
+        `returned or moved — GAM support does that. Email support@goldassetmanagement.com and name ` +
+        `${unitLabel ?? 'the space'}. ` +
+        (endedEarly ? 'Once it is sorted, the new lease is canceled for you.' : 'Once it is sorted, you can cancel it here.')
+    }
+  }
+  return null
+}
+
 // S534 (Nic): one-minute renewal support. One fetch gives the decision
 // modal everything it needs: any OPEN renewal draft for the lease (so a
 // second visit OPENS the draft instead of dead-ending on the duplicate-
@@ -3699,18 +3868,53 @@ esignRouter.post('/standalone-documents', requireAuth, requirePerm('esign.templa
 esignRouter.get('/documents/renewal-context/:leaseId', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const lease = await queryOne<any>(
-      `SELECT id, landlord_id FROM leases WHERE id = $1`, [req.params.leaseId])
+      `SELECT l.id, l.landlord_id, u.property_id, COALESCE(p.timezone, 'America/Phoenix') AS tz
+         FROM leases l JOIN units u ON u.id = l.unit_id JOIN properties p ON p.id = u.property_id
+        WHERE l.id = $1`, [req.params.leaseId])
     if (!lease) throw new AppError(404, 'Lease not found')
     if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Not your lease')
+    await assertWorksAtProperty(req.user, lease.property_id, 'That household is at a property you do not work at.')
 
     const openDraft = await queryOne<any>(`
-      SELECT d.id, d.status, d.title,
+      SELECT d.id, d.status, d.title, d.lease_id,
              (SELECT s.status FROM lease_document_signers s
                WHERE s.document_id = d.id AND s.role = 'landlord'
-               ORDER BY s.order_index LIMIT 1) AS landlord_signer_status
+               ORDER BY s.order_index LIMIT 1) AS landlord_signer_status,
+             -- S655: what the window says about it — when it starts and whether
+             -- the household has signed (a landlord-signed one is issued).
+             to_char(nl.start_date, 'YYYY-MM-DD') AS start_date,
+             nl.rent_amount::text AS rent_amount,
+             EXISTS (SELECT 1 FROM lease_document_signers t
+                      WHERE t.document_id = d.id AND t.role NOT IN ('landlord','witness')
+                        AND t.status = 'signed') AS tenant_signed,
+             -- The start-date test newLeaseCancelRefusal uses: once its start
+             -- date has come it is the household's lease (the window says so).
+             (nl.signed_by_landlord IS TRUE AND nl.status IN ('pending','active')
+               AND (nl.status = 'active' OR nl.start_date <= GREATEST(CURRENT_DATE, $2::date))) AS started
         FROM lease_documents d
+        LEFT JOIN leases nl ON nl.id = d.lease_id
        WHERE d.renews_lease_id = $1 AND d.status NOT IN ('completed','voided')
-       ORDER BY d.created_at DESC LIMIT 1`, [lease.id])
+       ORDER BY d.created_at DESC LIMIT 1`, [lease.id, todayIn(lease.tz)])
+    // Whether the window may offer "Cancel the new lease": exactly the void
+    // route's test (newLeaseCancelRefusal), and when it can't, that route's own
+    // words — so the button is never shown only to be refused.
+    if (openDraft) {
+      const refusal = !userHasPerm(req.user, 'esign.void')
+        // The cancel route needs this permission (requirePerm('esign.void')).
+        ? 'Canceling a new lease needs the "Void documents" permission. Ask the account owner to cancel it, or to give you that permission.'
+        : await newLeaseCancelRefusal(
+            async (sql, params) => ({ rows: await query<any>(sql, params) }),
+            { id: openDraft.id, status: openDraft.status, lease_id: openDraft.lease_id, renews_lease_id: lease.id })
+      openDraft.can_cancel = refusal === null
+      openDraft.cancel_refusal = refusal
+    }
+    // S655: a new lease everyone has signed, waiting to start (or started).
+    // Nothing to decide — the window just says so.
+    const signedNext = openDraft ? null : await queryOne<any>(`
+      SELECT to_char(s.start_date, 'YYYY-MM-DD') AS start_date, s.rent_amount::text AS rent_amount
+        FROM leases s
+       WHERE s.supersedes_lease_id = $1 AND s.status IN ('pending','active') AND s.signed_by_landlord = TRUE
+       ORDER BY s.start_date LIMIT 1`, [lease.id])
     const prior = await queryOne<any>(`
       SELECT d.template_id, t.name AS template_name
         FROM lease_documents d
@@ -3720,6 +3924,7 @@ esignRouter.get('/documents/renewal-context/:leaseId', requireAuth, requirePerm(
 
     res.json({ success: true, data: {
       openDraft: openDraft || null,
+      signedNext: signedNext || null,
       priorTemplateId: prior?.template_id ?? null,
       priorTemplateName: prior?.template_name ?? null,
     }})
@@ -3735,211 +3940,287 @@ esignRouter.get('/documents/renewal-context/:leaseId', requireAuth, requirePerm(
 // copy forward at execution via renews_lease_id. The draft is left in
 // 'draft' status: the landlord reviews + sends from the E-Sign page
 // (landlord signs first per S28).
-esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
-  const client = await getClient()
-  try {
-    // GAM standard (Nic, S531): THE LEASE IS THE DOCUMENT. This endpoint
-    // collects NO terms — no rent, no dates. It drafts the document with
-    // identity + carry-over facts prefilled; the landlord types the new
-    // rent/dates INTO the drafted lease during their landlord-first
-    // signing pass (the sign flow's field inputs + required-field
-    // validation are the only place terms are entered).
-    const { leaseId, templateId } = req.body
-    if (!leaseId) throw new AppError(400, 'leaseId required')
-    if (!templateId) throw new AppError(400, 'templateId required — pick the lease template to draft from')
+//
+// S655 (Nic, 10/2): this is "a new lease" for a household already living
+// there — month-to-month included. It takes over on its start date and bills
+// its rent whether or not the tenant signs; the lease it follows ends the day
+// before (services/renewalSuccessor). The tenant reads it as a new lease, never
+// as an ending, so the document is titled "New Lease". The same drafting backs
+// the park-wide sender below.
 
-    const lease = await queryOne<any>(`
-      SELECT l.*, u.unit_number, u.unit_type, u.property_id, p.name AS property_name,
-             p.street1, p.city, p.state, p.zip, p.timezone AS property_timezone
-      FROM leases l
-      JOIN units u ON u.id = l.unit_id
-      JOIN properties p ON p.id = u.property_id
-      WHERE l.id=$1`, [leaseId])
-    if (!lease) throw new AppError(404, 'Lease not found')
-    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Not your lease')
-    if (lease.status !== 'active') throw new AppError(409, `Cannot renew: lease is ${lease.status}, not active`)
+/**
+ * S655: a staff member scoped to some properties drafts, previews and reads new
+ * leases only there — the same rule routes/leases.ts holds. The park-wide
+ * preview lists every resident's name and rent, so it must never answer for a
+ * park the caller does not work at. Owners are unrestricted.
+ */
+async function assertWorksAtProperty(user: any, propertyId: string | null | undefined, refusal: string): Promise<void> {
+  const { getScopedPropertyIds } = await import('../middleware/auth')
+  const scoped = await getScopedPropertyIds(user)
+  if (scoped && (!propertyId || !scoped.includes(propertyId))) throw new AppError(403, refusal)
+}
 
-    // A second open renewal draft for the same lease is a mistake.
-    const openDraft = await queryOne<any>(`
-      SELECT id FROM lease_documents
-      WHERE renews_lease_id=$1 AND status NOT IN ('completed','voided')`, [leaseId])
-    if (openDraft) throw new AppError(409, 'A renewal draft already exists for this lease — void it first or send it')
+/** A unit type as the landlord reads it ('rv_spot' → "RV Spot"), never the raw value. */
+function unitTypeWords(t: string | null | undefined): string {
+  if (!t) return 'any kind of'
+  return (UNIT_TYPE_LABEL as Record<string, string>)[t] ?? humanize(t)
+}
 
-    const tmpl = await queryOne<any>(
-      'SELECT * FROM lease_templates WHERE id=$1 AND landlord_id IN (SELECT account_companies($2))', [templateId, lease.landlord_id])
-    if (!tmpl) throw new AppError(404, 'Template not found')
-    if (!tmpl.base_pdf_url) throw new AppError(400, 'Template has no base PDF')
-    // S535: templates are per unit type — refuse an incompatible pairing
-    // (universal NULL templates fit every unit).
-    if (tmpl.unit_type && lease.unit_type && tmpl.unit_type !== lease.unit_type) {
-      throw new AppError(400,
-        `Template "${tmpl.name}" is for ${tmpl.unit_type.replace('_', ' ')} units — this unit is ${String(lease.unit_type).replace('_', ' ')}. Pick a matching or universal template.`)
-    }
-    // S535: property-locked templates only draft at THEIR property —
-    // the form's own text names the property, so the wrong pairing is
-    // always a mistake.
-    if (tmpl.property_id && tmpl.property_id !== lease.property_id) {
-      throw new AppError(400,
-        `Template "${tmpl.name}" is locked to another property — this unit is at ${lease.property_name}. Pick that property's template or an unlocked one.`)
-    }
-    // The new terms are entered in the document, so the template must carry
-    // the fields the completion chain requires.
-    const requiredCols = await query<any>(
-      `SELECT DISTINCT lease_column FROM lease_template_fields
-       WHERE template_id=$1 AND lease_column IN ('rent_amount','start_date')`, [templateId])
-    if ((requiredCols as any[]).length < 2) {
-      throw new AppError(400, 'Template must include Rent Amount and Start Date fields — the new terms are set in the drafted lease itself')
-    }
+/** "January 1, 2027" from 'YYYY-MM-DD'. */
+function longDateWords(iso: string): string {
+  const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number)
+  return new Date(Date.UTC(y, m - 1, d))
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
 
-    // Signers = landlord + the current active roster, same roles.
-    // S630: signing routes per property, so an on-site manager signs for their
-    // own property without the portfolio login. Falls back to the account email.
-    const landlordUser = await landlordSigningContact(
-      lease.landlord_id, { propertyId: lease.property_id ?? null, unitId: lease.unit_id ?? null })
-    if (!landlordUser) throw new AppError(500, 'Landlord user not found')
-    const roster = await query<any>(`
-      SELECT lt.role, u.id AS user_id, u.first_name, u.last_name, u.email, u.phone
-      FROM lease_tenants lt
-      JOIN tenants t ON t.id = lt.tenant_id
-      JOIN users u ON u.id = t.user_id
-      WHERE lt.lease_id=$1 AND lt.status='active'
-      ORDER BY CASE lt.role WHEN 'primary' THEN 0 ELSE 1 END`, [leaseId])
-    if ((roster as any[]).length === 0) throw new AppError(409, 'Lease has no active tenants to renew with')
-    const signers = [
-      { userId: landlordUser.userId, role: 'landlord', name: landlordUser.name, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
-      ...(roster as any[]).map((r: any, i: number) => ({
-        userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`,
-        email: r.email, phone: r.phone, orderIndex: i + 2,
-      })),
-    ]
+/** A lease's status as words a landlord reads. */
+const LEASE_STATUS_WORDS: Record<string, string> = {
+  pending: 'not started yet', expired: 'over', terminated: 'ended', draft: 'still a draft',
+}
 
-    // Prefill: identity + carried-over settings ONLY. The new terms
-    // (rent_amount / start_date / end_date / lease_type) stay blank —
-    // the landlord fills them in the document.
-    const primary = (roster as any[])[0]
-    const prefillValues: Record<string, string> = {
-      tenant_name:      `${primary.first_name} ${primary.last_name}`,
-      tenant_email:     primary.email || '',
-      // S641 (Nic): "Nobody who's signing the landlord side of the legal
-      // document signs Oak Park Motel and RV. They sign their name as the agent
-      // of the landlord. So it needs to show the printed version of the name of
-      // the person signing."
-      //
-      // This used to reach past the signing contact and take the ACCOUNT
-      // OWNER's name, on the reasoning that delegating delivery does not change
-      // who the landlord is. True of the landlord as a PARTY — and irrelevant
-      // to this box, which sits under a signature line and must name whoever
-      // actually put ink on it. Once a property routes signing to an on-site
-      // manager, the old behavior printed the owner's name over somebody
-      // else's signature. `name` already resolves to the property's signer when
-      // one is named, and to the owner otherwise.
-      landlord_name:    landlordUser.name,
-      unit_number:      lease.unit_number,
-      property_name:    lease.property_name || '',
-      property_address: [lease.street1, lease.city, lease.state, lease.zip].filter(Boolean).join(', '),
-      rent_due_day:     String(lease.rent_due_day ?? 1),
-      auto_renew:       lease.auto_renew ? 'true' : 'false',
-      notice_days_required:   String(lease.notice_days_required ?? 30),
-      expiration_notice_days: String(lease.expiration_notice_days ?? 60),
-    }
-    if (lease.auto_renew && lease.auto_renew_mode) prefillValues.auto_renew_mode = lease.auto_renew_mode
+/**
+ * Draft (but do not send) a new lease for the household on `leaseId`. The
+ * single path leaves the start date and rent to the landlord's signing pass
+ * (defaults below); the park-wide sender passes both. Every refusal is one
+ * plain sentence with the next step.
+ */
+async function draftNewLeaseForHousehold(user: any, opts: {
+  leaseId: string; templateId: string
+  startIso?: string | null; rentAmount?: number | null
+}): Promise<any> {
+  const { leaseId, templateId } = opts
+  const lease = await queryOne<any>(`
+    SELECT l.*, u.unit_number, u.unit_type, u.property_id, p.name AS property_name,
+           p.street1, p.city, p.state, p.zip, p.timezone AS property_timezone
+    FROM leases l
+    JOIN units u ON u.id = l.unit_id
+    JOIN properties p ON p.id = u.property_id
+    WHERE l.id=$1`, [leaseId])
+  if (!lease) throw new AppError(404, 'Lease not found')
+  if (!canManageLandlordResource(user, lease.landlord_id)) throw new AppError(403, 'Not your lease')
+  await assertWorksAtProperty(user, lease.property_id, 'That household is at a property you do not work at.')
+  if (lease.status !== 'active') {
+    throw new AppError(409,
+      `This lease is ${LEASE_STATUS_WORDS[lease.status] ?? 'not in force'}, so there is nothing for a new lease to follow on from.`)
+  }
+  // A stay booked at the front desk is a guest's stay with a check-out date,
+  // not a resident's lease — it is changed from the booking, never re-leased.
+  if (lease.lease_source === 'booking_draft') {
+    throw new AppError(409,
+      'This is a stay booked at the front desk, not a resident\'s lease. Change its dates or rate from the booking instead.')
+  }
+  // S655: they told the desk they are leaving. A new lease and a move-out
+  // cannot both be true; the desk mark is undone first, on purpose.
+  if (lease.move_out_notice_at && lease.end_date) {
+    throw new AppError(409,
+      `Unit ${lease.unit_number} is down as leaving on ${isoToDocumentDate(String(dateIso(lease.end_date)))}. ` +
+      `If they are staying, call that off first (Leases → Change → Leaving date — change or call off), then start the new lease.`)
+  }
 
-    // S535 (Nic): CROSS-TEMPLATE renewal — the landlord may renew onto an
-    // entirely different/updated template ("change in form"). Prefill
-    // EVERY lease column derivable from the predecessor so a new form's
-    // bound fields populate automatically; anything underivable (e.g.
-    // custom_text, a fee the old lease never had) is typed by the
-    // landlord during their signing pass — the tagged-field completeness
-    // gate moved from /send to the landlord's sign submit.
-    if (lease.lease_type) prefillValues.lease_type = lease.lease_type
-    // S535: late fees deliberately NOT carried from the predecessor —
-    // they stamp from the CURRENT (property, unit type) policy inside
-    // createDocumentRecord ('N/A' when the class has no policy row).
-    // Utility responsibilities → 'tenant' / 'landlord' (UTILITY_ROW_SPECS
-    // treats 'tenant' as tenant_responsible=TRUE).
-    const utilRows = await query<{ utility_type: string; tenant_responsible: boolean }>(
-      `SELECT utility_type, tenant_responsible FROM lease_utility_responsibilities WHERE lease_id=$1`, [leaseId])
-    const UTIL_TAG: Record<string, string> = {
-      water: 'utility_water_responsibility', gas: 'utility_gas_responsibility',
-      electric: 'utility_electric_responsibility', sewer: 'utility_sewer_responsibility',
-      trash: 'utility_trash_responsibility',
-    }
-    for (const u of utilRows as any[]) {
-      const tag = UTIL_TAG[u.utility_type]
-      if (tag) prefillValues[tag] = u.tenant_responsible ? 'tenant' : 'landlord'
-    }
+  // A second open new-lease draft for the same lease is a mistake.
+  const openDraft = await queryOne<any>(`
+    SELECT id FROM lease_documents
+    WHERE renews_lease_id=$1 AND status NOT IN ('completed','voided')`, [leaseId])
+  if (openDraft) {
+    throw new AppError(409,
+      'A new lease for this household is already in progress. Open it from Leases → Change → New lease from a date… to finish or cancel it.')
+  }
+  // ...and one already signed by everyone, waiting to start, is too.
+  const { newLeaseFollowing } = await import('../services/renewalSuccessor')
+  const following = await newLeaseFollowing(async (sql, params) => ({ rows: await query<any>(sql, params) }), leaseId)
+  if (following) {
+    throw new AppError(409,
+      `This household already has a new lease starting ${longDateWords(following.start_date)}.`)
+  }
 
-    // S534 (Nic): the renewal defaults to the predecessor's terms — the
-    // landlord quick-edits what changed in the doc and signs. Rent
-    // defaults to the CURRENT rent (raise it in the doc if it changes);
-    // this also satisfies the send route's all-tagged-fields-have-values
-    // check so draft → auto-send → sign flows without a stop.
-    prefillValues.rent_amount = Number(lease.rent_amount).toFixed(2)
+  const tmpl = await queryOne<any>(
+    'SELECT * FROM lease_templates WHERE id=$1 AND landlord_id IN (SELECT account_companies($2))', [templateId, lease.landlord_id])
+  if (!tmpl) throw new AppError(404, 'Template not found')
+  if (!tmpl.base_pdf_url) throw new AppError(400, 'Template has no base PDF')
+  // S535: templates are per unit type — refuse an incompatible pairing
+  // (universal NULL templates fit every unit).
+  if (tmpl.unit_type && lease.unit_type && tmpl.unit_type !== lease.unit_type) {
+    throw new AppError(400,
+      `Template "${tmpl.name}" is for ${unitTypeWords(tmpl.unit_type)} spaces — this space is ${unitTypeWords(lease.unit_type)}. Pick a matching or universal template.`)
+  }
+  // S535: property-locked templates only draft at THEIR property —
+  // the form's own text names the property, so the wrong pairing is
+  // always a mistake.
+  if (tmpl.property_id && tmpl.property_id !== lease.property_id) {
+    throw new AppError(400,
+      `Template "${tmpl.name}" is locked to another property — this unit is at ${lease.property_name}. Pick that property's template or an unlocked one.`)
+  }
+  // The new terms are entered in the document, so the template must carry
+  // the fields the completion chain requires.
+  const requiredCols = await query<any>(
+    `SELECT DISTINCT lease_column FROM lease_template_fields
+     WHERE template_id=$1 AND lease_column IN ('rent_amount','start_date')`, [templateId])
+  if ((requiredCols as any[]).length < 2) {
+    throw new AppError(400, 'Template must include Rent Amount and Start Date fields — the new terms are set in the drafted lease itself')
+  }
 
-    // Term mirrors the predecessor — new start = the day after the old
-    // end, same duration (a 1-year lease renews as 1 year). Prefills are
-    // defaults, not law: the landlord edits them in the doc like any
-    // field. Month-to-month predecessors (no end date) get no date
-    // defaults.
-    if (lease.start_date && lease.end_date) {
-      const oldStart = new Date(lease.start_date)
-      const oldEnd   = new Date(lease.end_date)
-      const newStart = new Date(oldEnd); newStart.setDate(newStart.getDate() + 1)
-      const newEnd   = new Date(newStart.getTime() + (oldEnd.getTime() - oldStart.getTime()))
-      prefillValues.start_date = newStart.toLocaleDateString('en-US')
-      prefillValues.end_date   = newEnd.toLocaleDateString('en-US')
-    } else if (!lease.end_date) {
-      // S535 (Nic): month-to-month predecessor — '-' is the explicit
-      // "no end date" entry (execution maps it to end_date NULL +
-      // lease_type month_to_month).
-      // S536 (Nic): the renewal takes effect at the end of NEXT month —
-      // MTM changes need 30 days' notice, so one drafted today runs from
-      // the first of the month after next (drafted Jul 10 → effective
-      // Sep 1; signing deadline Aug 30 via the scheduler's 1-day-prior
-      // rule). Default only — the landlord edits it in the doc.
-      // S654: counted from the PROPERTY's today, not the API host's clock.
+  // Signers = landlord + the current active roster, same roles.
+  // S630: signing routes per property, so an on-site manager signs for their
+  // own property without the portfolio login. Falls back to the account email.
+  const landlordUser = await landlordSigningContact(
+    lease.landlord_id, { propertyId: lease.property_id ?? null, unitId: lease.unit_id ?? null })
+  if (!landlordUser) throw new AppError(500, 'Landlord user not found')
+  const roster = await query<any>(`
+    SELECT lt.role, u.id AS user_id, u.first_name, u.last_name, u.email, u.phone
+    FROM lease_tenants lt
+    JOIN tenants t ON t.id = lt.tenant_id
+    JOIN users u ON u.id = t.user_id
+    WHERE lt.lease_id=$1 AND lt.status='active'
+    ORDER BY CASE lt.role WHEN 'primary' THEN 0 ELSE 1 END`, [leaseId])
+  if ((roster as any[]).length === 0) throw new AppError(409, 'This lease has nobody on it to sign a new lease.')
+  const signers = [
+    { userId: landlordUser.userId, role: 'landlord', name: landlordUser.name, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
+    ...(roster as any[]).map((r: any, i: number) => ({
+      userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`,
+      email: r.email, phone: r.phone, orderIndex: i + 2,
+    })),
+  ]
+
+  // Prefill: identity + carried-over settings ONLY. The new terms
+  // (rent_amount / start_date / end_date / lease_type) stay blank —
+  // the landlord fills them in the document.
+  const primary = (roster as any[])[0]
+  const prefillValues: Record<string, string> = {
+    tenant_name:      `${primary.first_name} ${primary.last_name}`,
+    tenant_email:     primary.email || '',
+    // S641 (Nic): "Nobody who's signing the landlord side of the legal
+    // document signs Oak Park Motel and RV. They sign their name as the agent
+    // of the landlord. So it needs to show the printed version of the name of
+    // the person signing."
+    //
+    // This used to reach past the signing contact and take the ACCOUNT
+    // OWNER's name, on the reasoning that delegating delivery does not change
+    // who the landlord is. True of the landlord as a PARTY — and irrelevant
+    // to this box, which sits under a signature line and must name whoever
+    // actually put ink on it. Once a property routes signing to an on-site
+    // manager, the old behavior printed the owner's name over somebody
+    // else's signature. `name` already resolves to the property's signer when
+    // one is named, and to the owner otherwise.
+    landlord_name:    landlordUser.name,
+    unit_number:      lease.unit_number,
+    property_name:    lease.property_name || '',
+    property_address: [lease.street1, lease.city, lease.state, lease.zip].filter(Boolean).join(', '),
+    rent_due_day:     String(lease.rent_due_day ?? 1),
+    auto_renew:       lease.auto_renew ? 'true' : 'false',
+    notice_days_required:   String(lease.notice_days_required ?? 30),
+    expiration_notice_days: String(lease.expiration_notice_days ?? 60),
+  }
+  if (lease.auto_renew && lease.auto_renew_mode) prefillValues.auto_renew_mode = lease.auto_renew_mode
+
+  // S535 (Nic): CROSS-TEMPLATE renewal — the landlord may renew onto an
+  // entirely different/updated template ("change in form"). Prefill
+  // EVERY lease column derivable from the predecessor so a new form's
+  // bound fields populate automatically; anything underivable (e.g.
+  // custom_text, a fee the old lease never had) is typed by the
+  // landlord during their signing pass — the tagged-field completeness
+  // gate moved from /send to the landlord's sign submit.
+  if (lease.lease_type) prefillValues.lease_type = lease.lease_type
+  // S535: late fees deliberately NOT carried from the predecessor —
+  // they stamp from the CURRENT (property, unit type) policy inside
+  // createDocumentRecord ('N/A' when the class has no policy row).
+  // Utility responsibilities → 'tenant' / 'landlord' (UTILITY_ROW_SPECS
+  // treats 'tenant' as tenant_responsible=TRUE).
+  const utilRows = await query<{ utility_type: string; tenant_responsible: boolean }>(
+    `SELECT utility_type, tenant_responsible FROM lease_utility_responsibilities WHERE lease_id=$1`, [leaseId])
+  const UTIL_TAG: Record<string, string> = {
+    water: 'utility_water_responsibility', gas: 'utility_gas_responsibility',
+    electric: 'utility_electric_responsibility', sewer: 'utility_sewer_responsibility',
+    trash: 'utility_trash_responsibility',
+  }
+  for (const u of utilRows as any[]) {
+    const tag = UTIL_TAG[u.utility_type]
+    if (tag) prefillValues[tag] = u.tenant_responsible ? 'tenant' : 'landlord'
+  }
+
+  // S534 (Nic): the renewal defaults to the predecessor's terms — the
+  // landlord quick-edits what changed in the doc and signs. Rent
+  // defaults to the CURRENT rent (raise it in the doc if it changes);
+  // this also satisfies the send route's all-tagged-fields-have-values
+  // check so draft → auto-send → sign flows without a stop.
+  // S655: the park-wide sender sets the new rent for everyone at once.
+  prefillValues.rent_amount = (opts.rentAmount != null ? Number(opts.rentAmount) : Number(lease.rent_amount)).toFixed(2)
+
+  // Term mirrors the predecessor — new start = the day after the old
+  // end, same duration (a 1-year lease renews as 1 year). Prefills are
+  // defaults, not law: the landlord edits them in the doc like any
+  // field. S655: the park-wide sender names the start date; a fixed term
+  // keeps its length from there, a month-to-month stays month to month.
+  const oldStartIso = lease.start_date ? dateIso(lease.start_date) : null
+  const oldEndIso = lease.end_date ? dateIso(lease.end_date) : null
+  // The term the household SIGNED. A lease holding over has an end date carried
+  // past it (renewalSuccessor.holdOverUntilNewLeaseStarts); measured from that,
+  // each new lease would grow by the holdover.
+  const signedEndIso = lease.holdover_signed_end_date ? dateIso(lease.holdover_signed_end_date) : oldEndIso
+  if (oldEndIso && oldStartIso && signedEndIso) {
+    const termDays = isoDayDiff(oldStartIso, signedEndIso)
+    // From the day after the lease they are on now ends (held over or not).
+    const newStartIso = opts.startIso ?? isoAddDays(oldEndIso, 1)
+    prefillValues.start_date = isoToDocumentDate(newStartIso)
+    prefillValues.end_date   = isoToDocumentDate(isoAddDays(newStartIso, termDays))
+  } else if (!oldEndIso) {
+    // S535 (Nic): month-to-month predecessor — '-' is the explicit
+    // "no end date" entry (execution maps it to end_date NULL +
+    // lease_type month_to_month).
+    // S536 (Nic): the new lease takes effect at the end of NEXT month by
+    // default — one drafted today runs from the first of the month after
+    // next (drafted Jul 10 → effective Sep 1). Default only — the landlord
+    // edits it in the doc. GAM never gates on legality (S655): no notice
+    // rule decides the date.
+    // S654: counted from the PROPERTY's today, not the API host's clock.
+    if (opts.startIso) {
+      prefillValues.start_date = isoToDocumentDate(opts.startIso)
+    } else {
       const [ty, tm] = todayIn(lease.property_timezone).split('-').map(Number)
       const effIdx = (tm - 1) + 2
       prefillValues.start_date = isoToDocumentDate(
         `${ty + Math.floor(effIdx / 12)}-${String((effIdx % 12) + 1).padStart(2, '0')}-01`)
-      prefillValues.end_date = '-'
     }
+    prefillValues.end_date = '-'
+  }
 
-    // S534/S535 (Nic): show the CARRIED deposits on the renewal document,
-    // per fee_type (security_deposit, pet_deposit, key_deposit, …) so a
-    // template binding any deposit field populates with its own carried
-    // amount. Custody never moves on a renewal (the fee rows copy forward
-    // at execution, tagged, AFTER the move-in invoice); the per-type
-    // delta guard in buildLeaseFromDocument means these values can never
-    // double-charge — only an INCREASE bills, and only the difference.
-    const depositRows = await query<{ fee_type: string; total: string }>(`
-      SELECT fee_type, SUM(amount)::text AS total FROM lease_fees
-       WHERE lease_id=$1 AND due_timing='move_in' AND is_refundable=TRUE
-       GROUP BY fee_type`, [leaseId])
-    for (const d of depositRows as any[]) {
-      const total = Number(d.total || 0)
-      if (total > 0) prefillValues[d.fee_type] = total.toFixed(2).replace(/\.00$/, '')
-    }
-    if (!prefillValues.security_deposit) prefillValues.security_deposit = 'N/A'
+  // S534/S535 (Nic): show the CARRIED deposits on the renewal document,
+  // per fee_type (security_deposit, pet_deposit, key_deposit, …) so a
+  // template binding any deposit field populates with its own carried
+  // amount. Custody never moves on a renewal (the fee rows copy forward
+  // at execution, tagged, AFTER the move-in invoice); the per-type
+  // delta guard in buildLeaseFromDocument means these values can never
+  // double-charge — only an INCREASE bills, and only the difference.
+  const depositRows = await query<{ fee_type: string; total: string }>(`
+    SELECT fee_type, SUM(amount)::text AS total FROM lease_fees
+     WHERE lease_id=$1 AND due_timing='move_in' AND is_refundable=TRUE
+     GROUP BY fee_type`, [leaseId])
+  for (const d of depositRows as any[]) {
+    const total = Number(d.total || 0)
+    if (total > 0) prefillValues[d.fee_type] = total.toFixed(2).replace(/\.00$/, '')
+  }
+  if (!prefillValues.security_deposit) prefillValues.security_deposit = 'N/A'
 
-    // Carry recurring + move-out/other lease_fees forward as prefills (they
-    // bill on their own timing — nothing re-bills at completion). Move-in
-    // fees are excluded: refundable deposits copy at execution instead, and
-    // non-refundable move-in fees don't recur on a renewal.
-    const feeRows = await query<any>(`
-      SELECT fee_type, amount FROM lease_fees
-      WHERE lease_id=$1 AND due_timing != 'move_in'`, [leaseId])
-    for (const f of feeRows as any[]) {
-      prefillValues[f.fee_type] = String(f.amount)
-    }
+  // Carry recurring + move-out/other lease_fees forward as prefills (they
+  // bill on their own timing — nothing re-bills at completion). Move-in
+  // fees are excluded: refundable deposits copy at execution instead, and
+  // non-refundable move-in fees don't recur on a renewal.
+  const feeRows = await query<any>(`
+    SELECT fee_type, amount FROM lease_fees
+    WHERE lease_id=$1 AND due_timing != 'move_in'`, [leaseId])
+  for (const f of feeRows as any[]) {
+    prefillValues[f.fee_type] = String(f.amount)
+  }
 
+  const client = await getClient()
+  try {
     await client.query('BEGIN')
     const doc = await createDocumentRecord(client, {
       landlordId: lease.landlord_id,
       templateId,
       unitId: lease.unit_id,
       leaseId: null,
-      title: `Lease Renewal — Unit ${lease.unit_number}${lease.property_name ? ' — ' + lease.property_name : ''}`,
+      // S655: the household reads "New Lease", never an ending.
+      title: `New Lease — Unit ${lease.unit_number}${lease.property_name ? ' — ' + lease.property_name : ''}`,
       basePdfUrl: tmpl.base_pdf_url,
       documentType: 'original_lease',
       targetLeaseTenantId: null,
@@ -3953,15 +4234,261 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
       `UPDATE lease_renewal_requests SET status='approved', resolved_at=NOW(), updated_at=NOW()
        WHERE lease_id=$1 AND status='requested'`, [leaseId])
     await client.query('COMMIT')
-    res.status(201).json({ success: true, data: doc })
+    return doc
   } catch (e) {
-    await client.query('ROLLBACK')
-    next(e)
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
   } finally {
     client.release()
   }
+}
+
+/** A pg DATE (local midnight) or 'YYYY-MM-DD…' as 'YYYY-MM-DD'. */
+function dateIso(v: string | Date): string {
+  if (v instanceof Date) {
+    return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`
+  }
+  return String(v).slice(0, 10)
+}
+function isoAddDays(iso: string, days: number): string {
+  const [y, m, d] = iso.split('-').map(Number)
+  const t = new Date(Date.UTC(y, m - 1, d + days))
+  return t.toISOString().slice(0, 10)
+}
+function isoDayDiff(a: string, b: string): number {
+  const [ay, am, ad] = a.split('-').map(Number)
+  const [by, bm, bd] = b.split('-').map(Number)
+  return Math.round((Date.UTC(by, bm - 1, bd) - Date.UTC(ay, am - 1, ad)) / 86400000)
+}
+
+esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+  try {
+    // GAM standard (Nic, S531): THE LEASE IS THE DOCUMENT. This endpoint
+    // collects NO terms — no rent, no dates. It drafts the document with
+    // identity + carry-over facts prefilled; the landlord types the new
+    // rent/dates INTO the drafted lease during their landlord-first
+    // signing pass (the sign flow's field inputs + required-field
+    // validation are the only place terms are entered).
+    const { leaseId, templateId } = req.body
+    if (!leaseId) throw new AppError(400, 'leaseId required')
+    if (!templateId) throw new AppError(400, 'templateId required — pick the lease template to draft from')
+    const doc = await draftNewLeaseForHousehold(req.user, { leaseId, templateId })
+    res.status(201).json({ success: true, data: doc })
+  } catch (e) {
+    next(e)
+  }
 })
 
+// ── S655: THE PARK-WIDE SENDER ───────────────────────────────────────────
+//
+// Nic's direction: "new lease for every resident at this property, starting
+// <date>, rent <amount or +%>", the landlord signs each in one pass.
+//
+// Preview first (nothing is written): one row per household on a lease in force
+// at the property, with the new rent, the form it will be drafted on, and —
+// where it cannot go — the reason in plain words. Create drafts the ones the
+// landlord kept, sends each to the landlord's own signing queue (no email: they
+// are at the screen), and returns them in space order for the one-pass signing.
+
+const newLeaseBatchSchema = z.object({
+  propertyId: z.string().uuid(),
+  startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  rentMode: z.enum(NEW_LEASE_RENT_MODES),
+  rentValue: z.number().finite().optional().nullable(),
+  /** Create only: the households the landlord kept in. */
+  leaseIds: z.array(z.string().uuid()).optional(),
+})
+
+interface NewLeaseBatchRow {
+  leaseId: string
+  unitNumber: string
+  tenantNames: string
+  currentRent: number
+  newRent: number
+  templateId: string | null
+  templateName: string | null
+  ok: boolean
+  reason: string | null
+  /** A household that holds over first: "Signed through <end>; stays on today's rent until <start − 1>."
+   *  (Already holding over: "Its signed lease ended <end>; it stays on today's rent until <start − 1>.") */
+  note: string | null
+}
+
+async function planNewLeaseBatch(user: any, body: z.infer<typeof newLeaseBatchSchema>): Promise<{
+  propertyName: string; startDate: string; rows: NewLeaseBatchRow[]
+}> {
+  const prop = await queryOne<any>(
+    `SELECT id, name, landlord_id, COALESCE(timezone, 'America/Phoenix') AS tz FROM properties WHERE id = $1`,
+    [body.propertyId])
+  if (!prop) throw new AppError(404, 'Property not found')
+  if (!canManageLandlordResource(user, prop.landlord_id)) throw new AppError(403, 'Not your property')
+  await assertWorksAtProperty(user, prop.id, 'That property is not one you work at.')
+  const start = leaseFieldDate(body.startDate)
+  if (!start) throw new AppError(400, 'The start date is not a real date.')
+  if (start <= todayIn(prop.tz)) throw new AppError(400, 'Pick a start date after today.')
+  if (body.rentMode === 'amount' && !(Number(body.rentValue) > 0)) {
+    throw new AppError(400, 'Type the new monthly rent.')
+  }
+  if (body.rentMode === 'percent' && !(Number.isFinite(Number(body.rentValue)) && Number(body.rentValue) > -100)) {
+    throw new AppError(400, 'Type the percent to raise each rent by.')
+  }
+
+  const leases = await query<any>(`
+    SELECT l.id, l.rent_amount::text AS rent_amount, l.unit_id, u.unit_type, l.lease_type,
+           to_char(l.end_date, 'YYYY-MM-DD') AS end_date,
+           -- The end the household SIGNED. A term already holding over has an
+           -- end date moved past it (renewalSuccessor.holdOverUntilNewLeaseStarts);
+           -- that held-over day is never called the end of the signed lease.
+           to_char(l.holdover_signed_end_date, 'YYYY-MM-DD') AS holdover_signed_end_date,
+           COALESCE(u.display_label, u.unit_number) AS unit_number,
+           (SELECT string_agg(TRIM(tu.first_name || ' ' || COALESCE(tu.last_name, '')), ', '
+                              ORDER BY CASE lt.role WHEN 'primary' THEN 0 ELSE 1 END)
+              FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id JOIN users tu ON tu.id = t.user_id
+             WHERE lt.lease_id = l.id AND lt.status = 'active') AS tenant_names,
+           (SELECT d.template_id FROM lease_documents d
+             WHERE d.lease_id = l.id AND d.status = 'completed' AND d.template_id IS NOT NULL
+             ORDER BY d.completed_at DESC NULLS LAST, d.created_at DESC LIMIT 1) AS prior_template_id
+      FROM leases l
+      JOIN units u ON u.id = l.unit_id
+     WHERE u.property_id = $1 AND l.status = 'active'
+       -- A stay booked at the front desk is a guest's, not a resident's lease.
+       AND l.lease_source <> 'booking_draft'
+     ORDER BY COALESCE(u.display_label, u.unit_number)`, [prop.id])
+
+  // The lease forms this property can use, with the two fields a new lease needs.
+  const templates = await query<any>(`
+    SELECT t.id, t.name, t.unit_type, t.property_id
+      FROM lease_templates t
+     WHERE t.landlord_id IN (SELECT account_companies($1)) AND t.is_active = TRUE
+       AND t.purpose = 'lease' AND t.base_pdf_url IS NOT NULL
+       AND (t.property_id IS NULL OR t.property_id = $2)
+       AND (SELECT COUNT(DISTINCT f.lease_column) FROM lease_template_fields f
+             WHERE f.template_id = t.id AND f.lease_column IN ('rent_amount','start_date')) = 2
+     ORDER BY lower(t.name)`, [prop.landlord_id, prop.id])
+  // Same priority as the single new-lease window: the form the current lease
+  // was signed on → one locked to this property for this kind of space → one
+  // for this kind of space → the only form there is.
+  const pick = (unitType: string | null, prior: string | null): any | null => {
+    const fits = (t: any) => !t.unit_type || !unitType || t.unit_type === unitType
+    if (prior) { const p = templates.find((t: any) => t.id === prior && fits(t)); if (p) return p }
+    const propExact = templates.find((t: any) => t.property_id === prop.id && t.unit_type && t.unit_type === unitType)
+    if (propExact) return propExact
+    const exact = templates.find((t: any) => t.unit_type && t.unit_type === unitType)
+    if (exact) return exact
+    const universal = templates.filter((t: any) => !t.unit_type)
+    return universal.length === 1 ? universal[0] : null
+  }
+
+  const { assertNewLeaseDates, newLeaseFollowing } = await import('../services/renewalSuccessor')
+  const rq = async (sql: string, params?: any[]) => ({ rows: await query<any>(sql, params) })
+  const rows: NewLeaseBatchRow[] = []
+  for (const l of leases as any[]) {
+    const currentRent = Number(l.rent_amount) || 0
+    const newRent = newLeaseRent(currentRent, body.rentMode, body.rentValue ?? null)
+    const t = pick(l.unit_type, l.prior_template_id)
+    let reason: string | null = null
+    const fixedTerm = !!l.end_date && l.lease_type !== 'month_to_month'
+    const signedEnd: string | null = l.holdover_signed_end_date ?? l.end_date
+    const heldOver = fixedTerm && !!l.holdover_signed_end_date
+    if (!l.tenant_names) reason = 'Nobody is on this lease to sign.'
+    else if (!t) reason = `No lease form fits ${unitTypeWords(l.unit_type)} spaces — add one on the GoldSign page.`
+    // A signed fixed term runs to its end (renewalSuccessor.assertNewLeaseDates).
+    // Said here in the list's own words: this household's new lease goes on its
+    // own, from its row, once the batch date is not inside their term.
+    else if (fixedTerm && signedEnd && start <= signedEnd) {
+      reason = `On a signed lease through ${longDateWords(signedEnd)}. Its new lease can start ${longDateWords(isoAddDays(signedEnd, 1))} — ` +
+        'send that one from its own row (Change → New lease from a date…).'
+    }
+    else {
+      const open = await queryOne<any>(
+        `SELECT 1 FROM lease_documents WHERE renews_lease_id = $1 AND status NOT IN ('completed','voided') LIMIT 1`, [l.id])
+      const following = open ? null : await newLeaseFollowing(rq, l.id)
+      if (open) reason = 'A new lease for this household is already in progress.'
+      else if (following) reason = `Already has a new lease starting ${longDateWords(following.start_date)}.`
+      else {
+        try { await assertNewLeaseDates(rq, { renewsLeaseId: l.id, startIso: start }) }
+        catch (e: any) { reason = e instanceof AppError ? e.message : 'This lease cannot take a new lease right now.' }
+      }
+    }
+    // A signed term that ends before the day before the start holds over at
+    // today's rent until then (decisions 10/2 #7) — said on its row. One already
+    // holding over says when its signed lease ended, never the held-over day.
+    const holdsOver = reason === null && fixedTerm && (heldOver || l.end_date < isoAddDays(start, -1))
+    rows.push({
+      leaseId: l.id, unitNumber: l.unit_number, tenantNames: l.tenant_names || '—',
+      currentRent, newRent, templateId: t?.id ?? null, templateName: t?.name ?? null,
+      ok: reason === null, reason,
+      note: !holdsOver ? null
+        : heldOver
+          ? `Its signed lease ended ${longDateWords(signedEnd!)}; it stays on today's rent until ${longDateWords(isoAddDays(start, -1))}.`
+          : `Signed through ${longDateWords(signedEnd!)}; stays on today's rent until ${longDateWords(isoAddDays(start, -1))}.`,
+    })
+  }
+  return { propertyName: prop.name, startDate: start, rows }
+}
+
+esignRouter.post('/documents/renewal-batch/preview', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+  try {
+    const parsed = newLeaseBatchSchema.safeParse(req.body)
+    if (!parsed.success) throw new AppError(400, 'Pick the property, the start date and how the rent is set.')
+    res.json({ success: true, data: await planNewLeaseBatch(req.user, parsed.data) })
+  } catch (e) { next(e) }
+})
+
+esignRouter.post('/documents/renewal-batch', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+  try {
+    const parsed = newLeaseBatchSchema.safeParse(req.body)
+    if (!parsed.success) throw new AppError(400, 'Pick the property, the start date and how the rent is set.')
+    // Planned again here, from the database as it is now — never from what the
+    // screen showed a minute ago.
+    const plan = await planNewLeaseBatch(req.user, parsed.data)
+    const keep = parsed.data.leaseIds ? new Set(parsed.data.leaseIds) : null
+    const created: Array<{ documentId: string; leaseId: string; unitNumber: string }> = []
+    const skipped: Array<{ leaseId: string; unitNumber: string; reason: string }> = []
+    for (const r of plan.rows) {
+      if (keep && !keep.has(r.leaseId)) continue
+      if (!r.ok || !r.templateId) { skipped.push({ leaseId: r.leaseId, unitNumber: r.unitNumber, reason: r.reason ?? 'Not ready.' }); continue }
+      try {
+        const doc = await draftNewLeaseForHousehold(req.user, {
+          leaseId: r.leaseId, templateId: r.templateId, startIso: plan.startDate, rentAmount: r.newRent })
+        // Into the landlord's own signing queue — no email, they are signing now,
+        // and one notification for the whole batch (below), not one per draft.
+        await autoSendDraftedDocument(doc.id, { emailFirstSigner: false, notifyFirstSigner: false })
+        created.push({ documentId: doc.id, leaseId: r.leaseId, unitNumber: r.unitNumber })
+      } catch (e: any) {
+        skipped.push({ leaseId: r.leaseId, unitNumber: r.unitNumber,
+          reason: e instanceof AppError ? e.message : 'Could not draft this one — try it again from its own row.' })
+        if (!(e instanceof AppError)) logger.error({ err: e, leaseId: r.leaseId }, '[esign] park-wide new lease draft failed')
+      }
+    }
+    // ONE notification per person the drafts wait on ("one email per thing",
+    // S652 — the same for the bell): "N new leases at <property> are waiting
+    // for your signature", never one per household.
+    if (created.length > 0) {
+      try {
+        const waiting = await query<{ user_id: string; n: number }>(
+          `SELECT user_id, COUNT(*)::int AS n FROM lease_document_signers
+            WHERE document_id = ANY($1::uuid[]) AND role = 'landlord' AND status = 'sent' AND user_id IS NOT NULL
+            GROUP BY user_id`, [created.map(c => c.documentId)])
+        const startWords = longDateWords(plan.startDate)
+        for (const w of waiting) {
+          await createNotification({
+            userId: w.user_id,
+            type: 'esign_request',
+            title: w.n === 1 ? 'A new lease is ready to sign' : `${w.n} new leases are ready to sign`,
+            body: `${plan.propertyName}: ${w.n === 1 ? 'a new lease' : `${w.n} new leases`} starting ${startWords} ` +
+              `${w.n === 1 ? 'is' : 'are'} waiting for your signature. Nothing reaches a household until you sign theirs.`,
+            data: { documentIds: created.map(c => c.documentId), propertyId: parsed.data.propertyId },
+            actionUrl: '/esign',
+          }).catch(err => logger.error({ err }, '[esign] park-wide new lease notification failed'))
+        }
+      } catch (err) {
+        logger.error({ err }, '[esign] park-wide new lease notification failed')
+      }
+    }
+    res.status(201).json({ success: true, data: { created, skipped } })
+  } catch (e) { next(e) }
+})
 esignRouter.post('/documents/addendum-add', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   const client = await getClient()
   try {
@@ -4965,11 +5492,30 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
         // S647: exclude this document's own lease for the same reason as the
         // sign path — after issuance the document has one, and re-sending it
         // must not read that as a conflict with itself.
-        const ov = await canTenantsSignNewLease(
+        // S655: and, for a new lease of a household already living there, the
+        // lease it follows (it ends the day before this one starts).
+        let ov = await canTenantsSignNewLease(
           allTenantIds, doc.unit_id, startVal,
           endVal && endVal.trim() !== '-' ? endVal : null,
-          doc.lease_id ?? undefined)
+          [doc.lease_id, doc.renews_lease_id])
+        // S655: another company's lease is the resident's to settle when they sign.
+        if (!ov.ok && ov.crossCompany) {
+          ov = await canTenantsSignNewLease(
+            allTenantIds, doc.unit_id, startVal,
+            endVal && endVal.trim() !== '-' ? endVal : null,
+            [doc.lease_id, doc.renews_lease_id],
+            { residentDecides: await residentsWhoSignFirst(doc.id, [primary, ...coTenants]) })
+        }
         if (!ov.ok) throw new AppError(409, `Cannot send: ${ov.reason}`)
+        // S655: the dates a new lease must make sense against the one it
+        // follows — until the landlord has signed (after that the terms are
+        // locked and the lease is issued; a re-send only re-mails it).
+        const startIso = leaseFieldDate(startVal)
+        if (doc.renews_lease_id && startIso && !doc.issued_at) {
+          const { assertNewLeaseDates } = await import('../services/renewalSuccessor')
+          await assertNewLeaseDates(async (sql, params) => ({ rows: await query<any>(sql, params) }),
+            { renewsLeaseId: doc.renews_lease_id, startIso })
+        }
 
         // ────────────────────────────────────────────────────────────────────
         // S622: SCREENING GATE (Business Terms §9.2).
@@ -5230,6 +5776,15 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
     ).then((r: any) => r.rows[0])
     if (!doc) throw new AppError(404, 'Document not found')
 
+    // S655: a NEW LEASE for a household already living there — the refusals
+    // live in newLeaseCancelRefusal, the same test the new-lease window reads
+    // (renewal-context can_cancel), so the window never offers a cancel this
+    // route would refuse.
+    if (doc.renews_lease_id) {
+      const refusal = await newLeaseCancelRefusal(client.query.bind(client), doc)
+      if (refusal) throw new AppError(409, refusal)
+    }
+
     // S29 item 6 / S558 / S581 / S647 / S652: every step of a void lives in
     // lib/voidDocument, so a script clearing a packet runs the same ones. Read
     // that file for why each exists — including the one that was missing.
@@ -5292,7 +5847,10 @@ export async function autoSendDraftedDocument(
   // draft sends a signing link for copies that get voided seconds later. The
   // S620 reason for the email — the tenant accepted while the landlord was out —
   // still holds on the ACCEPT path, which keeps the default.
-  opts: { emailFirstSigner?: boolean } = {},
+  // S655: the park-wide new-lease sender drafts one per household and sends the
+  // landlord ONE notification for the lot (one per draft put forty in the bell
+  // while they were already signing them).
+  opts: { emailFirstSigner?: boolean; notifyFirstSigner?: boolean } = {},
 ): Promise<boolean> {
   const emailFirstSigner = opts.emailFirstSigner !== false
   try {
@@ -5329,14 +5887,16 @@ export async function autoSendDraftedDocument(
       await emailSigningRequest(firstSigner.email, firstSigner.name, doc.title, unitLabel,
         doc.landlord_name, url, { landlordId: doc.landlord_id, documentId: doc.id })
     }
-    await createNotification({
-      userId: firstSigner.user_id,
-      type: 'esign_request',
-      title: 'Document ready to sign',
-      body: `${doc.landlord_name} sent you "${doc.title}" for ${unitLabel}.`,
-      data: { documentId: doc.id },
-      actionUrl: '/esign',
-    }).catch(() => {})
+    if (opts.notifyFirstSigner !== false) {
+      await createNotification({
+        userId: firstSigner.user_id,
+        type: 'esign_request',
+        title: 'Document ready to sign',
+        body: `${doc.landlord_name} sent you "${doc.title}" for ${unitLabel}.`,
+        data: { documentId: doc.id },
+        actionUrl: '/esign',
+      }).catch(() => {})
+    }
     await query("UPDATE lease_documents SET status='sent', sent_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
     await query("UPDATE lease_document_signers SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1",
       [firstSigner.id])
@@ -5611,6 +6171,74 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
       carried_rent = Number(cr?.rent_amount || 0)
     }
 
+    // S655: A NEW LEASE'S FIRST BILL, worked out here, for both signing pages.
+    // The tenant usually opens the emailed link with no session, and the page
+    // could not read the current lease to say when the new rent starts — so it
+    // stated a rule instead of the date. The facts come from the server now:
+    // the current lease's end and due day (a month-to-month has no end until the
+    // new lease starts; it then ends the day before), the terms on this
+    // document, the sentence the bill run's own arithmetic produces, and each
+    // money box's tag (deposit / prepaid / fee) so the landlord's page bills
+    // only a deposit INCREASE exactly as the server will.
+    let renewal_billing: any = null
+    if (doc.renews_lease_id) {
+      const prev = await queryOne<{ end_date: string | null; rent_due_day: number | null; rent_amount: string; status: string }>(
+        `SELECT to_char(end_date, 'YYYY-MM-DD') AS end_date, rent_due_day, rent_amount::text AS rent_amount, status
+           FROM leases WHERE id = $1`, [doc.renews_lease_id])
+      // The current lease's last day. While it is in force that is ALWAYS the
+      // day before the new start, whatever its printed end — a month-to-month
+      // ends then, and a signed term that runs out sooner holds over at its old
+      // rent until then (decisions 10/2 #7: never a gap). So it is sent as null
+      // — "the day before whatever start is typed" — because the landlord's page
+      // works the bill out again as the start box changes. A lease already over
+      // keeps its real last day.
+      const prevLastDay = prev && prev.status !== 'active' ? prev.end_date : null
+      const valueOf = (col: string): string | null => {
+        const f = (fields as any[]).find(x => x.lease_column === col && x.value != null && String(x.value).trim() !== '')
+        return f ? String(f.value) : null
+      }
+      const startIso = leaseFieldDate(valueOf('start_date'))
+      const rentNum = Number(String(valueOf('rent_amount') ?? '').replace(/[$,\s]/g, ''))
+      const prevDay = prev?.rent_due_day != null ? Number(prev.rent_due_day) : null
+      const newDay = parseDueDay(valueOf('rent_due_day')) ?? prevDay ?? 1
+      // A list, not a map: the wire camelizes object KEYS, and these keys are
+      // lease column names the page matches exactly.
+      const kinds = doc.template_id
+        ? await query<{ lease_column: string; money_kind: string }>(
+            `SELECT DISTINCT lease_column, money_kind FROM lease_template_fields
+              WHERE template_id = $1 AND money_kind IS NOT NULL AND lease_column IS NOT NULL`, [doc.template_id])
+        : []
+      let summary: string | null = null
+      if (startIso && rentNum > 0) {
+        const sched = renewalSchedule({
+          oldEnd: prevLastDay, oldDueDay: prevDay ?? newDay,
+          newStart: startIso, newDueDay: newDay, rent: rentNum,
+        })
+        summary = renewalBillingSummary(sched, rentNum, newDay)
+      }
+      // Every deposit-type box the current lease already holds, by type: page 8
+      // bills only an INCREASE over these.
+      const carriedDeposits = await query<{ fee_type: string; amount: string }>(
+        `SELECT fee_type, SUM(amount)::text AS amount FROM lease_fees
+          WHERE lease_id = $1 AND due_timing = 'move_in' AND is_refundable = TRUE
+          GROUP BY fee_type`, [doc.renews_lease_id])
+      renewal_billing = {
+        carried_deposits: carriedDeposits.map(r => ({ fee_type: r.fee_type, amount: Number(r.amount) })),
+        previous_end_date: prevLastDay,
+        previous_due_day: prevDay,
+        previous_rent: prev ? Number(prev.rent_amount) : null,
+        start_date: startIso,
+        // Its start date has come (by the property's calendar): it is the
+        // household's lease now, so the page says so instead of "nothing
+        // changes before then".
+        started: !!startIso && startIso <= todayIn(doc.property_timezone),
+        rent: rentNum > 0 ? rentNum : null,
+        due_day: newDay,
+        summary,
+        box_money_kinds: kinds,
+      }
+    }
+
     // S535: property late-fee POLICY for the signing UI — when set, the
     // doc's late-fee fields render locked (uniform terms per property,
     // fair-housing) and clicking one explains the policy + the exact
@@ -5650,7 +6278,7 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
           `SELECT p.rent_due_mode AS m FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
           [doc.unit_id]))?.m ?? 'fixed_day'
       : 'fixed_day'
-    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, property_late_fee, existing_tenancy, rent_due_mode, readOnly, waitingOn, packageDocs } })
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, renewal_billing, property_late_fee, existing_tenancy, rent_due_mode, readOnly, waitingOn, packageDocs } })
   } catch (e) { next(e) }
 })
 
@@ -5721,6 +6349,23 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     if (doc.status === 'voided') throw new AppError(400, 'Document has been voided')
     if (doc.status === 'execution_failed') throw new AppError(400, 'Document execution failed - contact your landlord')
 
+    // S655: a NEW LEASE whose lease before it ENDED EARLY while nobody in the
+    // household had signed it: nobody is staying on to take it up, it never
+    // starts, and it is being canceled (scheduler.processNewLeaseSignings). A
+    // signature now — from the emailed link, in the minutes before the cancel,
+    // or while money paid on it holds the cancel — would make it stand
+    // (someoneSignedNewLease) and bill a household that has gone.
+    if (doc.renews_lease_id && doc.lease_id && isTenantRole(signer.role)) {
+      const { followsLeaseEndedEarlyUnsigned } = await import('../services/renewalSuccessor')
+      const gone = (await client.query(
+        `SELECT 1 FROM leases nl WHERE nl.id = $1 AND ${followsLeaseEndedEarlyUnsigned('nl')}`, [doc.lease_id])).rows[0]
+      if (gone) {
+        throw new AppError(409,
+          'The lease this new lease was to follow has ended, so it can no longer be signed — it is being canceled. ' +
+          'If you meant to stay, contact the office.')
+      }
+    }
+
     // Re-check overlap on EVERY signing (another roommate may have taken a conflicting lease
     // between send time and now). Helpers below use non-transactional query() —
     // same pattern as platform block, acceptable race window.
@@ -5760,11 +6405,56 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       if (startVal) {
         const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
         // S535: '-' end date = month-to-month (no end date) — never cast it as a date.
-        const ov = await canTenantsSignNewLease(
+        // S655: a new lease for a household already living there does not
+        // overlap the lease it follows — that one ends the day before.
+        let ov = await canTenantsSignNewLease(
           allTenantIds, doc.unit_id, startVal,
           endVal && endVal.trim() !== '-' ? endVal : null,
-          doc.lease_id ?? undefined)
+          [doc.lease_id, doc.renews_lease_id])
+        // S655 (Nic, 10/2: "imports are NEVER blocked"): a lease the resident
+        // still holds with ANOTHER company never refuses the landlord's
+        // signature when the resident's own signature is what starts this one
+        // (nothing issues before they sign). Their signature is checked as
+        // always, and that is where they settle it.
+        //
+        // Nor anyone ELSE's signature on the lease. A household member signing
+        // ahead of them (this company's resident, listed first) was refused
+        // over a lease that is not theirs and that they cannot end, the refusal
+        // told them about the other person's home elsewhere, and the other
+        // person never reached their own turn — the lease sat with nothing on
+        // screen saying why. Only the signer's OWN overlap stops their
+        // signature. Nothing issues on theirs: the landlord's issuance waits
+        // for those residents, the last of their own signatures is what issues
+        // it (lastOwnSignature below), and the build re-checks every tenant.
+        const ownTenantId = isTenantRole(signer.role)
+          ? [primary, ...coTenants].find(t => t?.userId === signer.user_id)?.tenantId
+          : undefined
+        if (!ov.ok && ov.crossCompany) {
+          const decides = (await residentsWhoSignFirst(doc.id, [primary, ...coTenants]))
+            .filter(id => id !== ownTenantId)
+          ov = await canTenantsSignNewLease(
+            allTenantIds, doc.unit_id, startVal,
+            endVal && endVal.trim() !== '-' ? endVal : null,
+            [doc.lease_id, doc.renews_lease_id],
+            { residentDecides: decides })
+        }
+        // Their own home elsewhere, said to them in their own words, with what
+        // to do next. Which company and which unit stay unsaid.
+        if (!ov.ok && ov.crossCompany && ownTenantId && ov.conflictingTenantId === ownTenantId) {
+          throw new AppError(409,
+            'You still have a lease with another company that overlaps this one, so you can\'t sign this lease yet. ' +
+            'That lease has to end before this one starts: ask that landlord to end it, or ask this landlord to move this lease\'s start date.')
+        }
         if (!ov.ok) throw new AppError(409, ov.reason || 'Lease overlap detected')
+        // S655: the landlord's signature issues it, so the dates are checked
+        // against the lease it follows now, while the box can still be fixed.
+        // The tenant signs terms already locked — never refused for them.
+        const startIso = leaseFieldDate(startVal)
+        if (doc.renews_lease_id && signer.role === 'landlord' && startIso) {
+          const { assertNewLeaseDates } = await import('../services/renewalSuccessor')
+          await assertNewLeaseDates(client.query.bind(client) as any,
+            { renewsLeaseId: doc.renews_lease_id, startIso })
+        }
       }
     }
 
@@ -5976,7 +6666,61 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       }
     }
 
-    if (signer.role === 'landlord' && !isNoLeaseDoc) {
+    // ── S655 (Nic, 10/2): "NOBODY IS ATTACHED TO A COMPANY WITHOUT THEIR
+    // OWN SIGNATURE." ─────────────────────────────────────────────────────
+    //
+    // Imports are never blocked, so a lease can be drafted for somebody who
+    // already has a GAM account with ANOTHER company (a tenant of another
+    // park, a neighbor on its utilities, its invitee). For them the landlord's
+    // signature does not issue the lease: nothing is billed and they are not
+    // made this company's tenant until they sign it themselves. The all-signed
+    // path below builds and bills it then, exactly once. Everyone else is
+    // unchanged (S647: the landlord's signature issues). If the check itself
+    // fails, the lease waits for their signature — never the other way round.
+    const ownSignatureFirst = signer.role === 'landlord' && !isNoLeaseDoc
+      ? await (await import('../services/newLeaseInvite')).tenantsNeedingOwnSignature(doc.id)
+          .catch((err: any) => {
+            logger.error({ err, documentId: doc.id }, '[ESIGN] own-signature check failed — issuance waits for the tenants')
+            return [{ userId: '', name: '' }]
+          })
+      : []
+    if (ownSignatureFirst.length > 0) {
+      logger.info({ documentId: doc.id, waitingOn: ownSignatureFirst.length },
+        '[ESIGN] issuance waits for the residents\' own signatures (another company\'s account)')
+    }
+
+    // S655: and the LAST of those own signatures issues it. A mixed household
+    // (this company's resident beside another company's) waited at the
+    // landlord's signature only for the person whose consent was missing; once
+    // they sign, the lease issues and bills exactly as the landlord's signature
+    // would have — not when every co-tenant has finally signed. Only for a
+    // document that was held for exactly that reason (the person who just
+    // signed is one the check counts), the landlord has signed, it has not
+    // issued, and someone is still to sign (when nobody is, the all-signed
+    // path below builds it).
+    let lastOwnSignature = false
+    if (isTenantRole(signer.role) && signer.user_id && !isNoLeaseDoc && !doc.renews_lease_id
+        && (doc.document_type === 'original_lease' || doc.document_type === 'addendum_add')) {
+      try {
+        const st = await queryOne<{ held: boolean }>(
+          `SELECT (d.issued_at IS NULL AND d.finalized_at IS NULL
+                   AND EXISTS (SELECT 1 FROM lease_document_signers s
+                                WHERE s.document_id = d.id AND s.role = 'landlord' AND s.status = 'signed')
+                   AND EXISTS (SELECT 1 FROM lease_document_signers s
+                                WHERE s.document_id = d.id AND s.status <> 'signed')) AS held
+             FROM lease_documents d WHERE d.id = $1`, [doc.id])
+        if (st?.held) {
+          const { tenantsNeedingOwnSignature } = await import('../services/newLeaseInvite')
+          const counted = await tenantsNeedingOwnSignature(doc.id, { alsoSignedUserId: signer.user_id })
+          lastOwnSignature = counted.length > 0 && counted.every(p => p.userId === signer.user_id)
+        }
+      } catch (err: any) {
+        // The signature stands; the lease issues on the last signature instead.
+        logger.error({ err, documentId: doc.id }, '[ESIGN] own-signature re-check failed — issuance waits for every signer')
+      }
+    }
+
+    if (!isNoLeaseDoc && ((signer.role === 'landlord' && ownSignatureFirst.length === 0) || lastOwnSignature)) {
       try {
         const issued = await buildLeaseFromDocument(doc.id)
         if (!issued.deferred) await query(
@@ -6014,7 +6758,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         await createAdminNotification({
           severity: 'critical',
           category: 'esign_issuance_build_failed',
-          title:    `Lease did not issue on landlord signature for document ${doc.id}`,
+          title:    `Lease did not issue on ${lastOwnSignature ? "the resident's own" : 'landlord'} signature for document ${doc.id}`,
           body:     e.message,
           context:  { document_id: doc.id },
         }).catch(() => {})
@@ -6306,7 +7050,27 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
           nextSigningUrl = link.url
           needsSetup = link.needsSetup
         }
-        await emailSigningRequest(nextSignerAddress, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl, { landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
+        // S655: a new lease for a household already living there is announced
+        // as one — "nothing changes today; from <date> the new lease takes over"
+        // — never as a lease to start, and never as an ending.
+        const newLeaseTerms = doc.renews_lease_id && isTenantRole(nextSigner.role)
+          ? await queryOne<{ start_date: string; rent_amount: string; tz: string }>(
+              `SELECT to_char(l.start_date, 'YYYY-MM-DD') AS start_date, l.rent_amount::text AS rent_amount,
+                      COALESCE(p.timezone, 'America/Phoenix') AS tz
+                 FROM lease_documents d JOIN leases l ON l.id = d.lease_id
+                 LEFT JOIN units u ON u.id = l.unit_id LEFT JOIN properties p ON p.id = u.property_id
+                WHERE d.id = $1`, [doc.id])
+          : null
+        if (newLeaseTerms) {
+          const { emailNewLeaseSigningRequest } = await import('../services/email')
+          await emailNewLeaseSigningRequest(nextSignerAddress, nextSigner.name, unitLabel, doc.landlord_name, nextSigningUrl,
+            { startDate: newLeaseTerms.start_date, rent: newLeaseTerms.rent_amount,
+              // Signed on or after its start date: it is their lease already.
+              started: newLeaseTerms.start_date <= todayIn(newLeaseTerms.tz),
+              landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
+        } else {
+          await emailSigningRequest(nextSignerAddress, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl, { landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
+        }
         await createNotification({
           userId: nextSigner.user_id,
           type: 'esign_request',
@@ -6368,7 +7132,11 @@ esignRouter.get('/pending', requireAuth, async (req, res, next) => {
     const pending = await query<any>(`
       SELECT d.id as document_id, s.role, s.status, d.title, d.base_pdf_url,
         u.unit_number, p.name as property_name,
-        lu.first_name || ' ' || lu.last_name as landlord_name
+        lu.first_name || ' ' || lu.last_name as landlord_name,
+        -- S655: a new lease for the household they already live in. The tenant
+        -- portal shows it as a banner and a "next lease" card, never as the
+        -- signing lock-in a brand-new tenant gets.
+        d.renews_lease_id
       FROM lease_document_signers s
       JOIN lease_documents d ON d.id = s.document_id
       LEFT JOIN units u ON u.id = d.unit_id
@@ -6401,6 +7169,9 @@ esignRouter.get('/landlord-pending', requireAuth, requirePerm('leases.sign'), as
     const pending = await query<any>(`
       SELECT d.id as document_id, s.status, s.name, d.title, d.status as doc_status,
         u.unit_number, p.name as property_name, d.base_pdf_url,
+        -- S655: the portal tells a new lease for a sitting household apart by
+        -- this link, never by the title's wording.
+        d.renews_lease_id,
         (SELECT name FROM lease_document_signers WHERE document_id=d.id AND role='primary' LIMIT 1) as primary_tenant_name,
         (SELECT status FROM lease_document_signers WHERE document_id=d.id AND role='primary' LIMIT 1) as primary_tenant_status
       FROM lease_document_signers s

@@ -61,6 +61,18 @@ unitsRouter.get('/', async (req, res, next) => {
     const propertyFilter = req.query.propertyId
       ? `AND u.property_id = $${params.push(req.query.propertyId)}`
       : ''
+    // S655: a staff member assigned to particular properties (property
+    // manager, on-site manager or maintenance worker without "all
+    // properties") lists only those properties' units — and so only those
+    // residents. This list feeds the landlord Tenants page; before, such a
+    // staff member saw every resident in the company by name and email, and
+    // each row they could not open ended in "You can't open this resident".
+    // null = no property limit (owners, GAM admin, all-properties staff);
+    // [] = sees nothing (a staff login with no properties assigned).
+    const scopedPropertyIds = await getScopedPropertyIds(req.user)
+    const staffScopeFilter = scopedPropertyIds === null
+      ? ''
+      : `AND u.property_id = ANY($${params.push(scopedPropertyIds)}::uuid[])`
     // S605: retired units are EXCLUDED by default — fail-closed. Any frontend
     // that feeds a dropdown from this endpoint would otherwise silently offer a
     // unit the server will refuse to lease or book, and a long-lived park would
@@ -150,13 +162,24 @@ unitsRouter.get('/', async (req, res, next) => {
            WHERE pti.unit_id = u.id
              AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
              AND (pu2.tenant_invite_expires_at IS NULL
-                  OR pu2.tenant_invite_expires_at > NOW()))
+                  OR pu2.tenant_invite_expires_at > NOW()
+                  -- S655: a DRAFTED LEASE holds the unit whatever the
+                  -- invite's clock says. Since S647 the lease drafts at
+                  -- invite and waits for the landlord's signature; a
+                  -- landlord who took more than seven days to sign (or a
+                  -- resident who took more than seven to sign after him)
+                  -- saw the unit offered to a second household while that
+                  -- lease was still live. Only a voided or failed document
+                  -- lets it go.
+                  OR EXISTS (SELECT 1 FROM lease_documents hold_doc
+                              WHERE hold_doc.id = pti.draft_document_id
+                                AND hold_doc.status NOT IN ('voided', 'execution_failed'))))
         ) AS pending_invite_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       LEFT JOIN tenants pt ON pt.id = vuo.primary_tenant_id
-      WHERE 1=1 ${landlordFilter} ${propertyFilter} ${retiredFilter}
+      WHERE 1=1 ${landlordFilter} ${propertyFilter} ${staffScopeFilter} ${retiredFilter}
       ORDER BY p.name, u.unit_number
     `, params)
     res.json({ success: true, data: units })
@@ -231,7 +254,10 @@ unitsRouter.get('/:id', async (req, res, next) => {
       SELECT u.*, p.name AS property_name, p.type AS property_type,
         p.street1, p.city, p.state, p.zip,
         ul.first_name AS landlord_first, ul.last_name AS landlord_last,
-        te.ssi_ssdi, te.on_time_pay_enrolled, te.ach_verified,
+        -- S655 (Nic, 10/2): no SSI/SSDI flag. "That's our check for the flex
+        -- products" — GAM's eligibility check, kept GAM-side; this unit page
+        -- is the landlord's and staff's.
+        te.on_time_pay_enrolled, te.ach_verified,
         vuo.primary_first_name AS tenant_first,
         vuo.primary_last_name AS tenant_last,
         vuo.primary_email AS tenant_email,
@@ -295,6 +321,13 @@ unitsRouter.get('/:id', async (req, res, next) => {
     if (!unit) throw new AppError(404, 'Unit not found')
     if (!canAccessLandlordResource(req.user, unit.landlord_id)) {
       throw new AppError(403, 'Forbidden')
+    }
+    // S655: the same property limit as the list above. This page carries the
+    // resident's name, email and phone, so a staff member assigned to
+    // particular properties opens units at those properties only.
+    const scopedPropertyIds = await getScopedPropertyIds(req.user)
+    if (scopedPropertyIds !== null && !scopedPropertyIds.includes(unit.property_id)) {
+      throw new AppError(403, "This unit is at a property you're not assigned to. Ask the owner if you need it.")
     }
     res.json({ success: true, data: unit })
   } catch (e) { next(e) }

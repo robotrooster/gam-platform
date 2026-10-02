@@ -994,4 +994,36 @@ describe('GET /api/units — pending invite count (S613)', () => {
     const row = res.body.data.find((u: any) => u.id === f.aUnitId)
     expect(Number(row.pending_invite_count ?? row.pendingInviteCount)).toBe(1)
   })
+
+  // S655: since S647 the lease drafts at invite and waits for the landlord's
+  // signature. A lease that waited more than seven days (for him, or for the
+  // resident after he signed) let the invite's clock run out and the unit was
+  // offered to a second household while that lease was still live.
+  it('a DRAFTED lease holds the unit even after the invite\'s clock has run out', async () => {
+    const f = await seed()
+    const app = buildApp()
+    // The invite's seven days ran out two days ago.
+    const t = (await db.query<{ id: string }>(
+      `WITH u AS (
+         INSERT INTO users (email, password_hash, role, first_name, last_name, tenant_invite_token, tenant_invite_expires_at)
+         VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'Held', 'Unit', 'old', NOW() - INTERVAL '2 days')
+         RETURNING id)
+       INSERT INTO tenants (user_id) SELECT id FROM u RETURNING id`,
+      [`held-${f.aLid.slice(0, 6)}@test.dev`])).rows[0]
+    const d = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status)
+       VALUES ($1, $2, 'Lease', 'original_lease', 'pending') RETURNING id`, [f.aLid, f.aUnitId])).rows[0]
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, draft_document_id)
+       VALUES ($1, $2, 'not_uploaded', $3, $4)`, [f.aLid, t.id, f.aUnitId, d.id])
+    const held = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+    const rowHeld = held.body.data.find((u: any) => u.id === f.aUnitId)
+    expect(Number(rowHeld.pending_invite_count ?? rowHeld.pendingInviteCount)).toBe(1)
+
+    // Voiding the lease lets the lapsed invite release the unit, as before.
+    await db.query(`UPDATE lease_documents SET status = 'voided' WHERE id = $1`, [d.id])
+    const freed = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+    const rowFreed = freed.body.data.find((u: any) => u.id === f.aUnitId)
+    expect(Number(rowFreed.pending_invite_count ?? rowFreed.pendingInviteCount)).toBe(0)
+  })
 })

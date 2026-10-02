@@ -30,6 +30,7 @@ import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLateFeeDecision, seedTenant,
+  seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
 import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
@@ -721,5 +722,96 @@ describe('S653 owner-use occupant', () => {
     const { emergencyContactRoster } = await import('../services/emergencyContacts')
     const roster = await emergencyContactRoster({ landlordIds: [landlordId], propertyIds: null })
     expect(roster.some((r: any) => r.tenant_id === null && r.tenant_first === 'Grandpa Rhoades' && r.unit_number === 'MH 03' && r.tenant_phone === '520-555-0100')).toBe(true)
+  })
+})
+
+// ── S655: who sees which units ───────────────────────────────────────────────
+//
+// Two parks under one company, a resident living at each. The resident at
+// park 1 is flagged SSI/SSDI.
+async function seedTwoParks() {
+  const f = await seedUnitsFixture()
+  const c = await db.connect()
+  try {
+    const p2 = await seedProperty(c, { landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+    const u2 = await seedUnit(c, { propertyId: p2, landlordId: f.landlordId })
+    const t1 = await seedTenant(c)
+    const t2 = await seedTenant(c)
+    await seedLeaseTenant(c, { leaseId: await seedLease(c, { unitId: f.unitId, landlordId: f.landlordId }), tenantId: t1 })
+    await seedLeaseTenant(c, { leaseId: await seedLease(c, { unitId: u2, landlordId: f.landlordId }), tenantId: t2 })
+    await c.query(`UPDATE tenants SET ssi_ssdi = TRUE WHERE id = $1`, [t1])
+    const { rows: [staff] } = await c.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'Park', 'Two', TRUE) RETURNING id`, [`os-${randomUUID()}@test.dev`])
+    await c.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, property_ids, all_properties)
+       VALUES ($1, $2, $3::uuid[], FALSE)`, [staff.id, f.landlordId, [p2]])
+    const staffToken = jwt.sign(
+      { userId: staff.id, role: 'onsite_manager', email: 'os@test.dev', profileId: null,
+        landlordId: f.landlordId, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    return { ...f, p2, u2, t1, t2, staffId: staff.id, staffToken }
+  } finally { c.release() }
+}
+
+describe('S655: SSI/SSDI never reaches a landlord or staff member', () => {
+  // Nic, 10/2: "That's our check for the flex products." It stays GAM-side.
+  it('the unit page and the unit list carry no SSI/SSDI flag, for the owner or for staff', async () => {
+    const f = await seedTwoParks()
+    await db.query(`UPDATE onsite_manager_scopes SET all_properties = TRUE WHERE user_id = $1`, [f.staffId])
+    for (const token of [f.landlordToken, f.staffToken]) {
+      const one = await request(buildApp()).get(`/api/units/${f.unitId}`).set('Authorization', `Bearer ${token}`)
+      expect(one.status).toBe(200)
+      expect(one.body.data.tenant_id).toBe(f.t1)          // the flagged resident lives here
+      expect(JSON.stringify(one.body)).not.toMatch(/ssi_ssdi|ssiSsdi/i)
+      const list = await request(buildApp()).get('/api/units').set('Authorization', `Bearer ${token}`)
+      expect(list.status).toBe(200)
+      expect(list.body.data.map((u: any) => u.tenant_id)).toContain(f.t1)
+      expect(JSON.stringify(list.body)).not.toMatch(/ssi_ssdi|ssiSsdi/i)
+    }
+  })
+})
+
+describe('S655: a staff member assigned to one property sees that property\'s units only', () => {
+  it('the unit list (the Tenants page) shows their property\'s units and residents; all-properties staff and the owner see both parks; no properties shows none', async () => {
+    const f = await seedTwoParks()
+    const list = async (token: string) => {
+      const res = await request(buildApp()).get('/api/units').set('Authorization', `Bearer ${token}`)
+      expect(res.status).toBe(200)
+      return res.body.data as any[]
+    }
+
+    const scoped = await list(f.staffToken)
+    expect(scoped.map(u => u.id)).toEqual([f.u2])
+    expect(scoped.map(u => u.tenant_id)).toEqual([f.t2])
+    // Asking for the other park by name does not get around it.
+    const res = await request(buildApp()).get(`/api/units?propertyId=${f.propertyId}`).set('Authorization', `Bearer ${f.staffToken}`)
+    expect(res.body.data).toEqual([])
+
+    expect((await list(f.landlordToken)).map(u => u.id).sort()).toEqual([f.unitId, f.u2].sort())
+
+    await db.query(`UPDATE onsite_manager_scopes SET all_properties = TRUE WHERE user_id = $1`, [f.staffId])
+    expect((await list(f.staffToken)).map(u => u.id).sort()).toEqual([f.unitId, f.u2].sort())
+
+    await db.query(`UPDATE onsite_manager_scopes SET all_properties = FALSE, property_ids = '{}'::uuid[] WHERE user_id = $1`, [f.staffId])
+    expect(await list(f.staffToken)).toEqual([])
+  })
+
+  it('opening a unit at another property is refused in plain words; their own property\'s unit opens', async () => {
+    const f = await seedTwoParks()
+    const open = (unitId: string) => request(buildApp()).get(`/api/units/${unitId}`).set('Authorization', `Bearer ${f.staffToken}`)
+
+    const refused = await open(f.unitId)
+    expect(refused.status).toBe(403)
+    expect(refused.body.error).toMatch(/at a property you're not assigned to/)
+    expect(JSON.stringify(refused.body)).not.toContain('@')   // no resident contact rides along
+
+    const mine = await open(f.u2)
+    expect(mine.status).toBe(200)
+    expect(mine.body.data.tenant_id).toBe(f.t2)
+
+    // The owner is never property-limited.
+    const owner = await request(buildApp()).get(`/api/units/${f.unitId}`).set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(owner.status).toBe(200)
   })
 })

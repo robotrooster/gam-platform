@@ -15,6 +15,12 @@
  * tenant invited from that modal was waiting on an email nobody sent.
  *
  * The last test in this file is the one that would have caught it.
+ *
+ * S655 (Nic, 10/2): invites are EMAIL-ONLY — no setup link comes back in any
+ * response. A UNIT invite goes through the one invite function every door
+ * uses: the household's lease drafts at once and nobody is emailed until the
+ * landlord signs. Only when the lease can't draft (no default lease here, as
+ * in most fixtures below) does the old invite email still go out.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import express from 'express'
@@ -118,7 +124,10 @@ describe('POST /api/tenants/invite — what it actually does', () => {
     })
     expect(res.status).toBe(200)
     expect(res.body.data.tenantId).toBeTruthy()
-    expect(res.body.data.acceptUrl).toContain('https://tenants.example.test/accept-invite?token=')
+    // S655: email-only — the link is never in the response.
+    expect(res.body.data).not.toHaveProperty('acceptUrl')
+    expect(res.body.data).not.toHaveProperty('inviteToken')
+    expect(sentInvites[0][5]).toContain('https://tenants.example.test/accept-invite?token=')
     expect(res.body.data.alreadyOnPlatform).toBe(false)
     expect(res.body.data.inviteSent).toBe(true)
     // S654: stored the way every lookup reads it.
@@ -183,18 +192,18 @@ describe('POST /api/tenants/invite — what it actually does', () => {
     const { token, unitId } = await seed()
     const app = buildApp()
     const first  = await post(app, token, { email: 'a@b.test', firstName: 'Al', unitId })
+    const firstToken = (await db.query(`SELECT tenant_invite_token FROM users WHERE email = $1`, ['a@b.test'])).rows[0].tenant_invite_token
     const second = await post(app, token, { email: 'A@B.test', firstName: 'Al', unitId })
 
     expect(second.body.data.userId).toBe(first.body.data.userId)
     expect(second.body.data.tenantId).toBe(first.body.data.tenantId)
-    // S654: a fresh link goes to their inbox, but only the invite that made
-    // the account hands it back.
-    expect(second.body.data.inviteToken).toBeNull()
-    expect(second.body.data.acceptUrl).toBeNull()
+    // S655: a fresh link goes to their inbox and never back to the screen.
+    expect(second.body.data).not.toHaveProperty('inviteToken')
+    expect(second.body.data).not.toHaveProperty('acceptUrl')
     expect(second.body.data.inviteSent).toBe(true)
     const dbToken = (await db.query(`SELECT tenant_invite_token FROM users WHERE email = $1`, ['a@b.test'])).rows[0].tenant_invite_token
     expect(dbToken).toBeTruthy()
-    expect(dbToken).not.toBe(first.body.data.inviteToken)
+    expect(dbToken).not.toBe(firstToken)
     expect(sentInvites).toHaveLength(2)
     expect(sentInvites[1][0]).toBe('a@b.test')
     expect(sentInvites[1][5]).toContain(dbToken)
@@ -215,7 +224,9 @@ describe('POST /api/tenants/invite — what it actually does', () => {
     expect(to).toBe('nadia@example.test')
     expect(tenantName).toBe('Nadia')
     expect(landlordName).toBe('Dana Okafor')
-    expect(activationUrl).toBe(res.body.data.acceptUrl)
+    const dbToken = (await db.query(`SELECT tenant_invite_token FROM users WHERE email = $1`, ['nadia@example.test'])).rows[0].tenant_invite_token
+    expect(activationUrl).toBe(`https://tenants.example.test/accept-invite?token=${dbToken}`)
+    expect(res.body.data.inviteSent).toBe(true)
   })
 
   it('says a screening is coming on a property invite, and not on a unit invite', async () => {
@@ -238,7 +249,7 @@ describe('POST /api/tenants/invite — what it actually does', () => {
       email: 'a@b.test', firstName: 'Al', unitId,
     })
     expect(res.status).toBe(200)
-    expect(res.body.data.acceptUrl).toContain('accept-invite?token=')
+    expect(res.body.data).not.toHaveProperty('acceptUrl')
     expect((await db.query(
       `SELECT tenant_invite_token FROM users WHERE email = $1`, ['a@b.test'])).rows[0]
       .tenant_invite_token).toBeTruthy()
@@ -450,8 +461,8 @@ describe('S654: the invite route and existing accounts', () => {
     const res = await post(buildApp(), token, { email, firstName: 'Pat', unitId, phone: '999-999-9999' })
     expect(res.status).toBe(200)
     expect(res.body.data.userId).toBe(r.userId)
-    expect(res.body.data.inviteToken).toBeNull()
-    expect(res.body.data.acceptUrl).toBeNull()
+    expect(res.body.data).not.toHaveProperty('inviteToken')
+    expect(res.body.data).not.toHaveProperty('acceptUrl')
     expect(res.body.data.alreadyOnPlatform).toBe(true)
     expect(res.body.data.inviteSent).toBe(false)
     expect(await stateOf(r.userId)).toEqual(before)
@@ -476,8 +487,8 @@ describe('S654: the invite route and existing accounts', () => {
 
     const res = await post(buildApp(), second.token, { email: email.toUpperCase(), firstName: 'Pat', unitId: second.unitId })
     expect(res.status).toBe(200)
-    expect(res.body.data.inviteToken).toBeNull()
-    expect(res.body.data.acceptUrl).toBeNull()
+    expect(res.body.data).not.toHaveProperty('inviteToken')
+    expect(res.body.data).not.toHaveProperty('acceptUrl')
     expect(res.body.data.alreadyOnPlatform).toBe(true)
     expect(await stateOf(r.userId)).toEqual(before)
     expect(sentInvites).toHaveLength(0)
@@ -495,20 +506,205 @@ describe('S654: the invite route and existing accounts', () => {
     const res = await post(buildApp(), token, { email: 'kim.harland@example.test', firstName: 'Kim', unitId })
     expect(res.status).toBe(200)
     expect(res.body.data.userId).toBe(r.userId)
-    expect(res.body.data.acceptUrl).toBeNull()      // this invite didn't make the account
+    expect(res.body.data).not.toHaveProperty('acceptUrl')
     expect(res.body.data.inviteSent).toBe(true)
     expect((await db.query(`SELECT id FROM users WHERE lower(email) = lower($1)`, [stored])).rows).toHaveLength(1)
     expect(sentInvites).toHaveLength(1)
     expect(sentInvites[0][0]).toBe(stored)
   })
 
-  it('a brand-new address still gets its link, emailed and handed back', async () => {
+  // S655 (Nic, 10/2): email-only. The one exception S654 kept — an account
+  // this invite just made — is gone: the link goes to their inbox, nowhere else.
+  it('a brand-new address gets its link by email only, never handed back', async () => {
     const { token, unitId } = await seed()
     const res = await post(buildApp(), token, { email: 'fresh@example.test', firstName: 'Fresh', unitId })
     expect(res.status).toBe(200)
-    expect(res.body.data.inviteToken).toMatch(/^[0-9a-f]{64}$/)
-    expect(res.body.data.acceptUrl).toBe(`https://tenants.example.test/accept-invite?token=${res.body.data.inviteToken}`)
+    expect(res.body.data).not.toHaveProperty('inviteToken')
+    expect(res.body.data).not.toHaveProperty('acceptUrl')
+    expect(JSON.stringify(res.body)).not.toMatch(/accept-invite|[0-9a-f]{64}/)
+    const dbToken = (await db.query(`SELECT tenant_invite_token FROM users WHERE email = $1`, ['fresh@example.test'])).rows[0].tenant_invite_token
+    expect(dbToken).toMatch(/^[0-9a-f]{64}$/)
     expect(sentInvites).toHaveLength(1)
-    expect(sentInvites[0][5]).toBe(res.body.data.acceptUrl)
+    expect(sentInvites[0][5]).toBe(`https://tenants.example.test/accept-invite?token=${dbToken}`)
+  })
+
+  it('a property-level invite hands back no link either', async () => {
+    const { token, propertyId } = await seed()
+    const res = await post(buildApp(), token, { email: 'applicant@example.test', firstName: 'App', propertyId })
+    expect(res.status).toBe(200)
+    expect(res.body.data).not.toHaveProperty('acceptUrl')
+    expect(res.body.data).not.toHaveProperty('inviteToken')
+    expect(res.body.data.inviteSent).toBe(true)
+    expect(sentInvites).toHaveLength(1)
+  })
+})
+
+// ── S655: a unit invite is the one invite every door uses ────────────────
+async function seedDefaultLease(landlordId: string, propertyId: string): Promise<void> {
+  await db.query(
+    `INSERT INTO property_unit_type_late_fees (property_id, unit_type, no_late_fee) VALUES ($1, 'apartment', true)
+     ON CONFLICT DO NOTHING`, [propertyId])
+  const tid = (await db.query<{ id: string }>(
+    `INSERT INTO lease_templates (landlord_id, name, page_count, unit_type, deposit_months, default_term_months, is_unit_type_default)
+     VALUES ($1, 'Primary Apartment', 1, 'apartment', 1, 12, true) RETURNING id`, [landlordId])).rows[0].id
+  for (const c of ['rent_amount', 'security_deposit', 'start_date', 'end_date', 'lease_type']) {
+    await db.query(
+      `INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y, width, height)
+       VALUES ($1, 'text', 'landlord', $2, 1, 10, 10, 100, 20)`, [tid, c])
+  }
+  await db.query(`INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y) VALUES ($1,'signature','primary','tenant_signature',1,10,100)`, [tid])
+  await db.query(`INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y) VALUES ($1,'signature','co_tenant_1','tenant_signature',1,10,140)`, [tid])
+  await db.query(`INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y) VALUES ($1,'signature','landlord','landlord_signature',1,10,180)`, [tid])
+}
+const liveLeaseDocs = async (unitId: string) => (await db.query<{ id: string }>(
+  `SELECT id FROM lease_documents WHERE unit_id = $1 AND document_type = 'original_lease' AND status <> 'voided'`,
+  [unitId])).rows
+const tenantSignerEmails = async (documentId: string) => (await db.query<{ email: string }>(
+  `SELECT email FROM lease_document_signers WHERE document_id = $1 AND role NOT IN ('landlord','witness') ORDER BY order_index`,
+  [documentId])).rows.map(r => r.email)
+
+describe('S655: a unit invite drafts the lease and emails nobody until the landlord signs', () => {
+  it('with a default lease set, the lease drafts at once and the tenant gets NO email and no link', async () => {
+    const f = await seed()
+    await seedDefaultLease(f.landlordId, f.propertyId)
+    const res = await post(buildApp(), f.token, { email: 'quiet@example.test', firstName: 'Quinn', lastName: 'Et', unitId: f.unitId })
+    expect(res.status).toBe(200)
+    expect(res.body.data.leaseDrafted).toBe(true)
+    expect(res.body.data.inviteSent).toBe(false)
+    expect(sentInvites).toHaveLength(0)
+    expect((await db.query(`SELECT tenant_invite_token FROM users WHERE email = $1`, ['quiet@example.test'])).rows[0].tenant_invite_token)
+      .toBeNull()
+    expect(await liveLeaseDocs(f.unitId)).toHaveLength(1)
+  })
+
+  it('a household sent together lands on ONE lease with everyone on it', async () => {
+    const f = await seed()
+    await seedDefaultLease(f.landlordId, f.propertyId)
+    const res = await post(buildApp(), f.token, {
+      unitId: f.unitId, email: 'one@example.test', firstName: 'One',
+      residents: [
+        { email: 'one@example.test', firstName: 'One', lastName: 'A' },
+        { email: 'two@example.test', firstName: 'Two', lastName: 'B' },
+      ],
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.data.people.map((p: any) => p.email)).toEqual(['one@example.test', 'two@example.test'])
+    const docs = await liveLeaseDocs(f.unitId)
+    expect(docs).toHaveLength(1)
+    expect(await tenantSignerEmails(docs[0].id)).toEqual(['one@example.test', 'two@example.test'])
+  })
+
+  it('a second person invited to the same home is added to the lease, not left off it', async () => {
+    const f = await seed()
+    await seedDefaultLease(f.landlordId, f.propertyId)
+    const app = buildApp()
+    await post(app, f.token, { email: 'first@example.test', firstName: 'First', lastName: 'A', unitId: f.unitId })
+    await post(app, f.token, { email: 'second@example.test', firstName: 'Second', lastName: 'B', unitId: f.unitId })
+    const docs = await liveLeaseDocs(f.unitId)
+    expect(docs).toHaveLength(1)
+    expect(await tenantSignerEmails(docs[0].id)).toEqual(['first@example.test', 'second@example.test'])
+  })
+})
+
+// ── S655 review: the result says what actually reached each person ─────────
+// The Invite Tenant screen read everyone who was not emailed as "already has a
+// GAM account — they were told there", including a new person whose email
+// failed. Each person now carries `notified`: 'email', 'notice' or null.
+describe('S655: the invite result says who was actually contacted', () => {
+  const failNextEmail = async () => {
+    const { emailTenantInvite } = await import('../services/email')
+    vi.mocked(emailTenantInvite).mockImplementationOnce(async () => { throw new Error('mail provider down') })
+  }
+
+  it('a lease that cannot draft: a new person whose email went is marked emailed', async () => {
+    const f = await seed()   // no default lease, so the usual invite goes instead
+    const res = await post(buildApp(), f.token, { email: 'went@example.test', firstName: 'Went', lastName: 'Out', unitId: f.unitId })
+    expect(res.status).toBe(200)
+    expect(res.body.data.leaseDrafted).toBe(false)
+    expect(res.body.data.people[0]).toMatchObject({ notified: 'email', inviteSent: true, alreadyOnPlatform: false })
+  })
+
+  it('a lease that cannot draft: a new person whose email failed is marked not contacted, not "told there"', async () => {
+    const f = await seed()
+    await failNextEmail()
+    const res = await post(buildApp(), f.token, { email: 'failed@example.test', firstName: 'Fay', lastName: 'Led', unitId: f.unitId })
+    expect(res.status).toBe(200)
+    expect(res.body.data.leaseDrafted).toBe(false)
+    expect(res.body.data.people[0]).toMatchObject({ notified: null, inviteSent: false, alreadyOnPlatform: false })
+  })
+
+  it('a lease that drafts contacts nobody yet', async () => {
+    const f = await seed()
+    await seedDefaultLease(f.landlordId, f.propertyId)
+    const res = await post(buildApp(), f.token, { email: 'later@example.test', firstName: 'Lay', lastName: 'Ter', unitId: f.unitId })
+    expect(res.body.data.leaseDrafted).toBe(true)
+    expect(res.body.data.people[0].notified).toBeNull()
+  })
+
+  it('a property invite whose email failed does not claim the email went', async () => {
+    const f = await seed()
+    await failNextEmail()
+    const res = await post(buildApp(), f.token, { email: 'applicant-x@example.test', firstName: 'App', propertyId: f.propertyId })
+    expect(res.status).toBe(200)
+    expect(res.body.data.inviteSent).toBe(false)
+    expect(res.body.data.notified).toBeNull()
+    expect(res.body.data.alreadyOnPlatform).toBe(false)
+  })
+
+  it('a property invite whose email went says so', async () => {
+    const f = await seed()
+    const res = await post(buildApp(), f.token, { email: 'applicant-y@example.test', firstName: 'App', propertyId: f.propertyId })
+    expect(res.body.data.inviteSent).toBe(true)
+    expect(res.body.data.notified).toBe('email')
+  })
+})
+
+// ── S655: security item 4 — a property invite never rewrites another company's row ──
+describe('S655: a property-level invite keeps to its own company', () => {
+  async function waiverAt(companyLandlordId: string, propertyId: string, tenantId: string) {
+    return (await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id, screening_waived, screening_attested)
+       VALUES ($1, $2, 'not_uploaded', $3, NULL, true, true) RETURNING id`, [companyLandlordId, tenantId, propertyId])).rows[0].id
+  }
+
+  it("company X's property invite leaves company Y's waiver row exactly as it was", async () => {
+    const y = await seed()
+    const x = await seed()
+    const u = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ('shared@example.test', '$2b$10$placeholder_invite_pending', 'tenant', 'Sha', 'Red') RETURNING id`)).rows[0]
+    const t = (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.id])).rows[0]
+    const yRow = await waiverAt(y.landlordId, y.propertyId, t.id)
+    const before = (await db.query(`SELECT * FROM pending_tenant_intents WHERE id = $1`, [yRow])).rows[0]
+
+    const res = await post(buildApp(), x.token, { email: 'shared@example.test', firstName: 'Sha', propertyId: x.propertyId })
+    expect(res.status).toBe(200)
+    expect((await db.query(`SELECT * FROM pending_tenant_intents WHERE id = $1`, [yRow])).rows[0]).toEqual(before)
+  })
+
+  it('once the old person-wide index is gone (the post-deploy step), X gets a row of its own', async () => {
+    const y = await seed()
+    const x = await seed()
+    const u = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ('both@example.test', '$2b$10$placeholder_invite_pending', 'tenant', 'Bo', 'Th') RETURNING id`)).rows[0]
+    const t = (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.id])).rows[0]
+    const yRow = await waiverAt(y.landlordId, y.propertyId, t.id)
+    await db.query(`DROP INDEX IF EXISTS pending_tenant_intents_tenant_nounit_live_key`)
+    try {
+      const res = await post(buildApp(), x.token, { email: 'both@example.test', firstName: 'Bo', propertyId: x.propertyId })
+      expect(res.status).toBe(200)
+      const rows = (await db.query(
+        `SELECT id, landlord_id, property_id FROM pending_tenant_intents
+          WHERE tenant_id = $1 AND unit_id IS NULL AND cancelled_at IS NULL ORDER BY created_at`, [t.id])).rows
+      expect(rows).toHaveLength(2)
+      expect(rows.find((r: any) => r.id === yRow)).toMatchObject({ landlord_id: y.landlordId, property_id: y.propertyId })
+      expect(rows.find((r: any) => r.id !== yRow)).toMatchObject({ landlord_id: x.landlordId, property_id: x.propertyId })
+    } finally {
+      await db.query(`DELETE FROM pending_tenant_intents WHERE tenant_id = $1`, [t.id])
+      await db.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS pending_tenant_intents_tenant_nounit_live_key
+           ON pending_tenant_intents (tenant_id) WHERE cancelled_at IS NULL AND unit_id IS NULL`)
+    }
   })
 })

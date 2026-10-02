@@ -51,6 +51,33 @@ const declareSchema = z.object({
   reference: z.string().max(120).optional(),
 })
 
+/**
+ * SQL: GAM is reading this company's bank — an active link that has synced at
+ * least once. Only then can a report be matched (and only then does the expiry
+ * job ever write one off, jobs/declaredDepositExpiry.ts). A link in error, a
+ * disconnected one, or one Stripe has not finished fetching is not watching.
+ */
+const BANK_FEED_WATCHING_SQL = (landlordExpr: string) => `EXISTS (
+  SELECT 1 FROM bank_connections c
+   WHERE c.landlord_id = ${landlordExpr} AND c.status = 'active' AND c.last_synced_at IS NOT NULL)`
+
+async function bankFeedWatching(landlordId: string): Promise<boolean> {
+  const r = await queryOne<{ watching: boolean }>(
+    `SELECT ${BANK_FEED_WATCHING_SQL('$1')} AS watching`, [landlordId])
+  return !!r?.watching
+}
+
+/**
+ * What happens to a report next, said plainly — a tenant who thinks this paid
+ * their rent will stop worrying about a bill that is still due. The same words
+ * for a new report and for a double tap.
+ */
+function whatHappensNext(bankFeedLinked: boolean): string {
+  return bankFeedLinked
+    ? 'Your balance stays the same until your deposit shows up in the bank — usually a day or two. We will apply it automatically and date it to the day you paid.'
+    : 'Your landlord’s bank isn’t connected to GAM right now, so we can’t watch for this deposit ourselves. Let your landlord know you paid and keep your deposit slip — they’ll check their bank and mark your bill paid. Your balance stays the same until they do.'
+}
+
 /** The lease must actually be this tenant's, and active. */
 async function assertTenantsLease(tenantId: string, leaseId: string) {
   const row = await queryOne<{ landlord_id: string }>(
@@ -113,7 +140,21 @@ declaredDepositsRouter.post('/', async (req, res, next) => {
           AND amount = $3 AND declared_date = $4::date`,
       [tenantId, body.leaseId, body.amount.toFixed(2), body.declaredDate])
     if (dup) {
-      return res.json({ success: true, data: { id: dup.id, alreadyReported: true } })
+      // S655 review: a double tap gets the same next step as the first report.
+      // The agent relays this reply, and without the sentence it could not
+      // tell a tenant at a company with no bank read (TruBlu today) to let the
+      // landlord know and keep the slip.
+      const bankFeedLinked = await bankFeedWatching(landlordId)
+      return res.json({
+        success: true,
+        data: {
+          id: dup.id,
+          alreadyReported: true,
+          message: `You already reported this deposit. ${whatHappensNext(bankFeedLinked)}`,
+          ...(bankFeedLinked ? { expiresInDays: DECLARATION_EXPIRY_DAYS } : {}),
+          bankFeedLinked,
+        },
+      })
     }
 
     const strikes = await queryOne<{ n: string }>(
@@ -128,14 +169,27 @@ declaredDepositsRouter.post('/', async (req, res, next) => {
       [tenantId, body.leaseId, landlordId, body.amount.toFixed(2),
        body.declaredDate, body.method, body.reference ?? null])
 
+    // S655 review: the promise depends on whether GAM is reading the
+    // landlord's bank. With no link (Country Acres / TruBlu today), a link in
+    // error, or one Stripe has not finished fetching, nothing can match the
+    // report and it never expires (jobs/declaredDepositExpiry.ts) — the
+    // landlord checks their own bank and records the payment by hand. Telling
+    // that tenant "we will apply it automatically" in "a day or two", with a
+    // 7-day clock, was a promise GAM cannot keep. And the landlord has no
+    // screen that lists reports without a bank row to match them to, so the
+    // tenant is told to let them know. The wording holds for every one of
+    // those cases ("isn't connected … right now"), not only for "never linked".
+    const bankFeedLinked = await bankFeedWatching(landlordId)
+
     res.json({
       success: true,
       data: {
         id: row!.id,
         // Said plainly, because a tenant who thinks this paid their rent will
         // stop worrying about a bill that is still due.
-        message: 'Reported. Your balance stays the same until your deposit shows up in the bank — usually a day or two. We will apply it automatically and date it to the day you paid.',
-        expiresInDays: DECLARATION_EXPIRY_DAYS,
+        message: `Reported. ${whatHappensNext(bankFeedLinked)}`,
+        ...(bankFeedLinked ? { expiresInDays: DECLARATION_EXPIRY_DAYS } : {}),
+        bankFeedLinked,
         priorUnconfirmed: strikeCount,
         trusted: strikeCount < UNCONFIRMED_STRIKE_LIMIT,
       },
@@ -149,16 +203,42 @@ declaredDepositsRouter.get('/', async (req, res, next) => {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Forbidden')
     const tenantId = req.user!.profileId
     if (!tenantId) throw new AppError(403, 'Forbidden')
+    // S655 review: each report carries its lease (the payments page lists them
+    // under the lease they were made for — without it the list was always
+    // empty) and whether GAM is reading that landlord's bank, so a report it
+    // cannot watch for is not described as "waiting for it to appear".
     const rows = await query(
-      `SELECT id, amount::float AS amount,
-              to_char(declared_date,'YYYY-MM-DD') AS declared_date,
-              method, reference, status, resolution_note,
-              to_char(confirmed_at,'YYYY-MM-DD') AS confirmed_on
-         FROM tenant_declared_deposits
-        WHERE tenant_id = $1
-        ORDER BY created_at DESC
+      `SELECT d.id, d.lease_id, d.amount::float AS amount,
+              to_char(d.declared_date,'YYYY-MM-DD') AS declared_date,
+              d.method, d.reference, d.status, d.resolution_note,
+              to_char(d.confirmed_at,'YYYY-MM-DD') AS confirmed_on,
+              ${BANK_FEED_WATCHING_SQL('d.landlord_id')} AS bank_feed_linked
+         FROM tenant_declared_deposits d
+        WHERE d.tenant_id = $1
+        ORDER BY d.created_at DESC
         LIMIT 50`, [tenantId])
     res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// GET /api/declared-deposits/feed/:leaseId — before reporting: can GAM watch?
+//
+// S655 review: the report window has to say the right thing BEFORE the tenant
+// submits. With no bank to read, "we'll apply it automatically" and "the
+// report will expire" are both untrue — the landlord checks their own bank
+// and marks the bill paid.
+declaredDepositsRouter.get('/feed/:leaseId', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Forbidden')
+    const tenantId = req.user!.profileId
+    if (!tenantId) throw new AppError(403, 'Forbidden')
+    const leaseId = z.string().uuid().parse(req.params.leaseId)
+    const landlordId = await assertTenantsLease(tenantId, leaseId)
+    const bankFeedLinked = await bankFeedWatching(landlordId)
+    res.json({
+      success: true,
+      data: { leaseId, bankFeedLinked, ...(bankFeedLinked ? { expiresInDays: DECLARATION_EXPIRY_DAYS } : {}) },
+    })
   } catch (e) { next(e) }
 })
 

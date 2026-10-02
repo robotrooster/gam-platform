@@ -613,6 +613,254 @@ export async function emailDocumentAutoVoided(to: string, recipientName: string,
   )
 }
 
+// ── NEW LEASE FOR A HOUSEHOLD ALREADY LIVING THERE (S655) ─────
+//
+// Nic (10/2): tenant copy about a new lease reads as a new lease / a rent
+// update — never "we're ending your lease". The current lease stays as it is
+// until the new one starts; from that day the new lease's rent is what is
+// billed, signed or not (it says so plainly, without threatening anyone).
+
+/** "January 1, 2027" from 'YYYY-MM-DD'. */
+function newLeaseDate(iso: string): string {
+  const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number)
+  if (!y || !m || !d) return String(iso)
+  return new Date(Date.UTC(y, m - 1, d))
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
+function newLeaseMoney(n: number | string | null | undefined): string {
+  return '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+/** The day before 'YYYY-MM-DD', as words. */
+function newLeaseDayBefore(iso: string): string {
+  const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number)
+  const t = new Date(Date.UTC(y, m - 1, d - 1))
+  return t.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
+function newLeaseBox(unitLabel: string, startDate: string, rent: number | string, started = false) {
+  return `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">New lease — ${started ? 'started' : 'starts'} ${escapeHtml(newLeaseDate(startDate))}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${escapeHtml(unitLabel)} · ${newLeaseMoney(rent)} a month</div>
+      </div>`
+}
+
+/**
+ * The tenant's signing request for a new lease (sent when the landlord signs).
+ * Same link rules as emailSigningRequest (S647: one email that sets up the
+ * account and opens the lease when they have none yet).
+ *
+ * `started`: the start date is today or already past by the property's calendar
+ * (a landlord may sign on or after it while that date is not billed yet — the
+ * lease is then in force at once). "Your current lease stays as it is through
+ * <a day already gone>" would be false, so it says the new lease is their lease
+ * now — the signing page and the banner say the same.
+ */
+export async function emailNewLeaseSigningRequest(to: string, signerName: string, unitLabel: string, landlordName: string, signingUrl: string, ctx: {
+  startDate: string; rent: number | string; landlordId?: string; documentId?: string; needsSetup?: boolean
+  started?: boolean
+}) {
+  const setup = !!ctx.needsSetup
+  await send(to, `Your new lease is ready to sign — ${unitLabel}`,
+    base(
+      h('Your New Lease Is Ready to Sign') +
+      p(`Hi ${escapeHtml(signerName)},`) +
+      p(`<strong style="color:#eef1f8">${escapeHtml(landlordName)}</strong> has signed a new lease for your home and it is ready for your signature.`) +
+      newLeaseBox(unitLabel, ctx.startDate, ctx.rent, ctx.started) +
+      p(ctx.started
+        ? `Your new lease started ${escapeHtml(newLeaseDate(ctx.startDate))} and is your lease now — ` +
+          `${newLeaseMoney(ctx.rent)} a month. Please read it and sign it.`
+        : `Nothing changes today. Your current lease stays exactly as it is through ${escapeHtml(newLeaseDayBefore(ctx.startDate))}. ` +
+          `Starting ${escapeHtml(newLeaseDate(ctx.startDate))}, the new lease takes over and your rent is ${newLeaseMoney(ctx.rent)} a month. ` +
+          `Please read it and sign it.`) +
+      p('This is a legally binding agreement under UETA and the federal E-SIGN Act.') +
+      btn(setup ? 'Set Up Account & Sign Lease' : 'Review & Sign New Lease', signingUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">${setup
+        ? 'You will choose a password and enter a code we email you, then your lease opens.'
+        : 'Sign in to your GAM account to open it. It is also waiting on your Home page.'}</div>`
+    ),
+    {
+      category: 'esign_signing_request',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.documentId ? 'document' : null,
+      relatedEntityId: ctx.documentId ?? null,
+    },
+    'support',
+  )
+}
+
+/**
+ * A reminder to the TENANT to sign their new lease (14 and 3 days before it
+ * starts). One household, one document — one email.
+ */
+export async function emailNewLeaseSigningReminder(to: string, signerName: string, unitLabel: string, landlordName: string, signingUrl: string, ctx: {
+  startDate: string; rent: number | string
+  landlordId?: string; documentId?: string; needsSetup?: boolean
+}) {
+  const when = newLeaseDate(ctx.startDate)
+  await send(to, `Reminder: your new lease starts ${when}`,
+    base(
+      h('Your New Lease Is Waiting for Your Signature') +
+      p(`Hi ${escapeHtml(signerName)},`) +
+      p(`A reminder that your new lease from <strong style="color:#eef1f8">${escapeHtml(landlordName)}</strong> is waiting for your signature.`) +
+      newLeaseBox(unitLabel, ctx.startDate, ctx.rent) +
+      p(`Your current lease stays as it is through ${escapeHtml(newLeaseDayBefore(ctx.startDate))}. ` +
+        `Starting ${escapeHtml(when)}, the new lease takes over and your rent is ${newLeaseMoney(ctx.rent)} a month. Please read it and sign it.`) +
+      btn(ctx.needsSetup ? 'Set Up Account & Sign Lease' : 'Review & Sign New Lease', signingUrl)
+    ),
+    {
+      category: 'esign_signing_reminder',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.documentId ? 'document' : null,
+      relatedEntityId: ctx.documentId ?? null,
+    },
+    'support',
+  )
+}
+
+// ── To the LANDLORD: one email per person per run, never one per lease ─────
+//
+// S652 "one email per thing" (reminders per packet, alerts as one digest). The
+// park-wide sender drafts a new lease for every household at once, so anything
+// the landlord hears about new leases is a LIST: forty drafts waiting on them is
+// one morning email, not forty.
+
+export interface NewLeaseDigestItem {
+  unitLabel: string
+  startDate: string | null
+  rent?: number | string | null
+  /** Who in the household has not signed (the "not signed yet" alerts). */
+  tenantNames?: string | null
+}
+
+function newLeaseList(items: NewLeaseDigestItem[]): string {
+  const rows = items.map(it => {
+    const bits = [
+      it.tenantNames ? escapeHtml(it.tenantNames) : null,
+      it.startDate ? `starts ${escapeHtml(newLeaseDate(it.startDate))}` : null,
+      it.rent != null && String(it.rent).trim() !== '' && Number(it.rent) > 0 ? `${newLeaseMoney(it.rent)} a month` : null,
+    ].filter(Boolean).join(' · ')
+    return `<div style="padding:8px 0;border-bottom:1px solid #1d2733">
+        <div style="font-weight:700;color:#eef1f8">${escapeHtml(it.unitLabel)}</div>
+        ${bits ? `<div style="font-size:.82rem;color:#b8c4d8">${bits}</div>` : ''}
+      </div>`
+  }).join('')
+  return `<div style="margin:12px 0;padding:4px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">${rows}</div>`
+}
+const newLeaseCount = (n: number) => `${n} new lease${n === 1 ? '' : 's'}`
+
+/**
+ * To the landlord, each morning while new leases they drafted wait on their
+ * signature: every one of them in one email, with one link that opens the first
+ * and walks on to the next.
+ */
+export async function emailNewLeasesAwaitingLandlord(to: string, recipientName: string, items: NewLeaseDigestItem[], signingUrl: string, ctx: {
+  landlordId?: string; documentId?: string
+} = {}) {
+  if (items.length === 0) return
+  const one = items.length === 1
+  await send(to, one ? `Reminder: sign the new lease for ${items[0].unitLabel}` : `Reminder: ${newLeaseCount(items.length)} waiting for your signature`,
+    base(
+      h(one ? 'A New Lease Is Waiting for Your Signature' : `${items.length} New Leases Are Waiting for Your Signature`) +
+      p(`Hi ${escapeHtml(recipientName)},`) +
+      p(one
+        ? 'The new lease below is drafted and waiting for your signature. Open it, check the rent and start date, and sign — the household gets it right after.'
+        : 'The new leases below are drafted and waiting for your signature. The button opens the first; each signature moves you on to the next. Each household gets theirs right after you sign it.') +
+      newLeaseList(items) +
+      p(`A new lease you have not signed by its start date is canceled, and nothing changes for that household.`) +
+      btn(one ? 'Open & Sign' : 'Open & Sign Them', signingUrl)
+    ),
+    {
+      category: 'esign_signing_reminder',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.documentId ? 'document' : null,
+      relatedEntityId: ctx.documentId ?? null,
+    },
+    'support',
+  )
+}
+
+/**
+ * To the landlord: new leases they drafted but never signed reached their start
+ * date, so they were canceled. Nothing went to those households, so only the
+ * landlord hears — once, for all of them.
+ */
+export async function emailNewLeaseDraftLapsed(to: string, recipientName: string, items: NewLeaseDigestItem[], ctx: {
+  landlordId?: string; documentId?: string
+} = {}) {
+  if (items.length === 0) return
+  const one = items.length === 1
+  const only = items[0]
+  await send(to, one ? `New lease canceled (never signed): ${only.unitLabel}` : `${newLeaseCount(items.length)} canceled (never signed)`,
+    base(
+      h(one ? 'A New Lease Draft Was Canceled' : `${items.length} New Lease Drafts Were Canceled`) +
+      p(`Hi ${escapeHtml(recipientName)},`) +
+      (one
+        ? p(`The new lease for <strong style="color:#eef1f8">${escapeHtml(only.unitLabel)}</strong> was never signed on your side` +
+            `${only.startDate ? ` before its start date (${escapeHtml(newLeaseDate(only.startDate))})` : ''}, so it was canceled.`)
+        : p('These new leases were never signed on your side before their start dates, so they were canceled:') + newLeaseList(items)) +
+      p(one
+        ? 'Nothing changed for the household: their current lease carries on exactly as it is, and they were never sent this draft.'
+        : 'Nothing changed for those households: each current lease carries on exactly as it is, and none of them was sent a draft.') +
+      p('To send a new one, open <strong style="color:#eef1f8">Leases</strong>, find the space, and choose <strong style="color:#eef1f8">Change → New lease from a date…</strong>')
+    ),
+    {
+      category: 'esign_document_auto_voided',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.documentId ? 'document' : null,
+      relatedEntityId: ctx.documentId ?? null,
+    },
+  )
+}
+
+/**
+ * To the landlord: households that have not signed their new lease yet — 14
+ * days before it starts, and again on the day it starts. One email per stage
+ * for all of them. The new lease bills its rent from its start date either way
+ * (Nic, 10/2); this is so the landlord can follow up in person.
+ */
+export async function emailNewLeaseTenantUnsigned(to: string, recipientName: string, items: NewLeaseDigestItem[], ctx: {
+  stage: 'soon' | 'started'; landlordId?: string; documentId?: string; leasesUrl?: string
+}) {
+  if (items.length === 0) return
+  const one = items.length === 1
+  const only = items[0]
+  const when = only.startDate ? newLeaseDate(only.startDate) : ''
+  const subject = one
+    ? (ctx.stage === 'started'
+        ? `New lease started, still not signed: ${only.unitLabel}`
+        : `Not signed yet — new lease starts ${when}: ${only.unitLabel}`)
+    : (ctx.stage === 'started'
+        ? `${newLeaseCount(items.length)} started, still not signed`
+        : `Not signed yet — ${newLeaseCount(items.length)} start soon`)
+  const rule = ctx.stage === 'started'
+    ? (one
+        ? `It took over on ${escapeHtml(when)}: the old lease ended the day before, and the household is billed the new rent of ${newLeaseMoney(only.rent)} from that day. The lease stays open for their signature.`
+        : 'Each one took over on its start date: the old lease ended the day before, and the household is billed the new rent from that day. Each lease stays open for their signature.')
+    : (one
+        ? `It takes over on ${escapeHtml(when)} whether or not they sign — the household is billed the new rent of ${newLeaseMoney(only.rent)} from that day. A word with them now usually gets it signed.`
+        : 'Each one takes over on its start date whether or not they sign — the household is billed the new rent from that day. A word with them now usually gets it signed.')
+  await send(to, subject,
+    base(
+      h(ctx.stage === 'started'
+        ? (one ? 'The New Lease Started — Not Signed Yet' : 'New Leases Started — Not Signed Yet')
+        : (one ? 'The New Lease Is Not Signed Yet' : 'New Leases Not Signed Yet')) +
+      p(`Hi ${escapeHtml(recipientName)},`) +
+      (one
+        ? p(`${escapeHtml(only.tenantNames || 'The household')} ${ctx.stage === 'started' ? 'still has' : 'has'} not signed the new lease for ` +
+            `<strong style="color:#eef1f8">${escapeHtml(only.unitLabel)}</strong>.`) +
+          newLeaseBox(only.unitLabel, only.startDate ?? '', only.rent ?? 0, ctx.stage === 'started')
+        : p(`These households ${ctx.stage === 'started' ? 'still have' : 'have'} not signed their new leases:`) + newLeaseList(items)) +
+      p(rule) +
+      (ctx.leasesUrl ? btn('Open Leases', ctx.leasesUrl) : '')
+    ),
+    {
+      category: 'esign_new_lease_unsigned',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.documentId ? 'document' : null,
+      relatedEntityId: ctx.documentId ?? null,
+    },
+  )
+}
+
 // ── INVITATION EMAILS ─────────────────────────────────────────
 
 /**

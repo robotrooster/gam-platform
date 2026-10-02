@@ -34,7 +34,9 @@ vi.mock('../lib/stripe', () => ({
 import { db } from '../db'
 import { BUSINESS_TYPES } from '@gam/shared'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
-import { reconcilePlatformHeldPayments, tryReconcileForLandlordUserId, recoverPendingPlatformTransfers, heldOwnerShareForUser } from './landlordPassthrough'
+import { reconcilePlatformHeldPayments, tryReconcileForLandlordUserId, recoverPendingPlatformTransfers, heldOwnerShareForUser, executePlatformTransferIntent } from './landlordPassthrough'
+import { takePayoutCut, payoutCutLockKey, cutUnderLock } from './payoutCut'
+import { stampPayoutTransfers } from './payoutComposition'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -688,5 +690,233 @@ describe('S648 business payout batch', () => {
   it('an item names exactly one payee', async () => {
     const { recordHeldItem } = await import('./heldPayouts')
     await expect(recordHeldItem({ sourceType: 'refund', sourceId: 'x', amount: -1 })).rejects.toThrow(/one payee/)
+  })
+})
+
+// ── S655 review: A TRANSFER IS NEVER IN NO PAYOUT ──────────────────────────
+//
+// A GAM sweep carries every transfer dated at or before its cut, and the next
+// sweep starts at that cut. The confirm used to date a transfer NOW() — when
+// its transaction BEGAN — and the row only became visible at COMMIT. Begun
+// before a payout's cut and committed after the payout looked for its
+// transfers, it was too late for that payout and too early for the next one:
+// listed in no payout, ever. Confirm and cut now share one lock per Connect
+// account, and the transfer is dated when it is written.
+describe('a transfer confirmed while a payout takes its cut', () => {
+  const HOLD_KEY = 6550002   // the test's own lock, held to pause a confirm mid-transaction
+
+  async function pendingIntent(ctx: Ctx, account: string, amount: number): Promise<string> {
+    return (await db.query<{ id: string }>(
+      `INSERT INTO platform_transfer_intents
+         (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, status)
+       VALUES ($1,$2,$3,$4,$4,'pending') RETURNING id`,
+      [ctx.landlordId, ctx.landlordUserId, account, amount])).rows[0].id
+  }
+  async function sweepAt(ctx: Ctx, payoutId: string, amount: number, at: Date): Promise<string> {
+    return (await db.query<{ id: string }>(
+      `INSERT INTO disbursements (user_id, landlord_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged)
+       VALUES ($1,$2,'auto_friday',$3,'processing',$4,$5,0) RETURNING id`,
+      [ctx.landlordUserId, ctx.landlordId, amount, payoutId, at])).rows[0].id
+  }
+  async function waitersOn(key: number): Promise<number> {
+    return (await db.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pg_locks
+        WHERE locktype = 'advisory' AND NOT granted AND classid = 0 AND objid = $1`, [key])).rows[0].n
+  }
+  async function until(check: () => Promise<boolean>, what: string) {
+    for (let i = 0; i < 200; i++) {
+      if (await check()) return
+      await new Promise(r => setTimeout(r, 25))
+    }
+    throw new Error(`timed out waiting for ${what}`)
+  }
+
+  it('a transfer being confirmed when the payout takes its cut is waited for, and that payout carries it', async () => {
+    const ctx = await seedCtx({ connectAccount: 'acct_cut_wait' })
+    const intentId = await pendingIntent(ctx, 'acct_cut_wait', 75)
+    transferMock.mockResolvedValueOnce({ id: 'tr_cut_wait' } as any)
+
+    // Pause the confirm after it has dated the transfer and before it commits.
+    await db.query(`
+      CREATE OR REPLACE FUNCTION zz_test_hold_confirm() RETURNS trigger AS $$
+      BEGIN
+        IF OLD.status = 'pending' AND NEW.status = 'transferred' THEN
+          PERFORM pg_advisory_xact_lock(${HOLD_KEY});
+        END IF;
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql`)
+    await db.query(`CREATE TRIGGER zz_test_hold_confirm AFTER UPDATE ON platform_transfer_intents
+                      FOR EACH ROW EXECUTE FUNCTION zz_test_hold_confirm()`)
+    const holder = await db.connect()
+    try {
+      await holder.query(`SELECT pg_advisory_lock(${HOLD_KEY})`)
+      const confirming = executePlatformTransferIntent(intentId)
+      confirming.catch(() => {})
+      await until(async () => (await waitersOn(HOLD_KEY)) > 0, 'the confirm to be mid-transaction')
+
+      let cut: Date | null = null
+      const cutting = takePayoutCut('acct_cut_wait').then(d => { cut = d; return d })
+      cutting.catch(() => {})
+      // The cut waits for the transfer being confirmed.
+      await new Promise(r => setTimeout(r, 300))
+      expect(cut, 'the cut was taken while a transfer to the account was still being confirmed').toBeNull()
+
+      await holder.query(`SELECT pg_advisory_unlock(${HOLD_KEY})`)
+      expect(await confirming).toBe('tr_cut_wait')
+      const at = await cutting
+
+      const t = (await db.query<{ status: string; on_or_before: boolean }>(
+        `SELECT status, transferred_at <= $2::timestamptz AS on_or_before
+           FROM platform_transfer_intents WHERE id = $1`, [intentId, at])).rows[0]
+      expect(t).toEqual({ status: 'transferred', on_or_before: true })
+
+      // The payout made at that cut finds it, committed, and carries it.
+      const sweep = await sweepAt(ctx, 'po_cut_wait', 75, at)
+      const r = await stampPayoutTransfers({
+        disbursementId: sweep, connectAccountId: 'acct_cut_wait', payoutAmount: 75, payoutAt: at,
+      })
+      expect(r.intentIds).toEqual([intentId])
+      expect(r.residual).toBe(0)
+    } finally {
+      await holder.query(`SELECT pg_advisory_unlock_all()`).catch(() => {})
+      holder.release()
+      await db.query(`DROP TRIGGER IF EXISTS zz_test_hold_confirm ON platform_transfer_intents`)
+      await db.query(`DROP FUNCTION IF EXISTS zz_test_hold_confirm()`)
+    }
+  })
+
+  // The confirm's transaction can BEGIN before a payout's cut and reach the lock
+  // only after it. Dated by when it began (NOW()), it would sit before a cut
+  // whose payout never saw it, and after nothing the next payout looks at.
+  it('a confirm that began before the cut but reached the lock after it is dated after the cut, so the next payout carries it', async () => {
+    const ctx = await seedCtx({ connectAccount: 'acct_cut_began' })
+    const intentId = await pendingIntent(ctx, 'acct_cut_began', 55)
+    transferMock.mockResolvedValueOnce({ id: 'tr_cut_began' } as any)
+
+    // A payout run holding the account's cut lock, as takePayoutCut does.
+    const run = await db.connect()
+    let at!: Date
+    try {
+      await run.query('BEGIN')
+      await run.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [payoutCutLockKey('acct_cut_began')])
+      const confirming = executePlatformTransferIntent(intentId)
+      confirming.catch(() => {})
+      await until(async () => (await db.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`)).rows[0].n > 0,
+        'the confirm to wait on the cut lock')
+      at = await cutUnderLock(run)
+      await run.query('COMMIT')
+      expect(await confirming).toBe('tr_cut_began')
+    } finally { run.release() }
+
+    const after = (await db.query<{ after: boolean }>(
+      `SELECT transferred_at > $2::timestamptz AS after FROM platform_transfer_intents WHERE id = $1`,
+      [intentId, at])).rows[0].after
+    expect(after, 'the transfer was dated before a cut it was not visible to').toBe(true)
+
+    const first = await sweepAt(ctx, 'po_cut_began', 0.01, at)
+    expect((await stampPayoutTransfers({
+      disbursementId: first, connectAccountId: 'acct_cut_began', payoutAmount: 0.01, payoutAt: at,
+    })).intentIds).toEqual([])
+    const nextAt = (await db.query<{ at: Date }>(`SELECT clock_timestamp() AS at`)).rows[0].at
+    const next = await sweepAt(ctx, 'po_cut_began_next', 55, nextAt)
+    expect((await stampPayoutTransfers({
+      disbursementId: next, connectAccountId: 'acct_cut_began', payoutAmount: 55, payoutAt: nextAt,
+    })).intentIds).toEqual([intentId])
+  })
+
+  // A batch netted down to $0 makes no Stripe call and has no confirm: the
+  // reserve writes it already 'transferred'. Dated by the app's clock without
+  // the cut lock, it could sit before a sweep's cut and commit after that
+  // sweep looked — in no payout, and the payments netted inside it listed in
+  // no payout breakdown.
+  it('a batch netted down to $0 while a payout takes its cut waits for the cut, is dated after it, and the next payout carries it', async () => {
+    const ctx = await seedCtx({ connectAccount: 'acct_cut_netted' })
+    await seedOwnerShareLedger(ctx, 200)
+    // The landlord owes back exactly what this batch would pay: it nets to $0.
+    await db.query(
+      `INSERT INTO payment_reversals
+         (payment_id, landlord_id, reversal_type, reversed_amount, reversal_fee,
+          stripe_event_id, raw_event, recovery_method, recovery_status, status)
+       VALUES ($1,$2,'ach_unauthorized',200,4,'evt_net_cut','{}','netting','scheduled_netting','recovering')`,
+      [ctx.paymentId, ctx.landlordId])
+
+    // A payout run holding the account's cut lock, as takePayoutCut does.
+    const run = await db.connect()
+    let at!: Date
+    try {
+      await run.query('BEGIN')
+      await run.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [payoutCutLockKey('acct_cut_netted')])
+      const reserving = reconcilePlatformHeldPayments(ctx.landlordUserId)
+      reserving.catch(() => {})
+      await until(async () => (await db.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`)).rows[0].n > 0,
+        'the netted batch to wait on the cut lock')
+      at = await cutUnderLock(run)
+      await run.query('COMMIT')
+      expect((await reserving).transfer_id).toMatch(/^netted:/)
+    } finally { run.release() }
+    expect(transferMock).not.toHaveBeenCalled()
+
+    const rows = (await db.query<{ id: string; status: string; amount: number; after: boolean }>(
+      `SELECT id, status, amount::float AS amount, transferred_at > $2::timestamptz AS after
+         FROM platform_transfer_intents WHERE landlord_id = $1`, [ctx.landlordId, at])).rows
+    expect(rows).toHaveLength(1)
+    expect(rows[0], 'the netted batch was dated before a cut it was not visible to')
+      .toMatchObject({ status: 'transferred', amount: 0, after: true })
+
+    const first = await sweepAt(ctx, 'po_cut_netted', 0.01, at)
+    expect((await stampPayoutTransfers({
+      disbursementId: first, connectAccountId: 'acct_cut_netted', payoutAmount: 0.01, payoutAt: at,
+    })).intentIds).toEqual([])
+    const nextAt = (await db.query<{ at: Date }>(`SELECT clock_timestamp() AS at`)).rows[0].at
+    const next = await sweepAt(ctx, 'po_cut_netted_next', 0.01, nextAt)
+    expect((await stampPayoutTransfers({
+      disbursementId: next, connectAccountId: 'acct_cut_netted', payoutAmount: 0.01, payoutAt: nextAt,
+    })).intentIds).toEqual([rows[0].id])
+  })
+
+  it('a transfer confirmed after the cut is dated after it: that payout leaves it, the next payout carries it', async () => {
+    const ctx = await seedCtx({ connectAccount: 'acct_cut_after' })
+    const intentId = await pendingIntent(ctx, 'acct_cut_after', 40)
+    transferMock.mockResolvedValueOnce({ id: 'tr_cut_after' } as any)
+
+    const at = await takePayoutCut('acct_cut_after')
+    expect(await executePlatformTransferIntent(intentId)).toBe('tr_cut_after')
+    const after = (await db.query<{ after: boolean }>(
+      `SELECT transferred_at > $2::timestamptz AS after FROM platform_transfer_intents WHERE id = $1`,
+      [intentId, at])).rows[0].after
+    expect(after).toBe(true)
+
+    const first = await sweepAt(ctx, 'po_cut_first', 0.01, at)
+    const r1 = await stampPayoutTransfers({
+      disbursementId: first, connectAccountId: 'acct_cut_after', payoutAmount: 0.01, payoutAt: at,
+    })
+    expect(r1.intentIds).toEqual([])
+
+    const nextAt = (await db.query<{ at: Date }>(`SELECT clock_timestamp() AS at`)).rows[0].at
+    const next = await sweepAt(ctx, 'po_cut_next', 40, nextAt)
+    const r2 = await stampPayoutTransfers({
+      disbursementId: next, connectAccountId: 'acct_cut_after', payoutAmount: 40, payoutAt: nextAt,
+    })
+    expect(r2.intentIds).toEqual([intentId])
+    expect(r2.residual).toBe(0)
+  })
+
+  // The cut is stored in whole milliseconds. Cut down to the millisecond, a
+  // transfer confirmed just before it, in the same millisecond, was dated after
+  // it — its money in this payout, its line on the next. Rounded up without
+  // waiting, one confirmed just after could be dated at or before it.
+  it('a transfer dated just before the cut is inside it and one dated just after is outside it, even within the same millisecond', async () => {
+    const clock = async () => (await db.query<{ t: string }>(`SELECT clock_timestamp()::text AS t`)).rows[0].t
+    const inside = async (t: string, cut: Date) =>
+      (await db.query<{ ok: boolean }>(`SELECT $1::timestamptz <= $2::timestamptz AS ok`, [t, cut])).rows[0].ok
+    for (let i = 0; i < 40; i++) {
+      const before = await clock()
+      const cut = await takePayoutCut('acct_cut_ms')
+      const after = await clock()
+      expect(await inside(before, cut), `dated ${before}, before a cut at ${cut.toISOString()}`).toBe(true)
+      expect(await inside(after, cut), `dated ${after}, after a cut at ${cut.toISOString()}`).toBe(false)
+    }
   })
 })

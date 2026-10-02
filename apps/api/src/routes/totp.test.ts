@@ -559,3 +559,89 @@ describe('S655 TOTP passes carry the session policy', () => {
     expect(pass.exp).toBe(exp)
   })
 })
+
+// ── S655: a password change ends every pass minted before it — here too ────
+//
+// /auth/refresh and /auth/me refuse a pass whose iat is before
+// users.sessions_valid_from. The authenticator endpoints mint passes as well,
+// and never asked: a pass from before a password change could set up an
+// authenticator its holder controls (taking the account's second factor) and
+// come away with a renewed pass.
+describe('S655 a pass from before a password change cannot enroll or verify an authenticator', () => {
+  // The password change is stamped 5 seconds back and the stale pass a minute
+  // back: iat is whole seconds, so a pass minted in the same second as the
+  // change would otherwise read as older than it.
+  const minuteAgo = () => Math.floor(Date.now() / 1000) - 60
+  const passMintedBeforeChange = (claims: object) =>
+    jwt.sign({ ...claims, iat: minuteAgo() }, process.env.JWT_SECRET!, { expiresIn: '1h' })
+
+  it('a full pass from before the change gets 401 at enroll-start and enroll-confirm; nothing is set up and no pass is minted', async () => {
+    const { userId } = await seedUser({ email: 's655-stale@test.dev', password: 'pw123456789012', role: 'landlord' })
+    const stale = passMintedBeforeChange({ userId, role: 'landlord', email: 's655-stale@test.dev', profileId: null })
+    await db.query(`UPDATE users SET sessions_valid_from = NOW() - interval '5 seconds' WHERE id = $1`, [userId])
+
+    const start = await request(buildApp()).post('/api/auth/totp/enroll-start')
+      .set('Authorization', `Bearer ${stale}`).send({})
+    expect(start.status).toBe(401)
+    expect(start.body.error).toMatch(/password was changed/i)
+    const afterStart = (await db.query<any>(`SELECT totp_secret FROM users WHERE id=$1`, [userId])).rows[0]
+    expect(afterStart.totp_secret).toBeNull()
+    const codes = await db.query(`SELECT 1 FROM user_totp_recovery_codes WHERE user_id=$1`, [userId])
+    expect(codes.rows).toHaveLength(0)
+
+    // Even with a secret already waiting (enrollment begun before the change),
+    // the stale pass cannot finish it.
+    const secret = authenticator.generateSecret()
+    await db.query(`UPDATE users SET totp_secret = $2 WHERE id = $1`, [userId, secret])
+    const confirm = await request(buildApp()).post('/api/auth/totp/enroll-confirm')
+      .set('Authorization', `Bearer ${stale}`).send({ token: authenticator.generate(secret) })
+    expect(confirm.status).toBe(401)
+    expect(confirm.body.data?.token).toBeUndefined()
+    const row = (await db.query<any>(`SELECT totp_enabled FROM users WHERE id=$1`, [userId])).rows[0]
+    expect(row.totp_enabled).toBe(false)
+
+    // A pass from after the change enrolls normally.
+    const fresh = jwt.sign({ userId, role: 'landlord', email: 's655-stale@test.dev', profileId: null },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const ok = await request(buildApp()).post('/api/auth/totp/enroll-confirm')
+      .set('Authorization', `Bearer ${fresh}`).send({ token: authenticator.generate(secret) })
+    expect(ok.status).toBe(200)
+    expect(typeof ok.body.data.token).toBe('string')
+  })
+
+  it('an enrollment pass from before the change cannot finish setting up an authenticator', async () => {
+    const { userId } = await seedUser({ email: 's655-enroll-stale@test.dev', password: 'pw123456789012', role: 'admin' })
+    const stale = passMintedBeforeChange({ userId, role: 'admin', email: 's655-enroll-stale@test.dev', profileId: null, purpose: 'totp_enroll' })
+    const secret = authenticator.generateSecret()
+    await db.query(`UPDATE users SET totp_secret = $2, sessions_valid_from = NOW() - interval '5 seconds' WHERE id = $1`, [userId, secret])
+    const start = await request(buildApp()).post('/api/auth/totp/enroll-start')
+      .set('Authorization', `Bearer ${stale}`).send({})
+    expect(start.status).toBe(401)
+    const confirm = await request(buildApp()).post('/api/auth/totp/enroll-confirm')
+      .set('Authorization', `Bearer ${stale}`).send({ token: authenticator.generate(secret) })
+    expect(confirm.status).toBe(401)
+    expect((await db.query<any>(`SELECT totp_enabled FROM users WHERE id=$1`, [userId])).rows[0].totp_enabled).toBe(false)
+  })
+
+  it('a pending authenticator sign-in from before the change gets no full pass, even with a right code', async () => {
+    const secret = authenticator.generateSecret()
+    const { userId } = await seedUser({ email: 's655-pending-stale@test.dev', password: 'pw123456789012',
+      totpEnabled: true, totpSecret: secret })
+    const totpSession = passMintedBeforeChange({ userId, role: 'tenant', email: 's655-pending-stale@test.dev',
+      profileId: null, purpose: 'totp_pending' })
+    await db.query(`UPDATE users SET sessions_valid_from = NOW() - interval '5 seconds' WHERE id = $1`, [userId])
+    const verify = await request(buildApp()).post('/api/auth/totp/verify')
+      .send({ totpSession, code: authenticator.generate(secret) })
+    expect(verify.status).toBe(401)
+    expect(verify.body.error).toMatch(/password was changed/i)
+    expect(verify.body.data?.token).toBeUndefined()
+  })
+
+  it('an account that never changed its password is unaffected', async () => {
+    const { userId, token } = await seedUser({ email: 's655-never@test.dev', password: 'pw123456789012' })
+    expect((await db.query<any>(`SELECT sessions_valid_from FROM users WHERE id=$1`, [userId])).rows[0].sessions_valid_from).toBeNull()
+    const start = await request(buildApp()).post('/api/auth/totp/enroll-start')
+      .set('Authorization', `Bearer ${token}`).send({})
+    expect(start.status).toBe(200)
+  })
+})

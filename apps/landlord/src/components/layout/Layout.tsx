@@ -289,10 +289,14 @@ function PendingSignBanner() {
   // state to phrase. The landlord's pending signature is always the
   // document's first.
   const doc = (pending as any[])[0]
-  const isRenewal = (doc.title || '').startsWith('Lease Renewal')
-  const subtitle = isRenewal
-    ? `${doc.title} · Upcoming lease for your renewal — sign now and send to the tenant`
-    : `${doc.title} · You sign first — then it goes to the tenant`
+  // S655: a new lease for a household already living here is told apart by its
+  // link to the lease it follows, never by the title's wording.
+  const isRenewal = !!doc.renewsLeaseId
+  const others = (pending as any[]).length - 1
+  const subtitle = (isRenewal
+    ? `${doc.title} · New lease for a household already living here — sign it and it goes to them`
+    : `${doc.title} · You sign first — then it goes to the tenant`)
+    + (others > 0 ? ` · ${others} more waiting on you` : '')
   return (
     <div onClick={() => navigate('/sign/' + doc.documentId)}
       style={{ background:'rgba(201,162,39,.1)', border:'1px solid rgba(201,162,39,.3)', borderRadius:10, padding:'12px 16px', marginBottom:16, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'space-between' }}>

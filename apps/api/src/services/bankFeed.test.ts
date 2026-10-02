@@ -815,3 +815,227 @@ describe('ignore + suggestion attach', () => {
     expect(next.suggested_unit_id).toBe(f.unitA)
   })
 })
+
+/**
+ * S655 review: the sync's auto-match read its candidates without a lock and
+ * then wrote `status='matched'` over whatever the row had become. A deposit
+ * the landlord filed as income meanwhile ended up both income AND a GAM payout;
+ * a tenant's deposit confirmed meanwhile was relabeled a GAM payout and used up
+ * that payout's match, leaving the real payout deposit in review to be filed
+ * as income. The match now re-checks the row and counts only when it landed.
+ */
+describe('an auto-match never overwrites a row someone acted on while it ran', () => {
+  /** Hold the row the way a filing does, run the matcher into it, then commit the filing. */
+  async function actWhileMatching(f: any, txnId: string, act: (c: any) => Promise<void>) {
+    const other = await db.connect()
+    try {
+      await other.query('BEGIN')
+      await other.query(`SELECT id FROM bank_transactions WHERE id = $1 FOR UPDATE`, [txnId])
+      const running = autoMatchLandlord(f.landlordId)
+      running.catch(() => {})
+      await untilSomeoneWaitsOnALock()
+      await act(other)
+      await other.query('COMMIT')
+      return await running
+    } finally { other.release() }
+  }
+
+  it('a deposit filed as income while the matcher runs stays income, with no payout stamped on it', async () => {
+    const f = await seed()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'race_inc', postedDate: '2026-09-11', amount: 1500, description: 'GOLD ASSET MGMT' },
+    ])
+    await seedDisbursement(f.landlordId, 1500, '2026-09-09')
+    const id = (await row('race_inc')).id
+
+    const n = await actWhileMatching(f, id, async (c) => {
+      const inc = (await c.query(
+        `INSERT INTO landlord_other_income (landlord_id, unit_id, category, amount, income_date)
+         VALUES ($1,$2,'other',1500,'2026-09-11') RETURNING id`, [f.landlordId, f.unitA])).rows[0].id
+      await c.query(
+        `UPDATE bank_transactions SET status = 'categorized', landlord_other_income_id = $2, categorized_at = now() WHERE id = $1`,
+        [id, inc])
+    })
+
+    expect(n).toBe(0)
+    const after = (await db.query(
+      `SELECT status, matched_disbursement_id, landlord_other_income_id FROM bank_transactions WHERE id = $1`, [id])).rows[0]
+    expect(after.status).toBe('categorized')
+    expect(after.matched_disbursement_id).toBeNull()
+    expect(after.landlord_other_income_id).toBeTruthy()
+  })
+
+  it('a tenant deposit confirmed while the matcher runs keeps its rent, and the payout stays free for its own deposit', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    let paymentId: string
+    try {
+      const tenantId = await seedTenant(c)
+      paymentId = await seedRentPayment(c, { unitId: f.unitA, tenantId, landlordId: f.landlordId, amount: 800 })
+    } finally { c.release() }
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'race_cash', postedDate: '2026-09-10', amount: 800, description: 'TELLER DEPOSIT' },
+    ])
+    const disb = await seedDisbursement(f.landlordId, 800, '2026-09-09')
+    const id = (await row('race_cash')).id
+
+    const n = await actWhileMatching(f, id, async (other) => {
+      await other.query(`UPDATE bank_transactions SET status = 'matched', matched_payment_id = $2 WHERE id = $1`, [id, paymentId])
+    })
+
+    expect(n).toBe(0)
+    const cash = (await db.query(
+      `SELECT status, matched_payment_id, matched_disbursement_id FROM bank_transactions WHERE id = $1`, [id])).rows[0]
+    expect(cash).toMatchObject({ status: 'matched', matched_payment_id: paymentId, matched_disbursement_id: null })
+    // The real GAM payout deposit arrives and still finds its payout.
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'real_payout', postedDate: '2026-09-11', amount: 800, description: 'GOLD ASSET MGMT' },
+    ])
+    expect((await db.query(`SELECT matched_disbursement_id FROM bank_transactions WHERE external_id = 'real_payout'`)).rows[0]
+      .matched_disbursement_id).toBe(disb)
+  })
+
+  // The matcher runs after the sync commits, outside its lock: the next sync
+  // on the link can follow the bank and change an untouched row in between.
+  it('a deposit whose amount the bank changed while the matcher ran is not stamped with the payout chosen for the old amount', async () => {
+    const f = await seed()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'moved_amt', postedDate: '2026-09-11', amount: 1500, description: 'GOLD ASSET MGMT' },
+    ])
+    const disb = await seedDisbursement(f.landlordId, 1500, '2026-09-09')
+    const id = (await row('moved_amt')).id
+
+    // What the next sync's followTheBank writes to an untouched row.
+    const n = await actWhileMatching(f, id, async (other) => {
+      await other.query(`UPDATE bank_transactions SET amount = 1450, updated_at = now() WHERE id = $1`, [id])
+    })
+
+    expect(n).toBe(0)
+    expect(await row('moved_amt')).toMatchObject({ status: 'needs_review', amount: '1450.00' })
+    expect((await db.query(`SELECT matched_disbursement_id FROM bank_transactions WHERE id = $1`, [id])).rows[0]
+      .matched_disbursement_id).toBeNull()
+    // Looked at again with the new figures, it still is not that payout…
+    expect(await autoMatchLandlord(f.landlordId)).toBe(0)
+    // …and the payout stays free for the deposit that really is it.
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'real_1500', postedDate: '2026-09-10', amount: 1500, description: 'GOLD ASSET MGMT' },
+    ])
+    expect((await db.query(`SELECT matched_disbursement_id FROM bank_transactions WHERE external_id = 'real_1500'`)).rows[0]
+      .matched_disbursement_id).toBe(disb)
+  })
+
+  it('a deposit whose date the bank moved out of the payout’s window while the matcher ran stays in review', async () => {
+    const f = await seed()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'moved_day', postedDate: '2026-09-11', amount: 1500, description: 'GOLD ASSET MGMT' },
+    ])
+    await seedDisbursement(f.landlordId, 1500, '2026-09-09')
+    const id = (await row('moved_day')).id
+
+    const n = await actWhileMatching(f, id, async (other) => {
+      await other.query(`UPDATE bank_transactions SET posted_date = '2026-09-30', updated_at = now() WHERE id = $1`, [id])
+    })
+
+    expect(n).toBe(0)
+    expect(await row('moved_day')).toMatchObject({ status: 'needs_review', posted_date: '2026-09-30' })
+    expect(await autoMatchLandlord(f.landlordId)).toBe(0)
+  })
+})
+
+/**
+ * S655 review: after a relink whose old copy was already filed, the filed
+ * original stays on the retired link (never synced again) and only its hidden
+ * copy on the live link hears from the bank. A void the bank reports there now
+ * reaches the original, so the page's "your bank voided this after it was
+ * filed" warning shows.
+ */
+describe('a void on a hidden copy reaches the original it copies', () => {
+  it('a filed original is flagged voided and still listed, so the landlord is warned', async () => {
+    const f = await seed()
+    const relink = await relinkSameBank(f)
+    const r = { postedDate: '2026-09-03', amount: -310, description: 'HOME DEPOT #9 AZ' }
+    await upsertTransactions(f.connectionId, f.landlordId, [{ externalId: 'o_v', ...r }])
+    const original = (await row('o_v')).id
+    await categorizeTransaction(f.landlordId, original, { category: 'repairs', scopeKind: 'unit', unitId: f.unitA })
+    await upsertTransactions(relink, f.landlordId, [{ externalId: 'n_v', ...r }])
+    expect(await row('n_v')).toMatchObject({ ignored_reason: 'duplicate', duplicate_of_id: original })
+
+    await upsertTransactions(relink, f.landlordId, [{ externalId: 'n_v', ...r, status: 'void' }])
+
+    expect(await row('o_v')).toMatchObject({ status: 'categorized', bank_status: 'void' })
+    const listed = (await listTransactions(f.landlordId)).find((t: any) => t.id === original)
+    expect(listed).toMatchObject({ status: 'categorized', bank_status: 'void' })
+    expect(await landlordExpensesTotal(f.landlordId, '2026-09-01', '2026-09-30')).toBe(310)   // still in the books
+  })
+
+  it('an original nobody filed is hidden as voided, like any voided row', async () => {
+    const f = await seed()
+    const relink = await relinkSameBank(f)
+    // An untouched original on the retired link, its copy on the live one.
+    const original = (await db.query(
+      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status, bank_status)
+       VALUES ($1,$2,'o_u','2026-09-04',-75,'HOTEL HOLD','needs_review','posted') RETURNING id`,
+      [f.connectionId, f.landlordId])).rows[0].id
+    await db.query(
+      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status, ignored_reason, duplicate_of_id, bank_status)
+       VALUES ($1,$2,'n_u','2026-09-04',-75,'HOTEL HOLD','ignored','duplicate',$3,'posted')`,
+      [relink, f.landlordId, original])
+
+    await upsertTransactions(relink, f.landlordId, [
+      { externalId: 'n_u', postedDate: '2026-09-04', amount: -75, description: 'HOTEL HOLD', status: 'void' },
+    ])
+
+    expect(await row('o_u')).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void', bank_status: 'void' })
+    expect(await listTransactions(f.landlordId)).toHaveLength(0)
+  })
+})
+
+/**
+ * S655 review: categorize booked the expense on a different connection from
+ * the one holding the bank row. A failure after the expense left it booked with
+ * the row still in review — to be filed, and booked, a second time.
+ */
+describe('filing a bank row is all or nothing', () => {
+  it('when marking the row filed fails, no expense is left behind and the row stays in review', async () => {
+    const f = await seed()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'atomic', postedDate: '2026-09-07', amount: -64, description: 'LOWES' },
+    ])
+    const id = (await row('atomic')).id
+    await db.query(`CREATE OR REPLACE FUNCTION test_refuse_bank_filing() RETURNS trigger AS $$
+                    BEGIN RAISE EXCEPTION 'simulated failure after the expense was booked'; END $$ LANGUAGE plpgsql`)
+    await db.query(`CREATE TRIGGER test_refuse_bank_filing BEFORE UPDATE ON bank_transactions
+                    FOR EACH ROW WHEN (NEW.expense_id IS NOT NULL) EXECUTE FUNCTION test_refuse_bank_filing()`)
+    try {
+      await expect(categorizeTransaction(f.landlordId, id, { category: 'repairs', scopeKind: 'unit', unitId: f.unitA }))
+        .rejects.toThrow(/simulated failure/)
+    } finally {
+      await db.query(`DROP TRIGGER IF EXISTS test_refuse_bank_filing ON bank_transactions`)
+      await db.query(`DROP FUNCTION IF EXISTS test_refuse_bank_filing()`)
+    }
+    expect((await db.query(`SELECT count(*)::int AS n FROM landlord_expenses WHERE landlord_id = $1`, [f.landlordId])).rows[0].n).toBe(0)
+    expect(await row('atomic')).toMatchObject({ status: 'needs_review' })
+    // And it can be filed cleanly afterwards — once.
+    await categorizeTransaction(f.landlordId, id, { category: 'repairs', scopeKind: 'unit', unitId: f.unitA })
+    expect(await landlordExpensesTotal(f.landlordId, '2026-09-01', '2026-09-30')).toBe(64)
+  })
+})
+
+describe('setting the books start date inside a caller’s transaction', () => {
+  it('moves nothing until the caller commits, and nothing at all when it rolls back', async () => {
+    const f = await seed()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'old_a', postedDate: '2026-08-20', amount: -12, description: 'AUGUST' },
+      { externalId: 'sept_a', postedDate: '2026-09-05', amount: -13, description: 'SEPTEMBER' },
+    ])
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      expect(await setBooksStartDate(f.landlordId, '2026-09-01', c)).toEqual({ ignored: 1, restored: 0 })
+      expect((await row('old_a')).status).toBe('needs_review')          // not visible outside yet
+      await c.query('ROLLBACK')
+    } finally { c.release() }
+    expect((await row('old_a')).status).toBe('needs_review')
+    expect((await db.query(`SELECT books_start_date FROM landlords WHERE id = $1`, [f.landlordId])).rows[0].books_start_date).toBeNull()
+  })
+})

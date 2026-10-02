@@ -5,6 +5,7 @@ import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS } from '
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
+import { usePerms } from '../lib/permissions'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 // S252: legacy per-tenant FlexChargePanel removed. The new schema
@@ -21,9 +22,37 @@ export function TenantDetailPage() {
   // panel. New flex_charge_accounts schema is (customer, property)
   // keyed; consult the FlexCharge dashboard (S254) for per-property
   // account management.
-  const { data, isLoading } = useQuery(['tenant-profile', id], () => apiGet<any>(`/tenants/${id}/profile`))
+  const { data, isLoading, error, refetch, isFetching } = useQuery(['tenant-profile', id], () => apiGet<any>(`/tenants/${id}/profile`), {
+    // A refusal or a missing person will not change on a retry: say it once.
+    retry: (count: number, e: any) => {
+      const status = e?.response?.status
+      return !(status >= 400 && status < 500) && count < 2
+    },
+  })
   if (isLoading) return <div style={{ color: 'var(--text-3)', padding: 32 }}>Loading...</div>
-  if (!data) return <div className="empty-state"><h3>Tenant not found</h3></div>
+  if (!data) {
+    // S655: say why in plain words, with the way out — a staff member assigned
+    // to particular properties cannot open someone who never lived there.
+    const status = (error as any)?.response?.status
+    const reason: string | undefined = (error as any)?.response?.data?.error
+    const title = status === 403 ? "You can't open this resident"
+      : status === 404 || !error ? 'Tenant not found'
+      : "This resident's page didn't load"
+    return (
+      <div className="empty-state">
+        <h3>{title}</h3>
+        {status === 403 && reason && <p>{reason}</p>}
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 12 }}>
+          {error && status !== 403 && status !== 404 && (
+            <button className="btn btn-primary btn-sm" disabled={isFetching} onClick={() => refetch()}>
+              {isFetching ? 'Trying again…' : 'Try again'}
+            </button>
+          )}
+          <button className="btn btn-ghost btn-sm" onClick={() => navigate('/tenants')}>Back to tenants</button>
+        </div>
+      </div>
+    )
+  }
   const { tenant, units, payments, maintenance, stats } = data
   // S641: staff without the payment permissions get no payment history or
   // money figures from the server; the payment cards are left out for them.
@@ -44,7 +73,9 @@ export function TenantDetailPage() {
               <h1 className="page-title" style={{ marginBottom: 2 }}>{tenant.firstName} {tenant.lastName}</h1>
               <p className="page-subtitle">
                 {currentUnit ? `Unit ${currentUnit.unitNumber} - ${currentUnit.propertyName}` : 'No current unit'}
-                {tenant.ssiSsdi && <span className="badge badge-gold" style={{ marginLeft: 8 }}>SSI/SSDI</span>}
+                {/* S655 (Nic, 10/2): no SSI/SSDI badge. "That's our check for
+                    the flex products" — GAM-side only; the server no longer
+                    sends the flag to a landlord. */}
               </p>
             </div>
           </div>
@@ -464,6 +495,12 @@ function AddChargeModal({ tenantId, onClose, onSaved }: {
 // payment." A check that arrived before its bill: settles what is open, and
 // the rest is paid ahead — drawn down by the next invoice before it goes out.
 function PostPaymentCard({ tenantId, hasUnit, paidAhead }: { tenantId: string; hasUnit: boolean; paidAhead: number }) {
+  // S655: posting a payment needs "Take payments". A worker without it used to
+  // see the button and get "Insufficient permissions" after filling the form
+  // in — now the button is simply not there. The paid-ahead line still shows
+  // to anyone the server sends it to (those who may see payments).
+  const { can } = usePerms()
+  const canPost = can('take_payment')
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
   const [amount, setAmount] = useState('')
@@ -489,20 +526,23 @@ function PostPaymentCard({ tenantId, hasUnit, paidAhead }: { tenantId: string; h
     },
   )
   const ready = Number(amount) > 0 && (method === 'cash' || reference.trim().length > 0 || true)
+  if (!canPost && !(paidAhead > 0)) return null
   return (
     <div className="card" style={{ marginBottom: 16 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
         <div className="card-title" style={{ marginBottom: 0 }}>Payments</div>
-        {hasUnit && (
+        {hasUnit && canPost && (
           <button className="btn btn-primary btn-sm" onClick={() => { setError(''); setOpen(true) }}>
             <Plus size={13}/> Post a payment
           </button>
         )}
       </div>
-      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
-        Cash, a check or a money order handed over. It settles whatever is open first; anything
-        beyond that is paid ahead and comes off their next invoice before it goes out.
-      </div>
+      {canPost && (
+        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
+          Cash, a check or a money order handed over. It settles whatever is open first; anything
+          beyond that is paid ahead and comes off their next invoice before it goes out.
+        </div>
+      )}
       {paidAhead > 0 && (
         <div style={{ marginTop: 10, padding: '8px 12px', borderRadius: 8, background: 'rgba(34,197,94,.08)', border: '1px solid rgba(34,197,94,.25)', fontSize: '.8rem', color: 'var(--text-0)' }}>
           Paid ahead: <strong className="mono">{fmt(paidAhead)}</strong> — covers their next invoice.

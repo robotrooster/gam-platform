@@ -66,10 +66,8 @@ const DELIBERATE = new Map(Object.entries({
     'adds a customer at the register, named by the person standing at the counter. Typed there with the sale on screen; a misheard name or email files purchases under a stranger.',
   'pos POST /transactions/:id/email-receipt':
     'emails a receipt for a sale the register just rang up, to an address typed at the counter — a misheard address sends someone\'s purchase to a stranger.',
-  'pos PUT /transactions/:id/customer-info':
-    'types in the name, email and phone of the person a rung-up sale belongs to. Done on the receipt screen or the sale\'s line in History with the sale on screen — a misheard email files a purchase under a stranger.',
   'pos PATCH /transactions/:id/customer':
-    'changes which person a rung-up sale belongs to. Done from the sale\'s own line in History with the list of names on screen — the wrong name is a purchase on the wrong person\'s record.',
+    'changes which person a rung-up sale belongs to. Done from the sale\'s own line in History by typing their name into the type-ahead and picking them — the wrong name is a purchase on the wrong person\'s record.',
   'pos PATCH /customers/:id':
     'edits a register customer\'s name, email or phone. Done on the Customers tab with the record on screen.',
   'pos POST /customers/:id/merge':
@@ -281,8 +279,20 @@ const DELIBERATE = new Map(Object.entries({
   'landlords POST /me/onboard-properties-csv/validate': 'a CSV is a file the landlord uploads and reviews',
   'landlords POST /me/onboard-properties-csv/commit': 'commits an import the landlord reviewed on screen',
   'landlords POST /me/onboard-tenants-csv/validate': 'a CSV is a file the landlord uploads and reviews',
-  'landlords POST /me/onboard-tenants-csv/commit': 'commits an import the landlord reviewed on screen; a bad one lands on hundreds of rows',
-  'landlords POST /me/onboard-tenants-csv/commit-pending': 'commits an import the landlord reviewed on screen',
+  // S655 (decisions 10/2): the park-wide new-lease sender. Added here by the
+  // owner of this file so the parity test stays closed; the routes are the
+  // renewals work's (routes/esign.ts).
+  'esign POST /documents/renewal-batch/preview':
+    'shows, per household, the new rent and start date a park-wide new lease would carry. It is the review step of the on-screen sender, with every household listed — nothing to ask for out loud.',
+  'esign POST /documents/renewal-batch':
+    'drafts a new lease for every household at a property at once, at a new rent. Pressed on the screen that lists each household and its new rent; a misheard date or amount would reach the whole park.',
+  // S655: the tenant CSV is a DRAFT ROSTER reviewed and confirmed on screen.
+  'landlords POST /me/onboard-tenants-csv/commit': 'retired: the tenant import saves a draft roster now, and this answers 410 with that next step',
+  'landlords POST /me/onboard-tenants-csv/commit-pending': 'retired: the tenant import saves a draft roster now, and this answers 410 with that next step',
+  'landlords POST /me/onboard-tenants-csv/draft': 'saves a CSV file the landlord uploads to a draft roster they then review on screen; a file is not something said out loud',
+  'landlords PATCH /me/tenant-roster/:id': 'edits one person on a draft roster the landlord is reviewing on screen, unit by unit, with the file\'s own values beside it',
+  'landlords DELETE /me/tenant-roster/:id': 'removes one person from a draft roster the landlord is reviewing on screen',
+  'landlords POST /me/tenant-roster/confirm': 'confirms a whole property\'s roster at once and drafts a lease per household; it is pressed on the review screen where every unit and its problems are listed',
   'landlords POST /me/onboard-payment-history-csv/validate': 'a CSV is a file the landlord uploads and reviews',
   'landlords POST /me/onboard-payment-history-csv/commit': 'commits imported payment history the landlord reviewed on screen',
   'tenants POST /flexpay/inquiry/proof': 'proof of income is a file the tenant uploads',

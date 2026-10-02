@@ -142,7 +142,8 @@ describe('POST /invite — landlord invites tenant', () => {
     expect(res.body.error).toMatch(/forbidden/i)
   })
 
-  it('happy: creates user + tenant + invite token; URL uses TENANT_APP_URL', async () => {
+  // S655 (Nic, 10/2): email-only — the token is stamped and mailed, never returned.
+  it('happy: creates user + tenant + invite token, and returns no link', async () => {
     const f = await seedLandlordFixture()
     process.env.TENANT_APP_URL = 'https://tenant.test.gam'
     const res = await request(buildApp())
@@ -153,8 +154,9 @@ describe('POST /invite — landlord invites tenant', () => {
     expect(res.status).toBe(200)
     expect(res.body.success).toBe(true)
     expect(res.body.data.email).toBe('new-tenant@test.dev')
-    expect(res.body.data.inviteToken).toMatch(/^[0-9a-f]{64}$/)
-    expect(res.body.data.acceptUrl).toContain('https://tenant.test.gam/accept-invite?token=')
+    expect(res.body.data).not.toHaveProperty('inviteToken')
+    expect(res.body.data).not.toHaveProperty('acceptUrl')
+    expect(res.body.data.inviteSent).toBe(true)
 
     // Side effects: user row + tenants row + token stamped on users.
     // S410 (S377): read tenant_invite_token + expiry, not email_verify_token.
@@ -166,7 +168,7 @@ describe('POST /invite — landlord invites tenant', () => {
       ['new-tenant@test.dev'])
     expect(u.rows[0].first_name).toBe('New')
     expect(u.rows[0].phone).toBe('5555550100')
-    expect(u.rows[0].tenant_invite_token).toBe(res.body.data.inviteToken)
+    expect(u.rows[0].tenant_invite_token).toMatch(/^[0-9a-f]{64}$/)
     // S410: 7-day expiry stamped at invite time.
     const expiresAt = new Date(u.rows[0].tenant_invite_expires_at)
     const expectedExpiry = Date.now() + 7 * 24 * 60 * 60 * 1000

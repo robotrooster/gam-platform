@@ -426,10 +426,39 @@ describe('GET /:id/profile — a landlord sees only its own company', () => {
     const t = res.body.data.tenant
     expect(t.id).toBe(m.a.tenantId)
     expect(t.email).toBeTruthy()
-    expect('ssi_ssdi' in t).toBe(true)
     for (const k of ['stripe_customer_id', 'bank_last4', 'bank_routing_last4', 'date_of_birth',
       'mailing_address', 'flexpay_disqualified_reason', 'background_check_status', 'flexpay_enrolled']) {
       expect(t[k]).toBeUndefined()
+    }
+  })
+
+  // S655 (Nic, 10/2): "That's our check for the flex products." The SSI/SSDI
+  // flag is GAM's FlexPay/FlexDeposit eligibility check — never the landlord's.
+  it('never sends the SSI/SSDI flag to a landlord or staff viewer; the resident and GAM admin still see it', async () => {
+    const m = await seedMovedResident()
+    await db.query(`UPDATE tenants SET ssi_ssdi = TRUE WHERE id = $1`, [m.a.tenantId])
+    const sign = (payload: object) => jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const { rows: [staff] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'property_manager', 'Pat', 'Manager', TRUE) RETURNING id`, [`pm-${randomUUID()}@test.dev`])
+    await db.query(`INSERT INTO property_manager_scopes (user_id, landlord_id, all_properties) VALUES ($1, $2, TRUE)`,
+      [staff.id, m.bLandlordId])
+    const staffToken = sign({ userId: staff.id, role: 'property_manager', email: 'pm@test.dev',
+      profileId: null, landlordId: m.bLandlordId, permissions: { 'payments.view_all': true, 'books.view': true } })
+    for (const token of [m.bToken, m.a.landlordToken, staffToken]) {
+      const res = await request(buildApp())
+        .get(`/api/tenants/${m.a.tenantId}/profile`)
+        .set('Authorization', `Bearer ${token}`)
+      expect(res.status).toBe(200)
+      expect('ssi_ssdi' in res.body.data.tenant).toBe(false)
+      expect(JSON.stringify(res.body)).not.toMatch(/ssi_ssdi|ssiSsdi/)
+    }
+    for (const token of [m.a.tenantToken, m.a.adminToken]) {
+      const res = await request(buildApp())
+        .get(`/api/tenants/${m.a.tenantId}/profile`)
+        .set('Authorization', `Bearer ${token}`)
+      expect(res.status).toBe(200)
+      expect(res.body.data.tenant.ssi_ssdi).toBe(true)
     }
   })
 
@@ -454,6 +483,8 @@ describe('GET /:id/profile — a landlord sees only its own company', () => {
     const { rows: [staff] } = await db.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'onsite_manager', 'On', 'Site', TRUE) RETURNING id`, [`os-${randomUUID()}@test.dev`])
+    await db.query(`INSERT INTO onsite_manager_scopes (user_id, landlord_id, all_properties) VALUES ($1, $2, TRUE)`,
+      [staff.id, f.landlordId])
     const sign = (payload: object) => jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '1h' })
     const plain = sign({ userId: staff.id, role: 'onsite_manager', email: 'os@test.dev',
       profileId: null, landlordId: f.landlordId, permissions: {} })
@@ -477,5 +508,177 @@ describe('GET /:id/profile — a landlord sees only its own company', () => {
     expect(res2.body.data.payments).toHaveLength(1)
     expect(res2.body.data.paymentsHidden).toBe(false)
     expect(res2.body.data.stats.totalPaid).toBeCloseTo(800, 2)
+  })
+
+  // S655: the paid-ahead figure is money too. It goes to whoever may see
+  // payments, and to the front desk that posts them (so a check is not posted
+  // twice) — to nobody else.
+  it('the paid-ahead figure goes only to staff who may see payments or who post them', async () => {
+    const f = await seedPortfolio()
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1, $2, 125, 125)`, [f.leaseId, f.tenantId])
+    const { rows: [staff] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'On', 'Site', TRUE) RETURNING id`, [`os-${randomUUID()}@test.dev`])
+    await db.query(`INSERT INTO onsite_manager_scopes (user_id, landlord_id, all_properties) VALUES ($1, $2, TRUE)`,
+      [staff.id, f.landlordId])
+    const sign = (permissions: Record<string, boolean>) => jwt.sign(
+      { userId: staff.id, role: 'onsite_manager', email: 'os@test.dev',
+        profileId: null, landlordId: f.landlordId, permissions },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const paidAheadFor = async (token: string) => {
+      const res = await request(buildApp())
+        .get(`/api/tenants/${f.tenantId}/profile`)
+        .set('Authorization', `Bearer ${token}`)
+      expect(res.status).toBe(200)
+      return res.body.data.paidAhead
+    }
+
+    expect(await paidAheadFor(sign({}))).toBeNull()
+    expect(await paidAheadFor(sign({ 'maintenance.view': true }))).toBeNull()
+    expect(await paidAheadFor(sign({ take_payment: true }))).toBe(125)
+    expect(await paidAheadFor(sign({ 'payments.view_all': true }))).toBe(125)
+    expect(await paidAheadFor(sign({ 'books.view': true }))).toBe(125)
+    expect(await paidAheadFor(f.landlordToken)).toBe(125)
+    expect(await paidAheadFor(f.adminToken)).toBe(125)
+
+    // The front desk gets the figure, not the history.
+    const desk = await request(buildApp())
+      .get(`/api/tenants/${f.tenantId}/profile`)
+      .set('Authorization', `Bearer ${sign({ take_payment: true })}`)
+    expect(desk.body.data.paymentsHidden).toBe(true)
+    expect(desk.body.data.payments).toEqual([])
+    expect(desk.body.data.stats.totalPaid).toBeNull()
+  })
+
+  // S655: a staff member assigned to one park sees the person's time at that
+  // park — not at the company's other parks.
+  it('a staff member assigned to one property sees only that property\'s history; all-properties staff see both', async () => {
+    const f = await seedPortfolio()   // park 1: the current lease
+    const c = await db.connect()
+    let p2 = '', u2 = '', l2 = ''
+    try {
+      await c.query('BEGIN')
+      p2 = await seedProperty(c, { landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      u2 = await seedUnit(c, { propertyId: p2, landlordId: f.landlordId })
+      l2 = await seedLease(c, { unitId: u2, landlordId: f.landlordId, status: 'terminated', startDate: '2025-01-01' })
+      await seedLeaseTenant(c, { leaseId: l2, tenantId: f.tenantId, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    await payment(f.unitId, f.tenantId, f.landlordId, 800, 1)
+    await payment(u2, f.tenantId, f.landlordId, 650, 14)
+    await db.query(
+      `INSERT INTO maintenance_requests (tenant_id, unit_id, landlord_id, title, description, priority, status)
+       VALUES ($1, $2, $3, 'Park 1 gate', 'x', 'normal', 'open'), ($1, $4, $3, 'Park 2 roof', 'y', 'normal', 'completed')`,
+      [f.tenantId, f.unitId, f.landlordId, u2])
+    await db.query(
+      `INSERT INTO work_trade_agreements (unit_id, tenant_id, landlord_id, start_date) VALUES ($1, $2, $3, '2025-01-01')`,
+      [u2, f.tenantId, f.landlordId])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1, $3, 50, 50), ($2, $3, 20, 20)`, [f.leaseId, l2, f.tenantId])
+
+    const { rows: [staff] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'Park', 'One', TRUE) RETURNING id`, [`os1-${randomUUID()}@test.dev`])
+    await db.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, property_ids, all_properties)
+       VALUES ($1, $2, $3::uuid[], FALSE)`, [staff.id, f.landlordId, [f.propertyId]])
+    const token = jwt.sign({ userId: staff.id, role: 'onsite_manager', email: 'os1@test.dev', profileId: null,
+      landlordId: f.landlordId, permissions: { 'payments.view_all': true } }, process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const view = async () => {
+      const res = await request(buildApp())
+        .get(`/api/tenants/${f.tenantId}/profile`)
+        .set('Authorization', `Bearer ${token}`)
+      expect(res.status).toBe(200)
+      return res.body.data
+    }
+
+    const d = await view()
+    expect(d.units.map((u: any) => u.id)).toEqual([f.unitId])
+    expect(d.payments.map((p: any) => Number(p.amount))).toEqual([800])
+    expect(d.maintenance.map((m: any) => m.title)).toEqual(['Park 1 gate'])
+    expect(d.workTrade).toEqual([])
+    expect(d.paidAhead).toBe(50)
+    expect(d.stats.totalPaid).toBeCloseTo(800, 2)
+    expect(d.stats.unitsOccupied).toBe(1)
+
+    // Moved to park 2 only: park 2's history, none of park 1's.
+    await db.query(`UPDATE onsite_manager_scopes SET property_ids = $2::uuid[] WHERE user_id = $1`, [staff.id, [p2]])
+    const d2 = await view()
+    expect(d2.units.map((u: any) => u.id)).toEqual([u2])
+    expect(d2.payments.map((p: any) => Number(p.amount))).toEqual([650])
+    expect(d2.maintenance.map((m: any) => m.title)).toEqual(['Park 2 roof'])
+    expect(d2.workTrade).toHaveLength(1)
+    expect(d2.paidAhead).toBe(20)
+
+    // All properties: the company's whole history with this person.
+    await db.query(`UPDATE onsite_manager_scopes SET all_properties = TRUE WHERE user_id = $1`, [staff.id])
+    const all = await view()
+    expect(all.units).toHaveLength(2)
+    expect(all.payments).toHaveLength(2)
+    expect(all.maintenance).toHaveLength(2)
+    expect(all.paidAhead).toBe(70)
+
+    // The owner is never property-limited.
+    const owner = await request(buildApp())
+      .get(`/api/tenants/${f.tenantId}/profile`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(owner.body.data.units).toHaveLength(2)
+  })
+
+  // S655: limiting the history lists was not enough — the contact card (name,
+  // email, phone) still came back for someone who never lived at the staff
+  // member's park. Same company, so nothing crossed companies, but staff are
+  // scoped on the server.
+  it('a staff member assigned to one property cannot open a resident who never had a lease or invitation there', async () => {
+    const f = await seedPortfolio()   // the resident's only lease is at park 1
+    const c = await db.connect()
+    let p2 = '', u2 = ''
+    try {
+      p2 = await seedProperty(c, { landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      u2 = await seedUnit(c, { propertyId: p2, landlordId: f.landlordId })
+    } finally { c.release() }
+    const { rows: [staff] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'Park', 'Two', TRUE) RETURNING id`, [`os2-${randomUUID()}@test.dev`])
+    await db.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, property_ids, all_properties)
+       VALUES ($1, $2, $3::uuid[], FALSE)`, [staff.id, f.landlordId, [p2]])
+    const token = jwt.sign({ userId: staff.id, role: 'onsite_manager', email: 'os2@test.dev', profileId: null,
+      landlordId: f.landlordId, permissions: { 'payments.view_all': true } }, process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const open = () => request(buildApp())
+      .get(`/api/tenants/${f.tenantId}/profile`)
+      .set('Authorization', `Bearer ${token}`)
+
+    const refused = await open()
+    expect(refused.status).toBe(403)
+    expect(refused.body.error).toMatch(/never had a lease at the properties you're assigned to/)
+    expect(JSON.stringify(refused.body)).not.toContain('@')   // no contact details ride along
+
+    // An open invitation to a site at park 2 lets them open the person.
+    const { rows: [intent] } = await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, property_id)
+       VALUES ($1, $2, $3, $4) RETURNING id`, [f.landlordId, f.tenantId, u2, p2])
+    const invited = await open()
+    expect(invited.status).toBe(200)
+    expect(invited.body.data.tenant.id).toBe(f.tenantId)
+    expect(invited.body.data.units).toEqual([])        // still none of park 1's history
+    expect(invited.body.data.payments).toEqual([])
+
+    // A withdrawn invitation does not.
+    await db.query(`UPDATE pending_tenant_intents SET cancelled_at = NOW() WHERE id = $1`, [intent.id])
+    expect((await open()).status).toBe(403)
+
+    // Assigned to park 1 (where the lease is), or to every property: they can.
+    await db.query(`UPDATE onsite_manager_scopes SET property_ids = $2::uuid[] WHERE user_id = $1`, [staff.id, [f.propertyId]])
+    expect((await open()).status).toBe(200)
+    await db.query(`UPDATE onsite_manager_scopes SET property_ids = $2::uuid[], all_properties = TRUE WHERE user_id = $1`, [staff.id, [p2]])
+    expect((await open()).status).toBe(200)
+
+    // A staff login with no properties at all opens nobody.
+    await db.query(`UPDATE onsite_manager_scopes SET property_ids = '{}'::uuid[], all_properties = FALSE WHERE user_id = $1`, [staff.id])
+    expect((await open()).status).toBe(403)
   })
 })

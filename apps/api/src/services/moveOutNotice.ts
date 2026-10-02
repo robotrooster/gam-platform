@@ -27,6 +27,10 @@ export interface MoveOutNoticeLease {
   landlord_id: string
   unit_id: string
   status: string
+  /** S655: a landlord-signed new lease whose start date has come — the
+   *  household's lease now, even while the hand-off from the lease it follows
+   *  waits a night on that lease's last bill (it can still read 'pending'). */
+  took_over: boolean
   start_date: string
   end_date: string | null
   move_out_notice_at: string | null
@@ -42,6 +46,10 @@ export interface MoveOutNoticeLease {
 export async function loadLeaseForNotice(leaseId: string): Promise<MoveOutNoticeLease | null> {
   return queryOne<MoveOutNoticeLease>(`
     SELECT l.id, l.landlord_id, l.unit_id, l.status,
+           (l.status IN ('pending', 'active') AND l.supersedes_lease_id IS NOT NULL
+             AND l.lease_source = 'esigned' AND l.signed_by_landlord = TRUE
+             AND l.start_date <= GREATEST(CURRENT_DATE, (NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date)
+           ) AS took_over,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
            l.move_out_notice_at, l.move_out_notice_by, l.move_out_notice_note,
@@ -68,6 +76,30 @@ function sayDate(iso: string, tz: string): string {
   return DateTime.fromISO(iso, { zone: tz }).toFormat('cccc, LLLL d')
 }
 
+/** In force for a leaving date: active, or a new lease that has taken over (S655). */
+function inForce(lease: MoveOutNoticeLease): boolean {
+  return lease.status === 'active' || (lease.status === 'pending' && lease.took_over)
+}
+
+/**
+ * S655: the household's new lease once its start date has come. From that day
+ * it is their lease — the one before it ended the day before — so a leaving
+ * date belongs on it, whichever row the desk opened. (Normally the hand-off has
+ * already expired the old lease; this covers the night or two it can wait on
+ * the old lease's last bill.)
+ */
+async function newLeaseThatTookOver(leaseId: string): Promise<string | null> {
+  const r = await queryOne<{ id: string }>(`
+    SELECT s.id FROM leases s
+      JOIN units u ON u.id = s.unit_id
+      JOIN properties p ON p.id = u.property_id
+     WHERE s.supersedes_lease_id = $1 AND s.lease_source = 'esigned'
+       AND s.signed_by_landlord = TRUE AND s.status IN ('pending', 'active')
+       AND s.start_date <= GREATEST(CURRENT_DATE, (NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date)
+     ORDER BY s.start_date DESC LIMIT 1`, [leaseId])
+  return r?.id ?? null
+}
+
 /**
  * Record that the resident said they are leaving on `on`. The day is the
  * departure day (the space is theirs through the night before — same exclusive
@@ -79,13 +111,56 @@ export async function recordMoveOutNotice(opts: {
   note?: string | null
   byUserId: string
 }): Promise<MoveOutNoticeLease> {
-  const lease = await loadLeaseForNotice(opts.leaseId)
+  let lease = await loadLeaseForNotice(opts.leaseId)
   if (!lease) throw new AppError(404, 'Lease not found')
-  if (lease.status !== 'active') throw new AppError(409, `That lease is ${lease.status}, not active`)
+  if (lease.status === 'active') {
+    const successorId = await newLeaseThatTookOver(lease.id)
+    if (successorId) lease = (await loadLeaseForNotice(successorId))!
+  }
+  if (!inForce(lease)) {
+    throw new AppError(409, lease.status === 'pending'
+      ? 'That lease has not started yet, so there is no leaving date to write down on it.'
+      : 'That lease is no longer in force — there is nothing to mark.')
+  }
 
   const today = DateTime.now().setZone(lease.property_tz).toISODate()!
   if (opts.on < today) throw new AppError(400, 'The leaving date cannot be in the past — if they have already gone, record it as today so the final read is asked for now')
   if (opts.on <= lease.start_date) throw new AppError(400, 'The leaving date has to be after the day they moved in')
+  // S655: a new lease for this household is waiting (drafted, or signed by the
+  // landlord to start on a date). Leaving and staying on a new lease cannot both
+  // be true — and the lease-end job would read the new lease as a hand-off, so
+  // the move-out would never happen. The new lease is canceled first, by hand,
+  // with the button the new-lease window shows — and that button exists only
+  // while nobody in the household has signed (a document a tenant has signed is
+  // never voided: lib/voidDocument, S558). Once anyone has, the leaving date
+  // goes on the new lease once it starts. The window says the same.
+  const signedNext = await queryOne<{ start_date: string; someone_signed: boolean }>(`
+    SELECT to_char(s.start_date, 'YYYY-MM-DD') AS start_date,
+           (s.signed_by_tenant OR EXISTS (
+              SELECT 1 FROM lease_documents d JOIN lease_document_signers t ON t.document_id = d.id
+               WHERE d.lease_id = s.id AND d.renews_lease_id = $1
+                 AND t.role NOT IN ('landlord', 'witness') AND t.signed_at IS NOT NULL)) AS someone_signed
+      FROM leases s
+     WHERE s.supersedes_lease_id = $1 AND s.status IN ('pending', 'active') AND s.signed_by_landlord = TRUE
+     ORDER BY s.start_date LIMIT 1`, [lease.id])
+  if (signedNext?.someone_signed) {
+    throw new AppError(409,
+      `${lease.unit_number} has a new lease starting ${sayDate(signedNext.start_date, lease.property_tz)} that the household has signed, ` +
+      'so it can\'t be canceled. Write down the leaving date on that new lease once it starts (Leases → Change → They\'re leaving on…).')
+  }
+  if (signedNext) {
+    throw new AppError(409,
+      `${lease.unit_number} has a new lease starting ${sayDate(signedNext.start_date, lease.property_tz)}. ` +
+      'If they are leaving instead, cancel it first: Leases → Change → New lease — view or cancel → Cancel the new lease. Then write down the leaving date.')
+  }
+  const draft = await queryOne<{ id: string }>(`
+    SELECT d.id FROM lease_documents d
+     WHERE d.renews_lease_id = $1 AND d.status NOT IN ('completed', 'voided') LIMIT 1`, [lease.id])
+  if (draft) {
+    throw new AppError(409,
+      `A new lease for ${lease.unit_number} is being drawn up. ` +
+      'If they are leaving instead, throw it away first: Leases → Change → New lease from a date… → Throw away draft. Then write down the leaving date.')
+  }
   // A date PAST the signed end would extend the term with no document behind
   // it. Nic decided extensions are not automatic: "I'll just invite them if
   // that flow happens." A month-to-month lease (no end date) can be marked
@@ -107,8 +182,8 @@ export async function recordMoveOutNotice(opts: {
            move_out_notice_note = $4,
            move_out_notice_prev_end_date = $5,
            updated_at = NOW()
-     WHERE id = $1 AND status = 'active'
-     RETURNING id`, [lease.id, opts.on, opts.byUserId, opts.note?.trim() || null, prevEnd])
+     WHERE id = $1 AND (status = 'active' OR (status = 'pending' AND $6::boolean))
+     RETURNING id`, [lease.id, opts.on, opts.byUserId, opts.note?.trim() || null, prevEnd, lease.took_over])
   if (!updated) throw new AppError(409, 'That lease changed while you were typing — reload and try again')
 
   logger.info({ leaseId: lease.id, on: opts.on, by: opts.byUserId, prevEnd },
@@ -150,7 +225,7 @@ export async function cancelMoveOutNotice(opts: { leaseId: string; byUserId: str
   const lease = await loadLeaseForNotice(opts.leaseId)
   if (!lease) throw new AppError(404, 'Lease not found')
   if (!lease.move_out_notice_at) throw new AppError(409, 'There is no leaving date on this lease to call off')
-  if (lease.status !== 'active') throw new AppError(409, `That lease is ${lease.status} — the move-out already happened`)
+  if (!inForce(lease)) throw new AppError(409, 'That lease is no longer in force — the move-out already happened')
 
   const restoreTo = lease.move_out_notice_prev_end_date  // null = month-to-month again
   const { findStayConflict } = await import('./unitAvailability')

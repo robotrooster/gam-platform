@@ -272,8 +272,7 @@ export async function generateMoveInInvoice(
             -- S652: the day the property was added to GAM, in its own time zone.
             to_char((COALESCE(p.onboarding_started_at, p.created_at)
                      AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on,
-            -- S654: read exactly as invoiceGeneration's ACTIVE_LEASE_SELECT does,
-            -- for the S638 started-after-the-20th exemption below.
+            -- S654: read exactly as invoiceGeneration's ACTIVE_LEASE_SELECT does.
             to_char(l.start_date, 'YYYY-MM-DD') AS lease_start_date,
             COALESCE(p.timezone, 'America/Phoenix') AS property_tz
        FROM leases l
@@ -460,16 +459,14 @@ export async function generateMoveInInvoice(
 
     // S654: the late-fee stamp is decided the same way the nightly generator
     // decides it (invoiceGeneration.ts, lateStartExempt): work trade, OR the
-    // first bill AND (an existing tenancy where the landlord waived, OR a
-    // lease that started after the 20th — S638, "late onboarders are exempt
-    // system wide"). This path had the waiver but not the 20th, so a resident
-    // signed on the 25th was exempt if billed overnight and fined if billed
-    // at signing. A voided history invoice is not a prior bill (S654).
-    // A renewal is nobody's first bill on the platform: the S638 grace for
-    // people who need days to get set up does not apply to it.
-    const startedAfter20th = !renewal && DateTime
-      .fromISO(leaseMeta?.lease_start_date ?? inputs.start_date,
-        { zone: leaseMeta?.property_tz ?? 'America/Phoenix' }).day > 20
+    // first bill of an existing tenancy where the landlord waived it. A voided
+    // history invoice is not a prior bill (S654).
+    //
+    // Nic (10/2): the S638 "started after the 20th" exemption is gone. "That
+    // late fee waiver was just my personal preference... That should be a
+    // landlord preference, not a platform setting." The property's onboarding
+    // answer (onboarding_late_fee_waiver) is the only thing that waives a first
+    // bill now. A renewal is nobody's first bill on the platform.
     const priorInvoice = await client.query<{ n: string }>(
       `SELECT COUNT(*)::text AS n FROM invoices WHERE lease_id = $1 AND due_date < $2::date AND status <> 'void'`,
       [inputs.lease_id, invoiceDueDate])
@@ -481,7 +478,7 @@ export async function generateMoveInInvoice(
     const renewalBackdated = renewal
       && invoiceDueDate < DateTime.now().setZone(leaseMeta?.property_tz ?? 'America/Phoenix').toISODate()!
     const lateFeeExempt = !!wtAgreement || renewalBackdated
-      || (isFirstInvoice && (onboardingWaived || startedAfter20th))
+      || (isFirstInvoice && onboardingWaived)
 
     const invoiceRes = await client.query(
       `INSERT INTO invoices (
@@ -517,7 +514,6 @@ export async function generateMoveInInvoice(
         //
         // S648 (Nic): and only where the landlord chose to waive it for this
         // property. Unanswered = the resident is billed late fees.
-        // S654: plus the S638 after-the-20th rule — see lateFeeExempt above.
         lateFeeExempt,
       ]
     )

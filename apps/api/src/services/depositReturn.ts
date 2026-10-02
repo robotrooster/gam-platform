@@ -101,6 +101,37 @@ export interface UnpaidBalanceLine {
   status:            'pending' | 'failed'
 }
 
+/**
+ * S655: the leases one tenancy has run under — this lease and every lease it
+ * follows as a NEW LEASE OF THE SAME HOUSEHOLD (an e-signed renewal), as a
+ * subquery on $1.
+ *
+ * A renewal (month-to-month included) hands the household's OPEN items to the
+ * new lease, but money already settled stays on the lease it was paid on, and
+ * so does anything left unpaid there. A $200 pet deposit paid on the old lease
+ * was missing from the renewal's move-out (the landlord kept the tenant's
+ * money), and the old lease's unpaid lines were outside the sweep. Settled rows
+ * never move, so reading the whole chain counts each one once.
+ *
+ * Only a real renewal is followed: an e-signed lease whose own signing named the
+ * lease it renews (lease_documents.renews_lease_id — the only way an e-signed
+ * lease gets supersedes_lease_id). supersedes_lease_id is ALSO written by the
+ * PDF import, which links a new import to whatever lease was in force on the
+ * same unit — very often a DIFFERENT household. Followed blindly, that
+ * household's settled pet and key deposits were refunded to the new one, and
+ * their unpaid bills were swept against the new household's deposit (and marked
+ * paid from it at finalize). Same gate as invoiceGeneration.isRenewalSuccessor.
+ */
+const LEASE_CHAIN = `(WITH RECURSIVE chain(id) AS (
+      SELECT $1::uuid
+      UNION
+      SELECT cl.supersedes_lease_id FROM leases cl JOIN chain c ON cl.id = c.id
+       WHERE cl.supersedes_lease_id IS NOT NULL
+         AND cl.lease_source = 'esigned'
+         AND EXISTS (SELECT 1 FROM lease_documents rd
+                      WHERE rd.lease_id = cl.id AND rd.renews_lease_id = cl.supersedes_lease_id))
+    SELECT id FROM chain)`
+
 // S180 / A1 (S182 frontend): live re-pull of the auto-sweep lines.
 // The deposit_returns row stores only the dollar total
 // (unpaid_balance_amount); the line array isn't snapshotted because
@@ -120,7 +151,7 @@ export async function fetchUnpaidBalanceLines(leaseId: string): Promise<UnpaidBa
   }>(
     `SELECT id, type, amount::text, due_date::text, entry_description, status
        FROM payments
-      WHERE lease_id = $1
+      WHERE lease_id IN ${LEASE_CHAIN}
         AND status IN ('pending', 'failed')
         AND entry_description != 'DEPOSIT'
         AND amount > 0
@@ -230,7 +261,7 @@ export async function calculateDepositReturn(
   const otherHeld = await queryOne<{ total: string }>(
     `SELECT COALESCE(SUM(p.amount), 0)::text AS total
        FROM payments p JOIN lease_fees lf ON lf.id = p.lease_fee_id
-      WHERE p.lease_id = $1 AND p.type = 'deposit' AND p.status = 'settled'
+      WHERE p.lease_id IN ${LEASE_CHAIN} AND p.type = 'deposit' AND p.status = 'settled'
         AND lf.money_kind = 'deposit' AND lf.fee_type <> 'security_deposit'`,
     [leaseId],
   )
@@ -284,7 +315,7 @@ export async function calculateDepositReturn(
   }>(
     `SELECT id, type, amount::text, due_date::text, entry_description, status
        FROM payments
-      WHERE lease_id = $1
+      WHERE lease_id IN ${LEASE_CHAIN}
         AND status IN ('pending', 'failed')
         AND entry_description != 'DEPOSIT'
         AND amount > 0
@@ -310,7 +341,7 @@ export async function calculateDepositReturn(
     `SELECT id, utility_type, (charge_amount + tax_amount)::text AS amount,
             to_char(billing_cycle_month, 'YYYY-MM-DD') AS cycle
        FROM utility_bills
-      WHERE lease_id = $1 AND payment_id IS NULL AND status IN ('unbilled', 'billed')
+      WHERE lease_id IN ${LEASE_CHAIN} AND payment_id IS NULL AND status IN ('unbilled', 'billed')
       ORDER BY billing_cycle_month ASC`,
     [leaseId],
   )
@@ -465,7 +496,7 @@ export async function applyDeductionsToDraft(
   const unpaidRows = await query<{ amount: string }>(
     `SELECT amount::text
        FROM payments
-      WHERE lease_id = $1
+      WHERE lease_id IN ${LEASE_CHAIN}
         AND status IN ('pending', 'failed')
         AND entry_description != 'DEPOSIT'
         AND amount > 0`,
@@ -554,7 +585,7 @@ export async function finalizeDepositReturn(
     const sweptRows = await client.query<{ id: string; amount: string }>(
       `SELECT id, amount::text
          FROM payments
-        WHERE lease_id = $1
+        WHERE lease_id IN ${LEASE_CHAIN}
           AND status IN ('pending', 'failed')
           AND entry_description != 'DEPOSIT'
           AND amount > 0
@@ -588,7 +619,7 @@ export async function finalizeDepositReturn(
       `SELECT id, utility_type, (charge_amount + tax_amount)::text AS amount,
               usage_amount::text, reading_start::text, reading_end::text
          FROM utility_bills
-        WHERE lease_id = $1 AND payment_id IS NULL AND status IN ('unbilled', 'billed')
+        WHERE lease_id IN ${LEASE_CHAIN} AND payment_id IS NULL AND status IN ('unbilled', 'billed')
         FOR UPDATE`,
       [row.lease_id],
     )

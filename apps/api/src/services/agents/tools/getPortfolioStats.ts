@@ -9,6 +9,12 @@
  * through and manually figure that out. We're already tracking all that
  * information."
  *
+ * S655 (Nic, 10/2): EXCEPT source of income. The SSI/SSDI flag is "our check
+ * for the flex products" — GAM's eligibility check, kept GAM-side. Not even a
+ * count leaves here: at a ten-site park "1 tenant on fixed income" names
+ * someone. The tool says plainly that it is private instead, so the agent
+ * neither guesses a number nor goes looking for one.
+ *
  * That is the point of this tool: the platform already records every payment,
  * lease, repair and tenant. Nobody was turning that into the two-second answer
  * — "17% of my rent comes in late", "my average repair takes eleven days" —
@@ -48,6 +54,15 @@ const OCCUPIED = `('active','delinquent','suspended')`
  */
 const LATE = `COALESCE(p.settled_at, NOW()) > p.due_date + (COALESCE(l.late_fee_grace_days, 0) || ' days')::interval`
 
+/**
+ * S655 (Nic, 10/2): SSI/SSDI is GAM's check for the flex products, kept
+ * GAM-side. Said in words so the agent can answer "how many of my tenants are
+ * on fixed income" truthfully instead of inventing a figure.
+ */
+const INCOME_IS_PRIVATE =
+  'Private. GAM does not share whether any resident receives SSI, SSDI, disability or other ' +
+  'benefits, not even as a count. It is between the resident and GAM.'
+
 const pct = (n: number, d: number): number | null =>
   d > 0 ? Math.round((n / d) * 1000) / 10 : null
 const numOrNull = (v: unknown): number | null =>
@@ -74,7 +89,7 @@ export const getPortfolioStats: AgentTool = {
   name: 'get_portfolio_stats',
   description:
     'Statistics about the landlord’s OWN portfolio, computed from their real records — occupancy ' +
-    'rate; how many tenants and their average age and how many are on fixed income; monthly rent ' +
+    'rate; how many tenants and their average age; monthly rent ' +
     'roll and average rent; what share of rent arrives late and how many days late on average; how ' +
     'many leases end early and average lease length; open repairs and average days to complete one; ' +
     'rent collected against recorded expenses and other income; what deposits cost at move-out; how ' +
@@ -131,8 +146,7 @@ export const getPortfolioStats: AgentTool = {
       const [r] = await query<any>(
         `SELECT COUNT(DISTINCT lt.tenant_id)::int AS tenants,
                 ROUND(AVG(EXTRACT(YEAR FROM age(t.date_of_birth)))::numeric, 1) AS avg_age,
-                COUNT(DISTINCT lt.tenant_id) FILTER (WHERE t.date_of_birth IS NOT NULL)::int AS with_dob,
-                COUNT(DISTINCT lt.tenant_id) FILTER (WHERE t.ssi_ssdi)::int AS fixed_income
+                COUNT(DISTINCT lt.tenant_id) FILTER (WHERE t.date_of_birth IS NOT NULL)::int AS with_dob
            FROM leases l
            JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status = 'active'
            JOIN tenants t        ON t.id = lt.tenant_id
@@ -143,8 +157,7 @@ export const getPortfolioStats: AgentTool = {
         currentTenants: r.tenants,
         averageAgeYears: avgAge,
         tenantsWithAgeOnFile: r.with_dob,
-        onFixedIncome: r.fixed_income,
-        onFixedIncomePct: pct(r.fixed_income, r.tenants),
+        sourceOfIncome: INCOME_IS_PRIVATE,
       }
     }
 
@@ -324,7 +337,8 @@ export const getPortfolioStats: AgentTool = {
     // on any of it. Saying plainly what is NOT here is cheaper than catching
     // every shape of embellishment afterwards.
     out.whatThisDoesNotContain =
-      'No per-tenant or per-property breakdown, no day-range buckets, no month-by-month trend, no ' +
+      'No per-tenant or per-property breakdown, no source of income (private), no day-range ' +
+      'buckets, no month-by-month trend, no ' +
       'forecast, and no comparison to other landlords. Report only the figures above. For the ' +
       'month-by-month late history use get_late_payment_history; for named tenants use ' +
       'get_delinquent_tenants or lookup_tenant_payment_status.'

@@ -3,7 +3,10 @@ import { DateTime } from 'luxon'
 import { notifyLeaseExpiring, notifyLowStock } from '../services/notifications'
 import {
   emailSigningReminder, emailDocumentAutoVoided, emailSigningRequest,
+  emailNewLeaseDraftLapsed, emailNewLeaseSigningReminder, emailNewLeasesAwaitingLandlord,
+  type NewLeaseDigestItem,
 } from '../services/email'
+import { documentDateToIso, NEW_LEASE_TENANT_REMINDER_DAYS } from '@gam/shared'
 import { runLateBalanceDigest } from './lateBalanceDigest'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { portalLink } from '../lib/portalUrls'
@@ -50,6 +53,12 @@ export async function checkLeaseExpiryNotices() {
         AND l.expiration_notice_sent_at IS NULL
         AND l.end_date <= CURRENT_DATE + (l.expiration_notice_days || ' days')::interval
         AND l.end_date >= CURRENT_DATE
+        -- S655: a lease with a new lease signed by the landlord to follow it is
+        -- not "expiring" — the household is staying on the new one.
+        AND NOT EXISTS (
+          SELECT 1 FROM leases s
+           WHERE s.supersedes_lease_id = l.id AND s.status IN ('pending', 'active')
+             AND s.signed_by_landlord = TRUE)
     `)
     for (const lease of expiring) {
       const tName = ((lease.tenant_first || '') + ' ' + (lease.tenant_last || '')).trim() || 'Tenant'
@@ -87,8 +96,45 @@ export async function checkLeaseExpiryNotices() {
 // lease ends activates before/despite the old lease's expiry handling — except
 // a renewal whose old lease is past its end and still in force: that one comes
 // into force at the hand-off (processLeaseEnds), never alongside it.
+//
+// S655 (Nic, 10/2): a NEW LEASE for a household already living there — a
+// month-to-month included — ends the lease it follows the day before it starts,
+// whether or not the tenant has signed it. That end date is written here, on the
+// start date, so the wait below holds the new lease and processLeaseEnds hands
+// the household over the same night (services/renewalSuccessor).
+//
+// Decisions 10/2 #7: never a stretch with no lease. A signed fixed term that
+// runs out before its new lease starts HOLDS OVER — at the old rent — until the
+// day before; that is written here too, before processLeaseEnds can read the
+// passed end date as a move-out.
 export async function activatePendingLeases() {
   try {
+    try {
+      const { holdOverUntilNewLeaseStarts } = await import('../services/renewalSuccessor')
+      const held = await holdOverUntilNewLeaseStarts(
+        async (sql, params) => ({ rows: await query<any>(sql, params) }))
+      for (const h of held) {
+        logger.info(`[LeaseActivate] lease ${h.leaseId}: term ended ${h.termEnded}; holds over at the old rent to ${h.holdsOverTo} — its new lease ${h.renewalId} starts the day after`)
+      }
+    } catch (e) {
+      // processLeaseEnds never hands over to a new lease that has not started,
+      // and the bill run bills a held-over lease to the day before its new lease
+      // either way — so a missed night loses nothing.
+      logger.error({ err: e }, '[LeaseActivate] could not write the holdover end dates — retried tomorrow')
+    }
+    try {
+      const { closePredecessorOfStartedRenewals } = await import('../services/renewalSuccessor')
+      const closed = await closePredecessorOfStartedRenewals(
+        async (sql, params) => ({ rows: await query<any>(sql, params) }))
+      for (const c of closed) {
+        logger.info(`[LeaseActivate] lease ${c.predecessorId} ends ${c.endDate} — its new lease ${c.renewalId} starts the day after`)
+      }
+    } catch (e) {
+      // The new lease stays pending another night; the old one keeps billing
+      // up to the day before it (the bill run's own clamp), so nothing doubles.
+      logger.error({ err: e }, '[LeaseActivate] could not end the leases that new leases follow — retried tomorrow')
+    }
+    const { followsLeaseEndedEarlyUnsigned } = await import('../services/renewalSuccessor')
     const due = await query<any>(`
       SELECT id, unit_id FROM leases
       WHERE status='pending'
@@ -106,14 +152,23 @@ export async function activatePendingLeases() {
         -- household never has two leases in force on the unit — two would
         -- count its people twice in a split by headcount. Bounded by the bill
         -- run's catch-up window, so a stuck hand-off cannot hold it forever.
+        -- S655: nor while the lease it follows is still open (a month-to-month
+        -- the step above could not end tonight) — a new lease never comes into
+        -- force beside the old one; the hand-off brings it in.
         AND NOT EXISTS (
           SELECT 1 FROM leases pl
            WHERE pl.status = 'active' AND pl.unit_id = leases.unit_id
-             AND pl.end_date < CURRENT_DATE
-             AND pl.end_date >= CURRENT_DATE - $1::int
+             AND ((pl.end_date < CURRENT_DATE AND pl.end_date >= CURRENT_DATE - $1::int)
+                  OR pl.end_date IS NULL OR pl.end_date >= leases.start_date)
              AND (pl.id = leases.supersedes_lease_id
                   OR EXISTS (SELECT 1 FROM lease_documents d
-                              WHERE d.lease_id = leases.id AND d.renews_lease_id = pl.id)))`, [CATCHUP_DAYS])
+                              WHERE d.lease_id = leases.id AND d.renews_lease_id = pl.id)))
+        -- S655: and never a new lease whose household ENDED the lease it follows
+        -- early, with nobody having signed the new one: nobody is staying on to
+        -- take it up. Brought into force it occupied the emptied space again and
+        -- billed the new rent to a household that had gone. It is canceled
+        -- (processNewLeaseSignings); until then it simply never starts.
+        AND NOT ${followsLeaseEndedEarlyUnsigned('leases')}`, [CATCHUP_DAYS])
     for (const l of due) {
       await query(`UPDATE leases SET status='active', updated_at=NOW() WHERE id=$1`, [l.id])
       await query(`UPDATE units SET status='active', updated_at=NOW() WHERE id=$1`, [l.unit_id])
@@ -243,7 +298,9 @@ export async function processLeaseEnds() {
                  EXISTS (SELECT 1 FROM lease_tenants nt
                            JOIN lease_tenants ot ON ot.tenant_id = nt.tenant_id
                           WHERE nt.lease_id = s.id AND nt.status IN ('active','pending_add')
-                            AND ot.lease_id = $2 AND ot.status IN ('active','pending_add','pending_remove')) AS same_household
+                            AND ot.lease_id = $2 AND ot.status IN ('active','pending_add','pending_remove')) AS same_household,
+                 -- Decisions 10/2 #7: it has not started yet.
+                 (s.start_date > CURRENT_DATE) AS not_started
           FROM leases s
           WHERE s.unit_id=$1 AND s.status IN ('pending','active') AND s.id != $2
             AND s.start_date > $3
@@ -268,6 +325,14 @@ export async function processLeaseEnds() {
         // keeps today's timing (the move-out notice reads the end date as the
         // day they leave).
         if (successor?.renews && !lease.past_end) continue
+
+        // HOLDOVER (decisions 10/2 #7: "there is never a stretch with no
+        // lease"). The household's own new lease has not started: handing over
+        // now would leave them on a lease not in force — no rent billed for the
+        // gap, autopay moved to it, and no lease to write a leaving date on. The
+        // old lease carries on at the old rent until the day before (its end date
+        // is normally already moved there — renewalSuccessor.holdOverUntilNewLeaseStarts).
+        if (successor?.renews && successor.not_started) continue
 
         // ...and until the old lease's last bill is made. A bill still held (an
         // unread meter, a reading run the landlord has not approved yet) or
@@ -852,127 +917,422 @@ export async function processEsignTimeouts() {
       logger.info(`[ESIGN-TIMEOUTS] auto-voided ${(expired as any[]).length} document(s)`)
     }
 
-    // ── S536 (Nic): RENEWALS ARE A DIFFERENT FLOW ─────────────────────
-    // The tenant already lives in the unit, so renewals do NOT ride the
-    // 24h window above (both passes exclude renews_lease_id). Their
-    // clock is the predecessor lease: everyone must have signed 1 DAY
-    // BEFORE the old lease ends so the unit never lapses — even when
-    // the renewal went out 2 weeks early. Cadence: landlord is reminded
-    // each morning until they sign; after that the tenant is reminded
-    // twice daily. reminder_sent_at is safe to reuse as the cadence
-    // anchor because pass 1 (the one-shot 2h reminder) skips renewals.
-    const hour = new Date().getHours()
+    // ── RENEWALS: A NEW LEASE FOR A HOUSEHOLD ALREADY LIVING THERE ──────
+    // Their own clock (passes 1 and 2 exclude renews_lease_id). S655.
+    await processNewLeaseSignings()
+  } catch(e) { logger.error({ err: e }, '[SCHEDULER] esign timeouts') }
+}
 
-    // Pass 3: renewal deadline — void anything not fully signed by
-    // 1 day before the predecessor's end. The normal lease-end
-    // processor (extend / m2m / expire) then handles the unit.
-    // Month-to-month predecessors have no end_date: their termination
-    // point is the END OF THE MONTH AFTER the renewal was created
-    // (30-day-notice convention — created Jul 10 → effective end Aug 31
-    // → signing deadline Aug 30 under the same 1-day-prior rule).
-    // Anchored to created_at, NOT sent_at (Nic): renewals auto-send at
-    // creation — the landlord drafts, signs, and it flows — so there is
-    // no draft/send distinction, and a sent_at anchor would leave a doc
-    // whose send hiccuped with no deadline at all.
-    const renewalExpired = await query<any>(`
-      SELECT d.id, d.title, d.document_type, d.landlord_id,
-             d.lease_id, d.issued_at, d.unit_id,
-             u.unit_number, p.name as property_name
+/** 'YYYY-MM-DD' from a document date box (M/D/YYYY, or ISO), or null. */
+function docBoxDate(raw: string | null | undefined): string | null {
+  const t = String(raw ?? '').trim()
+  if (!t) return null
+  const iso = /^(\d{4}-\d{2}-\d{2})/.exec(t)?.[1] || documentDateToIso(t)
+  return iso || null
+}
+
+/**
+ * S536 → S655: A NEW LEASE FOR A HOUSEHOLD ALREADY LIVING THERE (a renewal —
+ * month-to-month included) runs on its own clock.
+ *
+ * Nic (10/2): "they always get charged the new rent, whether or not they sign
+ * it... the old one is expired... they've had plenty of notice." So a new lease
+ * the LANDLORD has signed is never canceled for want of the tenant's
+ * signature: it takes over on its start date (activatePendingLeases →
+ * processLeaseEnds) and stays open for theirs. The S536 deadline-void that used
+ * to cancel it a day before the old lease ended — and then vacate a household
+ * that was not leaving — is gone.
+ *
+ * Only a draft the landlord NEVER signed lapses, once its start date has passed
+ * (it was never sent to the household, so only the landlord hears). Without a
+ * readable start date, the old S536 rule decides: the day before the old lease's
+ * end, or the end of the month after drafting for a month-to-month.
+ *
+ * Reminders (one email per stage, never a stream):
+ *   - the landlord, each morning at 8 while drafts wait on them (at most 8) —
+ *     ONE email listing every draft waiting on that person, with one link that
+ *     signs them in a row (S652 "one email per thing": a park-wide batch of 40
+ *     is one email, not 40). The lapse notice is one email per person too;
+ *   - the tenant at 9, 14 days and 3 days before the start — after the signing
+ *     request they got when the landlord signed, and the banner in their portal.
+ *     NEW_LEASE_TENANT_REMINDER_DAYS.
+ *
+ * The landlord's own "not signed yet" alerts (14 days out, and on the start
+ * date) are sent by jobs/renewalPing.
+ */
+export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
+  const hour = opts.hour ?? new Date().getHours()
+
+  // ── Lapse: a draft the landlord never signed ────────────────────────────
+  const drafts = await query<any>(`
+    SELECT d.id, d.title, d.document_type, d.landlord_id, d.lease_id, d.issued_at, d.unit_id,
+           u.unit_number, p.name AS property_name, COALESCE(p.timezone, 'America/Phoenix') AS tz,
+           (SELECT f.value FROM lease_document_fields f
+             WHERE f.document_id = d.id AND f.lease_column = 'start_date'
+               AND f.value IS NOT NULL AND btrim(f.value) <> ''
+             LIMIT 1) AS start_raw,
+           to_char(COALESCE(ol.end_date,
+                            (date_trunc('month', d.created_at) + INTERVAL '2 months' - INTERVAL '1 day')::date),
+                   'YYYY-MM-DD') AS fallback_last
       FROM lease_documents d
       JOIN leases ol ON ol.id = d.renews_lease_id
       LEFT JOIN units u ON u.id = d.unit_id
       LEFT JOIN properties p ON p.id = u.property_id
-      WHERE d.status IN ('sent','in_progress')
-        AND NOW() >= COALESCE(
-              ol.end_date::timestamp,
-              date_trunc('month', d.created_at) + INTERVAL '2 months' - INTERVAL '1 day'
-            ) - INTERVAL '1 day'
-    `)
-    for (const d of renewalExpired as any[]) {
+     WHERE d.status IN ('sent','in_progress')
+       AND d.issued_at IS NULL AND d.lease_id IS NULL
+       AND NOT EXISTS (SELECT 1 FROM lease_document_signers ls
+                        WHERE ls.document_id = d.id AND ls.role = 'landlord' AND ls.status = 'signed')
+  `)
+  let lapsed = 0
+  // One lapse email per landlord-side person, listing every draft of theirs that
+  // lapsed in this run.
+  const lapseMail = new Map<string, { email: string; name: string; landlordId: string; items: NewLeaseDigestItem[]; documentId: string }>()
+  for (const d of drafts as any[]) {
+    try {
+      const today = todayIn(d.tz)
+      const startIso = docBoxDate(d.start_raw)
+      const due = startIso ? today > startIso : today >= addDaysTo(d.fallback_last, -1)
+      if (!due) continue
+      const vc = await getClient()
       try {
-        // S647: a renewal the landlord signed has already issued its successor
-        // lease and first invoice. Voiding only the paper left both live, and
-        // the expiry handoff would then read that successor as a renewal that
-        // happened. One transaction, so the paper and the lease go together.
+        await vc.query('BEGIN')
+        await cascadeLeaseTenantsOnVoid(vc.query.bind(vc) as any, d)
+        const { unwindIssuedLease } = await import('../lib/unwindIssuedLease')
+        await unwindIssuedLease(vc.query.bind(vc), d)
+        await vc.query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
+          ['auto-voided: the landlord never signed this new lease before its start date', d.id])
+        await vc.query('COMMIT')
+      } catch (e) {
+        await vc.query('ROLLBACK').catch(() => {})
+        throw e
+      } finally {
+        vc.release()
+      }
+      lapsed++
+      const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
+      // The household was never sent this draft — only the landlord side hears.
+      const recipients = await query<any>(`
+        SELECT s.email, s.name FROM lease_document_signers s
+         WHERE s.document_id = $1 AND s.role = 'landlord'
+        UNION
+        SELECT lu.email, (lu.first_name || ' ' || lu.last_name) AS name
+          FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id = $2
+      `, [d.id, d.landlord_id])
+      for (const rcp of recipients as any[]) {
+        const key = String(rcp.email || '').toLowerCase()
+        if (!key) continue
+        if (!lapseMail.has(key)) {
+          lapseMail.set(key, { email: rcp.email, name: rcp.name, landlordId: d.landlord_id, items: [], documentId: d.id })
+        }
+        const m = lapseMail.get(key)!
+        if (!m.items.some(i => i.unitLabel === unitLabel && i.startDate === startIso)) {
+          m.items.push({ unitLabel, startDate: startIso })
+        }
+      }
+    } catch (e) {
+      logger.error({ err: e, document_id: d.id }, '[ESIGN-TIMEOUTS] new-lease lapse failed for doc')
+    }
+  }
+  for (const m of lapseMail.values()) {
+    try {
+      await emailNewLeaseDraftLapsed(m.email, m.name, m.items, { landlordId: m.landlordId, documentId: m.documentId })
+    } catch (e) {
+      logger.error({ err: e, recipient_email: m.email }, '[ESIGN-TIMEOUTS] new-lease lapse email failed')
+    }
+  }
+  if (lapsed > 0) logger.info(`[ESIGN-TIMEOUTS] ${lapsed} unsigned new-lease draft(s) lapsed at their start date`)
+
+  // ── The lease it follows ended EARLY: nobody is staying on ──────────────
+  // The household's lease was ended early while a landlord-signed new lease
+  // waited, and nobody in the household had signed it
+  // (renewalSuccessor.followsLeaseEndedEarlyUnsigned). Ending it early through
+  // the tenant's or the landlord's own button is refused up front now
+  // (newLeaseBlocksEarlyEnd), so this is a lease that REPLACED it (a paper
+  // lease imported over it). Left alone the new lease came into force on its
+  // start date, occupied the emptied space again and billed the new rent to a
+  // household that had gone — and by then it could no longer be canceled. It is
+  // canceled now, exactly as the window's Cancel button would (lib/voidDocument:
+  // the lease row ends, the deposit record goes back to the lease that ended),
+  // and the landlord side hears once — one notice per person for the lot. A new
+  // lease somebody in the household signed stands (S558; decisions 10/2 #8) and
+  // is never touched here.
+  //
+  // MONEY PAID ON IT holds the cancel. lib/unwindIssuedLease refuses to void a
+  // lease money has moved on — undoing a payment is a refund, not a void — e.g.
+  // a deposit top-up the tenant paid early. That used to fail here on every
+  // run, forever: an error in the log every 15 minutes, the deposit record left
+  // on a lease that will never start (so the lease that ended had none to
+  // return), and nobody told. Now the landlord side and GAM hear ONCE, the
+  // deposit record goes back to the lease that ended, and the document is
+  // stamped (new_lease_cancel_held_at) so later runs leave it be. Nobody can
+  // sign it meanwhile (POST /esign/sign), so it still never starts. Once the
+  // payment has been returned or moved, the next run cancels it like any other.
+  try {
+    const { newLeasesAfterEarlyEnd, returnDepositToEndedLease, sayMoney } = await import('../services/renewalSuccessor')
+    const { voidDocument } = await import('../lib/voidDocument')
+    const endedEarly = await newLeasesAfterEarlyEnd(async (sql, params) => ({ rows: await query<any>(sql, params) }))
+    const words = (iso: string) => DateTime.fromISO(iso).toFormat('LLLL d, yyyy')
+    type Notice = Map<string, { email: string; landlordId: string; items: any[] }>
+    const canceled: Notice = new Map()
+    const held: Notice = new Map()
+    /** Everyone on the landlord side of `d` — its landlord signers and the account owner — once each. */
+    const addLandlordSide = async (into: Notice, d: any) => {
+      const people = await query<{ user_id: string; email: string }>(`
+        SELECT s.user_id, COALESCE(su.email, s.email) AS email
+          FROM lease_document_signers s LEFT JOIN users su ON su.id = s.user_id
+         WHERE s.document_id = $1 AND s.role = 'landlord' AND s.user_id IS NOT NULL
+        UNION
+        SELECT lu.id, lu.email FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id = $2`,
+        [d.id, d.landlord_id])
+      for (const p of people) {
+        if (!into.has(p.user_id)) into.set(p.user_id, { email: p.email, landlordId: d.landlord_id, items: [] })
+        const items = into.get(p.user_id)!.items
+        if (!items.some((x: any) => x.id === d.id)) items.push(d)
+      }
+    }
+    for (const d of endedEarly) {
+      if (Number(d.paid_count) > 0) {
+        // Already told: it waits on the payment, quietly.
+        if (d.new_lease_cancel_held_at) continue
         const vc = await getClient()
         try {
           await vc.query('BEGIN')
-          await cascadeLeaseTenantsOnVoid(vc.query.bind(vc) as any, d)
-          const { unwindIssuedLease } = await import('../lib/unwindIssuedLease')
-          await unwindIssuedLease(vc.query.bind(vc), d)
-          await vc.query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
-            ['auto-voided: renewal not fully signed 1 day before the current lease ends', d.id])
+          const live = (await vc.query(
+            `SELECT id FROM lease_documents
+              WHERE id = $1 AND status NOT IN ('completed','voided') AND new_lease_cancel_held_at IS NULL
+              FOR UPDATE`, [d.id])).rows[0]
+          if (!live) { await vc.query('ROLLBACK'); continue }
+          await returnDepositToEndedLease(vc.query.bind(vc) as any, d.new_lease_id, d.ended_lease_id)
+          await vc.query(
+            `UPDATE lease_documents SET new_lease_cancel_held_at = NOW(), updated_at = NOW() WHERE id = $1`, [d.id])
           await vc.query('COMMIT')
         } catch (e) {
           await vc.query('ROLLBACK').catch(() => {})
-          throw e
+          logger.error({ err: e, document_id: d.id, lease_id: d.new_lease_id },
+            '[ESIGN-TIMEOUTS] could not hold a new lease with money paid on it — retried next run')
+          continue
         } finally {
           vc.release()
         }
-        const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
-        // S654: each signer at the address on their own account (the landlord's
-        // row keeps its own), never a signer row's possibly stale one.
-        const recipients = await query<any>(`
-          SELECT CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS email, s.name
-            FROM lease_document_signers s LEFT JOIN users su ON su.id = s.user_id
-           WHERE s.document_id=$1
-          UNION ALL
-          SELECT lu.email, (lu.first_name || ' ' || lu.last_name) as name
-          FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id=$2
-        `, [d.id, d.landlord_id])
-        for (const rcp of recipients as any[]) {
-          try {
-            await emailDocumentAutoVoided(rcp.email, rcp.name, d.title, unitLabel, { landlordId: d.landlord_id, documentId: d.id })
-          } catch(e) {
-            logger.error({ err: e, recipient_email: rcp.email }, '[ESIGN-TIMEOUTS] renewal deadline-void email failed')
-          }
+        logger.warn({ document_id: d.id, lease_id: d.new_lease_id, ended_lease_id: d.ended_lease_id, paid_total: d.paid_total },
+          '[ESIGN-TIMEOUTS] new lease after an early end has money paid on it — held until it is returned; landlord side and GAM told')
+        try {
+          const { createAdminNotification } = await import('../services/adminNotifications')
+          await createAdminNotification({
+            severity: 'warn',
+            category: 'new_lease_cancel_held',
+            title: `New lease can't be canceled — money paid on it (${d.unit_label}, ${d.property_name})`,
+            body: `The lease it follows ended early on ${words(d.ended_on)} and nobody in the household signed the new lease ` +
+              `(it was to start ${words(d.new_start_date)}), so it will never start. But ${sayMoney(Number(d.paid_total))} was ` +
+              'already paid on it. Return or move that payment; the next run then cancels the new lease. The deposit record ' +
+              'is already back on the lease that ended. The landlord has been told.',
+            context: { document_id: d.id, new_lease_id: d.new_lease_id, ended_lease_id: d.ended_lease_id, paid_total: d.paid_total },
+          })
+        } catch (e) {
+          logger.error({ err: e, document_id: d.id }, '[ESIGN-TIMEOUTS] new-lease held admin notice failed')
         }
-      } catch(e) {
-        logger.error({ err: e, document_id: d.id }, '[ESIGN-TIMEOUTS] renewal deadline-void failed for doc')
+        await addLandlordSide(held, d)
+        continue
+      }
+      const vc = await getClient()
+      try {
+        await vc.query('BEGIN')
+        // Held for the void, and read again: a signature a moment ago keeps it
+        // (voidDocument refuses a document a tenant has signed).
+        const live = (await vc.query(
+          `SELECT * FROM lease_documents WHERE id = $1 AND status NOT IN ('completed','voided') FOR UPDATE`, [d.id])).rows[0]
+        if (!live) { await vc.query('ROLLBACK'); continue }
+        await voidDocument(vc.query.bind(vc), live,
+          `canceled: the lease it follows ended early (${d.ended_on}) and nobody in the household had signed it`)
+        await vc.query('COMMIT')
+      } catch (e) {
+        await vc.query('ROLLBACK').catch(() => {})
+        logger.error({ err: e, document_id: d.id, lease_id: d.new_lease_id },
+          '[ESIGN-TIMEOUTS] could not cancel a new lease whose lease ended early — it stays pending and never starts')
+        continue
+      } finally {
+        vc.release()
+      }
+      logger.info({ document_id: d.id, lease_id: d.new_lease_id, ended_lease_id: d.ended_lease_id },
+        '[ESIGN-TIMEOUTS] new lease canceled — the lease it follows ended early')
+      await addLandlordSide(canceled, d)
+    }
+    const { createNotification } = await import('../services/notifications')
+    for (const [userId, t] of canceled) {
+      const one = t.items.length === 1
+      const first = t.items[0]
+      const line = (d: any) => `${d.unit_label} at ${d.property_name} (its lease ended early on ${words(d.ended_on)}; ` +
+        `the new lease was to start ${words(d.new_start_date)})`
+      try {
+        await createNotification({
+          userId, landlordId: t.landlordId,
+          type: 'lease_renewal_status',
+          title: one ? `New lease canceled — ${first.unit_label}, ${first.property_name}`
+                     : `${t.items.length} new leases canceled`,
+          body: (one
+            ? `The lease for ${first.unit_label} at ${first.property_name} ended early on ${words(first.ended_on)}, and nobody ` +
+              `in the household had signed the new lease that was to start ${words(first.new_start_date)}, so it has been canceled. `
+            : `These leases ended early, and nobody in the household had signed the new lease that was to follow, so each new ` +
+              `lease has been canceled: ${t.items.map(line).join('; ')}. `) +
+            'Nothing else to do. If a household is staying after all, invite them again from the Tenants page.',
+          data: { documentIds: t.items.map((d: any) => d.id), leaseIds: t.items.map((d: any) => d.new_lease_id) },
+          actionUrl: '/leases',
+          sendEmail: true,
+          emailTo: t.email,
+          emailSubject: one ? `New lease canceled — ${first.unit_label}, ${first.property_name}`
+                            : `${t.items.length} new leases canceled`,
+        })
+      } catch (e) {
+        logger.error({ err: e, user_id: userId }, '[ESIGN-TIMEOUTS] new-lease canceled notice failed')
       }
     }
-    if ((renewalExpired as any[]).length > 0) {
-      logger.info(`[ESIGN-TIMEOUTS] deadline-voided ${(renewalExpired as any[]).length} renewal(s)`)
+    for (const [userId, t] of held) {
+      const one = t.items.length === 1
+      const first = t.items[0]
+      const line = (d: any) => `${d.unit_label} at ${d.property_name} (${sayMoney(Number(d.paid_total))} paid; its lease ` +
+        `ended early on ${words(d.ended_on)}; the new lease was to start ${words(d.new_start_date)})`
+      const title = one ? `New lease can't be canceled yet — ${first.unit_label}, ${first.property_name}`
+                        : `${t.items.length} new leases can't be canceled yet`
+      try {
+        await createNotification({
+          userId, landlordId: t.landlordId,
+          type: 'lease_renewal_status',
+          title,
+          body: (one
+            ? `The lease for ${first.unit_label} at ${first.property_name} ended early on ${words(first.ended_on)}, and nobody ` +
+              `in the household had signed the new lease that was to start ${words(first.new_start_date)}. It will never ` +
+              `start, but ${sayMoney(Number(first.paid_total))} was already paid on it, so it can't be canceled until that ` +
+              'money is returned or moved. The deposit record is back on the lease that ended. '
+            : 'These leases ended early, and nobody in the household had signed the new lease that was to follow. None of ' +
+              'those new leases will start, but money was already paid on each, so they can\'t be canceled until it is ' +
+              `returned or moved: ${t.items.map(line).join('; ')}. The deposit records are back on the leases that ended. `) +
+            'GAM has been told. To speed it up, email support@goldassetmanagement.com and name the ' +
+            (one ? 'space' : 'spaces') + '. Once it is sorted, ' + (one ? 'the new lease is' : 'each is') + ' canceled for you.',
+          data: { documentIds: t.items.map((d: any) => d.id), leaseIds: t.items.map((d: any) => d.new_lease_id) },
+          actionUrl: '/leases',
+          sendEmail: true,
+          emailTo: t.email,
+          emailSubject: title,
+        })
+      } catch (e) {
+        logger.error({ err: e, user_id: userId }, '[ESIGN-TIMEOUTS] new-lease held notice failed')
+      }
     }
+  } catch (e) {
+    logger.error({ err: e }, '[ESIGN-TIMEOUTS] new leases after an early end — sweep failed; retried next run')
+  }
 
-    // Pass 4 (8am): remind the landlord every morning until they sign.
-    // Pass 5 (9am + 4pm): after the landlord signs, remind the tenant
-    // twice daily. The job runs every 15 min; the reminder_sent_at gap
-    // check makes each window fire exactly once.
-    if (hour === 8 || hour === 9 || hour === 16) {
-      const landlordPass = hour === 8
-      const renewalRemind = await query<any>(`
-        SELECT s.id, s.email, s.name, s.role, s.token, s.user_id,
-               CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS send_to,
-               d.id as doc_id, d.title, d.landlord_id, d.package_group_id, d.package_sort_order,
-               u.unit_number, p.name as property_name,
-               lu.first_name || ' ' || lu.last_name as landlord_name
+  // ── The landlord, each morning, while drafts wait on them ───────────────
+  // One email per landlord-side signer, listing every draft waiting on them.
+  if (hour === 8) {
+    const rows = await query<any>(`
+      SELECT s.id, s.email, s.name, s.token, s.user_id,
+             d.id AS doc_id, d.landlord_id, COALESCE(u.display_label, u.unit_number) AS unit_number,
+             p.name AS property_name, d.title,
+             (SELECT f.value FROM lease_document_fields f WHERE f.document_id = d.id
+                AND f.lease_column = 'start_date' AND f.value IS NOT NULL AND btrim(f.value) <> '' LIMIT 1) AS start_raw,
+             (SELECT f.value FROM lease_document_fields f WHERE f.document_id = d.id
+                AND f.lease_column = 'rent_amount' AND f.value IS NOT NULL AND btrim(f.value) <> '' LIMIT 1) AS rent_raw
+        FROM lease_document_signers s
+        JOIN lease_documents d ON d.id = s.document_id
+        LEFT JOIN units u ON u.id = d.unit_id
+        LEFT JOIN properties p ON p.id = u.property_id
+       WHERE d.renews_lease_id IS NOT NULL
+         AND d.status IN ('sent','in_progress')
+         AND s.role = 'landlord' AND s.status IN ('sent','viewed')
+         AND (s.reminder_sent_at IS NULL OR s.reminder_sent_at < NOW() - INTERVAL '20 hours')
+         AND COALESCE(s.reminder_count, 0) < 8
+       ORDER BY p.name, COALESCE(u.display_label, u.unit_number)
+    `)
+    const byPerson = new Map<string, any[]>()
+    for (const r of rows as any[]) {
+      if (!docBoxDate(r.start_raw)) continue
+      const key = `${r.user_id}|${String(r.email || '').toLowerCase()}`
+      if (!byPerson.has(key)) byPerson.set(key, [])
+      byPerson.get(key)!.push(r)
+    }
+    let sent = 0
+    for (const group of byPerson.values()) {
+      const r = group[0]
+      try {
+        const items: NewLeaseDigestItem[] = group.map((g: any) => ({
+          unitLabel: g.unit_number ? `Unit ${g.unit_number} — ${g.property_name}` : g.title,
+          startDate: docBoxDate(g.start_raw),
+          rent: String(g.rent_raw ?? '').replace(/[$,\s]/g, ''),
+        }))
+        // The signing link opens the first; the rest ride along in ?queue= as
+        // their own signer tokens, so it works from the email with no session.
+        const refs = group.map((g: any) => g.token || g.doc_id)
+        const queue = refs.slice(1, 60)
+        const url = portalLink('landlord', `sign/${refs[0]}${queue.length ? `?queue=${queue.join(',')}` : ''}`)
+        await emailNewLeasesAwaitingLandlord(r.email, r.name, items, url,
+          { landlordId: r.landlord_id, documentId: group.length === 1 ? r.doc_id : undefined })
+        await query(`UPDATE lease_document_signers
+                        SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1
+                      WHERE id = ANY($1::uuid[])`, [group.map((g: any) => g.id)])
+        sent++
+      } catch (e) {
+        logger.error({ err: e, signer_ids: group.map((g: any) => g.id) }, '[ESIGN-TIMEOUTS] new-lease landlord reminder failed')
+      }
+    }
+    if (sent > 0) logger.info(`[ESIGN-TIMEOUTS] sent ${sent} new-lease landlord reminder email(s)`)
+  }
+
+  // ── The tenant, 14 and 3 days before the start ──────────────────────────
+  if (hour === 9) {
+    const { followsLeaseEndedEarlyUnsigned } = await import('../services/renewalSuccessor')
+    const rows = await query<any>(`
+      SELECT s.id, s.name, s.token, s.user_id,
+             COALESCE(su.email, s.email) AS send_to,
+             d.id AS doc_id, d.landlord_id, u.unit_number, p.name AS property_name, d.title,
+             to_char(nl.start_date, 'YYYY-MM-DD') AS start_date, nl.rent_amount::text AS rent,
+             lu.first_name || ' ' || lu.last_name AS landlord_name
         FROM lease_document_signers s
         LEFT JOIN users su ON su.id = s.user_id
         JOIN lease_documents d ON d.id = s.document_id
+        JOIN leases nl ON nl.id = d.lease_id
         LEFT JOIN units u ON u.id = d.unit_id
         LEFT JOIN properties p ON p.id = u.property_id
         JOIN landlords la ON la.id = d.landlord_id
         JOIN users lu ON lu.id = la.user_id
-        WHERE d.renews_lease_id IS NOT NULL
-          AND d.status IN ('sent','in_progress')
-          AND s.status IN ('sent','viewed')
-          AND (s.reminder_sent_at IS NULL OR s.reminder_sent_at < NOW() - INTERVAL '${landlordPass ? '20 hours' : '5 hours'}')
-          -- S639: same ceiling as the main pass. Renewals nudge faster (a
-          -- renewal has a deadline), but they still have to stop.
-          AND COALESCE(s.reminder_count, 0) < 8
-          AND ${landlordPass
-            ? `s.role = 'landlord'`
-            : `s.role != 'landlord' AND NOT EXISTS (
-                 SELECT 1 FROM lease_document_signers ls
-                 WHERE ls.document_id = d.id AND ls.role='landlord' AND ls.status != 'signed')`}
-      `)
-      const renewalSent = await remindByPacket(renewalRemind as any[], 'renewal reminder')
-      if (renewalSent > 0) {
-        logger.info(`[ESIGN-TIMEOUTS] sent ${renewalSent} renewal ${landlordPass ? 'landlord' : 'tenant'} reminder(s)`)
+       WHERE d.renews_lease_id IS NOT NULL
+         AND d.status IN ('sent','in_progress')
+         AND nl.status IN ('pending','active')
+         AND s.role <> 'landlord' AND s.status IN ('sent','viewed')
+         AND COALESCE(s.reminder_count, 0) < 8
+         -- Not a new lease whose lease before it ENDED EARLY with nobody signed:
+         -- it never starts, nobody can sign it, and it is being canceled (or
+         -- waits on money paid on it) — a "please sign" would invite them back
+         -- into a lease for a home they left.
+         AND NOT ${followsLeaseEndedEarlyUnsigned('nl')}
+         -- Their turn: everyone before them, the landlord included, has signed.
+         AND NOT EXISTS (SELECT 1 FROM lease_document_signers e
+                          WHERE e.document_id = d.id AND e.status <> 'signed'
+                            AND (e.order_index < s.order_index OR e.role = 'landlord'))
+         -- A stage (14 or 3 days out) has arrived since we last wrote to them.
+         AND EXISTS (SELECT 1 FROM unnest($1::int[]) AS k(days)
+                      WHERE CURRENT_DATE >= nl.start_date - k.days
+                        AND COALESCE(s.reminder_sent_at, s.invite_sent_at, d.created_at)::date
+                              < nl.start_date - k.days)
+    `, [[...NEW_LEASE_TENANT_REMINDER_DAYS]])
+    let sent = 0
+    for (const r of rows as any[]) {
+      try {
+        const unitLabel = r.unit_number ? `Unit ${r.unit_number} — ${r.property_name}` : r.title
+        const link = await tenantLeaseLink({ userId: r.user_id, documentId: r.doc_id, signerToken: r.token, sendTo: r.send_to })
+        await emailNewLeaseSigningReminder(r.send_to, r.name, unitLabel, r.landlord_name, link.url,
+          { startDate: r.start_date, rent: r.rent, needsSetup: link.needsSetup,
+            landlordId: r.landlord_id, documentId: r.doc_id })
+        await query(`UPDATE lease_document_signers
+                        SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1
+                      WHERE id = $1`, [r.id])
+        sent++
+      } catch (e) {
+        logger.error({ err: e, signer_id: r.id }, '[ESIGN-TIMEOUTS] new-lease tenant reminder failed')
       }
     }
-  } catch(e) { logger.error({ err: e }, '[SCHEDULER] esign timeouts') }
+    if (sent > 0) logger.info(`[ESIGN-TIMEOUTS] sent ${sent} new-lease tenant reminder(s)`)
+  }
 }
 
 async function checkLowStock() {

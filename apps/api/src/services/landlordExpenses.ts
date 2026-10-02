@@ -1,6 +1,7 @@
 // Landlord-entered expenses (S568, Nic). Unit-linked or common (property-level);
 // common expenses can be allocated per unit for per-unit P&L. Feeds the landlord
 // reports P&L. Soft-void, never hard-delete (keep-everything).
+import type { PoolClient } from 'pg'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { EXPENSE_CATEGORIES } from '@gam/shared'
@@ -21,7 +22,19 @@ export interface CreateExpenseInput {
   utilityType?: string | null
 }
 
-export async function createLandlordExpense(input: CreateExpenseInput) {
+/**
+ * Book one landlord expense.
+ *
+ * `client` (S655 review): pass the caller's transaction to book the expense
+ * inside it. The bank feed files a bank row by booking its expense and marking
+ * the row filed — written on two different connections, a failure after the
+ * expense left it booked with no bank row pointing at it, and the row back in
+ * review to be filed (and booked) again. Without a client it runs on its own,
+ * as every other caller wants.
+ */
+export async function createLandlordExpense(input: CreateExpenseInput, client?: Pick<PoolClient, 'query'>) {
+  const one = async <T = any>(sql: string, params: any[]): Promise<T | null> =>
+    client ? ((await client.query(sql, params)).rows[0] ?? null) : queryOne<T>(sql, params)
   if (!(EXPENSE_CATEGORIES as readonly string[]).includes(input.category)) {
     throw new AppError(400, `Invalid expense category '${input.category}'`)
   }
@@ -32,11 +45,11 @@ export async function createLandlordExpense(input: CreateExpenseInput) {
   let propertyId = input.propertyId ?? null
 
   if (unitId) {
-    const u = await queryOne<any>('SELECT id, property_id, landlord_id FROM units WHERE id=$1', [unitId])
+    const u = await one<any>('SELECT id, property_id, landlord_id FROM units WHERE id=$1', [unitId])
     if (!u || u.landlord_id !== input.landlordId) throw new AppError(400, 'Unit does not belong to you')
     propertyId = u.property_id
   } else if (propertyId) {
-    const p = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [propertyId])
+    const p = await one<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [propertyId])
     if (!p || p.landlord_id !== input.landlordId) throw new AppError(400, 'Property does not belong to you')
   }
   // S603 (Nic): allocation is unconditional now — any non-unit-linked cost is
@@ -45,7 +58,7 @@ export async function createLandlordExpense(input: CreateExpenseInput) {
   // but nothing consults it any more.
   const allocate = isCommon
 
-  const row = await queryOne<any>(
+  const row = await one<any>(
     `INSERT INTO landlord_expenses
        (landlord_id, created_by, property_id, unit_id, category, amount, description, vendor,
         expense_date, is_common, allocate_per_unit, utility_type)

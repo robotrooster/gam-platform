@@ -20,6 +20,7 @@ import { createNotification } from './notifications'
 import { insertInspectionWithChecklist } from './inspections'
 import { US_FEDERAL_HOLIDAYS } from '../jobs/autoPayouts'
 import { todayIn } from '../lib/timezone'
+import { followsLeaseEndedEarlyUnsigned } from './renewalSuccessor'
 
 /** date + n business days (skips weekends + US federal holidays). */
 export function addBusinessDays(isoDate: string, n: number): string {
@@ -76,6 +77,33 @@ export async function scheduleMoveOutInspections(): Promise<{ scheduled: number 
          SELECT 1 FROM unit_inspections i
           WHERE i.lease_id = l.id AND i.inspection_type = 'move_out'
             AND i.status <> 'cancelled')
+       -- S655: a household handed over to its own NEW LEASE is staying, not
+       -- moving out. Its old lease gets an end date (the day before the new
+       -- one starts; a held-over fixed term too) and is then expired by the
+       -- hand-off — which put it squarely in this window, so a park-wide new
+       -- lease produced an "OVERDUE move-out walkthrough" for every household
+       -- that stayed. The same test the lease-end job uses for a hand-off
+       -- (scheduler.processLeaseEnds): a landlord-signed lease on this space,
+       -- starting later, that follows this one or has someone from it on it.
+       AND NOT EXISTS (
+         SELECT 1 FROM leases s
+          WHERE s.unit_id = l.unit_id AND s.id <> l.id
+            AND s.status IN ('pending', 'active') AND s.signed_by_landlord = TRUE
+            AND s.start_date > l.start_date
+            AND (s.supersedes_lease_id = l.id
+                 OR EXISTS (SELECT 1 FROM lease_documents d
+                             WHERE d.lease_id = s.id AND d.renews_lease_id = l.id)
+                 OR EXISTS (SELECT 1 FROM lease_tenants nt
+                              JOIN lease_tenants ot ON ot.tenant_id = nt.tenant_id
+                             WHERE nt.lease_id = s.id AND nt.status IN ('active', 'pending_add')
+                               AND ot.lease_id = l.id
+                               AND (ot.status IN ('active', 'pending_add', 'pending_remove')
+                                    OR (ot.status = 'removed' AND ot.removed_reason = 'lease_ended'))))
+            -- ...but not a household that ENDED this lease early while its new
+            -- lease waited unsigned: nobody is staying on to take that one up
+            -- (it never starts, and is canceled), so this is a real move-out —
+            -- and its deposit return waits on this very walkthrough.
+            AND NOT ${followsLeaseEndedEarlyUnsigned('s')})
      ORDER BY l.end_date`,
     [[...MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES]])
 

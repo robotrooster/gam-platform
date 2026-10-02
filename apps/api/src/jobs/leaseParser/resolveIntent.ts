@@ -70,7 +70,25 @@ interface ResolveNeedsConfirm {
   supersedeLeaseId: string
   supersedeTenantName: string | null
 }
-type ResolveResult = ResolveSuccess | ResolveNeedsConfirm
+// S655 (Nic, 10/2): "imports are NEVER blocked" — and nobody is attached to a
+// company without their OWN signature. A person who already has a GAM account
+// with another company is not refused and not silently attached: their paper
+// lease becomes a lease drafted from this landlord's setup and sent to THEM to
+// sign. It waits for the landlord's signature first (Front Desk → Waiting on
+// you to sign) and starts when they sign.
+interface ResolveSentToSign {
+  sentToSign: true
+  tenantId: string
+  userId: string
+  email: string
+  unitId: string
+  unitNumber: string
+  draftedDocumentIds: string[]
+  /** Why no lease drafted, when one didn't — said on screen, never emailed. */
+  draftBlocked: string[]
+  message: string
+}
+type ResolveResult = ResolveSuccess | ResolveNeedsConfirm | ResolveSentToSign
 
 /**
  * S550 (Nic): street-number address safety. Property names repeat in the
@@ -153,11 +171,11 @@ export async function resolveIntent(
   // unresolvable from the same login.
   landlordIds: string[],
   landlordOverrides: Partial<ParserOutput>,
-  opts: { confirmSupersede?: boolean } = {},
+  opts: { confirmSupersede?: boolean; byUserId?: string } = {},
 ): Promise<ResolveResult> {
   // 1. Load intent + verify ownership + state
-  const intent = await queryOne<IntentRow>(
-    `SELECT id, landlord_id, tenant_id, parser_status, parser_output, imported_pdf_url
+  const intent = await queryOne<IntentRow & { unit_id: string | null; draft_document_id: string | null }>(
+    `SELECT id, landlord_id, tenant_id, parser_status, parser_output, imported_pdf_url, unit_id, draft_document_id
      FROM pending_tenant_intents
      WHERE id = $1 AND landlord_id = ANY($2::uuid[]) AND resolved_at IS NULL`,
     [intentId, landlordIds]
@@ -262,21 +280,19 @@ export async function resolveIntent(
   const userTenant = accounts[0] ?? null
   // S654: a password link only for an account that still needs setting up and
   // belongs to no other company. Anyone else is already on GAM (S616).
-  const alreadyOnPlatform = !!userTenant && (userTenant.activated
-    || await accountTiedElsewhere(userTenant.user_id, [landlordId, ...landlordIds]))
+  const tiedElsewhere = !!userTenant && await accountTiedElsewhere(userTenant.user_id, [landlordId, ...landlordIds])
+  const alreadyOnPlatform = !!userTenant && (userTenant.activated || tiedElsewhere)
 
-  // Cross-landlord active lease check (block).
-  if (userTenant?.tenant_id) {
-    const otherLease = await queryOne<{ landlord_id: string }>(
-      `SELECT l.landlord_id FROM lease_tenants lt
-       JOIN leases l ON l.id = lt.lease_id
-       WHERE lt.tenant_id = $1 AND lt.status='active' AND l.status='active' AND l.landlord_id != $2
-       LIMIT 1`,
-      [userTenant.tenant_id, landlordId]
-    )
-    if (otherLease) {
-      throw new AppError(409, 'This email is already a tenant of another landlord. Cross-landlord onboarding requires a separate flow.')
-    }
+  // S655 (Nic, 10/2): another company's resident — a tenant there now, an
+  // invitee, a neighbor on its utilities, anyone it has on file — is never
+  // refused and never attached by this import. Their paper lease becomes a
+  // lease sent to them to sign. (This used to refuse an active tenant of
+  // another landlord outright, and attach everyone else silently.)
+  if (tiedElsewhere && userTenant) {
+    return await sendImportToSign({
+      intentId, intent, landlordId, landlordIds, unit, userTenant,
+      firstName, lastName, phone, byUserId: opts.byUserId ?? null,
+    })
   }
 
   // S582: NEVER silently end an active lease. If the resolved unit already has
@@ -560,6 +576,65 @@ export async function resolveIntent(
     throw e
   } finally {
     client.release()
+  }
+}
+
+/**
+ * S655: the import of another company's resident, turned into a lease they
+ * sign. The intent this PDF arrived on is bound to the unit (or, when the
+ * person already holds a live invite to that unit, closed as a duplicate of
+ * it), then the household is invited through the one invite function: the
+ * lease drafts from this landlord's setup, waits for his signature, and its
+ * issuance waits for THEIRS (tenantsNeedingOwnSignature in the e-sign
+ * issuance step). Pressing "Build lease" again on an intent whose lease is
+ * already drafted says so instead of drafting a second one.
+ */
+async function sendImportToSign(a: {
+  intentId: string
+  intent: { unit_id: string | null; draft_document_id: string | null }
+  landlordId: string; landlordIds: string[]
+  unit: { id: string; unit_number: string }
+  userTenant: { user_id: string; email: string; tenant_id: string | null }
+  firstName: string; lastName: string; phone: string | null
+  byUserId: string | null
+}): Promise<ResolveSentToSign> {
+  const message =
+    `${a.firstName} ${a.lastName} already has a GAM account with another company, so they sign this lease themselves. ` +
+    `It's drafted from your setup for Unit ${a.unit.unit_number} and waiting for your signature in Front Desk; it starts when they sign.`
+  if (a.intent.draft_document_id) {
+    const live = await queryOne<{ id: string }>(
+      `SELECT id FROM lease_documents WHERE id = $1 AND status NOT IN ('voided', 'execution_failed')`,
+      [a.intent.draft_document_id])
+    if (live) {
+      return {
+        sentToSign: true, tenantId: a.userTenant.tenant_id ?? '', userId: a.userTenant.user_id,
+        email: a.userTenant.email, unitId: a.unit.id, unitNumber: a.unit.unit_number,
+        draftedDocumentIds: [live.id], draftBlocked: [], message,
+      }
+    }
+  }
+  // This intent goes onto the unit inside the invite's own transaction
+  // (rebindIntentId), after the unit's checks — a build that fails leaves it
+  // exactly as it was, so the hourly sweep never drafts what the landlord was
+  // just told had failed.
+  const { inviteHouseholdToNewLease } = await import('../../services/newLeaseInvite')
+  const res = await inviteHouseholdToNewLease({
+    unitId: a.unit.id,
+    people: [{ firstName: a.firstName, lastName: a.lastName, email: a.userTenant.email, phone: a.phone }],
+    // The intent's own company, already checked against the caller's account.
+    authorize: (lid) => { if (!a.landlordIds.includes(lid) && lid !== a.landlordId) throw new AppError(403, 'That unit is not yours to onboard into.') },
+    ownCompanies: a.landlordIds,
+    byUserId: a.byUserId ?? '',
+    // A paper lease is a sitting resident's.
+    existingResident: !!a.byUserId,
+    source: 'import',
+    rebindIntentId: a.intentId,
+  })
+  const person = res.people[0]
+  return {
+    sentToSign: true, tenantId: person.tenantId, userId: person.userId, email: person.email,
+    unitId: res.unitId, unitNumber: res.unitNumber,
+    draftedDocumentIds: res.draftedDocumentIds, draftBlocked: res.draftBlocked, message,
   }
 }
 

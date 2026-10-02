@@ -2,40 +2,29 @@ import { useState, useRef, useMemo, useEffect, useCallback } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 // S633: an import lands in ONE company. The account names it.
 import { EntityPicker, useCompanyMissing } from '../components/EntityPicker'
-import { toast } from '../components/dialogs'
+import { toast, appConfirm } from '../components/dialogs'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
-import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, ArrowUp, X, Inbox } from 'lucide-react'
-import { api, apiPost, apiGet, apiPut, apiPatch } from '../lib/api'
-import { AUTO_RENEW_MODES, AUTO_RENEW_MODE_LABEL, UNIT_TYPE_LABEL, humanize, dueDayLabel } from '@gam/shared'
+import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, Inbox } from 'lucide-react'
+import { api, apiPost, apiGet, apiPut, apiPatch, apiDelete } from '../lib/api'
+import { UNIT_TYPE_LABEL, humanize, dueDayLabel } from '@gam/shared'
 
-// Backend response shape from POST /onboard-tenants-csv/validate.
-type CsvIssue = { severity: 'block' | 'warn'; field?: string; message: string }
-type CsvRow = {
+// S655: what checking a tenant file returns (POST /onboard-tenants-csv/validate).
+type RosterIssue = { severity: 'block' | 'warn'; field?: string; message: string }
+type RosterCsvRow = {
   rowIndex: number
-  firstName: string
-  lastName: string
-  email: string
-  phone: string
-  propertyName: string
-  unitNumber: string
-  leaseStart: string
-  leaseEnd: string
-  monthlyRent: string
-  securityDeposit: string
-  lateFeeAmount: string
-  lateFeeGraceDays: string
-  autoRenew: string
-  autoRenewMode: string
-  noticeDaysRequired: string
-  outstandingBalance: string
+  firstName: string; lastName: string; email: string; phone: string
+  propertyName: string; unitNumber: string
+  monthlyRent: string; outstandingBalance: string
+  resolvedPropertyId?: string
   resolvedUnitId?: string
-  resolvedExistingUserId?: string
-  resolvedExistingTenantId?: string
-  issues: CsvIssue[]
+  unitRent?: number | null
+  openingBalance?: number | null
+  skip?: boolean
+  issues: RosterIssue[]
 }
 type ValidateResponse = {
-  rows: CsvRow[]
+  rows: RosterCsvRow[]
   summary: { total: number; blockers: number; warnings: number; ready: number }
   // S537: (property, unit_type) pairs lacking a late-fee decision, each
   // with a suggested prefill = the file's most frequent (fee, grace) pair.
@@ -44,35 +33,14 @@ type ValidateResponse = {
     suggested: { initialAmount: number; graceDays: number; initialType: 'flat'; leaseCount: number; leaseTotal: number } | null
   }[]
 }
-type CommitResponse = {
-  committed: number
-  leases: number
-  tenants: { email: string; tenantId: string; leaseId: string }[]
-  /** S296: true when this platform + import_type slot has not yet
-   *  been marked verified by super admin. Triggers the review
-   *  banner. Replaces S295's firstFive flag. */
+// S655: what saving it as a draft roster returns (POST /onboard-tenants-csv/draft).
+type DraftResponse = {
+  saved: number
+  updated: number
+  properties: { propertyId: string; propertyName: string; count: number }[]
+  notSaved: { rowIndex: number; email: string; name: string; reasons: string[] }[]
+  /** S296: this platform's column mapping is still being checked by GAM. */
   escalateToSuperAdmin?: boolean
-  mappingStatus?: 'unverified' | 'verified'
-}
-
-// Backend issue.field is snake_case; row state keys are camelCase. Map.
-const FIELD_TO_ISSUE_KEY: Record<string, string> = {
-  firstName: 'first_name',
-  lastName: 'last_name',
-  email: 'email',
-  phone: 'phone',
-  propertyName: 'property_name',
-  unitNumber: 'unit_number',
-  leaseStart: 'lease_start',
-  leaseEnd: 'lease_end',
-  monthlyRent: 'monthly_rent',
-  securityDeposit: 'security_deposit',
-  lateFeeAmount: 'late_fee_amount',
-  lateFeeGraceDays: 'late_fee_grace_days',
-  autoRenew: 'auto_renew',
-  autoRenewMode: 'auto_renew_mode',
-  noticeDaysRequired: 'notice_days_required',
-  outstandingBalance: 'outstanding_balance',
 }
 
 const PLATFORM_OPTIONS = [
@@ -87,7 +55,7 @@ const PLATFORM_OPTIONS = [
   { value: 'tenantcloud', label: 'TenantCloud',            enabled: true },
 ]
 
-type Mode = 'choose' | 'bulk' | 'single' | 'new_lease'
+type Mode = 'choose' | 'bulk' | 'single' | 'new_lease' | 'roster'
 
 // S654: the API's reason lives in `error` (errorHandler). Reading only
 // `message` hid every 400 behind a generic line.
@@ -102,7 +70,7 @@ const CHOOSE_COMPANY_FIRST = 'Choose the company this file belongs to first.'
 // open or not, whose late-fee question is still unanswered. After close, every new tenant there
 // must pass a background check (no reopen). Uses an inline two-step confirm (no
 // native dialogs — Safari/webviews drop them).
-function OnboardingWindowsBanner() {
+function OnboardingWindowsBanner({ onOpenRoster }: { onOpenRoster: (propertyId: string) => void }) {
   const qc = useQueryClient()
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
   // S654 (review): a closed-window property answered here stays on screen with
@@ -111,7 +79,16 @@ function OnboardingWindowsBanner() {
   const { data: windows = [] } = useQuery<any[]>('onboarding-windows', () => apiGet('/landlords/me/onboarding-windows'))
   const completeMut = useMutation(
     (propertyId: string) => apiPost(`/properties/${propertyId}/onboarding-complete`, {}),
-    { onSuccess: () => { setConfirmingId(null); qc.invalidateQueries('onboarding-windows'); qc.invalidateQueries(['ob-window']) } },
+    {
+      onSuccess: () => { setConfirmingId(null); qc.invalidateQueries('onboarding-windows'); qc.invalidateQueries(['ob-window']) },
+      // S655: refused while the property's draft roster has people nobody has
+      // confirmed — say so, with the next step, and show the fresh state.
+      onError: (e: any) => {
+        setConfirmingId(null)
+        toast(serverReason(e, 'Onboarding could not be marked complete. Try again.'))
+        qc.invalidateQueries('onboarding-windows')
+      },
+    },
   )
   // S648 (Nic): waiving late fees while residents migrate is the landlord's
   // call, per property. Unanswered = residents are billed late fees.
@@ -139,11 +116,28 @@ function OnboardingWindowsBanner() {
   const unansweredClosed = all.filter(w => !w.open && (w.lateFeeWaiver == null || answeredHere.has(w.propertyId)))
   if (openWins.length === 0 && unansweredClosed.length === 0) return null
 
+  // S655 (Nic, 10/2): the first-bill late-fee waiver is the landlord's call,
+  // never a platform rule. Late in the month (after the 20th, or with the
+  // first bill close) residents who take a few days to sign up land right on
+  // that bill, so the question is flagged prominently then.
   const waiverQuestion = (w: any) => (
-    <div style={{ flexBasis: '100%', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: '.78rem' }}>
-      <span style={{ color: w.lateFeeWaiver == null ? 'var(--gold)' : 'var(--text-2)' }}>
-        Waive late fees on each resident&apos;s first bill while they move over?
-      </span>
+    <div style={{ flexBasis: '100%', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: '.78rem',
+                  ...(w.lateInMonth ? { background: 'rgba(201,162,39,.12)', border: '1px solid var(--gold)', borderRadius: 8, padding: '10px 12px' } : {}) }}>
+      {w.lateInMonth ? (
+        <span style={{ flexBasis: '100%', color: 'var(--text-0)', fontWeight: 700, fontSize: '.84rem', lineHeight: 1.5 }}>
+          You&apos;re onboarding late in the month. If your tenants take some time to get signed up, do you want to
+          waive their first late fee on GAM?
+          {w.nextRentDueDate && (
+            <span style={{ display: 'block', fontWeight: 400, fontSize: '.74rem', color: 'var(--text-2)' }}>
+              Rent at {w.propertyName} is next due {new Date(w.nextRentDueDate + 'T12:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}.
+            </span>
+          )}
+        </span>
+      ) : (
+        <span style={{ color: w.lateFeeWaiver == null ? 'var(--gold)' : 'var(--text-2)' }}>
+          Waive late fees on each resident&apos;s first bill while they move over?
+        </span>
+      )}
       {/* Unanswered: both are actions (gold). Answered: the saved one gold, the other the switch. */}
       <button className={`btn btn-sm ${w.lateFeeWaiver === true || w.lateFeeWaiver == null ? 'btn-primary' : 'btn-ghost'}`}
         disabled={waiverMut.isLoading}
@@ -171,14 +165,24 @@ function OnboardingWindowsBanner() {
             {typeof w.daysRemaining === 'number' && <> — <span style={{ color: 'var(--gold)', fontWeight: 700 }}>{w.daysRemaining} day{w.daysRemaining === 1 ? '' : 's'}</span> left</>}
           </div>
           {waiverQuestion(w)}
-          {confirmingId === w.propertyId ? (
+          {/* S655: a draft roster is reviewed and confirmed before the window
+              closes — closing it first would send every one of those sitting
+              residents to a background check. */}
+          {w.draftRosterCount > 0 ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '.74rem', color: 'var(--text-2)' }}>
+                {w.draftRosterCount} {w.draftRosterCount === 1 ? 'person' : 'people'} on the draft roster to confirm first.
+              </span>
+              <button className="btn btn-primary btn-sm" onClick={() => onOpenRoster(w.propertyId)}>Review roster</button>
+            </div>
+          ) : confirmingId === w.propertyId ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ fontSize: '.74rem', color: 'var(--text-2)' }}>Close now? New tenants will be screened.</span>
               <button className="btn btn-primary btn-sm" disabled={completeMut.isLoading} onClick={() => completeMut.mutate(w.propertyId)}>Confirm</button>
               <button className="btn btn-ghost btn-sm" onClick={() => setConfirmingId(null)}>Cancel</button>
             </div>
           ) : (
-            <button className="btn btn-ghost btn-sm" onClick={() => setConfirmingId(w.propertyId)}>Mark onboarding complete</button>
+            <button className="btn btn-primary btn-sm" onClick={() => setConfirmingId(w.propertyId)}>Mark onboarding complete</button>
           )}
         </div>
       ))}
@@ -213,6 +217,12 @@ export function TenantOnboardingPage() {
   const [deepLinkUnit] = useState(() => sp.get('unit') ?? '')
   const deepLinkProperty = sp.get('property') ?? ''
   const [mode, setMode] = useState<Mode>(deepLinkUnit || deepLinkProperty ? 'new_lease' : 'choose')
+  // S655: which property's draft roster to open.
+  const [rosterProperty, setRosterProperty] = useState('')
+  const openRoster = (propertyId: string) => { setRosterProperty(propertyId); setMode('roster') }
+  const { data: rosterSummary } = useQuery<any>('tenant-roster-summary',
+    () => apiGet('/landlords/me/tenant-roster'), { staleTime: 0, refetchOnWindowFocus: true })
+  const rosterCount = ((rosterSummary?.properties ?? []) as any[]).reduce((n, p) => n + Number(p.count || 0), 0)
 
   // S629 (Nic): "when I click out and back into it, it wants to open with
   // mobile home six selected and expanded already... I've cleared the whole
@@ -257,7 +267,7 @@ export function TenantOnboardingPage() {
         </p>
       </div>
 
-      <OnboardingWindowsBanner />
+      <OnboardingWindowsBanner onOpenRoster={openRoster} />
 
       {mode === 'choose' && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16 }}>
@@ -267,8 +277,8 @@ export function TenantOnboardingPage() {
           >
             <div style={{ fontWeight: 700, fontSize: '1rem', color: 'var(--text-0)', marginBottom: 6 }}>New Lease — Invite to Sign</div>
             <div style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
-              Invite a tenant to a unit to sign a NEW lease. Pick the unit, send the
-              invite — the lease auto-drafts from the unit&apos;s template when they accept.
+              Put a household on a unit. Their lease drafts right away from your setup and waits for
+              your signature; they get one email when you sign it.
             </div>
           </button>
 
@@ -278,10 +288,25 @@ export function TenantOnboardingPage() {
           >
             <div style={{ fontWeight: 700, fontSize: '1rem', color: 'var(--text-0)', marginBottom: 6 }}>Bulk CSV Import</div>
             <div style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
-              Upload a spreadsheet of existing tenants and their leases. Best for
-              migrating from another platform.
+              Upload a spreadsheet of the tenants who live here now, from another platform or the
+              GAM template. It becomes a draft roster you review — nobody is emailed by the upload.
             </div>
           </button>
+
+          {rosterCount > 0 && (
+            <button
+              onClick={() => openRoster('')}
+              style={{ textAlign: 'left', padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--gold)', cursor: 'pointer' }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <div style={{ fontWeight: 700, fontSize: '1rem', color: 'var(--text-0)' }}>Draft roster</div>
+                <span className="badge badge-amber" style={{ fontSize: '.72rem' }}>{rosterCount} to review</span>
+              </div>
+              <div style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+                People from your uploaded file, waiting for you to check where they live and confirm.
+              </div>
+            </button>
+          )}
 
           <button
             onClick={() => setMode('single')}
@@ -316,7 +341,9 @@ export function TenantOnboardingPage() {
         </div>
       )}
 
-      {mode === 'bulk' && <BulkCsvMode onBack={() => setMode('choose')} />}
+      {mode === 'bulk' && <BulkCsvMode onBack={() => setMode('choose')} onOpenRoster={openRoster} />}
+
+      {mode === 'roster' && <RosterReviewMode key={rosterProperty} onBack={() => setMode('choose')} initialPropertyId={rosterProperty} />}
 
       {mode === 'new_lease' && <NewLeaseInviteMode onBack={() => setMode('choose')} initialUnitId={deepLinkUnit} initialPropertyId={deepLinkProperty} />}
 
@@ -352,8 +379,12 @@ export const homeSaleComplete = (_f: HomeSaleForm | null) => true
  * checklist the e-sign page shows. `sale` re-asks the package as a sale so the
  * installment papers appear the moment the sale box is ticked.
  */
-export function PacketChecklist({ unitId, sale, ticked, setTicked }: {
+export function PacketChecklist({ unitId, sale, ticked, setTicked, initial, onUserChange }: {
   unitId: string; sale: boolean; ticked: Record<string, boolean> | null; setTicked: (v: Record<string, boolean>) => void
+  /** S655: ticks saved earlier (a draft roster); left out, the package's own suggestion. */
+  initial?: string[] | null
+  /** S655: called only when the landlord ticks or unticks something. */
+  onUserChange?: (v: Record<string, boolean>) => void
 }) {
   const { data: pkg, isLoading } = useQuery<any>(['signing-package-for-unit', unitId, sale],
     () => apiGet(`/signing-packages/for-unit/${unitId}${sale ? '?sale=1' : ''}`), { enabled: !!unitId })
@@ -361,7 +392,7 @@ export function PacketChecklist({ unitId, sale, ticked, setTicked }: {
   useEffect(() => {
     if (!pkg?.items) return
     const next: Record<string, boolean> = {}
-    for (const i of pkg.items) next[i.templateId] = !!i.suggested
+    for (const i of pkg.items) next[i.templateId] = Array.isArray(initial) ? (initial.includes(i.templateId) || !!i.required) : !!i.suggested
     setTicked(next)
   }, [pkg])
   // S652 (Nic): "no packet yet — build one; not able to build one — take you
@@ -403,7 +434,7 @@ export function PacketChecklist({ unitId, sale, ticked, setTicked }: {
         <label key={i.templateId} style={{ display: 'flex', alignItems: 'flex-start', gap: 9, padding: '4px 0',
           cursor: i.required ? 'default' : 'pointer', opacity: i.required ? .85 : 1 }}>
           <input type="checkbox" checked={i.required ? true : !!t[i.templateId]} disabled={i.required}
-            onChange={e => setTicked({ ...t, [i.templateId]: e.target.checked })} style={{ marginTop: 3 }} />
+            onChange={e => { const next = { ...t, [i.templateId]: e.target.checked }; setTicked(next); onUserChange?.(next) }} style={{ marginTop: 3 }} />
           <span>
             <span style={{ fontSize: '.78rem', color: 'var(--text-1)' }}>{i.templateName}</span>
             <span style={{ display: 'block', fontSize: '.68rem', color: 'var(--text-3)', marginTop: 1 }}>{i.reason}</span>
@@ -498,7 +529,9 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
   const [dueDay, setDueDay] = useState<Record<string, string>>({})
   const [open, setOpen] = useState<Record<string, boolean>>(
     initialUnitId ? { [initialUnitId]: true } : {})
-  const [sent, setSent] = useState<Record<string, string[]>>({})
+  // S655: what each unit's invite did — who is on it, why a lease did not
+  // draft (when it didn't), and who signs their own lease first.
+  const [sent, setSent] = useState<Record<string, { names: string[]; blocked: string[]; ownSignature: string[]; invited: string[] }>>({})
   const [sending, setSending] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
 
@@ -529,39 +562,36 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
       : unitsReady.length === 0 ? 'Fill in at least one unit.' : null
 
   /**
-   * One press, every unit. Sent per person, one at a time, because each is a
-   * real invite email — a failure part way through must leave the people
-   * already invited invited, never roll back a message that has landed.
-   * Units that succeed drop off; units that fail stay on the page with the
-   * reason and the people who did not make it.
+   * One press, every unit. S655: each unit's household goes in ONE call, so
+   * its lease drafts once with everyone on it (one person at a time drafted,
+   * voided and re-drafted the lease for every person added). A unit that fails
+   * stays on the page with the reason and everyone still on it; units that
+   * succeed drop off. Nobody is emailed: the leases wait for your signature.
    */
   const sendEverything = async () => {
     setSending(true); setErrors({})
-    const nextSent: Record<string, string[]> = {}
+    const nextSent: Record<string, { names: string[]; blocked: string[]; ownSignature: string[]; invited: string[] }> = {}
     const nextErrors: Record<string, string> = {}
     for (const u of unitsReady) {
       const people = rosterFor(u.id).filter(p => !untouched(p))
-      const okNames: string[] = []
-      const failed: Person[] = []
-      let lastErr = ''
-      for (const p of people) {
-        try {
-          await apiPost<any>('/landlords/me/onboard-new-lease-tenant',
-            { ...p, unitId: u.id, existingResident: attest[u.id] !== false,
-              rentDueDay: attest[u.id] !== false && dueDay[u.id] ? Number(dueDay[u.id]) : undefined,
-              homeSale: sale[u.id] ? homeSalePayload(sale[u.id]!) : undefined,
-              packageTemplateIds: tickedIds(packet[u.id] ?? null) })
-          okNames.push(`${p.firstName} ${p.lastName}`.trim() || p.email)
-        } catch (e: any) {
-          failed.push(p)
-          lastErr = serverReason(e, e?.message || 'Could not send the invite.')
+      try {
+        const r: any = await apiPost<any>('/landlords/me/onboard-new-lease-tenant', {
+          unitId: u.id, people,
+          existingResident: attest[u.id] !== false,
+          rentDueDay: attest[u.id] !== false && dueDay[u.id] ? Number(dueDay[u.id]) : undefined,
+          homeSale: sale[u.id] ? homeSalePayload(sale[u.id]!) : undefined,
+          packageTemplateIds: tickedIds(packet[u.id] ?? null),
+        })
+        const d = r?.data ?? {}
+        nextSent[u.id] = {
+          names: people.map(p => `${p.firstName} ${p.lastName}`.trim() || p.email),
+          blocked: Array.isArray(d.draftBlocked) ? d.draftBlocked : [],
+          ownSignature: (Array.isArray(d.people) ? d.people : []).filter((x: any) => x.needsOwnSignature).map((x: any) => x.name),
+          // A lease that could not draft: these people got the usual invite instead.
+          invited: (Array.isArray(d.people) ? d.people : []).filter((x: any) => !!x.notified).map((x: any) => x.name || x.email),
         }
-      }
-      if (failed.length) {
-        nextErrors[u.id] = `${failed.length} of ${people.length} failed: ${lastErr}`
-        setRoster(u.id, failed)
-      } else {
-        nextSent[u.id] = okNames
+      } catch (e: any) {
+        nextErrors[u.id] = serverReason(e, 'This unit could not be invited. Try again.')
       }
     }
     setSent(prev => ({ ...prev, ...nextSent }))
@@ -590,9 +620,10 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
       <div style={{ marginBottom: 14 }}>
         <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-0)', margin: 0, marginBottom: 6 }}>Invite to sign a new lease</h2>
         <p style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5, margin: 0 }}>
-          Fill in as many units as you like, then send them all at once. Each person gets a portal
-          invite by email; a unit&apos;s lease drafts once everyone on it accepts. Units drop off the
-          list as their invites go.
+          Fill in as many units as you like, then send them all at once. Each household&apos;s lease drafts
+          right away from your setup and waits for your signature in Front Desk. Nobody is emailed until
+          you sign their lease; then each person gets one email to set up their account and sign. Units drop
+          off the list as they go.
         </p>
       </div>
 
@@ -617,11 +648,38 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
       {sentUnitCount > 0 && (
         <div style={{ background: 'rgba(38,167,90,.08)', border: '1px solid rgba(38,167,90,.3)', borderRadius: 8,
                       padding: '10px 14px', marginBottom: 14, fontSize: '.8rem', color: 'var(--text-1)' }}>
-          <strong style={{ color: 'var(--green)' }}>Sent for {sentUnitCount} unit{sentUnitCount === 1 ? '' : 's'}:</strong>{' '}
-          {Object.entries(sent).map(([id, names]) => {
+          <strong style={{ color: 'var(--green)' }}>Done for {sentUnitCount} unit{sentUnitCount === 1 ? '' : 's'}:</strong>{' '}
+          {Object.entries(sent).map(([id, r]) => {
             const u = (allUnits as any[]).find(x => x.id === id)
-            return `${u ? `Unit ${u.unitNumber}` : 'unit'} (${names.join(', ')})`
+            return `${u ? `Unit ${u.unitNumber}` : 'unit'} (${r.names.join(', ')})`
           }).join(' · ')}
+          {Object.values(sent).some(r => r.blocked.length === 0) && (
+            <div style={{ marginTop: 4, color: 'var(--text-2)' }}>
+              {Object.values(sent).some(r => r.blocked.length > 0) ? 'The leases that drafted are' : 'Their leases are'} waiting
+              for your signature in <Link to="/front-desk" style={{ color: 'var(--gold)', fontWeight: 600 }}>Front Desk</Link>.
+            </div>
+          )}
+          {Object.entries(sent).flatMap(([id, r]) => {
+            const u = (allUnits as any[]).find(x => x.id === id)
+            const label = u ? `Unit ${u.unitNumber}` : 'A unit'
+            return [
+              ...r.blocked.map((b, i) => (
+                <div key={`${id}-b${i}`} style={{ marginTop: 4, color: 'var(--amber, #d97706)' }}>{label}: {b}</div>
+              )),
+              ...(r.blocked.length && r.invited.length ? [(
+                <div key={`${id}-inv`} style={{ marginTop: 4, color: 'var(--text-2)' }}>
+                  {label}: because the lease did not draft, {r.invited.join(', ')} {r.invited.length === 1 ? 'was' : 'were'} sent
+                  the usual invite instead (an email to set up their account, or a notice in the GAM account they already use).
+                </div>
+              )] : []),
+              ...(r.ownSignature.length ? [(
+                <div key={`${id}-own`} style={{ marginTop: 4, color: 'var(--text-2)' }}>
+                  {label}: {r.ownSignature.join(', ')} already {r.ownSignature.length === 1 ? 'has' : 'have'} a GAM account with
+                  another company, so {r.ownSignature.length === 1 ? 'they sign' : 'each signs'} the lease themselves and it starts when they sign.
+                </div>
+              )] : []),
+            ]
+          })}
         </div>
       )}
 
@@ -679,9 +737,9 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
                         padding: '12px 0', marginTop: 8 }}>
             <button type="button" className="btn btn-primary" style={{ width: '100%' }}
                     disabled={!!blockedBecause || sending} onClick={sendEverything}>
-              {sending ? 'Sending…'
-                : unitsReady.length === 0 ? 'Send invites'
-                : `Send ${peopleReady} invite${peopleReady === 1 ? '' : 's'} across ${unitsReady.length} unit${unitsReady.length === 1 ? '' : 's'}`}
+              {sending ? 'Drafting the leases…'
+                : unitsReady.length === 0 ? 'Invite and draft the leases'
+                : `Invite ${peopleReady} ${peopleReady === 1 ? 'person' : 'people'} and draft ${unitsReady.length} lease${unitsReady.length === 1 ? '' : 's'}`}
             </button>
             {blockedBecause && !sending && (
               <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 6, textAlign: 'center' }}>{blockedBecause}</div>
@@ -814,61 +872,6 @@ function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest
   )
 }
 
-// Identity field set — these blockers mean we can't safely create a user
-// record at all. Rows with any identity blocker stay in the punch list for
-// inline correction. Lease-only blockers (rent, dates, unit) route to limbo.
-const IDENTITY_FIELDS = new Set(['first_name', 'last_name', 'email', 'phone'])
-
-// Split dirty rows into limbo-routeable vs punch-list. A row is limbo-routeable
-// if it has at least one block-severity issue AND every block-severity issue
-// is on a non-identity field. Rows with mixed (identity + lease) blockers, or
-// pure identity blockers, stay in punch list.
-//
-// Backend re-validates identity server-side. Frontend classification is a
-// hint; bad data here gets caught and returned as a per-row error.
-function splitDirtyRows(rows: CsvRow[]): { limboRows: CsvRow[]; punchListRows: CsvRow[] } {
-  const limboRows: CsvRow[] = []
-  const punchListRows: CsvRow[] = []
-  for (const r of rows) {
-    const blockers = r.issues.filter(i => i.severity === 'block')
-    if (blockers.length === 0) {
-      // Defensive — splitFastPath should have caught this, but if a row with
-      // no blockers landed here (e.g. cross-landlord warn-only), keep it in
-      // punch list rather than silently routing.
-      punchListRows.push(r)
-      continue
-    }
-    const hasIdentityBlocker = blockers.some(b => b.field && IDENTITY_FIELDS.has(b.field))
-    if (hasIdentityBlocker) {
-      punchListRows.push(r)
-    } else {
-      limboRows.push(r)
-    }
-  }
-  return { limboRows, punchListRows }
-}
-
-// Split rows into fast-path (clean unit groups) and dirty (units with at least one blocker).
-// Rows without resolvedUnitId always go to dirty so the punch list can surface them.
-function splitFastPath(rows: CsvRow[]): { fastPathRows: CsvRow[]; dirtyRows: CsvRow[] } {
-  const byUnit = new Map<string, CsvRow[]>()
-  const orphans: CsvRow[] = []
-  for (const r of rows) {
-    if (!r.resolvedUnitId) { orphans.push(r); continue }
-    if (!byUnit.has(r.resolvedUnitId)) byUnit.set(r.resolvedUnitId, [])
-    byUnit.get(r.resolvedUnitId)!.push(r)
-  }
-
-  const fastPathRows: CsvRow[] = []
-  const dirtyRows: CsvRow[] = [...orphans]
-  for (const [, groupRows] of byUnit) {
-    const hasBlocker = groupRows.some(r => r.issues.some(i => i.severity === 'block'))
-    if (hasBlocker) dirtyRows.push(...groupRows)
-    else fastPathRows.push(...groupRows)
-  }
-  return { fastPathRows, dirtyRows }
-}
-
 function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComplete: () => void }) {
   const [form, setForm] = useState({ firstName: '', lastName: '', email: '', phone: '' })
   // W-27 (S531): optionally bind the unit the incoming tenant already
@@ -908,9 +911,12 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
 
   const set = (k: keyof typeof form, v: string) => setForm(prev => ({ ...prev, [k]: v }))
 
+  // The trimmed values are passed in: setForm() has not landed yet when the
+  // mutation runs, so reading `form` here sent the untrimmed copy.
   const submitMut = useMutation(
-    () => apiPost<any>('/landlords/me/onboard-tenant-pending', {
-      ...form,
+    (f: typeof form) => apiPost<any>('/landlords/me/onboard-tenant-pending', {
+      ...f,
+      phone: f.phone || undefined,
       unitId: unitId || undefined,
       landlordId: !unitId && landlordId ? landlordId : undefined,
       existingResident: !!unitId && windowOpen && attestExisting,
@@ -933,10 +939,8 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
         setError(null)
       },
       onError: (e: any) => {
-        // Backend 409 messages surface here directly:
-        //  - "Tenant has an active lease with another landlord. Cannot onboard to your portfolio."
-        //  - "Tenant already has an active lease with you."
-        //  - "Pending intent already exists for this email."
+        // The server's own plain-words reason (already on a lease with you,
+        // already in your pending list, a login that isn't a resident's).
         setError(serverReason(e, 'Could not add tenant.'))
       },
     }
@@ -951,13 +955,14 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
       email:     form.email.trim(),
       phone:     form.phone.trim(),
     }
-    if (!trimmed.firstName || !trimmed.lastName || !trimmed.email || !trimmed.phone) {
-      setError('All fields are required.')
+    // S629: phone is optional — plenty of landlords only have an email.
+    if (!trimmed.firstName || !trimmed.lastName || !trimmed.email) {
+      setError('Add their first name, last name and email.')
       return
     }
     if (needsCompany) { setError('Pick the unit they live in, or choose the company they belong to.'); return }
     setForm(trimmed)
-    submitMut.mutate()
+    submitMut.mutate(trimmed)
   }
 
   const handleAddAnother = () => {
@@ -1039,7 +1044,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
             <input className="input" type="email" placeholder="jane@example.com" value={form.email} onChange={e => set('email', e.target.value)} style={{ width: '100%' }} />
           </div>
           <div style={{ marginBottom: 12 }}>
-            <label style={{ display: 'block', fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 4 }}>Phone</label>
+            <label style={{ display: 'block', fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 4 }}>Phone (optional)</label>
             <input className="input" type="tel" placeholder="(555) 000-0000" value={form.phone} onChange={e => set('phone', e.target.value)} style={{ width: '100%' }} />
           </div>
           <div style={{ marginBottom: 20 }}>
@@ -1217,53 +1222,49 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
   )
 }
 
-function BulkCsvMode({ onBack }: { onBack: () => void }) {
+/**
+ * S655 (Nic, 10/2): THE TENANT CSV IS A DRAFT ROSTER.
+ *
+ * "Check the file" only checks it. "Save as draft roster" saves who lives
+ * where — nobody is emailed and no account is made. The landlord then reviews
+ * each property's roster (RosterReviewMode) and confirms it; confirming drafts
+ * every household's lease from the landlord's own setup, the leases wait for
+ * the landlord's signature, and each household gets one email when he signs.
+ *
+ * It used to commit on Validate: clean units became live leases nobody had
+ * signed, and every new person got an "Activate your account" email at once.
+ */
+function BulkCsvMode({ onBack, onOpenRoster }: { onBack: () => void; onOpenRoster: (propertyId: string) => void }) {
+  const qc = useQueryClient()
   const [source, setSource] = useState<string>('generic')
   // S633: a tenant import lands in ONE company. Single-company accounts never
-  // see the picker; an account that owns several must say which, because a
-  // roster imported into the wrong LLC is unwound tenant by tenant.
+  // see the picker; an account that owns several must say which.
   const [landlordId, setLandlordId] = useState<string>('')
   const [fileName, setFileName] = useState<string>('')
   const [csvText, setCsvText] = useState<string>('')
-  const [punchListRows, setPunchListRows] = useState<CsvRow[] | null>(null)
-  const [validateSummary, setValidateSummary] = useState<{ total: number; blockers: number; warnings: number; ready: number } | null>(null)
+  const [review, setReview] = useState<ValidateResponse | null>(null)
+  const [saved, setSaved] = useState<DraftResponse | null>(null)
   const [errorMsg, setErrorMsg] = useState<string>('')
-  const [fastPathBanner, setFastPathBanner] = useState<string>('')
   const [reviewBanner, setReviewBanner] = useState<{ platform: string } | null>(null)
   // S297: free-text claim required on generic uploads.
   const [claimedPlatformName, setClaimedPlatformName] = useState<string>('')
-  // S537: decision interception — when validate reports undecided unit
-  // classes, the import pauses here until the landlord decides.
+  // S537: undecided late-fee classes are decided before the roster is saved —
+  // a roster can't be confirmed onto an undecided class.
   const [pendingDecisions, setPendingDecisions] = useState<NonNullable<ValidateResponse['missingLateFeeDecisions']>>([])
   const [decisionInputs, setDecisionInputs] = useState<Record<string, { noLateFee: boolean; amount: string; grace: string; kind: 'flat' | 'percent_of_rent' }>>({})
   const [savingDecisions, setSavingDecisions] = useState(false)
-  // S654 (review): unit cards being onboarded right now. The company can't be
-  // switched under a card whose import is still in flight.
-  const [cardsBusy, setCardsBusy] = useState(0)
-  const cardBusy = (on: boolean) => setCardsBusy(n => Math.max(0, n + (on ? 1 : -1)))
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // Limbo state — rows missing only lease data routed to pending pool.
-  const [limboBanner, setLimboBanner] = useState<string>('')
-  const [limboErrors, setLimboErrors] = useState<Array<{ rowIndex: number; email: string; message: string }>>([])
-
-  // S654: NO DEFAULT COMPANY — a several-company account validates and imports
+  // S654: NO DEFAULT COMPANY — a several-company account checks and saves
   // nothing until it names one.
   const companyMissing = useCompanyMissing(landlordId)
-  // S654: a review was matched against one company's units; switching company
-  // makes it stale, so it goes. The first pick (from nothing) keeps it.
+  const clearResults = () => {
+    setReview(null); setSaved(null); setPendingDecisions([]); setDecisionInputs({})
+    setErrorMsg(''); setReviewBanner(null)
+  }
+  // A check was matched against one company's units; switching company makes it stale.
   const chooseCompany = useCallback((id: string) => {
-    if (landlordId && id !== landlordId) {
-      setPunchListRows(null)
-      setValidateSummary(null)
-      setPendingDecisions([])
-      setDecisionInputs({})
-      setErrorMsg('')
-      setFastPathBanner('')
-      setReviewBanner(null)
-      setLimboBanner('')
-      setLimboErrors([])
-    }
+    if (landlordId && id !== landlordId) clearResults()
     setLandlordId(id)
   }, [landlordId])
 
@@ -1274,26 +1275,22 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
     const n = normalizeClaim(claimedPlatformName)
     if (!n) return null
     return PLATFORM_OPTIONS.find(p =>
-      p.value !== 'generic' && p.enabled && (
-        normalizeClaim(p.value) === n || normalizeClaim(p.label) === n
-      )
+      p.value !== 'generic' && p.enabled && (normalizeClaim(p.value) === n || normalizeClaim(p.label) === n)
     ) || null
   }, [claimedPlatformName])
 
+  const fileBody = () => ({
+    csv: csvText, source, landlordId,
+    ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
+  })
+
   const validateMut = useMutation(
-    (body: { csv: string; source: string; claimedPlatformName?: string }) => apiPost<ValidateResponse>('/landlords/me/onboard-tenants-csv/validate', { ...body, landlordId }),
+    () => apiPost<ValidateResponse>('/landlords/me/onboard-tenants-csv/validate', fileBody()),
     {
-      onSuccess: async (res: any) => {
+      onSuccess: (res: any) => {
         const data: ValidateResponse = res.data
         setErrorMsg('')
-        setValidateSummary(data.summary)
-        setLimboBanner('')
-        setLimboErrors([])
-
-        // S537: undecided late-fee classes pause the import BEFORE any
-        // commit — the fast-path would 422 against the gate anyway. The
-        // landlord decides (mode-of-file prefill), we save, re-validate,
-        // and the flow resumes clean.
+        setSaved(null)
         if (data.missingLateFeeDecisions && data.missingLateFeeDecisions.length > 0) {
           setPendingDecisions(data.missingLateFeeDecisions)
           setDecisionInputs(Object.fromEntries(data.missingLateFeeDecisions.map(m => [
@@ -1302,94 +1299,42 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
               ? { noLateFee: false, amount: String(m.suggested.initialAmount), grace: String(m.suggested.graceDays), kind: 'flat' as const }
               : { noLateFee: false, amount: '', grace: '5', kind: 'flat' as const },
           ])))
-          setPunchListRows(null)
+          setReview(null)
           return
         }
         setPendingDecisions([])
-
-        const { fastPathRows, dirtyRows } = splitFastPath(data.rows)
-        const { limboRows, punchListRows: identityBlockerRows } = splitDirtyRows(dirtyRows)
-
-        // Fast-path: clean unit groups commit straight through. Existing flow.
-        let fastPathFailed = false
-        if (fastPathRows.length > 0) {
-          try {
-            const commitRes: any = await apiPost<CommitResponse>('/landlords/me/onboard-tenants-csv/commit', {
-              landlordId,
-              rows: fastPathRows, source,
-              ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
-            })
-            const c: CommitResponse = commitRes.data
-            const tenantWord = c.committed === 1 ? 'tenant' : 'tenants'
-            const unitWord = c.leases === 1 ? 'unit' : 'units'
-            setFastPathBanner(`${c.committed} ${tenantWord} onboarded across ${c.leases} ${unitWord}. Activation emails sent.`)
-            if (c.escalateToSuperAdmin) {
-              const label = PLATFORM_OPTIONS.find(p => p.value === source)?.label || source
-              setReviewBanner({ platform: label })
-            } else {
-              setReviewBanner(null)
-            }
-          } catch (e: any) {
-            // Fast-path failure: roll fast-path rows into punch list. Limbo
-            // dispatch still attempted independently below — separate failures.
-            setErrorMsg(serverReason(e, 'Some rows could not be auto-onboarded. Review below.'))
-            fastPathFailed = true
-          }
-        }
-
-        // Limbo: rows with only lease-only blockers route to pending pool.
-        // Independent of fast-path — runs even if fast-path failed.
-        if (limboRows.length > 0) {
-          try {
-            const limboRes: any = await apiPost<{ created: number; skipped: number; results: Array<{ rowIndex: number; email: string; status: string; intentId?: string; message?: string }> }>(
-              '/landlords/me/onboard-tenants-csv/commit-pending',
-              { rows: limboRows, landlordId }
-            )
-            const l = limboRes.data
-            if (l.created > 0) {
-              const tenantWord = l.created === 1 ? 'tenant' : 'tenants'
-              setLimboBanner(`${l.created} ${tenantWord} routed to pending pool. Upload their lease PDFs to complete onboarding.`)
-            }
-            const errs = (l.results || [])
-              .filter((r: any) => r.status === 'error')
-              .map((r: any) => ({ rowIndex: r.rowIndex, email: r.email, message: r.message || 'Row failed' }))
-            if (errs.length > 0) {
-              setLimboErrors(errs)
-              const erroredIndexes = new Set(errs.map((e: { rowIndex: number }) => e.rowIndex))
-              const erroredRows = limboRows.filter(r => erroredIndexes.has(r.rowIndex))
-              identityBlockerRows.push(...erroredRows)
-            }
-          } catch (e: any) {
-            // Network or 500-level failure on the whole batch. Roll limbo
-            // rows back into punch list with banner-level error.
-            setErrorMsg(serverReason(e, 'Could not route tenants to pending pool. Review below.'))
-            identityBlockerRows.push(...limboRows)
-          }
-        }
-
-        // Settle the punch list once. If fast-path failed, include those too.
-        if (fastPathFailed) {
-          setPunchListRows([...fastPathRows, ...identityBlockerRows])
-        } else {
-          setPunchListRows(identityBlockerRows)
-        }
+        setReview(data)
       },
       onError: (err: any) => {
-        setErrorMsg(serverReason(err, 'Validation failed. Check the CSV format and try again.'))
-        setPunchListRows(null)
-        setValidateSummary(null)
+        setErrorMsg(serverReason(err, 'The file could not be checked. Make sure it is a CSV and try again.'))
+        setReview(null)
       },
+    }
+  )
+
+  const saveMut = useMutation(
+    () => apiPost<DraftResponse>('/landlords/me/onboard-tenants-csv/draft', fileBody()),
+    {
+      onSuccess: (res: any) => {
+        const d: DraftResponse = res.data
+        setSaved(d)
+        setReview(null)
+        setErrorMsg('')
+        qc.invalidateQueries('tenant-roster-summary')
+        qc.invalidateQueries('onboarding-windows')
+        if (d.escalateToSuperAdmin) {
+          setReviewBanner({ platform: PLATFORM_OPTIONS.find(p => p.value === source)?.label || source })
+        } else {
+          setReviewBanner(null)
+        }
+      },
+      onError: (err: any) => setErrorMsg(serverReason(err, 'The roster could not be saved. Check the file and try again.')),
     }
   )
 
   const handleFile = (file: File) => {
     setFileName(file.name)
-    setErrorMsg('')
-    setPunchListRows(null)
-    setValidateSummary(null)
-    setFastPathBanner('')
-    setLimboBanner('')
-    setLimboErrors([])
+    clearResults()
     const reader = new FileReader()
     reader.onload = (e) => setCsvText(String(e.target?.result || ''))
     reader.onerror = () => setErrorMsg('Could not read the file. Try again.')
@@ -1398,27 +1343,24 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
 
   const handleDownloadTemplate = async () => {
     // Raw fetch (not apiGet) because the response is text/csv, not JSON.
-    // apiGet/apiPost both parse response.data.data; this needs a blob.
     try {
       const apiUrl = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
       const token = localStorage.getItem('gam_token')
       const res = await fetch(`${apiUrl}/api/landlords/me/onboard-tenants-csv/template?source=${encodeURIComponent(source)}`, {
         headers: { Authorization: 'Bearer ' + token },
       })
-      if (!res.ok) { setErrorMsg('Could not download the template.'); return }
+      if (!res.ok) { setErrorMsg('Could not download the template. Try again.'); return }
       const blob = await res.blob()
       const url = window.URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = source === 'generic'
-        ? 'gam-tenant-onboarding-template.csv'
-        : `gam-tenant-onboarding-template-${source}.csv`
+      a.download = source === 'generic' ? 'gam-tenant-roster-template.csv' : `gam-tenant-roster-template-${source}.csv`
       document.body.appendChild(a)
       a.click()
       a.remove()
       window.URL.revokeObjectURL(url)
     } catch {
-      setErrorMsg('Could not download the template.')
+      setErrorMsg('Could not download the template. Try again.')
     }
   }
 
@@ -1426,27 +1368,20 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
     if (!csvText.trim()) { setErrorMsg('Pick a CSV file first.'); return }
     if (companyMissing) { setErrorMsg(CHOOSE_COMPANY_FIRST); return }
     if (source === 'generic' && !claimedPlatformName.trim()) {
-      setErrorMsg('Enter the platform name your CSV came from before validating.')
+      setErrorMsg('Enter the name of the platform this file came from first.')
       return
     }
-    setFastPathBanner('')
-    setLimboBanner('')
-    setLimboErrors([])
-    validateMut.mutate({
-      csv: csvText, source,
-      ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
-    })
+    validateMut.mutate()
   }
 
-  // S537: persist the decisions (properties already exist in the tenant
-  // flow), then re-validate — the gate is satisfied and the import resumes.
+  // S537: save the decisions, then check the file again — the import resumes.
   const handleSaveDecisions = async () => {
     if (companyMissing) { setErrorMsg(CHOOSE_COMPANY_FIRST); return }
     const incomplete = pendingDecisions.some(m => {
       const d = decisionInputs[`${m.propertyId}|${m.unitType}`]
       return !d || (!d.noLateFee && (d.amount === '' || d.grace === ''))
     })
-    if (incomplete) { setErrorMsg('Every listed unit type needs a decision (terms or "no late fee").'); return }
+    if (incomplete) { setErrorMsg('Every listed kind of unit needs an answer: a fee, or "No late fee".'); return }
     setSavingDecisions(true)
     setErrorMsg('')
     try {
@@ -1457,12 +1392,9 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
           : { unitType: m.unitType, graceDays: Math.trunc(Number(d.grace) || 0), initialAmount: Number(d.amount), initialType: d.kind })
       }
       setPendingDecisions([])
-      validateMut.mutate({
-        csv: csvText, source,
-        ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
-      })
+      validateMut.mutate()
     } catch (e: any) {
-      setErrorMsg(serverReason(e, 'Could not save the late-fee decisions.'))
+      setErrorMsg(serverReason(e, 'The late-fee answers could not be saved. Try again.'))
     } finally {
       setSavingDecisions(false)
     }
@@ -1471,40 +1403,36 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
   const handleReset = () => {
     setFileName('')
     setCsvText('')
-    setPunchListRows(null)
-    setValidateSummary(null)
-    setPendingDecisions([])
-    setErrorMsg('')
-    setFastPathBanner('')
-    setLimboBanner('')
-    setLimboErrors([])
+    clearResults()
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  const handleUnitCommitted = (unitId: string) => {
-    if (!punchListRows) return
-    setPunchListRows(prev => (prev || []).filter(r => r.resolvedUnitId !== unitId))
-  }
+  const busy = validateMut.isLoading || saveMut.isLoading || savingDecisions
 
   return (
     <div>
       <button onClick={onBack} className="btn btn-ghost" style={{ marginBottom: 16 }}>&larr; Back</button>
 
       <EntityPicker value={landlordId} onChange={chooseCompany}
-        disabled={validateMut.isLoading || savingDecisions || cardsBusy > 0}
-        note="Every tenant in this file is onboarded under this company." />
+        disabled={busy}
+        note="Everyone in this file goes on this company's draft roster." />
+
+      <div style={{ padding: 16, borderRadius: 10, background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.25)', marginBottom: 16, fontSize: '.82rem', color: 'var(--text-1)', lineHeight: 1.6 }}>
+        <strong style={{ color: 'var(--text-0)' }}>How this works.</strong> Your file becomes a <strong>draft roster</strong> of who
+        lives where. Nothing is sent to anyone and no accounts are made. You review each property&apos;s roster and confirm it;
+        GAM then drafts every household&apos;s lease from your own setup (the unit&apos;s rent and your default lease) and they
+        wait for your signature. Each household gets one email when you sign their lease.
+      </div>
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>1. Pick the Source Platform</h2>
+        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>1. Pick where the file came from</h2>
         <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
-          GAM recognizes the standard export column names from Buildium, AppFolio, DoorLoop,
-          Yardi, RentManager, Propertyware, Rentec Direct, and TenantCloud. Pick yours and we'll
-          auto-map the columns; the preview step lets you correct anything that didn't land cleanly
-          before anything is committed. Pick Generic if you're hand-filling the GAM template instead.
+          GAM reads the standard export columns from Buildium, AppFolio, DoorLoop, Yardi, RentManager, Propertyware,
+          Rentec Direct and TenantCloud. Pick Generic if you are filling in the GAM template yourself.
         </p>
         <select
           value={source}
-          onChange={(e) => setSource(e.target.value)}
+          onChange={(e) => { setSource(e.target.value); clearResults() }}
           style={{ width: '100%', maxWidth: 360, padding: '10px 12px', borderRadius: 8, background: 'var(--bg-0)', border: '1px solid var(--border-0)', color: 'var(--text-0)', fontSize: '.88rem' }}
         >
           {PLATFORM_OPTIONS.map(opt => (
@@ -1517,7 +1445,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
         {source === 'generic' && (
           <div style={{ marginTop: 16 }}>
             <label style={{ display: 'block', fontSize: '.78rem', color: 'var(--text-1)', marginBottom: 6, fontWeight: 600 }}>
-              What platform is this CSV from? <span style={{ color: 'var(--gold)' }}>*</span>
+              What platform is this file from? <span style={{ color: 'var(--gold)' }}>*</span>
             </label>
             <input
               type="text"
@@ -1526,12 +1454,9 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
               placeholder="e.g. Hemlane, SimplifyEm, Rentmoji..."
               style={{ width: '100%', maxWidth: 360, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-0)', border: '1px solid var(--border-0)', color: 'var(--text-0)', fontSize: '.86rem' }}
             />
-            <p style={{ fontSize: '.74rem', color: 'var(--text-2)', marginTop: 6, lineHeight: 1.5 }}>
-              We track which platforms our customers migrate from so we can build dedicated importers when enough demand shows up.
-            </p>
             {claimMatchesExisting && (
               <div style={{ marginTop: 8, padding: '10px 12px', borderRadius: 7, background: 'var(--bg-2)', borderLeft: '3px solid var(--gold)', fontSize: '.78rem', color: 'var(--text-1)' }}>
-                We have a dedicated <strong>{claimMatchesExisting.label}</strong> importer — switch to <em>{claimMatchesExisting.label}</em> in the dropdown above for better column mapping.
+                GAM reads <strong>{claimMatchesExisting.label}</strong> files directly — pick <em>{claimMatchesExisting.label}</em> above for better column matching.
               </div>
             )}
           </div>
@@ -1542,30 +1467,18 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
         <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>
           2. {source === 'generic' ? 'Get the template' : 'Export from your platform'}
         </h2>
-        {source === 'generic' ? (
-          <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
-            Download the GAM template, fill in your tenants and lease info, then upload it below. One row per tenant. Co-tenants on the same lease share the same property and unit number.
-          </p>
-        ) : (
-          <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
-            {source === 'buildium' && 'Export from Buildium: Reports > Tenant List > Export to CSV. We map the tenant + active-lease columns automatically.'}
-            {source === 'appfolio' && 'Export from AppFolio: Reports > Tenant Directory > Export to CSV. If your export uses a combined "Tenant" column instead of First/Last, split it in your spreadsheet before uploading.'}
-            {source === 'doorloop' && 'Export from DoorLoop: Tenants > Export to CSV. We map the tenant + primary-lease columns automatically.'}
-            {source === 'yardi' && 'Export from Yardi (Voyager or Breeze): Resident Roster or Rent Roll. If your export uses a combined "Resident Name" column, split it into First/Last before uploading.'}
-            {source === 'rentmanager' && 'Export from RentManager: Reports > Tenant List > CSV.'}
-            {source === 'propertyware' && 'Export from Propertyware: Reports > Tenant Roster > CSV.'}
-            {source === 'rentec' && 'Export from Rentec Direct: Tenants > Export. If your export combines name into "Tenant Name", split it before uploading.'}
-            {source === 'tenantcloud' && 'Export from TenantCloud: Tenants > Export to CSV.'}
-            {' '}Upload the CSV below — GAM recognizes the platform's standard column names. The download button gives you the column reference if you need it.
-          </p>
-        )}
+        <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
+          One row per person. People in the same home share the same property and unit. Only the name, email, property
+          and unit are needed; a phone number and an old balance are welcome. Rent, dates, deposit and late fee are
+          optional — they are shown beside each person for reference, and the lease drafts from your own setup.
+        </p>
         <button onClick={handleDownloadTemplate} className="btn btn-ghost" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
           <Download size={14} /> {source === 'generic' ? 'Download template' : 'Download column reference'}
         </button>
       </div>
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>3. Upload Your Filled-In CSV</h2>
+        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>3. Upload the file</h2>
         <input
           ref={fileInputRef}
           type="file"
@@ -1582,14 +1495,12 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-0)', border: '1px solid var(--border-0)' }}>
               <FileText size={14} color="var(--text-2)" /> <span style={{ fontSize: '.85rem', color: 'var(--text-0)' }}>{fileName}</span>
             </div>
-            <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }}>Replace File</button>
-            <button onClick={handleValidate} className="btn btn-primary" disabled={validateMut.isLoading || companyMissing} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+            <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }} disabled={busy}>Use a different file</button>
+            <button onClick={handleValidate} className="btn btn-primary" disabled={busy || companyMissing} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               {validateMut.isLoading ? <span className="spinner" /> : null}
-              {validateMut.isLoading ? 'Validating…' : 'Validate'}
+              {validateMut.isLoading ? 'Checking…' : 'Check the file'}
             </button>
-            {companyMissing && (
-              <span style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>{CHOOSE_COMPANY_FIRST}</span>
-            )}
+            {companyMissing && <span style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>{CHOOSE_COMPANY_FIRST}</span>}
           </div>
         )}
       </div>
@@ -1601,70 +1512,23 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
         </div>
       )}
 
-      {fastPathBanner && (
-        <div style={{ padding: 16, borderRadius: 10, background: 'rgba(34,197,94,.08)', border: '1px solid rgba(34,197,94,.3)', color: '#22c55e', display: 'flex', gap: 10, alignItems: 'flex-start', marginBottom: 16 }}>
-          <CheckCircle2 size={16} style={{ flexShrink: 0, marginTop: 2 }} />
-          <div style={{ fontSize: '.85rem' }}>{fastPathBanner}</div>
-        </div>
-      )}
-
       {reviewBanner && (
-        <div style={{
-          padding: 14, marginBottom: 16, background: 'var(--bg-2)',
-          borderLeft: '3px solid var(--gold)', borderRadius: 6,
-          fontSize: '.9rem', color: 'var(--text-0)',
-        }}>
-          <strong>We're reviewing your {reviewBanner.platform} migration for accuracy.</strong>
+        <div style={{ padding: 14, marginBottom: 16, background: 'var(--bg-2)', borderLeft: '3px solid var(--gold)', borderRadius: 6, fontSize: '.9rem', color: 'var(--text-0)' }}>
+          <strong>We&apos;re checking how your {reviewBanner.platform} file was read.</strong>
           <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 4, lineHeight: 1.5 }}>
-            Our team checks the column mapping on every new {reviewBanner.platform} import to make sure your data landed cleanly. If anything looks off we'll reach out. No action needed from you.
+            Our team looks over the column matching on every new {reviewBanner.platform} import. If anything looks off we&apos;ll reach out. Nothing for you to do.
           </div>
         </div>
       )}
 
-      {limboBanner && (
-        <div style={{ padding: 16, borderRadius: 10, background: 'rgba(245,158,11,.08)', border: '1px solid rgba(245,158,11,.3)', color: '#f59e0b', marginBottom: 16 }}>
-          <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
-            <Inbox size={16} style={{ flexShrink: 0, marginTop: 2 }} />
-            <div style={{ fontSize: '.85rem', flex: 1, color: 'var(--text-1)' }}>
-              {limboBanner}{' '}
-              <span
-                onClick={() => window.location.assign('/tenant-onboarding/pending')}
-                style={{ color: '#f59e0b', textDecoration: 'underline', cursor: 'pointer' }}
-              >
-                Open pending pool
-              </span>
-            </div>
-          </div>
-          {limboErrors.length > 0 && (
-            <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid rgba(245,158,11,.2)' }}>
-              <div style={{ fontSize: '.78rem', fontWeight: 600, color: 'var(--text-1)', marginBottom: 6 }}>
-                {limboErrors.length} {limboErrors.length === 1 ? 'row' : 'rows'} could not be routed:
-              </div>
-              <ul style={{ margin: 0, paddingLeft: 18, fontSize: '.8rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
-                {limboErrors.map((er, i) => (
-                  <li key={i}>
-                    Row {er.rowIndex + 1} ({er.email}): {er.message}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* S537: late-fee decision interception — import is paused until
-          every unit class in the file has a decision. Prefill = the most
-          frequent (fee, grace) among the file's own leases. */}
       {pendingDecisions.length > 0 && (
         <div style={{ padding: 20, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--gold)', marginBottom: 16 }}>
           <div style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>
-            Late-fee decisions needed before import
+            One question first: late fees
           </div>
           <div style={{ fontSize: '.8rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
-            These unit types have no late-fee decision yet. Where your file&apos;s leases share a
-            consistent late fee, it&apos;s prefilled below as the suggested policy — confirm or change
-            it. Imported leases keep the exact terms on their paper; this decision caps what can be
-            billed and applies to every future lease of the class.
+            These kinds of unit have no late-fee answer yet, and a lease can&apos;t be drafted without one. Where your
+            file&apos;s leases share a late fee, it is filled in below as a suggestion — keep it or change it.
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {pendingDecisions.map(m => {
@@ -1683,7 +1547,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
                   </span>
                   <select className="input" value={d.noLateFee ? 'none' : 'fee'}
                     onChange={e => setD({ noLateFee: e.target.value === 'none' })}
-                    style={{ width: 120, fontSize: '.8rem', padding: '4px 6px' }}>
+                    style={{ width: 130, fontSize: '.8rem', padding: '4px 6px' }}>
                     <option value="fee">Charge a fee</option>
                     <option value="none">No late fee</option>
                   </select>
@@ -1693,7 +1557,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
                       <input className="input" value={d.amount} inputMode="decimal"
                         onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setD({ amount: v }) }}
                         style={{ width: 70, fontSize: '.8rem', padding: '4px 6px' }} />
-                      <span style={{ color: 'var(--text-3)' }}>grace</span>
+                      <span style={{ color: 'var(--text-3)' }}>after</span>
                       <input className="input" value={d.grace} inputMode="numeric"
                         onChange={e => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) setD({ grace: v }) }}
                         style={{ width: 50, fontSize: '.8rem', padding: '4px 6px' }} />
@@ -1706,42 +1570,102 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
           </div>
           <button className="btn btn-primary" style={{ marginTop: 14 }} disabled={savingDecisions || companyMissing}
             onClick={handleSaveDecisions}>
-            {savingDecisions ? 'Saving…' : 'Save decisions & continue import'}
+            {savingDecisions ? 'Saving…' : 'Save answers and check the file again'}
           </button>
-          {companyMissing && (
-            <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginTop: 6 }}>{CHOOSE_COMPANY_FIRST}</div>
-          )}
         </div>
       )}
 
-      {validateSummary && <ValidateSummary summary={validateSummary} hasPunchList={!!(punchListRows && punchListRows.length > 0)} />}
-
-      {punchListRows && punchListRows.length > 0 && (
-        <PunchList rows={punchListRows} source={source} claimedPlatformName={claimedPlatformName} landlordId={landlordId} companyMissing={companyMissing} onUnitCommitted={handleUnitCommitted} onBusy={cardBusy} />
+      {review && (
+        <RosterFileReview review={review} saving={saveMut.isLoading} disabled={companyMissing}
+          onSave={() => saveMut.mutate()} />
       )}
 
-      {punchListRows && punchListRows.length === 0 && validateSummary && validateSummary.total > 0 && !fastPathBanner && (
-        <div style={{ padding: 16, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', color: 'var(--text-2)', fontSize: '.88rem' }}>
-          All units are onboarded. Nothing else to review.
-        </div>
-      )}
+      {saved && <RosterSaved saved={saved} onOpenRoster={onOpenRoster} />}
     </div>
   )
 }
 
-function ValidateSummary({ summary, hasPunchList }: { summary: { total: number; blockers: number; warnings: number; ready: number }; hasPunchList: boolean }) {
+/** What checking the file found: what will be saved, what can't be, and every note. */
+function RosterFileReview({ review, saving, disabled, onSave }: {
+  review: ValidateResponse; saving: boolean; disabled: boolean; onSave: () => void
+}) {
+  const rowName = (r: RosterCsvRow) => `${r.firstName} ${r.lastName}`.trim() || r.email || `Row ${r.rowIndex + 1}`
+  const blocked = review.rows.filter(r => r.issues.some(i => i.severity === 'block'))
+  const notes = review.rows.filter(r => !r.issues.some(i => i.severity === 'block') && r.issues.length > 0)
+  const ready = review.summary.ready
   return (
     <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-      <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 16 }}>Validation Results</h2>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
-        <SummaryStat label="Total rows"     value={summary.total}    color="var(--text-0)" />
-        <SummaryStat label="Ready"          value={summary.ready}    color="#22c55e" icon={<CheckCircle2 size={14} />} />
-        <SummaryStat label="Warnings"       value={summary.warnings} color="#eab308" icon={<AlertTriangle size={14} />} />
-        <SummaryStat label="Need attention" value={summary.blockers} color="#dc5050" icon={<AlertCircle size={14} />} />
+      <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 16 }}>What the file says</h2>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 12, marginBottom: 16 }}>
+        <SummaryStat label="People in the file" value={review.summary.total} color="var(--text-0)" />
+        <SummaryStat label="Ready to save" value={ready} color="#22c55e" icon={<CheckCircle2 size={14} />} />
+        <SummaryStat label="With a note" value={notes.length} color="#eab308" icon={<AlertTriangle size={14} />} />
+        <SummaryStat label="Can't be saved" value={blocked.length} color="#dc5050" icon={<AlertCircle size={14} />} />
       </div>
-      {hasPunchList && (
-        <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--border-0)', fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
-          Units with at least one blocker are listed below. Fix the issue or promote a clean co-tenant to primary, then submit each unit.
+
+      {blocked.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--red,#dc5050)', marginBottom: 6 }}>
+            These can&apos;t be saved. Fix them in your file and check it again — everyone else can be saved now.
+          </div>
+          {blocked.map(r => (
+            <div key={r.rowIndex} style={{ fontSize: '.8rem', color: 'var(--text-1)', padding: '4px 0', borderTop: '1px solid var(--border-0)' }}>
+              <strong>Row {r.rowIndex + 1}</strong> — {rowName(r)}: {r.issues.filter(i => i.severity === 'block').map(i => i.message).join(' ')}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {notes.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 6 }}>Notes</div>
+          {notes.map(r => (
+            <div key={r.rowIndex} style={{ fontSize: '.8rem', color: 'var(--text-2)', padding: '4px 0', borderTop: '1px solid var(--border-0)' }}>
+              <strong style={{ color: 'var(--text-1)' }}>Row {r.rowIndex + 1}</strong> — {rowName(r)}: {r.issues.map(i => i.message).join(' ')}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <button className="btn btn-primary" style={{ width: '100%' }} disabled={saving || disabled || ready === 0} onClick={onSave}>
+        {saving ? 'Saving…' : ready === 0 ? 'Nobody in this file can be saved yet'
+          : `Save ${ready} ${ready === 1 ? 'person' : 'people'} as a draft roster`}
+      </button>
+      <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 6, textAlign: 'center' }}>
+        Nothing is sent to anyone. You review each property&apos;s roster next.
+      </div>
+    </div>
+  )
+}
+
+function RosterSaved({ saved, onOpenRoster }: { saved: DraftResponse; onOpenRoster: (propertyId: string) => void }) {
+  const total = saved.saved + saved.updated
+  return (
+    <div style={{ padding: 20, borderRadius: 10, background: 'rgba(34,197,94,.06)', border: '1px solid rgba(34,197,94,.3)', marginBottom: 16 }}>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', marginBottom: 12 }}>
+        <CheckCircle2 size={18} style={{ color: '#22c55e', flexShrink: 0, marginTop: 2 }} />
+        <div style={{ fontSize: '.9rem', color: 'var(--text-0)', lineHeight: 1.5 }}>
+          <strong>{total} {total === 1 ? 'person is' : 'people are'} on the draft roster.</strong>
+          {saved.updated > 0 && <> ({saved.updated} already there {saved.updated === 1 ? 'was' : 'were'} updated from this file.)</>}
+          {' '}Nobody has been emailed. Review each property next and confirm it to draft the leases.
+          {' '}Payment history from your old system can be imported once their leases are signed — it is matched to their GAM lease.
+        </div>
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+        {saved.properties.map(p => (
+          <button key={p.propertyId} className="btn btn-primary" onClick={() => onOpenRoster(p.propertyId)}>
+            Review {p.propertyName} ({p.count})
+          </button>
+        ))}
+      </div>
+      {saved.notSaved.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: '.8rem', fontWeight: 700, color: 'var(--text-1)', marginBottom: 4 }}>Not saved</div>
+          {saved.notSaved.map(n => (
+            <div key={n.rowIndex} style={{ fontSize: '.78rem', color: 'var(--text-2)', padding: '3px 0' }}>
+              Row {n.rowIndex + 1} — {n.name || n.email}: {n.reasons.join(' ') || 'Left out.'}
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -1750,323 +1674,340 @@ function ValidateSummary({ summary, hasPunchList }: { summary: { total: number; 
 
 function SummaryStat({ label, value, color, icon }: { label: string; value: number; color: string; icon?: React.ReactNode }) {
   return (
-    <div style={{ padding: 14, borderRadius: 8, background: 'var(--bg-0)', border: '1px solid var(--border-0)' }}>
-      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 4 }}>{label}</div>
-      <div style={{ fontSize: '1.4rem', fontWeight: 700, color, display: 'flex', alignItems: 'center', gap: 6 }}>
-        {icon}{value}
+    <div style={{ padding: 12, borderRadius: 8, background: 'var(--bg-0)', border: '1px solid var(--border-0)' }}>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-2)', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+        {icon && <span style={{ color }}>{icon}</span>}
+        {label}
       </div>
+      <div style={{ fontSize: '1.4rem', fontWeight: 700, color }}>{value}</div>
     </div>
   )
 }
 
-// ── Punch list — per-unit cards ─────────────────────────────────────────
-
-// S633: landlordId is threaded down rather than re-resolved here — the company
-// was chosen once, at the top of the import, and every row in the file belongs
-// to it. Re-deriving per card would let one file straddle two companies.
-function PunchList({ rows, source, claimedPlatformName, landlordId, companyMissing, onUnitCommitted, onBusy }: { rows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; companyMissing: boolean; onUnitCommitted: (unitId: string) => void; onBusy: (on: boolean) => void }) {
-  // Group by resolvedUnitId. Rows without a resolved unit get a synthetic key per row
-  // (so each unmatched row appears as its own card with a clear "add property first" message).
-  const groups = useMemo(() => {
-    const map = new Map<string, CsvRow[]>()
-    for (const r of rows) {
-      const key = r.resolvedUnitId || `__unresolved_${r.rowIndex}`
-      if (!map.has(key)) map.set(key, [])
-      map.get(key)!.push(r)
-    }
-    return Array.from(map.entries())
-  }, [rows])
-
+/** An input that saves when you leave it, and takes fresh values from the server while you're not in it. */
+function BlurInput({ value, onCommit, placeholder, type = 'text', width }: {
+  value: string; onCommit: (v: string) => void; placeholder?: string; type?: string; width?: number | string
+}) {
+  const [v, setV] = useState(value)
+  const focused = useRef(false)
+  useEffect(() => { if (!focused.current) setV(value) }, [value])
   return (
-    <div>
-      <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 24, marginBottom: 12 }}>
-        Units that need attention ({groups.length})
-      </h2>
-      <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 0, marginBottom: 16, lineHeight: 1.5 }}>
-        Each card is one unit. Fix the highlighted fields, then submit. You can submit cards one at a time so a single bad row does not hold up the rest.
-      </p>
-      {groups.map(([key, groupRows]) => (
-        <UnitCard
-          key={key}
-          initialRows={groupRows}
-          source={source}
-          claimedPlatformName={claimedPlatformName}
-          landlordId={landlordId}
-          companyMissing={companyMissing}
-          onCommitted={() => { if (groupRows[0].resolvedUnitId) onUnitCommitted(groupRows[0].resolvedUnitId) }}
-          onBusy={onBusy}
-        />
-      ))}
-    </div>
+    <input className="input" type={type} placeholder={placeholder} value={v}
+      style={{ width: width ?? '100%', fontSize: '.8rem', padding: '6px 8px' }}
+      onFocus={() => { focused.current = true }}
+      onChange={e => setV(e.target.value)}
+      onBlur={() => { focused.current = false; if (v.trim() !== (value ?? '').trim()) onCommit(v.trim()) }}
+      onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }} />
   )
 }
 
-function UnitCard({ initialRows, source, claimedPlatformName, landlordId, companyMissing, onCommitted, onBusy }: { initialRows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; companyMissing: boolean; onCommitted: () => void; onBusy: (on: boolean) => void }) {
-  const [groupRows, setGroupRows] = useState<CsvRow[]>(initialRows)
-  const [submitErr, setSubmitErr] = useState<string>('')
-  const [submitting, setSubmitting] = useState<boolean>(false)
-  const [committed, setCommitted] = useState<boolean>(false)
-  const [routedTo, setRoutedTo] = useState<'commit' | 'limbo' | null>(null)
+const usd = (n: number | null | undefined) => n == null ? '' : `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`
 
-  const primary = groupRows[0]
-  const hasResolvedUnit = !!primary.resolvedUnitId
+/**
+ * S655: one property's draft roster. Read fresh from the server every time and
+ * after every change — never a stale copy. Each unit's problems are named with
+ * the next step; one gold button confirms the property, and it says why when
+ * it can't yet.
+ */
+function RosterReviewMode({ onBack, initialPropertyId = '' }: { onBack: () => void; initialPropertyId?: string }) {
+  const qc = useQueryClient()
+  const { data: summary } = useQuery<any>('tenant-roster-summary', () => apiGet('/landlords/me/tenant-roster'),
+    { staleTime: 0, refetchOnWindowFocus: true })
+  const properties: Array<{ propertyId: string; propertyName: string; count: number }> = summary?.properties ?? []
+  const [propertyId, setPropertyId] = useState(initialPropertyId)
+  useEffect(() => {
+    if (!propertyId && properties.length > 0) setPropertyId(properties[0].propertyId)
+  }, [properties.length])
+  const rosterKey = ['tenant-roster', propertyId]
+  const { data: roster, isLoading } = useQuery<any>(rosterKey,
+    () => apiGet(`/landlords/me/tenant-roster?propertyId=${propertyId}`),
+    { enabled: !!propertyId, staleTime: 0, refetchOnWindowFocus: true })
+  const { data: allUnits = [] } = useQuery<any[]>('units', () => apiGet('/units'))
+  const [error, setError] = useState('')
+  const [problems, setProblems] = useState<string[]>([])
+  const [result, setResult] = useState<any>(null)
 
-  // Tenant-row field edit. Clears that field's issues locally; backend re-validates on commit.
-  // Email edits also strip resolvedExistingUserId/TenantId because the resolution becomes stale.
-  const updateRowField = (rowIdx: number, field: keyof CsvRow, value: string) => {
-    const issueKey = FIELD_TO_ISSUE_KEY[field as string]
-    setGroupRows(prev => prev.map((r, i) => {
-      if (i !== rowIdx) return r
-      const issues = issueKey ? r.issues.filter(iss => iss.field !== issueKey) : r.issues
-      const next: CsvRow = { ...r, [field]: value, issues } as CsvRow
-      if (field === 'email' && value !== r.email) {
-        delete next.resolvedExistingUserId
-        delete next.resolvedExistingTenantId
-      }
-      return next
-    }))
+  const refresh = () => {
+    qc.invalidateQueries(rosterKey)
+    qc.invalidateQueries('tenant-roster-summary')
+    qc.invalidateQueries('onboarding-windows')
   }
-
-  // Lease-level edits propagate to ALL rows in the unit. Backend uses primary group row
-  // for lease values; consistency across rows keeps the data model honest.
-  const updateLeaseField = (field: keyof CsvRow, value: string) => {
-    const issueKey = FIELD_TO_ISSUE_KEY[field as string]
-    setGroupRows(prev => prev.map(r => {
-      const issues = issueKey ? r.issues.filter(iss => iss.field !== issueKey) : r.issues
-      return { ...r, [field]: value, issues } as CsvRow
-    }))
-  }
-
-  const promoteToPrimary = (rowIdx: number) => {
-    if (rowIdx === 0) return
-    setGroupRows(prev => {
-      const next = [...prev]
-      const [picked] = next.splice(rowIdx, 1)
-      next.unshift(picked)
-      return next
-    })
-  }
-
-  const removeRow = (rowIdx: number) => {
-    setGroupRows(prev => prev.length === 1 ? prev : prev.filter((_, i) => i !== rowIdx))
-  }
-
-  const handleSubmit = async () => {
-    if (companyMissing) { setSubmitErr(CHOOSE_COMPANY_FIRST); return }
-    setSubmitErr('')
-    setSubmitting(true)
-    onBusy(true)
-    let landed = false
+  const patch = async (id: string, body: any) => {
     try {
-      // S177: re-classify groupRows at submit time. Pre-S177 the punch-list
-      // resubmit always hit /commit, which rejects on any remaining lease
-      // blocker — so a row with an identity blocker fix that still has a
-      // lease blocker would error out and the landlord had to hand-route it
-      // to the limbo flow. Mirror the initial-CSV split-dispatch logic
-      // here so partially-fixed rows route automatically.
-      const rowsWithIdentityBlocker = groupRows.filter(r =>
-        r.issues.some(i => i.severity === 'block' && i.field && IDENTITY_FIELDS.has(i.field))
-      )
-      if (rowsWithIdentityBlocker.length > 0) {
-        const names = rowsWithIdentityBlocker
-          .map(r => `${r.firstName || ''} ${r.lastName || ''}`.trim() || r.email || `row ${r.rowIndex}`)
-          .join(', ')
-        setSubmitErr(`These tenants still need fixes: ${names}. Resolve the highlighted identity fields, then submit.`)
-        setSubmitting(false)
-        return
-      }
-      const groupHasLeaseBlocker = groupRows.some(r =>
-        r.issues.some(i => i.severity === 'block' && (!i.field || !IDENTITY_FIELDS.has(i.field)))
-      )
-      if (groupHasLeaseBlocker) {
-        // All identity clean, but lease info is still incomplete — dispatch
-        // the whole group to limbo. Each row becomes a user + tenant +
-        // pending_tenant_intent on the backend; lease will be built later
-        // from a parsed PDF or manual entry.
-        await apiPost('/landlords/me/onboard-tenants-csv/commit-pending', { rows: groupRows, landlordId })
-        setRoutedTo('limbo')
-      } else {
-        await apiPost<CommitResponse>('/landlords/me/onboard-tenants-csv/commit', {
-          landlordId,
-          rows: groupRows, source,
-          ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
-        })
-        setRoutedTo('commit')
-      }
-      setCommitted(true)
-      landed = true
-      // Brief pause so the green confirmation flashes before the parent unmounts the card.
-      setTimeout(() => { onCommitted(); onBusy(false) }, 600)
+      await apiPatch(`/landlords/me/tenant-roster/${id}`, body)
+      setError('')
     } catch (e: any) {
-      setSubmitErr(serverReason(e, 'Submission failed. Check the highlighted fields.'))
-    } finally {
-      setSubmitting(false)
-      if (!landed) onBusy(false)
-    }
+      setError(serverReason(e, 'That change did not save. Try it again.'))
+    } finally { refresh() }
   }
+  const remove = async (id: string, name: string) => {
+    if (!(await appConfirm(`Take ${name} off this roster? Nothing has been sent to them, and you can upload them again later.`,
+      { title: 'Remove from the roster', confirmLabel: 'Remove' }))) return
+    try {
+      await apiDelete(`/landlords/me/tenant-roster/${id}`)
+      setError('')
+    } catch (e: any) {
+      setError(serverReason(e, 'They could not be removed. Try again.'))
+    } finally { refresh() }
+  }
+  const confirmMut = useMutation(
+    () => apiPost<any>('/landlords/me/tenant-roster/confirm', { propertyId }),
+    {
+      onSuccess: (res: any) => {
+        setResult(res.data); setProblems([]); setError('')
+        refresh()
+        qc.invalidateQueries('units'); qc.invalidateQueries('pending-tenants'); qc.invalidateQueries('pending-tenants-count')
+      },
+      onError: (e: any) => {
+        const p = e?.response?.data?.problems
+        if (Array.isArray(p) && p.length) { setProblems(p); setError('') }
+        else { setProblems([]); setError(serverReason(e, 'The roster could not be confirmed. Try again.')) }
+        refresh()
+      },
+    },
+  )
 
-  if (committed) {
-    return (
-      <div style={{ padding: 16, borderRadius: 10, background: 'rgba(34,197,94,.08)', border: '1px solid rgba(34,197,94,.3)', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 10 }}>
-        <CheckCircle2 size={16} color="#22c55e" />
-        <div style={{ fontSize: '.88rem', color: '#22c55e' }}>
-          {routedTo === 'limbo'
-            ? `Routed to pending pool — ${primary.propertyName} Unit ${primary.unitNumber}. Upload the lease PDF on the Pending Tenants page to finish onboarding.`
-            : `Onboarded ${primary.propertyName} — Unit ${primary.unitNumber}.`}
-        </div>
-      </div>
-    )
-  }
+  const units: any[] = roster?.units ?? []
+  const notPlaced: any[] = roster?.notPlaced ?? []
+  const inProperty = (allUnits as any[]).filter(u => u.propertyId === propertyId)
+  const rosterUnitIds = new Set(units.map(u => u.unitId))
+  const placeable = inProperty.filter(u => rosterUnitIds.has(u.id) || canInviteToUnit(u))
+    .sort((a, b) => String(a.unitNumber).localeCompare(String(b.unitNumber), undefined, { numeric: true }))
+  const anyBlocker = units.some(u => (u.blockers ?? []).length > 0)
+  const confirmBlocked = notPlaced.length > 0
+    ? `Place ${notPlaced.length === 1 ? 'the 1 person' : `all ${notPlaced.length} people`} below "Not placed yet" in a unit, or remove them.`
+    : anyBlocker ? 'Fix what is listed in red on the units above.'
+    : units.length === 0 ? 'There is nobody on this roster.' : null
 
   return (
-    <div style={{ padding: 20, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-      <div style={{ marginBottom: 16 }}>
-        <div style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--text-0)' }}>
-          {primary.propertyName || '(unmatched property)'} — Unit {primary.unitNumber || '(unmatched)'}
+    <div style={{ maxWidth: 820, paddingBottom: 110 }}>
+      <button onClick={onBack} className="btn btn-ghost" style={{ marginBottom: 16 }}>&larr; Back</button>
+      <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-0)', margin: 0, marginBottom: 6 }}>Draft roster</h2>
+      <p style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 0 }}>
+        Check who lives where, then confirm. Confirming drafts each household&apos;s lease from your setup, and they wait for
+        your signature in Front Desk. Nobody hears from GAM until you sign their lease. Changes save as you go.
+      </p>
+
+      {properties.length > 1 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
+          <label className="form-label" style={{ margin: 0, fontSize: '.72rem' }}>Property</label>
+          <select className="input" style={{ width: 'auto', minWidth: 260 }} value={propertyId}
+            onChange={e => { setPropertyId(e.target.value); setResult(null); setProblems([]); setError('') }}>
+            {properties.map(p => <option key={p.propertyId} value={p.propertyId}>{p.propertyName} ({p.count})</option>)}
+          </select>
         </div>
-        {!hasResolvedUnit && (
-          <div style={{ fontSize: '.82rem', color: '#dc5050', marginTop: 4 }}>
-            This property/unit pair was not found in your portfolio. Add the property and unit first, then re-upload the CSV.
+      )}
+
+      {result && (
+        <div style={{ padding: 16, borderRadius: 10, background: 'rgba(34,197,94,.06)', border: '1px solid rgba(34,197,94,.3)', marginBottom: 16 }}>
+          <div style={{ fontSize: '.92rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 6 }}>
+            {result.drafted} lease{result.drafted === 1 ? ' is' : 's are'} waiting for your signature.
           </div>
+          <div style={{ fontSize: '.8rem', color: 'var(--text-2)', marginBottom: 10 }}>
+            Sign them in Front Desk → Waiting on you to sign. Each household gets one email when you sign theirs.
+          </div>
+          {(result.units ?? []).filter((u: any) => u.status !== 'drafted').map((u: any) => (
+            <div key={u.unitId} style={{ fontSize: '.8rem', color: u.status === 'error' ? 'var(--red,#dc5050)' : 'var(--amber,#d97706)', padding: '3px 0' }}>
+              Unit {u.unitNumber} ({u.people.join(', ')}): {u.message}
+            </div>
+          ))}
+          {(result.units ?? []).filter((u: any) => Array.isArray(u.ownSignature) && u.ownSignature.length > 0).map((u: any) => (
+            <div key={`${u.unitId}-own`} style={{ fontSize: '.8rem', color: 'var(--text-1)', padding: '3px 0' }}>
+              Unit {u.unitNumber}: {u.ownSignature.join(', ')} already {u.ownSignature.length === 1 ? 'has' : 'have'} a GAM
+              account, so {u.ownSignature.length === 1 ? 'their lease starts when they sign it themselves' : 'a lease with them on it starts only once they have signed it themselves'}.
+              Sign as usual; nothing on that lease is billed until then.
+            </div>
+          ))}
+          <Link to="/front-desk" className="btn btn-primary" style={{ marginTop: 10, display: 'inline-flex' }}>Go to Front Desk</Link>
+        </div>
+      )}
+
+      {!propertyId ? (
+        <div className="card" style={{ padding: 24, textAlign: 'center', color: 'var(--text-2)', fontSize: '.85rem' }}>
+          No draft roster yet. Upload a tenant file from Bulk CSV Import to start one.
+        </div>
+      ) : isLoading ? (
+        <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>Loading the roster…</div>
+      ) : (
+        <>
+          {roster?.window && (
+            <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 12, lineHeight: 1.5 }}>
+              {roster.window.open
+                ? <>Onboarding window: <strong style={{ color: 'var(--gold)' }}>{roster.window.daysRemaining} day{roster.window.daysRemaining === 1 ? '' : 's'}</strong> left. Existing residents confirmed before it closes skip the background check.</>
+                : <>The onboarding window for this property is closed, so everyone confirmed here completes a background check.</>}
+            </div>
+          )}
+
+          {error && (
+            <div style={{ padding: 12, borderRadius: 8, background: 'rgba(220,80,80,.08)', border: '1px solid rgba(220,80,80,.3)', color: 'var(--red,#dc5050)', fontSize: '.82rem', marginBottom: 12 }}>
+              {error}
+            </div>
+          )}
+          {problems.length > 0 && (
+            <div style={{ padding: 12, borderRadius: 8, background: 'rgba(220,80,80,.08)', border: '1px solid rgba(220,80,80,.3)', marginBottom: 12 }}>
+              <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--red,#dc5050)', marginBottom: 6 }}>Fix these, then press Confirm again:</div>
+              {problems.map((p, i) => <div key={i} style={{ fontSize: '.8rem', color: 'var(--text-1)', padding: '2px 0' }}>• {p}</div>)}
+            </div>
+          )}
+
+          {notPlaced.length > 0 && (
+            <div className="card" style={{ padding: 14, marginBottom: 14, border: '1px solid var(--gold)' }}>
+              <div style={{ fontSize: '.85rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Not placed yet ({notPlaced.length})</div>
+              <div style={{ fontSize: '.76rem', color: 'var(--text-2)', marginBottom: 10 }}>Pick the unit each person lives in.</div>
+              {notPlaced.map(p => (
+                <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', padding: '6px 0', borderTop: '1px solid var(--border-0)' }}>
+                  <div style={{ flex: '1 1 220px', fontSize: '.82rem', color: 'var(--text-1)' }}>
+                    <strong>{p.firstName} {p.lastName}</strong> <span style={{ color: 'var(--text-3)' }}>{p.email}</span>
+                    {p.file?.unitNumber && <span style={{ display: 'block', fontSize: '.72rem', color: 'var(--text-3)' }}>Your file said: {p.file.propertyName} {p.file.unitNumber}</span>}
+                  </div>
+                  <select className="input" value="" style={{ width: 'auto', minWidth: 170, fontSize: '.8rem' }}
+                    onChange={e => { if (e.target.value) patch(p.id, { unitId: e.target.value }) }}>
+                    <option value="">Pick their unit…</option>
+                    {placeable.map(u => <option key={u.id} value={u.id}>Unit {u.unitNumber}</option>)}
+                  </select>
+                  <button className="btn btn-danger btn-sm" onClick={() => remove(p.id, `${p.firstName} ${p.lastName}`.trim())}>Remove</button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {units.map(u => (
+            <RosterUnitCard key={u.unitId} unit={u} windowOpen={!!roster?.window?.open} placeable={placeable}
+              onPatch={patch} onRemove={remove} />
+          ))}
+
+          <div style={{ position: 'sticky', bottom: 0, background: 'var(--bg-1)', borderTop: '1px solid var(--border-0)', padding: '12px 0', marginTop: 8 }}>
+            <button type="button" className="btn btn-primary" style={{ width: '100%' }}
+              disabled={!!confirmBlocked || confirmMut.isLoading}
+              onClick={() => confirmMut.mutate()}>
+              {confirmMut.isLoading ? 'Drafting the leases…'
+                : `Confirm roster and draft ${units.length} lease${units.length === 1 ? '' : 's'}`}
+            </button>
+            {confirmBlocked && !confirmMut.isLoading && (
+              <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 6, textAlign: 'center' }}>{confirmBlocked}</div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+/** One unit's household on the roster: who, what the file said, and the household's settings. */
+function RosterUnitCard({ unit, windowOpen, placeable, onPatch, onRemove }: {
+  unit: any; windowOpen: boolean; placeable: any[]
+  onPatch: (id: string, body: any) => Promise<void>; onRemove: (id: string, name: string) => Promise<void>
+}) {
+  const people: any[] = unit.people ?? []
+  const first = people[0]
+  const all = (body: any) => Promise.all(people.map(p => onPatch(p.id, body)))
+  const blockers: string[] = unit.blockers ?? []
+  const existing = people.every(p => p.existingResident !== false)
+  const dueDay = people.find(p => p.rentDueDay != null)?.rentDueDay
+  const sale = people.some(p => p.homeSale)
+  const [ticked, setTicked] = useState<Record<string, boolean> | null>(null)
+  // A whole unit's household has one old balance; in a by-room unit each
+  // person is their own lease, so each keeps their own (on their row below).
+  const byRoom = unit.occupancyMode === 'by_room'
+  const balanceHolder = people.find(p => p.openingBalance != null) ?? first
+  const fileRent = first?.file?.monthlyRent ? Number(String(first.file.monthlyRent).replace(/[$,\s]/g, '')) : null
+  const rentDiffers = fileRent != null && Number.isFinite(fileRent) && unit.rent != null && Math.abs(fileRent - unit.rent) >= 0.005
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 10, border: blockers.length ? '1px solid rgba(220,80,80,.45)' : undefined }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
+        <div style={{ fontSize: '.9rem', fontWeight: 700, color: 'var(--text-0)' }}>
+          Unit {unit.unitNumber}
+          {unit.occupancyMode === 'by_room' && <span style={{ fontSize: '.72rem', color: 'var(--text-3)', fontWeight: 400 }}> · by the room</span>}
+        </div>
+        <div style={{ fontSize: '.8rem', color: 'var(--text-2)' }}>
+          {unit.rent != null && unit.rent > 0 ? <>Lease drafts at <strong style={{ color: 'var(--gold)' }}>{usd(unit.rent)}/mo</strong></> : 'No rent set'}
+        </div>
+      </div>
+
+      {blockers.length > 0 && (
+        <div style={{ background: 'rgba(220,80,80,.07)', borderRadius: 6, padding: '8px 10px', marginBottom: 10 }}>
+          {blockers.map((b, i) => <div key={i} style={{ fontSize: '.78rem', color: 'var(--red,#dc5050)', padding: '1px 0' }}>{b}</div>)}
+        </div>
+      )}
+
+      {first?.file && (first.file.monthlyRent || first.file.leaseStart || first.file.securityDeposit) && (
+        <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
+          From your file, for reference: {[
+            first.file.monthlyRent && <span key="r" style={rentDiffers ? { color: 'var(--amber,#d97706)', fontWeight: 600 } : undefined}>
+              rent {usd(fileRent)}{rentDiffers ? ` (differs from this unit's ${usd(unit.rent)})` : ''}</span>,
+            first.file.leaseStart && <span key="s">lease started {first.file.leaseStart}</span>,
+            first.file.securityDeposit && <span key="d">deposit {first.file.securityDeposit}</span>,
+          ].filter(Boolean).reduce((acc: any[], el, i) => (i ? [...acc, ' · ', el] : [el]), [])}
+        </div>
+      )}
+
+      {people.map((p, i) => (
+        <div key={p.id} style={{ padding: '8px 0', borderTop: '1px solid var(--border-0)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+            <span style={{ fontSize: '.68rem', color: i === 0 || byRoom ? 'var(--gold)' : 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', fontWeight: 700 }}>
+              {byRoom ? 'Their own lease' : i === 0 ? 'Holds the lease' : `Co-tenant ${i}`}
+            </span>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <select className="input" value="" style={{ width: 'auto', fontSize: '.74rem', padding: '3px 6px' }}
+                onChange={e => { if (e.target.value === '__none') onPatch(p.id, { unitId: null }); else if (e.target.value) onPatch(p.id, { unitId: e.target.value }) }}>
+                <option value="">Move to…</option>
+                {placeable.filter(u => u.id !== unit.unitId).map(u => <option key={u.id} value={u.id}>Unit {u.unitNumber}</option>)}
+                <option value="__none">Not placed</option>
+              </select>
+              <button className="btn btn-danger btn-sm" style={{ padding: '1px 8px' }}
+                onClick={() => onRemove(p.id, `${p.firstName} ${p.lastName}`.trim())}>Remove</button>
+            </div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+            <BlurInput value={p.firstName} placeholder="First name" onCommit={v => onPatch(p.id, { firstName: v })} />
+            <BlurInput value={p.lastName} placeholder="Last name" onCommit={v => onPatch(p.id, { lastName: v })} />
+            <BlurInput value={p.email} type="email" placeholder="Email" onCommit={v => onPatch(p.id, { email: v })} />
+            <BlurInput value={p.phone ?? ''} placeholder="Phone (optional)" onCommit={v => onPatch(p.id, { phone: v })} />
+          </div>
+          {byRoom && (
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: '.76rem', color: 'var(--text-2)', marginTop: 6 }}>
+              Their old balance owed
+              <BlurInput width={110} placeholder="0.00" value={p.openingBalance != null ? String(p.openingBalance) : ''}
+                onCommit={v => onPatch(p.id, { openingBalance: v === '' ? null : v })} />
+            </label>
+          )}
+        </div>
+      ))}
+
+      <div style={{ borderTop: '1px solid var(--border-0)', paddingTop: 10, marginTop: 4 }}>
+        {windowOpen ? (
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer', marginBottom: 10 }}>
+            <input type="checkbox" checked={existing} onChange={e => all({ existingResident: e.target.checked })} style={{ marginTop: 3 }} />
+            <span style={{ fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+              <strong style={{ color: 'var(--text-1)' }}>They already live here — skip the background check.</strong>
+            </span>
+          </label>
+        ) : null}
+        {windowOpen && existing && (
+          <DueDayPicker value={dueDay != null ? String(dueDay) : ''} onChange={v => all({ rentDueDay: v === '' ? null : Number(v) })} />
+        )}
+        {unit.dwellingOwnership === 'landlord' && unit.unitType === 'mobile_home' && (
+          // Selling the home changes the packet (the sale papers go in), so the
+          // ticks start again from the package's own suggestion.
+          <HomeSaleToggle sale={sale ? emptyHomeSale() : null} setSale={v => all({ homeSale: !!v, packageTemplateIds: null })} />
+        )}
+        <PacketChecklist unitId={unit.unitId} sale={sale} ticked={ticked} setTicked={setTicked}
+          initial={first?.packageTemplateIds ?? null}
+          onUserChange={next => all({ packageTemplateIds: tickedIds(next) ?? [] })} />
+        {byRoom ? (
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+            Each person here rents by the room on their own lease, so each old balance above is theirs alone. It posts once, as one
+            charge on their own lease when it starts. No late fees on it.
+          </div>
+        ) : (
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: '.76rem', color: 'var(--text-2)' }}>
+            Old balance owed
+            <BlurInput width={110} placeholder="0.00" value={balanceHolder?.openingBalance != null ? String(balanceHolder.openingBalance) : ''}
+              onCommit={v => onPatch(balanceHolder.id, { openingBalance: v === '' ? null : v })} />
+            <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>One balance for the whole household. It posts once, as one charge on their lease when it starts. No late fees on it.</span>
+          </label>
         )}
       </div>
-
-      <div style={{ padding: 14, borderRadius: 8, background: 'var(--bg-0)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-        <div style={{ fontSize: '.78rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 10 }}>Lease</div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10 }}>
-          <Field label="Start date" type="date" value={primary.leaseStart} issues={primary.issues} field="lease_start"
-                 onChange={v => updateLeaseField('leaseStart', v)} />
-          <Field label="End date (blank = month-to-month)" type="date" value={primary.leaseEnd} issues={primary.issues} field="lease_end"
-                 onChange={v => updateLeaseField('leaseEnd', v)} />
-          <Field label="Monthly rent" type="number" value={primary.monthlyRent} issues={primary.issues} field="monthly_rent"
-                 onChange={v => updateLeaseField('monthlyRent', v)} />
-          <Field label="Security deposit" type="number" value={primary.securityDeposit} issues={primary.issues} field="security_deposit"
-                 onChange={v => updateLeaseField('securityDeposit', v)} />
-          <Field label="Late fee amount" type="number" value={primary.lateFeeAmount} issues={primary.issues} field="late_fee_amount"
-                 onChange={v => updateLeaseField('lateFeeAmount', v)} />
-          <Field label="Late fee grace days" type="number" value={primary.lateFeeGraceDays} issues={primary.issues} field="late_fee_grace_days"
-                 onChange={v => updateLeaseField('lateFeeGraceDays', v)} />
-          <SelectField label="Auto-renew" value={primary.autoRenew} issues={primary.issues} field="auto_renew"
-                       onChange={v => updateLeaseField('autoRenew', v)}
-                       options={[{ value: '', label: '— select —' }, { value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }]} />
-          {String(primary.autoRenew).toLowerCase() === 'yes' && (
-            <SelectField label="Auto-renew mode" value={primary.autoRenewMode} issues={primary.issues} field="auto_renew_mode"
-                         onChange={v => updateLeaseField('autoRenewMode', v)}
-                         options={[
-                           { value: '', label: '— select —' },
-                           ...AUTO_RENEW_MODES.map(m => ({ value: m, label: AUTO_RENEW_MODE_LABEL[m] })),
-                         ]} />
-          )}
-          <Field label="Notice days required" type="number" value={primary.noticeDaysRequired} issues={primary.issues} field="notice_days_required"
-                 onChange={v => updateLeaseField('noticeDaysRequired', v)} />
-          <Field label="Opening balance (carry-over AR)" type="number" value={primary.outstandingBalance} issues={primary.issues} field="outstanding_balance"
-                 onChange={v => updateLeaseField('outstandingBalance', v)} />
-        </div>
-      </div>
-
-      <div style={{ padding: 14, borderRadius: 8, background: 'var(--bg-0)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-        <div style={{ fontSize: '.78rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 10 }}>
-          Tenants ({groupRows.length})
-        </div>
-        {groupRows.map((r, idx) => (
-          <div key={r.rowIndex} style={{ padding: 12, borderRadius: 8, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: idx === groupRows.length - 1 ? 0 : 10 }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-              <div style={{ fontSize: '.82rem', fontWeight: 700, color: idx === 0 ? 'var(--gold,#c4a14a)' : 'var(--text-2)' }}>
-                {idx === 0 ? 'PRIMARY' : 'CO-TENANT'}
-              </div>
-              <div style={{ display: 'flex', gap: 6 }}>
-                {idx !== 0 && (
-                  <button onClick={() => promoteToPrimary(idx)} className="btn btn-ghost" style={{ fontSize: '.78rem', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                    <ArrowUp size={12} /> Make primary
-                  </button>
-                )}
-                {groupRows.length > 1 && (
-                  <button onClick={() => removeRow(idx)} className="btn btn-ghost" style={{ fontSize: '.78rem', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                    <X size={12} /> Remove
-                  </button>
-                )}
-              </div>
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 10 }}>
-              <Field label="First name" value={r.firstName} issues={r.issues} field="first_name"
-                     onChange={v => updateRowField(idx, 'firstName', v)} />
-              <Field label="Last name" value={r.lastName} issues={r.issues} field="last_name"
-                     onChange={v => updateRowField(idx, 'lastName', v)} />
-              <Field label="Email" type="email" value={r.email} issues={r.issues} field="email"
-                     onChange={v => updateRowField(idx, 'email', v)} />
-              <Field label="Phone" value={r.phone} issues={r.issues} field="phone"
-                     onChange={v => updateRowField(idx, 'phone', v)} />
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {submitErr && (
-        <div style={{ padding: 12, borderRadius: 8, background: 'rgba(220,80,80,.08)', border: '1px solid rgba(220,80,80,.3)', color: 'var(--red,#dc5050)', fontSize: '.82rem', marginBottom: 12 }}>
-          {submitErr}
-        </div>
-      )}
-
-      <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-        {companyMissing && <span style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{CHOOSE_COMPANY_FIRST}</span>}
-        <button onClick={handleSubmit} disabled={submitting || !hasResolvedUnit || companyMissing} className="btn btn-primary" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-          {submitting ? <span className="spinner" /> : null}
-          {submitting ? 'Onboarding…' : 'Onboard this unit'}
-        </button>
-      </div>
-    </div>
-  )
-}
-
-function Field({ label, value, onChange, issues, field, type = 'text' }: {
-  label: string; value: string; onChange: (v: string) => void;
-  issues: CsvIssue[]; field: string; type?: string
-}) {
-  const fieldIssues = issues.filter(i => i.field === field)
-  const hasBlock = fieldIssues.some(i => i.severity === 'block')
-  const hasWarn = fieldIssues.some(i => i.severity === 'warn') && !hasBlock
-  const borderColor = hasBlock ? '#dc5050' : hasWarn ? '#eab308' : 'var(--border-0)'
-  return (
-    <div>
-      <label style={{ display: 'block', fontSize: '.75rem', color: 'var(--text-2)', marginBottom: 4 }}>{label}</label>
-      <input
-        type={type}
-        value={value}
-        onChange={e => onChange(e.target.value)}
-        style={{ width: '100%', padding: '8px 10px', borderRadius: 6, background: 'var(--bg-0)', border: `1px solid ${borderColor}`, color: 'var(--text-0)', fontSize: '.85rem' }}
-      />
-      {fieldIssues.length > 0 && (
-        <div style={{ fontSize: '.72rem', color: hasBlock ? '#dc5050' : '#eab308', marginTop: 3, lineHeight: 1.4 }}>
-          {fieldIssues.map((i, k) => <div key={k}>{i.message}</div>)}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function SelectField({ label, value, onChange, issues, field, options }: {
-  label: string; value: string; onChange: (v: string) => void;
-  issues: CsvIssue[]; field: string; options: { value: string; label: string }[]
-}) {
-  const fieldIssues = issues.filter(i => i.field === field)
-  const hasBlock = fieldIssues.some(i => i.severity === 'block')
-  const hasWarn = fieldIssues.some(i => i.severity === 'warn') && !hasBlock
-  const borderColor = hasBlock ? '#dc5050' : hasWarn ? '#eab308' : 'var(--border-0)'
-  return (
-    <div>
-      <label style={{ display: 'block', fontSize: '.75rem', color: 'var(--text-2)', marginBottom: 4 }}>{label}</label>
-      <select
-        value={value}
-        onChange={e => onChange(e.target.value)}
-        style={{ width: '100%', padding: '8px 10px', borderRadius: 6, background: 'var(--bg-0)', border: `1px solid ${borderColor}`, color: 'var(--text-0)', fontSize: '.85rem' }}
-      >
-        {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-      </select>
-      {fieldIssues.length > 0 && (
-        <div style={{ fontSize: '.72rem', color: hasBlock ? '#dc5050' : '#eab308', marginTop: 3, lineHeight: 1.4 }}>
-          {fieldIssues.map((i, k) => <div key={k}>{i.message}</div>)}
-        </div>
-      )}
     </div>
   )
 }

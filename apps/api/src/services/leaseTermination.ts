@@ -3,6 +3,7 @@ import { query, queryOne, getClient } from '../db'
 import { appendEvent } from './creditLedger'
 import { logger } from '../lib/logger'
 import { stripeSecretKeyOrNull } from '../lib/stripe'
+import { AppError } from '../middleware/errorHandler'
 
 // ============================================================
 // Early-termination service.
@@ -148,6 +149,16 @@ export async function requestEarlyTermination(args: {
   if (!lease) throw new Error(`Lease ${args.leaseId} not found`)
   if (lease.status !== 'active' && lease.status !== 'pending') {
     throw new Error(`Cannot terminate lease in status ${lease.status}`)
+  }
+  // S655: a new lease is waiting for this household (or this IS that new lease,
+  // not started yet). Leaving and staying on a new lease cannot both be true —
+  // the same rule, in the same words, as the front desk's leaving date
+  // (services/renewalSuccessor.newLeaseBlocksEarlyEnd).
+  {
+    const { newLeaseBlocksEarlyEnd } = await import('./renewalSuccessor')
+    const blocked = await newLeaseBlocksEarlyEnd(
+      async (sql, params) => ({ rows: await query<any>(sql, params) }), args.leaseId, 'tenant')
+    if (blocked) throw new AppError(409, blocked)
   }
 
   // Reject duplicate active requests
@@ -396,6 +407,15 @@ export async function waiveFeeAndTerminate(args: {
     const req = cur.rows[0]
     if (req.status !== 'requested' && req.status !== 'failed') {
       throw new Error(`Cannot waive request in status ${req.status}`)
+    }
+    // S655: the same rule as the tenant's request — a waiting new lease is
+    // canceled first (nobody signed) or the leaving date goes on it once it
+    // starts (someone signed). A request made before the new lease was signed
+    // lands here.
+    {
+      const { newLeaseBlocksEarlyEnd } = await import('./renewalSuccessor')
+      const blocked = await newLeaseBlocksEarlyEnd(client.query.bind(client) as any, req.lease_id, 'landlord')
+      if (blocked) throw new AppError(409, blocked)
     }
 
     await client.query(

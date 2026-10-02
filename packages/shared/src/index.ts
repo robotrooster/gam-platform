@@ -131,6 +131,36 @@ export const AGENT_REVENUE_CAPABILITY_LABEL: Record<AgentRevenueCapability, stri
 export const LEASE_RENEWAL_REQUEST_STATUSES = ['requested', 'approved', 'declined', 'cancelled', 'completed'] as const
 export type LeaseRenewalRequestStatus = typeof LEASE_RENEWAL_REQUEST_STATUSES[number]
 
+// S655 (Nic, 10/2): a NEW LEASE for a household already living there (a
+// renewal, month-to-month included). It takes over on its start date and bills
+// its rent whether or not the tenant has signed; the landlord hears it is still
+// unsigned this many days before the start, and again on the start date.
+export const NEW_LEASE_UNSIGNED_ALERT_DAYS = 14
+// The tenant's reminders to sign, this many days before the start (plus the
+// signing request the moment the landlord signs, and the portal banner).
+export const NEW_LEASE_TENANT_REMINDER_DAYS = [14, 3] as const
+// The park-wide sender: how the new rent is set for every household at once.
+export const NEW_LEASE_RENT_MODES = ['same', 'amount', 'percent'] as const
+export type NewLeaseRentMode = typeof NEW_LEASE_RENT_MODES[number]
+export const NEW_LEASE_RENT_MODE_LABEL: Record<NewLeaseRentMode, string> = {
+  same:    'Keep each current rent',
+  amount:  'Everyone pays the same new rent',
+  percent: 'Raise each rent by a percent',
+}
+/**
+ * The new monthly rent for one household under the park-wide sender. A percent
+ * raise rounds to the cent; the result is never negative. The server and the
+ * preview on screen both use this, so the number shown is the number drafted.
+ */
+export function newLeaseRent(currentRent: number, mode: NewLeaseRentMode, value?: number | null): number {
+  const cur = Number(currentRent) || 0
+  const v = Number(value)
+  let next = cur
+  if (mode === 'amount') next = Number.isFinite(v) ? v : cur
+  else if (mode === 'percent') next = Number.isFinite(v) ? cur * (1 + v / 100) : cur
+  return Math.max(0, Math.round(next * 100) / 100)
+}
+
 // S565: FlexCredit (rent-payment credit reporting) demand-capture inquiry
 // status. Demand-test only for now — 'interested' is the sole live state; the
 // others are reserved for when the product actually launches (past the $500/mo
@@ -733,6 +763,15 @@ export const OCCUPANCY_MODE_LABEL: Record<OccupancyMode, string> = {
 }
 // People-per-bedroom cap for by_room stacking.
 export const BY_ROOM_LEASES_PER_BEDROOM = 2
+
+// S655: the tenant CSV is a DRAFT ROSTER (tenant_roster_drafts). A lease drafts
+// itself for at most this many people (a primary plus three co-tenants — the
+// signer roles a drafted lease has); a bigger household is drafted by hand.
+export const ROSTER_MAX_HOUSEHOLD = 4
+// "Late in the month" for the onboarding late-fee question: after this day of
+// the month, or when the property's next rent due day is this close.
+export const ONBOARDING_LATE_MONTH_DAY = 20
+export const ONBOARDING_FIRST_BILL_NEAR_DAYS = 10
 
 // S558 (Nic): late-fee lease-document field columns. These boxes are populated
 // from the per-(property, unit_type) late-fee POLICY (S535/S537) and stamped

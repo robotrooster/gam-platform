@@ -26,9 +26,9 @@ Paying by cash, check or money order is free on every payment — there is no fe
 
 ## If you deposit rent at the bank yourself
 
-If you pay by depositing straight into your landlord's account, tell us with **"I paid at the bank"** on your payments screen. Report the amount, the day you went, and whether it was cash, a check or a money order. When the deposit shows up in your landlord's bank feed we apply it automatically — **dated to the day you paid, not the day the bank posted it**, which matters if you deposited on a Friday and it didn't land until Monday.
+If you pay by depositing straight into your landlord's account, tell us with **"I paid at the bank"** on your payments screen. Report the amount, the day you went, and whether it was cash, a check or a money order. When your landlord's bank is connected to GAM, we apply it automatically when the deposit shows up — **dated to the day you paid, not the day the bank posted it**, which matters if you deposited on a Friday and it didn't land until Monday. If it isn't connected, your landlord checks their own bank and marks your bill paid. Let them know you paid and keep your deposit slip. The report doesn't expire.
 
-Two things to know. Report it **after** you've actually been to the bank and given it a few hours to show up — reporting it beforehand means there's nothing to match and the report expires. And reporting a deposit doesn't change your balance on its own: what you owe stays exactly the same until the deposit actually appears. If it never appears, you'll be told, and your balance will still be unchanged.
+Two things to know. Report it **after** you've actually been to the bank. When your landlord's bank is connected, give the deposit a few hours to show up first — reporting it beforehand means there's nothing to match, and a report with nothing to match expires after a week. And reporting a deposit doesn't change your balance on its own: what you owe stays exactly the same until the deposit is applied or your landlord marks your bill paid. When your landlord's bank is connected and the deposit never appears there, you'll be told, and your balance will still be unchanged.
 
 ## If a card payment is declined
 

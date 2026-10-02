@@ -20,7 +20,7 @@ There is one case GAM settles without asking: the tenant reported the deposit th
 
 ## Tenants can report their own deposits
 
-A tenant who banks their own rent can tell GAM straight away with **"I paid at the bank"** in their portal — the amount, the day, and whether it was cash, a check or a money order. Nothing is credited on their say-so: their balance is unchanged until the deposit actually appears in your feed. If it never appears, they are told, and after a week the report expires. Repeated reports that never arrive are flagged to you.
+A tenant who banks their own rent can tell GAM straight away with **"I paid at the bank"** in their portal — the amount, the day, and whether it was cash, a check or a money order. Nothing is credited on their say-so: their balance is unchanged until the deposit appears in your feed or you record the payment yourself. While your bank is connected and syncing, a report whose deposit never appears expires after a week, the tenant is told, and repeated reports that never arrive are flagged to you. Without that, nothing matches or expires a report: it stays open, and the tenant is told to let you know they paid and keep their deposit slip. Check your own bank and record the payment the way you record any cash or check.
 
 Encourage it. It is the difference between a deposit you have to attribute and one that files itself, and it earns the tenant the date they actually paid rather than the date the bank posted it.
 

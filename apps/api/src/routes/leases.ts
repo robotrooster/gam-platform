@@ -288,6 +288,7 @@ leasesRouter.get('/', async (req, res, next) => {
       // after login still resolves. Team roles keep their single scope through
       // the same helper.
       const scope = landlordScopeIds(req.user!)
+      const { followsLeaseEndedEarlyUnsigned } = await import('../services/renewalSuccessor')
       rows = scope.length === 0 ? [] : await query<any>(`
         SELECT l.*,
           (SELECT amount FROM lease_fees lf
@@ -296,6 +297,11 @@ leasesRouter.get('/', async (req, res, next) => {
               AND lf.due_timing = 'move_in'
             LIMIT 1) AS security_deposit,
           u.unit_number, unit_number_on(l.unit_id, l.start_date) AS unit_number_then, u.unit_type, p.id AS property_id, p.name AS property_name,
+          -- S655: a household's new lease whose lease before it ENDED EARLY,
+          -- with nobody in the household signed: it never starts and is being
+          -- canceled. The Leases page says so, instead of "it takes over on its
+          -- start date whether or not they have signed".
+          (l.supersedes_lease_id IS NOT NULL AND ${followsLeaseEndedEarlyUnsigned('l')}) AS new_lease_wont_start,
           -- S609 autopay VISIBILITY (Nic, DIRECTIVE). The landlord sees THAT a
           -- payment is scheduled and on which day, so a quiet lease does not
           -- read as a tenant who stopped paying. They can never CHANGE it — a

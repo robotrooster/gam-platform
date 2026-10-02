@@ -2,8 +2,9 @@ import { useState } from 'react'
 import { HomeSaleToggle, homeSalePayload, homeSaleComplete, PacketChecklist, tickedIds, type HomeSaleForm } from './TenantOnboardingPage'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
-import { X, Mail, DoorOpen, Copy, Check, ChevronRight, ChevronLeft } from 'lucide-react'
+import { X, Mail, DoorOpen, Check, ChevronRight, ChevronLeft } from 'lucide-react'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
+import { reachedBy, unitInviteFallbackLine, screeningInviteLine, inviteResultTitle } from '../lib/inviteOutcome'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface Props { onClose: () => void }
@@ -38,11 +39,16 @@ export function InviteTenantModal({ onClose }: Props) {
   const [residents, setResidents] = useState<Resident[]>([blankResident()])
   const [form, setForm] = useState({ unitId: '' })
   const [errors, setErrors] = useState<Record<string, string>>({})
-  // S654: acceptUrl comes back only for an account this invite created. Someone
-  // already on GAM gets no email and no link (alreadyOnPlatform).
-  type InviteOutcome = { email: string; acceptUrl: string | null; inviteSent: boolean; alreadyOnPlatform: boolean }
-  const [inviteResult, setInviteResult] = useState<{ screened: boolean; sent: InviteOutcome[]; draft?: { drafted: boolean; reason?: string } | null } | null>(null)
-  const [copied, setCopied] = useState<string | null>(null)
+  // S655 (Nic, 10/2): invites are EMAIL-ONLY. The setup link sets the
+  // person's password, so it goes only to their own inbox and never comes back
+  // to this screen. Someone who didn't get it: Resend on the Front Desk.
+  // notified: what actually reached them — an email, a notice in the GAM
+  // account they already use, or nothing (null).
+  type InviteOutcome = {
+    email: string; name: string; inviteSent: boolean; alreadyOnPlatform: boolean; needsOwnSignature: boolean
+    notified: 'email' | 'notice' | null
+  }
+  const [inviteResult, setInviteResult] = useState<{ screened: boolean; sent: InviteOutcome[]; drafted: boolean; draftBlocked: string[] } | null>(null)
   // S579: a person invited to a vacant unit is a NEW applicant by default — they
   // create an account + complete a background check before a unit is assigned
   // (property-level invite). Uncheck only for someone who doesn't need screening.
@@ -79,18 +85,35 @@ export function InviteTenantModal({ onClose }: Props) {
   const hiddenReasons = hiddenUnitReasons(allUnits as any[])
   const units = (allUnits as any[]).filter(canInviteToUnit)
 
+  // S655: a household invited to a UNIT goes in one call — its lease drafts
+  // once with everyone on it and waits for your signature; nobody is emailed
+  // until you sign. Applicants invited to a PROPERTY (they screen first) are
+  // invited one at a time and get their invite email now.
   const inviteMut = useMutation(
-    async (payloads: any[]) => {
+    async (req: { unit: any | null; property: any[] | null }) => {
+      if (req.unit) {
+        const res: any = await apiPost('/tenants/invite', req.unit)
+        const d = res?.data ?? {}
+        const people: any[] = Array.isArray(d.people) ? d.people : []
+        return {
+          drafted: d.leaseDrafted === true,
+          draftBlocked: Array.isArray(d.draftBlocked) ? d.draftBlocked : [],
+          sent: people.map(p => ({
+            email: p.email, name: p.name || p.email, inviteSent: p.inviteSent === true,
+            alreadyOnPlatform: p.alreadyOnPlatform === true, needsOwnSignature: p.needsOwnSignature === true,
+            notified: reachedBy(p),
+          })) as InviteOutcome[],
+        }
+      }
       const out: InviteOutcome[] = []
-      for (const [i, payload] of payloads.entries()) {
+      for (const [i, payload] of (req.property ?? []).entries()) {
         try {
           const res: any = await apiPost('/tenants/invite', payload)
           const d = res?.data ?? {}
           out.push({
-            email: payload.email,
-            acceptUrl: typeof d.acceptUrl === 'string' && d.acceptUrl ? d.acceptUrl : null,
-            inviteSent: d.inviteSent !== false,
-            alreadyOnPlatform: d.alreadyOnPlatform === true,
+            email: payload.email, name: [payload.firstName, payload.lastName].filter(Boolean).join(' '),
+            inviteSent: d.inviteSent === true, alreadyOnPlatform: d.alreadyOnPlatform === true, needsOwnSignature: false,
+            notified: reachedBy(d),
           })
         } catch (e: any) {
           const msg = e?.response?.data?.error || e?.message || 'Invite failed'
@@ -99,27 +122,14 @@ export function InviteTenantModal({ onClose }: Props) {
           throw new Error(`${payload.email}: ${msg}${i > 0 ? ` (${i} invite${i > 1 ? 's' : ''} already sent)` : ''}`)
         }
       }
-      return out
+      return { drafted: false, draftBlocked: [] as string[], sent: out }
     },
     {
-      onSuccess: async (out: InviteOutcome[]) => {
+      onSuccess: (r) => {
         qc.invalidateQueries('tenants')
         qc.invalidateQueries('units')
-        // S605: draft the lease for the whole household off the unit type's
-        // default template. Best-effort — the invites already went out, so a
-        // landlord who hasn't set a template yet is TOLD, not failed.
-        let draft: { drafted: boolean; reason?: string } | null = null
-        if (form.unitId) {
-          try {
-            const r: any = await apiPost('/esign/draft-household', {
-              unitId: form.unitId, emails: out.map(o => o.email),
-              homeSale: askSale && homeSale ? homeSalePayload(homeSale) : undefined,
-              packageTemplateIds: tickedIds(packet),
-            })
-            draft = r?.data ?? r
-          } catch { draft = null }
-        }
-        setInviteResult({ screened: requireScreening, sent: out, draft })
+        qc.invalidateQueries('vacant-units')
+        setInviteResult({ screened: requireScreening, sent: r.sent, drafted: r.drafted, draftBlocked: r.draftBlocked })
       },
       onError: (e: any) => setErrors(er => ({ ...er, submit: e?.message || 'Could not send the invites' })),
     }
@@ -167,83 +177,90 @@ export function InviteTenantModal({ onClose }: Props) {
   const back = () => setStep(s => s - 1)
 
   const submit = () => {
-    // Sequential, not parallel: they hit the same unit and the same landlord
-    // scope, and a partially-applied household is worse than a slow one — the
-    // caller sees exactly which resident failed.
-    inviteMut.mutate(residents.map((r, i) => {
-      const base = {
-        email: r.email.trim(),
-        firstName: r.firstName.trim(),
-        lastName: r.lastName.trim(),
-        phone: r.phone.trim() || undefined,
-        // First listed holds the lease; the rest ride as co-tenants.
-        householdRole: i === 0 ? 'primary' : 'co_tenant',
-      }
-      // S579: screening → property-level invite (they screen, unit assigned
-      // later at lease). Otherwise the unit-bound invite.
-      return requireScreening && selectedUnit?.propertyId
-        ? { ...base, propertyId: selectedUnit.propertyId }
-        : { ...base, unitId: form.unitId, ...(screenMode === 'returning' ? { returningResident: true } : {}) }
+    const people = residents.map(r => ({
+      email: r.email.trim(),
+      firstName: r.firstName.trim(),
+      lastName: r.lastName.trim(),
+      phone: r.phone.trim() || undefined,
     }))
-  }
-
-  const copyLink = (url: string | null) => {
-    if (!url) return
-    navigator.clipboard.writeText(url)
-    setCopied(url)
-    setTimeout(() => setCopied(c => (c === url ? null : c)), 2000)
+    // S579: screening → property-level invite (they screen, unit assigned
+    // later at lease). Sequential: the caller sees exactly which one failed.
+    if (requireScreening && selectedUnit?.propertyId) {
+      inviteMut.mutate({ unit: null, property: people.map(p => ({ ...p, propertyId: selectedUnit.propertyId })) })
+      return
+    }
+    // The household on its unit, in one call. The first person listed holds
+    // the lease; the rest are co-tenants on it.
+    inviteMut.mutate({ property: null, unit: {
+      ...people[0], residents: people, unitId: form.unitId,
+      ...(screenMode === 'returning' ? { returningResident: true } : {}),
+      ...(screenMode === 'sitting' ? { existingResident: true } : {}),
+      homeSale: askSale && homeSale ? homeSalePayload(homeSale) : undefined,
+      packageTemplateIds: tickedIds(packet),
+    } })
   }
 
   // Success screen
   if (inviteResult) {
-    const anySent = inviteResult.sent.some(r => r.inviteSent)
-    const links = inviteResult.sent.filter(r => r.acceptUrl)
+    const r = inviteResult
+    const title = inviteResultTitle(r)
+    // Green only when everything went; amber when something is left to do.
+    const allWent = title === 'Lease drafted' || title === 'Invite Sent' || title === 'Already on GAM'
+    const tone = allWent ? 'var(--green)' : 'var(--amber, #d97706)'
     return (
       <div className="modal-overlay" onClick={onClose}>
         <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
           <div style={{ textAlign: 'center', padding: '8px 0 20px' }}>
-            <div style={{ width: 56, height: 56, borderRadius: '50%', background: 'rgba(30,219,122,.12)', border: '2px solid var(--green)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-              <Check size={24} style={{ color: 'var(--green)' }} />
+            <div style={{ width: 56, height: 56, borderRadius: '50%', background: allWent ? 'rgba(30,219,122,.12)' : 'rgba(217,119,6,.12)', border: `2px solid ${tone}`, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+              <Check size={24} style={{ color: tone }} />
             </div>
             <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.15rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>
-              {anySent ? 'Invite Sent' : 'Already on GAM'}
+              {title}
             </div>
-            {inviteResult.sent.map(r => (
-              <div key={r.email} style={{ fontSize: '.82rem', color: 'var(--text-3)', marginTop: 4 }}>
-                {r.inviteSent
-                  ? <>{r.email} will receive an email to set up their account.</>
-                  : <>{r.email}: They already have a GAM account — {inviteResult.screened
-                      ? 'your invite is waiting for them there.'
-                      : 'the lease is waiting for them there.'}</>}
+            {r.screened ? r.sent.map(x => (
+              <div key={x.email} style={{ fontSize: '.82rem', color: x.notified ? 'var(--text-3)' : 'var(--amber, #d97706)', marginTop: 4 }}>
+                {screeningInviteLine(x)}
               </div>
-            ))}
+            )) : r.drafted ? (
+              <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 4, lineHeight: 1.6 }}>
+                {r.draftBlocked.length === 0
+                  ? <>The lease for {r.sent.map(x => x.name).join(', ')} is waiting for your signature in Front Desk.</>
+                  // A by-room unit drafts a lease per person: some can draft
+                  // while others are refused. Each reason names whose it is.
+                  : <>The leases that drafted are waiting for your signature in Front Desk. These did not draft yet:</>}
+                {r.draftBlocked.map((b, i) => <div key={i} style={{ color: 'var(--amber, #d97706)', marginTop: 4 }}>{b}</div>)}
+                <div style={{ marginTop: 4 }}>
+                  Nobody has been emailed yet — each person gets one email when you sign their lease.
+                </div>
+              </div>
+            ) : (
+              <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 4, lineHeight: 1.6 }}>
+                {r.draftBlocked.map((b, i) => <div key={i} style={{ color: 'var(--amber, #d97706)' }}>{b}</div>)}
+                {/* The usual invite was tried instead: say who it reached, and
+                    for anyone it did not, what to press. */}
+                {r.sent.map(x => (
+                  <div key={x.email} style={{ marginTop: 4, color: x.notified ? undefined : 'var(--amber, #d97706)' }}>
+                    {unitInviteFallbackLine(x)}
+                  </div>
+                ))}
+              </div>
+            )}
+            {!r.screened && r.sent.some(x => x.needsOwnSignature) && (
+              <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginTop: 8, lineHeight: 1.6 }}>
+                {r.sent.filter(x => x.needsOwnSignature).map(x => x.name).join(', ')} already
+                {r.sent.filter(x => x.needsOwnSignature).length === 1 ? ' has' : ' have'} a GAM account with another
+                company, so the lease starts when they sign it themselves.
+              </div>
+            )}
           </div>
 
-          {links.length > 0 && (
-            <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10, padding: 14, marginBottom: 16 }}>
-              <div style={{ fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: 8 }}>
-                Invite Link{links.length > 1 ? 's' : ''} — share directly if needed
-              </div>
-              {links.map(r => (
-                <div key={r.email} style={{ marginTop: 6 }}>
-                  {links.length > 1 && <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>{r.email}</div>}
-                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <div style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: '.68rem', color: 'var(--text-2)', background: 'var(--bg-3)', border: '1px solid var(--border-0)', borderRadius: 6, padding: '7px 10px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {r.acceptUrl}
-                    </div>
-                    <button className="btn btn-ghost btn-sm" onClick={() => copyLink(r.acceptUrl)} style={{ flexShrink: 0, gap: 5 }}>
-                      {copied === r.acceptUrl ? <><Check size={13} style={{ color: 'var(--green)' }} /> Copied</> : <><Copy size={13} /> Copy</>}
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-
           <div style={{ fontSize: '.75rem', color: 'var(--text-3)', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.15)', borderRadius: 8, padding: '10px 12px', marginBottom: 20, lineHeight: 1.6 }}>
-            {inviteResult.screened
-              ? <>⚡ They&apos;ll create an account and complete a <strong style={{ color: 'var(--amber)' }}>background check</strong>. Once it clears and you approve, assign them a unit and send the lease.</>
-              : <>⚡ Unit has been assigned. The tenant will appear as <strong style={{ color: 'var(--amber)' }}>Pending</strong> until they complete their account setup and verify their bank account.</>}
+            {r.screened
+              ? <>They&apos;ll set up an account and complete a <strong style={{ color: 'var(--amber)' }}>background check</strong>. Once it clears and you approve, assign them a unit and send the lease.</>
+              : <>Sign the lease in <strong style={{ color: 'var(--amber)' }}>Front Desk → Waiting on you to sign</strong>. Rent bills from the lease once it is signed.</>}
+            {r.screened
+              ? <>{' '}If someone doesn&apos;t get their email, press <strong>Re-send invite</strong> next to them on the Front Desk.</>
+              : <>{' '}If someone doesn&apos;t get their email after you sign, send a reminder from the lease&apos;s row in <strong>E-Sign</strong>.</>}
           </div>
 
           <button className="btn btn-primary" style={{ width: '100%' }} onClick={onClose}>Done</button>
@@ -486,15 +503,19 @@ export function InviteTenantModal({ onClose }: Props) {
                 </div>
               )}
 
-              {/* What happens next */}
-              {[
-                { icon: '📧', text: 'Invite email sent to tenant' },
-                { icon: '🔐', text: 'Tenant sets password and verifies identity' },
-                { icon: '🏦', text: 'Tenant connects bank account for ACH' },
-                { icon: '✅', text: 'Unit goes active — rent collection begins' },
-              ].map((item, i) => (
-                <div key={i} style={{ padding: '8px 16px', borderBottom: i < 3 ? '1px solid var(--border-0)' : 'none', display: 'flex', alignItems: 'center', gap: 10, fontSize: '.75rem', color: 'var(--text-3)' }}>
-                  <span>{item.icon}</span> {item.text}
+              {/* What happens next — S647: you sign first, then they get one email. */}
+              {(requireScreening ? [
+                'An invite email goes to each of them now',
+                'They set up an account and complete a background check',
+                'Once it clears, you assign their space and send the lease',
+              ] : [
+                'Their lease drafts now, from this unit\'s rent and your default lease',
+                'You sign it in Front Desk → Waiting on you to sign',
+                'Each of them gets one email: set up their account and sign',
+                'Rent bills from the lease once it is signed',
+              ]).map((text, i, arr) => (
+                <div key={i} style={{ padding: '8px 16px', borderBottom: i < arr.length - 1 ? '1px solid var(--border-0)' : 'none', display: 'flex', alignItems: 'center', gap: 10, fontSize: '.75rem', color: 'var(--text-3)' }}>
+                  <span style={{ color: 'var(--gold)', fontWeight: 700 }}>{i + 1}</span> {text}
                 </div>
               ))}
             </div>
@@ -524,7 +545,9 @@ export function InviteTenantModal({ onClose }: Props) {
           ) : (
             <button className="btn btn-primary" onClick={submit} disabled={inviteMut.isLoading}>
               {inviteMut.isLoading ? <span className="spinner" />
-                : <><Mail size={14} /> Send {residents.length > 1 ? `${residents.length} invites` : 'invite'}</>}
+                : requireScreening
+                  ? <><Mail size={14} /> Send {residents.length > 1 ? `${residents.length} invites` : 'invite'}</>
+                  : <>Invite and draft the lease</>}
             </button>
           )}
         </div>

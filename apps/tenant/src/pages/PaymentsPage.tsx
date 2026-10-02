@@ -13,7 +13,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import { paidByLabel, formatCurrency, humanize, humanizeEntryDescription, chargeLabel } from '@gam/shared'
-import { ReportBankDepositModal, ReportedDeposits } from '../components/ReportBankDeposit'
+import { ReportBankDepositModal, ReportedDeposits, type WithdrawRefusal } from '../components/ReportBankDeposit'
 import { apiGet } from '../lib/api'
 import { AutopaySection } from './AutopayCard'
 import {
@@ -80,11 +80,13 @@ const STATUS_BADGE: Record<string, string> = {
 // figures come from the server, computed with the same formula that actually
 // charges — so what is shown here is what gets taken. S654: cash, check and
 // money order are free; the server's label for that row says so.
-function WaysToPay({ lease, reports = [], onReportDeposit, onWithdrawn }: {
+function WaysToPay({ lease, reports = [], onReportDeposit, onWithdrawn, refusal, onRefusal }: {
   lease: any
   reports?: any[]
   onReportDeposit?: () => void
   onWithdrawn?: () => void
+  refusal?: WithdrawRefusal | null
+  onRefusal?: (r: WithdrawRefusal | null) => void
 }) {
   const costs: any[] = lease?.methodCosts ?? []
   if (!costs.length) return null
@@ -117,7 +119,8 @@ function WaysToPay({ lease, reports = [], onReportDeposit, onWithdrawn }: {
           I paid at the bank — report a deposit
         </button>
       )}
-      <ReportedDeposits reports={reports} onWithdrawn={onWithdrawn ?? (() => {})} />
+      <ReportedDeposits reports={reports} onWithdrawn={onWithdrawn ?? (() => {})}
+        refusal={refusal} onRefusal={onRefusal} />
     </div>
   )
 }
@@ -181,6 +184,9 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   // landlord works out whose it was.
   const [reportDepositFor, setReportDepositFor] =
     useState<{ leaseId: string; outstanding: number } | null>(null)
+  // S655 review: the server's answer to an "I hadn't paid" it would not do,
+  // held by the page — see depositRefusalInCard below.
+  const [depositRefusal, setDepositRefusal] = useState<WithdrawRefusal | null>(null)
 
   const refetchAll = () => {
     qc.invalidateQueries('payments')
@@ -242,6 +248,23 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   // S581: leases the tenant can actually pay right now (unblocked, non-zero).
   const payable = leaseGroups.filter((l) => !l.paymentBlocked && l.outstanding > 0)
   const payableTotal = Math.round(payable.reduce((s, l) => s + l.outstanding, 0) * 100) / 100
+
+  // S655 review: where a refused "I hadn't paid" is answered. Inside the
+  // balance card that lists the report, while that card is on screen;
+  // otherwise as its own block. The refused report has usually just been
+  // applied to the bill — often paying it off — and the card goes away with
+  // the balance, so a list holding its own answer lost it on the reload.
+  // (The cards list reports under "Ways to pay", which shows only with a priced
+  // way to pay; one card for two or more leases, else one for the single one.)
+  const priced = (l: { methodCosts?: unknown[] }) => (l.methodCosts ?? []).length > 0
+  const reportsInCard: any[] =
+    payable.length >= 2 ? (payable.some(priced) ? declaredDeposits : [])
+    : payable.length === 1 && priced(payable[0])
+      ? declaredDeposits.filter((d: any) => d.leaseId === payable[0].leaseId)
+      : []
+  const depositRefusalInCard =
+    !!depositRefusal && reportsInCard.some((d: any) => d.id === depositRefusal.id)
+  const cardRefusal = depositRefusalInCard ? depositRefusal : null
 
   // "Pay all" — ONLY when there are 2+ payable leases (any mix: two units, a
   // unit + a parking spot, two parking spots…). One method, a separate charge
@@ -423,7 +446,8 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                     </div>
                   ))}
                 </div>
-                <WaysToPay lease={combined} reports={declaredDeposits} onWithdrawn={refetchAll} />
+                <WaysToPay lease={combined} reports={declaredDeposits} onWithdrawn={refetchAll}
+                  refusal={cardRefusal} onRefusal={setDepositRefusal} />
                 {payable.map((l) => (
                   <button key={l.leaseId} className="btn-ghost"
                     onClick={() => setReportDepositFor({ leaseId: l.leaseId, outstanding: l.outstanding })}
@@ -471,6 +495,8 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                   onReportDeposit={() => setReportDepositFor({
                     leaseId: lg.leaseId, outstanding: lg.outstanding })}
                   onWithdrawn={refetchAll}
+                  refusal={cardRefusal}
+                  onRefusal={setDepositRefusal}
                 />
               </div>
               <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
@@ -482,6 +508,21 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
           </div>
         ) : null
       ))}
+
+      {/* S655 review: a refused "I hadn't paid" whose balance card has gone —
+          the report was applied and paid the bill off. It stays on screen,
+          saying where the report stands, until the tenant presses OK. */}
+      {depositRefusal && !depositRefusalInCard && (
+        <div className="card" style={{ padding: 16, marginTop: 16 }}>
+          <ReportedDeposits
+            standalone
+            reports={declaredDeposits.filter((d: any) => d.id === depositRefusal.id)}
+            onWithdrawn={refetchAll}
+            refusal={depositRefusal}
+            onRefusal={setDepositRefusal}
+          />
+        </div>
+      )}
 
       {/* S616: one card per AGREEMENT — every utility on it, one Pay. */}
       {serviceAgreements.map((b: any) => (

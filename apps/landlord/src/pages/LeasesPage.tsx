@@ -9,6 +9,7 @@ import { ChevronDown, ChevronRight } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 import { LeaseOverviewModal } from './LeaseOverviewModal'
 import { RenewalDecisionModal } from './RenewalDecisionModal'
+import { NewLeaseForEveryoneModal } from '../components/NewLeaseForEveryoneModal'
 import { LeavingModal, type LeavingLease } from '../components/LeavingModal'
 import { usePerms } from '../lib/permissions'
 
@@ -61,6 +62,8 @@ export function LeasesPage() {
   // W-7 (S531): renewal decision form — deep-linked from the dashboard
   // to-do's expiring-lease items via ?renew=<leaseId>.
   const [renewalLeaseId, setRenewalLeaseId] = useState<string | null>(null)
+  // S655: the park-wide sender — a new lease for every household at a property.
+  const [everyoneAt, setEveryoneAt] = useState<{ id: string; name: string } | null>(null)
   // S652 (Nic): "the leases page should be broken down like the sign page
   // where each property is a menu and when you click on it it drops down
   // everything for that." One folder per property, closed until opened; the
@@ -129,11 +132,11 @@ export function LeasesPage() {
   // opens the editable confirm form for staff who can edit — that row is
   // flagged for action, not reading. Lease details moved to the Details
   // row button.
-  // S640: discard an unsigned draft. Soft — the row stays, marked cancelled.
+  // S640: discard an unsigned draft. Soft — the row stays, marked canceled.
   const discardDraft = async (l: any) => {
     const where = [l.unitNumber, l.propertyName].filter(Boolean).join(' at ')
     if (!await appConfirm(
-      `The unsigned draft lease${where ? ` for ${where}` : ''} will be cancelled. `
+      `The unsigned draft lease${where ? ` for ${where}` : ''} will be canceled. `
       + 'It stays on record, and nothing is sent to anyone.',
       { title: 'Discard this draft?', confirmLabel: 'Discard draft', danger: true },
     )) return
@@ -170,6 +173,16 @@ export function LeasesPage() {
   // underneath his name and show all the documents."
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const currentLeases = (leases as any[]).filter(l => l.status === 'active' || l.status === 'pending')
+  // S655: a NEW LEASE the landlord has signed for a household already living
+  // here, keyed by the lease it follows — shown on that lease's row ("New lease
+  // Nov 1 · not signed yet"), whatever order the rows are in.
+  const newLeaseFor = new Map<string, any>()
+  for (const l of leases as any[]) {
+    if (l.supersedesLeaseId && l.signedByLandlord && (l.status === 'pending' || l.status === 'active')) {
+      newLeaseFor.set(l.supersedesLeaseId, l)
+    }
+  }
+  const shortDate = (d: any) => new Date(String(d).slice(0, 10) + 'T12:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
   // S536: count over CURRENT leases (matches the dashboard alert and the
   // default table) — a needs_review flag on an expired lease shouldn't
   // inflate a banner above rows that aren't shown.
@@ -307,6 +320,13 @@ export function LeasesPage() {
                           {g.leases.length} lease{g.leases.length === 1 ? '' : 's'}{active !== g.leases.length ? ` · ${active} active` : ''}
                         </span>
                       </span>
+                      {/* S655: a new lease for every household here, starting one date. */}
+                      {can('leases.create') && active > 0 && g.id !== 'none' && (
+                        <button className="btn btn-primary btn-sm" style={{ float: 'right', padding: '3px 10px', fontSize: '.72rem' }}
+                          onClick={e => { e.stopPropagation(); setEveryoneAt({ id: g.id, name: g.name }) }}>
+                          New lease for everyone…
+                        </button>
+                      )}
                     </td>
                   </tr>
                 )
@@ -438,6 +458,43 @@ export function LeasesPage() {
                           Leaving {new Date(l.endDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
                         </span>
                       )}
+                      {/* S655: the household's new lease, on the lease it follows. */}
+                      {newLeaseFor.has(l.id) && (() => {
+                        const n = newLeaseFor.get(l.id)
+                        // The server's call (new_lease_wont_start): this lease ended
+                        // early and nobody signed the new one — it never takes over.
+                        if (n.newLeaseWontStart) {
+                          return (
+                            <span className="badge badge-muted" style={{ marginLeft: 4 }}
+                              title="This lease ended early and nobody in the household signed the new lease that was to follow it, so that new lease never starts. It is canceled automatically — nothing to do.">
+                              New lease will be canceled
+                            </span>
+                          )
+                        }
+                        return (
+                          <span className="badge badge-gold" style={{ marginLeft: 4 }}
+                            title={`New lease at ${fmt(n.rentAmount)} a month. This lease carries on at today's rent until the day before it starts.${n.signedByTenant ? '' : ' The tenant has not signed it yet — it takes over on its date either way.'}`}>
+                            New lease {shortDate(n.startDate)}{n.signedByTenant ? '' : ' · tenant has not signed'}
+                          </span>
+                        )
+                      })()}
+                      {l.supersedesLeaseId && l.signedByLandlord && l.status === 'pending' && (l.newLeaseWontStart ? (
+                        <span className="badge badge-muted" style={{ marginLeft: 4 }}
+                          title="The lease before it ended early and nobody in the household signed this one, so it never takes over. It is canceled automatically. If money was already paid on it, it waits until that money is returned — GAM has been told; to speed it up, email support@goldassetmanagement.com.">
+                          Will be canceled — the lease before it ended early
+                        </span>
+                      ) : (
+                        <span className="badge badge-amber" style={{ marginLeft: 4 }}
+                          title="A new lease for a household already living here. It takes over on its start date whether or not they have signed.">
+                          Starts {shortDate(l.startDate)}{l.signedByTenant ? '' : ' · tenant has not signed'}
+                        </span>
+                      ))}
+                      {l.supersedesLeaseId && l.signedByLandlord && l.status === 'active' && !l.signedByTenant && (
+                        <span className="badge badge-amber" style={{ marginLeft: 4 }}
+                          title="This new lease is in force and billing; it stays open for the tenant's signature.">
+                          Tenant has not signed
+                        </span>
+                      )}
                     </td>
                     <td onClick={e => e.stopPropagation()}>
                       {/* S652 (Nic): "this page just feels like it has too much
@@ -455,10 +512,11 @@ export function LeasesPage() {
                         >
                           <Eye size={12} /> Details
                         </button>
-                        {can('leases.terminate') && (l.status === 'pending' || l.status === 'draft') && (
+                        {can('leases.terminate') && (l.status === 'pending' || l.status === 'draft')
+                          && !(l.supersedesLeaseId && l.signedByLandlord) && (
                           <button
                             className="btn btn-ghost btn-sm"
-                            title="Discard this unsigned draft — it stays on record as cancelled"
+                            title="Discard this unsigned draft — it stays on record as canceled"
                             onClick={() => discardDraft(l)}
                             style={{ padding: '3px 8px' }}
                           >
@@ -479,8 +537,27 @@ export function LeasesPage() {
                             ] : []),
                           ]} />
                         )}
-                        {(can('leases.edit') || can('leases.deposit_return') || can('front_desk.mark_leaving')) && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
+                        {(can('leases.edit') || can('leases.deposit_return') || can('front_desk.mark_leaving') || can('leases.create')) && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
                           <RowMenu label={<><ArrowRight size={12} /> Change</>} items={[
+                            // S655: a new lease from a date — month-to-month included.
+                            // Never on a stay booked at the front desk (a guest's
+                            // stay, changed from the booking). A signed fixed term
+                            // runs to its end, so its new lease starts the day after
+                            // or later — later, and the household stays on this one
+                            // at today's rent until then (never a gap). One already
+                            // holding over past its signed end is past its term: its
+                            // new lease can start on any day of the holdover.
+                            ...(can('leases.create') && l.status === 'active' && l.leaseSource !== 'booking_draft' ? [
+                              newLeaseFor.has(l.id)
+                                ? { label: 'New lease — view or cancel', hint: `Starts ${shortDate(newLeaseFor.get(l.id).startDate)}`, onClick: () => setRenewalLeaseId(l.id) }
+                                : { label: 'New lease from a date…',
+                                    hint: l.endDate && l.leaseType !== 'month_to_month' && l.holdoverSignedEndDate
+                                      ? `New rent or terms — the signed term ended ${shortDate(l.holdoverSignedEndDate)}; this lease runs until the new one starts`
+                                      : l.endDate && l.leaseType !== 'month_to_month'
+                                      ? `New rent or terms — from the day after this lease ends (${shortDate(l.endDate)}) or later`
+                                      : 'New rent or terms — this lease runs until the new one starts',
+                                    onClick: () => setRenewalLeaseId(l.id) },
+                            ] : []),
                             ...((can('leases.edit') || can('front_desk.mark_leaving')) && l.status === 'active' ? [
                               l.moveOutNoticeAt
                                 ? { label: 'Leaving date — change or call off', hint: `On file: ${new Date(l.endDate).toLocaleDateString()}`, onClick: () => setLeavingLease(toLeaving(l, tenantName)) }
@@ -531,6 +608,7 @@ export function LeasesPage() {
           disabled inputs). The editable needs-review confirm path keeps the
           full form. */}
       {renewalLeaseId && <RenewalDecisionModal leaseId={renewalLeaseId} onClose={closeRenewal} />}
+      {everyoneAt && <NewLeaseForEveryoneModal propertyId={everyoneAt.id} propertyName={everyoneAt.name} onClose={() => setEveryoneAt(null)} />}
       {modalOpen && editingLeaseId && (
         <LeaseOverviewModal leaseId={editingLeaseId} onClose={closeModal} />
       )}

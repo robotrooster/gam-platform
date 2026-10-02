@@ -124,22 +124,24 @@ describe('S640 onboarding waiver survives an unstamped invoice', () => {
   })
 })
 
-// S654 — the S638 rule ("if onboarding happens after the twentieth of the
-// month, they are exempt from late fees", system wide) was applied by the
-// nightly generator only. The invoice made at signing stamped work trade and
-// the existing-tenancy waiver, never the 20th, so the same resident was exempt
-// or fined depending on which path billed them first.
-describe('S638 at signing: the move-in invoice stamps like the nightly run', () => {
-  async function seedNewLease(startDate: string) {
+// Nic (10/2): the S638 "started after the 20th, no late fee" rule is gone. "That
+// late fee waiver was just my personal preference. Make that an onboarding
+// question... That should be a landlord preference, not a platform setting."
+// The bill made at signing (like the nightly run) is exempt only where the
+// property's onboarding answer waived an existing tenancy's first bill.
+describe('the first bill at signing: only the property\'s onboarding answer waives it', () => {
+  async function seedNewLease(startDate: string, opts: { existingTenancy?: boolean; waiver?: boolean | null } = {}) {
     const c = await db.connect()
     try {
       await c.query('BEGIN')
       const ll = await seedLandlord(c)
       const tenantId = await seedTenant(c)
       const propertyId = await seedProperty(c, { landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
-      await c.query(`UPDATE properties SET timezone=$2 WHERE id=$1`, [propertyId, TZ])
+      await c.query(`UPDATE properties SET timezone=$2, onboarding_late_fee_waiver=$3 WHERE id=$1`,
+        [propertyId, TZ, opts.waiver ?? null])
       const unitId = await seedUnit(c, { propertyId, landlordId: ll.landlordId })
       const leaseId = await seedLease(c, { unitId, landlordId: ll.landlordId, rentAmount: 900, startDate })
+      await c.query(`UPDATE leases SET is_existing_tenancy=$2 WHERE id=$1`, [leaseId, opts.existingTenancy ?? false])
       await seedLeaseTenant(c, { leaseId, tenantId })
       await c.query('COMMIT')
       return { landlordId: ll.landlordId, tenantId, unitId, leaseId }
@@ -164,25 +166,35 @@ describe('S638 at signing: the move-in invoice stamps like the nightly run', () 
      VALUES ($1,$2,$3,$4,'2026-08-01',900,900,$5)`,
     [s.landlordId, s.leaseId, s.unitId, `INV-${Math.random().toString(36).slice(2, 10)}`, status])
 
-  it('exempts a lease that started after the 20th', async () => {
-    const s = await seedNewLease('2026-09-25')
+  it('a new tenant who moved in after the 20th is not exempt — the calendar no longer decides', async () => {
+    const s = await seedNewLease('2026-09-25', { waiver: true })
+    expect(await moveIn(s, '2026-09-25')).toBe(false)
+  })
+
+  it('an existing tenancy signed on the 25th where the property never answered is not exempt', async () => {
+    const s = await seedNewLease('2026-09-25', { existingTenancy: true, waiver: null })
+    expect(await moveIn(s, '2026-09-25')).toBe(false)
+  })
+
+  it('an existing tenancy signed on the 25th where the landlord said no is not exempt', async () => {
+    const s = await seedNewLease('2026-09-25', { existingTenancy: true, waiver: false })
+    expect(await moveIn(s, '2026-09-25')).toBe(false)
+  })
+
+  it('an existing tenancy signed on the 25th where the landlord waived it is exempt', async () => {
+    const s = await seedNewLease('2026-09-25', { existingTenancy: true, waiver: true })
     expect(await moveIn(s, '2026-09-25')).toBe(true)
   })
 
-  it('does not exempt a lease that started on the 20th or earlier', async () => {
-    const s = await seedNewLease('2026-09-20')
-    expect(await moveIn(s, '2026-09-20')).toBe(false)
-  })
-
   // First bill only, as in the generator — and a voided bill is not a bill.
-  it('a voided earlier bill does not take the exemption away', async () => {
-    const s = await seedNewLease('2026-09-25')
+  it('a voided earlier bill does not take the waiver away', async () => {
+    const s = await seedNewLease('2026-09-25', { existingTenancy: true, waiver: true })
     await priorBill(s, 'void')
     expect(await moveIn(s, '2026-09-25')).toBe(true)
   })
 
   it('a real earlier bill does', async () => {
-    const s = await seedNewLease('2026-09-25')
+    const s = await seedNewLease('2026-09-25', { existingTenancy: true, waiver: true })
     await priorBill(s, 'settled')
     expect(await moveIn(s, '2026-09-25')).toBe(false)
   })

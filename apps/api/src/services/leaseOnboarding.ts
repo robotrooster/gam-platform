@@ -14,7 +14,7 @@
  */
 import { AppError } from '../middleware/errorHandler'
 import { landlordSigningContact } from './landlordSigningContact'
-import { BY_ROOM_LEASES_PER_BEDROOM } from '@gam/shared'
+import { BY_ROOM_LEASES_PER_BEDROOM, ROSTER_MAX_HOUSEHOLD } from '@gam/shared'
 import { resolveDefaultTemplateForUnit } from './templateResolve'
 import { createNotification } from './notifications'
 import { computeLeaseStart, computeLeaseEnd } from './leaseDates'
@@ -134,7 +134,16 @@ export async function autoDraftLeasesForUnit(
   // S653 (Nic): an approved screening already says when they want in and for
   // how long — the draft carries THAT, not the template's default term.
   terms?: DraftTermOverride,
-): Promise<{ draftedDocumentIds: string[] }> {
+  // S655: QUIET — the landlord is the one on the screen doing this (an invite
+  // or a roster confirm), so no "Lease drafted" or "could not draft" email
+  // goes to them; the reasons come back in `blocked` for the screen to show.
+  // A 75-unit roster confirm used to mean 75 emails to the person who had
+  // just pressed the button. The accept path, the hourly sweep and approvals
+  // keep the emails: nobody is watching a screen when those draft.
+  opts: { quiet?: boolean } = {},
+): Promise<{ draftedDocumentIds: string[]; blocked: string[] }> {
+  const quiet = opts.quiet === true
+  const blocked: string[] = []
   const unit = await client.query(
     // S654: available_date as text — a pg DATE arrives as local midnight, not a calendar day.
     `SELECT u.id, u.occupancy_mode, u.unit_number, u.available_date::text AS available_date,
@@ -146,6 +155,10 @@ export async function autoDraftLeasesForUnit(
   const landlord = await landlordSigner(client, unit.landlord_id, unitId)
 
   const notifyNeedsTemplate = async () => {
+    if (quiet) {
+      blocked.push(`No default lease is set for this kind of unit, so the lease for Unit ${unit.unit_number} could not be drafted. Set one in E-Sign, then it drafts on its own.`)
+      return
+    }
     await createNotification({
       userId: landlord.userId, type: 'lease_draft_blocked',
       title: 'Set a default lease template',
@@ -158,7 +171,7 @@ export async function autoDraftLeasesForUnit(
       sendEmail: true, emailTo: landlord.email,
     }).catch(() => {})
   }
-  if (!tmpl) { await notifyNeedsTemplate(); return { draftedDocumentIds: [] } }
+  if (!tmpl) { await notifyNeedsTemplate(); return { draftedDocumentIds: [], blocked } }
 
   const term = terms
     ? termPrefill(terms.monthToMonth ? null : (terms.termMonths ?? tmpl.default_term_months), terms.startDate ?? unit.available_date, unit.timezone)
@@ -241,7 +254,7 @@ export async function autoDraftLeasesForUnit(
       // another connection's uncommitted rows.
       const sent = false
 
-      await createNotification({
+      if (!quiet) await createNotification({
         userId: landlord.userId, type: 'lease_ready_to_sign',
         title: 'Lease drafted — ready for your signature',
         body: sent
@@ -261,6 +274,15 @@ export async function autoDraftLeasesForUnit(
       drafted.push(doc.id)
     } catch (err: any) {
       await client.query('ROLLBACK TO SAVEPOINT draft_one', []).catch(() => {})
+      if (quiet) {
+        // S655: a by-room unit drafts one lease per person, so one person's
+        // can draft while another's is refused. Name whose it is, so the
+        // screen and the agent can say which drafted and which did not.
+        const whose = unit.occupancy_mode === 'by_room'
+          ? ` (${members.map(m => `${m.first_name} ${m.last_name}`.trim()).join(', ')})` : ''
+        blocked.push(`The lease for Unit ${unit.unit_number}${whose} could not be drafted: ${err?.message || 'unexpected error'}. This is usually the unit's default lease missing a required field. Fix it, then it drafts on its own.`)
+        return
+      }
       await createNotification({
         userId: landlord.userId, type: 'lease_draft_blocked',
         title: 'Lease could not be drafted automatically',
@@ -296,10 +318,14 @@ export async function autoDraftLeasesForUnit(
     // whole_unit: one shared lease for the household as it stands, if none is
     // drafted yet. Adding a co-tenant voids an UNSIGNED draft upstream, so
     // draft_document_id being null here is still the re-draft signal.
-    if (roster.length === 0) return { draftedDocumentIds: [] }
+    if (roster.length === 0) return { draftedDocumentIds: [], blocked }
     const alreadyDrafted = roster.some(m => m.draft_document_id)
     if (!alreadyDrafted) {
-      if (roster.length > 4) {
+      if (roster.length > ROSTER_MAX_HOUSEHOLD) {
+        if (quiet) {
+          blocked.push(`Unit ${unit.unit_number} has ${roster.length} people on one lease; a lease drafts itself for up to ${ROSTER_MAX_HOUSEHOLD}. Draft this one by hand in E-Sign.`)
+          return { draftedDocumentIds: [], blocked }
+        }
         await createNotification({
           userId: landlord.userId, type: 'lease_draft_blocked',
           title: 'Too many co-tenants to auto-draft',
@@ -308,10 +334,10 @@ export async function autoDraftLeasesForUnit(
           actionUrl: '/esign',
           sendEmail: true, emailTo: landlord.email,
         }).catch(() => {})
-        return { draftedDocumentIds: [] }
+        return { draftedDocumentIds: [], blocked }
       }
       await draftFor(roster, `Lease — Unit ${unit.unit_number} — ${unit.property_name}`)
     }
   }
-  return { draftedDocumentIds: drafted }
+  return { draftedDocumentIds: drafted, blocked }
 }

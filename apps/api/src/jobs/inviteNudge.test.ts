@@ -75,4 +75,65 @@ describe('nudgeExpiringInvites', () => {
     await seedInvite({ expiresInDays: 2, nudgedDaysAgo: 3 })
     expect((await nudgeExpiringInvites()).nudged).toBe(1)
   })
+
+  // S655: since S647 the lease drafts at invite and waits for the LANDLORD's
+  // signature; the tenant hears nothing until he signs, and from then on the
+  // e-sign reminders carry the signing link. "Your invite is expiring" about a
+  // lease nobody has signed yet went out 38 times since 9/1.
+  async function withDraft(intentUnitId: string, landlordId: string, status: string) {
+    const d = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status)
+       VALUES ($1, $2, 'Lease', 'original_lease', $3) RETURNING id`, [landlordId, intentUnitId, status])).rows[0]
+    await db.query(`UPDATE pending_tenant_intents SET draft_document_id = $1 WHERE unit_id = $2`, [d.id, intentUnitId])
+  }
+
+  it('an invite whose lease is drafted and waiting on the landlord is never nudged', async () => {
+    const s = await seedInvite({ expiresInDays: 2 })
+    await withDraft(s.unitId, s.landlordId, 'pending')
+    expect((await nudgeExpiringInvites()).nudged).toBe(0)
+    expect(emailTenantInviteReminder).not.toHaveBeenCalled()
+  })
+
+  it('nor once the landlord has signed — the e-sign reminders own that lease', async () => {
+    const s = await seedInvite({ expiresInDays: 2 })
+    await withDraft(s.unitId, s.landlordId, 'in_progress')
+    expect((await nudgeExpiringInvites()).nudged).toBe(0)
+  })
+
+  it('a voided draft no longer counts: the plain invite is nudged again', async () => {
+    const s = await seedInvite({ expiresInDays: 2 })
+    await withDraft(s.unitId, s.landlordId, 'voided')
+    expect((await nudgeExpiringInvites()).nudged).toBe(1)
+  })
+
+  // The old job read TENANT_APP_URL once, at import, with a localhost
+  // fallback; in production with the variable missing every reminder linked to
+  // localhost. Both cases are pinned here, with the environment set per test.
+  async function linkWith(env: { NODE_ENV?: string; TENANT_APP_URL?: string }): Promise<string> {
+    const saved = { NODE_ENV: process.env.NODE_ENV, TENANT_APP_URL: process.env.TENANT_APP_URL }
+    try {
+      for (const [k, v] of Object.entries(env)) {
+        if (v === undefined) delete (process.env as any)[k]; else (process.env as any)[k] = v
+      }
+      await seedInvite({ expiresInDays: 2 })
+      await nudgeExpiringInvites()
+      return (emailTenantInviteReminder as any).mock.calls[0][4] as string
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete (process.env as any)[k]; else (process.env as any)[k] = v
+      }
+    }
+  }
+
+  it('the reminder link goes to the tenant portal the server is configured with', async () => {
+    const url = await linkWith({ TENANT_APP_URL: 'https://tenant.portal.example/' })
+    expect(url).toMatch(/^https:\/\/tenant\.portal\.example\/accept-invite\?token=tok-/)
+  })
+
+  it('in production with the variable missing, the link is the real tenant portal, never localhost', async () => {
+    const url = await linkWith({ NODE_ENV: 'production', TENANT_APP_URL: undefined })
+    expect(url).not.toMatch(/localhost/)
+    expect(url).toMatch(/^https:\/\/tenant\.goldassetmanagement\.com\/accept-invite\?token=tok-/)
+  })
 })
+

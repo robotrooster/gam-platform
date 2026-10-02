@@ -42,6 +42,7 @@ import { netAgainstDisbursement, markBalance } from './landlordGamAccount'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
 import { lockHeldItems, stampHeldItems } from './heldPayouts'
+import { lockPayoutCut } from './payoutCut'
 
 export interface PassthroughResult {
   attempted:        boolean
@@ -309,18 +310,26 @@ async function reservePlatformHeldBatch(
     }).catch(() => {})
 
     // Create the durable intent. For a fully-netted batch there is no Stripe
-    // Transfer to make, so it's born already 'transferred'.
+    // Transfer to make, so it's born already 'transferred' — and dated here,
+    // so it follows the same rule as confirmIntent (services/payoutCut.ts):
+    // take the account's cut lock first (a payout taking its cut waits for
+    // this to commit), then date it by the database clock at the moment it is
+    // written. Dated by the app's clock without the lock, it could sit before
+    // a sweep's cut yet commit after that sweep looked: in no payout, ever,
+    // with the payments netted inside it listed nowhere.
+    if (fullyNetted) await lockPayoutCut(client, landlordRow.stripe_connect_account_id)
     const intentRow = await client.query<{ id: string }>(
       `INSERT INTO platform_transfer_intents
          (landlord_id, landlord_user_id, destination_connect_account_id,
           amount, gross_owed, netted_amount, status, stripe_transfer_id, transferred_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,
+               CASE WHEN $7::text = 'transferred' THEN clock_timestamp() END)
        RETURNING id`,
       [
         landlordRow.landlord_id, landlordUserId, landlordRow.stripe_connect_account_id,
         transferAmount, owed, netted,
         fullyNetted ? 'transferred' : 'pending',
-        null, fullyNetted ? new Date() : null,
+        null,
       ]
     )
     const intentId = intentRow.rows[0].id
@@ -455,11 +464,22 @@ async function confirmIntent(intentId: string, transferId: string): Promise<void
   const client = await getClient()
   try {
     await client.query('BEGIN')
+    // S655 review: a GAM payout carries every transfer dated before its cut,
+    // and the next payout starts at that cut (services/payoutCut.ts). NOW() is
+    // when this transaction BEGAN, and the row is invisible until it commits —
+    // begun before a cut and committed after the payout looked, a transfer was
+    // in neither payout, for good. So take the account's cut lock first (a
+    // payout taking its cut waits for this to commit), then date the transfer
+    // by the clock at the moment it is written.
+    const dest = (await client.query<{ destination_connect_account_id: string | null }>(
+      `SELECT destination_connect_account_id FROM platform_transfer_intents WHERE id = $1`,
+      [intentId])).rows[0]?.destination_connect_account_id
+    if (dest) await lockPayoutCut(client, dest)
     // Only advance a still-pending intent (concurrent execute/recover safe).
     const upd = await client.query(
       `UPDATE platform_transfer_intents
           SET status = 'transferred', stripe_transfer_id = $1,
-              transferred_at = COALESCE(transferred_at, NOW()), updated_at = NOW()
+              transferred_at = COALESCE(transferred_at, clock_timestamp()), updated_at = NOW()
         WHERE id = $2 AND status = 'pending'
         RETURNING id`,
       [transferId, intentId]

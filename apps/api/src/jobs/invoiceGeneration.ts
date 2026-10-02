@@ -54,8 +54,10 @@ interface ActiveLease {
   supersedes_lease_id?: string | null
   predecessor_end_date?: string | null
   predecessor_due_day?: number | null
-  // On the OLD lease: the start of a fully signed renewal of it. It never
-  // bills on or after that day, whatever order the jobs run in.
+  // On the OLD lease: the start of a landlord-signed new lease of it (signed
+  // by the tenant or not — Nic, 10/2). Its last day is the day before: it never
+  // bills on or after that day, and a term that ended sooner holds over to it
+  // (decisions 10/2 #7) — whatever order the jobs run in.
   successor_start_date?: string | null
 }
 
@@ -249,16 +251,25 @@ export async function generateFinalUtilityInvoice(
  */
 const RENEWAL_COLUMNS = `
            l.supersedes_lease_id,
-           to_char(pl.end_date, 'YYYY-MM-DD') AS predecessor_end_date,
+           -- The lease this one follows ran to the day before this one started:
+           -- a signed term that ended sooner HELD OVER at its old rent until then
+           -- (decisions 10/2 #7 — never a gap; the old lease's bills below), so
+           -- this lease's schedule picks up from there, not from the printed end.
+           to_char(CASE WHEN pl.end_date IS NOT NULL AND pl.end_date < l.start_date - 1
+                         AND l.lease_source = 'esigned'
+                        THEN l.start_date - 1 ELSE pl.end_date END, 'YYYY-MM-DD') AS predecessor_end_date,
            pl.rent_due_day AS predecessor_due_day,
-           -- A renewal of THIS lease that everyone has signed. Only then does
-           -- the new lease own the dates from its start on; an unsigned one can
-           -- still be cancelled, and the old lease must keep billing if it is.
+           -- A new lease of THIS household that the landlord has signed. Nic
+           -- (10/2): "they always get charged the new rent, whether or not they
+           -- sign it... the old one is expired." From its start date the new
+           -- lease owns the dates, signed by the tenant or not; a landlord who
+           -- cancels it before then takes it out of this list (it is no longer
+           -- pending or active), and the old lease bills on as before.
            (SELECT to_char(MIN(s.start_date), 'YYYY-MM-DD') FROM leases s
              WHERE s.supersedes_lease_id = l.id
                AND s.lease_source = 'esigned'
                AND s.status IN ('pending', 'active')
-               AND s.signed_by_landlord AND s.signed_by_tenant) AS successor_start_date`
+               AND s.signed_by_landlord) AS successor_start_date`
 
 /**
  * S648: ONE lease query for every generator. There were three copies, and the
@@ -327,9 +338,19 @@ export function billDatesForLease(
 ): { dueDates: string[]; rentForDate: Record<string, string> } {
   const none = { dueDates: [] as string[], rentForDate: {} as Record<string, string> }
   const leaseStart = DateTime.fromISO(lease.start_date, { zone: lease.property_tz })
-  const leaseEnd = lease.end_date
-    ? DateTime.fromISO(lease.end_date, { zone: lease.property_tz })
-    : null
+  // The lease's last day. RENEWAL (Nic's rule): with a landlord-signed new
+  // lease to follow, it is the day before that one starts — whatever the
+  // printed end date says, and whatever order tonight's jobs run in (a
+  // property's 7am run can land before the 2am lease-end job, or that job can
+  // miss a night). Both ways: a lease printed past the new start bills nothing
+  // on or after it, and a signed term that ran out BEFORE the new start holds
+  // over and keeps billing its old rent until the day before (decisions 10/2
+  // #7: there is never a stretch with no lease).
+  const leaseEnd = lease.successor_start_date
+    ? DateTime.fromISO(lease.successor_start_date, { zone: lease.property_tz }).minus({ days: 1 })
+    : lease.end_date
+      ? DateTime.fromISO(lease.end_date, { zone: lease.property_tz })
+      : null
 
   let windowStart: DateTime
   let windowEnd: DateTime
@@ -343,15 +364,6 @@ export function billDatesForLease(
     const catchupStart = todayInTz.minus({ days: CATCHUP_DAYS })
     windowStart = catchupStart > leaseStart ? catchupStart : leaseStart
     windowEnd = leaseEnd && leaseEnd < todayInTz ? leaseEnd : todayInTz
-  }
-
-  // RENEWAL (Nic's rule): the old lease bills every due date up to its last
-  // day and never one on or after the renewal's start — whatever its printed
-  // end date says, and whatever order tonight's jobs run in (a property's 7am
-  // run can land before the 2am lease-end job, or that job can miss a night).
-  if (lease.successor_start_date) {
-    const lastDay = DateTime.fromISO(lease.successor_start_date, { zone: lease.property_tz }).minus({ days: 1 })
-    if (lastDay < windowEnd) windowEnd = lastDay
   }
 
   if (windowEnd < windowStart) return none
@@ -1021,26 +1033,14 @@ async function runGeneration(
         // Insert invoice — ON CONFLICT short-circuits whole cycle if already exists.
         // total_amount is NET of the work-trade credit; the credit + driving
         // agreement are stamped for audit + tenant/landlord display.
-        // ── S638 (Nic, DIRECTIVE): ONBOARDED LATE IN THE MONTH, NO LATE FEE ──
+        // ── THE FIRST BILL'S LATE FEE IS THE LANDLORD'S CALL (Nic, 10/2) ──────
         //
-        //   "We onboarded too close to the end of the month for people to be
-        //    able to be set up and paid on time. So system wide, if onboarding
-        //    happens after the twentieth of the month, they are exempt from late
-        //    fees, so they have time to get set up."
-        //
-        // A resident who signs on the 29th has days to accept a portal invite,
-        // verify an email, set a password, link a bank and have an ACH clear
-        // before rent falls due on the 1st. ACH alone takes about four business
-        // days. Charging them for that is charging them for our own timing —
-        // nine residents each collected nine daily $5 fees this cycle, $405 in
-        // total, every one of them onboarding.
-        //
-        // Platform-wide rather than a per-landlord switch: the reason is the
-        // calendar, not a landlord's generosity, and it is true at every park
-        // on the platform. It applies to the FIRST cycle only — by the second,
-        // they have had a full month to get set up.
-        const startedAfter20th = DateTime
-          .fromISO(lease.start_date, { zone: lease.property_tz }).day > 20
+        // S638 exempted every lease that started after the 20th, platform-wide.
+        // Nic, 10/2: "that late fee waiver was just my personal preference. Make
+        // that an onboarding question... That should be a landlord preference,
+        // not a platform setting." So the calendar no longer decides anything
+        // here: only the property's onboarding answer does (below), and only for
+        // an existing tenancy's first bill. A renewal is never exempt.
         const priorInvoice = await client.query<{ n: string }>(
           // S654: a voided history invoice is not a prior bill (see lateFees.ts).
           `SELECT COUNT(*)::text AS n FROM invoices WHERE lease_id = $1 AND due_date < $2::date AND status <> 'void'`,
@@ -1073,11 +1073,9 @@ async function runGeneration(
         const onboardingWaived =
           lease.is_existing_tenancy === true && lease.onboarding_late_fee_waiver === true
         // A renewal is not an onboarding: the resident has been set up and
-        // paying here for a whole lease. The after-the-20th grace exists for
-        // people who have days to get set up, and a renewal starting the 25th
-        // is nobody's first bill.
-        const lateStartExempt =
-          isFirstInvoice && (onboardingWaived || (startedAfter20th && !renewal))
+        // paying here for a whole lease, and a new lease is nobody's first bill
+        // on the platform. (Renewals never carry is_existing_tenancy either.)
+        const lateStartExempt = isFirstInvoice && onboardingWaived && !renewal
 
         const invoiceRes = await client.query(
           `INSERT INTO invoices (

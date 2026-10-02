@@ -1036,55 +1036,65 @@ describe('generateLateFeesForTimezone', () => {
   })
 })
 
-// ─── S638: onboarded after the 20th → first cycle carries no late fee ────────
+// ─── The first bill's late fee is the LANDLORD's call (Nic, 10/2) ───────────
 //
-// Nic: "We onboarded too close to the end of the month for people to be able to
-// be set up and paid on time. So system wide, if onboarding happens after the
-// twentieth of the month, they are exempt from late fees, so they have time to
-// get set up."
-//
-// A resident signing on the 29th has days to accept an invite, verify an email,
-// set a password, link a bank and clear an ACH before rent falls due — and ACH
-// alone takes about four business days. Nine residents each took nine daily $5
-// fees this cycle, $405 in total, every one of them still onboarding.
-describe('S638 late-start onboarding is exempt from late fees', () => {
-  it('exempts the first cycle for a lease that started after the 20th', async () => {
-    const stack = await buildLeaseStack({
-      rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-29',
-    })
-    await generateInvoices(new Date('2026-05-05T12:00:00Z'))
-    const { rows } = await db.query<{ late_fee_exempt: boolean; due_date: string }>(
-      `SELECT late_fee_exempt, due_date::text FROM invoices
-        WHERE lease_id=$1 ORDER BY due_date`, [stack.leaseId])
-    expect(rows.length).toBeGreaterThan(0)
-    expect(rows[0].late_fee_exempt).toBe(true)
-  })
-
-  it('does not exempt a lease that started early in the month', async () => {
-    const stack = await buildLeaseStack({
-      rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-05',
-    })
-    await generateInvoices(new Date('2026-05-05T12:00:00Z'))
-    const { rows } = await db.query<{ late_fee_exempt: boolean }>(
-      `SELECT late_fee_exempt FROM invoices WHERE lease_id=$1 ORDER BY due_date`,
-      [stack.leaseId])
-    expect(rows.length).toBeGreaterThan(0)
-    expect(rows.every(r => r.late_fee_exempt === false)).toBe(true)
-  })
-
-  // The exemption buys setup time, not a standing discount — by the second
-  // cycle they have had a full month.
-  it('covers the FIRST cycle only', async () => {
-    const stack = await buildLeaseStack({
-      rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-29',
-    })
+// S638 made "started after the 20th → no late fee on the first bill" a platform
+// rule. Nic, 10/2: "that late fee waiver was just my personal preference. Make
+// that an onboarding question... That should be a landlord preference, not a
+// platform setting." Only properties.onboarding_late_fee_waiver decides now, and
+// only for an existing tenancy's first bill. A renewal is never exempt.
+describe('the first bill is exempt only where the property waived it for onboarding', () => {
+  async function firstBills(stack: LeaseStack, opts: { existing: boolean; waiver: boolean | null }) {
+    await db.query(`UPDATE properties SET onboarding_late_fee_waiver=$2 WHERE id=$1`, [stack.propertyId, opts.waiver])
+    await db.query(`UPDATE leases SET is_existing_tenancy=$2 WHERE id=$1`, [stack.leaseId, opts.existing])
     await generateInvoices(new Date('2026-05-05T12:00:00Z'))   // first cycle
     await generateInvoices(new Date('2026-06-05T12:00:00Z'))   // second
     const { rows } = await db.query<{ late_fee_exempt: boolean; due_date: string }>(
       `SELECT late_fee_exempt, due_date::text FROM invoices
         WHERE lease_id=$1 ORDER BY due_date`, [stack.leaseId])
+    return rows
+  }
+
+  it('an existing tenancy signed on the 25th, property never answered: the first bill is NOT exempt', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-25' })
+    const rows = await firstBills(stack, { existing: true, waiver: null })
+    expect(rows.length).toBeGreaterThan(0)
+    expect(rows.every(r => r.late_fee_exempt === false)).toBe(true)
+  })
+
+  it('an existing tenancy signed on the 25th, landlord said no: the first bill is NOT exempt', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-25' })
+    const rows = await firstBills(stack, { existing: true, waiver: false })
+    expect(rows.every(r => r.late_fee_exempt === false)).toBe(true)
+  })
+
+  it('an existing tenancy signed on the 25th, landlord waived it: the FIRST bill only is exempt', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-25' })
+    const rows = await firstBills(stack, { existing: true, waiver: true })
     expect(rows.length).toBeGreaterThan(1)
     expect(rows[0].late_fee_exempt).toBe(true)
     expect(rows[rows.length - 1].late_fee_exempt).toBe(false)
+  })
+
+  it('a new tenant who moved in after the 20th is not exempt — the calendar no longer decides', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-29' })
+    const rows = await firstBills(stack, { existing: false, waiver: true })
+    expect(rows.length).toBeGreaterThan(0)
+    expect(rows.every(r => r.late_fee_exempt === false)).toBe(true)
+  })
+
+  it('a renewal is never exempt, even at a property that waives onboarding first bills', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-25' })
+    // The lease it follows, ended the day before; the renewal links to it. Even
+    // flagged as an existing tenancy (it never is), a renewal is nobody's first bill.
+    const prev = await db.query<{ id: string }>(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date,
+                           rent_due_day, signed_by_landlord, signed_by_tenant)
+       VALUES ($1,$2,1000,'month_to_month','expired','2025-01-01','2026-04-24',1,TRUE,TRUE) RETURNING id`,
+      [stack.unitId, stack.landlordId])
+    await db.query(`UPDATE leases SET supersedes_lease_id=$2 WHERE id=$1`, [stack.leaseId, prev.rows[0].id])
+    const rows = await firstBills(stack, { existing: true, waiver: true })
+    expect(rows.length).toBeGreaterThan(0)
+    expect(rows.every(r => r.late_fee_exempt === false)).toBe(true)
   })
 })

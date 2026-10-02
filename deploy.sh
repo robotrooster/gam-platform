@@ -86,7 +86,7 @@ $CHECK_ONLY && echo "${DIM}check-only — nothing will be changed${OFF}"
 # The gate runs FIRST — before the shared build, before the API build — because
 # the point is to fail before anything is published, not after.
 if $CHECK_ONLY; then
-  echo; echo "── tests ──"; warn "would run the API suite (skipped in --check)"
+  echo; echo "── tests ──"; warn "would run the API and tenant portal suites (skipped in --check)"
 elif $SKIP_TESTS; then
   echo; echo "── tests ──"
   bad "SKIPPED (--skip-tests). You are shipping code nothing verified."
@@ -101,6 +101,20 @@ else
     grep -E "FAIL|✕|Tests +[0-9]+ failed" /tmp/gam-deploy-tests.log | head -20
     echo
     echo "Full output: /tmp/gam-deploy-tests.log"
+    echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
+    exit 1
+  fi
+  # S655 review: the tenant portal's own tests (apps/tenant/vitest.config.ts) —
+  # its screens' wording and behavior, which nothing else runs. No database.
+  echo; echo "── tests (tenant portal) ──"
+  if (cd apps/tenant && npx vitest run --reporter=dot) >/tmp/gam-deploy-tests-tenant.log 2>&1; then
+    ok "$(grep -oE '[0-9]+ passed' /tmp/gam-deploy-tests-tenant.log | tail -1) — suite green"
+  else
+    bad "TENANT TESTS FAILED — nothing has been deployed."
+    echo
+    grep -E "FAIL|✕|Tests +[0-9]+ failed" /tmp/gam-deploy-tests-tenant.log | head -20
+    echo
+    echo "Full output: /tmp/gam-deploy-tests-tenant.log"
     echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
     exit 1
   fi

@@ -284,6 +284,8 @@ describe('S380: avatar XSS strong fix', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.url).toMatch(/\.jpg$/)
     expect(res.body.data.url).not.toMatch(/\.html$/)
+    // S655: the upload answers with the photo's address and nothing else.
+    expect(Object.keys(res.body.data)).toEqual(['url'])
     // Track the file for afterAll cleanup
     const onDiskName = res.body.data.url.split('/').pop()
     cleanupTargets.push(path.join(process.cwd(), 'uploads', 'avatars', onDiskName))

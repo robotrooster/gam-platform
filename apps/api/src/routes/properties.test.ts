@@ -23,6 +23,7 @@ import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
+import type { PoolClient } from 'pg'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedManager, seedUnit,
@@ -381,6 +382,59 @@ describe('PATCH /api/properties/:id — late-fee accrual all-or-nothing', () => 
       .send({ lateFeeAccrualAmount: 5 })  // missing type + period
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/accrual requires all of amount, type, and period/)
+  })
+
+  // S655: the check used to run after the rest of the save had committed, and
+  // the address audit row was written before the save even started — so this
+  // 400 came back with the rename and the new street already saved and logged.
+  it('a refused accrual saves none of the request: no rename, no address change, no address audit row', async () => {
+    const f = await seedPropsFixture()
+    const prop = await createProperty(f)
+    const id = prop.body.data.id as string
+    const res = await request(buildApp())
+      .patch(`/api/properties/${id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ name: 'Renamed', street1: '42 New Road', lateFeeGraceDays: 9, lateFeeAccrualAmount: 5 })
+    expect(res.status).toBe(400)
+    const { rows: [p] } = await db.query(
+      `SELECT name, street1, late_fee_grace_days, late_fee_accrual_amount FROM properties WHERE id = $1`, [id])
+    expect(p.name).toBe('Test Prop')
+    expect(p.street1).toBe(prop.body.data.street1)
+    expect(p.late_fee_grace_days).toBe(prop.body.data.late_fee_grace_days)
+    expect(p.late_fee_accrual_amount).toBeNull()
+    const { rows: audits } = await db.query(
+      `SELECT 1 FROM audit_log WHERE action = 'property_address_changed' AND entity_id = $1`, [id])
+    expect(audits).toHaveLength(0)
+
+    // The same request with the whole triple saves all of it together.
+    const ok = await request(buildApp())
+      .patch(`/api/properties/${id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ name: 'Renamed', street1: '42 New Road', lateFeeGraceDays: 9,
+              lateFeeAccrualAmount: 5, lateFeeAccrualType: 'flat', lateFeeAccrualPeriod: 'daily' })
+    expect(ok.status).toBe(200)
+    expect(ok.body.data.name).toBe('Renamed')
+    expect(ok.body.data.street1).toBe('42 New Road')
+    expect(ok.body.data.late_fee_grace_days).toBe(9)
+    expect(Number(ok.body.data.late_fee_accrual_amount)).toBe(5)
+    const { rows: logged } = await db.query(
+      `SELECT old_value, new_value FROM audit_log WHERE action = 'property_address_changed' AND entity_id = $1`, [id])
+    expect(logged).toHaveLength(1)
+    expect(logged[0].old_value.street1).toBe(prop.body.data.street1)
+    expect(logged[0].new_value.street1).toBe('42 New Road')
+  })
+
+  it('a property that already has the accrual set accepts a change to just one part of it', async () => {
+    const f = await seedPropsFixture()
+    const prop = await createProperty(f)
+    const id = prop.body.data.id as string
+    await request(buildApp()).patch(`/api/properties/${id}`).set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeAccrualAmount: 5, lateFeeAccrualType: 'flat', lateFeeAccrualPeriod: 'daily' })
+    const res = await request(buildApp()).patch(`/api/properties/${id}`).set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeAccrualAmount: 7 })
+    expect(res.status).toBe(200)
+    expect(Number(res.body.data.late_fee_accrual_amount)).toBe(7)
+    expect(res.body.data.late_fee_accrual_period).toBe('daily')
   })
 
   it('full accrual triple → 200', async () => {
@@ -872,6 +926,43 @@ describe('S631/S649 property address changes', () => {
     expect(after.rows[0].name).toBe('Renamed Park')
     expect(after.rows[0].street1).toBe(cur.rows[0].street1)
   })
+
+  // The edit form always sends the suite line, blank when there is none. A
+  // blank one used to be ignored, so a wrong suite line could never be
+  // removed, while the audit row recorded it as removed.
+  it('a blank suite line clears it (audited); re-sending the same suite line, or leaving it out, keeps it', async () => {
+    const app = buildApp()
+    const fx = await seedPropsFixture()
+    const c = await db.connect()
+    let propertyId = ''
+    try {
+      propertyId = await seedProperty(c, { landlordId: fx.landlordId, ownerUserId: fx.landlordUserId, managedByUserId: fx.landlordUserId })
+    } finally { c.release() }
+    await db.query(`UPDATE properties SET street2 = 'Suite 5' WHERE id = $1`, [propertyId])
+    const suite = async () => (await db.query<{ street2: string | null }>(
+      `SELECT street2 FROM properties WHERE id = $1`, [propertyId])).rows[0].street2
+    const audits = async () => (await db.query(
+      `SELECT old_value, new_value FROM audit_log WHERE action = 'property_address_changed' AND entity_id = $1`,
+      [propertyId])).rows
+
+    const same = await request(app).patch(`/api/properties/${propertyId}`)
+      .set('Authorization', `Bearer ${fx.landlordToken}`).send({ name: 'Park', street2: 'Suite 5' })
+    expect(same.status).toBe(200)
+    expect(await suite()).toBe('Suite 5')
+    const omitted = await request(app).patch(`/api/properties/${propertyId}`)
+      .set('Authorization', `Bearer ${fx.landlordToken}`).send({ name: 'Park Two' })
+    expect(omitted.status).toBe(200)
+    expect(await suite()).toBe('Suite 5')
+    expect(await audits()).toHaveLength(0)
+
+    const cleared = await request(app).patch(`/api/properties/${propertyId}`)
+      .set('Authorization', `Bearer ${fx.landlordToken}`).send({ street2: '' })
+    expect(cleared.status).toBe(200)
+    expect(await suite()).toBeNull()
+    const logged = await audits()
+    expect(logged).toHaveLength(1)
+    expect(logged[0].old_value.street2).toBe('Suite 5')
+  })
 })
 
 describe('S649 an address change cannot land on another landlord\'s property', () => {
@@ -892,6 +983,67 @@ describe('S649 an address change cannot land on another landlord\'s property', (
       .send({ street1: t.street1, city: t.city, state: t.state })
     expect(res.status).toBe(409)
     expect(String(res.body.error)).toMatch(/already registered/i)
+  })
+
+  // S655: the suite line is now cleared by a blank OR null one, but the check
+  // read a null as "suite unchanged". A property registered as Suite 5 at
+  // another landlord's street could drop its suite with {street2: null} and
+  // sit on their address.
+  it('clearing the suite line is refused when the street without it belongs to someone else, sent as null or blank', async () => {
+    const app = buildApp()
+    const fx = await seedPropsFixture()
+    const other = await seedPropsFixture()
+    const client = await db.connect()
+    let mine = '', theirs = ''
+    try {
+      mine = await seedProperty(client, { landlordId: fx.landlordId, ownerUserId: fx.landlordUserId, managedByUserId: fx.landlordUserId })
+      theirs = await seedProperty(client, { landlordId: other.landlordId, ownerUserId: other.landlordUserId, managedByUserId: other.landlordUserId })
+    } finally { client.release() }
+    await db.query(`UPDATE properties SET street1 = '77 Shared Rd', street2 = NULL WHERE id = $1`, [theirs])
+    await db.query(`UPDATE properties SET street1 = '77 Shared Rd', street2 = 'Suite 5' WHERE id = $1`, [mine])
+    const stored = async () => (await db.query<{ street1: string; street2: string | null }>(
+      `SELECT street1, street2 FROM properties WHERE id = $1`, [mine])).rows[0]
+    const moves = async () => (await db.query(
+      `SELECT 1 FROM audit_log WHERE action = 'property_address_changed' AND entity_id = $1`, [mine])).rows
+
+    for (const street2 of [null, '']) {
+      const res = await request(app).patch(`/api/properties/${mine}`)
+        .set('Authorization', `Bearer ${fx.landlordToken}`).send({ street2 })
+      expect(res.status, `street2=${JSON.stringify(street2)}`).toBe(409)
+      expect(String(res.body.error)).toMatch(/already registered/i)
+      expect(await stored()).toEqual({ street1: '77 Shared Rd', street2: 'Suite 5' })
+    }
+    expect(await moves()).toHaveLength(0)
+    const alerts = await db.query(
+      `SELECT 1 FROM admin_notifications WHERE category = 'duplicate_property_claim' AND context->>'propertyId' = $1`, [mine])
+    expect(alerts.rows).toHaveLength(2)
+
+    // A different suite is still fine, and is recorded as the change it is.
+    const moved = await request(app).patch(`/api/properties/${mine}`)
+      .set('Authorization', `Bearer ${fx.landlordToken}`).send({ street2: 'Suite 6' })
+    expect(moved.status).toBe(200)
+    expect((await stored()).street2).toBe('Suite 6')
+    expect(await moves()).toHaveLength(1)
+  })
+
+  // A blank street, city or state is not stored (the save keeps the current
+  // one), so it is neither checked nor logged as a move.
+  it('a blank street line keeps the address and is not recorded as a move', async () => {
+    const app = buildApp()
+    const fx = await seedPropsFixture()
+    const client = await db.connect()
+    let mine = ''
+    try {
+      mine = await seedProperty(client, { landlordId: fx.landlordId, ownerUserId: fx.landlordUserId, managedByUserId: fx.landlordUserId })
+    } finally { client.release() }
+    const res = await request(app).patch(`/api/properties/${mine}`)
+      .set('Authorization', `Bearer ${fx.landlordToken}`).send({ street1: '', city: '' })
+    expect(res.status).toBe(200)
+    const { rows: [p] } = await db.query(`SELECT street1, city FROM properties WHERE id = $1`, [mine])
+    expect(p).toEqual({ street1: '1 Test St', city: 'Phoenix' })
+    const audit = await db.query(
+      `SELECT 1 FROM audit_log WHERE action = 'property_address_changed' AND entity_id = $1`, [mine])
+    expect(audit.rows).toHaveLength(0)
   })
 })
 
@@ -999,6 +1151,199 @@ describe('PATCH /api/properties/:id — owner signing routing is owner-only', ()
     const { rows: notes } = await db.query(
       `SELECT 1 FROM admin_notifications WHERE context->>'propertyId' = $1`, [propertyId])
     expect(notes).toHaveLength(0)
+  })
+
+  // The new address, its audit row and the move of the owner's open seats are
+  // one transaction with the rest of the save. The address used to be stored
+  // first and the seats moved in a second step, so a failure there returned
+  // 500 with the new address already saved, no audit row, and the old inbox's
+  // link still signing as the owner.
+  it('when moving the owner\'s open seats fails, nothing is saved: address, other fields, audit row and seat stay as they were', async () => {
+    const { f, propertyId } = await withManager()
+    await db.query(`UPDATE properties SET lease_signing_email='office@park.test' WHERE id=$1`, [propertyId])
+    const c = await db.connect()
+    let unitId = ''
+    try { unitId = await seedUnit(c, { propertyId, landlordId: f.landlordId }) } finally { c.release() }
+    const { rows: [doc] } = await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, status)
+       VALUES ($1, $2, 'Lease', 'sent') RETURNING id`, [f.landlordId, unitId])
+    await db.query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, token, status)
+       VALUES ($1, $2, 'landlord', 'Owner', 'office@park.test', 'tok-before-change', 'sent')`,
+      [doc.id, f.landlordUserId])
+    const seat = async () => (await db.query(
+      `SELECT email, token FROM lease_document_signers WHERE document_id = $1`, [doc.id])).rows[0]
+
+    await db.query(`CREATE OR REPLACE FUNCTION test_s655_fail_seat_move() RETURNS trigger
+                      LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'seat move failed'; END $$`)
+    await db.query(`CREATE TRIGGER test_s655_fail_seat_move BEFORE UPDATE ON lease_document_signers
+                      FOR EACH ROW EXECUTE FUNCTION test_s655_fail_seat_move()`)
+    try {
+      const res = await request(buildApp())
+        .patch(`/api/properties/${propertyId}`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+        .send({ name: 'Renamed With It', leaseSigningEmail: 'new-office@park.test' })
+      expect(res.status).toBe(500)
+    } finally {
+      await db.query(`DROP TRIGGER IF EXISTS test_s655_fail_seat_move ON lease_document_signers`)
+      await db.query(`DROP FUNCTION IF EXISTS test_s655_fail_seat_move()`)
+    }
+
+    const { rows: [p] } = await db.query(
+      `SELECT name, lease_signing_email FROM properties WHERE id = $1`, [propertyId])
+    expect(p.lease_signing_email).toBe('office@park.test')
+    expect(p.name).toBe('Test Prop')
+    const { rows: audits } = await db.query(
+      `SELECT 1 FROM audit_log WHERE action = 'property_lease_signing_changed' AND entity_id = $1`, [propertyId])
+    expect(audits).toHaveLength(0)
+    expect(await seat()).toEqual({ email: 'office@park.test', token: 'tok-before-change' })
+
+    // The same save goes through once nothing is in the way, all of it at once.
+    const ok = await request(buildApp())
+      .patch(`/api/properties/${propertyId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ name: 'Renamed With It', leaseSigningEmail: 'new-office@park.test' })
+    expect(ok.status).toBe(200)
+    expect(ok.body.data.lease_signing_email).toBe('new-office@park.test')
+    expect(ok.body.data.name).toBe('Renamed With It')
+    const moved = await seat()
+    expect(moved.email).toBe('new-office@park.test')
+    expect(moved.token).not.toBe('tok-before-change')
+    const { rows: done } = await db.query(
+      `SELECT 1 FROM audit_log WHERE action = 'property_lease_signing_changed' AND entity_id = $1`, [propertyId])
+    expect(done).toHaveLength(1)
+  })
+
+  // An open owner seat at this property, mailed to `email`.
+  async function ownerSeat(f: PropsFixture, propertyId: string, email: string, token: string) {
+    const c = await db.connect()
+    let unitId = ''
+    try { unitId = await seedUnit(c, { propertyId, landlordId: f.landlordId }) } finally { c.release() }
+    const { rows: [doc] } = await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, status)
+       VALUES ($1, $2, 'Lease', 'sent') RETURNING id`, [f.landlordId, unitId])
+    await db.query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, token, status)
+       VALUES ($1, $2, 'landlord', 'Owner', $3, $4, 'sent')`,
+      [doc.id, f.landlordUserId, email, token])
+    return { docId: doc.id, seat: async () => (await db.query<{ email: string; token: string }>(
+      `SELECT email, token FROM lease_document_signers WHERE document_id = $1`, [doc.id])).rows[0] }
+  }
+
+  // Holds the property row the way a save in progress does (locked, changed,
+  // not yet committed), starts a second request while it is held, waits until
+  // that request is queued behind the lock, then commits the first.
+  async function whileAnotherSaveHoldsTheRow(
+    propertyId: string,
+    firstSave: (c: PoolClient) => Promise<void>,
+    second: () => Promise<any>,
+  ) {
+    const first = await db.connect()
+    try {
+      await first.query('BEGIN')
+      await first.query(`SELECT 1 FROM properties WHERE id = $1 FOR UPDATE`, [propertyId])
+      await firstSave(first)
+      const pending = second()
+      const deadline = Date.now() + 5000
+      for (;;) {
+        const { rows: [w] } = await db.query<{ n: number }>(
+          `SELECT COUNT(*)::int AS n FROM pg_stat_activity
+            WHERE datname = current_database() AND wait_event_type = 'Lock'`)
+        if (w.n > 0) break
+        if (Date.now() > deadline) throw new Error('the second save never waited for the first')
+        await new Promise(r => setTimeout(r, 20))
+      }
+      await first.query('COMMIT')
+      return await pending
+    } catch (e) {
+      await first.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { first.release() }
+  }
+
+  // Two owners save different signing addresses at the same moment (A to B,
+  // A to C). The second save read the property before the first committed, so
+  // it believed the address was still A. It used to look for seats at A, find
+  // none (the first had moved them to B), and leave the owner's live link in
+  // inbox B while the property pointed at C, with an audit row saying A to C.
+  it('two owners saving different signing addresses at once: the later save moves the seats from where the earlier one left them', async () => {
+    const { f, propertyId } = await withManager()
+    await db.query(`UPDATE properties SET lease_signing_email='a@park.test' WHERE id=$1`, [propertyId])
+    const { seat } = await ownerSeat(f, propertyId, 'a@park.test', 'tok-a')
+
+    const res = await whileAnotherSaveHoldsTheRow(propertyId,
+      async (c) => {
+        // The first save: A to B, its seat already moved, not yet committed.
+        await c.query(`UPDATE properties SET lease_signing_email='b@park.test' WHERE id=$1`, [propertyId])
+        await c.query(`UPDATE lease_document_signers SET email='b@park.test', token='tok-b'
+                        WHERE email='a@park.test'`)
+      },
+      () => request(buildApp())
+        .patch(`/api/properties/${propertyId}`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+        .send({ leaseSigningEmail: 'c@park.test' })
+        .then(r => r))
+    expect(res.status).toBe(200)
+    expect(res.body.data.lease_signing_email).toBe('c@park.test')
+
+    const s = await seat()
+    expect(s.email).toBe('c@park.test')
+    expect(['tok-a', 'tok-b']).not.toContain(s.token)
+    const { rows } = await db.query(
+      `SELECT old_value, new_value FROM audit_log
+        WHERE action = 'property_lease_signing_changed' AND entity_id = $1`, [propertyId])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].old_value.leaseSigningEmail).toBe('b@park.test')
+    expect(rows[0].new_value.leaseSigningEmail).toBe('c@park.test')
+  })
+
+  it('a manager\'s save that carries the old signing address back does not undo an owner\'s change made a moment earlier', async () => {
+    const { f, propertyId, mgrToken } = await withManager()
+    await db.query(`UPDATE properties SET lease_signing_email='a@park.test' WHERE id=$1`, [propertyId])
+    const { seat } = await ownerSeat(f, propertyId, 'a@park.test', 'tok-a')
+
+    const res = await whileAnotherSaveHoldsTheRow(propertyId,
+      async (c) => {
+        await c.query(`UPDATE properties SET lease_signing_email='b@park.test' WHERE id=$1`, [propertyId])
+        await c.query(`UPDATE lease_document_signers SET email='b@park.test', token='tok-b'
+                        WHERE email='a@park.test'`)
+      },
+      // The manager's form was loaded while the address was still A.
+      () => request(buildApp())
+        .patch(`/api/properties/${propertyId}`)
+        .set('Authorization', `Bearer ${mgrToken}`)
+        .send({ name: 'Renamed By Manager', leaseSigningEmail: 'a@park.test' })
+        .then(r => r))
+    expect(res.status).toBe(200)
+    expect(res.body.data.name).toBe('Renamed By Manager')
+    expect(res.body.data.lease_signing_email).toBe('b@park.test')
+    expect(await seat()).toEqual({ email: 'b@park.test', token: 'tok-b' })
+    const { rows } = await db.query(
+      `SELECT 1 FROM audit_log WHERE action = 'property_lease_signing_changed' AND entity_id = $1`, [propertyId])
+    expect(rows).toHaveLength(0)
+  })
+
+  // The late-fee accrual check used to run after the save committed: its 400
+  // came back for a change that had already taken effect — new signing
+  // address, audit row, moved seat and new token included.
+  it('a signing change sent with an incomplete late-fee accrual is refused and changes nothing', async () => {
+    const { f, propertyId } = await withManager()
+    await db.query(`UPDATE properties SET lease_signing_email='office@park.test' WHERE id=$1`, [propertyId])
+    const { seat } = await ownerSeat(f, propertyId, 'office@park.test', 'tok-before')
+    const res = await request(buildApp())
+      .patch(`/api/properties/${propertyId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ name: 'Renamed', leaseSigningEmail: 'new-office@park.test', lateFeeAccrualAmount: 5 })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/accrual requires all of amount, type, and period/)
+    const { rows: [p] } = await db.query(
+      `SELECT name, lease_signing_email, late_fee_accrual_amount FROM properties WHERE id = $1`, [propertyId])
+    expect(p.name).toBe('Test Prop')
+    expect(p.lease_signing_email).toBe('office@park.test')
+    expect(p.late_fee_accrual_amount).toBeNull()
+    expect(await seat()).toEqual({ email: 'office@park.test', token: 'tok-before' })
+    const { rows: audits } = await db.query(`SELECT action FROM audit_log WHERE entity_id = $1`, [propertyId])
+    expect(audits.map((a: any) => a.action)).not.toContain('property_lease_signing_changed')
   })
 })
 
