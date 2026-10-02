@@ -16,6 +16,7 @@ import type Stripe from 'stripe'
 import { query, queryOne } from '../db'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
+import { AppError } from '../middleware/errorHandler'
 
 export interface CardIdentity {
   fingerprint: string
@@ -217,4 +218,44 @@ export async function saveCardForCustomer(opts: { landlordId: string; customerId
     `UPDATE pos_customer_cards SET stripe_payment_method_id = $1, saved_at = NOW()
       WHERE landlord_id = $2 AND fingerprint = $3`,
     [opts.generatedCard, opts.landlordId, opts.fingerprint])
+}
+
+/**
+ * S654 (Nic): fold one customer record into another. Purchases, cards, open
+ * tickets, pay links, register sessions, invitations and the charge account
+ * move; the survivor keeps its own email/phone and takes the other's when it
+ * had none; the folded record is archived, never deleted (its email moves
+ * with the survivor when taken, because an address belongs to one live record
+ * per company). Throws 409 when both hold something only one can.
+ */
+export async function mergePosCustomers(client: PoolClient, opts: { landlordId: string; loserId: string; into: string }): Promise<void> {
+  if (opts.loserId === opts.into) throw new AppError(400, 'Pick a different customer to merge into')
+  const both = await client.query<any>(
+    `SELECT id, email, phone, stripe_customer_id FROM pos_customers
+      WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND archived_at IS NULL FOR UPDATE`,
+    [[opts.loserId, opts.into], opts.landlordId])
+  if (both.rows.length !== 2) throw new AppError(404, 'Both customers must be yours and current')
+  const loser = both.rows.find((r: any) => r.id === opts.loserId)
+  const survivor = both.rows.find((r: any) => r.id === opts.into)
+  const takeEmail = !survivor.email && !!loser.email
+  const takePhone = !survivor.phone && !!loser.phone
+  try {
+    for (const table of ['pos_transactions', 'pos_customer_cards', 'pos_open_tickets', 'pos_pay_links', 'pos_sessions', 'pos_customer_invitations', 'flex_charge_accounts']) {
+      await client.query(`UPDATE ${table} SET pos_customer_id = $1 WHERE pos_customer_id = $2`, [opts.into, opts.loserId])
+    }
+    // The folded record lets go of what the survivor takes, then is archived.
+    await client.query(
+      `UPDATE pos_customers SET archived_at = NOW(), updated_at = NOW(),
+              email = CASE WHEN $3::boolean THEN NULL ELSE email END,
+              phone = CASE WHEN $4::boolean THEN NULL ELSE phone END,
+              notes = TRIM(COALESCE(notes, '') || ' Merged into customer ' || $2 || COALESCE(' (email ' || email || ')', ''))
+        WHERE id = $1`, [opts.loserId, opts.into, takeEmail, takePhone])
+    await client.query(
+      `UPDATE pos_customers SET email = COALESCE(email, $2), phone = COALESCE(phone, $3),
+              stripe_customer_id = COALESCE(stripe_customer_id, $4), updated_at = NOW()
+        WHERE id = $1`, [opts.into, takeEmail ? loser.email : null, takePhone ? loser.phone : null, loser.stripe_customer_id])
+  } catch (e: any) {
+    if (e?.code === '23505') throw new AppError(409, 'Both customers have something only one can hold (a charge account) — close one first.')
+    throw e
+  }
 }

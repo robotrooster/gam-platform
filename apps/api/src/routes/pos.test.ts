@@ -598,6 +598,80 @@ describe('POST /api/pos/transactions — happy paths', () => {
     expect(row.rows[0].email).toBe('jane@example.com')
   })
 
+  // S654 (Nic): the Customers tab — the whole base with counts and cards,
+  // likely duplicates by email or phone (never by name), edit, fold one into
+  // another, and fix which person a past sale belongs to.
+  it('customers tab: list with counts, duplicates by email/phone, edit, merge, and re-assign a sale', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const itemId = await seedPosItem(f, { sellPrice: 25, stockQty: 999 })
+    const mk = async (first: string, last: string, email: string | null, phone: string | null) =>
+      (await db.query<{ id: string }>(
+        `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+        [f.landlordId, first, last, email, phone])).rows[0].id
+    const jane  = await mk('Jane', 'Doe', 'jane@example.com', null)
+    const jane2 = await mk('J', 'Doe', null, '(602) 555-0100')                   // no email yet; a phone
+    const bob   = await mk('Bob', 'Doe', null, '602-555-0100')                   // same phone as jane2 (different punctuation)
+    const sam   = await mk('Sam', 'Doe', 'sam@example.com', null)                // same last name only — not a duplicate
+    await db.query(`INSERT INTO pos_customer_cards (landlord_id, pos_customer_id, fingerprint, brand, last4, stripe_payment_method_id, saved_at)
+                    VALUES ($1,$2,'fp_j2','visa','4242','pm_saved',NOW())`, [f.landlordId, jane2])
+    // Two sales for jane2, one for jane.
+    for (const [who, pi] of [[jane2, 'pi_c1'], [jane2, 'pi_c2'], [jane, 'pi_c3']] as const) {
+      calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 25, taxAmount: 0, lines: [{ itemId, lineSubtotal: 25, lineTax: 0 }] })
+      retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({ id: pi, status: 'succeeded', amount: withCardFee(25), metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId, gam_property_id: f.propertyId } } as any)
+      const r = await request(buildApp()).post('/api/pos/transactions').set('Authorization', `Bearer ${f.landlordToken}`)
+        .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Propane', qty: 1, price: 25 }], paymentMethod: 'card', stripePaymentIntentId: pi, posCustomerId: who })
+      expect(r.status, JSON.stringify(r.body)).toBe(201)
+    }
+    const list = await request(buildApp()).get(`/api/pos/customers?propertyId=${f.propertyId}`).set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(list.status).toBe(200)
+    const by = Object.fromEntries(list.body.data.map((c: any) => [c.id, c]))
+    expect(by[jane2]).toMatchObject({ purchases: 2, total_spent: withCardFee(25) / 100 * 2, cards: [{ brand: 'visa', last4: '4242', saved: true }] })
+    expect(by[jane2].duplicate_ids).toEqual([bob])                        // phone ↔ bob, punctuation ignored
+    expect(by[bob].duplicate_ids).toEqual([jane2])
+    expect(by[jane].duplicate_ids).toEqual([])
+    expect(by[sam].duplicate_ids).toEqual([])                             // a shared surname is not a match
+    // Edit.
+    const ed = await request(buildApp()).patch(`/api/pos/customers/${bob}`).set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ firstName: 'Robert', email: 'bob@example.com' })
+    expect(ed.status).toBe(200)
+    expect(ed.body.data).toMatchObject({ first_name: 'Robert', last_name: 'Doe', email: 'bob@example.com', phone: '602-555-0100' })
+    // Re-assign jane's sale to sam.
+    const sale = (await db.query<{ id: string }>(`SELECT id FROM pos_transactions WHERE pos_customer_id = $1`, [jane])).rows[0].id
+    const re = await request(buildApp()).patch(`/api/pos/transactions/${sale}/customer`).set('Authorization', `Bearer ${f.landlordToken}`).send({ posCustomerId: sam })
+    expect(re.status).toBe(200)
+    expect(re.body.data).toMatchObject({ pos_customer_id: sam, tenant_id: null, customer_name: 'Sam Doe' })
+    // Merge jane2 into jane: sales + cards move, jane keeps her email and gains jane2's phone, jane2 is archived.
+    const mg = await request(buildApp()).post(`/api/pos/customers/${jane2}/merge`).set('Authorization', `Bearer ${f.landlordToken}`).send({ into: jane })
+    expect(mg.status, JSON.stringify(mg.body)).toBe(200)
+    expect(mg.body.data).toMatchObject({ id: jane, email: 'jane@example.com', phone: '(602) 555-0100' })   // kept hers, took the phone
+    expect((await db.query<any>(`SELECT COUNT(*)::int AS n FROM pos_transactions WHERE pos_customer_id = $1`, [jane])).rows[0].n).toBe(2)
+    expect((await db.query<any>(`SELECT pos_customer_id FROM pos_customer_cards WHERE fingerprint = 'fp_j2'`)).rows[0].pos_customer_id).toBe(jane)
+    const gone = (await db.query<any>(`SELECT archived_at, notes FROM pos_customers WHERE id = $1`, [jane2])).rows[0]
+    expect(gone.archived_at).not.toBeNull()
+    expect(gone.notes).toContain(jane)
+    // The folded record is out of the list; a stranger can touch none of it.
+    const after = await request(buildApp()).get(`/api/pos/customers?propertyId=${f.propertyId}`).set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(after.body.data.map((c: any) => c.id)).not.toContain(jane2)
+    // A card-made record that gives Jane's email for a receipt IS Jane: it folds into her.
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 25, taxAmount: 0, lines: [{ itemId, lineSubtotal: 25, lineTax: 0 }] })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce(tapped(f, 'pi_c4', withCardFee(25), { fingerprint: 'fp_new_card', cardholder_name: 'JANE DOE', generated_card: null }) as any)
+    const r4 = await request(buildApp()).post('/api/pos/transactions').set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Propane', qty: 1, price: 25 }], paymentMethod: 'card', stripePaymentIntentId: 'pi_c4' })
+    expect(r4.status).toBe(201)
+    const fresh = r4.body.data.customer.id
+    expect(fresh).not.toBe(jane)
+    const rc = await request(buildApp()).post(`/api/pos/transactions/${r4.body.data.id}/email-receipt`).set('Authorization', `Bearer ${f.landlordToken}`).send({ email: 'jane@example.com' })
+    expect(rc.status, JSON.stringify(rc.body)).toBe(200)
+    expect((await db.query<any>(`SELECT pos_customer_id FROM pos_transactions WHERE id = $1`, [r4.body.data.id])).rows[0].pos_customer_id).toBe(jane)
+    expect((await db.query<any>(`SELECT pos_customer_id FROM pos_customer_cards WHERE fingerprint = 'fp_new_card'`)).rows[0].pos_customer_id).toBe(jane)
+    expect((await db.query<any>(`SELECT archived_at FROM pos_customers WHERE id = $1`, [fresh])).rows[0].archived_at).not.toBeNull()
+    expect((await db.query<any>(`SELECT COUNT(*)::int AS n FROM pos_transactions WHERE pos_customer_id = $1`, [jane])).rows[0].n).toBe(3)
+    const stranger = await seedPosFixture()
+    expect((await request(buildApp()).patch(`/api/pos/customers/${jane}`).set('Authorization', `Bearer ${stranger.landlordToken}`).send({ firstName: 'X' })).status).toBe(404)
+    expect((await request(buildApp()).post(`/api/pos/customers/${sam}/merge`).set('Authorization', `Bearer ${stranger.landlordToken}`).send({ into: jane })).status).toBe(404)
+    expect((await request(buildApp()).patch(`/api/pos/transactions/${sale}/customer`).set('Authorization', `Bearer ${stranger.landlordToken}`).send({ posCustomerId: sam })).status).toBe(404)
+  })
+
   it('card sale with valid terminal stripePaymentIntentId persists with PI stamp', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
     const itemId = await seedPosItem(f, { sellPrice: 25, stockQty: 999 })

@@ -89,7 +89,10 @@ describe('draftLeaseFromApplication', () => {
     expect(signers[1].user_id).toBe(fx.applicantUserId)
     const vals = await fieldVals(r.documentId!)
     expect(vals.rent_amount).toBe('1350.00')
-    expect(vals.start_date).toBe(new Date() > new Date('2026-09-01') ? new Date().toISOString().slice(0, 10) : '2026-09-01')
+    // S654: "today" is the database's today (the property's clock), not UTC —
+    // the suite crossed midnight UTC at 5 pm Phoenix and this read a day ahead.
+    const dbToday = (await db.query<{ d: string }>(`SELECT CURRENT_DATE::text AS d`)).rows[0].d
+    expect(vals.start_date).toBe(dbToday > '2026-09-01' ? dbToday : '2026-09-01')
     // never a bare lease row
     expect((await db.query(`SELECT 1 FROM leases WHERE source_application_id=$1`, [fx.applicationId])).rows).toHaveLength(0)
     // the household is on the space

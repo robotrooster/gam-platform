@@ -328,6 +328,34 @@ None is the default. They should not be merged in any way." (memory
   yields a generated_card (Stripe: wallets can be saved, `allow_redisplay=
   limited`); and that the S710 displays the `collect_inputs` prompt.
 
+## Late: Customers tab, per-sale fixes, the open-tab banner
+
+- **"Discard needs three clicks / Resume does nothing" (Nic, live):** three
+  stale EMPTY tabs were open at Mountain View; each Discard voided one and the
+  banner showed the next; Resume of an empty tab restored an empty cart. Now
+  empty tabs clear themselves on load, the banner counts the rest ("3 open
+  tabs"), Discard clears them all in one click.
+- **Apple Pay "card ending 9767":** the phone's device number, not the plastic
+  card's — expected. A wallet tap and the physical card are two records until
+  merged.
+- **Customers tab** (`GET /pos/customers?propertyId=`): every customer of the
+  company with email/phone, cards (on file or not), purchases, last purchase,
+  total spent; "possible duplicate" = same email or same phone (digits only),
+  never the same name (`pos_customers_email_landlord_uniq` already forbids two
+  live records with one email per company). Click a row: edit name/email/phone
+  (`PATCH /pos/customers/:id`), Purchase history (History filtered), Fold
+  into… with a two-step confirm (`POST /pos/customers/:id/merge`;
+  `mergePosCustomers` moves transactions, cards, tickets, pay links, sessions,
+  invitations, charge account; the folded record is archived and gives up the
+  email/phone the survivor took).
+- **Email match = same person:** a card-made record that gives an email
+  another live customer already has (receipt box at the desk or typed on the
+  reader) is folded into that customer automatically.
+- **History row:** "Customer: … [Change]" (`PATCH /pos/transactions/:id/
+  customer`, resident or customer of this company) and "Email receipt" (resend
+  to any address; the address becomes the customer's when they had none).
+- Agent parity names the four new mutating routes.
+
 ## Still open
 
 - **Lots 22 and 24 are marked OUT OF SERVICE** (9/30, by the run's stuck-meter

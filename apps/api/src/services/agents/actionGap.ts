@@ -60,6 +60,12 @@ const DELIBERATE = new Map(Object.entries({
     'takes whatever is on a reader\'s screen off it. A register-side control for the reader at the counter.',
   'pos POST /transactions/:id/email-receipt':
     'emails a receipt for a sale the register just rang up, to an address typed at the counter — a misheard address sends someone\'s purchase to a stranger.',
+  'pos PATCH /transactions/:id/customer':
+    'changes which person a rung-up sale belongs to. Done from the sale\'s own line in History with the list of names on screen — the wrong name is a purchase on the wrong person\'s record.',
+  'pos PATCH /customers/:id':
+    'edits a register customer\'s name, email or phone. Done on the Customers tab with the record on screen.',
+  'pos POST /customers/:id/merge':
+    'folds one customer record into another — purchases, cards and charge account move, the folded record is archived. Done on the Customers tab with both records on screen; the wrong pair is two people\'s histories tangled.',
   // ── S648: register pay links ──────────────────────────────────────────────
   // A pay link is a register cart sent as a card charge to someone's inbox. The
   // amount is whatever the desk rang up, and the email goes to an address typed

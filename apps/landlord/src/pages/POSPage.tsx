@@ -33,6 +33,58 @@ const STATUS_MAP: Record<string,string> = { completed:'badge-green', voided:'bad
 // The API says HOW a card arrived (tender); payment_method alone says only 'card'.
 const METHOD_MAP: Record<string,string> = { cash:'badge-green', card:'badge-blue', card_reader:'badge-blue', pay_link:'badge-gold', pay_link_in_person_cash:'badge-gold', pay_link_in_person_card:'badge-gold', card_on_file:'badge-blue', charge:'badge-amber' }
 // S654 (Nic): online and in person are different facts about the same card.
+// S654 (Nic): one customer record — edit it, open its history, fold it into
+// another. Merge candidates are the same email or the same phone; never the
+// same name ("people aren't going to have the same email if they're a different
+// person"). The folded record is archived, never deleted.
+function CustomerEditor({ c, all, onHistory, onChanged }: { c: any; all: any[]; onHistory: () => void; onChanged: () => void }) {
+  const qc = useQueryClient()
+  const [form, setForm] = useState({ firstName: c.firstName || '', lastName: c.lastName || '', email: c.email || '', phone: c.phone || '' })
+  const [mergeInto, setMergeInto] = useState('')
+  const [confirmMerge, setConfirmMerge] = useState(false)
+  const refresh = () => { qc.invalidateQueries('pos-customer-base'); qc.invalidateQueries('pos-customers'); qc.invalidateQueries('pos-transactions') }
+  const saveMut = useMutation(
+    () => apiPatch(`/pos/customers/${c.id}`, { firstName: form.firstName.trim() || undefined, lastName: form.lastName.trim(), email: form.email.trim() || null, phone: form.phone.trim() || null }),
+    { onSuccess: () => { refresh(); toast('Saved') }, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save') })
+  const mergeMut = useMutation(
+    () => apiPost(`/pos/customers/${c.id}/merge`, { into: mergeInto }),
+    { onSuccess: () => { refresh(); setConfirmMerge(false); toast('Merged'); onChanged() }, onError: (e: any) => { setConfirmMerge(false); toast.error(e?.response?.data?.error || 'Could not merge') } })
+  const dupeIds: string[] = c.duplicateIds || []
+  const others = all.filter(o => o.id !== c.id)
+  const ordered = [...others.filter(o => dupeIds.includes(o.id)), ...others.filter(o => !dupeIds.includes(o.id))]
+  const target = others.find(o => o.id === mergeInto)
+  const label = (o: any) => `${o.firstName} ${o.lastName}`.trim() + (o.email ? ` — ${o.email}` : o.phone ? ` — ${o.phone}` : '')
+  return (
+    <div style={{display:'grid',gap:10}}>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}}>
+        <input className="form-input" placeholder="First name" value={form.firstName} onChange={e=>setForm(f=>({ ...f, firstName:e.target.value }))} />
+        <input className="form-input" placeholder="Last name" value={form.lastName} onChange={e=>setForm(f=>({ ...f, lastName:e.target.value }))} />
+        <input className="form-input" type="email" placeholder="Email" value={form.email} onChange={e=>setForm(f=>({ ...f, email:e.target.value }))} />
+        <input className="form-input" placeholder="Phone" value={form.phone} onChange={e=>setForm(f=>({ ...f, phone:e.target.value }))} />
+      </div>
+      <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+        <button className="btn btn-primary btn-sm" disabled={!form.firstName.trim()||saveMut.isLoading} onClick={()=>saveMut.mutate()}>{saveMut.isLoading?'Saving…':'Save'}</button>
+        <button className="btn btn-ghost btn-sm" onClick={onHistory}>Purchase history</button>
+        <span style={{flex:1}} />
+        <span style={{fontSize:'.75rem',color:'var(--text-3)'}}>Fold into</span>
+        <select className="form-select" value={mergeInto} onChange={e=>{ setMergeInto(e.target.value); setConfirmMerge(false) }} style={{minWidth:240}}>
+          <option value="">Choose a customer…</option>
+          {ordered.map(o => <option key={o.id} value={o.id}>{dupeIds.includes(o.id) ? '★ ' : ''}{label(o)}</option>)}
+        </select>
+        {!confirmMerge ? (
+          <button className="btn btn-ghost btn-sm" disabled={!mergeInto} onClick={()=>setConfirmMerge(true)}>Merge</button>
+        ) : (
+          <button className="btn btn-primary btn-sm" disabled={mergeMut.isLoading} onClick={()=>mergeMut.mutate()}>
+            {mergeMut.isLoading ? 'Merging…' : `Confirm: fold ${`${c.firstName} ${c.lastName}`.trim()} into ${target ? `${target.firstName} ${target.lastName}`.trim() : '…'}`}
+          </button>
+        )}
+      </div>
+      {dupeIds.length>0 && <div style={{fontSize:'.75rem',color:'var(--text-3)'}}>★ same email or phone as this record — likely the same person.</div>}
+      {confirmMerge && <div style={{fontSize:'.75rem',color:'var(--text-2)'}}>Their purchases, cards on file, open tickets and charge account move to that record; this one is archived (never deleted).</div>}
+    </div>
+  )
+}
+
 const TENDER_LABEL: Record<string,string> = { cash:'Cash', card:'Card · online', card_reader:'Card · in person', pay_link:'Pay link · online', pay_link_in_person_cash:'Pay link · in person (cash)', pay_link_in_person_card:'Pay link · in person (card)', card_on_file:'Card on file', charge:'Charge account' }
 // S512 LAUNCH: the "charge" (FlexCharge) tender is hidden at launch with the
 // rest of the Flex Suite. The button is filtered out of the register picker so
@@ -68,7 +120,7 @@ const nonNeg = { min: 0, onKeyDown: blockNeg, onPaste: blockNegPaste }
 export function POSPage() {
   const qc = useQueryClient()
   const [payLinkOpen, setPayLinkOpen] = useState(false)
-  const [tab, setTab] = useUrlTab('tab', 'register', ['register','history','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
+  const [tab, setTab] = useUrlTab('tab', 'register', ['register','history','customers','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
 
   const [cart, setCart] = useState<CartItem[]>([])
   // S651: the site + dates + guest for a stay in the cart. Held here rather
@@ -94,7 +146,11 @@ export function POSPage() {
   // queue's clientId→serverId mapping. For resumed sessions, the server
   // id is pre-mapped so the queue resolves it immediately.
   const [clientSessionId, setClientSessionId] = useState<string|null>(null)
-  const [openTabBanner, setOpenTabBanner] = useState<{ id:string; total:number; openedAt:string; itemCount:number }|null>(null)
+  // S654 (Nic): "if there's any outstanding shopping carts, have those as an
+  // expandable list to choose from, not just resuming a single cart."
+  type OpenTab = { id:string; total:number; openedAt:string; itemCount:number; customerName:string|null; preview:string|null }
+  const [openTabs, setOpenTabs] = useState<OpenTab[]>([])
+  const [tabsExpanded, setTabsExpanded] = useState(false)
   const [method, setMethod] = useState<'cash'|'card'|'card_on_file'|'charge'>('cash')
   const [tenantId, setTenantId] = useState('')
   // S254/S538: FlexCharge account holder can come from either backing
@@ -121,6 +177,10 @@ export function POSPage() {
   const [receiptEmail, setReceiptEmail] = useState('')
   const [receiptSent, setReceiptSent] = useState<string | null>(null)
   const [historyCustomer, setHistoryCustomer] = useState<{ id: string; name: string } | null>(null)
+  // S654: fixing a sale's customer / resending its receipt from History; the Customers tab.
+  const [txEdit, setTxEdit] = useState<{ id: string; mode: 'customer' | 'receipt'; value: string } | null>(null)
+  const [custSearch, setCustSearch] = useState('')
+  const [openCust, setOpenCust] = useState<string | null>(null)
   const [newCustomer, setNewCustomer] = useState<{ open: boolean; firstName: string; lastName: string; email: string; phone: string }>({ open: false, firstName: '', lastName: '', email: '', phone: '' })
   const [appliedDiscount, setAppliedDiscount] = useState<any>(null)
   const [discountCode, setDiscountCode] = useState('')
@@ -352,16 +412,22 @@ export function POSPage() {
     { enabled: tab==='register' && !!registerProperty },
   )
   useEffect(() => {
-    if (clientSessionId) { setOpenTabBanner(null); return }
+    if (clientSessionId) { setOpenTabs([]); return }
     const live = (openSessions || []).filter((s: any) => !dismissedSessions.has(s.id) && !dismissedSessions.has(s.clientSessionId))
-    if (live.length === 0) { setOpenTabBanner(null); return }
-    const first = live[0]
-    setOpenTabBanner({
-      id: first.id,
-      total: Number(first.total ?? 0),
-      openedAt: first.openedAt,
-      itemCount: Number(first.itemCount ?? 0),
-    })
+    // S654 (Nic, live): "Discard is still requiring three clicks and Resume
+    // does absolutely nothing." Each click cleared ONE stale tab and the
+    // banner showed the next; an EMPTY tab resumed to an empty cart. Empty
+    // tabs clear themselves; the banner counts the rest; Discard clears all.
+    const empty = live.filter((s: any) => Number(s.itemCount ?? 0) === 0)
+    if (empty.length) {
+      setDismissedSessions(prev => { const n = new Set(prev); empty.forEach((s: any) => n.add(s.id)); return n })
+      for (const s of empty) void apiPost(`/pos/sessions/${s.id}/void`, { reason: 'empty_tab_auto_cleared' }).catch(() => {})
+    }
+    const withItems = live.filter((s: any) => Number(s.itemCount ?? 0) > 0)
+    setOpenTabs(withItems.map((s: any) => ({
+      id: s.id, total: Number(s.total ?? 0), openedAt: s.openedAt, itemCount: Number(s.itemCount ?? 0),
+      customerName: s.customerName ?? null, preview: s.preview ?? null,
+    })))
   }, [openSessions, clientSessionId])
 
   // S263/S264: server-session helpers. ensureSession lazily mints a
@@ -414,20 +480,21 @@ export function POSPage() {
       }
       setCart(restored)
       setClientSessionId(id)
-      setOpenTabBanner(null)
+      setOpenTabs([])
     } catch (e) {
       console.error('[pos-session] resume failed', e)
     }
   }
 
-  async function discardOpenTab(id: string) {
+  async function discardOpenTab(id: string | 'all') {
     try {
       // Discard is a direct synchronous call (we know the server id and
       // we're not editing the cart). Best-effort; if it fails the banner
-      // re-appears on next refresh.
-      await apiPost(`/pos/sessions/${id}/void`, { reason: 'discarded_at_terminal_load' })
+      // re-appears on next refresh. S654: one tab, or every open tab at once.
+      const ids = id === 'all' ? openTabs.map(t => t.id) : [id]
+      await Promise.all(ids.map(x => apiPost(`/pos/sessions/${x}/void`, { reason: 'discarded_at_terminal_load' })))
       qc.invalidateQueries(['pos-sessions-open', registerProperty])
-      setOpenTabBanner(null)
+      setOpenTabs(prev => prev.filter(t => !ids.includes(t.id)))
     } catch (e) {
       console.error('[pos-session] discard failed', e)
     }
@@ -849,6 +916,8 @@ export function POSPage() {
   const TABS = [
     { key:'register',  label:'Register',   perm:'pos.tab.register' },
     { key:'history',   label:'History',    perm:'pos.tab.history' },
+    // S654 (Nic): "an overall customers tab… see my whole customer history."
+    { key:'customers', label:'Customers',  perm:'pos.tab.history' },
     // S648: emailed pay links + QR codes — anyone who can ring a sale.
     { key:'paylinks',  label:'Pay Links',  perm:'pos.tab.register' },
     { key:'items',     label:'Items',      perm:'pos.tab.items' },
@@ -912,6 +981,17 @@ export function POSPage() {
   const emailReceiptMut = useMutation(
     () => apiPost(`/pos/transactions/${receipt?.id}/email-receipt`, { email: receiptEmail.trim() }),
     { onSuccess: (r: any) => { setReceiptSent(r.data.sentTo); qc.invalidateQueries('pos-customers') },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'The receipt could not be sent') })
+  const { data: customersBase = [], isLoading: custLoading } = useQuery<any[]>(['pos-customer-base', registerProperty],
+    () => apiGet(`/pos/customers?propertyId=${registerProperty}`), { enabled: tab==='customers' && !!registerProperty })
+  const setTxCustomerMut = useMutation(
+    (v: { id: string; value: string }) => apiPatch(`/pos/transactions/${v.id}/customer`, {
+      tenantId: v.value.startsWith('t:') ? v.value.slice(2) : null, posCustomerId: v.value.startsWith('c:') ? v.value.slice(2) : null }),
+    { onSuccess: () => { setTxEdit(null); qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-customer-base') },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not change the customer') })
+  const txReceiptMut = useMutation(
+    (v: { id: string; email: string }) => apiPost(`/pos/transactions/${v.id}/email-receipt`, { email: v.email.trim() }),
+    { onSuccess: (r: any) => { setTxEdit(null); toast(`Receipt sent to ${r.data.sentTo}`); qc.invalidateQueries('pos-customers'); qc.invalidateQueries('pos-customer-base') },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'The receipt could not be sent') })
   const createCustomerMut = useMutation(
     () => apiPost('/landlords/pos-customers', { firstName: newCustomer.firstName.trim(), lastName: newCustomer.lastName.trim(),
@@ -1023,18 +1103,37 @@ export function POSPage() {
             {/* S263: open-tab banner — appears when there's an unclosed
                 session on this property from a prior terminal visit /
                 crash / handoff. Resume loads the items; Discard voids. */}
-            {openTabBanner && cart.length === 0 && (
-              <div style={{display:'flex',alignItems:'center',gap:12,padding:'12px 16px',background:'rgba(201,162,39,.08)',border:'1px solid rgba(201,162,39,.3)',borderRadius:10,marginBottom:12}}>
-                <div style={{flex:1}}>
-                  <div style={{fontWeight:700,color:'var(--gold)',fontSize:'.85rem',marginBottom:2}}>Open tab on this register</div>
-                  <div style={{fontSize:'.75rem',color:'var(--text-2)'}}>
-                    {openTabBanner.itemCount} item{openTabBanner.itemCount===1?'':'s'} · {fmt(openTabBanner.total)} · opened {openTabBanner.openedAt ? new Date(openTabBanner.openedAt).toLocaleTimeString() : 'earlier'}
+            {openTabs.length > 0 && cart.length === 0 && (() => {
+              const line = (t: OpenTab) => `${t.itemCount} item${t.itemCount===1?'':'s'} · ${fmt(t.total)} · opened ${t.openedAt ? new Date(t.openedAt).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' }) : 'earlier'}${t.customerName ? ` · ${t.customerName}` : ''}${t.preview ? ` · ${t.preview}` : ''}`
+              const many = openTabs.length > 1
+              const shown = many && !tabsExpanded ? [] : openTabs
+              return (
+              <div style={{padding:'12px 16px',background:'rgba(201,162,39,.08)',border:'1px solid rgba(201,162,39,.3)',borderRadius:10,marginBottom:12}}>
+                <div style={{display:'flex',alignItems:'center',gap:12}}>
+                  <div style={{flex:1,cursor:many?'pointer':'default'}} onClick={()=>many&&setTabsExpanded(x=>!x)}>
+                    <div style={{fontWeight:700,color:'var(--gold)',fontSize:'.85rem'}}>
+                      {many ? <>{tabsExpanded ? '▾' : '▸'} {openTabs.length} open carts on this register</> : 'Open cart on this register'}
+                    </div>
+                    {!many && <div style={{fontSize:'.75rem',color:'var(--text-2)',marginTop:2}}>{line(openTabs[0])}</div>}
+                    {many && !tabsExpanded && <div style={{fontSize:'.75rem',color:'var(--text-3)',marginTop:2}}>Open the list to pick one to resume.</div>}
                   </div>
+                  {!many && <button onClick={()=>resumeSession(openTabs[0].id)} className="btn btn-primary btn-sm">Resume</button>}
+                  {!many && <button onClick={()=>discardOpenTab(openTabs[0].id)} className="btn btn-ghost btn-sm">Discard</button>}
+                  {many && <button onClick={()=>discardOpenTab('all')} className="btn btn-ghost btn-sm">Discard all</button>}
                 </div>
-                <button onClick={()=>resumeSession(openTabBanner.id)} className="btn btn-primary btn-sm">Resume</button>
-                <button onClick={()=>discardOpenTab(openTabBanner.id)} className="btn btn-ghost btn-sm">Discard</button>
-              </div>
-            )}
+                {many && tabsExpanded && (
+                  <div style={{display:'grid',gap:6,marginTop:10}}>
+                    {shown.map(t => (
+                      <div key={t.id} style={{display:'flex',alignItems:'center',gap:10,padding:'8px 10px',background:'var(--bg-1)',border:'1px solid var(--border-1)',borderRadius:8}}>
+                        <div style={{flex:1,fontSize:'.78rem',color:'var(--text-1)'}}>{line(t)}</div>
+                        <button onClick={()=>resumeSession(t.id)} className="btn btn-primary btn-sm">Resume</button>
+                        <button onClick={()=>discardOpenTab(t.id)} className="btn btn-ghost btn-sm">Discard</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>)
+            })()}
             <div style={{display:'flex',gap:6,marginBottom:12,flexWrap:'wrap'}}>
               {categories.map(c => (<button key={c} onClick={()=>setFilterCat(c)} className={"tab-btn "+(filterCat===c?'active':'')} style={{fontSize:'.78rem',padding:'4px 12px',textTransform:'capitalize'}}>{c}</button>))}
               {/* S650 (Nic): no open items. "Items are set prices. There's no
@@ -1338,6 +1437,31 @@ export function POSPage() {
                       <span>{TENDER_LABEL[t.tender||t.paymentMethod]||humanize(t.paymentMethod)}{t.tenantName?` · ${t.tenantName}`:t.customerName?` · ${t.customerName}`:''} · {new Date(t.createdAt).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</span>
                       <span className="mono" style={{fontWeight:700,color:'var(--text-0)'}}>{fmt(t.total)}</span>
                     </div>
+                    {/* S654 (Nic): fix who a sale belongs to; resend its receipt. */}
+                    <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',marginTop:8,paddingTop:8,borderTop:'1px solid var(--border-1)'}}>
+                      {(() => { const te = txEdit && txEdit.id===t.id ? txEdit : null
+                      if (te && te.mode==='customer') { const cur = te; return (<>
+                        <select className="form-select" value={cur.value} onChange={e=>{ const v=e.target.value; setTxEdit(prev=>prev?{ ...prev, value:v }:prev) }} style={{minWidth:220}}>
+                          <option value="">No customer</option>
+                          {[
+                            ...(tenants as any[]).map((x:any)=>({ key:`t:${x.id}`, label:`${x.firstName} ${x.lastName}`.trim() })),
+                            ...(posCustomers as any[]).map((c:any)=>({ key:`c:${c.id}`, label:(`${c.firstName} ${c.lastName}`.trim())+(c.email?` — ${c.email}`:'') })),
+                          ].sort((a,b)=>a.label.localeCompare(b.label)).map(o=><option key={o.key} value={o.key}>{o.label}</option>)}
+                        </select>
+                        <button className="btn btn-primary btn-sm" disabled={setTxCustomerMut.isLoading} onClick={()=>setTxCustomerMut.mutate({ id:t.id, value:cur.value })}>Save</button>
+                        <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit(null)}>Cancel</button>
+                      </>) }
+                      if (te && te.mode==='receipt') { const cur = te; return (<>
+                        <input className="form-input" type="email" placeholder="name@example.com" value={cur.value} onChange={e=>{ const v=e.target.value; setTxEdit(prev=>prev?{ ...prev, value:v }:prev) }} style={{minWidth:220}} />
+                        <button className="btn btn-primary btn-sm" disabled={!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cur.value.trim())||txReceiptMut.isLoading} onClick={()=>txReceiptMut.mutate({ id:t.id, email:cur.value })}>{txReceiptMut.isLoading?'Sending…':'Send receipt'}</button>
+                        <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit(null)}>Cancel</button>
+                      </>) }
+                      return (<>
+                        <span style={{color:'var(--text-3)',fontSize:'.75rem'}}>Customer: {t.tenantName||t.customerName||'—'}</span>
+                        <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit({ id:t.id, mode:'customer', value: t.tenantId?`t:${t.tenantId}`:t.posCustomerId?`c:${t.posCustomerId}`:'' })}>Change</button>
+                        <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit({ id:t.id, mode:'receipt', value: t.customerEmail||'' })}>Email receipt</button>
+                      </>) })()}
+                    </div>
                   </div>
                 </td></tr>)}
                 </Fragment>)):<tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No transactions yet.</td></tr>}
@@ -1608,6 +1732,43 @@ export function POSPage() {
         </div>
       )}
 
+      {tab==='customers' && !!registerProperty && (() => {
+        const q = custSearch.trim().toLowerCase()
+        const rows = (customersBase as any[]).filter((c:any) => !q || [c.firstName, c.lastName, c.email, c.phone, ...(c.cards||[]).map((k:any)=>k.last4)].filter(Boolean).join(' ').toLowerCase().includes(q))
+        return (
+        <div className="card" style={{padding:0}}>
+          <div className="card-header" style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+            <span className="card-title">Customers <span style={{fontWeight:400,color:'var(--text-3)',fontSize:'.8rem'}}>· {rows.length}</span></span>
+            <input className="form-input" placeholder="Search name, email, phone, last four" value={custSearch} onChange={e=>setCustSearch(e.target.value)} style={{maxWidth:300}} />
+          </div>
+          {custLoading ? <div style={{padding:24,color:'var(--text-3)'}}>Loading…</div> : rows.length===0 ? (
+            <div style={{padding:32,textAlign:'center',color:'var(--text-3)'}}>No customers yet — a card tapped on the reader adds one; "+ New customer" on the register adds a cash customer.</div>
+          ) : (
+            <table className="data-table">
+              <thead><tr><th>Customer</th><th>Email</th><th>Phone</th><th>Cards</th><th style={{textAlign:'right'}}>Purchases</th><th>Last</th><th style={{textAlign:'right'}}>Spent</th></tr></thead>
+              <tbody>{rows.map((c:any) => (<Fragment key={c.id}>
+                <tr onClick={()=>setOpenCust(openCust===c.id?null:c.id)} style={{cursor:'pointer'}}>
+                  <td style={{fontWeight:500}}>{c.firstName} {c.lastName}
+                    {(c.duplicateIds||[]).length>0 && <span style={{marginLeft:8,fontSize:'.68rem',color:'var(--amber, #d0a02a)',fontWeight:600}}>possible duplicate</span>}
+                    {c.createdFrom==='card_reader' && <span style={{marginLeft:8,fontSize:'.68rem',color:'var(--text-3)'}}>from a card</span>}
+                  </td>
+                  <td style={{fontSize:'.82rem'}}>{c.email||'—'}</td>
+                  <td style={{fontSize:'.82rem'}}>{c.phone||'—'}</td>
+                  <td style={{fontSize:'.8rem'}}>{(c.cards||[]).length ? c.cards.map((k:any,i:number)=><span key={i} style={{marginRight:8}}>{humanize(k.brand||'card')} ····{k.last4}{k.saved?<span style={{color:'var(--gold)'}}> on file</span>:null}</span>) : '—'}</td>
+                  <td className="mono" style={{textAlign:'right'}}>{c.purchases}</td>
+                  <td style={{fontSize:'.82rem'}}>{c.lastPurchaseAt?new Date(c.lastPurchaseAt).toLocaleDateString():'—'}</td>
+                  <td className="mono" style={{textAlign:'right'}}>{fmt(Number(c.totalSpent||0))}</td>
+                </tr>
+                {openCust===c.id && (<tr><td colSpan={7} style={{background:'var(--bg-2)',padding:'10px 16px 14px'}}>
+                  <CustomerEditor c={c} all={customersBase as any[]}
+                    onHistory={()=>{ setHistoryCustomer({ id:c.id, name:`${c.firstName} ${c.lastName}`.trim() }); setTab('history') }}
+                    onChanged={()=>{ setOpenCust(null) }} />
+                </td></tr>)}
+              </Fragment>))}</tbody>
+            </table>
+          )}
+        </div>)
+      })()}
       {tab==='vendors' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">

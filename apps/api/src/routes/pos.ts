@@ -12,7 +12,7 @@ import { createConnectionToken, registerReader, listReaders, archiveReader, crea
 import crypto from 'crypto'
 import { logger } from '../lib/logger'
 import { resolveLandlordTarget, ownsLandlord, landlordScopeIds } from '../lib/landlordScope'
-import { cardIdentityFromIntent, findOrCreateCustomerForCard, startSaveCardPrompt, readSaveCardAnswer, saveCardForCustomer, type CardIdentity, type CardCustomer } from '../services/posCustomerCards'
+import { cardIdentityFromIntent, findOrCreateCustomerForCard, startSaveCardPrompt, readSaveCardAnswer, saveCardForCustomer, mergePosCustomers, type CardIdentity, type CardCustomer } from '../services/posCustomerCards'
 
 export const posRouter = Router()
 posRouter.use(requireAuth)
@@ -2053,6 +2053,7 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
       SELECT t.*,
         u.first_name || ' ' || u.last_name AS tenant_name,
         NULLIF(TRIM(pc.first_name || ' ' || pc.last_name), '') AS customer_name,
+        pc.email AS customer_email,
         (SELECT COUNT(*) FROM pos_transaction_items WHERE transaction_id=t.id) as item_count,
         -- S653 (Nic): "flag the history different for pay links vs terminal
         -- reader." payment_method says card either way; how the card was
@@ -2717,11 +2718,138 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
     await emailPosReceipt(email, tx.property_name || tx.business_name || 'GAM', receiptNumber, Number(tx.total), buffer,
       { relatedEntityType: 'pos_transaction', relatedEntityId: tx.id } as any)
     if (tx.pos_customer_id && !tx.c_email) {
-      await query(`UPDATE pos_customers SET email = $1, updated_at = NOW() WHERE id = $2`, [email, tx.pos_customer_id])
+      // S654 (Nic): "people aren't going to have the same email if they're a
+      // different person." An address another live customer of this company
+      // already has means THIS record (made from a card) is that person: fold
+      // it into them, cards and purchases included.
+      const existing = await queryOne<{ id: string }>(
+        `SELECT id FROM pos_customers WHERE landlord_id = $1 AND lower(email) = lower($2) AND archived_at IS NULL AND id <> $3`,
+        [tx.landlord_id, email, tx.pos_customer_id])
+      if (existing) {
+        const client = await getClient()
+        try {
+          await client.query('BEGIN')
+          await mergePosCustomers(client, { landlordId: tx.landlord_id, loserId: tx.pos_customer_id, into: existing.id })
+          await client.query('COMMIT')
+        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e } finally { client.release() }
+      } else {
+        await query(`UPDATE pos_customers SET email = $1, updated_at = NOW() WHERE id = $2`, [email, tx.pos_customer_id])
+      }
     }
     return email
   }
 }
+
+// ── S654 (Nic): the customer base ────────────────────────────────────────
+//
+//   "There should be an overall customers tab in the point of sale… see my
+//    whole customer history… merge customers — a match on email, I think, or
+//    phone number… people aren't going to have the same email if they're a
+//    different person." And from History: "retroactively link a specific
+//    customer to a transaction… resend another email."
+//
+// A customer belongs to one company; the register's property names it.
+// Merging folds one record into another (purchases, cards, tickets, links,
+// charge account all move; the folded record is archived, never deleted).
+// Likely duplicates are the same email or the same phone — never the same
+// name.
+
+const PHONE_DIGITS = `regexp_replace(COALESCE($$X$$, ''), '\\D', '', 'g')`
+function phoneDigits(col: string): string { return PHONE_DIGITS.replace('$$X$$', col) }
+
+posRouter.get('/customers', requirePerm('pos.ring_sale', 'pos.end_of_day'), async (req, res, next) => {
+  try {
+    const landlordId = posLandlordId(req)
+    const rows = await query<any>(
+      `SELECT c.id, c.first_name, c.last_name, c.email, c.phone, c.created_from, c.created_at, c.notes,
+              (c.stripe_customer_id IS NOT NULL) AS has_stripe_customer,
+              (SELECT COUNT(*)::int FROM pos_transactions t WHERE t.pos_customer_id = c.id) AS purchases,
+              (SELECT COALESCE(SUM(t.total), 0)::float FROM pos_transactions t WHERE t.pos_customer_id = c.id AND t.status <> 'voided') AS total_spent,
+              (SELECT MAX(t.created_at) FROM pos_transactions t WHERE t.pos_customer_id = c.id) AS last_purchase_at,
+              (SELECT COALESCE(json_agg(json_build_object('brand', k.brand, 'last4', k.last4, 'saved', k.stripe_payment_method_id IS NOT NULL) ORDER BY k.last_seen_at DESC), '[]'::json)
+                 FROM pos_customer_cards k WHERE k.pos_customer_id = c.id) AS cards,
+              (SELECT COALESCE(json_agg(d.id), '[]'::json) FROM pos_customers d
+                WHERE d.landlord_id = c.landlord_id AND d.id <> c.id AND d.archived_at IS NULL
+                  AND ((c.email IS NOT NULL AND lower(d.email) = lower(c.email))
+                    OR (${phoneDigits('c.phone')} <> '' AND ${phoneDigits('d.phone')} = ${phoneDigits('c.phone')}))) AS duplicate_ids
+         FROM pos_customers c
+        WHERE c.landlord_id = $1 AND c.archived_at IS NULL
+        ORDER BY c.last_name, c.first_name`, [landlordId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+posRouter.patch('/customers/:id', requirePerm('pos.ring_sale'), async (req, res, next) => {
+  try {
+    const b = z.object({
+      firstName: z.string().trim().min(1).max(80).optional(),
+      lastName:  z.string().trim().max(80).optional(),
+      email:     z.string().trim().toLowerCase().email().nullable().optional(),
+      phone:     z.string().trim().max(40).nullable().optional(),
+    }).parse(req.body)
+    const row = await queryOne<any>(
+      `UPDATE pos_customers SET
+          first_name = COALESCE($1, first_name), last_name = COALESCE($2, last_name),
+          email = CASE WHEN $3::text IS NULL AND $5::boolean THEN NULL ELSE COALESCE($3, email) END,
+          phone = CASE WHEN $4::text IS NULL AND $6::boolean THEN NULL ELSE COALESCE($4, phone) END,
+          updated_at = NOW()
+        WHERE id = $7 AND landlord_id = $8 AND archived_at IS NULL
+        RETURNING id, first_name, last_name, email, phone`,
+      [b.firstName ?? null, b.lastName ?? null, b.email ?? null, b.phone ?? null,
+       'email' in b && b.email === null, 'phone' in b && b.phone === null,
+       req.params.id, posLandlordId(req)])
+    if (!row) throw new AppError(404, 'Customer not found')
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+posRouter.post('/customers/:id/merge', requirePerm('pos.ring_sale'), async (req, res, next) => {
+  try {
+    const { into } = z.object({ into: z.string().uuid() }).parse(req.body)
+    const landlordId = posLandlordId(req)
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      await mergePosCustomers(client, { landlordId, loserId: String(req.params.id), into })
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
+    const survivor = await queryOne<any>(`SELECT id, first_name, last_name, email, phone FROM pos_customers WHERE id = $1`, [into])
+    res.json({ success: true, data: survivor })
+  } catch (e) { next(e) }
+})
+
+// Fix which customer a sale belongs to, after the fact.
+posRouter.patch('/transactions/:id/customer', requirePerm('pos.ring_sale'), async (req, res, next) => {
+  try {
+    const b = z.object({ posCustomerId: z.string().uuid().nullable().optional(), tenantId: z.string().uuid().nullable().optional() }).parse(req.body)
+    if (b.posCustomerId && b.tenantId) throw new AppError(400, 'A sale belongs to one person — a resident or a customer, not both')
+    const landlordId = posLandlordId(req)
+    const tx = await queryOne<{ id: string }>(`SELECT id FROM pos_transactions WHERE id = $1 AND landlord_id = $2`, [req.params.id, landlordId])
+    if (!tx) throw new AppError(404, 'Sale not found')
+    if (b.posCustomerId) {
+      const c = await queryOne(`SELECT 1 FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL`, [b.posCustomerId, landlordId])
+      if (!c) throw new AppError(404, 'Customer not found')
+    }
+    if (b.tenantId) {
+      const t = await queryOne(
+        `SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id WHERE lt.tenant_id = $1 AND l.landlord_id = $2 LIMIT 1`,
+        [b.tenantId, landlordId])
+      if (!t) throw new AppError(404, 'That resident is not at one of this company\'s properties')
+    }
+    const row = await queryOne<any>(
+      `UPDATE pos_transactions SET pos_customer_id = $1, tenant_id = $2 WHERE id = $3
+       RETURNING id, pos_customer_id, tenant_id`, [b.posCustomerId ?? null, b.tenantId ?? null, tx.id])
+    const name = await queryOne<{ name: string | null }>(
+      `SELECT COALESCE(
+          (SELECT NULLIF(TRIM(pc.first_name || ' ' || pc.last_name), '') FROM pos_customers pc WHERE pc.id = $1),
+          (SELECT u.first_name || ' ' || u.last_name FROM tenants tn JOIN users u ON u.id = tn.user_id WHERE tn.id = $2)) AS name`,
+      [row.pos_customer_id, row.tenant_id])
+    res.json({ success: true, data: { ...row, customer_name: name?.name ?? null } })
+  } catch (e) { next(e) }
+})
 
 // ── S263: POS sessions (server-of-record cart state) ──────────────────────
 //
@@ -2748,7 +2876,10 @@ posRouter.get('/sessions', requirePerm('pos.ring_sale'), async (req, res, next) 
                 tu.first_name  || ' ' || tu.last_name
               ) AS customer_name,
               pr.name AS property_name,
-              (SELECT COUNT(*)::int FROM pos_session_items WHERE session_id = s.id) AS item_count
+              (SELECT COUNT(*)::int FROM pos_session_items WHERE session_id = s.id) AS item_count,
+              -- S654 (Nic): the open-tab list says what is in each cart.
+              (SELECT string_agg(x.item_name || CASE WHEN x.qty > 1 THEN ' ×' || x.qty::int ELSE '' END, ', ')
+                 FROM (SELECT item_name, qty FROM pos_session_items WHERE session_id = s.id ORDER BY created_at LIMIT 3) x) AS preview
          FROM pos_sessions s
          LEFT JOIN pos_customers pcu ON pcu.id = s.pos_customer_id
          LEFT JOIN tenants       t   ON t.id   = s.tenant_id
