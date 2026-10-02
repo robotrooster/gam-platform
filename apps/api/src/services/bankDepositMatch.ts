@@ -5,9 +5,8 @@
 // bank. Today GAM makes the landlord transcribe every one of those by hand:
 // look up when the deposit hit, waive the late fee that accrued in the
 // meantime, credit it back down, mark the charges paid — and unwind all of it
-// when a check bounces. That is the work the manual-payment fee is charging
-// for, and it is work GAM can simply delete: the bank feed is already required
-// and already syncing these very rows.
+// when a check bounces. That is work GAM can simply delete: the bank feed is
+// already required and already syncing these very rows.
 //
 // The important by-product is not the clicks saved. It is that the DEPOSIT'S
 // OWN BANK DATE becomes the payment date, so the late fee is decided by a fact
@@ -61,10 +60,6 @@ export interface OpenCharge {
  * landlord never touches it: the tenant asserts, the BANK verifies, GAM
  * reconciles the two. It is strictly better evidence than the landlord guessing,
  * because the landlord was not at the bank either.
- *
- * It also puts the manual-payment fee in front of the person choosing to pay
- * that way, at the moment they choose it, instead of on a bill the landlord has
- * to hand them.
  */
 export interface TenantDeclaredDeposit {
   id: string

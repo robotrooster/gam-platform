@@ -12,7 +12,7 @@
  */
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { paidByLabel, formatCurrency, humanize, humanizeEntryDescription, chargeLabel, MANUAL_PAYMENT_FEE_SCOPE } from '@gam/shared'
+import { paidByLabel, formatCurrency, humanize, humanizeEntryDescription, chargeLabel } from '@gam/shared'
 import { ReportBankDepositModal, ReportedDeposits } from '../components/ReportBankDeposit'
 import { apiGet } from '../lib/api'
 import { AutopaySection } from './AutopayCard'
@@ -78,14 +78,8 @@ const STATUS_BADGE: Record<string, string> = {
 //
 // Every way to pay this balance, priced, before the tenant picks one. The
 // figures come from the server, computed with the same formula that actually
-// charges — so what is shown here is what gets taken.
-//
-// When the landlord is covering the cash fee, the row deliberately shows the
-// full price struck through with the saving named, rather than quietly showing a
-// smaller number. Nic: the tenant "needs to know that the landlord is actively
-// covering that and that they may choose to stop covering that at any time" — so
-// if a $10 ever does appear later, they recognize it as the landlord stopping
-// rather than a new charge nobody warned them about.
+// charges — so what is shown here is what gets taken. S654: cash, check and
+// money order are free; the server's label for that row says so.
 function WaysToPay({ lease, reports = [], onReportDeposit, onWithdrawn }: {
   lease: any
   reports?: any[]
@@ -94,43 +88,25 @@ function WaysToPay({ lease, reports = [], onReportDeposit, onWithdrawn }: {
 }) {
   const costs: any[] = lease?.methodCosts ?? []
   if (!costs.length) return null
-  const covered = !!lease.manualFeeCoveredByLandlord
-  const firstFree = !!lease.manualFeeFirstFree
-  const absorbed = Number(lease.manualFeeAbsorbed || 0)
 
   return (
     <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--bd)' }}>
       <div style={{ fontSize: '.7rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
         Ways to pay
       </div>
-      {costs.map((c) => {
-        const isCash = c.method === 'manual'
-        return (
-          <div key={c.method} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12, padding: '3px 0', fontSize: '.78rem' }}>
-            <span style={{ color: 'var(--t2)' }}>
-              {isCash ? 'Cash, check or money order' : c.label}
-              {c.fee > 0 && (
-                <span style={{ color: 'var(--t3)', fontSize: '.72rem' }}> · +{formatCurrency(c.fee)} fee</span>
-              )}
-              {isCash && covered && (
-                <span style={{ color: 'var(--t3)', fontSize: '.72rem' }}> · {formatCurrency(absorbed)} fee covered by your landlord</span>
-              )}
-              {isCash && !covered && firstFree && (
-                <span style={{ color: 'var(--t3)', fontSize: '.72rem' }}> · no fee this time</span>
-              )}
-            </span>
-            <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--t0)', whiteSpace: 'nowrap' }}>
-              {formatCurrency(c.total)}
-            </span>
-          </div>
-        )
-      })}
-      {/* S630 (Nic): cash is free. Every fee disclosure here is gone rather than
-          rewritten to say "$0.00" — telling a tenant a fee applies and is
-          currently zero still reads as a fee that could arrive next month. */}
-      <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
-        There is no charge for {MANUAL_PAYMENT_FEE_SCOPE}.
-      </div>
+      {costs.map((c) => (
+        <div key={c.method} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12, padding: '3px 0', fontSize: '.78rem' }}>
+          <span style={{ color: 'var(--t2)' }}>
+            {c.label}
+            {c.fee > 0 && (
+              <span style={{ color: 'var(--t3)', fontSize: '.72rem' }}> · +{formatCurrency(c.fee)} fee</span>
+            )}
+          </span>
+          <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--t0)', whiteSpace: 'nowrap' }}>
+            {formatCurrency(c.total)}
+          </span>
+        </div>
+      ))}
 
       {/* S624: the entry point sits HERE, under the cash row, because this is
           where a tenant is already deciding to pay that way — not buried on a
@@ -164,12 +140,9 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
       // the amount box, not a ceiling — there is no cap on paying ahead.
       suggestedPayAhead?: number
       requiredNow?: number
-      // S654: what each way of paying costs on THIS lease, and the cash-fee
-      // flags — summed into the one card when there are two or more leases.
+      // S654: what each way of paying costs on THIS lease — summed into the
+      // one card when there are two or more leases.
       methodCosts?: { method: string; label: string; fee: number; total: number }[]
-      manualFeeCoveredByLandlord?: boolean
-      manualFeeFirstFree?: boolean
-      manualFeeAbsorbed?: number
     }[]
     rows: { id: string; amount: number; dueDate: string; type: string; entryDescription: string }[]
     // S616: what the payer owes on each utility service agreement — the same
@@ -405,10 +378,6 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
           equivalent — the pull day is the tenant's alone (Nic). */}
       <AutopaySection />
 
-      {/* S570 (Nic): removed the cash/check/MO fee banner — a tenant can't
-          initiate a cash payment through the portal (they hand cash to the
-          landlord, who records it), so the tenant-facing banner was nonsensical. */}
-
       {/* S654 (Nic): ONE BUTTON. "They can't choose what they pay. They pay
           everything that's owed." With two or more payable leases the page used
           to offer a bare "Pay all" card above a Pay button per lease — three
@@ -427,9 +396,6 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
               ? { method: m, label: parts[0].label, fee: r2(parts.reduce((s, c) => s + Number(c.fee), 0)), total: r2(parts.reduce((s, c) => s + Number(c.total), 0)) }
               : null
           }).filter(Boolean),
-          manualFeeCoveredByLandlord: payable.every((l) => l.manualFeeCoveredByLandlord),
-          manualFeeFirstFree: payable.every((l) => l.manualFeeFirstFree),
-          manualFeeAbsorbed: r2(payable.reduce((s, l) => s + Number(l.manualFeeAbsorbed || 0), 0)),
         }
         const properties = [...new Set(payable.map((l) => l.propertyName))].join(' · ')
         return (

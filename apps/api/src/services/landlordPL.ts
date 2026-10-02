@@ -15,7 +15,7 @@ const round2 = (n: number) => Math.round(n * 100) / 100
  * P&L, owner statement, tax summary, property reports, the report engine,
  * Books). A payment row is the landlord's income when:
  *   - it is their money: revenue_owner 'landlord'. Never GAM's fees ('gam':
- *     decline, return, manual-payment, opt-in products), never paid-ahead
+ *     decline, return, opt-in products), never paid-ahead
  *     money GAM holds ('held', counted as rent when it is drawn down);
  *   - it is rent, a late fee, a fee, a utility, a home-sale payment, or a
  *     carried balance (pre-platform arrears and work-trade deficits: real

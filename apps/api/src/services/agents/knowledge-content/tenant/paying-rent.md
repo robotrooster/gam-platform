@@ -20,9 +20,9 @@ A processing fee may apply depending on how you pay:
 - **Non-US-issued cards:** an additional 1.5%.
 - **Declined card attempt:** a flat $1.00 declined-payment fee.
 
-Because ACH and cash both cost a flat $6.00, either is usually the lowest-cost way to pay a larger amount; for a small payment, a card can be cheaper.
+Of the electronic options, ACH's flat $6.00 is usually the lowest-cost way to pay a larger amount; for a small payment, a card can be cheaper.
 
-There is no charge for paying this way, on any payment, whatever the instrument: cash, a personal, cashier's or certified check, a money order, or a bank draft. Not all landlords accept off-platform payment, so ask yours first.
+Paying by cash, check or money order is free on every payment — there is no fee for it, whatever the instrument: cash, a personal, cashier's or certified check, a money order, or a bank draft. Not all landlords accept off-platform payment, so ask yours first.
 
 ## If you deposit rent at the bank yourself
 

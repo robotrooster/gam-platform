@@ -8,8 +8,8 @@
  *
  * The receipt is written as a receipt (tenant_remittances: method, check
  * number, date, who took it). It settles whatever is open, oldest first, by
- * the same rules as recording a payment against a charge — cash is free, the
- * first payment's waiver, pay-in-full. Whatever is left is banked on the lease
+ * the same rules as recording a payment against a charge — no fee (S654: cash
+ * and check are free), pay-in-full. Whatever is left is banked on the lease
  * as money PAID AHEAD (lease_prepaid_credits), which the next invoice draws
  * down before it goes out. No credit is created anywhere: nothing here is
  * money the landlord made up, it is money that arrived.
@@ -54,13 +54,8 @@ export async function postTenantPayment(client: PoolClient, input: PostPaymentIn
 
   // What is open, oldest first — the receipt settles that before anything is paid ahead.
   const open = (await client.query<any>(
-    `SELECT p.id, p.landlord_id, p.tenant_id, p.unit_id, p.lease_id, p.due_date::text AS due_date,
-            COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
-            t.background_check_status
+    `SELECT p.id, p.landlord_id, p.tenant_id, p.unit_id, p.lease_id, p.due_date::text AS due_date
        FROM payments p
-       JOIN units u ON u.id = p.unit_id
-       LEFT JOIN tenants t ON t.id = p.tenant_id
-       LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
       WHERE p.lease_id = $1 AND p.status IN ('pending', 'failed') AND p.work_trade_suspended_at IS NULL
       ORDER BY p.due_date, p.created_at LIMIT 1 FOR UPDATE OF p`, [lease.id])).rows[0]
 

@@ -11,7 +11,6 @@ import { randomUUID } from 'crypto'
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import { confirmDepositMatch } from './bankDepositConfirm'
-import { MANUAL_PAYMENT_FEE } from '@gam/shared'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease,
   seedLeaseTenant,
@@ -179,9 +178,9 @@ describe('confirming a deposit', () => {
     expect(credit.reason).toContain('2026-09-04')
   })
 
-  it('charges nothing for cash (S630), and marks the bank row matched', async () => {
+  it('charges nothing for cash (S654), and marks the bank row matched', async () => {
     const s = await buildStack()
-    // Give the tenant a prior settled rent so this isn't the free first payment.
+    // A prior settled rent, so this is not the tenant's first payment.
     await db.query(
       `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type,
                              amount, status, due_date, entry_description, settled_at)
@@ -191,16 +190,12 @@ describe('confirming a deposit', () => {
     const r = await confirmDepositMatch({
       bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'cash',
     })
-    // S630 (Nic, DIRECTIVE): "cash is FREE." MANUAL_PAYMENT_FEE is 0, so a cash
-    // confirmation raises NO fee row at all and nobody is billed — this test
-    // still said 'tenant' from when the fee was $10. `feeBilledTo: 'none'` is
-    // the whole point of that directive, and the absent row is what proves it:
-    // a $0 row would still show up on a tenant's ledger as a charge.
-    expect(r.feeBilledTo).toBe('none')
-    expect(MANUAL_PAYMENT_FEE).toBe(0)
+    // S654 (Nic, DIRECTIVE): "Paying cash or check is free." No fee row, and
+    // the result carries no fee field — there is nothing to report.
+    expect(r).not.toHaveProperty('feeBilledTo')
     const feeRows = (await db.query(
       `SELECT amount::float AS amount FROM payments
-        WHERE lease_id=$1 AND entry_description='MANUALPAY'`, [s.leaseId])).rows
+        WHERE lease_id=$1 AND type='fee'`, [s.leaseId])).rows
     expect(feeRows).toHaveLength(0)
 
     const txn = (await db.query(

@@ -66,7 +66,8 @@ propertiesRouter.get('/', async (req, res, next) => {
          OR EXISTS (SELECT 1 FROM invoices ix JOIN units ux2 ON ux2.id = ix.unit_id WHERE ux2.property_id = p.id)) AS first_billing_cycle_locked,
         COUNT(u.id) FILTER (WHERE u.status='active')::int AS occupied_units,
         COUNT(u.id) FILTER (WHERE u.status='vacant')::int AS vacant_units,
-        to_jsonb(r.*) AS allocation_rule,
+        -- S654: manual_fee_payer is retired (cash/check is free); never sent.
+        to_jsonb(r.*) - 'manual_fee_payer' AS allocation_rule,
         COALESCE(ll.business_name, lu.first_name || ' ' || lu.last_name) AS entity_name
       FROM properties p
       LEFT JOIN units u ON u.property_id = p.id
@@ -116,10 +117,9 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
         // volume discounts must never reach a tenant's bill. Accepted for
         // backward compatibility with older clients, then ignored below.
         platformFeePayer:   z.enum(FEE_PAYER_VALUES).default('landlord'),
-        // S607 (Nic): who reimburses the cash/check/money-order fee.
-        // Defaults to the tenant — a landlord who has not opted in has not
-        // agreed to absorb anything.
-        manualFeePayer:     z.enum(FEE_PAYER_VALUES).default('tenant'),
+        // S654 (Nic): no cash/check fee exists, so there is no manualFeePayer.
+        // An older client still sending it is stripped by zod, not refused.
+
         // Deprecated S116 — accepted for backward compat; if set, mirrors
         // into achFeePayer + cardFeePayer when those aren't supplied.
         bankingFeePayer:    z.enum(FEE_PAYER_VALUES).optional(),
@@ -350,18 +350,16 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     await client.query(`
       INSERT INTO property_allocation_rules
         (property_id, ach_fee_payer, card_fee_payer, platform_fee_payer,
-         manual_fee_payer,
          rent_percent, rent_percent_floor, rent_percent_ceiling,
          flat_monthly_fee, per_unit_fee,
          placement_fee_type, placement_fee_value,
          maintenance_markup_percent, owner_bank_account_id)
-      VALUES ($1,$2,$3,$4,$14,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [prop.id, achFeePayer, cardFeePayer, platformFeePayer,
        ar.rentPercent ?? null, ar.rentPercentFloor ?? null, ar.rentPercentCeiling ?? null,
        ar.flatMonthlyFee ?? null, ar.perUnitFee ?? null,
        ar.placementFeeType ?? null, ar.placementFeeValue ?? null,
-       ar.maintenanceMarkupPercent ?? null, ar.ownerBankAccountId ?? null,
-       ar.manualFeePayer ?? 'tenant'])
+       ar.maintenanceMarkupPercent ?? null, ar.ownerBankAccountId ?? null])
 
     await client.query('COMMIT')
 
@@ -1594,7 +1592,6 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
       achFeePayer:        z.enum(FEE_PAYER_VALUES).optional(),
       cardFeePayer:       z.enum(FEE_PAYER_VALUES).optional(),
       platformFeePayer:   z.enum(FEE_PAYER_VALUES).optional(),
-      manualFeePayer:     z.enum(FEE_PAYER_VALUES).optional(),
     }).parse(req.body)
 
     const prop = await queryOne<any>(
@@ -1629,10 +1626,6 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
       params.push(body.ownerBankAccountId)
       sets.push(`owner_bank_account_id = $${params.length}`)
     }
-    if (body.manualFeePayer !== undefined) {
-      params.push(body.manualFeePayer)
-      sets.push(`manual_fee_payer = $${params.length}`)
-    }
     if (body.achFeePayer !== undefined) {
       params.push(body.achFeePayer)
       sets.push(`ach_fee_payer = $${params.length}`)
@@ -1649,6 +1642,16 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
     // older clients and simply ignored; a DB CHECK backs the rule up so no
     // future route, script or manual UPDATE can quietly reintroduce it.
     if (sets.length === 0) {
+      // S654: a landlord page cached from before the cash/check fee was retired
+      // can still send its old toggle alone. There is nothing to change, so it
+      // answers with the current rule instead of an error toast.
+      if (req.body && typeof req.body === 'object' && 'manualFeePayer' in req.body) {
+        const current = await queryOne<any>(
+          `SELECT * FROM property_allocation_rules WHERE property_id = $1`, [req.params.id])
+        if (!current) throw new AppError(404, 'Allocation rule not found for property')
+        delete current.manual_fee_payer
+        return res.json({ success: true, data: current })
+      }
       throw new AppError(400, 'No allocation-rule fields supplied')
     }
     params.push(req.params.id)
@@ -1659,6 +1662,8 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
        RETURNING *
     `, params)
     if (!updated) throw new AppError(404, 'Allocation rule not found for property')
+    // S654: manual_fee_payer is retired (cash/check is free) — never sent.
+    delete updated.manual_fee_payer
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })

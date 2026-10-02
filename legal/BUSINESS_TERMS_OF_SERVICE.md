@@ -3,7 +3,7 @@
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
 Effective Date: August 10, 2026
-Last Updated: August 26, 2026
+Last Updated: October 2, 2026
 
 ---
 
@@ -112,11 +112,7 @@ GAM reserves the right to change its fees prospectively with thirty (30) days' n
 
 ### 6.3 Electronic Payments and Recorded Manual Payments
 
-The Platform's built-in rent collection processes electronic payments (ACH and card) through the Payment Rail. A Landlord or authorized staff member may also **record a payment the Tenant made off-platform** — any payment handed to the office instead of made in the app, including cash, a personal, cashier's or certified check, a money order, or a bank draft — so that the Tenant's balance reflects it. Recording a manual payment marks the corresponding rent as settled but moves no money through the Payment Rail; the Landlord is responsible for having actually received the off-platform funds and for their accuracy. Each recorded manual payment is subject to a **$6.00 manual-payment fee** payable to GAM, **charged per recorded payment** (ten such payments in a month is $60). This is the same flat figure as the ACH payment fee, so no payment method costs the Tenant more than another.
-
-**When the fee is waived.** The fee is waived on a Tenant's **first rent payment on their lease, and only if that first payment is an off-platform payment.** If the Tenant's first rent payment is made electronically, the waiver is used up and does not carry forward. The waiver does not depend on when the Tenant or the property joined the Platform, and a late payment does not forfeit it.
-
-**Who pays it, and how GAM collects it.** By default the fee is charged to the Tenant, and you are made whole. You may elect, **per property**, to cover it instead. That election applies to every Tenant at that property alike and cannot be made tenant by tenant. Where you elect to cover it, GAM collects the fee from your collected balance before disbursement — it appears as a reduction in your payout rather than as an invoice — and the Platform shows you an itemised record of the fees you have absorbed. Where you do not cover it, the Tenant is charged and your payout is unaffected. You may change this election at any time, prospectively.
+The Platform's built-in rent collection processes electronic payments (ACH and card) through the Payment Rail. A Landlord or authorized staff member may also **record a payment the Tenant made off-platform** — any payment handed to the office instead of made in the app, including cash, a personal, cashier's or certified check, a money order, or a bank draft — so that the Tenant's balance reflects it. Recording a manual payment marks the corresponding rent as settled but moves no money through the Payment Rail; the Landlord is responsible for having actually received the off-platform funds and for their accuracy. **Recording a manual payment is free.** GAM charges no fee to you or to the Tenant for a cash, check or money-order payment.
 
 ### 6.4 Chargebacks, ACH Returns, and Disputes
 
@@ -175,7 +171,7 @@ GAM does **not** determine the legality, reasonableness, or enforceability of an
 The following refund policy applies to all transactions on the Platform:
 
 - **Payment processing fees** (ACH, card, Connect, platform) are **non-refundable** under all circumstances, including when the underlying payment is reversed, refunded, or charged back.
-- **GAM platform fees** (the $2/occupied-unit fee, the $10/property minimum, the short-term-stay fee, the manual-payment fee, and any other service fee charged by GAM to a Landlord or PM Company) are **non-refundable** under all circumstances.
+- **GAM platform fees** (the $2/occupied-unit fee, the $10/property minimum, the short-term-stay fee, and any other service fee charged by GAM to a Landlord or PM Company) are **non-refundable** under all circumstances.
 - **Tenant payments to Landlords** (rent, utility charges, fee assessments) may be refunded by the Landlord at the Landlord's discretion through the Platform's refund interface. GAM does not initiate, mandate, or guarantee any such refund.
 - GAM does **not** refund any payment for services rendered, even if you claim dissatisfaction. Disputes about Platform functionality should be raised through `support@goldassetmanagement.com`; GAM will work in good faith to resolve operational issues but is not obligated to refund.
 
@@ -335,7 +331,7 @@ TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT SHALL GAM, ITS AFFILIATES, O
 
 GAM'S AGGREGATE LIABILITY ARISING OUT OF OR RELATED TO THESE TERMS OR THE PLATFORM IS LIMITED TO THE TOTAL **PLATFORM FEES** YOU PAID TO GAM IN THE NINETY (90) DAYS IMMEDIATELY PRECEDING THE EARLIER OF (i) THE EVENT GIVING RISE TO THE CLAIM, OR (ii) THE TERMINATION OF YOUR ACCOUNT. IF YOU PAID NO PLATFORM FEES IN THAT WINDOW, GAM'S AGGREGATE LIABILITY IS ZERO.
 
-FOR PURPOSES OF THIS SECTION, "**PLATFORM FEES**" MEANS FEES CHARGED BY GAM FOR USE OF THE PLATFORM, INCLUDING THE PER-OCCUPIED-UNIT PLATFORM FEE, THE PER-PROPERTY MINIMUM, THE SHORT-TERM-STAY FEE, THE MANUAL-PAYMENT FEE, AND THE CONNECT ACCOUNT FEE. **PLATFORM FEES DO NOT INCLUDE, AND THE FOREGOING CAP EXCLUDES**:
+FOR PURPOSES OF THIS SECTION, "**PLATFORM FEES**" MEANS FEES CHARGED BY GAM FOR USE OF THE PLATFORM, INCLUDING THE PER-OCCUPIED-UNIT PLATFORM FEE, THE PER-PROPERTY MINIMUM, THE SHORT-TERM-STAY FEE, AND THE CONNECT ACCOUNT FEE. **PLATFORM FEES DO NOT INCLUDE, AND THE FOREGOING CAP EXCLUDES**:
 
 - (i) PAYMENT PROCESSING FEES OF ANY KIND, WHETHER ACH OR CARD, REGARDLESS OF WHETHER THEY WERE PAID BY THE TENANT (PASS-THROUGH) OR THE LANDLORD;
 - (ii) BANKING FEES, NETWORK INTERCHANGE, AND ANY THIRD-PARTY PAYMENT-NETWORK FEE OR SURCHARGE;

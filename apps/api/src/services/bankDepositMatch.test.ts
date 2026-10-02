@@ -93,7 +93,7 @@ describe('matching a deposit', () => {
     }
   })
 
-  it('combines charges that add up — rent plus last month’s manual fee', () => {
+  it('combines charges that add up — rent plus last month’s late fee', () => {
     const m = matchDeposit({ amount: 260, postedDate: '2026-09-03', description: 'DEPOSIT' }, [
       charge({ id: 'rent', leaseId: 'L', amount: 250, type: 'rent' }),
       charge({ id: 'fee', leaseId: 'L', amount: 10, type: 'fee', dueDate: '2026-09-01' }),

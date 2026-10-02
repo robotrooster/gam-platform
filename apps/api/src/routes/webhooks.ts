@@ -176,8 +176,8 @@ webhooksRouter.post('/stripe', async (req, res) => {
         // the tenant paid them and the money stopped on GAM's books.
         //
         // A row only allocates if it is the LANDLORD'S money — a 'fee' row can
-        // be either side's (GAM's ACH-return, decline, manual-payment and
-        // opt-in-product fees are stamped revenue_owner='gam' at creation), and
+        // be either side's (GAM's ACH-return, decline and opt-in-product
+        // fees are stamped revenue_owner='gam' at creation), and
         // it needs a unit to resolve a property (FlexCharge rows carry none).
         for (const row of settled.rows) {
           const allocatable =

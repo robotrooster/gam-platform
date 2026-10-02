@@ -1,13 +1,12 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { chargeLandlord } from '../services/landlordGamAccount'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AchReturnCode, ACH_RETURN_CONFIG, PLATFORM_FEES,
-         MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_FEE, paymentMethodCosts,
+         MANUAL_PAYMENT_METHODS, paymentMethodCosts,
          PRIOR_ARRANGEMENT_METHOD } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
 import { computePlatformCut, createRentPlatformCharge } from '../services/stripeConnect'
@@ -676,46 +675,6 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
 // S537: everything the tenant's Pay Now card needs in one fetch — the
 // outstanding oldest-first ledger + the total. Rent is pay-in-full only
 // (Nic) — no partial-payment concept, so nothing about partials is sent.
-// S607 (Nic): "If the landlord is covering the ten dollars, it needs to be
-// visible to them so they can track it. If the landlord is not covering the ten
-// dollars, it doesn't need to be visible to them."
-//
-// When the tenant reimburses it, the landlord is whole and the fee is none of
-// their business — it appears on the tenant's bill and nowhere else. When the
-// landlord ABSORBS it, it is a real cost that reduces their payout, and an
-// unexplained deduction is exactly the surprise the onboarding toggle exists to
-// prevent: ten cash payments is $100 off a disbursement with nothing naming it.
-//
-// Reads platform_revenue_ledger, which is otherwise admin-only (finances.ts
-// deliberately does not expose it) — so this endpoint is narrowly scoped to ONE
-// reference_type and to properties the caller actually owns or manages.
-paymentsRouter.get('/absorbed-manual-fees', async (req: any, res, next) => {
-  try {
-    const role = req.user!.role
-    // S633: every company the account owns.
-    const landlordIds = landlordScopeIds(req.user!)
-    if (!landlordIds.length) throw new AppError(403, 'Landlord scope required')
-    const months = Math.min(24, Math.max(1, Number(req.query.months) || 6))
-
-    const rows = await query<any>(`
-      SELECT prl.id, prl.amount::float AS amount, prl.created_at, prl.notes,
-             p.id AS property_id, p.name AS property_name, p.landlord_id,
-             u.unit_number
-        FROM platform_revenue_ledger prl
-        JOIN properties p ON p.id = prl.property_id
-        LEFT JOIN payments pay ON pay.id = prl.reference_id
-        LEFT JOIN units u ON u.id = pay.unit_id
-       WHERE prl.reference_type = 'manual_payment_fee'
-         AND p.landlord_id = ANY($1::uuid[])
-         AND prl.created_at >= NOW() - ($2::int * INTERVAL '1 month')
-       ORDER BY prl.created_at DESC
-       LIMIT 500`, [landlordIds, months])
-
-    const total = Math.round(rows.reduce((s: number, r: any) => s + r.amount, 0) * 100) / 100
-    res.json({ success: true, data: { total, count: rows.length, months, rows } })
-  } catch (e) { next(e) }
-})
-
 paymentsRouter.get('/balance-context', async (req: any, res, next) => {
   try {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
@@ -727,29 +686,11 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
               -- NULL lease_id is not it: ordinary tenants have lease-less
               -- payment rows too, and treating those as service charges pulled
               -- them out of their own balance group.
-              inv.service_agreement_id,
-              COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
-              -- S607: has this tenant ever had rent satisfied? The first manual
-              -- payment is free, so the quote must know which side of that the
-              -- tenant is on rather than promising a discount they already spent.
-              --
-              -- Scoped EXACTLY as record-manual scopes it: by lease when the row
-              -- carries one, otherwise by tenant. record-manual falls back the
-              -- same way (scopeCol = lease_id when present, else tenant_id),
-              -- and a quote that scopes differently from the charge is the drift
-              -- this whole breakdown exists to avoid.
-              NOT EXISTS (
-                SELECT 1 FROM payments pp
-                 WHERE pp.type = 'rent'
-                   AND pp.status IN ('settled', 'paid_via_deposit')
-                   AND (CASE WHEN p.lease_id IS NOT NULL
-                             THEN pp.lease_id = p.lease_id
-                             ELSE pp.tenant_id = p.tenant_id END)) AS manual_first_free
+              inv.service_agreement_id
          FROM payments p
          JOIN units u ON u.id = p.unit_id
          JOIN properties pr ON pr.id = u.property_id
          LEFT JOIN invoices inv ON inv.id = p.invoice_id
-         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.tenant_id = $1
           -- S637 (Nic): "Work trade is still showing people they owe a full
           -- balance." This is the number the TENANT sees on their own payments
@@ -770,7 +711,6 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     const byLease = new Map<string, {
       leaseId: string; propertyName: string; unitNumber: string; landlordId: string
       paymentBlocked: boolean; outstanding: number; carriedBalance: number; rows: any[]
-      manualFeePayer: 'tenant' | 'landlord'; manualFirstFree: boolean
     }>()
     // S615: a UTILITY-SERVICE payer's rows carry NO lease_id. Left in the
     // grouping below they would all collapse into one group keyed `null`, and
@@ -787,8 +727,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       if (!g) {
         g = { leaseId: r.lease_id, propertyName: r.property_name, unitNumber: r.unit_number,
               landlordId: r.landlord_id,
-              paymentBlocked: !!r.payment_block, outstanding: 0, carriedBalance: 0, rows: [],
-              manualFeePayer: r.manual_fee_payer, manualFirstFree: !!r.manual_first_free }
+              paymentBlocked: !!r.payment_block, outstanding: 0, carriedBalance: 0, rows: [] }
         byLease.set(r.lease_id, g)
       }
       g.outstanding = Math.round((g.outstanding + r.amount) * 100) / 100
@@ -845,26 +784,20 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
 
     const creditApplied_ = (leaseId: string) => creditApplied.get(leaseId) ?? 0
     const leases = await Promise.all([...byLease.values()].map(async l => {
-      const landlordCovers = l.manualFeePayer === 'landlord'
       // Never below zero: a credit larger than the bill leaves the rest on the
       // account for next month, it does not hand out change.
       const creditApplied = creditApplied_(l.leaseId)
       const grossOutstanding = l.outstanding
       l.outstanding = Math.round((l.outstanding - creditApplied) * 100) / 100
-      const manualFee = (landlordCovers || l.manualFirstFree) ? 0 : MANUAL_PAYMENT_FEE
       return {
         ...l,
-        methodCosts: paymentMethodCosts(l.outstanding, { manualFee }),
+        // S654: cash, check and money order are free — the manual row is fee 0.
+        methodCosts: paymentMethodCosts(l.outstanding),
         // Shown as a line so the resident SEES the credit, not just a smaller
         // number they have to take on faith.
         grossOutstanding,
         creditApplied,
         creditRemaining: creditLeft.get(l.leaseId) ?? 0,
-        manualFeeCoveredByLandlord: landlordCovers,
-        manualFeeFirstFree: l.manualFirstFree,
-        // What the landlord is absorbing on their behalf, so the tenant can see
-        // it as a line rather than only as an absence.
-        manualFeeAbsorbed: landlordCovers ? MANUAL_PAYMENT_FEE : 0,
         // S609: a SUGGESTION for the amount box — roughly what the balance plus
         // the rest of the lease term's rent comes to. NOT a limit (Nic): a
         // tenant may pay any amount above their balance, because utilities are
@@ -924,7 +857,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     }
     const serviceAgreements = [...byAgreement.values()].map(a => ({
       ...a,
-      methodCosts: paymentMethodCosts(a.outstanding, { manualFee: 0 }),
+      methodCosts: paymentMethodCosts(a.outstanding),
     }))
 
     res.json({ success: true, data: {
@@ -1118,17 +1051,11 @@ paymentsRouter.post('/post-payment', requirePerm('take_payment'), async (req: an
 // everywhere that treats settled as paid (balance / FIFO / late-fee / rent-roll),
 // while the weekly batch (services/landlordPassthrough.ts) SKIPS it because that
 // path requires platform_held=TRUE — so the landlord, who already physically
-// holds the cash, is never double-paid. type='fee' rows aren't disbursed either,
-// so the fee below stays GAM revenue (same as RETURNFEE). The amount is
-// MANUAL_PAYMENT_FEE, which is ZERO — cash is the cheapest way to pay, per
-// S630. (This prose has been wrong twice, claiming $10 and then $6 after the
-// constant had already moved. The constant is the truth; it is now named here
-// rather than quoted, so the two cannot drift again.)
+// holds the cash, is never double-paid.
 //
-// Each manual payment carries a flat fee (a tenant-owed 'fee' row,
-// entry_description 'MANUALPAY') EXCEPT the tenant's FIRST rent payment on the
-// lease — waived to give them time to onboard ACH. The tenant portal discloses
-// the future $10 charge.
+// S654 (Nic): "There's no fee. Paying cash or check is free." Recording a cash,
+// check or money-order payment charges nobody — no fee row, no waiver, no
+// fee-payer setting.
 //
 // Auth: requirePerm('take_payment') (owner roles auto-pass; staff need the
 // take_payment sub-permission). canManageLandlordResource confirms scope.
@@ -1172,15 +1099,9 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       // else in this route needed it.
       `SELECT p.id, p.type, p.status, p.landlord_id, p.tenant_id, p.unit_id,
               p.lease_id, p.amount::float AS amount, p.due_date::text AS due_date,
-              u.payment_block,
-              COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
-              -- S620: screened tenants do not get the free first manual
-              -- payment; see the waiver comment below.
-              t.background_check_status
+              u.payment_block
          FROM payments p
          JOIN units u ON u.id = p.unit_id
-         LEFT JOIN tenants t ON t.id = p.tenant_id
-         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.id = $1
           FOR UPDATE OF p`,
       [req.params.id])).rows[0]
@@ -1227,9 +1148,8 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       throw new AppError(409, 'This unit is in eviction mode — recording a payment is paused. Contact the landlord.')
     }
 
-    // S624: the waiver rules, the fee routing and the settle itself now live in
-    // services/manualPaymentSettle.ts, because the BANK-DEPOSIT match path has to
-    // settle a payment identically. Every rule that used to be inline here moved
+    // S624: the settle itself lives in services/manualPaymentSettle.ts, because
+    // the BANK-DEPOSIT match path has to settle a payment identically. Every rule that used to be inline here moved
     // there verbatim, comments included — see that file's header for why a second
     // copy was not acceptable.
     //
@@ -1237,8 +1157,7 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     // enter it, so it settles NOW. The deposit-match path passes the date the
     // money actually moved instead.
     const { settleManualRentPayment } = await import('../services/manualPaymentSettle')
-    const { feeWaived, feeBilledTo, feePaymentId, firstPayment,
-            amountSettled, creditUsed, surplus, creditId,
+    const { amountSettled, creditUsed, surplus, creditId,
             settledPaymentIds } = await settleManualRentPayment(client, {
       payment: pmt,
       method: body.method,
@@ -1252,7 +1171,6 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       // surplus with no answer is refused, not guessed at.
       surplusHandling: body.surplusHandling,
     })
-    const landlordCovers = pmt.manual_fee_payer === 'landlord'
 
     await client.query('COMMIT')
 
@@ -1273,19 +1191,6 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
         paymentId:    pmt.id,
         status:       'settled',
         method:       body.method,
-        feeWaived,
-        feeAmount:    feeWaived ? 0 : MANUAL_PAYMENT_FEE,
-        // Who the fee landed on. 'tenant' raises a charge they must pay;
-        // 'landlord' posts it to GAM revenue and nets out of their payout;
-        // 'none' only ever means the free first payment.
-        feeBilledTo:  feeWaived ? 'none' : (landlordCovers ? 'landlord' : 'tenant'),
-        feePaymentId,
-        // S607: these are now TWO different reasons a fee was not raised, and
-        // the caller must be able to tell them apart — "your first one is free"
-        // and "your landlord covers this" are different things to say to a
-        // tenant, and only one of them stops being true next month.
-        firstPayment,
-        coveredByLandlord: landlordCovers,
         // S637: what the ledger absorbed, and where the remainder went.
         amountSettled,
         // S638: how much of the bill an account credit covered, so the desk and
@@ -1306,14 +1211,14 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
 
 // POST /api/payments/:id/record-prior-arrangement — S568 (Nic).
 // Onboarding-transition ONLY: mark the FIRST rent charge of an IMPORTED lease as
-// paid via a prior off-platform arrangement. It comes off the books, no money
-// moves, and NO manual-payment fee is charged. Distinct from record-manual (a
+// paid via a prior off-platform arrangement. It comes off the books and no money
+// moves. Distinct from record-manual (a
 // cash/check received now) — this is "already paid before they came onto GAM."
 //
 // Hard gating (all enforced here, no landlord toggle): rent charge, still open,
 // lease_source='imported' (a brand-new GAM lease has no prior arrangement),
 // within PRIOR_ARRANGEMENT_TRANSITION_DAYS of onboarding, and it must be the
-// FIRST rent charge (no already-satisfied rent on the lease). Fee-free always.
+// FIRST rent charge (no already-satisfied rent on the lease).
 paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment'), async (req: any, res, next) => {
   const client = await getClient()
   try {
@@ -1357,7 +1262,7 @@ paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment')
       throw new AppError(409, 'Prior-arrangement only applies to the first rent charge; a later rent charge has already been paid.')
     }
 
-    // Satisfy the obligation off-platform. platform_held FALSE, no fee row.
+    // Satisfy the obligation off-platform. platform_held FALSE.
     await client.query(
       `UPDATE payments
           SET status = 'settled', settled_at = NOW(), manual_method = $2,
@@ -1370,7 +1275,7 @@ paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment')
     await client.query('COMMIT')
     res.json({
       success: true,
-      data: { paymentId: pmt.id, status: 'settled', method: PRIOR_ARRANGEMENT_METHOD, feeCharged: false },
+      data: { paymentId: pmt.id, status: 'settled', method: PRIOR_ARRANGEMENT_METHOD },
     })
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})

@@ -42,7 +42,7 @@ const Q: Record<KnowledgeScope, string[]> = {
   landlord: [
     'when do I get paid', 'how do payouts work', 'what does GAM charge me',
     'who is behind on rent', 'a tenant paid but it has not landed yet',
-    'how do I record a cash payment', 'what is the manual payment fee',
+    'how do I record a cash payment', 'is there a fee for cash or check payments',
     'how do I add a property', 'how do I invite a tenant', 'how do I set a late fee',
     'how do I run a background check', 'what happens when an application comes in',
     'how do I end a lease', 'how do I return a deposit', 'what is the deposit interest rule',

@@ -529,6 +529,24 @@ describe('PATCH /api/properties/:id/allocation-rule', () => {
     expect(res.body.error).toMatch(/No allocation-rule fields supplied/)
   })
 
+  // S654: a landlord page cached from before the cash/check fee was retired
+  // still sends its old toggle alone. Nothing changes and nothing errors.
+  it('the retired cash-fee toggle alone → 200, rule unchanged, no fee field', async () => {
+    const f = await seedPropsFixture()
+    const prop = await createProperty(f)
+    const res = await request(buildApp())
+      .patch(`/api/properties/${prop.body.data.id}/allocation-rule`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ manualFeePayer: 'landlord' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.property_id).toBe(prop.body.data.id)
+    expect(res.body.data).not.toHaveProperty('manual_fee_payer')
+    const row = await db.query(
+      `SELECT manual_fee_payer FROM property_allocation_rules WHERE property_id = $1`,
+      [prop.body.data.id])
+    expect(row.rows[0].manual_fee_payer).toBe('tenant')
+  })
+
   it('ownerBankAccountId belonging to different user → 403', async () => {
     const f = await seedPropsFixture()
     const prop = await createProperty(f)

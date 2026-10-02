@@ -18,14 +18,14 @@ describe('paymentMethodCosts', () => {
   const rent = 450
 
   it('prices every avenue the tenant has', () => {
-    const rows = paymentMethodCosts(rent, { manualFee: PROCESSING_FEES.ACH_FLAT })
+    const rows = paymentMethodCosts(rent)
     expect(rows.map(r => r.method)).toEqual(['ach', 'card', 'manual'])
   })
 
   it('bank is the flat fee on top', () => {
     const [ach] = paymentMethodCosts(rent)
-    expect(ach.fee).toBeCloseTo(6, 2)
-    expect(ach.total).toBeCloseTo(456, 2)
+    expect(ach.fee).toBeCloseTo(PROCESSING_FEES.ACH_FLAT, 2)
+    expect(ach.total).toBeCloseTo(rent + PROCESSING_FEES.ACH_FLAT, 2)
   })
 
   it('card is percentage plus flat', () => {
@@ -39,17 +39,15 @@ describe('paymentMethodCosts', () => {
     expect(card.fee).toBeCloseTo(450 * 0.05 + 0.55, 2)    // 3.5% + 1.5%
   })
 
-  it('manual takes whatever fee the caller says applies — it never guesses', () => {
-    const waived = paymentMethodCosts(rent, { manualFee: 0 })[2]
-    expect(waived.fee).toBe(0)
-    expect(waived.total).toBeCloseTo(450, 2)
-
-    // Deliberately NOT MANUAL_PAYMENT_FEE. The point of this test is that the
-    // function uses whatever it is handed and never reaches for the constant
-    // itself — so the figure here has to be one the constant has never been.
-    const charged = paymentMethodCosts(rent, { manualFee: 12.34 })[2]
-    expect(charged.fee).toBeCloseTo(12.34, 2)
-    expect(charged.total).toBeCloseTo(462.34, 2)
+  // S654 (Nic): "Paying cash or check is free." Always — no option can price it.
+  it('cash, check or money order is free, and says so', () => {
+    for (const amount of [450, 12.34, 7500]) {
+      const manual = paymentMethodCosts(amount, { cardCountry: 'CA' })[2]
+      expect(manual.method).toBe('manual')
+      expect(manual.fee).toBe(0)
+      expect(manual.total).toBeCloseTo(amount, 2)
+      expect(manual.label).toMatch(/free/i)
+    }
   })
 
   it('rounds to the cent so the quote is payable as shown', () => {

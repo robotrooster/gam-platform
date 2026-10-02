@@ -18,7 +18,7 @@ let landlordId: string
 
 const charge = (amount: number, sourceId: string) =>
   chargeLandlord(null, {
-    landlordId, kind: 'manual_payment_fee', amount,
+    landlordId, kind: 'subscription', amount,
     sourceType: 'test', sourceId,
   })
 
@@ -46,7 +46,7 @@ describe('landlord GAM account', () => {
   })
 
   it('takes the whole debt out of a disbursement that covers it', async () => {
-    // Six cash payments, then one ACH rent payment big enough to cover them —
+    // Six small charges, then one ACH rent payment big enough to cover them —
     // Nic's expected case, and the one where nothing gets debited.
     for (let i = 0; i < 6; i++) await charge(10, `4444444${i}-4444-4444-4444-444444444444`)
     const taken = await netAgainstDisbursement(await client(), landlordId, 750)

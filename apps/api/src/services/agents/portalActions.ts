@@ -979,12 +979,11 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'land in. Use for "we will eat the ACH fee at Oak Street".\n' +
       'Each payer is either landlord or tenant. Two things are NOT open: the card fee stays with the ' +
       'tenant, and the platform fee is always the landlord\u2019s. If they ask to move either, say so ' +
-      'plainly rather than sending it and reporting a change that did not happen. The manual fee is ' +
-      'the cash, check and money-order handling fee and it defaults to the tenant.',
+      'plainly rather than sending it and reporting a change that did not happen. Cash, check and ' +
+      'money order carry no fee at all, so there is nothing to set for them.',
     params: {
       propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       achFeePayer: { type: 'string', description: 'landlord or tenant — who covers the bank-transfer fee.' },
-      manualFeePayer: { type: 'string', description: 'landlord or tenant — who covers the cash, check and money-order fee.' },
       ownerBankAccountId: { type: 'string', description: 'The bank account this property pays out to, from a lookup. It must belong to the owner and be active.' },
     },
     required: ['propertyId'],
@@ -3675,15 +3674,13 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     audience: 'landlord', method: 'POST', path: '/api/payments/:paymentId/record-prior-arrangement',
     pathParams: ['paymentId'],
     description:
-      'Mark the FIRST rent charge on an IMPORTED lease as already settled off-platform, from before ' +
+      'Mark the FIRST rent charge on a lease as already settled off-platform, from before ' +
       'the landlord came onto GAM. Use for "they paid me for June in cash before we moved over".\n' +
-      'It comes off the books, no money moves, and NO manual-payment fee is charged — unlike ' +
-      'record_cash_payment, which is money received NOW and does carry that fee where one applies. ' +
-      'Getting the two the wrong way round bills a tenant for something they should not pay, so ask ' +
-      'WHEN they paid rather than inferring it. Do not quote the fee amount; it is not the same for ' +
-      'every tenant and you have not been given it.\n' +
-      'It only works on an imported lease, only on the first rent charge, and only during the ' +
-      'onboarding window. If the system refuses on any of those, record_cash_payment is almost ' +
+      'It comes off the books and no money moves — unlike record_cash_payment, which is money ' +
+      'received NOW. Neither carries a fee. Getting the two the wrong way round misstates when the ' +
+      'tenant paid, so ask WHEN they paid rather than inferring it.\n' +
+      'It only works on the first rent charge, and only during the landlord\u2019s onboarding ' +
+      'window. If the system refuses on either, record_cash_payment is almost ' +
       'certainly what they actually meant.',
     params: { paymentId: { type: 'string', description: 'The rent charge, from a lookup.' } },
     required: ['paymentId'],

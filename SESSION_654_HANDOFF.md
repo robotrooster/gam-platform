@@ -457,10 +457,23 @@ counts a bounced payment once and never quotes work-trade lines as owed).
   excluded them via is_bookable).
 - Add-owner referral restored (Nic: the adder is the referrer): set when the
   invited owner ACCEPTS, to the company's founding owner, first-touch wins.
-- MH 25's $10 credit: check #170, recorded 9/9 10:28 am for $470 against the
-  $460 September rent; a check overpayment is always kept as credit. Nic says
-  Dominic always writes $460 — likely a typo. Remove the $10 only on Nic's OK.
+- MH 25's $10 credit: check #170, recorded 9/9 for $470 against the $460
+  September rent. Nic confirmed the $470 is real (paid ahead). The $10 credit
+  STAYS.
 - Country Acres late fees: NOT waived (Nic). Blu can credit a bill one-off.
+- **Cash/check fee RIPPED OUT (Nic: "There's no fee. Paying cash or check is
+  free.")** The retired fee machinery (already $0 since S630) is gone: the
+  MANUALPAY fee row, the first-payment waiver, the fee-payer toggle on the
+  property page, the absorbed-fees card and endpoint, every fee field in API
+  responses, and the $6 fee and waiver text in both Terms of Service. Committed,
+  NOT deployed.
+  **After that deploy:** one contract migration drops
+  `property_allocation_rules.manual_fee_payer` (and its CHECK), removes
+  'MANUALPAY' from the payments entry_description CHECK and
+  'manual_payment_fee' from the landlord_gam_charges kind CHECK (prod has 0
+  rows of either), then delete the two `manual_fee_payer` strip lines in the
+  properties route, run migrate + db:dump-schema, and re-run
+  `npm run agents:ingest` so the tenant agents stop quoting the old $6 line.
 
 ### Decisions for Nic (numbered; recommendation first)
 1. **Deploy** the overnight batch — the security fixes are the reason.

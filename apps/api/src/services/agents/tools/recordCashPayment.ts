@@ -6,10 +6,10 @@
  * it meant leaving the conversation to find the Payments page.
  *
  * Goes through settleManualRentPayment — the SAME service POST
- * /payments/:id/record-manual calls, so the fee waiver rules, the fee routing
- * and the settle itself are the route's, not a second copy. It re-applies the
- * route's own guards: rent only, an open charge only, ownership, and the
- * eviction pause.
+ * /payments/:id/record-manual calls, so the settle itself is the route's, not a
+ * second copy. It re-applies the route's own guards: rent only, an open charge
+ * only, ownership, and the eviction pause. S654: no fee — cash, check and money
+ * order are free.
  *
  * MONEY, AND IT MOVES A LEGAL CLOCK. Marking rent settled stops late fees and
  * can reset an eviction timeline, so this confirms the tenant, the charge and
@@ -44,9 +44,8 @@ export const recordCashPayment: AgentTool = {
     'something to do on a maybe.\\n' +
     'If more than one rent charge is open it will NOT guess — it returns them and you ask which. ' +
     'Take the check or money-order number when there is one; it is the audit trail.\\n' +
-    'Rent only. A fee or a utility bill cannot be settled this way. There is a manual-payment fee on ' +
-    'all but a migrating tenant’s first payment — mention it if they ask, and never quote a figure ' +
-    'you have not been given.',
+    'Rent only. A fee or a utility bill cannot be settled this way. Recording it is free — there is ' +
+    'no fee for cash, check or money order, for the tenant or the landlord.',
   parameters: {
     type: 'object',
     properties: {
@@ -76,8 +75,6 @@ export const recordCashPayment: AgentTool = {
         `SELECT p.id, p.type, p.status, p.landlord_id, p.tenant_id, p.unit_id, p.lease_id,
                 p.amount::float AS amount, p.due_date::text AS due_date,
                 u.payment_block, u.unit_number,
-                COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
-                t.background_check_status,
                 us.first_name, us.last_name,
                 pr.name AS property_name
            FROM payments p
@@ -85,7 +82,6 @@ export const recordCashPayment: AgentTool = {
            JOIN properties pr ON pr.id = u.property_id
            LEFT JOIN tenants t ON t.id = p.tenant_id
            LEFT JOIN users us ON us.id = t.user_id
-           LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
           WHERE p.landlord_id = ANY($1::uuid[]) AND p.type = 'rent' AND p.status IN ('pending','failed')
             AND ($2::uuid IS NULL OR p.id = $2::uuid)
             AND ($3 = '' OR us.first_name ILIKE '%'||$3||'%' OR us.last_name ILIKE '%'||$3||'%'
@@ -123,7 +119,7 @@ export const recordCashPayment: AgentTool = {
         return { ok: false, error: 'That unit is in eviction mode, so recording a payment is paused. This has to be handled off the assistant.' }
       }
 
-      const result: any = await settleManualRentPayment(client, {
+      await settleManualRentPayment(client, {
         payment: pmt, method: method as any,
         reference: args.reference != null ? String(args.reference).slice(0, 120) : undefined,
         provenance: 'recorded by the assistant',
@@ -136,12 +132,9 @@ export const recordCashPayment: AgentTool = {
         tenant: `${pmt.first_name ?? ''} ${pmt.last_name ?? ''}`.trim(),
         unit: pmt.unit_number,
         amount: pmt.amount, dueDate: pmt.due_date, method,
-        feeWaived: result?.feeWaived,
         note:
           'Settled. Tell them it is recorded against that charge and the tenant now reads as paid — ' +
-          'GAM has not moved any money, since they are holding it.' +
-          (result?.feeWaived === false ? ' A manual-payment fee applies to this one.' : '') +
-          (result?.feeWaived === true ? ' No manual-payment fee on this one — it is their first.' : ''),
+          'GAM has not moved any money, since they are holding it. There is no fee for it.',
       }
     } catch (e) {
       try { await client.query('ROLLBACK') } catch { /* the throw is what matters */ }

@@ -213,7 +213,7 @@ describe('S633 a write that names no company', () => {
       .send({
         name: 'Ambiguous Park', street1: '1 Test St', city: 'Phoenix',
         state: 'AZ', zip: '85001',
-        allocationRule: { platformFeePayer: 'landlord', manualFeePayer: 'tenant' },
+        allocationRule: { platformFeePayer: 'landlord' },
       })
     expect(res.status).toBe(400)
     expect(String(res.body?.error)).toMatch(/more than one company/i)
@@ -225,7 +225,7 @@ describe('S633 a write that names no company', () => {
     const tok = accountToken(f)
     const base = {
       street1: '2 Test St', city: 'Phoenix', state: 'AZ', zip: '85001',
-      allocationRule: { platformFeePayer: 'landlord', manualFeePayer: 'tenant' },
+      allocationRule: { platformFeePayer: 'landlord' },
     }
     const ok = await request(app).post('/api/properties')
       .set('Authorization', `Bearer ${tok}`)

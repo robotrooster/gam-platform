@@ -36,7 +36,7 @@ describe('S640 per-unit economics', () => {
   })
 
   // Cash never touches Stripe — nothing is processed and nothing is paid out,
-  // and GAM's manual fee is zero by directive. It costs nothing to serve.
+  // and paying cash or check is free (S654). It costs nothing to serve.
   it('charges a cash-paying unit nothing but its share of the fixed cost', () => {
     const e = calcStripePerUnit(2000, 'manual', 25)
     expect(e.processingCost).toBe(0)

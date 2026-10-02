@@ -22,7 +22,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync, readdirSync, statSync } from 'fs'
 import { join } from 'path'
-import { MANUAL_PAYMENT_FEE, PROCESSING_FEES, CARD_DECLINE_FEE } from '@gam/shared'
+import { PROCESSING_FEES, CARD_DECLINE_FEE } from '@gam/shared'
 
 const ROOT = join(__dirname, 'knowledge-content')
 
@@ -60,34 +60,37 @@ describe('the knowledge base quotes the live fee schedule', () => {
   it('states the ACH fee as the constant, never a different flat figure', () => {
     // Standing directive: $6 flat ACH is ironclad revenue.
     expect(PROCESSING_FEES.ACH_FLAT).toBe(6)
-    // S630 (Nic): "we are gonna make that absolutely free to pay with cash."
-    // The manual fee used to be pinned to the ACH figure so cash never cost
-    // more; it is now zero, and cash is the CHEAPEST option rather than an
-    // equal one. The knowledge base must not still quote a figure for it —
-    // an agent telling a tenant cash costs $6 is quoting a price GAM does not
-    // charge.
-    expect(MANUAL_PAYMENT_FEE).toBe(0)
-    for (const line of CORPUS.split('\n')) {
-      if (!/manual[- ]payment fee|paying (this way|by cash)/i.test(line)) continue
-      expect(/\$\s?[1-9]/.test(line), `quotes a cash fee: ${line.trim().slice(0, 120)}`).toBe(false)
-    }
     // Exclude lines about the DECLINED-payment fee: it is its own constant,
     // legitimately $1, and shares a sentence with the bank/card wording. (A
     // lookahead was the first attempt and it silently backtracked "$1.00" down
     // to "1" until the exclusion passed — filter the line, don't out-clever the
     // regex engine.)
     const achLines = CORPUS.split('\n')
-      .filter((l) => /\bACH\b|manual[- ]payment fee/i.test(l))
+      .filter((l) => /\bACH\b/i.test(l))
       .filter((l) => !/declin\w*[- ]payment fee/i.test(l))
     expect(achLines.length).toBeGreaterThan(0)
     for (const line of achLines) {
-      // Any "flat $N" on an ACH/manual line must be the real fee — EXCEPT the
+      // Any "flat $N" on an ACH line must be the real fee — EXCEPT the
       // declined-payment fee, which is its own constant and legitimately $1,
       // and which shares a sentence with the bank/card wording.
       for (const m of line.matchAll(/flat \$\s?(\d+(?:\.\d\d)?)/gi)) {
         expect(Number(m[1]), `"${line.trim().slice(0, 90)}"`).toBe(PROCESSING_FEES.ACH_FLAT)
       }
     }
+  })
+
+  // S654 DIRECTIVE (Nic): "No charge for cash or checks anywhere in the
+  // platform... It's not a rule anymore. It's not a thing. There's no fee."
+  // No article may price paying in person, name a manual-payment fee, or keep
+  // the retired "first one free" rule alive.
+  it('never prices cash, check or money order, and never revives the first-free rule', () => {
+    const offenders = CORPUS.split('\n').filter((l) =>
+      // (A background or credit check legitimately costs money — not this rule.)
+      /manual[- ]payment fee|cash[- ](handling )?fee|(cash|(?<!background |credit )check|money order)[^.]{0,60}\bcosts?\b[^.]{0,30}\$\s?[1-9]/i.test(l)
+      || /first (one|payment|cash payment|manual payment)[^.]{0,40}\bfree\b/i.test(l))
+    expect(offenders, offenders.join('\n')).toHaveLength(0)
+    // And at least one article says it plainly, so an agent can ground on it.
+    expect(/(cash|check)[^.]{0,60}\bfree\b/i.test(CORPUS)).toBe(true)
   })
 
   it('states the card decline fee as the constant', () => {

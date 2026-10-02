@@ -351,9 +351,9 @@ export async function settleGamDebit(
  * The nightly sweep — every landlord who owes GAM anything.
  *
  * Cheap and usually silent, because almost everyone is under their threshold:
- * one ACH rent payment at Oak Park offsets roughly 44 cash fees and the park
- * does not have 44 spaces. The ones that surface here are the all-cash
- * properties, which is exactly who this was built for.
+ * the platform fee nets out of the electronic rent passing through. The ones
+ * that surface here are the all-cash properties (S654: cash itself is free —
+ * what they owe is the platform fee), which is exactly who this was built for.
  */
 export async function runGamDebitSweep(): Promise<{ considered: number; debited: number; skipped: Record<string, number> }> {
   const rows = await query<{ id: string }>(

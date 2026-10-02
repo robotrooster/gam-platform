@@ -29,8 +29,8 @@
  *
  * WHAT DOES AND DOES NOT GET HANDED OVER. Whatever is the LANDLORD'S money —
  * rent, utilities, late fees off the lease, fees they billed by hand (S609,
- * Nic). GAM's own charges (a returned bank payment, a declined card, a
- * manual-payment recording, an opt-in product) are stamped revenue_owner='gam'
+ * Nic). GAM's own charges (a returned bank payment, a declined card, an
+ * opt-in product) are stamped revenue_owner='gam'
  * at creation and are not paid out through this rail. A row also needs a unit,
  * since that is how a property and therefore an owner is resolved.
  */

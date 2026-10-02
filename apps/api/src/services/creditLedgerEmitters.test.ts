@@ -305,7 +305,7 @@ describe('classifyPaymentTier — the property calendar decides the day (S654)',
       await settleManualRentPayment(c, {
         payment: {
           id: paymentId, landlord_id: landlordId, tenant_id: tenantId, unit_id: unitId,
-          lease_id: leaseId, due_date: '2026-10-01', manual_fee_payer: null, background_check_status: null,
+          lease_id: leaseId, due_date: '2026-10-01',
         },
         method: 'cash',
         // 1:30 am Oct 2 in New York (10:30 pm Oct 1 in Phoenix).

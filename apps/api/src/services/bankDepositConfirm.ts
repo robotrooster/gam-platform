@@ -44,7 +44,6 @@ export interface ConfirmDepositResult {
   effectivePaidDate: string
   lateFeesUnbilled: number
   lateFeesRefunded: number
-  feeBilledTo: 'none' | 'landlord' | 'tenant'
 }
 
 /**
@@ -148,13 +147,9 @@ export async function confirmDepositMatch(
     const charges = (await client.query(
       `SELECT p.id, p.type, p.status, p.landlord_id, p.tenant_id, p.unit_id,
               p.lease_id, p.invoice_id, to_char(p.due_date,'YYYY-MM-DD') AS due_date,
-              COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
-              t.background_check_status,
               u.payment_block
          FROM payments p
          JOIN units u ON u.id = p.unit_id
-         LEFT JOIN tenants t ON t.id = p.tenant_id
-         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.id = ANY($1::uuid[])
         FOR UPDATE OF p`,
       [input.chargeIds])).rows
@@ -177,22 +172,21 @@ export async function confirmDepositMatch(
     }
 
     const settledAt = new Date(`${effectivePaidDate}T12:00:00Z`)
-    let feeBilledTo: ConfirmDepositResult['feeBilledTo'] = 'none'
     let unbilled = 0
     let refunded = 0
     const invoicesTouched = new Set<string>()
 
     for (const c of charges) {
       if (c.type === 'rent') {
-        // Only a rent charge carries the manual-payment fee — the fee is per
-        // manual RENT payment, not per row the deposit happened to cover.
-        const r = await settleManualRentPayment(client, {
+        // A rent charge settles through the shared manual-settle path (billing
+        // activation, credit-ledger event); other rows just flip to settled.
+        // S654: no fee on either — paying by cash or check is free.
+        await settleManualRentPayment(client, {
           payment: c,
           method: input.method,
           settledAt,
           provenance: `matched to a bank deposit posted ${txn.posted_date}`,
         })
-        if (r.feeBilledTo !== 'none') feeBilledTo = r.feeBilledTo
       } else {
         await client.query(
           `UPDATE payments
@@ -256,7 +250,6 @@ export async function confirmDepositMatch(
       effectivePaidDate,
       lateFeesUnbilled: unbilled,
       lateFeesRefunded: refunded,
-      feeBilledTo,
     }
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})

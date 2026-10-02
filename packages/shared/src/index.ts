@@ -4754,22 +4754,19 @@ export interface PaymentMethodCost {
  * by payment method... that way they see all the avenues and the price at the
  * point the invoice comes out."
  *
- * `manualFee` is passed in rather than assumed, because whether the cash/check/
- * money-order fee applies depends on the tenant's own history and the property's
- * onboarding window — a rule this pure function has no business guessing at.
- * Pass 0 when it is waived.
+ * S654 (Nic): "Paying cash or check is free." The manual row is always fee 0 —
+ * no fee, no waiver, no setting behind it.
  */
 export function paymentMethodCosts(
   amount: number,
-  opts: { manualFee?: number; cardCountry?: string | null } = {},
+  opts: { cardCountry?: string | null } = {},
 ): PaymentMethodCost[] {
   const ach  = processingFeeFor({ amount, paymentMethod: 'ach' })
   const card = processingFeeFor({ amount, paymentMethod: 'card', cardCountry: opts.cardCountry })
-  const manual = round2(opts.manualFee ?? 0)
   return [
     { method: 'ach',    label: 'Bank account',            fee: ach,    total: round2(amount + ach) },
     { method: 'card',   label: 'Card or debit',           fee: card,   total: round2(amount + card) },
-    { method: 'manual', label: 'Cash, check or money order', fee: manual, total: round2(amount + manual) },
+    { method: 'manual', label: 'Cash, check or money order — free', fee: 0, total: round2(amount) },
   ]
 }
 
@@ -5154,8 +5151,9 @@ export type PaymentType = typeof PAYMENT_TYPES[number]
 // NACHA CCD/PPD entry description field — uppercase, max 10 chars per spec.
 // S561: 'RETURNFEE' (9 chars) added for the pass-through Stripe reversal fee
 // ($4 ACH / $15 card) billed to the tenant on a post-settlement reversal.
-// S562: 'MANUALPAY' (9 chars) for the manual-payment fee; 'FLEXPAY' added
-// to close a long-standing drift (the DB CHECK always carried it).
+// S562: 'FLEXPAY' added to close a long-standing drift (the DB CHECK always
+// carried it). S654: 'MANUALPAY' (the retired cash/check fee) removed — never
+// written; the DB CHECK drops it with manual_fee_payer.
 // S583: 'FCPAYDOWN' — a customer FlexCharge revolving-balance pay-down.
 // S603: 'DECLINEFEE' (10 chars — the NACHA field limit exactly) for the flat
 // $1.00 declined-card-attempt fee. Distinct from RETURNFEE: that one covers a
@@ -5165,15 +5163,14 @@ export type PaymentType = typeof PAYMENT_TYPES[number]
 // Its own descriptor rather than 'RENT': this is what the tenant sees on their
 // bank statement, and a debt they recognize as an old balance should not appear
 // as a rent charge they might read as a duplicate.
-export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'MANUALPAY', 'HOMEPMT', 'FCPAYDOWN', 'DECLINEFEE', 'BALANCE'] as const
+export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'HOMEPMT', 'FCPAYDOWN', 'DECLINEFEE', 'BALANCE'] as const
 export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
 
 // S562: manual (off-platform) rent payment recording. A landlord/staff records
 // receipt of cash/check/money-order; the rent row is marked settled with
 // platform_held=false (GAM disburses nothing — the landlord already holds the
-// cash). Each manual payment carries a flat fee EXCEPT the tenant's first rent
-// payment on the lease (waived to give them time to onboard ACH). The fee is
-// GAM revenue (a tenant-owed type='fee' row, entry_description 'MANUALPAY').
+// cash). S654 (Nic): "There's no fee. Paying cash or check is free." — no fee,
+// no first-payment waiver, no fee-payer setting, anywhere.
 // S651: card is deliberately absent. These are the ways money arrives WITHOUT
 // GAM — a card is money moving through GAM, with a fee and a settlement and a
 // dispute window, and belongs on the register or a pay link rather than behind
@@ -5203,10 +5200,8 @@ export type ManualPaymentMethod = typeof MANUAL_PAYMENT_METHODS[number]
 export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> = {
   cash: 'Cash',
   // S607 (Nic): a cashier's check is a CHECK. Deliberately NOT its own value —
-  // the fee is for a payment handled and recorded BY HAND, not for the paper it
-  // arrived on, so splitting instruments would create work with no difference in
-  // outcome and simply move the argument to the next one (certified check, bank
-  // draft, traveler's check).
+  // splitting instruments would create work with no difference in outcome
+  // (certified check, bank draft, traveler's check are all handled alike).
   //
   // S646 (Nic) — THE LABEL LOST THE PARENTHETICAL. It used to read "Check (incl.
   // cashier's or certified)" to head off the argument. Nic: "we should remove
@@ -5217,51 +5212,9 @@ export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> =
   check: 'Check',
   money_order: 'Money order',
 }
-// S624 (Nic): DROPPED FROM $10 TO $6 — the same flat figure as ACH.
-//
-// The $10 priced MANUAL RECONCILIATION: someone had to find the deposit, work
-// out whose it was, date it, waive the late fee that accrued while it was in
-// transit, and unwind the lot if a check bounced. The bank-deposit matcher
-// (services/bankDepositMatch.ts + bankDepositConfirm.ts) deletes that work — the
-// feed finds the deposit, the bank's own posted date settles it, and a tenant
-// declaration identifies the payer. The cost the premium priced is largely gone,
-// so the premium goes with it.
-//
-// KNOWN TRADE, MADE DELIBERATELY: at $6 = $6 there is no longer a PRICE signal
-// pushing tenants toward ACH, and ACH volume is the path to the ODFI
-// partnership. Nic accepted that in exchange for the sale — "it costs the same
-// either way" ends the fee argument with a landlord who does not want to strain
-// a tenant relationship, and it stops cash-paying tenants (often unbanked, often
-// in low-rent parks where $10 is 4% of the rent) from carrying a surcharge for a
-// payment method they may have no alternative to.
-//
-// THE ACH FEE ITSELF IS UNTOUCHABLE (Nic, S624) — this moved toward ACH, never
-// the other way. See PROCESSING_FEES.ACH_FLAT.
-//
-// S630 DIRECTIVE (Nic): "We need to remove the cash charge completely. I know we
-// reduced it from ten dollars to six dollars. We are gonna make that absolutely
-// free to pay with cash. It doesn't make sense to charge for it, especially when
-// most landlords aren't gonna offer it anyway."
-//
-// ZERO, not "cheap". The history above is kept because it explains how the
-// number got here and why the ACH fee did NOT follow it down, but the argument
-// it settles is over: handing rent to the office costs the tenant nothing.
-// Nothing may raise a fee row, a ledger line, or a landlord charge for a manual
-// payment — a $0.00 charge is still a charge on a statement.
-//
-// The first-payment waiver and the manual_fee_payer toggle are now inert. They
-// are left in place rather than ripped out, in the same way subleasing and
-// On-Time Pay are dormant, so nothing silently changes meaning if a fee ever
-// returns; every path that would bill checks this constant first.
-export const MANUAL_PAYMENT_FEE = 0
-
-/** S607 (Nic): the ONE description of what the manual-payment fee covers, so no
- *  surface can quietly disagree with another. Category first, examples second,
- *  explicitly open-ended — the fee attaches to how the payment is handled, never
- *  to which instrument it happens to be. */
-export const MANUAL_PAYMENT_FEE_SCOPE =
-  'any payment handed to the office instead of made in the app — cash, a personal, ' +
-  'cashier\'s or certified check, a money order, or a bank draft'
+// S654 (Nic): "There's no fee. Paying cash or check is free." The old manual-
+// payment fee is gone entirely — no constant, no waiver, no fee-payer setting.
+// Recording a cash, check or money-order payment raises nothing on either side.
 
 // S603 (Nic): flat $1.00 fee on a DECLINED CARD ATTEMPT (entry_description
 // 'DECLINEFEE'). Stripe bills GAM per AUTHORIZATION, not per successful payment,
@@ -5282,7 +5235,7 @@ export const CARD_DECLINE_FEE = 1.00
 // a landlord's move onto GAM, an IMPORTED tenant may have already paid the FIRST
 // period's rent through the prior software/arrangement, off-platform. The
 // landlord marks that first invoice as paid via prior arrangement — it comes off
-// the books, NO money moves, NO manual-payment fee. Gating (route-enforced):
+// the books and NO money moves. Gating (route-enforced):
 // FIRST rent charge only, lease_source='imported' only, within
 // PRIOR_ARRANGEMENT_TRANSITION_DAYS of onboarding. Not a general cash method —
 // it is its own `payments.manual_method` value, kept out of MANUAL_PAYMENT_METHODS.
@@ -5315,7 +5268,6 @@ export const PRIOR_ARRANGEMENT_TRANSITION_DAYS = 21
 export const PAYMENT_ENTRY_DESCRIPTION_LABELS: Partial<Record<PaymentEntryDescription, string>> = {
   LATEFEE:    'Late fee',
   RETURNFEE:  'Returned-payment fee',
-  MANUALPAY:  'Manual-payment fee',
   DECLINEFEE: 'Declined-payment fee',
   ONTIMEPAY: 'On-time pay',
   FLEXPAY:   'FlexPay',
@@ -6951,9 +6903,6 @@ export type RevenueOwner = typeof REVENUE_OWNERS[number]
 //
 //   RETURNFEE  — a bank payment came back; NACHA retry cost passed through
 //   DECLINEFEE — a card was declined; the authorization cost passed through
-//   MANUALPAY  — recording a payment handed to the office (Nic confirmed S609
-//                this stays GAM's: it covers manual reconciliation and both
-//                Terms documents already disclose it that way)
 //   FLEXPAY / SUBSCRIP(subscription) / FCPAYDOWN / ONTIMEPAY
 //              — tenant opt-in products
 //
@@ -6961,7 +6910,7 @@ export type RevenueOwner = typeof REVENUE_OWNERS[number]
 // path and the landlord's hand-billed lease fees, so it proves nothing on its
 // own. Those two callers stamp revenue_owner explicitly instead.
 export const GAM_REVENUE_ENTRY_DESCRIPTIONS = [
-  'RETURNFEE', 'DECLINEFEE', 'MANUALPAY', 'FLEXPAY', 'FCPAYDOWN', 'ONTIMEPAY',
+  'RETURNFEE', 'DECLINEFEE', 'FLEXPAY', 'FCPAYDOWN', 'ONTIMEPAY',
 ] as const
 
 // ─── S609: HOW MANY PHOTOS A UNIT NEEDS BEFORE IT CAN BE LISTED ───────────

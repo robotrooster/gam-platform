@@ -9,7 +9,7 @@ import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, 
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, cardFeeLabel, achFeeLabel, MANUAL_PAYMENT_FEE_SCOPE, type FeePayer } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, cardFeeLabel, achFeeLabel, type FeePayer } from '@gam/shared'
 // Narrow KPI tiles use the compact format ($18,400 / $248.6K / $1.24M) so a
 // six-/seven-figure property (or portfolio sum) never overflows or resizes a card.
 import { fmtCompact as fmt } from '../lib/format'
@@ -57,7 +57,7 @@ const UNIT_TYPE_OPTIONS = UNIT_TYPES.map(value => ({
   icon:   UNIT_TYPE_ICON[value],
 }))
 
-// S173: compact display of the three fee_payer toggles on the property
+// S173: compact display of the fee_payer toggles on the property
 // card. Reads the same camelCase shape produced by GET /properties' jsonb
 // allocationRule join, with a legacy bankingFeePayer fallback for rows
 // created pre-S116. Renders nothing when no allocation rule is present
@@ -66,7 +66,6 @@ function FeeConfigChips({ allocationRule }: { allocationRule: any }) {
   if (!allocationRule) return null
   const ach      = (allocationRule.achFeePayer      || allocationRule.bankingFeePayer || 'tenant') as FeePayer
   const card     = (allocationRule.cardFeePayer     || allocationRule.bankingFeePayer || 'tenant') as FeePayer
-  const manual   = (allocationRule.manualFeePayer   || 'tenant')                                    as FeePayer
   const chip = (label: string, payer: FeePayer) => (
     <span
       key={label}
@@ -94,7 +93,6 @@ function FeeConfigChips({ allocationRule }: { allocationRule: any }) {
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 12 }}>
       {chip('ACH', ach)}
       {chip('Card', card)}
-      {chip('Cash', manual)}
     </div>
   )
 }
@@ -240,9 +238,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
       cardFeePayer: 'tenant' as FeePayer,
       platformFeePayer:
         (property?.allocationRule?.platformFeePayer || 'landlord') as FeePayer,
-      // S607 (Nic): who reimburses the cash/check/money-order fee.
-      manualFeePayer:
-        (property?.allocationRule?.manualFeePayer || 'tenant') as FeePayer,
       rentPercent: property?.allocationRule?.rentPercent != null ? String(property.allocationRule.rentPercent) : '',
       rentPercentFloor: property?.allocationRule?.rentPercentFloor != null ? String(property.allocationRule.rentPercentFloor) : '',
       rentPercentCeiling: property?.allocationRule?.rentPercentCeiling != null ? String(property.allocationRule.rentPercentCeiling) : '',
@@ -322,8 +317,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         const oldAch       = arOld.achFeePayer       || arOld.bankingFeePayer || 'tenant'
         const oldCard      = arOld.cardFeePayer      || arOld.bankingFeePayer || 'tenant'
         const oldPlatform  = arOld.platformFeePayer  || 'landlord'
-        const oldManual    = arOld.manualFeePayer    || 'tenant'
-        if (arNew.manualFeePayer   && arNew.manualFeePayer   !== oldManual)   allocPatch.manualFeePayer   = arNew.manualFeePayer
         if (arNew.achFeePayer      && arNew.achFeePayer      !== oldAch)      allocPatch.achFeePayer      = arNew.achFeePayer
         if (arNew.cardFeePayer     && arNew.cardFeePayer     !== oldCard)     allocPatch.cardFeePayer     = arNew.cardFeePayer
         if (arNew.platformFeePayer && arNew.platformFeePayer !== oldPlatform) allocPatch.platformFeePayer = arNew.platformFeePayer
@@ -432,7 +425,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
       ...form,
       allocationRule: {
         achFeePayer:       ar.achFeePayer,
-        manualFeePayer:    ar.manualFeePayer,
         cardFeePayer:      ar.cardFeePayer,
         platformFeePayer:  ar.platformFeePayer,
         rentPercent: num(ar.rentPercent),
@@ -819,17 +811,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 Tenant pays — always (landlords never cover card)
               </div>
             </div>
-            {/* S607 (Nic): "we need a toggle for them to cover old-fashioned
-                payment costs if they want to... that way the landlord isn't
-                surprised." GAM recovers the $10 from the landlord's collections
-                either way; this decides only whether the TENANT is invoiced to
-                reimburse them. Every tenant's FIRST payment is free regardless. */}
-            <FeePayerToggle
-              label="Cash, check or money order"
-              hint={`No charge, to anyone: ${MANUAL_PAYMENT_FEE_SCOPE}. This setting has no effect while cash is free — it exists so the choice is already recorded if a handling fee ever returns.`}
-              value={form.allocationRule.manualFeePayer}
-              onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, manualFeePayer: v } }))}
-            />
             {/* S607 lock (Nic): "the landlord cannot toggle the platform fee
                 because when we change for volume discounts or things like that,
                 that needs to not affect what the tenants are paying." GAM's

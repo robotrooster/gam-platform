@@ -8,55 +8,6 @@ import { usePerms } from '../lib/permissions'
 import { X } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
-// S607 (Nic): "If the landlord is covering the ten dollars, it needs to be
-// visible to them so they can track it. If the landlord is not covering the ten
-// dollars, it doesn't need to be visible to them."
-//
-// So this renders NOTHING at all when the tenant is the one reimbursing the fee
-// — there is nothing for the landlord to track, and an empty card claiming a
-// cost they do not bear is noise. It appears only once they have actually
-// absorbed something, which is also the moment the payout reduction becomes
-// real: ten cash payments is $100 off a disbursement, and it should have a name.
-function AbsorbedManualFeesSection({ companyId }: { companyId: string }) {
-  const { data } = useQuery<any>('absorbed-manual-fees',
-    () => apiGet('/payments/absorbed-manual-fees?months=6'))
-  const rows: any[] = (data?.rows ?? []).filter((r: any) => !companyId || r.landlordId === companyId)
-  const total = rows.reduce((n: number, r: any) => n + Number(r.amount || 0), 0)
-  if (!rows.length) return null
-
-  return (
-    <div className="card" style={{ marginBottom: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
-        <h3 style={{ margin: 0, fontSize: '1rem' }}>Cash-payment fees you're covering</h3>
-        <span style={{ fontWeight: 700 }}>{fmt(total)}</span>
-      </div>
-      <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.55, marginBottom: 10 }}>
-        You've chosen to cover the fee on cash, check and money-order payments, so it comes out of
-        your payout instead of being billed to the tenant. {rows.length} payment{rows.length === 1 ? '' : 's'} in
-        the last 6 months. Each tenant's first payment is always free. You can switch this back to
-        the tenant on the property's fee settings at any time.
-      </div>
-      <div style={{ maxHeight: 220, overflowY: 'auto' }}>
-        {rows.map((r: any) => (
-          <div key={r.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 10,
-                                   padding: '6px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.8rem' }}>
-            <span style={{ color: 'var(--text-2)' }}>
-              {r.propertyName}{r.unitNumber ? ` · ${r.unitNumber}` : ''}
-            </span>
-            <span style={{ display: 'flex', gap: 12, alignItems: 'baseline' }}>
-              <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-                {new Date(r.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-              </span>
-              <span className="mono">{fmt(r.amount)}</span>
-            </span>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-
 // ── S651: what you pay GAM ────────────────────────────────────────────────
 //
 // This sat in the database and on no screen. GAM netted $130 of platform fees
@@ -71,7 +22,6 @@ function AbsorbedManualFeesSection({ companyId }: { companyId: string }) {
 
 const GAM_CHARGE_LABEL: Record<string, string> = {
   subscription:       'Platform fee',
-  manual_payment_fee: 'Fee on a payment taken outside GAM',
   // S651: shown as its own line on purpose — see services/landlordGamDebit.ts.
   bank_debit_cost:    'Bank transfer cost',
 }
@@ -177,7 +127,7 @@ export function DisbursementsPage() {
   // and total pending ... it blends both properties on the What you pay GAM
   // card." One filter at the top of the page, listing every company on the
   // account (not just the ones that happen to have a payout row), and EVERY
-  // card below it follows: next payout, covered cash fees, what you pay GAM,
+  // card below it follows: next payout, what you pay GAM,
   // the two totals and the list. Nothing on this page is account-wide while a
   // company is chosen.
   const [companyId, setCompanyId] = useState('')
@@ -219,8 +169,6 @@ export function DisbursementsPage() {
       <BalanceWithdrawSection />
 
       {can('disbursements.pm_impact_view') && <PmImpactSection />}
-
-      <AbsorbedManualFeesSection companyId={companyId} />
 
       <GamChargesSection companyId={companyId} />
 

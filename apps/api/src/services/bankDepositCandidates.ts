@@ -28,9 +28,9 @@ export interface DepositWithCandidates {
  * Open charges for one landlord, with the tenant's name for memo matching.
  *
  * `payments` rows that are pending (or failed, which is still owed) and belong
- * to a real lease. Late fees and the manual-payment fee itself are included: a
- * tenant catching up may well deposit rent plus last month's fee in one go, and
- * the subset-sum only finds that combination if the rows are here.
+ * to a real lease. Late fees are included: a tenant catching up may well
+ * deposit rent plus last month's late fee in one go, and the subset-sum only
+ * finds that combination if the rows are here.
  */
 async function openChargesFor(landlordId: string): Promise<OpenCharge[]> {
   const rows = await query<any>(

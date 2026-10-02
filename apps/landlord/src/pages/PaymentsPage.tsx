@@ -369,7 +369,7 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
               payment; the card fee is the customer&apos;s.</>
           ) : (
             <>Settles all {group.charges.length} charge{group.charges.length === 1 ? '' : 's'} in full.
-              You already hold the funds, so GAM disburses nothing. No fee.</>
+              You already hold the funds, so GAM disburses nothing.</>
           )}
         </div>
 
@@ -605,10 +605,8 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
   const StatusIcon = STATUS_ICONS[p.status] || Clock
   const statusColor = STATUS_COLORS[p.status] || 'var(--text-3)'
 
-  // S562: record a rent charge paid off-platform (cash/check/money order). GAM
-  // moves no money — the row just flips to settled. The tenant's first rent
-  // payment is fee-free; subsequent ones bill a manual-payment fee (the
-  // server decides + returns feeWaived). Only open, unpaid RENT rows qualify.
+  // S562: record a charge paid off-platform (cash/check/money order). GAM
+  // moves no money — the row just flips to settled. S654: no fee, ever.
   const isManualRecordable = canRecord &&
     (p.status === 'pending' || p.status === 'failed')
   const [recordOpen, setRecordOpen] = useState(false)
@@ -618,11 +616,8 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
   const recordMut = useMutation(
     () => apiPost(`/payments/${p.id}/record-manual`, { method, reference: reference || undefined }),
     {
-      onSuccess: (res: any) => {
-        const waived = res?.data?.feeWaived
-        setRecordMsg(waived
-          ? 'Recorded. First rent payment — no manual-payment fee charged.'
-          : 'Recorded. No fee — cash, checks and money orders are free.')
+      onSuccess: () => {
+        setRecordMsg('Payment recorded.')
         onRecorded()
       },
     })
@@ -633,7 +628,7 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
     () => apiPost(`/payments/${p.id}/record-prior-arrangement`, {}),
     {
       onSuccess: () => {
-        setRecordMsg('Marked as paid off-platform via prior arrangement. No fee charged.')
+        setRecordMsg('Marked as paid off-platform via prior arrangement.')
         onRecorded()
       },
     })
@@ -788,7 +783,7 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
         {/* S568: onboarding reconciliation window — during a landlord's move onto
             GAM a tenant may still be auto-debited by the OLD system. The first GAM
             invoice can be marked paid off-platform to avoid double-charging.
-            Fee-free, first invoice only; the server gates it to the landlord's
+            First invoice only; the server gates it to the landlord's
             reconciliation window (new-vs-imported lease is irrelevant). */}
         {isManualRecordable && p.priorArrangementEligible && !recordMsg && (
           <div style={{ marginTop: 16, padding: '14px', borderTop: '1px solid var(--border-0)', background: 'rgba(201,162,39,.05)', borderRadius: 10 }}>
@@ -798,7 +793,7 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
             <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 10 }}>
               Was this first rent payment already collected through your old system
               (e.g. the tenant's autopay hadn't switched over yet)? Mark it paid so they
-              aren't double-charged — it comes off the books, no fee. First invoice only,
+              aren't double-charged — it comes off the books. First invoice only,
               during your onboarding reconciliation window.
             </div>
             <button className="btn btn-primary btn-sm" disabled={priorArrMut.isLoading}
@@ -836,10 +831,9 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
                   {(p as any)._groupTotal != null
                     ? <>This settles <strong>all {(p as any)._groupCount} outstanding charge
                         {(p as any)._groupCount === 1 ? '' : 's'}</strong> for this household —{' '}
-                        <strong>{fmt((p as any)._groupTotal)}</strong> in full. Cash, checks and
-                        money orders are free.</>
+                        <strong>{fmt((p as any)._groupTotal)}</strong> in full.</>
                     : <>This settles the household&rsquo;s whole outstanding balance, not just this
-                        charge — the same as a card payment. Cash, checks and money orders are free.</>}
+                        charge — the same as a card payment.</>}
                 </div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
                   <select className="form-input" style={{ width: 'auto' }} value={method}
@@ -857,8 +851,7 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
                   <button className="btn btn-ghost btn-sm" onClick={() => setRecordOpen(false)}>Cancel</button>
                 </div>
                 <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>
-                  Marks this rent as paid. GAM disburses nothing — you already hold the funds. The tenant's
-                  free for the tenant — cash, checks and money orders carry no fee.
+                  Marks this as paid. GAM disburses nothing — you already hold the funds.
                 </div>
                 {recordMut.isError && (
                   <div style={{ fontSize: '.75rem', color: 'var(--red)', marginTop: 8 }}>

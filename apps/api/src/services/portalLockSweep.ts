@@ -62,9 +62,9 @@ export async function lockCandidates(): Promise<{ due: LockCandidate[]; warning:
   const rows = await query<any>(
     `SELECT l.id, l.business_name, l.platform_locked_at, l.gam_debit_payment_method_id,
             COALESCE(SUM(c.amount - c.collected_amount), 0)::float AS owed,
-            -- Only the RECURRING bill counts as a cycle. A manual-payment fee or
-            -- the cost of a bank transfer rides along on somebody's balance; it
-            -- is not "the next bill coming around".
+            -- Only the RECURRING bill counts as a cycle. The cost of a bank
+            -- transfer or a device installment rides along on somebody's
+            -- balance; it is not "the next bill coming around".
             COUNT(DISTINCT date_trunc('month', c.created_at))
               FILTER (WHERE c.source_type = 'platform_fee_accrual')::int AS unpaid_cycles,
             MAX(c.created_at) FILTER (WHERE c.source_type = 'platform_fee_accrual') AS latest_bill_at,

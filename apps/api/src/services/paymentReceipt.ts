@@ -3,8 +3,8 @@
 // One place that builds a receipt, used by every path money can arrive through —
 // the desk recording cash or a check, and the Stripe webhook for card and ACH.
 // A receipt is the same document to the person who paid however it arrived, and
-// three copies of this logic would drift the way the fee rules nearly did
-// (see manualPaymentSettle's header).
+// three copies of this logic would drift (see manualPaymentSettle's header for
+// why the settle itself has one home).
 //
 // Reads its own rows rather than taking figures from the caller: the caller
 // knows what it settled, but the receipt has to say what the resident actually
