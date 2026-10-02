@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict gdrh39oQZWNGdedUJSJKJvrCHnE8wU5WhpR6vkJBn5iEL7T8PoHWM3BiadwMsk1
+\restrict A3iN7jeCc3L4ZwMV2X7GUWqB5qjJl0oLSeE9N4RptmhuDUFWDV6mzcEmQNqilhi
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -711,6 +711,21 @@ BEGIN
       VALUES (NEW.lease_id, NEW.tenant_id, NEW.amount, NEW.amount, NEW.id, 'Rent paid ahead on the lease (move-in)')
       ON CONFLICT (source_payment_id) WHERE source_payment_id IS NOT NULL DO NOTHING;
     END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+
+--
+-- Name: properties_timezone_must_be_real(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.properties_timezone_must_be_real() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.timezone IS NULL OR NOT EXISTS (SELECT 1 FROM pg_timezone_names WHERE name = NEW.timezone) THEN
+    RAISE EXCEPTION 'Unknown time zone "%" for a property', NEW.timezone USING ERRCODE = '22023';
   END IF;
   RETURN NEW;
 END $$;
@@ -21565,6 +21580,13 @@ CREATE TRIGGER trg_prepaid_fee_follows_payment AFTER INSERT OR UPDATE OF status 
 
 
 --
+-- Name: properties trg_properties_timezone_real; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_properties_timezone_real BEFORE INSERT OR UPDATE OF timezone ON public.properties FOR EACH ROW EXECUTE FUNCTION public.properties_timezone_must_be_real();
+
+
+--
 -- Name: properties trg_properties_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -28410,5 +28432,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict gdrh39oQZWNGdedUJSJKJvrCHnE8wU5WhpR6vkJBn5iEL7T8PoHWM3BiadwMsk1
+\unrestrict A3iN7jeCc3L4ZwMV2X7GUWqB5qjJl0oLSeE9N4RptmhuDUFWDV6mzcEmQNqilhi
 
