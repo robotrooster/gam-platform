@@ -513,6 +513,15 @@ export async function cancelReaderAction(stripeReaderId: string): Promise<void> 
 export interface ReaderCartLine { description: string; amountCents: number; quantity: number }
 
 /**
+ * S654 (Nic, live): "nothing showed up on the terminal except $0.58 — tap or
+ * insert." The cart went to the reader, but asking for the card replaced it
+ * within a second. The reader holds the breakdown this long before the pay
+ * screen takes over.
+ */
+export const READER_CART_PAUSE_MS = process.env.NODE_ENV === 'test' ? 0 : 5000
+export const holdForTheCart = () => new Promise<void>(r => setTimeout(r, READER_CART_PAUSE_MS))
+
+/**
  * S654 (Nic): "it'd be nice to see on the screen a little bit of a breakdown."
  * The reader shows the lines, the tax, the card fee and the total before it
  * asks for the card. Best-effort — a display that fails never stops a sale.

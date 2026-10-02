@@ -35,6 +35,8 @@ vi.mock('../services/posTerminal', () => ({
   cancelTerminalPaymentIntent:   cancelTerminalPaymentIntentMock,
   cancelReaderAction:            cancelReaderActionMock,
   showCartOnReader:              showCartOnReaderMock,
+  holdForTheCart:                vi.fn(async () => undefined),
+  READER_CART_PAUSE_MS:          0,
 }))
 vi.mock('../lib/stripe', () => ({
   getStripe: () => ({

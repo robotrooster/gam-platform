@@ -102,6 +102,8 @@ vi.mock('../services/posTerminal', () => ({
   cancelTerminalPaymentIntent:    cancelTerminalPaymentIntentMock,
   cancelReaderAction:             cancelReaderActionMock,
   showCartOnReader:               showCartOnReaderMock,
+  holdForTheCart:                 vi.fn(async () => undefined),
+  READER_CART_PAUSE_MS:           0,
 }))
 // S654: the reader's save-card prompt and the Stripe attach are mocked; the
 // card → customer bookkeeping runs for real.

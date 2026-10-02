@@ -1390,7 +1390,7 @@ paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment')
 // exactly like Pay Now (2a). The card fee is the customer's at the same rate as
 // online (3). Nothing is booked until the reader has approved the card — a
 // decline or a walk-away leaves the ledger untouched.
-import { createRentReaderPaymentIntent, processPaymentIntentOnReader, retrieveTerminalPaymentIntent, cancelTerminalPaymentIntent, showCartOnReader, cancelReaderAction } from '../services/posTerminal'
+import { holdForTheCart, createRentReaderPaymentIntent, processPaymentIntentOnReader, retrieveTerminalPaymentIntent, cancelTerminalPaymentIntent, showCartOnReader, cancelReaderAction } from '../services/posTerminal'
 import { labelFor } from '../services/invoiceNotice'
 
 async function readerAnchor(req: any, paymentId: string) {
@@ -1456,6 +1456,7 @@ async function sendToReader(pmt: any, quote: Awaited<ReturnType<typeof readerQuo
     : l)
   if (quote.cardFee > 0) lines.push({ description: 'Card processing fee', amountCents: Math.round(quote.cardFee * 100), quantity: 1 })
   await showCartOnReader({ stripeReaderId, lines, taxCents: 0, totalCents: Math.round(quote.total * 100) })
+  await holdForTheCart()   // the resident reads what the card is for before it asks for the card
   await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId })
 }
 

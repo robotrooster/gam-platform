@@ -8,7 +8,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { calculateCartTax, computeCartTotals, aggregateCartTotals, effectiveItemTaxes } from '../services/posTax'
-import { createConnectionToken, registerReader, listReaders, archiveReader, createCardPresentPaymentIntent, processPaymentIntentOnReader, captureTerminalPaymentIntent, cancelTerminalPaymentIntent, retrieveTerminalPaymentIntent, cancelReaderAction, showCartOnReader, retrieveTerminalPaymentIntentWithCharge } from '../services/posTerminal'
+import { holdForTheCart, createConnectionToken, registerReader, listReaders, archiveReader, createCardPresentPaymentIntent, processPaymentIntentOnReader, captureTerminalPaymentIntent, cancelTerminalPaymentIntent, retrieveTerminalPaymentIntent, cancelReaderAction, showCartOnReader, retrieveTerminalPaymentIntentWithCharge } from '../services/posTerminal'
 import crypto from 'crypto'
 import { logger } from '../lib/logger'
 import { resolveLandlordTarget, ownsLandlord, landlordScopeIds } from '../lib/landlordScope'
@@ -2550,6 +2550,7 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
       }))
       if (quoted.surcharge > 0) lines.push({ description: 'Card processing fee', amountCents: Math.round(quoted.surcharge * 100), quantity: 1 })
       await showCartOnReader({ stripeReaderId, lines, taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents: intent.amount })
+      await holdForTheCart()   // let the customer read it before the pay screen takes over
     }
     const reader = await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId, allowRedisplay: true })
     res.json({
