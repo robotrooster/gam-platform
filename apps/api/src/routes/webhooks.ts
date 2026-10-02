@@ -25,6 +25,7 @@ import {
   emitPaymentFailedEvent,
 } from '../services/creditLedgerEmitters'
 import { logger } from '../lib/logger'
+import { addDaysTo, todayIn } from '../lib/timezone'
 import { getStripe } from '../lib/stripe'
 
 export const webhooksRouter = Router()
@@ -919,6 +920,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
             property_id:     string
             unit_number:     string
             property_name:   string
+            property_tz:     string | null
           }>(`
             SELECT p.id, p.amount,
                    t.user_id AS tenant_user_id,
@@ -928,7 +930,8 @@ webhooksRouter.post('/stripe', async (req, res) => {
                    l.id  AS landlord_id_pk,
                    pr.id AS property_id,
                    un.unit_number,
-                   pr.name AS property_name
+                   pr.name AS property_name,
+                   pr.timezone AS property_tz
               FROM payments p
               JOIN tenants    t  ON t.id = p.tenant_id
               JOIN users      tu ON tu.id = t.user_id
@@ -945,8 +948,10 @@ webhooksRouter.post('/stripe', async (req, res) => {
             const { notifyAchRetryScheduled, notifyAchRetriesExhausted } =
               await import('../services/notifications')
             if (willRetry) {
-              const retryDate = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)
-                .toISOString().slice(0, 10)
+              // S654: the retry day as the property's calendar reads it.
+              // next_retry_at is NOW() + 3 days; formatting that instant in
+              // UTC told a tenant who bounced after 5 pm Phoenix a day late.
+              const retryDate = addDaysTo(todayIn(pctx.property_tz), 3)
               for (const recipient of recipients) {
                 await notifyAchRetryScheduled({
                   tenantUserId:    pctx.tenant_user_id,

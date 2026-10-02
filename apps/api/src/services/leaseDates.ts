@@ -12,9 +12,15 @@
  * DUE DAY: always the 1st (locked in @gam/shared WRITABLE_LEASE_COLUMN_SPECS).
  */
 
+import { dateIn } from '../lib/timezone'
+
 const pad = (n: number) => String(n).padStart(2, '0')
 
-/** Server-local 'YYYY-MM-DD' for today (local parts — no UTC-evening rollover). */
+/**
+ * Server-local 'YYYY-MM-DD' for today (local parts — no UTC-evening rollover).
+ * S654: not for a lease date — the server's zone is not the park's (a droplet
+ * runs on UTC). computeLeaseStart takes the property's zone instead.
+ */
 export function serverTodayYmd(now: Date = new Date()): string {
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
 }
@@ -33,9 +39,14 @@ const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 /**
  * Prefill start date: the unit's available_date if it's strictly in the future,
  * otherwise today. (An already-past availability isn't backdated onto a new lease.)
+ * S654: "today" is the property's day (`tz` = properties.timezone; null →
+ * GAM's home zone), never the server's — a lease drafted at 6 pm in Phoenix
+ * on a UTC server would otherwise start tomorrow.
  */
-export function computeLeaseStart(availableDate: string | Date | null, now: Date = new Date()): string {
-  const today = serverTodayYmd(now)
+export function computeLeaseStart(
+  availableDate: string | Date | null, now: Date = new Date(), tz: string | null = null,
+): string {
+  const today = dateIn(tz, now)
   const p = ymdParts(availableDate)
   if (!p) return today
   const avail = `${p.y}-${pad(p.m)}-${pad(p.d)}`

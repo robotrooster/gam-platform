@@ -12,6 +12,7 @@ import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
+import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 import { computeAmortization } from '@gam/shared'
 import { z } from 'zod'
 
@@ -447,11 +448,16 @@ export function saleTermsFromFields(fields: Array<{ lease_column: string | null;
   }
 }
 
-/** What the typed terms mean, or why they cannot bill — said in the landlord's words. */
-export function resolveTypedSaleTerms(t: TypedSaleTerms): { planType: 'flat' | 'amortized'; salePrice: number; downPayment: number; annualInterestRate: number; termMonths: number; startMonth: string } {
+/**
+ * What the typed terms mean, or why they cannot bill — said in the landlord's words.
+ * `tz` is the property's zone, for the default first payment month.
+ */
+export function resolveTypedSaleTerms(t: TypedSaleTerms, tz: string | null = null): { planType: 'flat' | 'amortized'; salePrice: number; downPayment: number; annualInterestRate: number; termMonths: number; startMonth: string } {
   const n = t.numberOfPayments
   if (!n || n <= 0) throw new AppError(400, 'The installment contract needs the number of payments.')
-  const start = t.startMonth ?? (() => { const d = new Date(); d.setUTCMonth(d.getUTCMonth() + 1, 1); return d.toISOString().slice(0, 10) })()
+  // S654: "next month" counts from the park's today. From UTC, a contract
+  // signed on the last evening of a month in Phoenix skipped a month.
+  const start = t.startMonth ?? monthStartOf(addDaysTo(monthStartOf(todayIn(tz)), 32))
   // Same amount every month, no interest: the plain case — price is the sum.
   if (t.monthlyAmount && t.monthlyAmount > 0 && (!t.annualInterestRate || t.annualInterestRate === 0)
       && (t.salePrice == null || Math.abs(t.salePrice - t.downPayment - t.monthlyAmount * n) < 1)) {
@@ -476,19 +482,27 @@ export async function applySaleTermsFromDocument(documentId: string): Promise<{ 
   try {
     await client.query('BEGIN')
     const doc = (await client.query<any>(
-      `SELECT d.id, d.unit_id, d.landlord_id FROM lease_documents d WHERE d.id = $1 FOR UPDATE`, [documentId])).rows[0]
+      `SELECT d.id, d.unit_id, d.landlord_id, p.timezone
+         FROM lease_documents d
+         LEFT JOIN units u ON u.id = d.unit_id
+         LEFT JOIN properties p ON p.id = u.property_id
+        WHERE d.id = $1 FOR UPDATE OF d`, [documentId])).rows[0]
     if (!doc?.unit_id) throw new AppError(400, 'This installment contract is not attached to a unit.')
     const fields = (await client.query<any>(
       `SELECT id, lease_column, value FROM lease_document_fields WHERE document_id = $1 AND lease_column LIKE 'sale_%'`, [documentId])).rows
-    const terms = resolveTypedSaleTerms(saleTermsFromFields(fields))
+    const terms = resolveTypedSaleTerms(saleTermsFromFields(fields), doc.timezone)
     const buyer = (await client.query<any>(
       `SELECT t.id FROM lease_document_signers s JOIN tenants t ON t.user_id = s.user_id
         WHERE s.document_id = $1 AND s.role IN ('primary','purchaser') ORDER BY s.order_index LIMIT 1`, [documentId])).rows[0]
     if (!buyer) throw new AppError(400, 'The installment contract has no buyer on it.')
 
     // A pending record already on this unit gives way to the paper.
+    // S654: start_month comes back as text — pg's Date for a DATE column
+    // stringifies as "Thu Oct 01", which never matched the typed 'YYYY-MM-DD',
+    // so a re-run cancelled the matching record and wrote a fresh one.
     const existing = (await client.query<any>(
-      `SELECT id, purchase_document_id, sale_price, down_payment, annual_interest_rate, term_months, start_month, plan_type
+      `SELECT id, purchase_document_id, sale_price, down_payment, annual_interest_rate, term_months,
+              to_char(start_month, 'YYYY-MM-DD') AS start_month, plan_type
          FROM home_sale_contracts WHERE unit_id = $1 AND status = 'pending_signature' FOR UPDATE`, [doc.unit_id])).rows[0]
     let contract: any = null
     if (existing && existing.purchase_document_id === documentId

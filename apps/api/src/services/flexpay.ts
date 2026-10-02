@@ -10,6 +10,7 @@ import {
   fireFlexsuiteAcceptanceEmail,
 } from './flexsuiteAcceptance'
 import { logger } from '../lib/logger'
+import { dateIn, todayIn, monthStartOf } from '../lib/timezone'
 
 // ============================================================
 // FlexPay — tenant-paid payment-scheduling product.
@@ -398,6 +399,7 @@ interface AdvanceCandidate {
   late_fee_grace_days: number | null
   pull_day:           number
   connect_account_id: string | null
+  timezone:           string
 }
 
 export interface GraceAdvanceResult {
@@ -423,9 +425,10 @@ export interface GraceAdvanceResult {
  * cron same-day skips existing rows.
  */
 export async function processGracePeriodAdvance(now: Date = new Date()): Promise<GraceAdvanceResult> {
-  const cycle = cycleMonthForDate(now)
+  // S654: the run's summary month is GAM's (Phoenix); each advance below takes
+  // its cycle from its own property's calendar, never UTC's.
   const out: GraceAdvanceResult = {
-    cycle_month:                cycle,
+    cycle_month:                monthStartOf(dateIn(null, now)),
     candidates_scanned:         0,
     advances_created:           0,
     advances_skipped_existing:  0,
@@ -438,22 +441,27 @@ export async function processGracePeriodAdvance(now: Date = new Date()): Promise
   const visible = await isFlexPayVisible()
   if (!visible) return out
 
-  const dayOfMonth = now.getUTCDate()
+  // S654: the grace period ends on a day of the LEASE's month, so "today" is
+  // the property's day of month. UTC's day is tomorrow after 5 pm in Phoenix.
   const candidates = await query<AdvanceCandidate>(
     `SELECT lt.tenant_id, l.landlord_id, l.unit_id, l.id AS lease_id,
             l.rent_amount, l.rent_due_day,
             COALESCE(l.late_fee_grace_days, $1) AS late_fee_grace_days,
             t.flexpay_pull_day AS pull_day,
             -- S554 Connect re-anchor: entity account preferred, user fallback.
-            COALESCE(la.stripe_connect_account_id, u.stripe_connect_account_id) AS connect_account_id
+            COALESCE(la.stripe_connect_account_id, u.stripe_connect_account_id) AS connect_account_id,
+            p.timezone
        FROM tenants t
        JOIN lease_tenants lt ON lt.tenant_id = t.id AND lt.status = 'active'
        JOIN leases l         ON l.id = lt.lease_id AND l.status IN ('active', 'pending')
+       JOIN units un         ON un.id = l.unit_id
+       JOIN properties p     ON p.id = un.property_id
        JOIN landlords la     ON la.id = l.landlord_id
        JOIN users u          ON u.id = la.user_id
       WHERE t.flexpay_enrolled = TRUE
         AND t.flexpay_pull_day IS NOT NULL
-        AND (l.rent_due_day + COALESCE(l.late_fee_grace_days, $1)) = $2
+        AND (l.rent_due_day + COALESCE(l.late_fee_grace_days, $1))
+              = EXTRACT(DAY FROM ($2::timestamptz AT TIME ZONE p.timezone))::int
         -- S581 (Nic): FlexPay is single-lease ONLY. If an enrolled tenant now
         -- holds more than one active lease, front NOTHING — the (cycle, tenant)
         -- advance can't represent two leases and would silently drop one. This
@@ -467,12 +475,13 @@ export async function processGracePeriodAdvance(now: Date = new Date()): Promise
              AND lt2.status = 'active'
              AND l2.status IN ('active', 'pending')
         ) = 1`,
-    [FLEXPAY_DEFAULT_GRACE_DAYS, dayOfMonth],
+    [FLEXPAY_DEFAULT_GRACE_DAYS, now],
   )
   out.candidates_scanned = candidates.length
 
   for (const c of candidates) {
     try {
+      const cycle = monthStartOf(dateIn(c.timezone, now))
       const rent = Number(c.rent_amount)
       const fee  = calculateFlexPayFee(c.pull_day)
 
@@ -665,9 +674,10 @@ export interface PullDayResult {
  * avoids a per-cycle duplicated Stripe ACH fee).
  */
 export async function processFlexPayPullDay(now: Date = new Date()): Promise<PullDayResult> {
-  const cycle = cycleMonthForDate(now)
+  // S654: the run's summary month is GAM's (Phoenix); each pull below takes
+  // its cycle and day from its own property's calendar, never UTC's.
   const out: PullDayResult = {
-    cycle_month:           cycle,
+    cycle_month:           monthStartOf(dateIn(null, now)),
     candidates_scanned:    0,
     pulls_initiated:       0,
     pulls_skipped_existing: 0,
@@ -677,7 +687,6 @@ export async function processFlexPayPullDay(now: Date = new Date()): Promise<Pul
   const visible = await isFlexPayVisible()
   if (!visible) return out
 
-  const dayOfMonth = now.getUTCDate()
   const candidates = await query<{
     advance_id:      string
     tenant_id:       string
@@ -688,17 +697,20 @@ export async function processFlexPayPullDay(now: Date = new Date()): Promise<Pul
     tenant_fee_amount: string
     pull_day:        number
     stripe_customer_id: string | null
+    timezone:        string
   }>(
     `SELECT a.id AS advance_id, a.tenant_id, a.landlord_id, a.lease_id, a.unit_id,
             a.rent_amount, a.tenant_fee_amount, a.pull_day,
-            t.stripe_customer_id
+            t.stripe_customer_id, p.timezone
        FROM flexpay_advances a
-       JOIN tenants t ON t.id = a.tenant_id
-      WHERE a.cycle_month = $1
-        AND a.pull_day    = $2
+       JOIN tenants t    ON t.id = a.tenant_id
+       JOIN units u      ON u.id = a.unit_id
+       JOIN properties p ON p.id = u.property_id
+      WHERE a.cycle_month = date_trunc('month', ($1::timestamptz AT TIME ZONE p.timezone))::date
+        AND a.pull_day    = EXTRACT(DAY FROM ($1::timestamptz AT TIME ZONE p.timezone))::int
         AND a.status      = 'fronted'
         AND a.rent_payment_id IS NULL`,
-    [cycle, dayOfMonth],
+    [now],
   )
   out.candidates_scanned = candidates.length
 
@@ -706,6 +718,7 @@ export async function processFlexPayPullDay(now: Date = new Date()): Promise<Pul
 
   for (const c of candidates) {
     try {
+      const cycle = monthStartOf(dateIn(c.timezone, now))
       const rent = Number(c.rent_amount)
       const fee  = Number(c.tenant_fee_amount)
       const total = rent + fee
@@ -827,9 +840,14 @@ export async function processFlexPayPullDay(now: Date = new Date()): Promise<Pul
  * Throws on failure so the caller skips the (stale-amount) confirm.
  */
 export async function repriceFlexPayRetryPayment(paymentId: string): Promise<void> {
-  const pay = await queryOne<{ stripe_payment_intent_id: string | null; tenant_id: string }>(
-    `SELECT stripe_payment_intent_id, tenant_id
-       FROM payments WHERE id = $1 AND entry_description = 'FLEXPAY'`,
+  const pay = await queryOne<{
+    stripe_payment_intent_id: string | null; tenant_id: string; timezone: string | null
+  }>(
+    `SELECT pm.stripe_payment_intent_id, pm.tenant_id, p.timezone
+       FROM payments pm
+       LEFT JOIN units u      ON u.id = pm.unit_id
+       LEFT JOIN properties p ON p.id = u.property_id
+      WHERE pm.id = $1 AND pm.entry_description = 'FLEXPAY'`,
     [paymentId],
   )
   if (!pay || !pay.stripe_payment_intent_id) return  // not a FlexPay PI — nothing to reprice
@@ -842,7 +860,8 @@ export async function repriceFlexPayRetryPayment(paymentId: string): Promise<voi
 
   const rent = Number(adv.rent_amount)
   // Retry day = today's calendar day, clamped to the 1..28 formula range.
-  const retryDay = Math.min(Math.max(new Date().getUTCDate(), 1), FLEXPAY_MAX_PULL_DAY)
+  // S654: the property's day, not UTC's (UTC is tomorrow after 5 pm Phoenix).
+  const retryDay = Math.min(Math.max(Number(todayIn(pay.timezone).slice(8, 10)), 1), FLEXPAY_MAX_PULL_DAY)
   const newFee = calculateFlexPayFee(retryDay)
   const boost = await computeTenantGamOutstandingTotal(pay.tenant_id)
   const newAmount = Math.round((rent + newFee + FLEXPAY_ACH_RETURN_FEE + boost) * 100) / 100

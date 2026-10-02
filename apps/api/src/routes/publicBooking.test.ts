@@ -23,6 +23,7 @@ import { db } from '../db'
 import { cleanupAllSchema } from '../test/dbHelpers'
 import { publicBookingRouter } from './publicBooking'
 import { errorHandler } from '../middleware/errorHandler'
+import { todayIn, dateIn, addDaysTo } from '../lib/timezone'
 
 function buildApp() {
   const app = express()
@@ -138,7 +139,7 @@ describe('GET /booking/:slug — public profile', () => {
 describe('GET /booking/:slug/availability', () => {
   it('returns 14 days of slots when no toDate supplied', async () => {
     const f = await seed()
-    const today = new Date().toISOString().slice(0, 10)
+    const today = todayIn(null)  // S654: GAM's home-zone today, not UTC's
     const res = await request(buildApp())
       .get(`/api/public/booking/${f.slug}/availability?serviceId=${f.serviceId}&fromDate=${today}`)
     expect(res.status).toBe(200)
@@ -151,7 +152,7 @@ describe('GET /booking/:slug/availability', () => {
         '0': null, '1': null, '2': null, '3': null, '4': null, '5': null, '6': null,
       },
     })
-    const today = new Date().toISOString().slice(0, 10)
+    const today = todayIn(null)  // S654: GAM's home-zone today, not UTC's
     const res = await request(buildApp())
       .get(`/api/public/booking/${f.slug}/availability?serviceId=${f.serviceId}&fromDate=${today}`)
     expect(res.body.data.days.every((d: any) => d.slots.length === 0)).toBe(true)
@@ -187,7 +188,7 @@ describe('GET /booking/:slug/availability', () => {
 
   it('disabled booking → 404', async () => {
     const f = await seed({ enabled: false })
-    const today = new Date().toISOString().slice(0, 10)
+    const today = todayIn(null)  // S654: GAM's home-zone today, not UTC's
     const res = await request(buildApp())
       .get(`/api/public/booking/${f.slug}/availability?serviceId=${f.serviceId}&fromDate=${today}`)
     expect(res.status).toBe(404)
@@ -336,7 +337,7 @@ describe('S511 booking modes', () => {
     const profile = await request(buildApp()).get(`/api/public/booking/${f.slug}`)
     expect(profile.body.data.booking_mode).toBe('day')
     const avail = await request(buildApp())
-      .get(`/api/public/booking/${f.slug}/availability?serviceId=${f.serviceId}&fromDate=${new Date().toISOString().slice(0, 10)}`)
+      .get(`/api/public/booking/${f.slug}/availability?serviceId=${f.serviceId}&fromDate=${todayIn(null)}`)
     expect(avail.body.data.mode).toBe('day')
     expect(avail.body.data.days.some((d: any) => d.available === true)).toBe(true)
     expect(avail.body.data.days[0].slots).toBeUndefined()
@@ -367,7 +368,8 @@ describe('S511 booking modes', () => {
     const appts = await db.query<{ scheduled_for: Date }>(
       `SELECT scheduled_for FROM appointments WHERE business_id = $1`, [f.businessId])
     expect(appts.rows.length).toBe(1)
-    expect(new Date(appts.rows[0]!.scheduled_for).toISOString().slice(0, 10)).toBe(day)
+    // S654: the local calendar day of the booked instant, not its UTC day.
+    expect(dateIn(null, new Date(appts.rows[0]!.scheduled_for))).toBe(day)
   })
 
   it('#11: customer-entered vehicle is filed when the business tracks vehicles', async () => {
@@ -410,9 +412,10 @@ describe('S511 booking modes', () => {
 // ── Helpers ───────────────────────────────────────────────────
 
 function nextMondayIso(daysAhead: number): string {
-  // Returns a Monday at least `daysAhead` days from now.
-  const d = new Date()
-  d.setDate(d.getDate() + daysAhead)
-  while (d.getDay() !== 1) d.setDate(d.getDate() + 1)
-  return d.toISOString().slice(0, 10)
+  // Returns a Monday at least `daysAhead` days from now. S654: counted on the
+  // local calendar (America/Phoenix, the server's and the DB's zone). The old
+  // local setDate + UTC toISOString handed back a TUESDAY after 5 pm.
+  let day = addDaysTo(todayIn(null), daysAhead)
+  while (new Date(`${day}T12:00:00Z`).getUTCDay() !== 1) day = addDaysTo(day, 1)
+  return day
 }

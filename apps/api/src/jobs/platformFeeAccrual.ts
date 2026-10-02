@@ -59,6 +59,7 @@ import { activateBillingForOccupancy } from '../services/billingActivation'
 import { billableUnitsForProperty } from '../services/billableUnits'
 import { NIGHTS_AGGREGATION_UNIT_TYPES, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
 import type { PoolClient } from 'pg'
+import { addDaysTo, dateIn, monthStartOf } from '../lib/timezone'
 
 interface AccrualResult {
   monthScanned: string
@@ -124,10 +125,14 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
   //
   // S637's all-arrears behavior is why September's fee had to be run by hand:
   // the run on the 1st was still billing the month before it.
-  const monthStart   = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
-  const monthIso     = monthStart.toISOString().slice(0, 10)
-  const arrearsStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1))
-  const arrearsIso   = arrearsStart.toISOString().slice(0, 10)
+  //
+  // S654: the month is read off GAM's Phoenix calendar, not UTC. The cron fires
+  // at 1:30 am Phoenix on the 1st, which is the 1st in UTC too, but a run
+  // started by hand after 5 pm Phoenix on the last day of a month was already
+  // next month in UTC and would have billed the wrong cycle. Phoenix is also the
+  // database's zone, so this agrees with CURRENT_DATE.
+  const monthIso     = monthStartOf(dateIn(null, now))
+  const arrearsIso   = monthStartOf(addDaysTo(monthIso, -1))
 
   const result: AccrualResult = {
     monthScanned: monthIso,

@@ -450,6 +450,20 @@ describe('PATCH /leases/:id — S201 material-change gate', () => {
       .send({ endDate: '2027-12-31' })
     expect(res.status).toBe(409)
     expect(res.body.error).toBe('material_change_requires_new_lease')
+    // S654: the stored date reads back as the date, not "Thu Dec 31".
+    expect(res.body.changes).toEqual([{ field: 'end_date', from: '2026-12-31', to: '2027-12-31' }])
+  })
+
+  // S654: a client that echoes the lease's own end date has changed nothing.
+  // pg's Date stringified as "Thu Dec 31" never matched, so this read as a term
+  // change and was refused.
+  it('an unchanged endDate on an active lease is not a material change', async () => {
+    const f = await seedFixture({ leaseStatus: 'active', endDate: '2026-12-31' })
+    const res = await request(buildApp())
+      .patch(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ endDate: '2026-12-31' })
+    expect(res.status).toBe(200)
   })
 
   it('non-material change (lateFeeGraceDays) on active without confirmAddendum → 409 addendum_confirmation_required', async () => {
@@ -817,13 +831,36 @@ describe('POST /leases/:id/bill-fee', () => {
   it('defaults dueDate to today when not provided', async () => {
     const f = await seedFixture()
     const feeId = await addBillableFee(f.leaseId, 'other_fee', 100)
-    const today = new Date().toISOString().slice(0, 10)
+    // S654: today from the database (Phoenix, the seeded park's zone), so the
+    // test agrees with the route in any hour — a UTC date runs a day ahead
+    // every evening.
+    const { rows: [{ today }] } = await db.query<{ today: string }>(`SELECT CURRENT_DATE::text AS today`)
     const res = await request(buildApp())
       .post(`/api/leases/${f.leaseId}/bill-fee`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ leaseFeeId: feeId })
     expect(res.status).toBe(201)
     expect(res.body.data.due_date).toBe(today)
+  })
+
+  // S654 (Nic): "Everything must be local to the property." A park far from
+  // Phoenix dates the charge on its own calendar — Kiritimati (UTC+14) is a
+  // calendar day ahead of Phoenix for 21 hours of every day.
+  it('defaults dueDate to the PROPERTY\'s today, not the server\'s or UTC\'s', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE properties SET timezone = 'Pacific/Kiritimati' WHERE id = $1`, [f.propertyId])
+    const feeId = await addBillableFee(f.leaseId, 'other_fee', 100)
+    const { rows: [{ today }] } = await db.query<{ today: string }>(
+      `SELECT (NOW() AT TIME ZONE 'Pacific/Kiritimati')::date::text AS today`)
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseId}/bill-fee`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseFeeId: feeId })
+    expect(res.status).toBe(201)
+    expect(res.body.data.due_date).toBe(today)
+    const row = await db.query<{ d: string }>(
+      `SELECT to_char(due_date, 'YYYY-MM-DD') AS d FROM payments WHERE id = $1`, [res.body.data.payment_id])
+    expect(row.rows[0].d).toBe(today)
   })
 
   it('409 when lease has no active primary tenant', async () => {

@@ -22,6 +22,7 @@ import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
 import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } from '../services/email'
 import { getNexusDashboard, recomputeNexusTally, setStateRegistration } from '../services/nexusMonitor'
+import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -1810,10 +1811,11 @@ async function currentPlatformRunRate(): Promise<number> {
 
   const { billableUnitsForProperty } = await import('../services/billableUnits')
   const { NIGHTS_AGGREGATION_UNIT_TYPES } = await import('@gam/shared')
-  const monthIso = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1))
-    .toISOString().slice(0, 10)
-  const arrears = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() - 1, 1))
-    .toISOString().slice(0, 10)
+  // S654: this month and last by the Phoenix calendar — the same calendar as the
+  // CURRENT_DATE filter above. The UTC month turns over at 5 pm on the last day,
+  // which priced next month against this month's landlords.
+  const monthIso = monthStartOf(todayIn(null))
+  const arrears = monthStartOf(addDaysTo(monthIso, -1))
 
   const client = await getClient()
   try {

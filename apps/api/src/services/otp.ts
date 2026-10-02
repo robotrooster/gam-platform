@@ -2,6 +2,7 @@ import { query, queryOne, getClient } from '../db'
 import { isFeatureEnabled } from './systemFeatures'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
+import { dateIn, addDaysTo, monthStartOf } from '../lib/timezone'
 
 // ============================================================
 // OTP (On-Time Pay) — landlord rent-advance product.
@@ -633,15 +634,14 @@ function round2(n: number) {
  * cycle_month for the advance run: the FOLLOWING month's 1st.
  * If the cron fires on the last business day of October, the cycle
  * is November ('2026-11-01').
+ *
+ * S654: "this month" is GAM's month (Phoenix, the database's zone) — the
+ * advance is one platform-wide run. UTC is already next month after 5 pm on
+ * the last day in Phoenix, which would have advanced a month too far.
  */
 export function cycleMonthFor(now: Date): string {
-  const y = now.getUTCFullYear()
-  const m = now.getUTCMonth() + 1 // 0-indexed → next month's number after +1
-  const cycleY = m === 11 + 1 ? y + 1 : (m === 12 ? y + 1 : y)
-  const cycleM = (m === 12 ? 1 : (m === 11 ? 12 : m + 1)) - 1
-  // Above logic is finicky; simpler: take the first of next month.
-  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
-  return next.toISOString().slice(0, 10)
+  // Day 1 + 31 days always lands in the next month.
+  return monthStartOf(addDaysTo(monthStartOf(dateIn(null, now)), 31))
 }
 
 /**

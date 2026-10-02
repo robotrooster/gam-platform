@@ -1,6 +1,7 @@
 import { query, queryOne } from '../db'
 import { logger } from '../lib/logger'
 import { createNotification } from './notifications'
+import { todayIn, dateIn } from '../lib/timezone'
 
 // S547 (Nic): the long-stay ping is a DECISION for the landlord — screen
 // first, or send the lease directly if they know the guest. The system never
@@ -17,7 +18,9 @@ interface GuestScreeningContext {
   continuousTenancySince: boolean          // leases chain from that check to today
 }
 
-async function guestScreeningContext(guestEmail: string | null, landlordId: string): Promise<GuestScreeningContext> {
+async function guestScreeningContext(
+  guestEmail: string | null, landlordId: string, tz: string | null,
+): Promise<GuestScreeningContext> {
   const out: GuestScreeningContext = { priorStays: 0, approvedCheckAt: null, continuousTenancySince: false }
   if (!guestEmail) return out
 
@@ -41,21 +44,30 @@ async function guestScreeningContext(guestEmail: string | null, landlordId: stri
       ORDER BY COALESCE(decided_at, created_at) DESC LIMIT 1`,
     [person.user_id, person.tenant_id])
   if (!check?.at) return out
-  // pg returns a Date object — normalize to YYYY-MM-DD.
-  out.approvedCheckAt = new Date(check.at).toISOString().slice(0, 10)
+  // pg returns a Date object — normalize to YYYY-MM-DD. S654: the day it was
+  // approved on the property's calendar; the UTC day reads as tomorrow for a
+  // check decided after 5 pm in Phoenix.
+  out.approvedCheckAt = dateIn(tz, new Date(check.at))
 
   if (person.tenant_id) {
     // Continuous = their leases (any GAM landlord, via the lease_tenants
     // junction), merged with a small move-between-properties grace, cover
     // check-date → today.
+    // S654: ::text — pg hands a bare DATE back as a JS Date, and String(Date)
+    // .slice(0, 10) is "Fri Jul 10", which made every lease below an Invalid
+    // Date: the walk never advanced and continuity was judged off the check
+    // date alone.
     const leases = await query<{ start_date: string; end_date: string | null }>(
-      `SELECT l.start_date, l.end_date
+      `SELECT l.start_date::text AS start_date, l.end_date::text AS end_date
          FROM leases l
          JOIN lease_tenants lt ON lt.lease_id = l.id
         WHERE lt.tenant_id = $1 AND l.status NOT IN ('pending', 'cancelled')
         ORDER BY l.start_date ASC`, [person.tenant_id])
     let cover = new Date(out.approvedCheckAt + 'T12:00:00Z')
-    const today = new Date()
+    // S654: today is the property's calendar day, anchored at noon UTC like
+    // the lease dates, so the 30-day grace is counted in whole days and does
+    // not flip with the hour.
+    const today = new Date(todayIn(tz) + 'T12:00:00Z')
     for (const l of leases) {
       const s = new Date(String(l.start_date).slice(0, 10) + 'T12:00:00Z')
       const e = l.end_date ? new Date(String(l.end_date).slice(0, 10) + 'T12:00:00Z') : today
@@ -83,7 +95,7 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
   const booking = await queryOne<any>(
     `SELECT b.id, b.unit_id, b.landlord_id, b.status, b.check_in, b.check_out, b.guest_name, b.guest_email,
             u.rent_amount, u.monthly_rate, u.unit_number,
-            p.weekly_lease_mode
+            p.weekly_lease_mode, p.timezone
        FROM unit_bookings b
        JOIN units u ON u.id = b.unit_id
        JOIN properties p ON p.id = u.property_id
@@ -129,7 +141,7 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
       const owner = await queryOne<{ user_id: string }>(
         `SELECT user_id FROM landlords WHERE id = $1`, [booking.landlord_id])
       if (owner) {
-        const ctx = await guestScreeningContext(booking.guest_email, booking.landlord_id)
+        const ctx = await guestScreeningContext(booking.guest_email, booking.landlord_id, booking.timezone)
 
         // ── S639 (Nic): A LONG STAY IS SCREENED AUTOMATICALLY ───────────────
         //

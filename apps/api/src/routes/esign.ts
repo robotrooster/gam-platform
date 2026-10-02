@@ -35,7 +35,10 @@ import {
   DISCLOSURE_TYPE_LABEL,
   TEMPLATE_APPLIES_TO,
   printedUnitNumber,
+  documentDateToIso,
+  isoToDocumentDate,
 } from '@gam/shared'
+import { todayIn, dateIn } from '../lib/timezone'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
 import { requireAuth, requirePerm } from '../middleware/auth'
@@ -198,6 +201,23 @@ async function getDocumentTenantSigners(documentId: string): Promise<{
  * Returns the created lease_documents row.
  */
 /**
+ * S654: the calendar day a lease date field names, as 'YYYY-MM-DD'. Document
+ * dates are M/D/YYYY (S636) and older values can be ISO; anything else falls
+ * back to the old local-time parse. Never read through UTC midnight.
+ */
+function leaseFieldDate(raw: string | null | undefined): string | null {
+  const t = String(raw ?? '').trim()
+  if (!t) return null
+  const iso = /^(\d{4}-\d{2}-\d{2})/.exec(t)
+  if (iso) return iso[1]
+  const doc = documentDateToIso(t)
+  if (doc) return doc
+  const d = new Date(t)
+  if (Number.isNaN(d.getTime())) return null
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/**
  * S652 — a lease cannot be issued already over.
  *
  * Blu signed Country Acres MH 06 with an end date of 8/1/2026 and MH 17 with
@@ -210,14 +230,16 @@ async function getDocumentTenantSigners(documentId: string): Promise<{
  * send and at every signature — with the date in the sentence. '-' (month to
  * month) and a blank end date pass.
  */
-export function assertLeaseNotAlreadyOver(endVal: string | null | undefined, today: Date = new Date()): void {
+export function assertLeaseNotAlreadyOver(endVal: string | null | undefined, today: string = todayIn(null)): void {
   const raw = (endVal ?? '').trim()
   if (!raw || raw === '-') return
-  const end = new Date(raw)
-  if (Number.isNaN(end.getTime())) return
-  const t = new Date(today.getFullYear(), today.getMonth(), today.getDate())
-  const e = new Date(end.getFullYear(), end.getMonth(), end.getDate())
-  if (e <= t) {
+  // S654: compare calendar days — the PROPERTY's today (callers pass it) against
+  // the day the field names. Two Date objects read an ISO end date at UTC
+  // midnight, the evening before in Phoenix, so a lease ending tomorrow was
+  // refused as already over.
+  const end = leaseFieldDate(raw)
+  if (!end) return
+  if (end <= today) {
     throw new AppError(400,
       `This lease ends ${raw}, which has already passed. A lease cannot be issued already over — enter the current term, or "-" for month to month.`)
   }
@@ -860,8 +882,9 @@ export async function buildLeaseFromDocument(documentId: string): Promise<{
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`esign_finalize:${documentId}`])
 
     const doc = await client.query(
-      `SELECT d.*, u.unit_type
+      `SELECT d.*, u.unit_type, p.timezone AS property_timezone
        FROM lease_documents d LEFT JOIN units u ON u.id = d.unit_id
+       LEFT JOIN properties p ON p.id = u.property_id
        WHERE d.id=$1`, [documentId]).then(r => r.rows[0])
     if (!doc) throw new AppError(404, 'Document not found')
 
@@ -1125,10 +1148,11 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startDate, vals.end_date || null)
   if (!ov.ok) throw new AppError(409, ov.reason || 'Lease overlap detected')
 
-  // Status: future start → pending, today/past → active
-  const today = new Date(); today.setHours(0,0,0,0)
-  const start = new Date(startDate)
-  const leaseStatus = start > today ? 'pending' : 'active'
+  // Status: future start → pending, today/past → active.
+  // S654: "today" is the PROPERTY's calendar day, compared as dates — not the
+  // API host's midnight against a field parsed in whatever zone it lands.
+  const startIso = leaseFieldDate(startDate)
+  const leaseStatus = startIso && startIso > todayIn(doc.property_timezone) ? 'pending' : 'active'
 
   // INSERT lease — writable-column portion dynamically assembled from the
   // shared spec registry. Adding a new writable value to WRITABLE_LEASE_COLUMN_SPECS
@@ -3388,7 +3412,7 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
 
     const lease = await queryOne<any>(`
       SELECT l.*, u.unit_number, u.unit_type, u.property_id, p.name AS property_name,
-             p.street1, p.city, p.state, p.zip
+             p.street1, p.city, p.state, p.zip, p.timezone AS property_timezone
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
@@ -3535,9 +3559,11 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
       // the first of the month after next (drafted Jul 10 → effective
       // Sep 1; signing deadline Aug 30 via the scheduler's 1-day-prior
       // rule). Default only — the landlord edits it in the doc.
-      const mtmNow = new Date()
-      const mtmEffect = new Date(mtmNow.getFullYear(), mtmNow.getMonth() + 2, 1)
-      prefillValues.start_date = mtmEffect.toLocaleDateString('en-US')
+      // S654: counted from the PROPERTY's today, not the API host's clock.
+      const [ty, tm] = todayIn(lease.property_timezone).split('-').map(Number)
+      const effIdx = (tm - 1) + 2
+      prefillValues.start_date = isoToDocumentDate(
+        `${ty + Math.floor(effIdx / 12)}-${String((effIdx % 12) + 1).padStart(2, '0')}-01`)
       prefillValues.end_date = '-'
     }
 
@@ -4535,7 +4561,8 @@ esignRouter.post('/documents/:id/remind', requireAuth, requirePerm('esign.send')
 esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), async (req, res, next) => {
   try {
     const doc = await queryOne<any>(`
-      SELECT d.*, u.unit_number, p.name as property_name, lu.first_name || ' ' || lu.last_name as landlord_name
+      SELECT d.*, u.unit_number, p.name as property_name, p.timezone AS property_timezone,
+             lu.first_name || ' ' || lu.last_name as landlord_name
       FROM lease_documents d
       LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
       JOIN landlords la ON la.id=d.landlord_id JOIN users lu ON lu.id=la.user_id
@@ -4554,7 +4581,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
         WHERE document_id=$1 AND lease_column IN ('start_date','end_date') AND value IS NOT NULL`, [doc.id])
       const startVal = (vals as any[]).find(v => v.lease_column === 'start_date')?.value
       const endVal   = (vals as any[]).find(v => v.lease_column === 'end_date')?.value
-      if (doc.document_type === 'original_lease') assertLeaseNotAlreadyOver(endVal)
+      if (doc.document_type === 'original_lease') assertLeaseNotAlreadyOver(endVal, todayIn(doc.property_timezone))
       if (startVal) {
         const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
         // S535: '-' end date = month-to-month (no end date) — never cast it as a date.
@@ -4596,7 +4623,11 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
         if (gateOn && doc.document_type === 'original_lease' && !doc.renews_lease_id) {
           const ll = await queryOne<{ created_at: string; migration_window_ends_at: string | null }>(
             `SELECT created_at, migration_window_ends_at FROM landlords WHERE id = $1`, [doc.landlord_id])
-          const leaseStart = new Date(startVal)
+          // S654: calendar days, not instants. `new Date('2026-10-02')` is UTC
+          // midnight — the evening before in Phoenix — so after 5 pm a lease
+          // starting tomorrow read as starting before a landlord who joined
+          // today, and slipped the screening gate as "migrated".
+          const leaseStart = leaseFieldDate(startVal)
           const onboardedAt = ll ? new Date(ll.created_at) : null
           // S624: DERIVE the window when the column is null rather than treating
           // null as "open forever".
@@ -4627,12 +4658,14 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
           //  2. The landlord marked that they already hold this tenant's deposit
           //     — an explicit assertion that the tenant was already living there,
           //     and it holds even after the window closes.
-          //  3. The lease genuinely starts before the landlord joined GAM.
+          //  3. The lease genuinely starts before the landlord joined GAM (on or
+          //     before their join day — the old instant compare, start-of-day
+          //     against the join moment, meant the same thing).
           const windowOpen = !windowEnds || new Date() < windowEnds
           const isMigrated =
             windowOpen ||
             doc.deposit_already_held === true ||
-            (!!onboardedAt && leaseStart < onboardedAt)
+            (!!onboardedAt && !!leaseStart && leaseStart <= dateIn(doc.property_timezone, onboardedAt))
           if (!isMigrated) {
             // LEFT JOIN, deliberately: a signer with no tenants row certainly has
             // no background check either. An inner join would have let exactly
@@ -4651,7 +4684,9 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
                   )`, [doc.id])
             if (unscreened.length > 0) {
               const who = unscreened.map(u => u.name).join(', ')
-              const closed = windowEnds ? windowEnds.toISOString().slice(0, 10) : 'your onboarding'
+              // S654: the landlord's window is account-level — name its day on
+              // GAM's home calendar, not the UTC one (a 6 pm signup read a day late).
+              const closed = windowEnds ? dateIn(null, windowEnds) : 'your onboarding'
               throw new AppError(409,
                 `Cannot send: ${who} ${unscreened.length === 1 ? 'has' : 'have'} not completed a background check. ` +
                 `Your onboarding migration window closed on ${closed}, so new applicants must be screened before ` +
@@ -5015,7 +5050,7 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
 
     const doc = await queryOne<any>(`
       SELECT d.*, u.unit_number, p.name as property_name, p.state as property_state,
-             p.landlord_id as property_landlord_id,
+             p.landlord_id as property_landlord_id, p.timezone AS property_timezone,
              lu.first_name || ' ' || lu.last_name as landlord_name
       FROM lease_documents d
       LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
@@ -5115,7 +5150,9 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     let deposit_interest_context: any = null
     const showsDepositTerms = doc.document_type === 'original_lease' || doc.document_type === 'addendum_terms'
     if (showsDepositTerms && doc.property_state) {
-      const currentYear = new Date().getUTCFullYear()
+      // S654: the rate year in effect where the PROPERTY is — the UTC year
+      // turned over at 5 pm Phoenix on December 31.
+      const currentYear = Number(todayIn(doc.property_timezone).slice(0, 4))
       const statutory = await queryOne<{
         annual_rate_pct:  string
         statute_citation: string
@@ -5281,7 +5318,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     }
 
     const docRes = await client.query(`
-      SELECT d.*, u.unit_number, u.unit_type, p.name as property_name,
+      SELECT d.*, u.unit_number, u.unit_type, p.name as property_name, p.timezone AS property_timezone,
         lu.first_name || ' ' || lu.last_name as landlord_name, lu.email as landlord_email
       FROM lease_documents d
       LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
@@ -5310,7 +5347,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       const vals = valsRes.rows
       const startVal = (vals as any[]).find(v => v.lease_column === 'start_date')?.value
       const endVal   = (vals as any[]).find(v => v.lease_column === 'end_date')?.value
-      if (doc.document_type === 'original_lease') assertLeaseNotAlreadyOver(endVal)
+      if (doc.document_type === 'original_lease') assertLeaseNotAlreadyOver(endVal, todayIn(doc.property_timezone))
       if (startVal) {
         const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
         // S535: '-' end date = month-to-month (no end date) — never cast it as a date.

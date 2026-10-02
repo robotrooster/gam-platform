@@ -22,6 +22,7 @@ import { db, query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { requireBusinessAccess } from '../middleware/businessAccess'
+import { todayIn } from '../lib/timezone'
 import {
   type RecurringInvoiceFrequency,
   isMonthlyRecurrence,
@@ -35,8 +36,10 @@ const requireSend  = async (req: any) => (await requireBusinessAccess(req, { per
 
 // ── helpers ────────────────────────────────────────────────────
 
+// S654: GAM's home-zone calendar day (Phoenix, same as CURRENT_DATE used by
+// pause/resume/end below), never UTC — UTC is already tomorrow after 5 pm.
 function todayIso(): string {
-  return new Date().toISOString().slice(0, 10)
+  return todayIn(null)
 }
 
 // Compute the first next_due_date >= start_date that matches the

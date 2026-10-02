@@ -7,6 +7,7 @@ import { AppError } from '../middleware/errorHandler'
 import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
 import { platformFeesByProperty, platformFeesByPropertyForEntities, periodMonths } from '../services/platformFee'
 import { computeLandlordPL } from '../services/landlordPL'
+import { todayIn, addDaysTo, monthStartOf, localDateTimeToUtc } from '../lib/timezone'
 import {
   runReport, REPORT_LEVELS, REPORT_BUCKETS,
   type ReportLevel, type ReportBucket,
@@ -18,11 +19,43 @@ export const reportsRouter = Router()
 // Owners auto-pass requirePerm via OWNER_ROLES short-circuit.
 reportsRouter.use(requireAuth)
 
-// Helper — get month date range
+// S654: report periods follow GAM's home calendar — Phoenix, the zone
+// todayIn(null) reads and the database's CURRENT_DATE uses — never the UTC
+// date, which turns over at 5 pm here.
+const REPORT_TZ = 'America/Phoenix'
+
+/** S654: this calendar year by the Phoenix clock. */
+function thisYear(): number {
+  return Number(todayIn(null).slice(0, 4))
+}
+
+/** S654: last day of a month as 'YYYY-MM-DD', by pure calendar math (no server zone). */
+function lastDayOfMonth(year: number, month: number): string {
+  return new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10)
+}
+
+/** S654: a Phoenix wall-clock time written with its UTC offset, e.g. '2026-09-30T23:59:59-07:00'. */
+function withReportOffset(local: string): string {
+  const offsetMin = Math.round((Date.parse(local + 'Z') - localDateTimeToUtc(local, REPORT_TZ).getTime()) / 60000)
+  const abs = Math.abs(offsetMin)
+  const hh = String(Math.floor(abs / 60)).padStart(2, '0')
+  const mm = String(abs % 60).padStart(2, '0')
+  return `${local}${offsetMin < 0 ? '-' : '+'}${hh}:${mm}`
+}
+
+// Helper — get month date range.
+// S654: the bounds carry the Phoenix offset ('2026-09-30T23:59:59-07:00').
+// They used to be UTC ISO strings, so the month's last second read
+// '2026-10-01T06:59:59Z': right as an instant, but every DATE column compared
+// against it (due_date, lot rent's billing_month, other income, entered
+// expenses) read 2026-10-01 and pulled next month's 1st into this month.
 function monthRange(year: number, month: number) {
-  const start = new Date(year, month - 1, 1)
-  const end   = new Date(year, month, 0, 23, 59, 59)
-  return { start: start.toISOString(), end: end.toISOString() }
+  // Date.UTC rolls month 0 / 13 over to the neighboring year, as before.
+  const first = new Date(Date.UTC(year, month - 1, 1))
+  return {
+    start: withReportOffset(`${first.toISOString().slice(0, 10)}T00:00:00`),
+    end:   withReportOffset(`${lastDayOfMonth(first.getUTCFullYear(), first.getUTCMonth() + 1)}T23:59:59`),
+  }
 }
 
 function round2(n: number): number {
@@ -291,9 +324,10 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
 // P&L reconciles with the landlord Dashboard's fee card.
 reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const now   = new Date()
-    const year  = parseInt(req.query.year as string)  || now.getFullYear()
-    const month = parseInt(req.query.month as string) || (now.getMonth() + 1)
+    // S654: "this month" by the Phoenix calendar, not the server clock's zone.
+    const today = todayIn(null)
+    const year  = parseInt(req.query.year as string)  || Number(today.slice(0, 4))
+    const month = parseInt(req.query.month as string) || Number(today.slice(5, 7))
     if (month < 1 || month > 12) throw new AppError(400, 'month must be 1-12')
     const { start, end } = monthRange(year, month)
     // S633: a STATEMENT belongs to one company — it carries that company's name
@@ -351,8 +385,12 @@ reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, r
 // ── MONTHLY OWNER STATEMENT ───────────────────────────────────
 reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const year  = parseInt(req.query.year as string)  || new Date().getFullYear()
-    const month = parseInt(req.query.month as string) || new Date().getMonth()
+    // S654: the default is LAST month (a statement covers a finished month),
+    // read off the Phoenix calendar. The old getMonth() shortcut handed back
+    // month 0 in January.
+    const lastMonth = addDaysTo(monthStartOf(todayIn(null)), -1)
+    const year  = parseInt(req.query.year as string)  || Number(lastMonth.slice(0, 4))
+    const month = parseInt(req.query.month as string) || Number(lastMonth.slice(5, 7))
     const { start, end } = monthRange(year, month)
     // S633: a STATEMENT belongs to one company — it carries that company's name
     // and EIN, and an LLC files its own return. Summing two together produces a
@@ -502,7 +540,7 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
 // ── ANNUAL TAX SUMMARY ────────────────────────────────────────
 reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, next) => {
   try {
-    const year = parseInt(req.query.year as string) || new Date().getFullYear()
+    const year = parseInt(req.query.year as string) || thisYear()   // S654: Phoenix year
     const start = `${year}-01-01`
     const end   = `${year}-12-31`
     // S633: a STATEMENT belongs to one company — it carries that company's name
@@ -638,14 +676,14 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
 // ── PER-PROPERTY P&L ──────────────────────────────────────────
 reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const year  = parseInt(req.query.year as string)  || new Date().getFullYear()
+    const year  = parseInt(req.query.year as string)  || thisYear()   // S654: Phoenix year
     const month = req.query.month ? parseInt(req.query.month as string) : null
     // S633: an analytical rollup is about the ACCOUNT, so it spans every company
     // it owns. Scoped to one entity, every figure here silently omitted the
     // other company's money.
     const landlordIds = reportScope(req.user!)
     const start = month ? `${year}-${String(month).padStart(2,'0')}-01` : `${year}-01-01`
-    const end   = month ? new Date(year, month, 0).toISOString().split('T')[0] : `${year}-12-31`
+    const end   = month ? lastDayOfMonth(year, month) : `${year}-12-31`
 
     // Scalar subqueries per concern — NOT multiple LEFT JOINs of payments +
     // maintenance onto units. Joining two one-to-many tables to the same unit
@@ -704,10 +742,10 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
 // P&L beside it: outages that ENDED in the period. Out-right-now is as of today.
 reportsRouter.get('/site-downtime', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const year  = parseInt(req.query.year as string)  || new Date().getFullYear()
+    const year  = parseInt(req.query.year as string)  || thisYear()   // S654: Phoenix year
     const month = req.query.month ? parseInt(req.query.month as string) : null
     const start = month ? `${year}-${String(month).padStart(2,'0')}-01` : `${year}-01-01`
-    const end   = month ? new Date(year, month, 0).toISOString().split('T')[0] : `${year}-12-31`
+    const end   = month ? lastDayOfMonth(year, month) : `${year}-12-31`
     const { siteDowntimeReport } = await import('../services/outOfOrder')
     const rows = await siteDowntimeReport(reportScope(req.user!), start, end)
     res.json({ success: true, data: { year, month, period: { start, end }, rows } })
@@ -725,7 +763,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
   try {
     const propertyId = req.query.propertyId as string
     if (!propertyId) throw new AppError(400, 'propertyId is required')
-    const year  = parseInt(req.query.year as string)  || new Date().getFullYear()
+    const year  = parseInt(req.query.year as string)  || thisYear()   // S654: Phoenix year
     const month = req.query.month ? parseInt(req.query.month as string) : null
     if (month !== null && (month < 1 || month > 12)) throw new AppError(400, 'month must be 1-12')
     // S633: the company is the one that owns the property being reported on —
@@ -734,7 +772,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
     const landlordIds = reportScope(req.user!)
 
     const start = month ? `${year}-${String(month).padStart(2,'0')}-01` : `${year}-01-01`
-    const end   = month ? new Date(year, month, 0).toISOString().split('T')[0] : `${year}-12-31`
+    const end   = month ? lastDayOfMonth(year, month) : `${year}-12-31`
     const yearStart = `${year}-01-01`, yearEnd = `${year}-12-31`
 
     const property = await queryOne<any>(`
@@ -839,7 +877,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
 // ── WORK TRADE 1099 SUMMARY ───────────────────────────────────
 reportsRouter.get('/work-trade-1099', requirePerm('books.view'), async (req, res, next) => {
   try {
-    const year = parseInt(req.query.year as string) || new Date().getFullYear()
+    const year = parseInt(req.query.year as string) || thisYear()   // S654: Phoenix year
     // S633: a STATEMENT belongs to one company — it carries that company's name
     // and EIN, and an LLC files its own return. Summing two together produces a
     // document that is wrong on its face, so this asks which when the account
@@ -966,7 +1004,10 @@ reportsRouter.get('/t12', requirePerm('payments.view_all'), async (req, res, nex
     // Trailing twelve FULL months ending with last month — the current partial
     // month is excluded on purpose, because a T-12 that includes a half-finished
     // month understates income and misleads whoever is reading it.
-    const anchor = req.query.asOf ? new Date(String(req.query.asOf)) : new Date()
+    // S654: anchored on today's Phoenix date (UTC midnight of it, so the UTC
+    // getters below read the Phoenix month). The raw UTC clock is next month
+    // after 5 pm on the last day, which pulled the partial month in.
+    const anchor = new Date(req.query.asOf ? String(req.query.asOf) : todayIn(null))
     if (isNaN(anchor.getTime())) throw new AppError(400, 'asOf must be a valid date')
     const endD   = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 0))
     const startD = new Date(Date.UTC(endD.getUTCFullYear(), endD.getUTCMonth() - 11, 1))

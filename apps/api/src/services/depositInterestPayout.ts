@@ -21,6 +21,7 @@
  */
 import { getClient, query } from '../db'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 
 export interface PayoutResult {
   scanned: number
@@ -50,6 +51,8 @@ export async function payAnnualDepositInterest(asOf?: Date): Promise<PayoutResul
   // One row per deposit that has a full year of unpaid accruals behind it.
   // Deposits already returned are excluded: their interest went out with the
   // deposit through depositReturn, and paying again would double-pay.
+  // S654: the year is measured to the property's today, not UTC's (UTC is
+  // tomorrow after 5 pm in Phoenix, which paid a day early at month's end).
   const due = await query<{
     security_deposit_id: string
     lease_id: string
@@ -69,13 +72,16 @@ export async function payAnnualDepositInterest(asOf?: Date): Promise<PayoutResul
        FROM security_deposit_interest_accruals a
        JOIN security_deposits sd ON sd.id = a.security_deposit_id
        JOIN leases l             ON l.id = a.lease_id
+       JOIN units u              ON u.id = l.unit_id
+       JOIN properties p         ON p.id = u.property_id
       WHERE a.paid_at IS NULL
         AND a.interest_amount > 0
         AND sd.disbursed_at IS NULL
-      GROUP BY a.security_deposit_id, a.lease_id, sd.tenant_id, l.landlord_id
-     HAVING MIN(a.accrual_month) <= ($1::date - INTERVAL '12 months')
+      GROUP BY a.security_deposit_id, a.lease_id, sd.tenant_id, l.landlord_id, p.timezone
+     HAVING MIN(a.accrual_month)
+              <= (($1::timestamptz AT TIME ZONE p.timezone)::date - INTERVAL '12 months')
         AND SUM(a.interest_amount) >= $2`,
-    [now.toISOString().slice(0, 10), MIN_CREDIT])
+    [now, MIN_CREDIT])
 
   out.scanned = due.length
 
@@ -214,7 +220,7 @@ export async function landlordHeldInterestAdvisory(
 ): Promise<LandlordHeldAdvisory[]> {
   const rows = await query<any>(
     `SELECT sd.id, sd.collected_amount::float AS principal, sd.tenant_id, sd.lease_id,
-            l.landlord_id, p.state AS state_code, p.name AS property_name,
+            l.landlord_id, p.state AS state_code, p.name AS property_name, p.timezone,
             u.unit_number, u.unit_type, u.rent_amount::float AS monthly_rent,
             TRIM(CONCAT_WS(' ', tu.first_name, tu.last_name)) AS tenant_name,
             -- Same definition of "funded" the accrual engine uses, so the
@@ -245,9 +251,11 @@ export async function landlordHeldInterestAdvisory(
     [landlordIds ?? null])
 
   const out: LandlordHeldAdvisory[] = []
-  const year = new Date().getUTCFullYear()
   for (const r of rows) {
     try {
+      // S654: the rate year is the property's year — UTC's is already next
+      // year after 5 pm on December 31 in Phoenix.
+      const year = Number(todayIn(r.timezone).slice(0, 4))
       const { resolveRateForLandlord, principalSubjectToInterest } = await import('./depositInterest')
       const rate = await resolveRateForLandlord(r.landlord_id, r.state_code, year, r.unit_type)
       // No rule, or a rule that owes nothing — nothing to tell them about.

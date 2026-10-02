@@ -9,17 +9,24 @@
  * a manager with nothing to collect is not scored zero for it.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
-import { getClient } from '../db'
+import { getClient, query } from '../db'
+import { addDaysTo } from '../lib/timezone'
 import { ownerPortfolio } from './ownerPortfolio'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease,
   seedUserBankAccount, seedPmCompany,
 } from '../test/dbHelpers'
 
-beforeEach(cleanupAllSchema)
+// S654: the portfolio window ends at CURRENT_DATE (Phoenix), so every "n days
+// ago" counts back from the database's today, not UTC's (already tomorrow
+// after 5 pm), or a charge could land outside the window it was written for.
+let dbToday = ''
+const daysAgo = (n: number) => addDaysTo(dbToday, -n)
 
-const iso = (d: Date) => d.toISOString().slice(0, 10)
-const daysAgo = (n: number) => iso(new Date(Date.now() - n * 864e5))
+beforeEach(async () => {
+  await cleanupAllSchema()
+  dbToday = (await query<{ d: string }>(`SELECT CURRENT_DATE::text AS d`))[0].d
+})
 
 async function park(client: any, o: { landlordId: string; userId: string },
                     pmCompanyId: string | null) {

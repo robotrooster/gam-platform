@@ -13,6 +13,7 @@ import {
   bookingGuestQrDataUrl,
   revokeBookingGuestTokens,
 } from './bookingGuestTokens'
+import { todayIn, addDaysTo } from '../lib/timezone'
 
 async function seedBooking(opts: { daysFromNowCheckout?: number } = {}) {
   const client = await db.connect()
@@ -20,12 +21,16 @@ async function seedBooking(opts: { daysFromNowCheckout?: number } = {}) {
     const { userId, landlordId } = await seedLandlord(client)
     const propertyId = await seedProperty(client, { landlordId, ownerUserId: userId, managedByUserId: userId })
     const unitId = await seedUnit(client, { propertyId, landlordId })
-    const checkout = new Date(Date.now() + (opts.daysFromNowCheckout ?? 5) * 86400000)
-    const checkin = new Date(Date.now() + 1 * 86400000)
+    // S654: stay dates counted from the property's today (seeded properties
+    // default to America/Phoenix), not from the UTC day, which runs a day
+    // ahead after 5 pm in Phoenix.
+    const today = todayIn(null)
+    const checkout = addDaysTo(today, opts.daysFromNowCheckout ?? 5)
+    const checkin = addDaysTo(today, 1)
     const b = await client.query<{ id: string }>(
       `INSERT INTO unit_bookings (unit_id, landlord_id, lease_type, check_in, check_out, guest_name, guest_email, status)
        VALUES ($1, $2, 'nightly', $3, $4, 'Sam Rivera', 'sam@guest.dev', 'confirmed') RETURNING id`,
-      [unitId, landlordId, checkin.toISOString().slice(0, 10), checkout.toISOString().slice(0, 10)]
+      [unitId, landlordId, checkin, checkout]
     )
     return { bookingId: b.rows[0].id, landlordId }
   } finally {

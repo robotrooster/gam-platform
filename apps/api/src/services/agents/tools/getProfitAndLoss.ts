@@ -30,6 +30,7 @@ import { computeLandlordPL } from '../../landlordPL'
 import { periodMonths } from '../../platformFee'
 import type { AgentTool, AgentActor } from './types'
 import { resolveActorCompany, COMPANY_PARAM } from './companyScope'
+import { todayIn } from '../../../lib/timezone'
 
 const money = (n: number) => Math.round(n * 100) / 100
 
@@ -54,10 +55,11 @@ export const getProfitAndLoss: AgentTool = {
   },
   audiences: ['landlord'],
   async execute(args, actor: AgentActor) {
-    const now = new Date()
     const rawYear = Number(args.year)
+    // S654: "this year" by the Phoenix calendar. The UTC year turns over at 5 pm
+    // on New Year's Eve here, so the evening answer was next year's empty P&L.
     const year = Number.isFinite(rawYear) && rawYear > 2000 && rawYear < 2100
-      ? Math.trunc(rawYear) : now.getUTCFullYear()
+      ? Math.trunc(rawYear) : Number(todayIn(null).slice(0, 4))
     const rawMonth = Number(args.month)
     const month = Number.isFinite(rawMonth) && rawMonth >= 1 && rawMonth <= 12
       ? Math.trunc(rawMonth) : null

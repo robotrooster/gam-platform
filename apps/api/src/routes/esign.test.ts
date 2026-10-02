@@ -42,6 +42,7 @@ import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
+import { todayIn, addDaysTo } from '../lib/timezone'
 import {
   cleanupAllSchema,
   seedLandlord, seedTenant, seedProperty, seedUnit,
@@ -719,10 +720,9 @@ describe('POST /documents/:id/send', () => {
          VALUES ($1,$2,'date','landlord','start_date',1,10,10,80,20,TRUE,$3)`,
         [documentId, signer.rows[0]?.id ?? null, startDate])
     }
-    const tomorrow = () => {
-      const d = new Date(); d.setDate(d.getDate() + 1)
-      return d.toISOString().slice(0, 10)
-    }
+    // S654: tomorrow on the property's calendar (fixtures sit in the default
+    // Phoenix zone) — the UTC date made this the day after after 5 pm.
+    const tomorrow = () => addDaysTo(todayIn(null), 1)
 
     // Closing the window is what turns a migration into ordinary leasing.
     const closeWindow = (landlordId: string) =>
@@ -1689,7 +1689,8 @@ describe('POST /sign/:documentId — completion handler (original_lease)', () =>
   it('future start_date → lease.status=pending, unit stays vacant', async () => {
     const f = await seedFixture()
     // Use a date safely in the future relative to test runtime.
-    const futureDate = new Date(Date.now() + 1000 * 60 * 60 * 24 * 30).toISOString().slice(0, 10)
+    // S654: counted from the property's today (default Phoenix), not UTC's.
+    const futureDate = addDaysTo(todayIn(null), 30)
     const { documentId } = await seedCompleteableDoc(f, {
       fields: defaultLeaseFields({ start_date: futureDate, end_date: '2099-12-31' }),
     })
@@ -1725,7 +1726,8 @@ describe('POST /sign/:documentId — completion handler (original_lease)', () =>
   it('S622: a lease signed AFTER its start date still completes the whole chain', async () => {
     const f = await seedFixture()
     // Signed today, but the lease began four days ago — the delayed-signature case.
-    const backdated = new Date(Date.now() - 1000 * 60 * 60 * 24 * 4).toISOString().slice(0, 10)
+    // S654: counted from the property's today (default Phoenix), not UTC's.
+    const backdated = addDaysTo(todayIn(null), -4)
     const { documentId } = await seedCompleteableDoc(f, {
       fields: defaultLeaseFields({ start_date: backdated, end_date: '2099-12-31' }),
     })

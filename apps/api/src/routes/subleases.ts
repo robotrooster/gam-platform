@@ -48,6 +48,7 @@ import { AppError } from '../middleware/errorHandler'
 import { isFeatureEnabled } from '../services/systemFeatures'
 import { appendEvent } from '../services/creditLedger'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 
 export const subleasesRouter = Router()
 subleasesRouter.use(requireAuth)
@@ -94,9 +95,10 @@ subleasesRouter.post('/', async (req, res, next) => {
       subleasing_allowed: 'prohibited' | 'with_consent' | 'allowed'
       property_id: string
       property_subleasing_allowed: boolean
+      timezone: string | null
     }>(
       `SELECT l.id, l.landlord_id, l.status, l.subleasing_allowed,
-              u.property_id, p.subleasing_allowed AS property_subleasing_allowed
+              u.property_id, p.subleasing_allowed AS property_subleasing_allowed, p.timezone
          FROM leases l
          JOIN units u      ON u.id = l.unit_id
          JOIN properties p ON p.id = u.property_id
@@ -184,7 +186,8 @@ subleasesRouter.post('/', async (req, res, next) => {
     } else {
       const autoApprove = lease.subleasing_allowed === 'allowed'
       initialStatus = autoApprove ? 'active' : 'pending'
-      consentDate = autoApprove ? new Date().toISOString().slice(0, 10) : null
+      // S654: consent is dated on the PROPERTY's calendar, not the UTC one.
+      consentDate = autoApprove ? todayIn(lease.timezone) : null
     }
 
     const inserted = await queryOne<any>(

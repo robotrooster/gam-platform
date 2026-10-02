@@ -18,6 +18,7 @@ import { chargeLeaseBalance, chargeLeaseBalanceSchema, resolveTargetLease,
 import { allocateOldestFirst, allocateCredits } from '@gam/shared'
 import { getClient } from '../db'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 
 export const paymentsRouter = Router()
 paymentsRouter.use(requireAuth)
@@ -233,8 +234,10 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
         )
     `)
 
-    const [year, month] = targetMonth.split('-').map(Number)
-    const dueDate = new Date(year, month - 1, 1) // 1st of target month
+    // S654: the 1st as a plain calendar string. A local-midnight Date is cast to
+    // DATE in the database's zone, so on a host whose clock is not Phoenix
+    // (UTC) it landed on the last day of the month before.
+    const dueDate = `${targetMonth}-01` // 1st of target month
 
     let initiated = 0
     const errors: string[] = []
@@ -411,12 +414,16 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
               -- S562: who bears the processing fee (must MATCH allocation.ts's
               -- settle-time branch exactly, or GAM under/over-collects). Lives
               -- on property_allocation_rules, not properties.
-              par.ach_fee_payer, par.card_fee_payer
+              par.ach_fee_payer, par.card_fee_payer,
+              -- S654: the property's zone, for the "today" a row with no due
+              -- date falls back to.
+              pr.timezone AS property_tz
          FROM payments p
          JOIN units u ON u.id = p.unit_id
          JOIN tenants t ON t.id = p.tenant_id
          JOIN landlords l ON l.id = p.landlord_id
          JOIN users lu ON lu.id = l.user_id
+         LEFT JOIN properties pr ON pr.id = u.property_id
          LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.id = $1`,
       [req.params.id]
@@ -518,7 +525,9 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
             AND s.start_date <= $3::date
             AND (s.end_date IS NULL OR s.end_date >= $3::date)
           LIMIT 1`,
-        [pmt.unit_id, pmt.tenant_id, pmt.due_date ?? new Date().toISOString().slice(0, 10)],
+        // S654: an undated row is checked against the property's today, not
+        // UTC's — after 5 pm Phoenix UTC is already tomorrow.
+        [pmt.unit_id, pmt.tenant_id, pmt.due_date ?? todayIn(pmt.property_tz)],
       )
       if (sub) {
         subleaseMarkup = Math.max(0, parseFloat(sub.sub) - parseFloat(sub.master))

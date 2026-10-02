@@ -4,6 +4,7 @@ import { db, queryOne } from '../db'
 import { requireAuth, requireLandlord, requireBooksRead, requireBooksWrite } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { isDisposableEmail } from '../lib/email'
+import { todayIn, monthStartOf } from '../lib/timezone'
 
 export const booksRouter = Router()
 booksRouter.use(requireAuth)
@@ -1192,8 +1193,12 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
   try {
     const { col, id: lid } = ownerScope(req.user)
     const { startDate, endDate } = req.query
-    const start = startDate || new Date(new Date().getFullYear(), 0, 1).toISOString().split('T')[0]
-    const end = endDate || new Date().toISOString().split('T')[0]
+    // S654: the default range runs to TODAY in GAM's home zone (Phoenix, the
+    // database's CURRENT_DATE). UTC turns over at 5 pm here, so an evening
+    // P&L used to run into tomorrow.
+    const today = todayIn(null)
+    const start = startDate || `${today.slice(0, 4)}-01-01`
+    const end = endDate || today
 
     // Income accounts
     const { rows: income } = await db.query(
@@ -1320,7 +1325,8 @@ booksRouter.get('/reports/balance-sheet', requireBooksRead, async (req, res, nex
     res.json({
       success: true,
       data: {
-        asOf: new Date().toISOString().split('T')[0],
+        // S654: as of today in Phoenix, not the UTC date (tomorrow after 5 pm).
+        asOf: todayIn(null),
         assets: assets.rows, totalAssets,
         liabilities: liabilities.rows, totalLiabilities,
         equity: equity.rows, totalEquity,
@@ -1474,8 +1480,10 @@ booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) =
   try {
     const { col, id: lid } = ownerScope(req.user)
     const { startDate, endDate } = req.query
-    const start = (startDate as string) || new Date(new Date().getFullYear(), 0, 1).toISOString().split('T')[0]
-    const end   = (endDate   as string) || new Date().toISOString().split('T')[0]
+    // S654: year-to-date ends today in Phoenix, not on the UTC date.
+    const today = todayIn(null)
+    const start = (startDate as string) || `${today.slice(0, 4)}-01-01`
+    const end   = (endDate   as string) || today
 
     const [rentRows, incomeRows, expenseRows, payrollRows, billRows, disbRows] = await Promise.all([
       db.query(
@@ -1546,9 +1554,11 @@ booksRouter.get('/reports/owner-statements', requireBooksRead, blockBusinessOwne
   try {
     const lid = landlordScope(req.user)
     const { startDate, endDate } = req.query
-    const now   = new Date()
-    const start = (startDate as string) || new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0]
-    const end   = (endDate   as string) || now.toISOString().split('T')[0]
+    // S654: month-to-date in Phoenix. The UTC date flips at 5 pm here, and on
+    // the last of the month that flipped the whole range into next month.
+    const today = todayIn(null)
+    const start = (startDate as string) || monthStartOf(today)
+    const end   = (endDate   as string) || today
 
     const { rows: landlords } = await db.query(
       `SELECT l.id, l.business_name, u.first_name, u.last_name, u.email
@@ -1601,7 +1611,8 @@ booksRouter.get('/reports/owner-statements', requireBooksRead, blockBusinessOwne
 booksRouter.get('/tax/summary', requireBooksRead, blockBusinessOwner, async (req, res, next) => {
   try {
     const lid  = landlordScope(req.user)
-    const year = req.query.year || new Date().getFullYear()
+    // S654: "this year" by the Phoenix calendar, not the server clock's zone.
+    const year = req.query.year || Number(todayIn(null).slice(0, 4))
     const start = `${year}-01-01`
     const end   = `${year}-12-31`
 

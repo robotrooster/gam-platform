@@ -8,13 +8,15 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
 import { compressPropertySchedule, rankUnitsBestFit, slackScore, relocateBlockingBookings } from './scheduleCompression'
+import { todayIn, addDaysTo } from '../lib/timezone'
 
 beforeEach(async () => { await cleanupAllSchema() })
 
+// S654: N days from the property's today (seeded properties default to
+// America/Phoenix, the test DB's zone too). Local setDate + UTC toISOString
+// jumped a day ahead after 5 pm in Phoenix.
 function plusDays(n: number): string {
-  const d = new Date()
-  d.setDate(d.getDate() + n)
-  return d.toISOString().slice(0, 10)
+  return addDaysTo(todayIn(null), n)
 }
 
 async function seedPark() {

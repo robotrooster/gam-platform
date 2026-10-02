@@ -18,6 +18,7 @@ import { generateMoveInInvoice } from './moveInBundle'
 import { bookingRentForDueDate, syncLeaseWithBookingDates } from '../services/bookingLeaseBilling'
 import { generateBillsForMeter } from '../services/utilityBilling'
 import { seedUtilityMeter } from '../test/dbHelpers'
+import { todayIn } from '../lib/timezone'
 
 beforeEach(async () => { await cleanupAllSchema() })
 
@@ -236,7 +237,10 @@ describe('S548 end-of-stay: final read after lease expiry', () => {
       `SELECT i.due_date::text AS due, i.subtotal_utilities::numeric AS u, i.total_amount::numeric AS t, p.status
          FROM payments p JOIN invoices i ON i.id = p.invoice_id
         WHERE p.id = $1`, [bill.rows[0].payment_id])
-    const today = new Date().toISOString().slice(0, 10)
+    // S654: the property's today — what generateFinalUtilityInvoice stamps —
+    // not UTC's, which is already tomorrow after 5 pm in Phoenix.
+    const tz = await db.query<{ timezone: string }>(`SELECT timezone FROM properties WHERE id=$1`, [s.propertyId])
+    const today = todayIn(tz.rows[0].timezone)
     expect(inv.rows[0].due.slice(0, 10)).toBe(today)
     expect(Number(inv.rows[0].u)).toBe(65)
     expect(Number(inv.rows[0].t)).toBe(65)

@@ -30,6 +30,7 @@ import { archiveProviderPayload } from '../services/backgroundReportArchive'
 // S640: shared with the status poller — see services/applicationPool.ts.
 import { isPoolEligible, upsertPoolEntry } from '../services/applicationPool'
 import { applyProviderUpdate } from '../services/backgroundApplyUpdate'
+import { todayIn } from '../lib/timezone'
 
 // S83: real Stripe PaymentIntents for applicant intake fee + landlord pool
 // unlock fee. When STRIPE_SECRET_KEY is unset (dev mode without Stripe
@@ -112,7 +113,9 @@ const SCREENING_GAM_MARGIN_USD = parseFloat(process.env.SCREENING_GAM_MARGIN_USD
 async function screeningIntakeTax(applicantState: string | null | undefined, parts: { screening: number; gamFee: number }): Promise<number> {
   if (!applicantState || applicantState.length !== 2) return 0
   const st = applicantState.toUpperCase()
-  const year = new Date().getFullYear()
+  // S654: GAM collects this tax, so the year is GAM's home calendar (Phoenix),
+  // not whatever zone the API host runs in.
+  const year = Number(todayIn(null).slice(0, 4))
   // Latest catalog row for the state at-or-before the current year (survives the
   // annual-refresh gap before next year's rows land), gated on an active
   // registration. Non-registered / non-taxable / no-row → no collection.
@@ -1664,7 +1667,7 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
     // for the preset-rent fallback below.
     const unit = unitId
       ? await queryOne<any>(
-          `SELECT u.*, p.name as property_name
+          `SELECT u.*, p.name as property_name, p.timezone AS property_timezone
            FROM units u JOIN properties p ON p.id=u.property_id
            WHERE u.id=$1 AND u.landlord_id=$2`,
           [unitId, landlordId]
@@ -1672,7 +1675,8 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
       : null
     if (unitId && !unit) throw new AppError(404, 'Unit not found')
     if (unit) {
-      const conflict = await findStayConflict(unit.id, { checkIn: new Date().toISOString().slice(0, 10) })
+      // S654: "from today onward" is the PROPERTY's today, not the UTC date.
+      const conflict = await findStayConflict(unit.id, { checkIn: todayIn(unit.property_timezone) })
       if (conflict) throw new AppError(409, 'That unit isn\u2019t available — it has an active lease or an upcoming reservation')
     }
     // W-48: monthly rent comes from the landlord's preset unit info — nobody

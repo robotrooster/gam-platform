@@ -362,9 +362,11 @@ describe('PATCH /logs/:logId', () => {
     const f = await seed()
     const agId = await seedAgreement(f)
     const log = await db.query<{ id: string }>(
+      // S654: today from the database (Phoenix), not UTC's — UTC is already
+      // tomorrow after 5 pm, which would log the work on a future day.
       `INSERT INTO work_trade_logs (agreement_id, tenant_id, submitted_by, work_date, hours, description)
-       VALUES ($1, $2, $3, $4, 4, 'mowed') RETURNING id`,
-      [agId, f.tenantAId, f.tenantAUserId, new Date().toISOString().slice(0, 10)])
+       VALUES ($1, $2, $3, CURRENT_DATE, 4, 'mowed') RETURNING id`,
+      [agId, f.tenantAId, f.tenantAUserId])
     const res = await request(buildApp())
       .patch(`/api/work-trade/logs/${log.rows[0].id}`)
       .set('Authorization', `Bearer ${f.tokenA}`)

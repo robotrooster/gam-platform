@@ -32,6 +32,7 @@
 import { getClient } from '../db'
 import type { PoolClient } from 'pg'
 import { logger } from '../lib/logger'
+import { dateIn, monthStartOf } from '../lib/timezone'
 
 interface AccrualResult {
   monthScanned: string
@@ -47,10 +48,14 @@ interface AccrualResult {
 }
 
 export async function processMonthlyFeeAccrual(now: Date = new Date()): Promise<AccrualResult> {
-  // Accrual month = first day of the current calendar month (UTC). The cron
-  // fires on the 1st so this is just today, pinned to day=01.
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
-  const monthIso = monthStart.toISOString().slice(0, 10)
+  // Accrual month = first day of the current calendar month. The cron fires on
+  // the 1st so this is just today, pinned to day=01.
+  // S654: read on GAM's Phoenix calendar (the cron's own zone and the
+  // database's), not UTC — a run by hand after 5 pm Phoenix on the last day of
+  // a month was already next month in UTC and accrued the wrong cycle. One
+  // month for the whole run: a per-property zone would put a Hawaii or Alaska
+  // property still in LAST month at 1 am Phoenix on the 1st.
+  const monthIso = monthStartOf(dateIn(null, now))
 
   const result: AccrualResult = {
     monthScanned: monthIso,

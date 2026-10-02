@@ -18,6 +18,7 @@
 import { db } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
+import { todayIn, addDaysTo } from '../lib/timezone'
 import {
   type RecurringInvoiceFrequency,
   RECURRING_INVOICE_MONTH_STEP,
@@ -125,10 +126,13 @@ export async function generateOneFromSchedule(
     const invoiceNumber = `INV-${String(thisNumber).padStart(4, '0')}`
 
     // Issue today; due = issue + payment_terms_days.
-    const issueDate = new Date()
-    const dueDate = new Date(issueDate.getTime() + sched.payment_terms_days * 24 * 60 * 60 * 1000)
-    const issueIso = issueDate.toISOString().slice(0, 10)
-    const dueIso = dueDate.toISOString().slice(0, 10)
+    // S654: "today" is GAM's home-zone calendar day, not UTC — after 5 pm in
+    // Phoenix UTC has already turned over and the invoice was dated tomorrow.
+    // A business has no property to take a zone from, and the daily sweep
+    // picks schedules with next_due_date <= CURRENT_DATE (Phoenix), so the
+    // issue date agrees with the day the sweep ran.
+    const issueIso = todayIn(null)
+    const dueIso = addDaysTo(issueIso, sched.payment_terms_days)
 
     const { rows: [inv] } = await client.query<any>(
       `INSERT INTO business_invoices

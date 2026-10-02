@@ -11,6 +11,7 @@ import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { logger } from '../lib/logger'
+import { todayIn, monthStartOf } from '../lib/timezone'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 
@@ -713,7 +714,17 @@ leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) =>
 
     if (lease.status === 'active' || lease.status === 'pending_signature') {
       const num = (v: any) => v == null ? null : Number(v)
-      const dateStr = (v: any) => v == null ? null : String(v).slice(0, 10)
+      // S654: pg hands a DATE back as a Date at local midnight, and String() of
+      // that reads "Thu Oct 01" — never equal to the 'YYYY-MM-DD' the client
+      // sends, so an unchanged start date was flagged as a term change. Read
+      // the Date back with the same local parts pg built it from.
+      const dateStr = (v: any) => {
+        if (v == null) return null
+        if (v instanceof Date) {
+          return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`
+        }
+        return String(v).slice(0, 10)
+      }
 
       const materialChanges: ChangeRow[] = []
       const nonMaterialChanges: ChangeRow[] = []
@@ -1470,13 +1481,17 @@ leasesRouter.post('/:id/bill-fee', requirePerm('leases.bill_fee'), async (req, r
       landlord_id: string
       unit_id: string
       tenant_id: string | null
+      timezone: string
     }>(
       `SELECT l.id, l.landlord_id, l.unit_id,
               (SELECT vlat.tenant_id
                  FROM v_lease_active_tenants vlat
                 WHERE vlat.lease_id = l.id AND vlat.role = 'primary'
-                LIMIT 1) AS tenant_id
+                LIMIT 1) AS tenant_id,
+              p.timezone
          FROM leases l
+         JOIN units u ON u.id = l.unit_id
+         JOIN properties p ON p.id = u.property_id
         WHERE l.id = $1`,
       [req.params.id],
     )
@@ -1508,6 +1523,7 @@ leasesRouter.post('/:id/bill-fee', requirePerm('leases.bill_fee'), async (req, r
       amount:      Number(fee.amount),
       description: body.description ?? fee.description ?? undefined,
       dueDate:     body.dueDate,
+      timezone:    lease.timezone,
       source:      'admin',
     })
     res.status(201).json({
@@ -1553,12 +1569,16 @@ leasesRouter.post('/:id/charge', requirePerm('leases.bill_fee'), async (req, res
   try {
     const body = oneOffChargeSchema.parse(req.body)
     const lease = await queryOne<{
-      id: string; landlord_id: string; unit_id: string; tenant_id: string | null
+      id: string; landlord_id: string; unit_id: string; tenant_id: string | null; timezone: string
     }>(
       `SELECT l.id, l.landlord_id, l.unit_id,
               (SELECT vlat.tenant_id FROM v_lease_active_tenants vlat
-                WHERE vlat.lease_id = l.id AND vlat.role = 'primary' LIMIT 1) AS tenant_id
-         FROM leases l WHERE l.id = $1`, [req.params.id])
+                WHERE vlat.lease_id = l.id AND vlat.role = 'primary' LIMIT 1) AS tenant_id,
+              p.timezone
+         FROM leases l
+         JOIN units u ON u.id = l.unit_id
+         JOIN properties p ON p.id = u.property_id
+        WHERE l.id = $1`, [req.params.id])
     if (!lease) throw new AppError(404, 'Lease not found')
     if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
     if (!lease.tenant_id) throw new AppError(400, 'This lease has no active tenant to charge')
@@ -1573,6 +1593,7 @@ leasesRouter.post('/:id/charge', requirePerm('leases.bill_fee'), async (req, res
       amount:      Math.round(body.amount * 100) / 100,
       description: body.description,
       dueDate:     body.dueDate,
+      timezone:    lease.timezone,
       source:      'admin',
     })
     res.status(201).json({
@@ -1880,8 +1901,10 @@ leasesRouter.post('/:id/carried-balance', requirePerm('leases.bill_fee'), async 
     }).parse(req.body)
 
     const lease = await queryOne<any>(
-      `SELECT l.id, l.landlord_id, l.unit_id, lt.tenant_id
+      `SELECT l.id, l.landlord_id, l.unit_id, lt.tenant_id, p.timezone
          FROM leases l
+         JOIN units u ON u.id = l.unit_id
+         JOIN properties p ON p.id = u.property_id
          LEFT JOIN LATERAL (
            SELECT tenant_id FROM lease_tenants WHERE lease_id = l.id ORDER BY created_at LIMIT 1
          ) lt ON TRUE
@@ -1898,11 +1921,14 @@ leasesRouter.post('/:id/carried-balance', requirePerm('leases.bill_fee'), async 
       throw new AppError(409, 'This lease already has a carried balance. Edit or void the existing one instead.')
     }
 
-    const due = body.dueDate ?? new Date().toISOString().slice(0, 10)
+    // S654: "today" is the park's day — a UTC date runs a day ahead every
+    // evening in Phoenix, and the invoice would be dated tomorrow.
+    const today = todayIn(lease.timezone)
+    const due = body.dueDate ?? today
     const client = await getClient()
     try {
       await client.query('BEGIN')
-      const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, new Date().getFullYear())
+      const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, Number(today.slice(0, 4)))
       const inv = await client.query<{ id: string }>(
         `INSERT INTO invoices (
            landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date,
@@ -2022,15 +2048,21 @@ async function leaseInScope(req: any, leaseId: string) {
 leasesRouter.patch('/:id/prepaid-draw', requirePerm('leases.edit', 'take_payment', 'front_desk.mark_leaving'), async (req: any, res, next) => {
   try {
     const body = z.object({ monthlyDraw: z.number().positive().max(100000).nullable() }).parse(req.body)
-    const lease = await queryOne<{ id: string; landlord_id: string; status: string }>(
-      'SELECT id, landlord_id, status FROM leases WHERE id = $1', [req.params.id])
+    const lease = await queryOne<{ id: string; landlord_id: string; status: string; timezone: string }>(
+      `SELECT l.id, l.landlord_id, l.status, p.timezone
+         FROM leases l
+         JOIN units u ON u.id = l.unit_id
+         JOIN properties p ON p.id = u.property_id
+        WHERE l.id = $1`, [req.params.id])
     if (!lease) throw new AppError(404, 'Lease not found')
     if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
     await query(`UPDATE leases SET prepaid_monthly_draw = $2, updated_at = NOW() WHERE id = $1`,
       [lease.id, body.monthlyDraw == null ? null : body.monthlyDraw.toFixed(2)])
     const { prepaidDrawAvailable } = await import('../services/prepaidRelease')
     const { db } = await import('../db')
-    const month = new Date().toISOString().slice(0, 7) + '-01'
+    // S654: the billing month is the park's month — on the last evening of a
+    // month UTC has already turned the page.
+    const month = monthStartOf(todayIn(lease.timezone))
     const draw = await prepaidDrawAvailable(db as any, lease.id, month).catch(() => null)
     logger.info({ leaseId: lease.id, monthlyDraw: body.monthlyDraw, by: req.user!.userId }, '[lease] prepaid monthly draw set')
     res.json({ success: true, data: { leaseId: lease.id, monthlyDraw: body.monthlyDraw, credit: draw } })

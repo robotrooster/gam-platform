@@ -12,26 +12,32 @@
 
 import { query } from '../../../db'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
+import { todayIn, addDaysTo, monthStartOf } from '../../../lib/timezone'
 
 type Period = 'this_month' | 'last_month' | 'this_year' | 'last_year'
 const PERIODS: Period[] = ['this_month', 'last_month', 'this_year', 'last_year']
 
+// S654: every window is read off today's Phoenix date (the database's
+// CURRENT_DATE zone) with plain calendar math. "To date" used to end on the UTC
+// date, which is tomorrow after 5 pm here — and next month or next year on the
+// last evening of one.
 function periodRange(period: Period): { start: string; end: string; label: string } {
-  const now = new Date()
-  const y = now.getFullYear()
-  const m = now.getMonth()
-  const iso = (d: Date) => d.toISOString().split('T')[0]
+  const today = todayIn(null)
+  const y = Number(today.slice(0, 4))
+  const thisMonth = monthStartOf(today)
   switch (period) {
     case 'this_month':
-      return { start: iso(new Date(y, m, 1)), end: iso(now), label: 'this month' }
-    case 'last_month':
-      // day 0 of this month = last day of previous month.
-      return { start: iso(new Date(y, m - 1, 1)), end: iso(new Date(y, m, 0)), label: 'last month' }
+      return { start: thisMonth, end: today, label: 'this month' }
+    case 'last_month': {
+      // The day before the 1st is the last day of the previous month.
+      const lastMonthEnd = addDaysTo(thisMonth, -1)
+      return { start: monthStartOf(lastMonthEnd), end: lastMonthEnd, label: 'last month' }
+    }
     case 'last_year':
       return { start: `${y - 1}-01-01`, end: `${y - 1}-12-31`, label: `last year (${y - 1})` }
     case 'this_year':
     default:
-      return { start: `${y}-01-01`, end: iso(now), label: `this year (${y} to date)` }
+      return { start: `${y}-01-01`, end: today, label: `this year (${y} to date)` }
   }
 }
 

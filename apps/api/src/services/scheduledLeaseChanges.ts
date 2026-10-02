@@ -175,12 +175,18 @@ export interface ApplyResult {
  * new figure from the next cycle — nothing else to touch.
  */
 export async function applyDueScheduledChanges(nowUtc: Date = new Date()): Promise<ApplyResult> {
-  const today = nowUtc.toISOString().slice(0, 10)
+  // S654: the effective date arrives on the PARK's calendar. Compared with the
+  // UTC date, a rent change dated the 1st landed on the evening of the 31st in
+  // Phoenix. Each change is measured against its own property's today.
   const due = await query<{ id: string }>(
-    `SELECT id FROM scheduled_lease_changes
-      WHERE status = 'scheduled' AND effective_date <= $1
-      ORDER BY effective_date ASC, created_at ASC`,
-    [today],
+    `SELECT s.id FROM scheduled_lease_changes s
+       LEFT JOIN leases l     ON l.id = s.lease_id
+       LEFT JOIN units u      ON u.id = l.unit_id
+       LEFT JOIN properties p ON p.id = u.property_id
+      WHERE s.status = 'scheduled'
+        AND s.effective_date <= ($1::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date
+      ORDER BY s.effective_date ASC, s.created_at ASC`,
+    [nowUtc],
   )
   let applied = 0
   let cancelled = 0

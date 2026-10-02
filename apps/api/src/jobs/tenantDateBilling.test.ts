@@ -168,8 +168,10 @@ describe('an onboarding resident with their own due day', () => {
     // 20th → their first bill is that month's 15th (already past when they
     // signed, so signing makes it). Two months back so every date is in the
     // past whatever day this runs.
-    const start = new Date(); start.setUTCDate(20); start.setUTCMonth(start.getUTCMonth() - 2)
-    const startIso = start.toISOString().slice(0, 10)
+    // S654: the 20th two months back, from the database's today (the park's
+    // zone) — not UTC's, which turns the month a day early every evening.
+    const { rows: [{ startIso }] } = await db.query<{ startIso: string }>(
+      `SELECT to_char(date_trunc('month', CURRENT_DATE) - interval '2 months' + interval '19 days', 'YYYY-MM-DD') AS "startIso"`)
     const firstIso = startIso.slice(0, 8) + '15'
     const f = await seedSite({ startDate: startIso, rentDueDay: 15, existing: true, firstCycle: startIso.slice(0, 8) + '01', propertyAdded: startIso.slice(0, 8) + '10' })
     const r = await genMoveIn({

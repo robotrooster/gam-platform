@@ -1191,7 +1191,12 @@ describe('POST /inspections/:id/flag-suspicious', () => {
     expect(res.status).toBe(200)
     const followupId = res.body.data.followupInspectionId
     expect(followupId).toBeTruthy()
-    expect(res.body.data.scheduledFor).toBe(addBusinessDays(new Date().toISOString().slice(0, 10), 3))
+    // S654: three business days from the PROPERTY's today, read from the
+    // database so the assertion agrees with the route at any hour.
+    const { rows: [{ today }] } = await db.query<{ today: string }>(
+      `SELECT (now() AT TIME ZONE p.timezone)::date::text AS today
+         FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [f.unitId])
+    expect(res.body.data.scheduledFor).toBe(addBusinessDays(today, 3))
 
     // Flagged record: closed with flag metadata + link to the follow-up.
     const flagged = (await db.query<any>(

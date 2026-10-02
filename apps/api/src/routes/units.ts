@@ -10,6 +10,7 @@ import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLAT
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
+import { todayIn, addDaysTo } from '../lib/timezone'
 import { promoteNextWaitlister } from '../services/propertyBooking'
 import { linkUnitToSubtype } from '../services/unitSubtype'
 import { recordBookingEvent, recordBookingChange } from '../services/bookingEvents'
@@ -192,10 +193,24 @@ unitsRouter.get('/available', async (req, res, next) => {
     const callerLandlordIds = landlordScopeIds(req.user!)
     if (!callerLandlordIds.length) throw new AppError(403, 'Forbidden')
     const scopedIds = await getScopedPropertyIds(req.user)
+    // S654: "today" is the park's day, not UTC's — after 5 pm in Phoenix UTC is
+    // already tomorrow, and tonight's open sites would drop out of the picker.
+    // One park (or an account whose parks share a zone) uses that zone; a
+    // portfolio spread across zones falls back to GAM's home zone.
+    let checkIn = q.checkIn
+    if (!checkIn) {
+      const zones = await query<{ timezone: string }>(
+        `SELECT DISTINCT timezone FROM properties
+          WHERE landlord_id = ANY($1::uuid[])
+            AND ($2::uuid IS NULL OR id = $2)
+            AND ($3::uuid[] IS NULL OR id = ANY($3::uuid[]))`,
+        [callerLandlordIds, q.propertyId ?? null, scopedIds])
+      checkIn = todayIn(zones.length === 1 ? zones[0].timezone : null)
+    }
     const rows = await findAvailableUnits({
       landlordIds: callerLandlordIds,
       window: {
-        checkIn: q.checkIn || new Date().toISOString().slice(0, 10),
+        checkIn,
         checkOut: q.checkOut ?? null,
         excludeBookingId: q.excludeBookingId ?? null,
       },
@@ -1553,15 +1568,20 @@ unitsRouter.patch('/:id/utility-responsibility', requirePerm('properties.edit'),
 // GET /api/units/:id/availability — get booked dates
 unitsRouter.get('/:id/availability', async (req, res, next) => {
   try {
-    const unit = await queryOne<any>('SELECT landlord_id FROM units WHERE id = $1', [req.params.id])
+    const unit = await queryOne<any>(
+      `SELECT u.landlord_id, p.timezone
+         FROM units u JOIN properties p ON p.id = u.property_id
+        WHERE u.id = $1`, [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
     if (!canAccessLandlordResource(req.user, unit.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
 
+    // S654: the default window starts on the park's today, not UTC's.
     const { from, to } = req.query
-    const fromDate = from || new Date().toISOString().split('T')[0]
-    const toDate = to || new Date(Date.now() + 90*24*60*60*1000).toISOString().split('T')[0]
+    const today = todayIn(unit.timezone)
+    const fromDate = from || today
+    const toDate = to || addDaysTo(today, 90)
 
     const bookings = await query<any>(`
       SELECT id, check_in, check_out, status, lease_type, guest_name
@@ -2248,8 +2268,6 @@ unitsRouter.get('/schedule/master', requirePerm(
 ), async (req, res, next) => {
   try {
     const { from, to, unitType } = req.query
-    const fromDate = from || new Date().toISOString().split('T')[0]
-    const toDate = to || new Date(Date.now() + 30*24*60*60*1000).toISOString().split('T')[0]
     // S639 (Nic): "Master schedule needs to be scoped to a property, not having
     // all the different properties on one schedule." Unit numbers repeat across
     // parks, so a merged timeline shows several rows labeled the same spot —
@@ -2274,6 +2292,7 @@ unitsRouter.get('/schedule/master', requirePerm(
         p.id as property_id, p.name as property_name,
         p.nightly_rate as property_nightly_rate, p.weekly_rate as property_weekly_rate,
         p.monthly_rate as property_monthly_rate, p.short_term_tax_rate as property_tax_rate,
+        p.timezone as property_timezone,
         vuo.primary_first_name as tenant_first,
         vuo.primary_last_name as tenant_last
       FROM units u
@@ -2293,6 +2312,15 @@ unitsRouter.get('/schedule/master', requirePerm(
                u.unit_number`,
       unitType ? [callerLandlordIds, scopedIds, oneProperty, unitType]
                : [callerLandlordIds, scopedIds, oneProperty])
+
+    // S654: the default window opens on the park's today, not UTC's (after 5 pm
+    // in Phoenix UTC is already tomorrow, and tonight would fall off the left
+    // edge). The schedule is one park, so its zone is the units' zone; an
+    // unscoped view across zones falls back to GAM's home zone.
+    const zones = new Set(units.map((u: any) => u.property_timezone))
+    const today = todayIn(zones.size === 1 ? [...zones][0] : null)
+    const fromDate = from || today
+    const toDate = to || addDaysTo(today, 30)
 
     // Get all bookings in range. S200: include the property's
     // requires_booking_acknowledgment flag so the schedule tile can

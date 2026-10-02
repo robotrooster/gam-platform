@@ -5,6 +5,7 @@ import { ensureBillsForUnit } from './utilityBilling'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
 import { stripeSecretKeyOrNull } from '../lib/stripe'
+import { todayIn } from '../lib/timezone'
 
 // ============================================================
 // Deposit-return service.
@@ -172,10 +173,13 @@ export async function calculateDepositReturn(
     tenant_id: string
     landlord_id: string
     unit_id: string
+    timezone: string | null
   }>(
-    `SELECT lt.tenant_id, l.landlord_id, l.unit_id
+    `SELECT lt.tenant_id, l.landlord_id, l.unit_id, p.timezone
        FROM leases l
        LEFT JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.role = 'primary'
+       LEFT JOIN units u ON u.id = l.unit_id
+       LEFT JOIN properties p ON p.id = u.property_id
       WHERE l.id = $1`,
     [leaseId],
   )
@@ -185,7 +189,9 @@ export async function calculateDepositReturn(
   // BEFORE sweeping, so the final meter read entered at move-out becomes a
   // utility_bills row this calculation can see. Best-effort — a generation
   // hiccup must not block the deposit preview.
-  try { await ensureBillsForUnit(lease.unit_id, new Date().toISOString().slice(0, 10)) } catch { /* preview stays usable */ }
+  // S654: the cycle is the property's month — a UTC "today" after 5 pm Phoenix
+  // on the last of the month billed next month's flat-rate charges early.
+  try { await ensureBillsForUnit(lease.unit_id, todayIn(lease.timezone)) } catch { /* preview stays usable */ }
 
   const sd = await queryOne<{
     id: string; total_amount: string; collected_amount: string; interest_accrued: string;
@@ -563,9 +569,15 @@ export async function finalizeDepositReturn(
     // S548 (Nic — end-of-stay): materialize + lock any final utility bills
     // that never rode an invoice (the last meter read lands at/after
     // move-out). They settle from the deposit right here.
-    const leaseUnitId = (await client.query<{ unit_id: string }>(
-      `SELECT unit_id FROM leases WHERE id = $1`, [row.lease_id])).rows[0].unit_id
-    try { await ensureBillsForUnit(leaseUnitId, new Date().toISOString().slice(0, 10)) }
+    // S654: through the PROPERTY's today, not UTC's (same reason as the preview).
+    const leaseUnit = (await client.query<{ unit_id: string; timezone: string | null }>(
+      `SELECT l.unit_id, p.timezone
+         FROM leases l
+         LEFT JOIN units u ON u.id = l.unit_id
+         LEFT JOIN properties p ON p.id = u.property_id
+        WHERE l.id = $1`, [row.lease_id])).rows[0]
+    const leaseUnitId = leaseUnit.unit_id
+    try { await ensureBillsForUnit(leaseUnitId, todayIn(leaseUnit.timezone)) }
     catch { /* a generation hiccup must not block finalize */ }
     const finalBillRows = await client.query<{
       id: string; utility_type: string; amount: string

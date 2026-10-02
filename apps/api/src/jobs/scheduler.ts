@@ -18,6 +18,7 @@ import { getPropertyResponsibleParty } from '../services/responsibleParty'
 import { logger } from '../lib/logger'
 import { reconcileStuckPayments } from './paymentReconcile'
 import { getStripe } from '../lib/stripe'
+import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 
 // ============================================================
 // GAM PAYMENT SCHEDULER
@@ -924,6 +925,7 @@ export async function revealTodaysSites() {
   try {
     const due = await query<any>(`
       SELECT b.id, b.guest_name, b.guest_email, b.landlord_id,
+             to_char(b.check_in, 'YYYY-MM-DD') AS check_in_date,
              u.unit_number, u.check_in_time, p.name AS property_name
         FROM unit_bookings b
         JOIN units u ON u.id = b.unit_id
@@ -942,7 +944,9 @@ export async function revealTodaysSites() {
           guestName: b.guest_name,
           propertyName: b.property_name,
           unitNumber: b.unit_number,
-          checkIn: new Date().toISOString().slice(0, 10),
+          // S654: the booking's own check-in day (the property's today, per
+          // the WHERE above) — the UTC date ran a day ahead after 5 pm Phoenix.
+          checkIn: b.check_in_date,
           checkInTime: b.check_in_time,
           ctx: { landlordId: b.landlord_id, bookingId: b.id },
         })
@@ -1515,8 +1519,8 @@ export function schedulerInit() {
   cron.schedule('20 4 * * *', async () => {
     try {
       const { billDueHomeSaleInstallments, reconcileAllHomeSaleContracts } = await import('../services/homeSale')
-      const firstOfMonth = new Date()
-      const asOf = `${firstOfMonth.getFullYear()}-${String(firstOfMonth.getMonth() + 1).padStart(2, '0')}-01`
+      // S654: the month on GAM's home calendar (Phoenix), not the host's clock.
+      const asOf = monthStartOf(todayIn(null))
       const billed = await billDueHomeSaleInstallments(asOf)
       await reconcileAllHomeSaleContracts()
       if (billed) logger.info({ billed, asOf }, '[home-sale-billing]')
@@ -1534,8 +1538,8 @@ export function schedulerInit() {
       const { isFeatureEnabled } = await import('../services/systemFeatures')
       if (!(await isFeatureEnabled('subleasing_enabled'))) return
       const { accrueLotRentCharges } = await import('../services/lotRent')
-      const now = new Date()
-      const asOf = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`
+      // S654: the month on GAM's home calendar (Phoenix), not the host's clock.
+      const asOf = monthStartOf(todayIn(null))
       const accrued = await accrueLotRentCharges(asOf)
       if (accrued) logger.info({ accrued, asOf }, '[lot-rent-accrual]')
     } catch (e) { logger.error({ err: e }, '[lot-rent-accrual] fatal') }
@@ -1771,10 +1775,10 @@ export function schedulerInit() {
   cron.schedule('0 6 * * *', async () => {
     try {
       const { trueUpProcessingMargin } = await import('../services/platformRevenue')
-      const now = new Date()
-      for (const back of [0, 1]) {
-        const m = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - back, 1))
-        const r = await trueUpProcessingMargin(m.toISOString().slice(0, 10))
+      // S654: this month and last on GAM's home calendar (Phoenix), not UTC's.
+      const thisMonth = monthStartOf(todayIn(null))
+      for (const month of [thisMonth, monthStartOf(addDaysTo(thisMonth, -1))]) {
+        const r = await trueUpProcessingMargin(month)
         if (r.adjustment !== 0) logger.info(r, '[processing-margin-true-up]')
       }
     } catch (e) {
@@ -2323,7 +2327,9 @@ export function schedulerInit() {
   cron.schedule('0 15 * * *', async () => {
     try {
       const { isLastBusinessDayOfMonth, processMonthlyAdvance } = await import('../services/otp')
-      if (!isLastBusinessDayOfMonth(new Date())) return
+      // S654: the helper reads UTC calendar fields, so hand it Phoenix's today
+      // at UTC noon — the UTC day is then Phoenix's day at any hour.
+      if (!isLastBusinessDayOfMonth(new Date(`${todayIn(null)}T12:00:00Z`))) return
       const result = await processMonthlyAdvance()
       logger.info(result, '[otp-advance]')
     } catch (e) {

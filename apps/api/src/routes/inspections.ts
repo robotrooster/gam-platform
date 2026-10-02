@@ -16,6 +16,7 @@ import {
   createNotification,
 } from '../services/notifications'
 import { addBusinessDays } from '../services/moveOutInspections'
+import { todayIn } from '../lib/timezone'
 import { logger } from '../lib/logger'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { insertInspectionWithChecklist } from '../services/inspections'
@@ -986,8 +987,11 @@ inspectionsRouter.post('/:id/finalize', requirePerm('inspections.manage'), async
       const docType = insp.inspection_type === 'move_in' ? 'move_in_checklist'
         : insp.inspection_type === 'move_out' ? 'move_out_checklist' : 'other'
       const TYPE_LABEL: Record<string, string> = { move_in: 'Move-in', move_out: 'Move-out', periodic: 'Periodic', turnover: 'Turnover' }
-      const un = await queryOne<{ unit_number: string | null }>(`SELECT unit_number FROM units WHERE id=$1`, [insp.unit_id])
-      const name = `${TYPE_LABEL[insp.inspection_type] ?? 'Inspection'} inspection — Unit ${un?.unit_number ?? ''} — ${finalizedAt.toLocaleDateString('en-US')}`.trim()
+      // S654: the date in the document name is the property's calendar day, not
+      // whatever zone the API host happens to run in.
+      const un = await queryOne<{ unit_number: string | null; timezone: string | null }>(
+        `SELECT u.unit_number, p.timezone FROM units u LEFT JOIN properties p ON p.id = u.property_id WHERE u.id=$1`, [insp.unit_id])
+      const name = `${TYPE_LABEL[insp.inspection_type] ?? 'Inspection'} inspection — Unit ${un?.unit_number ?? ''} — ${finalizedAt.toLocaleDateString('en-US', { timeZone: un?.timezone || 'America/Phoenix' })}`.trim()
       await query(`UPDATE unit_inspections SET report_url=$1, report_generated_at=NOW() WHERE id=$2`, [report.fileUrl, req.params.id])
       await query(
         `INSERT INTO documents (landlord_id, unit_id, tenant_id, lease_id, type, name, url, file_size, mime_type)
@@ -1090,17 +1094,19 @@ inspectionsRouter.post('/:id/flag-suspicious', requirePerm('inspections.manage')
 
     const unit = await queryOne<{
       bedrooms: number | null; bathrooms: number | null; unit_type: string | null; dwelling_ownership: string | null; is_multi_level: boolean | null; is_ada_accessible: boolean | null; living_areas: number | null; features: Record<string, unknown> | null
-      unit_number: string | null; property_id: string; property_name: string
+      unit_number: string | null; property_id: string; property_name: string; timezone: string | null
     }>(
       `SELECT u.bedrooms, u.bathrooms, u.unit_type, u.dwelling_ownership, u.is_multi_level, u.is_ada_accessible, u.living_areas, u.features, u.unit_number, u.property_id,
-              p.name AS property_name
+              p.name AS property_name, p.timezone
          FROM units u JOIN properties p ON p.id = u.property_id
         WHERE u.id = $1`,
       [insp.unit_id],
     )
     if (!unit) throw new AppError(404, 'Unit not found')
 
-    const scheduledFor = addBusinessDays(new Date().toISOString().slice(0, 10), 3)
+    // S654: three business days from the PROPERTY's today — the UTC date ran a
+    // day ahead after 5 pm Phoenix.
+    const scheduledFor = addBusinessDays(todayIn(unit.timezone), 3)
 
     await client.query('BEGIN')
     const { id: followupId } = await insertInspectionWithChecklist(client, {

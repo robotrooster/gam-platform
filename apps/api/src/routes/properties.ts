@@ -32,6 +32,7 @@ import { MAINTENANCE_CATEGORIES,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
+import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 import { checkAgainstStatute, checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { resolveLeaseSigner } from '../services/leaseSigner'
 import { initiateTransfer, approveTransfer, declineTransfer } from '../services/propertyTransfer'
@@ -272,7 +273,7 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
        body.city, body.state, body.zip, body.type || 'mixed', body.unitTypes || [],
        body.requiresBookingAcknowledgment ?? false, body.operatorOwnsLand ?? true,
        timezone,
-       (body.firstBillingCycle ?? nextMonthIso()).slice(0, 7) + '-01'])
+       (body.firstBillingCycle ?? nextMonthIso(timezone)).slice(0, 7) + '-01'])
     const prop = propRes.rows[0]
 
     // S579: open the property's onboarding window. While it's open the landlord
@@ -2657,8 +2658,11 @@ propertiesRouter.delete('/:id', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-/** The first of next month, ISO — a property's default first billing cycle. */
-function nextMonthIso(): string {
-  const d = new Date(); d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() + 1)
-  return d.toISOString().slice(0, 10)
+/**
+ * The first of next month, ISO — a property's default first billing cycle.
+ * S654: counted from the property's today. From UTC, a park added on the last
+ * evening of a month in Phoenix had its first cycle pushed a month out.
+ */
+function nextMonthIso(tz: string): string {
+  return monthStartOf(addDaysTo(monthStartOf(todayIn(tz)), 32))
 }

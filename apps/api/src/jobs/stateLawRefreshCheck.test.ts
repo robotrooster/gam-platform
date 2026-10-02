@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
 import { cleanupAllSchema } from '../test/dbHelpers'
 import { processStateLawRefreshCheck } from './stateLawRefreshCheck'
+import { addDaysTo } from '../lib/timezone'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -13,6 +14,7 @@ beforeEach(async () => {
   // posture). Clear them explicitly so each test runs in a clean KB.
   await db.query(`DELETE FROM state_law_provisions`)
   await db.query(`DELETE FROM state_landlord_tenant_acts`)
+  dbToday = (await db.query<{ d: string }>(`SELECT CURRENT_DATE::text AS d`)).rows[0].d
 })
 
 async function seedProvision(args: {
@@ -40,10 +42,11 @@ async function seedProvision(args: {
     [actId, args.state, args.topic, args.sourceDate, args.effectiveYear ?? 2026])
 }
 
+// S654: staleness is measured against CURRENT_DATE (Phoenix), so ages are
+// counted back from the database's today, not UTC's (already tomorrow after 5 pm).
+let dbToday = ''
 function daysAgo(n: number): string {
-  const d = new Date()
-  d.setDate(d.getDate() - n)
-  return d.toISOString().slice(0, 10)
+  return addDaysTo(dbToday, -n)
 }
 
 describe('processStateLawRefreshCheck', () => {

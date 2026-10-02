@@ -65,8 +65,10 @@ describe('the property\'s first billing cycle is the floor on every due month', 
   it('signing an existing resident before the first cycle makes no invoice; the cycle does', async () => {
     const s = await seedStack({ startDate: '2024-03-01', rentDueDay: 1 })
     await db.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [s.leaseId])
-    const next = new Date(); next.setUTCDate(1); next.setUTCMonth(next.getUTCMonth() + 1)
-    const cycle = next.toISOString().slice(0, 10)
+    // S654: next month from the database's today (the park's zone) — from UTC,
+    // the last evening of a month in Phoenix pointed at the month after next.
+    const { rows: [{ cycle }] } = await db.query<{ cycle: string }>(
+      `SELECT to_char(date_trunc('month', CURRENT_DATE) + interval '1 month', 'YYYY-MM-DD') AS cycle`)
     await db.query(`UPDATE properties SET first_billing_cycle = $2 WHERE id = $1`, [s.propertyId, cycle])
     const r = await genMoveIn({
       lease_id: s.leaseId, unit_id: s.unitId, tenant_id: s.tenantId,
@@ -161,13 +163,13 @@ describe('move-in month is never double-billed by daily generation', () => {
 describe('S622: a lease finalized AFTER its start date still bills', () => {
   it('creates the move-in invoice dated the lease start, with rent the tenant owes', async () => {
     // Lease began on the 1st of last month; the signature lands today.
-    // Built from LOCAL parts: toISOString() converts to UTC, which pushed the
-    // 1st to the 2nd whenever this ran after ~17:00 local and quietly turned a
-    // full month's rent into a prorated one. A date-only value must never make
-    // a round trip through a timestamp.
-    const d = new Date()
-    d.setMonth(d.getMonth() - 1, 1)
-    const startDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`
+    // A date-only value must never make a round trip through a timestamp:
+    // toISOString() pushed the 1st to the 2nd after ~17:00 in Phoenix and
+    // turned a full month's rent into a prorated one. S654: "last month" is the
+    // park's last month, so it comes from the database (Phoenix), not the
+    // test machine's clock.
+    const { rows: [{ startDate }] } = await db.query<{ startDate: string }>(
+      `SELECT to_char(date_trunc('month', CURRENT_DATE) - interval '1 month', 'YYYY-MM-DD') AS "startDate"`)
 
     const { leaseId, unitId, landlordId, tenantId } = await seedStack({ startDate, rentDueDay: 1, rent: 1000 })
     const res = await genMoveIn({

@@ -36,6 +36,7 @@ import Stripe from 'stripe'
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { createAdminNotification } from '../services/adminNotifications'
+import { dateIn } from '../lib/timezone'
 
 /** How long a payment may sit in 'processing' before we ask Stripe about it.
  *  ACH settles in 3-5 business days; a card is near-instant. 24h is well
@@ -91,7 +92,9 @@ export async function reconcileStuckPayments(stripe: Stripe): Promise<ReconcileR
         severity: 'warn',
         category: 'payment_reconcile',
         title: `Payment stuck with no Stripe reference — $${row.amount}`,
-        body: `Payment ${row.id} has been 'processing' since ${new Date(row.created_at).toISOString().slice(0, 10)} `
+        // S654: the day it started, on GAM's Phoenix calendar — UTC named the
+        // next day for anything created after 5 pm Phoenix.
+        body: `Payment ${row.id} has been 'processing' since ${dateIn(null, new Date(row.created_at))} `
             + `and carries no PaymentIntent id, so its real state cannot be checked. Investigate by hand.`,
         context: { paymentId: row.id, amount: row.amount, tenantEmail: row.tenant_email },
       }).catch(() => {})

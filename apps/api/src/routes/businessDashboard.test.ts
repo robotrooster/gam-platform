@@ -12,6 +12,7 @@ import { db } from '../db'
 import { cleanupAllSchema } from '../test/dbHelpers'
 import { businessDashboardRouter } from './businessDashboard'
 import { errorHandler } from '../middleware/errorHandler'
+import { addDaysTo, monthStartOf } from '../lib/timezone'
 
 function buildApp() {
   const app = express()
@@ -19,6 +20,14 @@ function buildApp() {
   app.use('/api/business-dashboard', businessDashboardRouter)
   app.use(errorHandler)
   return app
+}
+
+// S654: "today" comes from the database, because the dashboard compares against
+// CURRENT_DATE (Phoenix). toISOString() is the UTC date — tomorrow after 5 pm
+// in Phoenix — so these seeded invoices into the wrong day every evening.
+async function dbToday(): Promise<string> {
+  const { rows: [r] } = await db.query<{ d: string }>(`SELECT CURRENT_DATE::text AS d`)
+  return r.d
 }
 
 beforeEach(async () => {
@@ -171,12 +180,9 @@ describe('Revenue', () => {
   it('month_invoiced sums sent + paid for current month', async () => {
     const f = await seedFixture({ features: ['customers', 'staff', 'invoicing'] })
     // First-of-month for current month
-    const fom = new Date()
-    fom.setDate(1)
-    const today = new Date()
-    const todayIso = today.toISOString().slice(0, 10)
-    const fomIso = fom.toISOString().slice(0, 10)
-    const due = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    const todayIso = await dbToday()
+    const fomIso = monthStartOf(todayIso)
+    const due = addDaysTo(todayIso, 30)
     await db.query(
       `INSERT INTO business_invoices
          (business_id, customer_id, invoice_number, status, issue_date, due_date,
@@ -201,11 +207,8 @@ describe('Revenue', () => {
 describe('AR aging', () => {
   it('places invoices in correct buckets by days overdue', async () => {
     const f = await seedFixture({ features: ['customers', 'staff', 'invoicing'] })
-    const today = new Date()
-    const days = (n: number) => {
-      const d = new Date(today.getTime() + n * 24 * 60 * 60 * 1000)
-      return d.toISOString().slice(0, 10)
-    }
+    const today = await dbToday()
+    const days = (n: number) => addDaysTo(today, n)
     // current (not overdue), 15d, 45d, 75d, 120d overdue
     await db.query(
       `INSERT INTO business_invoices
@@ -242,8 +245,8 @@ describe('AR aging', () => {
 
   it('partially-paid invoice owed = total - amount_paid', async () => {
     const f = await seedFixture({ features: ['customers', 'staff', 'invoicing'] })
-    const today = new Date().toISOString().slice(0, 10)
-    const due = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    const today = await dbToday()
+    const due = addDaysTo(today, 30)
     await db.query(
       `INSERT INTO business_invoices
          (business_id, customer_id, invoice_number, status, issue_date, due_date,
@@ -258,8 +261,8 @@ describe('AR aging', () => {
 
   it('void / draft / paid invoices excluded', async () => {
     const f = await seedFixture({ features: ['customers', 'staff', 'invoicing'] })
-    const today = new Date().toISOString().slice(0, 10)
-    const due = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    const today = await dbToday()
+    const due = addDaysTo(today, 30)
     await db.query(
       `INSERT INTO business_invoices
          (business_id, customer_id, invoice_number, status, issue_date, due_date,
@@ -353,20 +356,18 @@ describe('Low stock', () => {
 describe('Today\'s appointments', () => {
   it('returns scheduled-for-today only; excludes other days + completed', async () => {
     const f = await seedFixture({ features: ['customers', 'staff', 'appointments'] })
-    const today9 = new Date(); today9.setHours(9, 0, 0, 0)
-    const today14 = new Date(); today14.setHours(14, 0, 0, 0)
-    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000)
-    tomorrow.setHours(9, 0, 0, 0)
+    // S654: times are built on the database's CURRENT_DATE, in its zone — the
+    // same calendar the route's `scheduled_for::date = CURRENT_DATE` reads —
+    // so the test holds whatever zone the Node process runs in.
     await db.query(
       `INSERT INTO appointments
          (business_id, customer_id, service_type, scheduled_for, status, duration_minutes, completed_at)
        VALUES
-         ($1, $2, 'Oil change',   $3, 'scheduled', 30, NULL),
-         ($1, $2, 'Tire rotation',$4, 'scheduled', 60, NULL),
-         ($1, $2, 'Diagnostic',   $5, 'scheduled', 45, NULL),
-         ($1, $2, 'Done one',     $3, 'completed', 30, NOW())`,
-      [f.businessId, f.customerId,
-       today9.toISOString(), today14.toISOString(), tomorrow.toISOString()])
+         ($1, $2, 'Oil change',   CURRENT_DATE + time '09:00',     'scheduled', 30, NULL),
+         ($1, $2, 'Tire rotation',CURRENT_DATE + time '14:00',     'scheduled', 60, NULL),
+         ($1, $2, 'Diagnostic',   CURRENT_DATE + 1 + time '09:00', 'scheduled', 45, NULL),
+         ($1, $2, 'Done one',     CURRENT_DATE + time '09:00',     'completed', 30, NOW())`,
+      [f.businessId, f.customerId])
     const res = await request(buildApp())
       .get('/api/business-dashboard/overview')
       .set('Authorization', `Bearer ${f.ownerToken}`)
@@ -408,8 +409,8 @@ describe('Cross-business isolation', () => {
     const a = await seedFixture({ features: ['customers', 'staff', 'invoicing'] })
     const b = await seedFixture({ features: ['customers', 'staff', 'invoicing'] })
 
-    const today = new Date().toISOString().slice(0, 10)
-    const due = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    const today = await dbToday()
+    const due = addDaysTo(today, 30)
     await db.query(
       `INSERT INTO business_invoices
          (business_id, customer_id, invoice_number, status, issue_date, due_date,

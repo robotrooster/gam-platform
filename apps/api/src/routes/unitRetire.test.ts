@@ -187,10 +187,12 @@ describe('a retired unit is structurally out of service', () => {
 
   it('never appears in the availability picker, but its replacement does', async () => {
     const replacementId = await retire()
+    // S654: today from the database (the park's zone), not UTC's date.
+    const [{ today }] = await query<{ today: string }>(`SELECT CURRENT_DATE::text AS today`)
     const avail = await findAvailableUnits({
       // S633: availability spans every company the ACCOUNT owns.
       landlordIds: [ctx.landlordId],
-      window: { checkIn: new Date().toISOString().slice(0, 10), checkOut: null, excludeBookingId: null } as any,
+      window: { checkIn: today, checkOut: null, excludeBookingId: null } as any,
     })
     const ids = avail.map((u: any) => u.id)
     expect(ids).not.toContain(ctx.unitId)

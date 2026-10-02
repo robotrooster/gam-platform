@@ -22,6 +22,7 @@
 import { query, queryOne } from '../db'
 import { logger } from '../lib/logger'
 import { US_FEDERAL_HOLIDAYS } from '../jobs/autoPayouts'
+import { todayIn } from '../lib/timezone'
 
 // Hard cap on how long a receivable may sit scheduled-to-net before GAM stops
 // waiting. If the anticipated influx never arrives within this window (e.g. the
@@ -100,7 +101,9 @@ export async function anticipatedLeaseInflux(
   windowDays: number = REVERSAL_NETTING_WINDOW_DAYS,
   asOf?: string,
 ): Promise<number> {
-  const anchor = asOf ? new Date(asOf + 'T00:00:00Z') : utcDateOnly(new Date())
+  // S654: "today" is GAM's day (Phoenix) — netting rides GAM's payout batch,
+  // a platform date, and UTC is already tomorrow after 5 pm in Phoenix.
+  const anchor = new Date((asOf ?? todayIn(null)) + 'T00:00:00Z')
   const leases = await query<{ rent_amount: string; rent_due_day: number }>(
     `SELECT rent_amount::text AS rent_amount, rent_due_day
        FROM leases

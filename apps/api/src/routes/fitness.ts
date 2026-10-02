@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { db } from '../db';
 import { requireAuth } from '../middleware/auth';
+import { todayIn, addDaysTo } from '../lib/timezone';
 
 const router = Router();
 const pool = db;
@@ -136,7 +137,8 @@ router.delete('/routines/:id', auth, async (req: Request, res: Response) => {
 router.post('/logs', auth, async (req: Request, res: Response) => {
   const { day_id, day_title, logged_date } = req.body;
   try {
-    const { rows } = await pool.query('INSERT INTO fitness_workout_logs (user_id, day_id, day_title, logged_date) VALUES ($1,$2,$3,$4) RETURNING *', [req.user!.userId, day_id, day_title, logged_date || new Date().toISOString().split('T')[0]]);
+    // S654: default to the Phoenix day (what /logs/today reads as CURRENT_DATE), not UTC's.
+    const { rows } = await pool.query('INSERT INTO fitness_workout_logs (user_id, day_id, day_title, logged_date) VALUES ($1,$2,$3,$4) RETURNING *', [req.user!.userId, day_id, day_title, logged_date || todayIn(null)]);
     res.json({ success: true, data: rows[0] });
   } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
@@ -203,9 +205,12 @@ router.get('/stats', auth, async (req: Request, res: Response) => {
     ]);
     let streak = 0;
     const dates = streakData.rows.map((r: any) => r.logged_date.toISOString().split('T')[0]);
-    let checkDate = new Date().toISOString().split('T')[0];
+    // S654: the streak counts back from GAM's home-zone today (Phoenix, the
+    // same day /logs/today reads as CURRENT_DATE), not UTC's, which is already
+    // tomorrow after 5 pm and broke the streak every evening.
+    let checkDate = todayIn(null);
     for (const date of dates) {
-      if (date === checkDate) { streak++; const d = new Date(checkDate); d.setDate(d.getDate() - 1); checkDate = d.toISOString().split('T')[0]; } else break;
+      if (date === checkDate) { streak++; checkDate = addDaysTo(checkDate, -1); } else break;
     }
     res.json({ success: true, data: { total_lbs_lifted: parseFloat(totals.rows[0].total_lbs_lifted), total_reps: parseInt(totals.rows[0].total_reps), total_sets: parseInt(totals.rows[0].total_sets), total_workouts: parseInt(workoutCount.rows[0].count), current_streak: streak, weekly_volume: weeklyVolume.rows, milestones: milestones.rows, body_weight_history: bodyWeight.rows } });
   } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
@@ -235,7 +240,8 @@ router.get('/progress/:exercise', auth, async (req: Request, res: Response) => {
 router.post('/bodyweight', auth, async (req: Request, res: Response) => {
   const { weight_lbs, logged_date } = req.body;
   try {
-    const { rows } = await pool.query('INSERT INTO fitness_body_weight_logs (user_id, weight_lbs, logged_date) VALUES ($1,$2,$3) ON CONFLICT (user_id, logged_date) DO UPDATE SET weight_lbs = EXCLUDED.weight_lbs RETURNING *', [req.user!.userId, weight_lbs, logged_date || new Date().toISOString().split('T')[0]]);
+    // S654: default to the Phoenix day, not UTC's (already tomorrow after 5 pm).
+    const { rows } = await pool.query('INSERT INTO fitness_body_weight_logs (user_id, weight_lbs, logged_date) VALUES ($1,$2,$3) ON CONFLICT (user_id, logged_date) DO UPDATE SET weight_lbs = EXCLUDED.weight_lbs RETURNING *', [req.user!.userId, weight_lbs, logged_date || todayIn(null)]);
     res.json({ success: true, data: rows[0] });
   } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });

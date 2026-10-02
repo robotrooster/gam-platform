@@ -8,9 +8,16 @@ import bcrypt from 'bcryptjs'
 import { db } from '../db'
 import { cleanupAllSchema } from '../test/dbHelpers'
 import { processRouteCleanup } from './routeCleanup'
+import { addDaysTo } from '../lib/timezone'
+
+// S654: the cleanup cutoff is CURRENT_DATE (Phoenix). Ages are counted back
+// from the database's today, not UTC's, which is already tomorrow after 5 pm.
+let dbToday = ''
+const daysAgo = (n: number) => addDaysTo(dbToday, -n)
 
 beforeEach(async () => {
   await cleanupAllSchema()
+  dbToday = (await db.query<{ d: string }>(`SELECT CURRENT_DATE::text AS d`)).rows[0].d
 })
 
 interface Fixture {
@@ -79,7 +86,7 @@ async function seedRoute(args: {
 describe('processRouteCleanup', () => {
   it('deletes a stale generated route + cascades its stops', async () => {
     const fx = await seedFixture()
-    const oldDate = new Date(Date.now() - 10 * 24 * 3600 * 1000).toISOString().slice(0, 10)
+    const oldDate = daysAgo(10)
     const id = await seedRoute({ fx, date: oldDate, status: 'generated', withStopCount: 3 })
 
     const result = await processRouteCleanup()
@@ -92,7 +99,7 @@ describe('processRouteCleanup', () => {
   it('keeps a generated route inside the retention window', async () => {
     const fx = await seedFixture()
     // 3 days old — well within the 7-day window.
-    const recent = new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString().slice(0, 10)
+    const recent = daysAgo(3)
     const id = await seedRoute({ fx, date: recent, status: 'generated' })
     const result = await processRouteCleanup()
     expect(result.routes_deleted).toBe(0)
@@ -102,7 +109,7 @@ describe('processRouteCleanup', () => {
 
   it('NEVER deletes in_progress or completed routes regardless of age', async () => {
     const fx = await seedFixture()
-    const veryOld = new Date(Date.now() - 60 * 24 * 3600 * 1000).toISOString().slice(0, 10)
+    const veryOld = daysAgo(60)
     const inProg = await seedRoute({ fx, date: veryOld, status: 'in_progress' })
     const done   = await seedRoute({ fx, date: veryOld, status: 'completed' })
     const result = await processRouteCleanup()
@@ -115,7 +122,7 @@ describe('processRouteCleanup', () => {
 
   it('configurable retention: 30-day window skips a 10-day-old route', async () => {
     const fx = await seedFixture()
-    const tenDaysOld = new Date(Date.now() - 10 * 24 * 3600 * 1000).toISOString().slice(0, 10)
+    const tenDaysOld = daysAgo(10)
     await seedRoute({ fx, date: tenDaysOld, status: 'generated' })
     const result = await processRouteCleanup(30)
     expect(result.routes_deleted).toBe(0)
@@ -123,7 +130,7 @@ describe('processRouteCleanup', () => {
 
   it('idempotent: second run is a no-op', async () => {
     const fx = await seedFixture()
-    const oldDate = new Date(Date.now() - 15 * 24 * 3600 * 1000).toISOString().slice(0, 10)
+    const oldDate = daysAgo(15)
     await seedRoute({ fx, date: oldDate, status: 'generated' })
     await processRouteCleanup()
     const result = await processRouteCleanup()

@@ -8,6 +8,7 @@ import { renderAcceptancePdf } from './flexsuitePdf'
 import { emailFlexsuiteEnrollment } from './email'
 import { FLEX_DEPOSIT_CUSTODY_FEE } from '@gam/shared'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 
 // S314: FlexSuite enrollment acceptance — render + persist the
 // populated terms text the tenant click-accepted at FlexPay /
@@ -42,10 +43,6 @@ function substitute(template: string, vars: SubstitutionMap): string {
   return out.replace(/\{\{[A-Za-z0-9_]+\}\}/g, '[Not Provided]')
 }
 
-function isoDate(d: Date = new Date()): string {
-  return d.toISOString().slice(0, 10)
-}
-
 // ── FlexPay ─────────────────────────────────────────────────────
 
 export interface FlexPayAcceptanceContext {
@@ -60,11 +57,24 @@ export interface FlexPayAcceptanceContext {
 export async function renderFlexPayAcceptanceText(
   ctx: FlexPayAcceptanceContext,
 ): Promise<{ renderedText: string; populatedContent: Record<string, any> }> {
+  // S654: the signature date is the tenant's date where they live — FlexPay is
+  // single-lease, so that is their active lease's property. UTC would date a
+  // 5 pm Phoenix signature tomorrow. No lease found → GAM's zone (Phoenix).
   const t = await queryOne<{
     first_name: string; last_name: string; email: string;
-    bank_last4: string | null
+    bank_last4: string | null; timezone: string | null
   }>(
-    `SELECT u.first_name, u.last_name, u.email, t.bank_last4
+    `SELECT u.first_name, u.last_name, u.email, t.bank_last4,
+            (SELECT p.timezone
+               FROM lease_tenants lt
+               JOIN leases l     ON l.id = lt.lease_id
+               JOIN units un     ON un.id = l.unit_id
+               JOIN properties p ON p.id = un.property_id
+              WHERE lt.tenant_id = t.id
+                AND lt.status = 'active'
+                AND l.status IN ('active', 'pending')
+              ORDER BY l.start_date DESC
+              LIMIT 1) AS timezone
        FROM tenants t JOIN users u ON u.id = t.user_id
       WHERE t.id = $1`,
     [ctx.tenantId],
@@ -81,7 +91,7 @@ export async function renderFlexPayAcceptanceText(
     // S562: the Subscription Terms hardcode the flat $25 fee in §3/§4 — there is
     // no {{Selected_Monthly_Fee}} placeholder anymore. ctx.fee still flows into
     // populatedContent below as the audit record of the fee accepted.
-    Signature_Date:         isoDate(),
+    Signature_Date:         todayIn(t.timezone),
     Support_Phone_Number:   process.env.SUPPORT_PHONE_NUMBER || '[See support contact in app]',
     Tenant_Signature:       '[Click-accepted electronically; see audit record]',
     Tenant_IP_Address:      ctx.ip || '[Not recorded]',
@@ -134,10 +144,10 @@ export async function renderFlexDepositAcceptanceText(
     first_name: string; last_name: string; email: string;
     bank_last4: string | null;
     property_name: string | null; property_address: string | null; unit_number: string | null;
-    landlord_name: string | null;
+    landlord_name: string | null; timezone: string | null;
   }>(
     `SELECT u.first_name, u.last_name, u.email, t.bank_last4,
-            p.name AS property_name,
+            p.name AS property_name, p.timezone,
             (p.street1
               || COALESCE(', ' || NULLIF(p.street2,''), '')
               || ', ' || p.city
@@ -174,7 +184,8 @@ export async function renderFlexDepositAcceptanceText(
     Total_Installment_Amount: ctx.totalInstallmentAmount.toFixed(2),
     Deposit_Total:            ctx.totalInstallmentAmount.toFixed(2),
     Custody_Fee:              FLEX_DEPOSIT_CUSTODY_FEE.toFixed(2),
-    Signature_Date:           isoDate(),
+    // S654: signed on the property's calendar, not UTC's.
+    Signature_Date:           todayIn(t.timezone),
     Tenant_Signature:         '[Click-accepted electronically; see audit record]',
     Tenant_IP_Address:        ctx.ip || '[Not recorded]',
     Tenant_User_Agent:        ctx.userAgent || '[Not recorded]',
