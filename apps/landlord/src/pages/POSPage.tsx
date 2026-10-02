@@ -1,11 +1,11 @@
-import { useState, useEffect, Fragment } from 'react'
+import { useState, useEffect, useRef, Fragment } from 'react'
 import { useUrlTab } from '../lib/useUrlTab'
 import type { KeyboardEvent as ReactKeyboardEvent, ClipboardEvent as ReactClipboardEvent } from 'react'
 import { useAuth } from '../context/AuthContext'
 import {
   discoverReaders, connectReader, collectCardPayment, cancelCurrentPayment, clearReaderPrompt,
   createTerminalIntent, processIntentOnReader, pollPiUntilTerminal,
-  cancelTerminalIntent,
+  cancelTerminalIntent, showCartOnReader as showCartLive,
   listRegisteredReaders, registerNewReader, archiveRegisteredReader,
   type RegisteredReader,
 } from '../lib/terminal'
@@ -42,7 +42,7 @@ function CustomerEditor({ c, all, onHistory, onChanged }: { c: any; all: any[]; 
   const [form, setForm] = useState({ firstName: c.firstName || '', lastName: c.lastName || '', email: c.email || '', phone: c.phone || '' })
   const [mergeInto, setMergeInto] = useState('')
   const [confirmMerge, setConfirmMerge] = useState(false)
-  const refresh = () => { qc.invalidateQueries('pos-customer-base'); qc.invalidateQueries('pos-customers'); qc.invalidateQueries('pos-transactions') }
+  const refresh = () => { qc.invalidateQueries('pos-customer-base'); qc.invalidateQueries('pos-people'); qc.invalidateQueries('pos-transactions') }
   const saveMut = useMutation(
     () => apiPatch(`/pos/customers/${c.id}`, { firstName: form.firstName.trim() || undefined, lastName: form.lastName.trim(), email: form.email.trim() || null, phone: form.phone.trim() || null }),
     { onSuccess: () => { refresh(); toast('Saved') }, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save') })
@@ -263,7 +263,6 @@ export function POSPage() {
   const { data: posCategories = [] } = useQuery<any[]>(['pos-categories', registerProperty], () => apiGet(`/pos/categories${propQ}`))
   // S219: full list (incl. inactive) for the manage-categories tab.
   const { data: posCategoriesAll = [] } = useQuery<any[]>(['pos-categories-all', registerProperty], () => apiGet(`/pos/categories?all=1${registerProperty ? '&propertyId='+registerProperty : ''}`), { enabled: tab==='categories' })
-  const { data: tenants = [] } = useQuery<any[]>('tenants', () => apiGet('/tenants'))
   // S192: per-property POS — properties list feeds the property
   // selector on item create/edit. NotificationBell already pulls
   // /properties so this is in cache.
@@ -280,8 +279,12 @@ export function POSPage() {
   const properties = isScoped
     ? (allProperties as any[]).filter((p: any) => user!.propertyIds!.includes(p.id))
     : allProperties
-  // S254: pos_customers roster for FlexCharge non-tenant picker
-  const { data: posCustomers = [] } = useQuery<any[]>('pos-customers', () => apiGet('/landlords/pos-customers'), { enabled: method==='charge'||method==='card_on_file' })
+  // S654 (Nic): "I need to be able to choose a customer from the drop-down menu
+  // to link to that transaction." The register's people for EVERY sale: this
+  // property's residents and the company's register customers — never another
+  // company's. Keys carry which kind ('t:' resident, 'c:' customer).
+  const { data: people = [] } = useQuery<any[]>(['pos-people', registerProperty],
+    () => apiGet(`/pos/people?propertyId=${registerProperty}`), { enabled: !!registerProperty })
   // S652: whose card, and which one. The counter is about to take money with
   // nobody handing anything over, so the screen says it out loud first.
   const tickets = useQuery<any[]>(
@@ -614,6 +617,46 @@ export function POSPage() {
   const changeDue = method==='cash' ? Math.max(0, Number(cashGiven)-total) : 0
   const chargeBlocked = method==='charge' && cart.some(i => !i.chargeEligible)
 
+  // S654 (Nic): "it goes away. It needs to be there the whole time … link it to
+  // be always on the screen until the payment is processed. Also, it doesn't
+  // show a customer name." Stripe's own pay screen shows the total and nothing
+  // else, and Stripe sends no word when a card is tapped on the breakdown. So
+  // the breakdown — the customer's name first — goes on the reader as the cart
+  // is rung, follows every change, and the customer taps ON it. Charge then
+  // finishes with that tap. Nothing is charged by showing it.
+  const [readerCart, setReaderCart] = useState<{ sig: string; shown: boolean; busy?: string } | null>(null)
+  const [readerCartNonce, setReaderCartNonce] = useState(0)
+  const shownOnReader = useRef<{ readerId: string; propertyId: string } | null>(null)
+  const liveCartCall = useRef<Promise<unknown> | null>(null)
+  const liveReaderId = method==='card' && activeReader?.type==='smart' ? activeReader.stripeReaderId : null
+  const liveCartLines = cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
+  const liveCartSig = liveReaderId && registerProperty && cart.length
+    ? JSON.stringify([liveReaderId, registerProperty, liveCartLines, discountAmt, tenantId, posCustomerId, readerCartNonce]) : ''
+  const takeDownLiveCart = () => {
+    const was = shownOnReader.current
+    shownOnReader.current = null
+    if (was) liveCartCall.current = showCartLive({ stripeReaderId: was.readerId, propertyId: was.propertyId, items: [] }).catch(() => {})
+  }
+  useEffect(() => {
+    if (terminalStatus === 'collecting' || terminalStatus === 'capturing') return
+    if (!liveCartSig) { takeDownLiveCart(); setReaderCart(null); return }
+    if (shownOnReader.current && shownOnReader.current.readerId !== liveReaderId) takeDownLiveCart()
+    let cancelled = false
+    const timer = setTimeout(() => {
+      const call = showCartLive({ stripeReaderId: liveReaderId!, propertyId: registerProperty, items: liveCartLines,
+        discountAmount: discountAmt, tenantId: tenantId || null, posCustomerId: posCustomerId || null })
+      liveCartCall.current = call.catch(() => {})
+      call.then(r => {
+        if (r.shown) shownOnReader.current = { readerId: liveReaderId!, propertyId: registerProperty }
+        if (!cancelled) setReaderCart({ sig: liveCartSig, shown: !!r.shown, busy: r.busy })
+      }).catch(() => { if (!cancelled) setReaderCart({ sig: liveCartSig, shown: false }) })
+    }, 500)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [liveCartSig, terminalStatus])   // eslint-disable-line react-hooks/exhaustive-deps
+  // Leaving the register takes the breakdown off the reader.
+  useEffect(() => () => takeDownLiveCart(), [])   // eslint-disable-line react-hooks/exhaustive-deps
+  const breakdownIsUp = !!readerCart?.shown && readerCart.sig === liveCartSig
+
   const applyDiscountCode = () => {
     const d = (discounts as any[]).find((x:any) => x.code?.toLowerCase() === discountCode.toLowerCase())
     if (d) { setAppliedDiscount(d); setDiscountCode('') }
@@ -835,13 +878,19 @@ export function POSPage() {
       // S648: the server prices the reader charge from the cart itself, card
       // fee included — the register no longer sends an amount.
       const cartLines = cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
+      // S654: a breakdown still being sent lands before the charge does; when
+      // the breakdown has been up for this exact cart, the customer has had it
+      // to tap on and the reader finishes with that tap straight away.
+      const cartOnReader = breakdownIsUp
+      await liveCartCall.current?.catch(() => {})
+      const who = { tenantId: tenantId || null, posCustomerId: posCustomerId || null, cartOnReader }
       let intent: { id: string; clientSecret: string } | null = null
       // S654: a charge the reader timed out on is sent again as-is. The server
       // re-prices the cart and refuses a changed one, in which case the old
       // charge is voided and a fresh one minted.
       if (pendingIntent && activeReader.type === 'smart' && pendingIntent.readerId === activeReader.stripeReaderId) {
         try {
-          await processIntentOnReader({ paymentIntentId: pendingIntent.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: discountAmt })
+          await processIntentOnReader({ paymentIntentId: pendingIntent.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: discountAmt, ...who })
           intent = { id: pendingIntent.id, clientSecret: '' }
         } catch {
           await cancelTerminalIntent(pendingIntent.id).catch(() => {})
@@ -852,7 +901,7 @@ export function POSPage() {
         const fresh = await createTerminalIntent({ items: cartLines, discountAmount: discountAmt, propertyId: registerProperty, description: 'GAM POS sale' })
         intent = fresh
         if (activeReader.type === 'smart') {
-          await processIntentOnReader({ paymentIntentId: fresh.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: discountAmt })
+          await processIntentOnReader({ paymentIntentId: fresh.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: discountAmt, ...who })
         }
       }
       piId = intent.id
@@ -879,6 +928,7 @@ export function POSPage() {
         // S654 (Nic): clear the reader's "tap or insert"; keep the charge and the cart.
         await clearReaderPrompt(piId, activeReader.stripeReaderId).catch(() => {})
         setPendingIntent({ id: piId, readerId: activeReader.stripeReaderId })
+        setReaderCartNonce(n => n + 1)   // the breakdown goes back up for the next try
         setTerminalError(/timed out/i.test(msg)
           ? 'No card was presented. The cart is still here — tap Charge again when they are ready.'
           : `${msg} — the cart is still here; tap Charge to try again.`)
@@ -966,7 +1016,7 @@ export function POSPage() {
             if (a.nameSet) {
               const parts = String(a.nameSet).split(' ')
               setReceipt((r: any) => r ? { ...r, customer: { ...r.customer, firstName: parts.length > 1 ? parts.slice(0, -1).join(' ') : parts[0], lastName: parts.length > 1 ? parts[parts.length - 1] : '' } } : r)
-              qc.invalidateQueries('pos-customers')
+              qc.invalidateQueries('pos-people')
             }
             return
           }
@@ -980,7 +1030,7 @@ export function POSPage() {
   }, [saveCard, receipt?.id])   // eslint-disable-line react-hooks/exhaustive-deps
   const emailReceiptMut = useMutation(
     () => apiPost(`/pos/transactions/${receipt?.id}/email-receipt`, { email: receiptEmail.trim() }),
-    { onSuccess: (r: any) => { setReceiptSent(r.data.sentTo); qc.invalidateQueries('pos-customers') },
+    { onSuccess: (r: any) => { setReceiptSent(r.data.sentTo); qc.invalidateQueries('pos-people') },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'The receipt could not be sent') })
   const { data: customersBase = [], isLoading: custLoading } = useQuery<any[]>(['pos-customer-base', registerProperty],
     () => apiGet(`/pos/customers?propertyId=${registerProperty}`), { enabled: tab==='customers' && !!registerProperty })
@@ -991,12 +1041,16 @@ export function POSPage() {
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not change the customer') })
   const txReceiptMut = useMutation(
     (v: { id: string; email: string }) => apiPost(`/pos/transactions/${v.id}/email-receipt`, { email: v.email.trim() }),
-    { onSuccess: (r: any) => { setTxEdit(null); toast(`Receipt sent to ${r.data.sentTo}`); qc.invalidateQueries('pos-customers'); qc.invalidateQueries('pos-customer-base') },
+    { onSuccess: (r: any) => { setTxEdit(null); toast(`Receipt sent to ${r.data.sentTo}`); qc.invalidateQueries('pos-people'); qc.invalidateQueries('pos-customer-base') },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'The receipt could not be sent') })
+  // S654: a first name is enough; an email already on the list picks that customer.
   const createCustomerMut = useMutation(
-    () => apiPost('/landlords/pos-customers', { firstName: newCustomer.firstName.trim(), lastName: newCustomer.lastName.trim(),
+    () => apiPost('/pos/customers', { firstName: newCustomer.firstName.trim(), lastName: newCustomer.lastName.trim() || null,
       email: newCustomer.email.trim() || null, phone: newCustomer.phone.trim() || null, propertyId: registerProperty }),
-    { onSuccess: (r: any) => { qc.invalidateQueries('pos-customers'); setPosCustomerId(r.data?.id || ''); setTenantId(''); setNewCustomer({ open: false, firstName: '', lastName: '', email: '', phone: '' }) },
+    { onSuccess: (r: any) => {
+        if (r.data?.existing) toast(`${`${r.data.firstName ?? ''} ${r.data.lastName ?? ''}`.trim()} is already on the list — picked them.`)
+        qc.invalidateQueries(['pos-people', registerProperty]); qc.invalidateQueries('pos-customer-base')
+        setPosCustomerId(r.data?.id || ''); setTenantId(''); setNewCustomer({ open: false, firstName: '', lastName: '', email: '', phone: '' }) },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'The customer could not be added') })
 
   if (receipt) return (
@@ -1248,33 +1302,22 @@ export function POSPage() {
               <input className="form-input" type="number" {...nonNeg} placeholder="Cash given" value={cashGiven} onChange={e=>setCashGiven(e.target.value)} style={{width:'100%'}} />
               {cashGiven&&Number(cashGiven)>=total&&<div style={{fontSize:'.82rem',color:'var(--green)',fontWeight:600,marginTop:4}}>Change: {fmt(changeDue)}</div>}
             </div>)}
-            {/* S652: the picker serves BOTH tenders that need to know who the
-                customer is — a charge account and a card on file. */}
-            {(method==='charge'||method==='card_on_file')&&(<div style={{marginBottom:10,display:'grid',gap:6}}>
-              {/* S254: FlexCharge property selector — accounts are
-                  per-property. Auto-picks for single-property landlords. */}
-              {(properties as any[]).length>1&&(
-                <select className="form-select" value={registerProperty} onChange={e=>{ setRegisterProperty(e.target.value); setTenantId(''); setPosCustomerId('') }} style={{width:'100%'}}>
-                  <option value="">Select property...</option>
-                  {(properties as any[]).map((p:any)=><option key={p.id} value={p.id}>{p.name||p.address1||p.id}</option>)}
-                </select>
-              )}
-              {/* S538: ONE neutral customer picker — both backing lists
-                  merged. Which id gets sent is carried by the option's
-                  prefix; the two ids stay mutually exclusive. */}
+            {/* S654 (Nic): "I need to be able to choose a customer from the
+                drop-down menu to link to that transaction and it should show
+                their name on the pay screen as well." One picker for every
+                tender — required only where the tender needs a person (a charge
+                account, a card on file). The name leads the reader's breakdown. */}
+            <div style={{marginBottom:10,display:'grid',gap:6}}>
+              <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Customer{(method==='charge'||method==='card_on_file')?'':' (optional)'}</div>
               <select className="form-select" value={tenantId?`t:${tenantId}`:posCustomerId?`c:${posCustomerId}`:''} onChange={e=>{ const v=e.target.value; if(v.startsWith('t:')){ setTenantId(v.slice(2)); setPosCustomerId('') } else if(v.startsWith('c:')){ setPosCustomerId(v.slice(2)); setTenantId('') } else { setTenantId(''); setPosCustomerId('') } }} style={{width:'100%'}}>
-                <option value="">Select customer... (optional for cash)</option>
-                {[
-                  ...(tenants as any[]).map((t:any)=>({ key:`t:${t.id}`, label:`${t.firstName} ${t.lastName}`.trim() })),
-                  ...(posCustomers as any[]).map((c:any)=>({ key:`c:${c.id}`, label:(`${c.firstName} ${c.lastName}`.trim())+(c.email?` — ${c.email}`:'') })),
-                ].sort((a,b)=>a.label.localeCompare(b.label)).map(o=><option key={o.key} value={o.key}>{o.label}</option>)}
+                <option value="">{(method==='charge'||method==='card_on_file') ? 'Pick who this is for…' : 'No customer'}</option>
+                {(people as any[]).map((p:any)=><option key={p.key} value={p.key}>{p.name}{p.detail?` — ${p.detail}`:''}</option>)}
               </select>
-              {method==='charge'&&chargeBlocked&&<div style={{fontSize:'.72rem',color:'var(--red)'}}>Cart has non-charge-eligible items</div>}
               {/* S654 (Nic): "for cash people we can add them as a customer." */}
               {!newCustomer.open ? (
-                <button type="button" className="btn btn-ghost btn-sm" style={{marginTop:4}} onClick={()=>setNewCustomer(n=>({ ...n, open:true }))}>+ New customer</button>
+                <button type="button" className="btn btn-ghost btn-sm" style={{justifySelf:'start'}} onClick={()=>setNewCustomer(n=>({ ...n, open:true }))}>+ New customer</button>
               ) : (
-                <div style={{display:'grid',gap:6,marginTop:6,padding:'8px 10px',border:'1px solid var(--border-1)',borderRadius:8}}>
+                <div style={{display:'grid',gap:6,padding:'8px 10px',border:'1px solid var(--border-1)',borderRadius:8}}>
                   <div style={{display:'flex',gap:6}}>
                     <input className="form-input" placeholder="First name" value={newCustomer.firstName} onChange={e=>setNewCustomer(n=>({ ...n, firstName:e.target.value }))} />
                     <input className="form-input" placeholder="Last name" value={newCustomer.lastName} onChange={e=>setNewCustomer(n=>({ ...n, lastName:e.target.value }))} />
@@ -1284,11 +1327,14 @@ export function POSPage() {
                     <input className="form-input" placeholder="Phone (optional)" value={newCustomer.phone} onChange={e=>setNewCustomer(n=>({ ...n, phone:e.target.value }))} />
                   </div>
                   <div style={{display:'flex',gap:6}}>
-                    <button type="button" className="btn btn-primary btn-sm" disabled={!newCustomer.firstName.trim()||createCustomerMut.isLoading} onClick={()=>createCustomerMut.mutate()}>{createCustomerMut.isLoading?'Adding…':'Add customer'}</button>
+                    <button type="button" className="btn btn-primary btn-sm" disabled={!newCustomer.firstName.trim()||!registerProperty||createCustomerMut.isLoading} onClick={()=>createCustomerMut.mutate()}>{createCustomerMut.isLoading?'Adding…':'Add customer'}</button>
                     <button type="button" className="btn btn-ghost btn-sm" onClick={()=>setNewCustomer({ open:false, firstName:'', lastName:'', email:'', phone:'' })}>Cancel</button>
                   </div>
                 </div>
               )}
+            </div>
+            {(method==='charge'||method==='card_on_file')&&(<div style={{marginBottom:10,display:'grid',gap:6}}>
+              {method==='charge'&&chargeBlocked&&<div style={{fontSize:'.72rem',color:'var(--red)'}}>Cart has non-charge-eligible items</div>}
               {method==='card_on_file'&&(
                 cardOnFile.isFetching
                   ? <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Checking for a card…</div>
@@ -1307,18 +1353,23 @@ export function POSPage() {
                 for single-property landlords (auto-picked on load); only
                 shows the picker when the landlord owns 2+ properties. */}
             {method==='card'&&(<div style={{marginBottom:10,display:'grid',gap:6}}>
-              {(properties as any[]).length>1&&(
-                <select className="form-select" value={registerProperty} onChange={e=>{ setRegisterProperty(e.target.value); setActiveReader(null) }} style={{width:'100%'}}>
-                  <option value="">Select property...</option>
-                  {(properties as any[]).map((p:any)=><option key={p.id} value={p.id}>{p.name||p.address1||p.id}</option>)}
-                </select>
-              )}
               <button type="button" className="btn btn-ghost btn-sm" onClick={()=>setReaderModal(true)} style={{width:'100%',justifyContent:'space-between',display:'flex'}}>
                 <span style={{color:'var(--text-3)'}}>Reader</span>
                 <span style={{color:activeReader?'var(--gold)':'var(--text-3)'}}>
                   {activeReader ? (activeReader.type==='smart' ? activeReader.nickname : activeReader.label) : 'Select…'}
                 </span>
               </button>
+              {/* S654: what the customer is looking at, and the order that keeps it there. */}
+              {activeReader?.type==='smart' && cart.length>0 && terminalStatus!=='collecting' && terminalStatus!=='capturing' && (
+                breakdownIsUp
+                  ? <div style={{fontSize:'.75rem',color:'var(--gold)',fontWeight:600,lineHeight:1.45,padding:'6px 8px',border:'1px solid var(--gold)',borderRadius:'var(--r-md)',background:'var(--gold-bg)'}}>
+                      The breakdown is on the reader. Let them tap there, then press Charge.
+                    </div>
+                  : readerCart?.busy && readerCart.sig === liveCartSig
+                    ? <div style={{fontSize:'.72rem',color:'var(--amber)',lineHeight:1.45}}>
+                        {readerCart.busy==='collect_inputs' ? 'The reader is still asking the last customer a question. It shows this sale when they answer.' : 'The reader is busy with another payment.'}
+                      </div>
+                    : <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Putting the breakdown on the reader…</div>)}
               {terminalStatus==='collecting'&&<div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Waiting for customer at reader…</div>}
               {terminalStatus==='capturing'&&<div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Capturing payment…</div>}
               {terminalStatus==='error'&&terminalError&&<div style={{fontSize:'.72rem',color:'var(--red)'}}>{terminalError}</div>}
@@ -1443,10 +1494,7 @@ export function POSPage() {
                       if (te && te.mode==='customer') { const cur = te; return (<>
                         <select className="form-select" value={cur.value} onChange={e=>{ const v=e.target.value; setTxEdit(prev=>prev?{ ...prev, value:v }:prev) }} style={{minWidth:220}}>
                           <option value="">No customer</option>
-                          {[
-                            ...(tenants as any[]).map((x:any)=>({ key:`t:${x.id}`, label:`${x.firstName} ${x.lastName}`.trim() })),
-                            ...(posCustomers as any[]).map((c:any)=>({ key:`c:${c.id}`, label:(`${c.firstName} ${c.lastName}`.trim())+(c.email?` — ${c.email}`:'') })),
-                          ].sort((a,b)=>a.label.localeCompare(b.label)).map(o=><option key={o.key} value={o.key}>{o.label}</option>)}
+                          {(people as any[]).map((p:any)=><option key={p.key} value={p.key}>{p.name}{p.detail?` — ${p.detail}`:''}</option>)}
                         </select>
                         <button className="btn btn-primary btn-sm" disabled={setTxCustomerMut.isLoading} onClick={()=>setTxCustomerMut.mutate({ id:t.id, value:cur.value })}>Save</button>
                         <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit(null)}>Cancel</button>

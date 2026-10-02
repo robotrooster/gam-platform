@@ -12,9 +12,12 @@ const {
   createRentReaderPaymentIntentMock, processPaymentIntentOnReaderMock,
   retrieveTerminalPaymentIntentMock, captureTerminalPaymentIntentMock, cancelTerminalPaymentIntentMock,
   paymentIntentsUpdateMock, readersCancelActionMock, paymentIntentsCaptureMock, paymentIntentsRetrieveMock, paymentIntentsCancelMock,
-  showCartOnReaderMock, cancelReaderActionMock,
+  showCartOnReaderMock, cancelReaderActionMock, holdForTheCartMock, clearCartOnReaderMock, readerActionMock,
 } = vi.hoisted(() => ({
-  showCartOnReaderMock:              vi.fn(async () => undefined),
+  showCartOnReaderMock:              vi.fn(async (): Promise<boolean> => true),
+  holdForTheCartMock:                vi.fn(async () => undefined),
+  clearCartOnReaderMock:             vi.fn(async () => true),
+  readerActionMock:                  vi.fn(async (): Promise<any> => null),
   cancelReaderActionMock:            vi.fn(async () => undefined),
   createRentReaderPaymentIntentMock: vi.fn(async (o: any) => ({ id: 'pi_reader_1', status: 'requires_payment_method', amount: o.amountCents, metadata: {} })),
   processPaymentIntentOnReaderMock:  vi.fn(async () => ({ id: 'tmr_1', action: { status: 'in_progress' } })),
@@ -35,7 +38,9 @@ vi.mock('../services/posTerminal', () => ({
   cancelTerminalPaymentIntent:   cancelTerminalPaymentIntentMock,
   cancelReaderAction:            cancelReaderActionMock,
   showCartOnReader:              showCartOnReaderMock,
-  holdForTheCart:                vi.fn(async () => undefined),
+  holdForTheCart:                holdForTheCartMock,
+  clearCartOnReader:             clearCartOnReaderMock,
+  readerAction:                  readerActionMock,
   READER_CART_PAUSE_MS:          0,
 }))
 vi.mock('../lib/stripe', () => ({
@@ -150,6 +155,48 @@ describe('S654 card on the counter reader', () => {
     const { rows } = await db.query(`SELECT status, stripe_payment_intent_id FROM payments WHERE invoice_id=$1`, [f.invoiceId])
     expect(rows.every((r: any) => r.status === 'pending' && r.stripe_payment_intent_id === null)).toBe(true)
     expect((await db.query(`SELECT 1 FROM tenant_remittances`)).rowCount).toBe(0)
+  })
+
+  // S654 (Nic): "it needs to be there the whole time … until the payment is processed."
+  it('puts the breakdown up as soon as the desk has the total; Send then finishes without holding it', async () => {
+    const f = await fixture()
+    const show = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/show`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1' })
+    expect(show.status, JSON.stringify(show.body)).toBe(200)
+    expect(show.body.data.shown).toBe(true)
+    const cart: any = (showCartOnReaderMock.mock.calls as any[])[0][0]
+    expect(cart.lines[0].description).toMatch(/^Rent — .+/)
+    expect(cart.totalCents).toBe(Math.round(TOTAL * 100))
+    expect(createRentReaderPaymentIntentMock).not.toHaveBeenCalled()
+    expect(processPaymentIntentOnReaderMock).not.toHaveBeenCalled()
+
+    const send = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1', cartOnReader: true })
+    expect(send.status).toBe(201)
+    expect(holdForTheCartMock).not.toHaveBeenCalled()
+    expect(processPaymentIntentOnReaderMock).toHaveBeenCalledTimes(1)
+
+    // Without the breakdown up first, it is held for the resident to read.
+    const cold = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1' })
+    expect(cold.status).toBe(201)
+    expect(holdForTheCartMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves a busy reader alone, takes only a breakdown down, and refuses a stranger\'s reader', async () => {
+    const f = await fixture()
+    readerActionMock.mockResolvedValueOnce({ type: 'process_payment_intent', status: 'in_progress' })
+    const busy = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/show`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1' })
+    expect(busy.body.data).toMatchObject({ shown: false, busy: 'process_payment_intent' })
+    expect(showCartOnReaderMock).not.toHaveBeenCalled()
+    const clear = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/show`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1', clear: true })
+    expect(clear.status).toBe(200)
+    expect(clearCartOnReaderMock).toHaveBeenCalledWith('tmr_1')
+    const foreign = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/show`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_not_mine' })
+    expect(foreign.status).toBe(404)
   })
 
   it('refuses a reader that is not paired to this company', async () => {

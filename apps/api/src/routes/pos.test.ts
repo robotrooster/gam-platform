@@ -27,7 +27,7 @@ const withCardFee = (net: number) => Math.round((net + processingFeeFor({ amount
 import { db } from '../db'
 import {
   cleanupAllSchema,
-  seedLandlord, seedProperty, seedTenant,
+  seedLandlord, seedProperty, seedTenant, seedUnit, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
 
 const {
@@ -45,7 +45,7 @@ const {
   processPaymentIntentOnReaderMock,
   captureTerminalPaymentIntentMock,
   cancelTerminalPaymentIntentMock,
-  cancelReaderActionMock, showCartOnReaderMock,
+  cancelReaderActionMock, showCartOnReaderMock, holdForTheCartMock, clearCartOnReaderMock, readerActionMock,
   startSaveCardPromptMock, readSaveCardAnswerMock, saveCardForCustomerMock, emailPosReceiptMock,
 } = vi.hoisted(() => ({
   startSaveCardPromptMock: vi.fn(async () => true),
@@ -53,7 +53,10 @@ const {
   saveCardForCustomerMock: vi.fn(async () => undefined),
   emailPosReceiptMock:     vi.fn(async () => undefined),
   cancelReaderActionMock: vi.fn(async () => undefined),
-  showCartOnReaderMock: vi.fn(async () => undefined),
+  showCartOnReaderMock: vi.fn(async (): Promise<boolean> => true),
+  holdForTheCartMock:   vi.fn(async () => undefined),
+  clearCartOnReaderMock: vi.fn(async () => true),
+  readerActionMock:     vi.fn(async (): Promise<any> => null),
   calculateCartTaxMock: vi.fn(async (_landlordId: string, cart: any[]) => {
     // Default: no tax. Tests can override per case via mockResolvedValueOnce.
     const subtotal = cart.reduce((s, l) => s + (l.qty * l.unitPrice), 0)
@@ -102,7 +105,9 @@ vi.mock('../services/posTerminal', () => ({
   cancelTerminalPaymentIntent:    cancelTerminalPaymentIntentMock,
   cancelReaderAction:             cancelReaderActionMock,
   showCartOnReader:               showCartOnReaderMock,
-  holdForTheCart:                 vi.fn(async () => undefined),
+  holdForTheCart:                 holdForTheCartMock,
+  clearCartOnReader:              clearCartOnReaderMock,
+  readerAction:                   readerActionMock,
   READER_CART_PAUSE_MS:           0,
 }))
 // S654: the reader's save-card prompt and the Stripe attach are mocked; the
@@ -167,7 +172,8 @@ beforeEach(async () => {
   captureTerminalPaymentIntentMock.mockResolvedValue({ id: 'pi_card_mock', status: 'succeeded', amount: 1000 } as any)
   cancelTerminalPaymentIntentMock.mockClear()
   cancelReaderActionMock.mockClear()
-  showCartOnReaderMock.mockClear()
+  showCartOnReaderMock.mockClear(); holdForTheCartMock.mockClear(); clearCartOnReaderMock.mockClear()
+  readerActionMock.mockReset(); readerActionMock.mockResolvedValue(null)
   startSaveCardPromptMock.mockClear(); startSaveCardPromptMock.mockResolvedValue(true)
   readSaveCardAnswerMock.mockClear(); readSaveCardAnswerMock.mockResolvedValue({ answered: false })
   saveCardForCustomerMock.mockClear()
@@ -2716,5 +2722,173 @@ describe('S649 a two-company account uses the register by property', () => {
       .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'I', qty: 1, price: 12 }], paymentMethod: 'cash' })
     expect(sale.status).toBe(201)
     expect(sale.body.data.landlord_id).toBe(f.landlordId)
+  })
+})
+
+// S654 (Nic): "it goes away. It needs to be there the whole time … link it to be
+// always on the screen until the payment is processed. Also, it doesn't show a
+// customer name … I need to be able to choose a customer from the drop-down menu
+// to link to that transaction and it should show their name on the pay screen."
+describe('S654 the breakdown on the reader while the cart is rung, with the customer', () => {
+  async function residentAt(f: PosFixture, first = 'Dakota', last = 'Lane'): Promise<string> {
+    const client = await db.connect()
+    try {
+      const tenantId = await seedTenant(client)
+      await client.query(`UPDATE users SET first_name = $1, last_name = $2 WHERE id = (SELECT user_id FROM tenants WHERE id = $3)`, [first, last, tenantId])
+      const unitId = await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId })
+      const leaseId = await seedLease(client, { unitId, landlordId: f.landlordId })
+      await seedLeaseTenant(client, { leaseId, tenantId })
+      return tenantId
+    } finally { client.release() }
+  }
+  async function customerOf(f: PosFixture, first: string, last: string, email: string | null = null): Promise<string> {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO pos_customers (landlord_id, first_name, last_name, email) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [f.landlordId, first, last, email])
+    return r.rows[0].id
+  }
+
+  it('puts the server-priced breakdown on the reader with the picked customer\'s name', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const { stripeReaderId } = await seedTerminalReader(f)
+    const itemId = await seedPosItem(f, { sellPrice: 10, stockQty: 9 })
+    const customerId = await customerOf(f, 'Jane', 'Doe')
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 20, taxAmount: 1.5, lines: [{ itemId, lineSubtotal: 20, lineTax: 1.5 }] })
+    const res = await request(buildApp()).post(`/api/pos/terminal/readers/${stripeReaderId}/cart`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Propane', qty: 2, price: 10 }], posCustomerId: customerId })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data.shown).toBe(true)
+    const cart: any = (showCartOnReaderMock.mock.calls as any[])[0][0]
+    expect(cart.who).toBe('Jane Doe')
+    // The tax, the card fee and the total are the server's — the same figures the charge will use.
+    expect(cart.lines[0]).toEqual({ description: 'Propane ×2', amountCents: 2000, quantity: 1 })
+    expect(cart.lines[1].description).toBe('Card processing fee')
+    expect(cart.taxCents).toBe(150)
+    expect(cart.totalCents).toBe(withCardFee(21.5))
+    expect(processPaymentIntentOnReaderMock).not.toHaveBeenCalled()
+  })
+
+  it('names a resident of the property, and refuses another company\'s customer or reader', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const other = await seedPosFixture()
+    const { stripeReaderId } = await seedTerminalReader(f)
+    const { stripeReaderId: otherReader } = await seedTerminalReader(other)
+    const itemId = await seedPosItem(f, { sellPrice: 4, stockQty: 9 })
+    const tenantId = await residentAt(f)
+    const ok = await request(buildApp()).post(`/api/pos/terminal/readers/${stripeReaderId}/cart`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 1, price: 4 }], tenantId })
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200)
+    expect((showCartOnReaderMock.mock.calls as any[])[0][0].who).toBe('Dakota Lane')
+
+    const stranger = await customerOf(other, 'Not', 'Mine')
+    const foreignCustomer = await request(buildApp()).post(`/api/pos/terminal/readers/${stripeReaderId}/cart`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 1, price: 4 }], posCustomerId: stranger })
+    expect(foreignCustomer.status).toBe(404)
+    const foreignReader = await request(buildApp()).post(`/api/pos/terminal/readers/${otherReader}/cart`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 1, price: 4 }] })
+    expect(foreignReader.status).toBe(404)
+    expect(showCartOnReaderMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves a reader alone that is mid-payment or asking the last customer a question; an empty cart takes the breakdown down', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const { stripeReaderId } = await seedTerminalReader(f)
+    const itemId = await seedPosItem(f, { sellPrice: 4, stockQty: 9 })
+    readerActionMock.mockResolvedValueOnce({ type: 'collect_inputs', status: 'in_progress' })
+    const busy = await request(buildApp()).post(`/api/pos/terminal/readers/${stripeReaderId}/cart`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 1, price: 4 }] })
+    expect(busy.status).toBe(200)
+    expect(busy.body.data).toMatchObject({ shown: false, busy: 'collect_inputs' })
+    expect(showCartOnReaderMock).not.toHaveBeenCalled()
+
+    // A breakdown already up is simply replaced.
+    readerActionMock.mockResolvedValueOnce({ type: 'set_reader_display', status: 'in_progress' })
+    const again = await request(buildApp()).post(`/api/pos/terminal/readers/${stripeReaderId}/cart`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 2, price: 4 }] })
+    expect(again.body.data.shown).toBe(true)
+
+    const empty = await request(buildApp()).post(`/api/pos/terminal/readers/${stripeReaderId}/cart`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [] })
+    expect(empty.status).toBe(200)
+    expect(clearCartOnReaderMock).toHaveBeenCalledWith(stripeReaderId)
+  })
+
+  it('Charge after the breakdown was up finishes at once; a breakdown that was not up is held; the name rides along', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const { stripeReaderId } = await seedTerminalReader(f)
+    const itemId = await seedPosItem(f, { sellPrice: 10, stockQty: 9 })
+    const customerId = await customerOf(f, 'Jane', 'Doe')
+    const pi = (id: string) => ({
+      id, status: 'requires_payment_method', amount: withCardFee(10),
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId, gam_property_id: f.propertyId },
+    } as any)
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce(pi('pi_up'))
+    const up = await request(buildApp()).post('/api/pos/terminal/payment-intents/pi_up/process')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ stripeReaderId, items: [{ id: itemId, name: 'Propane', qty: 1, price: 10 }], posCustomerId: customerId, cartOnReader: true })
+    expect(up.status, JSON.stringify(up.body)).toBe(200)
+    expect(holdForTheCartMock).not.toHaveBeenCalled()
+    expect((showCartOnReaderMock.mock.calls as any[])[0][0].who).toBe('Jane Doe')
+    expect(processPaymentIntentOnReaderMock).toHaveBeenCalledTimes(1)
+
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce(pi('pi_cold'))
+    const cold = await request(buildApp()).post('/api/pos/terminal/payment-intents/pi_cold/process')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ stripeReaderId, items: [{ id: itemId, name: 'Propane', qty: 1, price: 10 }] })
+    expect(cold.status).toBe(200)
+    expect(holdForTheCartMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('the register\'s people are this property\'s residents and this company\'s customers only', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const other = await seedPosFixture()
+    const tenantId = await residentAt(f, 'Ann', 'Resident')
+    const customerId = await customerOf(f, 'Bob', 'Walkin', 'bob@example.com')
+    await customerOf(other, 'Zed', 'Elsewhere')
+    await residentAt(other, 'Zoe', 'Elsewhere')
+    const res = await request(buildApp()).get(`/api/pos/people?propertyId=${f.propertyId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const keys = res.body.data.map((p: any) => p.key)
+    expect(keys).toEqual(expect.arrayContaining([`t:${tenantId}`, `c:${customerId}`]))
+    expect(res.body.data.map((p: any) => p.name)).not.toContain('Zed Elsewhere')
+    expect(res.body.data.map((p: any) => p.name)).not.toContain('Zoe Elsewhere')
+    const bob = res.body.data.find((p: any) => p.key === `c:${customerId}`)
+    expect(bob).toMatchObject({ name: 'Bob Walkin', detail: 'bob@example.com' })
+  })
+
+  it('adds a customer with a first name only; an email already on the list picks that customer', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const first = await request(buildApp()).post('/api/pos/customers')
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ propertyId: f.propertyId, firstName: 'Cash' })
+    expect(first.status, JSON.stringify(first.body)).toBe(201)
+    const row = await db.query(`SELECT landlord_id, first_name, last_name, email, created_from FROM pos_customers WHERE id = $1`, [first.body.data.id])
+    expect(row.rows[0]).toMatchObject({ landlord_id: f.landlordId, first_name: 'Cash', last_name: '', email: null, created_from: 'manual' })
+    const existing = await customerOf(f, 'Jane', 'Doe', 'jane@example.com')
+    const dup = await request(buildApp()).post('/api/pos/customers')
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ propertyId: f.propertyId, firstName: 'J', email: 'JANE@example.com' })
+    expect(dup.status).toBe(200)
+    expect(dup.body.data).toMatchObject({ id: existing, existing: true })
+  })
+
+  it('a cash sale cannot name another company\'s customer', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const other = await seedPosFixture()
+    const itemId = await seedPosItem(f, { sellPrice: 5, stockQty: 9 })
+    const stranger = await customerOf(other, 'Not', 'Mine')
+    const res = await request(buildApp()).post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ items: [{ id: itemId, name: 'Ice', qty: 1, price: 5, tax: 0 }], paymentMethod: 'cash', propertyId: f.propertyId,
+              posCustomerId: stranger, subtotal: 5, taxAmount: 0, total: 5 })
+    expect(res.status).toBe(404)
+    const n = await db.query(`SELECT COUNT(*)::int AS n FROM pos_transactions WHERE landlord_id = $1`, [f.landlordId])
+    expect(n.rows[0].n).toBe(0)
   })
 })

@@ -349,9 +349,11 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
                 {readers.map((r: any) => <option key={r.stripeReaderId} value={r.stripeReaderId}>{r.nickname}</option>)}
               </select>
             )}
+            {/* S654: one breakdown fits on the reader — the first lease not yet paid shows its own. */}
             {readerId && readerBlocks.map(b => (
               <ReaderLeaseBlock key={b.key} anchor={b.anchor} label={b.label} readerId={readerId}
                 done={tapped[b.key] != null}
+                live={b.key === readerBlocks.find(x => tapped[x.key] == null)?.key}
                 onDone={total => setTapped(prev => ({ ...prev, [b.key]: total }))} />
             ))}
           </div>
@@ -391,8 +393,8 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
  * cancel-then-resend never has two flows fighting over one screen; closing the
  * window mid-flow clears the reader and releases the hold.
  */
-function ReaderLeaseBlock({ anchor, label, readerId, done, onDone }: {
-  anchor: any; label: string | null; readerId: string; done: boolean; onDone: (total: number) => void
+function ReaderLeaseBlock({ anchor, label, readerId, done, live, onDone }: {
+  anchor: any; label: string | null; readerId: string; done: boolean; live: boolean; onDone: (total: number) => void
 }) {
   const { data: quote, isLoading: quoting, error: quoteError } = useQuery<any>(
     ['reader-quote', anchor.id],
@@ -406,22 +408,39 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, onDone }: {
   // again" puts the same charge back on the reader when they are ready.
   const [canResend, setCanResend] = useState(false)
   const readerRef = useRef(readerId); readerRef.current = readerId
+  // S654 (Nic): "it needs to be there the whole time … until the payment is
+  // processed." Stripe's pay screen shows the total only and Stripe sends no
+  // word of a tap on the breakdown — so the breakdown (name, each charge, the
+  // fee, the total) goes on the reader as soon as the total is known, the
+  // resident taps ON it, and Send finishes with that tap.
+  const [onReader, setOnReader] = useState<{ shown: boolean; busy?: string } | null>(null)
+  const breakdownUp = useRef(false)
+  useEffect(() => {
+    if (!live || !quote || !readerId || stage !== 'idle') return
+    let cancelled = false
+    apiPost(`/payments/${anchor.id}/reader/show`, { stripeReaderId: readerId })
+      .then((r: any) => { if (r.data?.shown) breakdownUp.current = true; if (!cancelled) setOnReader(r.data ?? { shown: false }) })
+      .catch(() => { if (!cancelled) setOnReader({ shown: false }) })
+    return () => { cancelled = true }
+  }, [live, quote?.total, readerId, stage])   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => () => {
     attempt.current++
     const pi = livePi.current; livePi.current = null
     if (pi) apiPost(`/payments/reader/intents/${pi}/cancel`, { stripeReaderId: readerRef.current }).catch(() => {})
-  }, [])
+    else if (breakdownUp.current) apiPost(`/payments/${anchor.id}/reader/show`, { stripeReaderId: readerRef.current, clear: true }).catch(() => {})
+  }, [])   // eslint-disable-line react-hooks/exhaustive-deps
   const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
   const send = async () => {
     const mine = ++attempt.current
     const live = () => attempt.current === mine
-    setErr(null); setStage('sending')
+    const cartOnReader = !!onReader?.shown
+    setErr(null); setStage('sending'); setOnReader(null)
     let piId: string | null = null
     try {
       let resent = false
       if (canResend && livePi.current) {
         try {
-          const again: any = await apiPost(`/payments/reader/intents/${livePi.current}/resend`, { stripeReaderId: readerId })
+          const again: any = await apiPost(`/payments/reader/intents/${livePi.current}/resend`, { stripeReaderId: readerId, cartOnReader })
           piId = again.data.paymentIntentId; resent = true
         } catch (e: any) {
           const m = String(e?.response?.data?.error || '')
@@ -430,7 +449,7 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, onDone }: {
         }
       }
       if (!resent) {
-        const r: any = await apiPost(`/payments/${anchor.id}/reader/charge`, { stripeReaderId: readerId })
+        const r: any = await apiPost(`/payments/${anchor.id}/reader/charge`, { stripeReaderId: readerId, cartOnReader })
         piId = r.data.paymentIntentId
       }
       setCanResend(false)
@@ -500,6 +519,15 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, onDone }: {
           {stage === 'sending' ? 'Sending to the reader…' : stage === 'waiting' ? 'Waiting for the card on the reader…' : 'Card approved — recording…'}
         </div>
       )}
+      {stage === 'idle' && live && onReader && (onReader.shown
+        ? <div style={{ fontSize: '.78rem', color: 'var(--gold)', fontWeight: 600, marginTop: 8, lineHeight: 1.45 }}>
+            The breakdown is on the reader. Let them tap there, then press Send.
+          </div>
+        : onReader.busy
+          ? <div style={{ fontSize: '.76rem', color: 'var(--amber)', marginTop: 8 }}>
+              {onReader.busy === 'collect_inputs' ? 'The reader is still asking the last customer a question.' : 'The reader is busy with another payment.'}
+            </div>
+          : null)}
       {stage === 'done' && <div style={{ fontSize: '.8rem', color: 'var(--green, #3fb950)', marginTop: 8 }}>Taken.</div>}
       {err && <div style={{ fontSize: '.76rem', color: 'var(--red)', marginTop: 6 }}>{err}</div>}
       <div style={{ marginTop: 10 }}>

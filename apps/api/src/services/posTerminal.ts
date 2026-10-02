@@ -528,26 +528,78 @@ export const holdForTheCart = () => new Promise<void>(r => setTimeout(r, READER_
 /**
  * S654 (Nic): "it'd be nice to see on the screen a little bit of a breakdown."
  * The reader shows the lines, the tax, the card fee and the total before it
- * asks for the card. Best-effort — a display that fails never stops a sale.
+ * asks for the card. Best-effort — a display that fails never stops a sale;
+ * the answer says whether the breakdown is up.
+ *
+ * S654 (Nic): "it doesn't show a customer name." The person the sale is for
+ * leads the list on a line of its own. Stripe's reference does not say whether
+ * a $0 line is accepted, so if it is refused the name goes in front of the
+ * first line instead, and every later display does that straight away.
  */
+let zeroLineRefused = false
+const cartLineItems = (lines: ReaderCartLine[]) => lines.slice(0, 40).map(l => ({
+  description: String(l.description).slice(0, 60),
+  amount:      Math.max(0, Math.round(l.amountCents)),
+  quantity:    Math.max(1, Math.round(l.quantity)),
+}))
 export async function showCartOnReader(opts: {
-  stripeReaderId: string; lines: ReaderCartLine[]; taxCents: number; totalCents: number
-}): Promise<void> {
+  stripeReaderId: string; lines: ReaderCartLine[]; taxCents: number; totalCents: number; who?: string | null
+}): Promise<boolean> {
+  const send = (lines: ReaderCartLine[]) => getStripe().terminal.readers.setReaderDisplay(opts.stripeReaderId, {
+    type: 'cart',
+    cart: {
+      currency: 'usd',
+      line_items: cartLineItems(lines),
+      tax:   Math.max(0, Math.round(opts.taxCents)),
+      total: Math.max(0, Math.round(opts.totalCents)),
+    },
+  })
+  const who = opts.who?.trim() || null
+  const prefixed = (): ReaderCartLine[] => who && opts.lines.length
+    ? [{ ...opts.lines[0], description: `${who} · ${opts.lines[0].description}` }, ...opts.lines.slice(1)]
+    : opts.lines
   try {
-    await getStripe().terminal.readers.setReaderDisplay(opts.stripeReaderId, {
-      type: 'cart',
-      cart: {
-        currency: 'usd',
-        line_items: opts.lines.slice(0, 40).map(l => ({
-          description: String(l.description).slice(0, 60),
-          amount:      Math.max(0, Math.round(l.amountCents)),
-          quantity:    Math.max(1, Math.round(l.quantity)),
-        })),
-        tax:   Math.max(0, Math.round(opts.taxCents)),
-        total: Math.max(0, Math.round(opts.totalCents)),
-      },
-    })
+    if (who && !zeroLineRefused) {
+      try {
+        await send([{ description: `Customer: ${who}`, amountCents: 0, quantity: 1 }, ...opts.lines])
+        return true
+      } catch (e: any) {
+        // Only a refusal of the line itself — a busy or offline reader is not that.
+        if (e?.type !== 'StripeInvalidRequestError' || !/line_items|amount/i.test(`${e?.param ?? ''} ${e?.message ?? ''}`)) throw e
+        zeroLineRefused = true
+        logger.warn({ err: e, stripeReaderId: opts.stripeReaderId }, '[terminal] $0 name line refused; naming the first line instead')
+      }
+    }
+    await send(prefixed())
+    return true
   } catch (e) {
     logger.warn({ err: e, stripeReaderId: opts.stripeReaderId }, '[terminal] setReaderDisplay')
+    return false
+  }
+}
+
+/**
+ * What the reader is doing right now — null when idle. A breakdown is an
+ * in-progress set_reader_display; anything else in progress (a payment, the
+ * last customer's "save this card?" question) is the reader being busy.
+ */
+export async function readerAction(stripeReaderId: string): Promise<{ type: string; status: string } | null> {
+  const r: any = await getStripe().terminal.readers.retrieve(stripeReaderId)
+  return r?.action ? { type: String(r.action.type), status: String(r.action.status) } : null
+}
+
+/**
+ * Take a breakdown off the reader — only a breakdown. A payment in progress or
+ * a question the last customer is answering is left alone.
+ */
+export async function clearCartOnReader(stripeReaderId: string): Promise<boolean> {
+  try {
+    const a = await readerAction(stripeReaderId)
+    if (a?.type !== 'set_reader_display' || a.status !== 'in_progress') return false
+    await getStripe().terminal.readers.cancelAction(stripeReaderId)
+    return true
+  } catch (e) {
+    logger.warn({ err: e, stripeReaderId }, '[terminal] clear cart')
+    return false
   }
 }

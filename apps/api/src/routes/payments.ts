@@ -1390,7 +1390,7 @@ paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment')
 // exactly like Pay Now (2a). The card fee is the customer's at the same rate as
 // online (3). Nothing is booked until the reader has approved the card — a
 // decline or a walk-away leaves the ledger untouched.
-import { holdForTheCart, createRentReaderPaymentIntent, processPaymentIntentOnReader, retrieveTerminalPaymentIntent, cancelTerminalPaymentIntent, showCartOnReader, cancelReaderAction } from '../services/posTerminal'
+import { holdForTheCart, createRentReaderPaymentIntent, processPaymentIntentOnReader, retrieveTerminalPaymentIntent, cancelTerminalPaymentIntent, showCartOnReader, cancelReaderAction, clearCartOnReader, readerAction } from '../services/posTerminal'
 import { labelFor } from '../services/invoiceNotice'
 
 async function readerAnchor(req: any, paymentId: string) {
@@ -1422,7 +1422,7 @@ paymentsRouter.get('/:id/reader/readers', requirePerm('take_payment'), async (re
 
 paymentsRouter.post('/:id/reader/charge', requirePerm('take_payment'), async (req: any, res, next) => {
   try {
-    const { stripeReaderId } = z.object({ stripeReaderId: z.string().min(1) }).parse(req.body)
+    const { stripeReaderId, cartOnReader } = z.object({ stripeReaderId: z.string().min(1), cartOnReader: z.boolean().optional() }).parse(req.body)
     const pmt = await readerAnchor(req, req.params.id)
     const reader = await queryOne<{ id: string }>(
       `SELECT id FROM pos_terminal_readers
@@ -1437,15 +1437,40 @@ paymentsRouter.post('/:id/reader/charge', requirePerm('take_payment'), async (re
       amountCents: Math.round(quote.total * 100),
       cardFeeCents: Math.round(quote.cardFee * 100),
     })
-    await sendToReader(pmt, quote, intent.id, stripeReaderId)
+    await sendToReader(pmt, quote, intent.id, stripeReaderId, cartOnReader === true)
     res.status(201).json({ success: true, data: { paymentIntentId: intent.id, ...quote } })
+  } catch (e) { next(e) }
+})
+
+// S654 (Nic): "it needs to be there the whole time … until the payment is
+// processed." Stripe's pay screen shows the total only and Stripe sends no word
+// of a tap on the breakdown, so the breakdown goes up as soon as the desk has
+// the total — the resident taps on it — and Send finishes with that tap.
+// Display only. `clear` takes the breakdown down (and only a breakdown); a
+// reader mid-payment or asking someone a question is left alone.
+paymentsRouter.post('/:id/reader/show', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const { stripeReaderId, clear } = z.object({ stripeReaderId: z.string().min(1), clear: z.boolean().optional() }).parse(req.body)
+    const pmt = await readerAnchor(req, req.params.id)
+    const reader = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_terminal_readers WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+      [pmt.landlord_id, stripeReaderId])
+    if (!reader) throw new AppError(404, 'That reader is not paired to this company')
+    if (clear) return res.json({ success: true, data: { shown: false, cleared: await clearCartOnReader(stripeReaderId) } })
+    const quote = await readerQuote(pmt)
+    const action = await readerAction(stripeReaderId).catch(() => null)
+    if (action && action.status === 'in_progress' && action.type !== 'set_reader_display') {
+      return res.json({ success: true, data: { shown: false, busy: action.type } })
+    }
+    const shown = await showCartOnReader({ stripeReaderId, lines: await rentReaderLines(pmt, quote), taxCents: 0, totalCents: Math.round(quote.total * 100) })
+    res.json({ success: true, data: { shown, total: quote.total } })
   } catch (e) { next(e) }
 })
 
 // S654 (Nic): "will it show somebody's name on this screen?" — the first line
 // carries the resident and the space; then each charge by name; then the fee;
 // then the reader asks for the card.
-async function sendToReader(pmt: any, quote: Awaited<ReturnType<typeof readerQuote>>, paymentIntentId: string, stripeReaderId: string) {
+async function rentReaderLines(pmt: any, quote: Awaited<ReturnType<typeof readerQuote>>) {
   const who = await queryOne<{ first_name: string | null; last_name: string | null; unit_number: string | null }>(
     `SELECT u.first_name, u.last_name, un.unit_number
        FROM payments p JOIN tenants t ON t.id = p.tenant_id JOIN users u ON u.id = t.user_id JOIN units un ON un.id = p.unit_id
@@ -1455,8 +1480,13 @@ async function sendToReader(pmt: any, quote: Awaited<ReturnType<typeof readerQuo
     ? { ...l, description: `${l.description} — ${name}${who?.unit_number ? ` (${who.unit_number})` : ''}` }
     : l)
   if (quote.cardFee > 0) lines.push({ description: 'Card processing fee', amountCents: Math.round(quote.cardFee * 100), quantity: 1 })
-  await showCartOnReader({ stripeReaderId, lines, taxCents: 0, totalCents: Math.round(quote.total * 100) })
-  await holdForTheCart()   // the resident reads what the card is for before it asks for the card
+  return lines
+}
+async function sendToReader(pmt: any, quote: Awaited<ReturnType<typeof readerQuote>>, paymentIntentId: string, stripeReaderId: string, cartOnReader = false) {
+  await showCartOnReader({ stripeReaderId, lines: await rentReaderLines(pmt, quote), taxCents: 0, totalCents: Math.round(quote.total * 100) })
+  // A breakdown that has been up (POST /:id/reader/show) has had its tap; one
+  // that was not is held so the resident reads it before the pay screen.
+  if (!cartOnReader) await holdForTheCart()
   await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId })
 }
 
@@ -1479,7 +1509,7 @@ paymentsRouter.post('/reader/intents/:pi/clear-reader', requirePerm('take_paymen
 
 paymentsRouter.post('/reader/intents/:pi/resend', requirePerm('take_payment'), async (req: any, res, next) => {
   try {
-    const { stripeReaderId } = z.object({ stripeReaderId: z.string().min(1) }).parse(req.body)
+    const { stripeReaderId, cartOnReader } = z.object({ stripeReaderId: z.string().min(1), cartOnReader: z.boolean().optional() }).parse(req.body)
     const pi = await ownReaderIntent(req, req.params.pi)
     if (pi.status !== 'requires_payment_method') {
       throw new AppError(409, pi.status === 'requires_capture' || pi.status === 'succeeded'
@@ -1495,7 +1525,7 @@ paymentsRouter.post('/reader/intents/:pi/resend', requirePerm('take_payment'), a
     if (Math.round(quote.total * 100) !== pi.amount) {
       throw new AppError(409, 'The balance changed since this charge was created — start again.')
     }
-    await sendToReader(pmt, quote, pi.id, stripeReaderId)
+    await sendToReader(pmt, quote, pi.id, stripeReaderId, cartOnReader === true)
     res.json({ success: true, data: { paymentIntentId: pi.id, ...quote } })
   } catch (e) { next(e) }
 })

@@ -46,6 +46,8 @@ const DELIBERATE = new Map(Object.entries({
   // records a cash, check or money-order payment (record_cash_payment).
   'payments POST /:id/reader/charge':
     'sends a resident\'s balance to the physical card reader on the counter. Done from the record-a-payment window with the balance and the reader on screen; a misheard name is someone else\'s balance on the reader.',
+  'payments POST /:id/reader/show':
+    'puts a resident\'s balance breakdown on the counter reader\'s screen, or takes it down. Display only, driven by the record-a-payment window that is open — nothing to ask for out loud.',
   'payments POST /reader/intents/:pi/capture':
     'books and captures a card the reader has approved — the second half of the same on-screen flow, nothing to say out loud.',
   'payments POST /reader/intents/:pi/cancel':
@@ -58,6 +60,10 @@ const DELIBERATE = new Map(Object.entries({
     'takes a sale\'s prompt off the register\'s reader without voiding the charge. Part of ringing a card sale at the register, where the reader and the cart are on screen.',
   'pos POST /terminal/readers/:stripeReaderId/cancel-action':
     'takes whatever is on a reader\'s screen off it. A register-side control for the reader at the counter.',
+  'pos POST /terminal/readers/:stripeReaderId/cart':
+    'puts the cart being rung up on the counter reader\'s screen as it changes. Display only, driven by the register\'s own cart — there is nothing to ask for out loud.',
+  'pos POST /customers':
+    'adds a customer at the register, named by the person standing at the counter. Typed there with the sale on screen; a misheard name or email files purchases under a stranger.',
   'pos POST /transactions/:id/email-receipt':
     'emails a receipt for a sale the register just rang up, to an address typed at the counter — a misheard address sends someone\'s purchase to a stranger.',
   'pos PATCH /transactions/:id/customer':

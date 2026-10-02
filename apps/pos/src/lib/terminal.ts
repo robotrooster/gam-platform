@@ -105,11 +105,39 @@ export async function processIntentOnReader(args: {
   // before it asks for the card. The server re-prices it; a changed cart is refused.
   items?: any[]
   discountAmount?: number
+  // S654: who the sale is for — their name leads the breakdown on the reader.
+  tenantId?: string | null
+  posCustomerId?: string | null
+  // S654: the breakdown has been up while the cart was rung, so the customer
+  // has had it to tap on; the charge completes at once instead of holding it.
+  cartOnReader?: boolean
 }): Promise<{ readerId: string; action: any }> {
   const res = await apiPost(
     `/pos/terminal/payment-intents/${args.paymentIntentId}/process`,
-    { stripeReaderId: args.stripeReaderId, items: args.items, discountAmount: args.discountAmount },
+    { stripeReaderId: args.stripeReaderId, items: args.items, discountAmount: args.discountAmount,
+      tenantId: args.tenantId || null, posCustomerId: args.posCustomerId || null, cartOnReader: !!args.cartOnReader },
   )
+  return res.data
+}
+
+/**
+ * S654 (Nic): "link it to be always on the screen until the payment is
+ * processed." The cart, as it is rung, goes on the reader — the breakdown and
+ * the customer's name — and the customer taps on it. An empty item list takes
+ * the breakdown down. Display only; nothing is charged.
+ */
+export async function showCartOnReader(args: {
+  stripeReaderId: string
+  propertyId:     string
+  items:          any[]
+  discountAmount?: number
+  tenantId?:      string | null
+  posCustomerId?: string | null
+}): Promise<{ shown: boolean; busy?: string; totalCents?: number }> {
+  const res = await apiPost(`/pos/terminal/readers/${args.stripeReaderId}/cart`, {
+    propertyId: args.propertyId, items: args.items, discountAmount: args.discountAmount ?? 0,
+    tenantId: args.tenantId || null, posCustomerId: args.posCustomerId || null,
+  })
   return res.data
 }
 

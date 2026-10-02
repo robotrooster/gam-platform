@@ -8,7 +8,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { calculateCartTax, computeCartTotals, aggregateCartTotals, effectiveItemTaxes } from '../services/posTax'
-import { holdForTheCart, createConnectionToken, registerReader, listReaders, archiveReader, createCardPresentPaymentIntent, processPaymentIntentOnReader, captureTerminalPaymentIntent, cancelTerminalPaymentIntent, retrieveTerminalPaymentIntent, cancelReaderAction, showCartOnReader, retrieveTerminalPaymentIntentWithCharge } from '../services/posTerminal'
+import { holdForTheCart, createConnectionToken, registerReader, listReaders, archiveReader, createCardPresentPaymentIntent, processPaymentIntentOnReader, captureTerminalPaymentIntent, cancelTerminalPaymentIntent, retrieveTerminalPaymentIntent, cancelReaderAction, showCartOnReader, clearCartOnReader, readerAction, retrieveTerminalPaymentIntentWithCharge } from '../services/posTerminal'
 import crypto from 'crypto'
 import { logger } from '../lib/logger'
 import { resolveLandlordTarget, ownsLandlord, landlordScopeIds } from '../lib/landlordScope'
@@ -623,6 +623,50 @@ async function resolveStayLines(landlordId: string, items: any[], unitId?: strin
   return out
 }
 
+/**
+ * S654 (Nic): "I need to be able to choose a customer from the drop-down menu to
+ * link to that transaction and it should show their name on the pay screen."
+ * The person a sale names must be THIS company's — a register customer of its,
+ * or a resident on one of its leases — and their name is what the reader shows.
+ * A name-less card record ("Card Customer") shows nothing.
+ */
+async function personOnSale(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }): Promise<string | null> {
+  const tenantId = typeof ids.tenantId === 'string' && ids.tenantId ? ids.tenantId : null
+  const posCustomerId = typeof ids.posCustomerId === 'string' && ids.posCustomerId ? ids.posCustomerId : null
+  if (tenantId && posCustomerId) throw new AppError(400, 'A sale belongs to one person — a resident or a customer, not both')
+  const uuid = /^[0-9a-f-]{36}$/i
+  if (posCustomerId) {
+    const c = uuid.test(posCustomerId) ? await queryOne<{ first_name: string; last_name: string }>(
+      `SELECT first_name, last_name FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL`,
+      [posCustomerId, landlordId]) : null
+    if (!c) throw new AppError(404, 'That customer is not on this register')
+    if (c.first_name === 'Card' && c.last_name === 'Customer') return null
+    return `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim() || null
+  }
+  if (tenantId) {
+    const t = uuid.test(tenantId) ? await queryOne<{ name: string | null }>(
+      `SELECT NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS name
+         FROM tenants tn JOIN users u ON u.id = tn.user_id
+        WHERE tn.id = $1
+          AND EXISTS (SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id
+                       WHERE lt.tenant_id = tn.id AND l.landlord_id = $2)`,
+      [tenantId, landlordId]) : null
+    if (!t) throw new AppError(404, "That resident is not at one of this company's properties")
+    return t.name
+  }
+  return null
+}
+
+/** The breakdown a register sale shows on the reader: each line, then the card fee. */
+function registerReaderLines(items: any[], surchargeDollars: number): { description: string; amountCents: number; quantity: number }[] {
+  const lines = items.filter((it: any) => Number(it.qty) > 0).map((it: any) => ({
+    description: `${String(it.name ?? 'Item')}${Number(it.qty) > 1 ? ` ×${Number(it.qty)}` : ''}`,
+    amountCents: Math.round(Number(it.qty) * Number(it.price) * 100), quantity: 1,
+  }))
+  if (surchargeDollars > 0) lines.push({ description: 'Card processing fee', amountCents: Math.round(surchargeDollars * 100), quantity: 1 })
+  return lines
+}
+
 async function serverCartTotals(landlordId: string, items: any[], paymentMethod: string | undefined,
                                 discountAmount: number | undefined, clientSurcharge?: number,
                                 propertyId?: string | null) {
@@ -808,12 +852,9 @@ posRouter.post('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, n
       `SELECT name FROM pos_items WHERE id = ANY($1::uuid[]) AND stay_unit IS NOT NULL`, [ids])
     if (stays.length) throw new AppError(400, `"${stays[0].name}" is a stay — ring it at the register with a site and dates.`)
 
-    if (body.posCustomerId) {
-      const c = await queryOne<{ id: string }>(
-        `SELECT id FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL`,
-        [body.posCustomerId, landlordId])
-      if (!c) throw new AppError(404, 'No such customer')
-    }
+    // S654: the person on a ticket is this company's — a resident on one of its
+    // leases or one of its register customers.
+    await personOnSale(landlordId, { tenantId: body.tenantId, posCustomerId: body.posCustomerId })
 
     const row = await queryOne<any>(
       `INSERT INTO pos_open_tickets
@@ -949,6 +990,9 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // their scope. Owners + all_properties bypass. Requires the client to send
     // propertyId on every sale (not just FlexCharge) — see POSPage checkout.
     await assertPropertyInScope(req.user, propertyId)
+    // S654: whoever the sale names — picked at the register for any tender —
+    // has to be this company's resident or customer.
+    if (paymentMethod !== 'charge') await personOnSale(posLandlordId(req), { tenantId, posCustomerId })
 
     // S254: paymentMethod='charge' is FlexCharge. Gate up-front so
     // the rest of the route knows the call is FlexCharge-shaped.
@@ -2544,13 +2588,17 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
       if (Math.round(quoted.total * 100) !== intent.amount) {
         throw new AppError(409, 'The cart changed since this card charge was created — start the charge again.')
       }
-      const lines = items.filter((it: any) => Number(it.qty) > 0).map((it: any) => ({
-        description: `${String(it.name ?? 'Item')}${Number(it.qty) > 1 ? ` ×${Number(it.qty)}` : ''}`,
-        amountCents: Math.round(Number(it.qty) * Number(it.price) * 100), quantity: 1,
-      }))
-      if (quoted.surcharge > 0) lines.push({ description: 'Card processing fee', amountCents: Math.round(quoted.surcharge * 100), quantity: 1 })
-      await showCartOnReader({ stripeReaderId, lines, taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents: intent.amount })
-      await holdForTheCart()   // let the customer read it before the pay screen takes over
+      const who = await personOnSale(landlordId, { tenantId: req.body.tenantId, posCustomerId: req.body.posCustomerId })
+      await showCartOnReader({ stripeReaderId, lines: registerReaderLines(items, quoted.surcharge),
+        taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents: intent.amount, who })
+      // S654 (Nic): "it needs to be there the whole time … until the payment is
+      // processed." Stripe's own pay screen shows the total only, and Stripe
+      // sends nothing when a card is tapped on the breakdown — so the register
+      // puts the breakdown up while the cart is rung (POST /terminal/readers/
+      // :id/cart) and the customer taps THERE. When it has been up, Charge
+      // completes with that tap at once. Only a breakdown that was not up yet
+      // is held, so the customer still gets to read it before the pay screen.
+      if (req.body.cartOnReader !== true) await holdForTheCart()
     }
     const reader = await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId, allowRedisplay: true })
     res.json({
@@ -2560,6 +2608,46 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
         action:   reader.action,  // status + payment_intent details for client polling
       },
     })
+  } catch (e) { next(e) }
+})
+
+// S654 (Nic): "link it to be always on the screen until the payment is
+// processed … and it should show their name on the pay screen as well." The
+// register sends the cart here as it is rung — every item, discount and change
+// of customer — and the reader shows the breakdown, the customer's name first.
+// In the US that screen takes the tap (pre-dip), so the breakdown is what they
+// pay on. Priced by the server from the cart, the same as the charge itself.
+// An empty cart takes the breakdown down. Display only: no money moves, and a
+// reader that is mid-payment or still asking the last customer a question is
+// left alone (`busy`).
+posRouter.post('/terminal/readers/:stripeReaderId/cart', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const stripeReaderId = String(req.params.stripeReaderId)
+    const propertyId = typeof req.body?.propertyId === 'string' ? req.body.propertyId : ''
+    if (!propertyId) throw new AppError(400, 'A property must be selected — sales are per-property')
+    await assertPropertyInScope(req.user, propertyId)
+    const landlordId = posLandlordId(req)
+    await assertPropertyIsLandlords(landlordId, propertyId)
+    if (!(await assertReaderBelongsToLandlord(landlordId, stripeReaderId))) {
+      throw new AppError(404, 'That reader is not paired to the company this register belongs to')
+    }
+    const items = Array.isArray(req.body?.items) ? req.body.items.filter((it: any) => Number(it?.qty) > 0) : []
+    if (!items.length) {
+      const cleared = await clearCartOnReader(stripeReaderId)
+      return res.json({ success: true, data: { shown: false, cleared } })
+    }
+    for (const it of items) assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
+    await assertCashierPricing(req, items.map((it: any) => ({ itemId: it.id, price: it.price })), req.body?.discountAmount)
+    const quoted = await serverCartTotals(landlordId, items, 'card', req.body?.discountAmount, undefined, propertyId)
+    const who = await personOnSale(landlordId, { tenantId: req.body?.tenantId, posCustomerId: req.body?.posCustomerId })
+    const action = await readerAction(stripeReaderId).catch(() => null)
+    if (action && action.status === 'in_progress' && action.type !== 'set_reader_display') {
+      return res.json({ success: true, data: { shown: false, busy: action.type } })
+    }
+    const totalCents = Math.round(Number(quoted.total) * 100)
+    const shown = await showCartOnReader({ stripeReaderId, lines: registerReaderLines(items, quoted.surcharge),
+      taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents, who })
+    res.json({ success: true, data: { shown, totalCents } })
   } catch (e) { next(e) }
 })
 
@@ -2757,6 +2845,74 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
 
 const PHONE_DIGITS = `regexp_replace(COALESCE($$X$$, ''), '\\D', '', 'g')`
 function phoneDigits(col: string): string { return PHONE_DIGITS.replace('$$X$$', col) }
+
+// S654 (Nic): "is there a way if I had selected an existing customer to link to
+// the ticket? Which I don't see a way to do from the point of sale screen." The
+// register's people for any sale: this property's residents and the company's
+// register customers, one list. Another company's people never appear.
+posRouter.get('/people', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const propertyId = String(req.query.propertyId ?? '')
+    if (!/^[0-9a-f-]{36}$/i.test(propertyId)) throw new AppError(400, 'A property must be selected')
+    await assertPropertyInScope(req.user, propertyId)
+    const landlordId = posLandlordId(req)
+    await assertPropertyIsLandlords(landlordId, propertyId)
+    const residents = await query<any>(
+      `SELECT DISTINCT ON (t.id) t.id, uu.first_name, uu.last_name, uu.email, un.unit_number, l.status
+         FROM tenants t
+         JOIN users uu ON uu.id = t.user_id
+         JOIN lease_tenants lt ON lt.tenant_id = t.id
+         JOIN leases l ON l.id = lt.lease_id
+         JOIN units un ON un.id = l.unit_id
+        WHERE l.landlord_id = $1 AND un.property_id = $2
+        ORDER BY t.id, l.created_at DESC`, [landlordId, propertyId])
+    const customers = await query<any>(
+      `SELECT id, first_name, last_name, email, phone FROM pos_customers
+        WHERE landlord_id = $1 AND archived_at IS NULL`, [landlordId])
+    const people = [
+      ...residents.map((r: any) => ({ key: `t:${r.id}`, kind: 'resident', id: r.id,
+        name: `${r.first_name ?? ''} ${r.last_name ?? ''}`.trim() || 'Resident',
+        detail: r.unit_number ? `Site ${r.unit_number}` : null, email: r.email ?? null })),
+      ...customers.map((c: any) => ({ key: `c:${c.id}`, kind: 'customer', id: c.id,
+        name: `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim() || 'Customer',
+        detail: c.email ?? c.phone ?? null, email: c.email ?? null })),
+    ].sort((a, b) => a.name.localeCompare(b.name))
+    res.json({ success: true, data: people })
+  } catch (e) { next(e) }
+})
+
+// S654 (Nic): "for cash people we can add them as a customer." A customer added
+// at the register needs a first name and nothing else; an email already on this
+// company's list returns that customer instead of a second one.
+posRouter.post('/customers', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const b = z.object({
+      propertyId: z.string().uuid(),
+      firstName:  z.string().trim().min(1, 'A first name is needed').max(80),
+      lastName:   z.string().trim().max(80).optional().nullable(),
+      email:      z.string().trim().max(200).optional().nullable(),
+      phone:      z.string().trim().max(40).optional().nullable(),
+    }).parse(req.body)
+    await assertPropertyInScope(req.user, b.propertyId)
+    const landlordId = posLandlordId(req)
+    await assertPropertyIsLandlords(landlordId, b.propertyId)
+    const email = b.email ? b.email.toLowerCase() : null
+    if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new AppError(400, 'That email does not look right')
+    if (email) {
+      const existing = await queryOne<any>(
+        `SELECT id, first_name, last_name, email, phone, archived_at FROM pos_customers
+          WHERE landlord_id = $1 AND lower(email) = $2`, [landlordId, email])
+      if (existing && !existing.archived_at) return res.json({ success: true, data: { ...existing, existing: true } })
+      if (existing) throw new AppError(409, 'That email is on a customer record that was closed. Use a different email or leave it blank.')
+    }
+    const row = await queryOne<any>(
+      `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone, created_from)
+       VALUES ($1, $2, $3, $4, $5, 'manual')
+       RETURNING id, first_name, last_name, email, phone`,
+      [landlordId, b.firstName, b.lastName ?? '', email, b.phone || null])
+    res.status(201).json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
 
 posRouter.get('/customers', requirePerm('pos.ring_sale', 'pos.end_of_day'), async (req, res, next) => {
   try {
