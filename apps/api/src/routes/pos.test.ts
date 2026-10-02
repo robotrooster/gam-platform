@@ -2817,7 +2817,7 @@ describe('S654 the breakdown on the reader while the cart is rung, with the cust
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ propertyId: f.propertyId, items: [] })
     expect(empty.status).toBe(200)
-    expect(clearCartOnReaderMock).toHaveBeenCalledWith(stripeReaderId)
+    expect(clearCartOnReaderMock).toHaveBeenCalledWith(stripeReaderId, expect.stringMatching(/^register:/))
   })
 
   it('Charge after the breakdown was up finishes at once; a breakdown that was not up is held; the name rides along', async () => {
@@ -2844,6 +2844,32 @@ describe('S654 the breakdown on the reader while the cart is rung, with the cust
       .send({ stripeReaderId, items: [{ id: itemId, name: 'Propane', qty: 1, price: 10 }] })
     expect(cold.status).toBe(200)
     expect(holdForTheCartMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('a breakdown another flow had taken over is held for reading even when the register says it was up', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const { stripeReaderId } = await seedTerminalReader(f)
+    const itemId = await seedPosItem(f, { sellPrice: 10, stockQty: 9 })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_taken', status: 'requires_payment_method', amount: withCardFee(10),
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId, gam_property_id: f.propertyId },
+    } as any)
+    showCartOnReaderMock.mockResolvedValueOnce('took_over' as any)
+    const res = await request(buildApp()).post('/api/pos/terminal/payment-intents/pi_taken/process')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ stripeReaderId, items: [{ id: itemId, name: 'Propane', qty: 1, price: 10 }], cartOnReader: true })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(holdForTheCartMock).toHaveBeenCalledTimes(1)
+    expect((showCartOnReaderMock.mock.calls as any[])[0][0].owner).toMatch(/^register:/)
+  })
+
+  it('the card-on-file lookup refuses another company\'s customer', async () => {
+    const f = await seedPosFixture()
+    const other = await seedPosFixture()
+    const stranger = await customerOf(other, 'Not', 'Mine')
+    const res = await request(buildApp()).get(`/api/pos/card-on-file?propertyId=${f.propertyId}&posCustomerId=${stranger}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(404)
   })
 
   it('the register\'s people are this property\'s residents and this company\'s customers only', async () => {

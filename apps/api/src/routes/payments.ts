@@ -1456,14 +1456,15 @@ paymentsRouter.post('/:id/reader/show', requirePerm('take_payment'), async (req:
       `SELECT id FROM pos_terminal_readers WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
       [pmt.landlord_id, stripeReaderId])
     if (!reader) throw new AppError(404, 'That reader is not paired to this company')
-    if (clear) return res.json({ success: true, data: { shown: false, cleared: await clearCartOnReader(stripeReaderId) } })
+    if (clear) return res.json({ success: true, data: { shown: false, cleared: await clearCartOnReader(stripeReaderId, `rent:${pmt.id}`) } })
     const quote = await readerQuote(pmt)
     const action = await readerAction(stripeReaderId).catch(() => null)
     if (action && action.status === 'in_progress' && action.type !== 'set_reader_display') {
       return res.json({ success: true, data: { shown: false, busy: action.type } })
     }
-    const shown = await showCartOnReader({ stripeReaderId, lines: await rentReaderLines(pmt, quote), taxCents: 0, totalCents: Math.round(quote.total * 100) })
-    res.json({ success: true, data: { shown, total: quote.total } })
+    const shown = await showCartOnReader({ stripeReaderId, lines: await rentReaderLines(pmt, quote), taxCents: 0,
+      totalCents: Math.round(quote.total * 100), owner: `rent:${pmt.id}` })
+    res.json({ success: true, data: { shown: !!shown, total: quote.total } })
   } catch (e) { next(e) }
 })
 
@@ -1483,10 +1484,12 @@ async function rentReaderLines(pmt: any, quote: Awaited<ReturnType<typeof reader
   return lines
 }
 async function sendToReader(pmt: any, quote: Awaited<ReturnType<typeof readerQuote>>, paymentIntentId: string, stripeReaderId: string, cartOnReader = false) {
-  await showCartOnReader({ stripeReaderId, lines: await rentReaderLines(pmt, quote), taxCents: 0, totalCents: Math.round(quote.total * 100) })
+  const shown = await showCartOnReader({ stripeReaderId, lines: await rentReaderLines(pmt, quote), taxCents: 0,
+    totalCents: Math.round(quote.total * 100), owner: `rent:${pmt.id}` })
   // A breakdown that has been up (POST /:id/reader/show) has had its tap; one
-  // that was not is held so the resident reads it before the pay screen.
-  if (!cartOnReader) await holdForTheCart()
+  // that was not — or that another flow had taken over — is held so the
+  // resident reads it before the pay screen.
+  if (!cartOnReader || shown === 'took_over') await holdForTheCart()
   await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId })
 }
 

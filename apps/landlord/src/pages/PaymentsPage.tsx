@@ -433,12 +433,18 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, live, onDone }: {
   // fee, the total) goes on the reader as soon as the total is known, the
   // resident taps ON it, and Send finishes with that tap.
   const [onReader, setOnReader] = useState<{ shown: boolean; busy?: string } | null>(null)
-  const breakdownUp = useRef(false)
+  // Which reader the breakdown is on — a different reader picked in the window
+  // takes it off the old one (S654 review).
+  const breakdownOn = useRef<string | null>(null)
   useEffect(() => {
+    if (breakdownOn.current && breakdownOn.current !== readerId && stage === 'idle') {
+      const old = breakdownOn.current; breakdownOn.current = null; setOnReader(null)
+      apiPost(`/payments/${anchor.id}/reader/show`, { stripeReaderId: old, clear: true }).catch(() => {})
+    }
     if (!live || !quote || !readerId || stage !== 'idle') return
     let cancelled = false
     apiPost(`/payments/${anchor.id}/reader/show`, { stripeReaderId: readerId })
-      .then((r: any) => { if (r.data?.shown) breakdownUp.current = true; if (!cancelled) setOnReader(r.data ?? { shown: false }) })
+      .then((r: any) => { if (r.data?.shown) breakdownOn.current = readerId; if (!cancelled) setOnReader(r.data ?? { shown: false }) })
       .catch(() => { if (!cancelled) setOnReader({ shown: false }) })
     return () => { cancelled = true }
   }, [live, quote?.total, readerId, stage])   // eslint-disable-line react-hooks/exhaustive-deps
@@ -447,13 +453,13 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, live, onDone }: {
     tapWaiter.current?.('cancel')
     const pi = livePi.current; livePi.current = null
     if (pi) apiPost(`/payments/reader/intents/${pi}/cancel`, { stripeReaderId: readerRef.current }).catch(() => {})
-    else if (breakdownUp.current) apiPost(`/payments/${anchor.id}/reader/show`, { stripeReaderId: readerRef.current, clear: true }).catch(() => {})
+    else if (breakdownOn.current) apiPost(`/payments/${anchor.id}/reader/show`, { stripeReaderId: breakdownOn.current, clear: true }).catch(() => {})
   }, [])   // eslint-disable-line react-hooks/exhaustive-deps
   const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
   const send = async () => {
     const mine = ++attempt.current
     const live = () => attempt.current === mine
-    let cartOnReader = !!onReader?.shown
+    let cartOnReader = !!onReader?.shown && breakdownOn.current === readerId
     setErr(null); setOnReader(null)
     let piId: string | null = null
     try {
@@ -463,7 +469,7 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, live, onDone }: {
       if (!cartOnReader) {
         const r: any = await apiPost(`/payments/${anchor.id}/reader/show`, { stripeReaderId: readerId }).catch(() => null)
         cartOnReader = !!r?.data?.shown
-        if (cartOnReader) breakdownUp.current = true
+        if (cartOnReader) breakdownOn.current = readerId
       }
       if (!live()) return
       if (cartOnReader) {

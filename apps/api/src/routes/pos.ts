@@ -935,6 +935,7 @@ posRouter.get('/card-on-file', requirePerm('pos.ring_sale'), async (req: any, re
     const tenantId = req.query.tenantId ? String(req.query.tenantId) : null
     const posCustomerId = req.query.posCustomerId ? String(req.query.posCustomerId) : null
     if (!tenantId && !posCustomerId) return res.json({ success: true, data: null })
+    await personOnSale(posLandlordId(req), { tenantId, posCustomerId })   // S654 (review): this company's person only
     const { savedCardFor } = await import('../services/posCardOnFile')
     const card = await savedCardFor({ tenantId, posCustomerId, landlordId: posLandlordId(req) })
     res.json({ success: true, data: card
@@ -2595,8 +2596,9 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
         throw new AppError(409, 'The cart changed since this card charge was created — start the charge again.')
       }
       const who = await personOnSale(landlordId, { tenantId: req.body.tenantId, posCustomerId: req.body.posCustomerId })
-      await showCartOnReader({ stripeReaderId, lines: registerReaderLines(items, quoted.surcharge),
-        taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents: intent.amount, who })
+      const shown = await showCartOnReader({ stripeReaderId, lines: registerReaderLines(items, quoted.surcharge),
+        taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents: intent.amount, who,
+        owner: `register:${(req as any).user.userId}:${propertyId}` })
       // S654 (Nic): "it needs to be there the whole time … until the payment is
       // processed." Stripe's own pay screen shows the total only, and Stripe
       // sends nothing when a card is tapped on the breakdown — so the register
@@ -2604,7 +2606,8 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
       // :id/cart) and the customer taps THERE. When it has been up, Charge
       // completes with that tap at once. Only a breakdown that was not up yet
       // is held, so the customer still gets to read it before the pay screen.
-      if (req.body.cartOnReader !== true) await holdForTheCart()
+      // A breakdown another flow had taken over is not the one they tapped on.
+      if (req.body.cartOnReader !== true || shown === 'took_over') await holdForTheCart()
     }
     const reader = await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId, allowRedisplay: true })
     res.json({
@@ -2638,8 +2641,9 @@ posRouter.post('/terminal/readers/:stripeReaderId/cart', requirePerm('pos.ring_s
       throw new AppError(404, 'That reader is not paired to the company this register belongs to')
     }
     const items = Array.isArray(req.body?.items) ? req.body.items.filter((it: any) => Number(it?.qty) > 0) : []
+    const owner = `register:${req.user.userId}:${propertyId}`
     if (!items.length) {
-      const cleared = await clearCartOnReader(stripeReaderId)
+      const cleared = await clearCartOnReader(stripeReaderId, owner)
       return res.json({ success: true, data: { shown: false, cleared } })
     }
     for (const it of items) assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
@@ -2652,8 +2656,8 @@ posRouter.post('/terminal/readers/:stripeReaderId/cart', requirePerm('pos.ring_s
     }
     const totalCents = Math.round(Number(quoted.total) * 100)
     const shown = await showCartOnReader({ stripeReaderId, lines: registerReaderLines(items, quoted.surcharge),
-      taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents, who })
-    res.json({ success: true, data: { shown, totalCents } })
+      taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents, who, owner })
+    res.json({ success: true, data: { shown: !!shown, totalCents } })
   } catch (e) { next(e) }
 })
 

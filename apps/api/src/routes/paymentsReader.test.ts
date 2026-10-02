@@ -193,7 +193,7 @@ describe('S654 card on the counter reader', () => {
     const clear = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/show`)
       .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1', clear: true })
     expect(clear.status).toBe(200)
-    expect(clearCartOnReaderMock).toHaveBeenCalledWith('tmr_1')
+    expect(clearCartOnReaderMock).toHaveBeenCalledWith('tmr_1', expect.stringMatching(/^rent:/))
     const foreign = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/show`)
       .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_not_mine' })
     expect(foreign.status).toBe(404)

@@ -277,6 +277,7 @@ export async function processPaymentIntentOnReader(opts: {
   allowRedisplay?:          boolean
 }): Promise<Stripe.Terminal.Reader> {
   const stripe = getStripe()
+  displayOwner.delete(opts.stripeReaderId)   // the breakdown gives way to the payment
   if (opts.allowRedisplay) {
     return stripe.terminal.readers.processPaymentIntent(
       opts.stripeReaderId,
@@ -503,6 +504,7 @@ export async function cancelBusinessPI(paymentIntentId: string): Promise<Stripe.
  * with nothing in progress answers with an error we do not care about.
  */
 export async function cancelReaderAction(stripeReaderId: string): Promise<void> {
+  displayOwner.delete(stripeReaderId)
   try {
     await getStripe().terminal.readers.cancelAction(stripeReaderId)
   } catch (e) {
@@ -537,6 +539,17 @@ export const holdForTheCart = () => new Promise<void>(r => setTimeout(r, READER_
  * first line instead, and every later display does that straight away.
  */
 let zeroLineRefused = false
+
+/**
+ * S654 (review): one reader, two flows — the register and the front desk's
+ * rent. A card tapped on one flow's breakdown is held by the reader and would
+ * pay whatever charge is processed next, and Stripe keeps a tap through any
+ * display update. So the reader remembers whose breakdown is up; when another
+ * flow takes the screen, the reader is cleared first (dropping any tap), and
+ * a flow may only take down its own breakdown. In memory: one API process.
+ */
+const displayOwner = new Map<string, string>()
+export type CartShown = 'kept' | 'took_over' | false
 const cartLineItems = (lines: ReaderCartLine[]) => lines.slice(0, 40).map(l => ({
   description: String(l.description).slice(0, 60),
   amount:      Math.max(0, Math.round(l.amountCents)),
@@ -544,7 +557,9 @@ const cartLineItems = (lines: ReaderCartLine[]) => lines.slice(0, 40).map(l => (
 }))
 export async function showCartOnReader(opts: {
   stripeReaderId: string; lines: ReaderCartLine[]; taxCents: number; totalCents: number; who?: string | null
-}): Promise<boolean> {
+  /** Whose breakdown this is — `register:<user>:<property>` or `rent:<payment>`. */
+  owner?: string
+}): Promise<CartShown> {
   const send = (lines: ReaderCartLine[]) => getStripe().terminal.readers.setReaderDisplay(opts.stripeReaderId, {
     type: 'cart',
     cart: {
@@ -558,11 +573,18 @@ export async function showCartOnReader(opts: {
   const prefixed = (): ReaderCartLine[] => who && opts.lines.length
     ? [{ ...opts.lines[0], description: `${who} · ${opts.lines[0].description}` }, ...opts.lines.slice(1)]
     : opts.lines
+  let tookOver = false
+  if (opts.owner && displayOwner.get(opts.stripeReaderId) !== opts.owner) {
+    const prev = displayOwner.get(opts.stripeReaderId)
+    const up = prev !== undefined || (await readerAction(opts.stripeReaderId).catch(() => null))?.type === 'set_reader_display'
+    if (up) { await cancelReaderAction(opts.stripeReaderId); tookOver = true }
+  }
+  const mine = (): CartShown => { if (opts.owner) displayOwner.set(opts.stripeReaderId, opts.owner); return tookOver ? 'took_over' : 'kept' }
   try {
     if (who && !zeroLineRefused) {
       try {
         await send([{ description: `Customer: ${who}`, amountCents: 0, quantity: 1 }, ...opts.lines])
-        return true
+        return mine()
       } catch (e: any) {
         // Only a refusal of the line itself — a busy or offline reader is not that.
         if (e?.type !== 'StripeInvalidRequestError' || !/line_items|amount/i.test(`${e?.param ?? ''} ${e?.message ?? ''}`)) throw e
@@ -571,7 +593,7 @@ export async function showCartOnReader(opts: {
       }
     }
     await send(prefixed())
-    return true
+    return mine()
   } catch (e) {
     logger.warn({ err: e, stripeReaderId: opts.stripeReaderId }, '[terminal] setReaderDisplay')
     return false
@@ -592,7 +614,9 @@ export async function readerAction(stripeReaderId: string): Promise<{ type: stri
  * Take a breakdown off the reader — only a breakdown. A payment in progress or
  * a question the last customer is answering is left alone.
  */
-export async function clearCartOnReader(stripeReaderId: string): Promise<boolean> {
+export async function clearCartOnReader(stripeReaderId: string, owner?: string): Promise<boolean> {
+  const holder = displayOwner.get(stripeReaderId)
+  if (owner && holder && holder !== owner) return false   // another flow's breakdown — not ours to take down
   try {
     const a = await readerAction(stripeReaderId)
     if (a?.type !== 'set_reader_display' || a.status !== 'in_progress') return false
