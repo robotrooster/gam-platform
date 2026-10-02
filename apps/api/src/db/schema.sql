@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict A3iN7jeCc3L4ZwMV2X7GUWqB5qjJl0oLSeE9N4RptmhuDUFWDV6mzcEmQNqilhi
+\restrict NhmyHC4DbZ9d7UKFWsOuiSltAcQvKgDcGTEr5hYyAIRrrQWaIb9gXniIPMgenDc
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -20376,6 +20376,13 @@ CREATE UNIQUE INDEX ux_user_balance_ledger_idempotent ON public.user_balance_led
 
 
 --
+-- Name: ux_users_email_lower; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_users_email_lower ON public.users USING btree (lower(email));
+
+
+--
 -- Name: ux_users_landlord_invite_token; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -28432,5 +28439,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict A3iN7jeCc3L4ZwMV2X7GUWqB5qjJl0oLSeE9N4RptmhuDUFWDV6mzcEmQNqilhi
+\unrestrict NhmyHC4DbZ9d7UKFWsOuiSltAcQvKgDcGTEr5hYyAIRrrQWaIb9gXniIPMgenDc
 

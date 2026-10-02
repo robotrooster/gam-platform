@@ -41,12 +41,6 @@ export interface CreditApplicationResult {
  *   'invoice' — only rows on the given invoice (invoice-generation behavior)
  *   'lease'   — every open row on the lease, whatever invoice it belongs to
  *               (what a landlord means by "forgive that late fee")
- *   'rows'    — exactly `rowIds` (S654: the pieces a payment cut for the credit)
- *
- * S654: every scope reads only this lease's own rows (a neighbor's utility on a
- * shared bill is another landlord's) and never a work-trade line (paid in
- * hours). `tenantId` spends only that tenant's credits — what the pay flows
- * netted; `maxApply` caps what is spent.
  *
  * S637 — A CREDIT NEVER SPLITS A CHARGE.
  *
@@ -71,10 +65,7 @@ export interface CreditApplicationResult {
  */
 export async function applyCreditsToOpenCharges(
   client: PoolClient,
-  opts: {
-    leaseId: string; scope: 'invoice' | 'lease' | 'rows'; invoiceId?: string
-    rowIds?: string[]; tenantId?: string; maxApply?: number
-  },
+  opts: { leaseId: string; scope: 'invoice' | 'lease'; invoiceId?: string },
 ): Promise<CreditApplicationResult> {
   const credits = await client.query<{ id: string; amount_remaining: string }>(
     // S648 (Nic): "every dollar should only be counted once." The pay flows
@@ -84,17 +75,14 @@ export async function applyCreditsToOpenCharges(
     // lease; the lease's own credits go first.
     `SELECT id, amount_remaining::text FROM tenant_credits
       WHERE status = 'active' AND amount_remaining > 0
-        AND ($2::uuid IS NULL OR tenant_id = $2)
         AND (lease_id = $1 OR (lease_id IS NULL
                AND landlord_id = (SELECT landlord_id FROM leases WHERE id = $1)
-               AND ($2::uuid IS NOT NULL
-                    OR tenant_id IN (SELECT tenant_id FROM v_lease_active_tenants WHERE lease_id = $1))))
+               AND tenant_id IN (SELECT tenant_id FROM v_lease_active_tenants WHERE lease_id = $1)))
       ORDER BY (lease_id IS NULL), created_at ASC
       FOR UPDATE`,
-    [opts.leaseId, opts.tenantId ?? null])
+    [opts.leaseId])
 
   let available = credits.rows.reduce((s, c) => s + Number(c.amount_remaining), 0)
-  if (opts.maxApply != null) available = Math.min(available, opts.maxApply)
   if (available <= 0.005) return { applied: 0, rowsTouched: 0 }
 
   // Open charges, oldest first. 'invoice' scope keeps the long-standing
@@ -104,26 +92,15 @@ export async function applyCreditsToOpenCharges(
   const charges = await client.query<{ id: string; amount: string }>(
     opts.scope === 'invoice'
       ? `SELECT id, amount::text FROM payments
-          WHERE invoice_id = $2 AND lease_id = $1 AND status = 'pending'
-            AND work_trade_suspended_at IS NULL
-          ORDER BY due_date ASC, created_at ASC
-          FOR UPDATE`
-      : opts.scope === 'rows'
-      ? `SELECT id, amount::text FROM payments
-          WHERE id = ANY($2::uuid[]) AND lease_id = $1 AND status = 'pending'
-            AND stripe_payment_intent_id IS NULL
-            AND work_trade_suspended_at IS NULL
+          WHERE invoice_id = $1 AND status = 'pending'
           ORDER BY due_date ASC, created_at ASC
           FOR UPDATE`
       : `SELECT id, amount::text FROM payments
           WHERE lease_id = $1 AND status = 'pending'
             AND stripe_payment_intent_id IS NULL
-            AND work_trade_suspended_at IS NULL
           ORDER BY due_date ASC, created_at ASC
           FOR UPDATE`,
-    opts.scope === 'invoice' ? [opts.leaseId, opts.invoiceId]
-      : opts.scope === 'rows' ? [opts.leaseId, opts.rowIds ?? []]
-      : [opts.leaseId])
+    [opts.scope === 'invoice' ? opts.invoiceId : opts.leaseId])
 
   let consumed = 0
   let rowsTouched = 0
