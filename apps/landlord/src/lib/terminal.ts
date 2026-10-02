@@ -121,6 +121,16 @@ export async function processIntentOnReader(args: {
 }
 
 /**
+ * S654 (Nic): "Can the tap happen in the background while the display is still
+ * up for the breakdown? Can you just leave it going for like thirty to
+ * forty-five seconds?" After Charge the breakdown stays up this long for the
+ * tap; the reader keeps a card tapped on it and the charge goes through with
+ * it. Stripe sends no word of the tap, so "They tapped — finish now" ends the
+ * wait early.
+ */
+export const TAP_WINDOW_SECONDS = 45
+
+/**
  * S654 (Nic): "link it to be always on the screen until the payment is
  * processed." The cart, as it is rung, goes on the reader — the breakdown and
  * the customer's name — and the customer taps on it. An empty item list takes

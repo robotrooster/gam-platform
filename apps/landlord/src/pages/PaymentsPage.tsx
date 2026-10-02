@@ -5,6 +5,7 @@ import { humanize, paidByLabel, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LA
          type ManualPaymentMethod,
          TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL } from '@gam/shared'
 import { api, apiGet, apiPost } from '../lib/api'
+import { TAP_WINDOW_SECONDS } from '../lib/terminal'
 import { usePerms } from '../lib/permissions'
 import { useAuth } from '../context/AuthContext'
 import { SearchBox, PropertySelect } from '../components/ListControls'
@@ -400,7 +401,25 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, live, onDone }: {
     ['reader-quote', anchor.id],
     () => apiGet<any>(`/payments/${anchor.id}/reader/quote`),
     { staleTime: 0, retry: false })
-  const [stage, setStage] = useState<'idle' | 'sending' | 'waiting' | 'capturing' | 'done'>(done ? 'done' : 'idle')
+  const [stage, setStage] = useState<'idle' | 'tap' | 'sending' | 'waiting' | 'capturing' | 'done'>(done ? 'done' : 'idle')
+  // S654 (Nic): "leave it going for like thirty to forty-five seconds. They tap
+  // and then it processes." The breakdown stays up for the tap after Send;
+  // Stripe sends no word of the tap, so "They tapped — finish now" ends it early.
+  const [tapEndsAt, setTapEndsAt] = useState<number | null>(null)
+  const [tapNow, setTapNow] = useState(Date.now())
+  const tapWaiter = useRef<((o: 'tapped' | 'cancel') => void) | null>(null)
+  useEffect(() => {
+    if (!tapEndsAt) return
+    const t = setInterval(() => setTapNow(Date.now()), 250)
+    return () => clearInterval(t)
+  }, [tapEndsAt])
+  const waitForTap = () => new Promise<'tapped' | 'time' | 'cancel'>(resolve => {
+    const ms = TAP_WINDOW_SECONDS * 1000
+    const finish = (o: 'tapped' | 'time' | 'cancel') => { clearTimeout(timer); tapWaiter.current = null; setTapEndsAt(null); resolve(o) }
+    const timer = setTimeout(() => finish('time'), ms)
+    tapWaiter.current = finish
+    setTapNow(Date.now()); setTapEndsAt(Date.now() + ms)
+  })
   const [err, setErr] = useState<string | null>(null)
   const attempt = useRef(0)
   const livePi = useRef<string | null>(null)
@@ -425,6 +444,7 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, live, onDone }: {
   }, [live, quote?.total, readerId, stage])   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => () => {
     attempt.current++
+    tapWaiter.current?.('cancel')
     const pi = livePi.current; livePi.current = null
     if (pi) apiPost(`/payments/reader/intents/${pi}/cancel`, { stripeReaderId: readerRef.current }).catch(() => {})
     else if (breakdownUp.current) apiPost(`/payments/${anchor.id}/reader/show`, { stripeReaderId: readerRef.current, clear: true }).catch(() => {})
@@ -433,10 +453,26 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, live, onDone }: {
   const send = async () => {
     const mine = ++attempt.current
     const live = () => attempt.current === mine
-    const cartOnReader = !!onReader?.shown
-    setErr(null); setStage('sending'); setOnReader(null)
+    let cartOnReader = !!onReader?.shown
+    setErr(null); setOnReader(null)
     let piId: string | null = null
     try {
+      // S654 (Nic): "Can the tap happen in the background while the display is
+      // still up for the breakdown?" Yes: the breakdown stays up for the tap
+      // window and the card tapped on it is what the charge goes through with.
+      if (!cartOnReader) {
+        const r: any = await apiPost(`/payments/${anchor.id}/reader/show`, { stripeReaderId: readerId }).catch(() => null)
+        cartOnReader = !!r?.data?.shown
+        if (cartOnReader) breakdownUp.current = true
+      }
+      if (!live()) return
+      if (cartOnReader) {
+        setStage('tap')
+        const outcome = await waitForTap()
+        if (!live()) return
+        if (outcome === 'cancel') { setStage('idle'); return }
+      }
+      setStage('sending')
       let resent = false
       if (canResend && livePi.current) {
         try {
@@ -498,6 +534,7 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, live, onDone }: {
     setStage('idle'); setErr(pi ? 'Cleared from the reader. Send again when they are ready.' : 'Canceled.')
   }
   const busy = stage === 'sending' || stage === 'waiting' || stage === 'capturing'
+  const tapSecondsLeft = tapEndsAt ? Math.max(0, Math.ceil((tapEndsAt - tapNow) / 1000)) : 0
   return (
     <div style={{ marginTop: 12, padding: '10px 12px', border: '1px solid var(--border-1)', borderRadius: 8 }}>
       {label && <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 4 }}>{label}</div>}
@@ -521,19 +558,29 @@ function ReaderLeaseBlock({ anchor, label, readerId, done, live, onDone }: {
       )}
       {stage === 'idle' && live && onReader && (onReader.shown
         ? <div style={{ fontSize: '.78rem', color: 'var(--gold)', fontWeight: 600, marginTop: 8, lineHeight: 1.45 }}>
-            The breakdown is on the reader. Let them tap there, then press Send.
+            The breakdown is on the reader. They can tap any time; Send gives them {TAP_WINDOW_SECONDS} seconds.
           </div>
         : onReader.busy
           ? <div style={{ fontSize: '.76rem', color: 'var(--amber)', marginTop: 8 }}>
               {onReader.busy === 'collect_inputs' ? 'The reader is still asking the last customer a question.' : 'The reader is busy with another payment.'}
             </div>
           : null)}
+      {stage === 'tap' && (
+        <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
+          <div style={{ fontSize: '.8rem', color: 'var(--gold)', fontWeight: 700 }}>The breakdown is on the reader. Waiting for their tap · {tapSecondsLeft}s</div>
+          <div style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.45 }}>The charge goes through when the time is up, with the card they tapped. If nobody taps, the reader then asks for the card.</div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button className="btn btn-primary btn-sm" style={{ flex: 1 }} onClick={() => tapWaiter.current?.('tapped')}>They tapped — finish now</button>
+            <button className="btn btn-ghost btn-sm" onClick={() => tapWaiter.current?.('cancel')}>Cancel</button>
+          </div>
+        </div>
+      )}
       {stage === 'done' && <div style={{ fontSize: '.8rem', color: 'var(--green, #3fb950)', marginTop: 8 }}>Taken.</div>}
       {err && <div style={{ fontSize: '.76rem', color: 'var(--red)', marginTop: 6 }}>{err}</div>}
       <div style={{ marginTop: 10 }}>
         {busy ? (
           <button className="btn btn-ghost" style={{ width: '100%' }} disabled={stage === 'capturing'} onClick={cancel}>Cancel on the reader</button>
-        ) : stage !== 'done' && (
+        ) : stage !== 'done' && stage !== 'tap' && (
           <button className="btn btn-primary" style={{ width: '100%' }} disabled={!quote || !readerId} onClick={send}>
             {canResend ? 'Send again to the reader' : `Send ${quote ? fmt(Number(quote.total)) : ''} to the reader`}
           </button>

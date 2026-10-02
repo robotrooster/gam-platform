@@ -5,7 +5,7 @@ import { useAuth } from '../context/AuthContext'
 import {
   discoverReaders, connectReader, collectCardPayment, cancelCurrentPayment, clearReaderPrompt,
   createTerminalIntent, processIntentOnReader, pollPiUntilTerminal,
-  cancelTerminalIntent, showCartOnReader as showCartLive,
+  cancelTerminalIntent, showCartOnReader as showCartLive, TAP_WINDOW_SECONDS,
   listRegisteredReaders, registerNewReader, archiveRegisteredReader,
   type RegisteredReader,
 } from '../lib/terminal'
@@ -195,7 +195,7 @@ export function POSPage() {
   const [readerModal, setReaderModal] = useState(false)
   const [readers, setReaders] = useState<any[]>([])  // Bluetooth-discovered SDK readers
   const [activeReader, setActiveReader] = useState<ActiveReader | null>(null)
-  const [terminalStatus, setTerminalStatus] = useState<'idle'|'discovering'|'connecting'|'collecting'|'capturing'|'error'>('idle')
+  const [terminalStatus, setTerminalStatus] = useState<'idle'|'discovering'|'connecting'|'awaiting_tap'|'collecting'|'capturing'|'error'>('idle')
   // S654 (Nic): "I don't want it to void the charge… revert back to the cart so
   // they can try again." A card charge the reader timed out on (or declined)
   // stays open with the cart; Charge sends it again. It is voided only when the
@@ -641,6 +641,7 @@ export function POSPage() {
     if (terminalStatus === 'collecting' || terminalStatus === 'capturing') return
     if (!liveCartSig) { takeDownLiveCart(); setReaderCart(null); return }
     if (shownOnReader.current && shownOnReader.current.readerId !== liveReaderId) takeDownLiveCart()
+    if (readerCart?.shown && readerCart.sig === liveCartSig && shownOnReader.current?.readerId === liveReaderId) return
     let cancelled = false
     const timer = setTimeout(() => {
       const call = showCartLive({ stripeReaderId: liveReaderId!, propertyId: registerProperty, items: liveCartLines,
@@ -656,6 +657,32 @@ export function POSPage() {
   // Leaving the register takes the breakdown off the reader.
   useEffect(() => () => takeDownLiveCart(), [])   // eslint-disable-line react-hooks/exhaustive-deps
   const breakdownIsUp = !!readerCart?.shown && readerCart.sig === liveCartSig
+  // The latest cart, read when the tap window ends — the cashier may still have
+  // changed it while the customer was reading the breakdown.
+  const latest = useRef({ cart, discountAmt, tenantId, posCustomerId })
+  latest.current = { cart, discountAmt, tenantId, posCustomerId }
+
+  // S654 (Nic): "leave it going for like thirty to forty-five seconds. They tap
+  // and then it processes." After Charge the breakdown stays up for the tap.
+  // Stripe sends no word of the tap itself, so the window ends on its own, or
+  // early with "They tapped — finish now", or "Cancel" goes back to the cart.
+  const [tapEndsAt, setTapEndsAt] = useState<number | null>(null)
+  const [tapNow, setTapNow] = useState(Date.now())
+  const tapWaiter = useRef<((o: 'tapped' | 'cancel') => void) | null>(null)
+  useEffect(() => {
+    if (!tapEndsAt) return
+    const t = setInterval(() => setTapNow(Date.now()), 250)
+    return () => clearInterval(t)
+  }, [tapEndsAt])
+  useEffect(() => () => tapWaiter.current?.('cancel'), [])
+  const waitForTap = () => new Promise<'tapped' | 'time' | 'cancel'>(resolve => {
+    const ms = TAP_WINDOW_SECONDS * 1000
+    const done = (o: 'tapped' | 'time' | 'cancel') => { clearTimeout(timer); tapWaiter.current = null; setTapEndsAt(null); resolve(o) }
+    const timer = setTimeout(() => done('time'), ms)
+    tapWaiter.current = done
+    setTapNow(Date.now()); setTapEndsAt(Date.now() + ms)
+  })
+  const tapSecondsLeft = tapEndsAt ? Math.max(0, Math.ceil((tapEndsAt - tapNow) / 1000)) : 0
 
   const applyDiscountCode = () => {
     const d = (discounts as any[]).find((x:any) => x.code?.toLowerCase() === discountCode.toLowerCase())
@@ -870,6 +897,31 @@ export function POSPage() {
     setTerminalStatus('collecting'); setTerminalError('')
     let piId: string | null = null
     try {
+      // S654 (Nic): "Can the tap happen in the background while the display is
+      // still up for the breakdown?" Yes — the breakdown stays up (it was put
+      // there while the cart was rung) for the tap window; a card tapped on it
+      // is what the charge goes through with. Nothing is charged until the
+      // window ends, so "Cancel" simply goes back to the cart.
+      let breakdownUp = false
+      if (activeReader.type === 'smart') {
+        breakdownUp = breakdownIsUp
+        await liveCartCall.current?.catch(() => {})
+        if (!breakdownUp) {
+          const l = latest.current
+          const r = await showCartLive({ stripeReaderId: activeReader.stripeReaderId, propertyId: registerProperty,
+            items: l.cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax })),
+            discountAmount: l.discountAmt, tenantId: l.tenantId || null, posCustomerId: l.posCustomerId || null }).catch(() => null)
+          breakdownUp = !!r?.shown
+          if (breakdownUp) shownOnReader.current = { readerId: activeReader.stripeReaderId, propertyId: registerProperty }
+        }
+        if (breakdownUp) {
+          setTerminalStatus('awaiting_tap')
+          const outcome = await waitForTap()
+          if (outcome === 'cancel') { setTerminalStatus('idle'); return }
+          setTerminalStatus('collecting')
+          await liveCartCall.current?.catch(() => {})
+        }
+      }
       // S554: mint the PI against the SERVER's authoritative total (same
       // computeCartTotals /transactions runs), not the client-side total.
       // Server tax can differ from item.tax_rate when a pos_tax_rates row is
@@ -877,20 +929,16 @@ export function POSPage() {
       // the card is captured (money taken, no sale).
       // S648: the server prices the reader charge from the cart itself, card
       // fee included — the register no longer sends an amount.
-      const cartLines = cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
-      // S654: a breakdown still being sent lands before the charge does; when
-      // the breakdown has been up for this exact cart, the customer has had it
-      // to tap on and the reader finishes with that tap straight away.
-      const cartOnReader = breakdownIsUp
-      await liveCartCall.current?.catch(() => {})
-      const who = { tenantId: tenantId || null, posCustomerId: posCustomerId || null, cartOnReader }
+      const l = latest.current
+      const cartLines = l.cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
+      const who = { tenantId: l.tenantId || null, posCustomerId: l.posCustomerId || null, cartOnReader: breakdownUp }
       let intent: { id: string; clientSecret: string } | null = null
       // S654: a charge the reader timed out on is sent again as-is. The server
       // re-prices the cart and refuses a changed one, in which case the old
       // charge is voided and a fresh one minted.
       if (pendingIntent && activeReader.type === 'smart' && pendingIntent.readerId === activeReader.stripeReaderId) {
         try {
-          await processIntentOnReader({ paymentIntentId: pendingIntent.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: discountAmt, ...who })
+          await processIntentOnReader({ paymentIntentId: pendingIntent.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: l.discountAmt, ...who })
           intent = { id: pendingIntent.id, clientSecret: '' }
         } catch {
           await cancelTerminalIntent(pendingIntent.id).catch(() => {})
@@ -898,10 +946,10 @@ export function POSPage() {
         }
       }
       if (!intent) {
-        const fresh = await createTerminalIntent({ items: cartLines, discountAmount: discountAmt, propertyId: registerProperty, description: 'GAM POS sale' })
+        const fresh = await createTerminalIntent({ items: cartLines, discountAmount: l.discountAmt, propertyId: registerProperty, description: 'GAM POS sale' })
         intent = fresh
         if (activeReader.type === 'smart') {
-          await processIntentOnReader({ paymentIntentId: fresh.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: discountAmt, ...who })
+          await processIntentOnReader({ paymentIntentId: fresh.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: l.discountAmt, ...who })
         }
       }
       piId = intent.id
@@ -1360,10 +1408,23 @@ export function POSPage() {
                 </span>
               </button>
               {/* S654: what the customer is looking at, and the order that keeps it there. */}
-              {activeReader?.type==='smart' && cart.length>0 && terminalStatus!=='collecting' && terminalStatus!=='capturing' && (
+              {terminalStatus==='awaiting_tap' && (
+                <div style={{display:'grid',gap:6,padding:'8px 10px',border:'1px solid var(--gold)',borderRadius:'var(--r-md)',background:'var(--gold-bg)'}}>
+                  <div style={{fontSize:'.78rem',color:'var(--gold)',fontWeight:700,lineHeight:1.45}}>
+                    The breakdown is on the reader. Waiting for their tap · {tapSecondsLeft}s
+                  </div>
+                  <div style={{fontSize:'.72rem',color:'var(--text-2)',lineHeight:1.45}}>
+                    The charge goes through when the time is up, with the card they tapped. If nobody taps, the reader then asks for the card.
+                  </div>
+                  <div style={{display:'flex',gap:6}}>
+                    <button type="button" className="btn btn-primary btn-sm" style={{flex:1}} onClick={()=>tapWaiter.current?.('tapped')}>They tapped — finish now</button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={()=>tapWaiter.current?.('cancel')}>Cancel</button>
+                  </div>
+                </div>)}
+              {activeReader?.type==='smart' && cart.length>0 && terminalStatus!=='awaiting_tap' && terminalStatus!=='collecting' && terminalStatus!=='capturing' && (
                 breakdownIsUp
                   ? <div style={{fontSize:'.75rem',color:'var(--gold)',fontWeight:600,lineHeight:1.45,padding:'6px 8px',border:'1px solid var(--gold)',borderRadius:'var(--r-md)',background:'var(--gold-bg)'}}>
-                      The breakdown is on the reader. Let them tap there, then press Charge.
+                      The breakdown is on the reader. They can tap any time; Charge gives them {TAP_WINDOW_SECONDS} seconds.
                     </div>
                   : readerCart?.busy && readerCart.sig === liveCartSig
                     ? <div style={{fontSize:'.72rem',color:'var(--amber)',lineHeight:1.45}}>
@@ -1386,6 +1447,7 @@ export function POSPage() {
             <button className="btn btn-primary" style={{width:'100%'}} disabled={
               cart.length===0
               || checkoutMut.isLoading
+              || terminalStatus==='awaiting_tap'
               || terminalStatus==='collecting'
               || terminalStatus==='capturing'
               || (method==='charge' && (chargeBlocked || !registerProperty || (!tenantId && !posCustomerId)))
@@ -1397,7 +1459,7 @@ export function POSPage() {
               if (stayInCart && !stay) { setStayModal(true); return }
               method==='card'?chargeWithReader():checkoutMut.mutate(undefined)
             }}>
-              {checkoutMut.isLoading?'Processing...':terminalStatus==='collecting'?'Awaiting card…':terminalStatus==='capturing'?'Capturing…'
+              {checkoutMut.isLoading?'Processing...':terminalStatus==='awaiting_tap'?'Waiting for the tap…':terminalStatus==='collecting'?'Awaiting card…':terminalStatus==='capturing'?'Capturing…'
                :stayInCart&&!stay?'Pick a site and dates'
                :'Charge '+fmt(total)}
             </button>
