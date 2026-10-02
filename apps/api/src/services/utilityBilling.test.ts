@@ -1274,11 +1274,14 @@ describe('S560 billMoveOutRead odometer rollover', () => {
 
     // Prior read, then the move-out read stamped to the CURRENT cycle — exactly
     // what the special-read route writes when someone unplugs and drives away.
-    const cycle = new Date().toISOString().slice(0, 8) + '01'
+    // S654: dates come from the database's clock (the suite crosses midnight UTC at 5 pm Phoenix).
+    const dd = (await db.query<{ today: string; yesterday: string; cycle: string }>(
+      `SELECT CURRENT_DATE::text AS today, (CURRENT_DATE - 1)::text AS yesterday, date_trunc('month', CURRENT_DATE)::date::text AS cycle`)).rows[0]
+    const cycle = dd.cycle
     // S654: the prior read must be BEFORE the move-out read. Dated on the
     // cycle's 1st, it equalled today's move-out read every 1st of the month
     // and the suite went red for 'no prior read'.
-    const priorDay = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10)
+    const priorDay = dd.yesterday
     await seedReadingAt(meterId, priorDay, cycle, 1000, 'monthly_cycle', base.landlordUserId)
     const { rows: [mo] } = await db.query<any>(
       `INSERT INTO utility_meter_readings
@@ -1299,7 +1302,7 @@ describe('S560 billMoveOutRead odometer rollover', () => {
         WHERE ub.meter_id = $1`, [meterId])
     expect(billed.rows.length).toBe(1)
     expect(billed.rows[0].status).toBe('billed')
-    expect(billed.rows[0].due_date).toBe(new Date().toISOString().slice(0, 10))
+    expect(billed.rows[0].due_date).toBe(dd.today)
   })
 
   it('says WHY it did not bill when the cycle was already billed off the monthly run', async () => {
@@ -1315,11 +1318,14 @@ describe('S560 billMoveOutRead odometer rollover', () => {
     await attachMeterToUnit(meterId, unitId)
     await setMeterRateBase(meterId, 1, 0)
 
-    const cycle = new Date().toISOString().slice(0, 8) + '01'
+    // S654: dates come from the database's clock (the suite crosses midnight UTC at 5 pm Phoenix).
+    const dd = (await db.query<{ today: string; yesterday: string; cycle: string }>(
+      `SELECT CURRENT_DATE::text AS today, (CURRENT_DATE - 1)::text AS yesterday, date_trunc('month', CURRENT_DATE)::date::text AS cycle`)).rows[0]
+    const cycle = dd.cycle
     // S654: the prior read must be BEFORE the move-out read. Dated on the
     // cycle's 1st, it equalled today's move-out read every 1st of the month
     // and the suite went red for 'no prior read'.
-    const priorDay = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10)
+    const priorDay = dd.yesterday
     await seedReadingAt(meterId, priorDay, cycle, 1000, 'monthly_cycle', base.landlordUserId)
     const mk = async (v: number) => (await db.query<any>(
       `INSERT INTO utility_meter_readings

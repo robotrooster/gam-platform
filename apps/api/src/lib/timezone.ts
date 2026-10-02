@@ -53,3 +53,16 @@ export function localDateTimeToUtc(localISO: string, tz: string): Date {
   const asUTC = new Date(localISO + 'Z')
   return new Date(asUTC.getTime() - offsetMin * 60 * 1000)
 }
+
+/**
+ * S654: today's calendar date where the PROPERTY is. A final utility invoice
+ * written at 5:30 pm in Phoenix was dated tomorrow, because `new Date()
+ * .toISOString()` is UTC and UTC had already turned over. Any "today" that
+ * lands on an invoice, a due date or a bill must come from the property's
+ * clock, never the server's UTC clock.
+ */
+export function todayIn(tz: string | null | undefined): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz || 'America/Phoenix', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date())
+}

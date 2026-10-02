@@ -129,7 +129,7 @@ export async function generateFinalUtilityInvoice(
     SELECT l.id, l.landlord_id, l.unit_id,
            (SELECT lt.tenant_id FROM lease_tenants lt
              WHERE lt.lease_id = l.id AND lt.role = 'primary' LIMIT 1) AS tenant_id,
-           u.unit_number, p.name AS property_name
+           u.unit_number, p.name AS property_name, p.timezone AS property_timezone
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
@@ -144,13 +144,14 @@ export async function generateFinalUtilityInvoice(
      ORDER BY ub.billing_cycle_month ASC`, [leaseId])
   if (bills.length === 0) return null
   const total = round2(bills.reduce((s: number, b: any) => s + Number(b.amount), 0))
-  const today = new Date().toISOString().slice(0, 10)
+  // S654: the property's today, not UTC's — after 5 pm here UTC is already tomorrow.
+  const today = todayIn(lease.property_timezone)
 
   const client = await getClient()
   let invoiceId: string
   try {
     await client.query('BEGIN')
-    const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, new Date().getFullYear())
+    const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, Number(today.slice(0, 4)))
     const inv = await client.query<{ id: string }>(
       `INSERT INTO invoices (
          landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date,
@@ -1356,6 +1357,7 @@ async function runGeneration(
 // ----- S26b-tz: per-timezone scoped variant + manager registration -----
 
 import { registerEngine } from './timezoneCronManager'
+import { todayIn } from '../lib/timezone'
 
 /**
  * Run invoice generation scoped to leases whose property is in the given
