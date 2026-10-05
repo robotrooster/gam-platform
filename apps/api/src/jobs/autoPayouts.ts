@@ -47,7 +47,7 @@ import { firePayoutForConnectAccount, getAvailableUsdBalance } from '../services
 import { stampPayoutTransfers } from '../services/payoutComposition'
 import { takePayoutCut } from '../services/payoutCut'
 import { createAdminNotification } from '../services/adminNotifications'
-import { reconcilePlatformHeldPayments, recoverPendingPlatformTransfers } from '../services/landlordPassthrough'
+import { reconcilePlatformHeldForAccount, recoverPendingPlatformTransfers } from '../services/landlordPassthrough'
 import { reconcileBusinessHeldFunds } from '../services/heldPayouts'
 import { collectOwedInstantMargins } from '../services/instantWithdrawalMargin'
 import {
@@ -111,53 +111,40 @@ function addDays(date: Date, n: number): Date {
   return d
 }
 
-// D1 (Nic, S561): the batch INITIATES on the weekday whose standard-payout
-// arrival lands the money in the landlord's bank BY FRIDAY. Standard payouts
-// settle T+1–T+2 business days, so we target TUESDAY: T+2 → Thursday, a full
-// business-day buffer before Friday. Wednesday would be razor-thin at T+2
-// (Wed+2 = Fri, no margin) and only safe if the account reliably settles T+1.
-// PINNED PENDING C4 (live-account payout speed): if the live account is
-// confirmed reliably T+1, move to Wednesday to reclaim a float day.
-// ── S640 (Nic): THURSDAY ────────────────────────────────────────────────────
+// ── 10/5 (Nic): TUESDAY AND FRIDAY WHILE RENT COMES IN, THEN TUESDAYS ──────
 //
-//   "Let's do the disbursement Thursdays... it'll either land Friday or Monday
-//    like you said."
+//   "At the first part of the month when money's coming in... money hitting
+//    their bank Tuesday and Friday. Anything in their Stripe balance. That way
+//    it's never more than a couple of days from a payout. After the 10th of the
+//    month, we can drop it to once a week. I think Tuesday should be the day
+//    that it hits, not Thursday."
 //
-// A standard Stripe payout lands one to two business days out, so Thursday
-// reaches the landlord's bank Friday at best and Monday at worst — money in
-// hand for the weekend when it moves fast, and waiting at the start of the week
-// when it does not. Tuesday was marginally quicker to usable funds; Nic weighed
-// that against landing on a Friday and chose Friday. Change this constant and
-// the holiday shift, the weekly gate and the run instant all follow.
-const PAYOUT_TARGET_DOW = 4  // Thursday (0=Sun … 6=Sat)
+// These are LANDING days. The run fires at 01:00 UTC — the evening before in
+// Arizona — and this account's standard payouts have arrived on the day they
+// were created (Sep 11, 21 and 22: arrival_date = the UTC creation day), so the
+// run day IS the landing day. Tuesday every week; Friday too while its date is
+// the 1st–10th. A run day that is a federal holiday moves to the next business
+// day (no backward compensation), exactly as before. Supersedes S640's
+// Thursday. Evaluated per Stripe Connect account (the candidates below).
+const EARLY_MONTH_LAST_DAY = 10
+const TUESDAY = 2
+const FRIDAY = 5
 
-// The target payout day for the work-week containing `now`, computed from any
-// day of that week. Sun is treated as day 7 (end of a Mon..Sun week) so the
-// offset is stable; weekend inputs map back to that week's target day, which
-// is harmless because shouldRunToday never fires on a weekend or holiday.
-function thisWeeksTargetDay(now: Date, tz: string, targetDow: number): Date {
-  const dow = localDayOfWeek(now, tz)
-  const d = dow === 0 ? 7 : dow
-  return addDays(now, targetDow - d)
+function addDaysIso(iso: string, n: number): string {
+  const d = new Date(iso + 'T12:00:00Z')
+  d.setUTCDate(d.getUTCDate() + n)
+  return d.toISOString().slice(0, 10)
 }
-
-function nextWeekday(date: Date, tz: string): Date {
-  let d = addDays(date, 1)
-  while (true) {
-    const dow = localDayOfWeek(d, tz)
-    if (dow >= 1 && dow <= 5) return d
-    d = addDays(d, 1)
-  }
+/** A scheduled landing day before any holiday shift. */
+function isScheduledLandingDate(iso: string): boolean {
+  const d = new Date(iso + 'T12:00:00Z')
+  const dow = d.getUTCDay()
+  return dow === TUESDAY || (dow === FRIDAY && d.getUTCDate() <= EARLY_MONTH_LAST_DAY)
 }
-
-function thisWeeksAutoPayoutDate(now: Date, tz: string): Date {
-  // If the target day is a federal holiday, shift FORWARD to the next weekday
-  // (D1: no backward compensation — holiday weeks simply land the following
-  // Mon and everyone expects that).
-  let d = thisWeeksTargetDay(now, tz, PAYOUT_TARGET_DOW)
-  while (US_FEDERAL_HOLIDAYS.has(localDateString(d, tz))) {
-    d = nextWeekday(d, tz)
-  }
+/** The first business day on or after `iso`. */
+function onOrAfterHoliday(iso: string): string {
+  let d = iso
+  while (!isBusinessDayUtc(d)) d = addDaysIso(d, 1)
   return d
 }
 
@@ -267,10 +254,15 @@ export function nextPayoutDateUtc(from: Date = new Date()): string {
 }
 
 export function shouldRunToday(now: Date = new Date(), tz: string = TZ): boolean {
-  const dow = localDayOfWeek(now, tz)
-  if (dow < 1 || dow > 5) return false
-  if (US_FEDERAL_HOLIDAYS.has(localDateString(now, tz))) return false
-  return localDateString(now, tz) === localDateString(thisWeeksAutoPayoutDate(now, tz), tz)
+  const today = localDateString(now, tz)
+  if (!isBusinessDayUtc(today)) return false
+  // Today runs if it is a scheduled landing day, or a scheduled day from the
+  // last week that a holiday pushed onto today.
+  for (let back = 0; back <= 6; back++) {
+    const d = addDaysIso(today, -back)
+    if (isScheduledLandingDate(d) && onOrAfterHoliday(d) === today) return true
+  }
+  return false
 }
 
 // ============================================================================
@@ -285,8 +277,9 @@ export function shouldRunToday(now: Date = new Date(), tz: string = TZ): boolean
 const MIN_PAYOUT_AMOUNT = 100
 /** ...and after this many days, move it whatever it is. Nothing strands. */
 const MAX_DAYS_BELOW_MINIMUM = 30
-/** Never pay the same account twice inside this window. */
-const MIN_DAYS_BETWEEN_PAYOUTS = 5
+/** Never pay the same Stripe account twice inside this window. 10/5: two days —
+ *  Tuesday→Friday is three and Friday→Tuesday four (was five, for one run a week). */
+const MIN_DAYS_BETWEEN_PAYOUTS = 2
 
 export interface PayoutResult {
   candidatesScanned: number
@@ -386,17 +379,20 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
   // landlord's bank since. Those landlords are paid on today's run whatever day
   // it is. Once paid, a disbursement exists after the transfer and they drop
   // out — this never repeats.
-  const catchUp = new Set<string>((await query<{ user_id: string }>(
-    `SELECT DISTINCT i.landlord_user_id AS user_id
+  // 10/5: keyed by the Stripe account the transfer landed in, never the login.
+  const catchUp = new Set<string>((await query<{ account: string }>(
+    `SELECT DISTINCT i.destination_connect_account_id AS account
        FROM platform_transfer_intents i
-      WHERE i.status = 'transferred' AND i.landlord_user_id IS NOT NULL
+      WHERE i.status = 'transferred' AND i.landlord_id IS NOT NULL
+        AND i.destination_connect_account_id IS NOT NULL
         AND i.transferred_at > i.created_at + interval '1 hour'
         AND i.transferred_at > NOW() - interval '21 days'
         AND i.transferred_at > COALESCE(
-              (SELECT max(d.created_at) FROM disbursements d WHERE d.user_id = i.landlord_user_id), 'epoch')`
-  )).map(r => r.user_id))
+              (SELECT max(d.created_at) FROM disbursements d
+                WHERE d.stripe_account_id = i.destination_connect_account_id), 'epoch')`
+  )).map(r => r.account))
   if (catchUp.size && !isPayoutDay) {
-    logger.info({ users: [...catchUp] }, '[auto_payouts] paying out late-landed transfers on a non-payout day')
+    logger.info({ accounts: [...catchUp] }, '[auto_payouts] paying out late-landed transfers on a non-payout day')
   }
 
   // Build the candidate list: every Connect-ready landlord/user + pm_company.
@@ -414,8 +410,11 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
   // the 6-day pre-skip all key off it, so all downstream 'user' handling is
   // unchanged. Readiness is gated on the SAME anchor that owns the account
   // (CASE), never a mix of entity account + user readiness.
+  // 10/5 (Nic): ONE candidate per Stripe Connect account — "It's not per
+  // property. It's not per company. It's per connect account." Two companies
+  // paying into one account are one payout; one login with two accounts is two.
   const userRows = await query<{ entity_id: string; stripe_connect_account_id: string }>(
-    `SELECT entity_id, stripe_connect_account_id FROM (
+    `SELECT DISTINCT ON (stripe_connect_account_id) entity_id, stripe_connect_account_id FROM (
        SELECT u.id AS entity_id,
               COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS stripe_connect_account_id,
               CASE WHEN l.stripe_connect_account_id IS NOT NULL
@@ -425,7 +424,8 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
          FROM users u
          LEFT JOIN landlords l ON l.user_id = u.id
      ) x
-     WHERE x.stripe_connect_account_id IS NOT NULL AND x.ready = TRUE`
+     WHERE x.stripe_connect_account_id IS NOT NULL AND x.ready = TRUE
+     ORDER BY stripe_connect_account_id, entity_id`
   )
   const pmRows = await query<{ entity_id: string; stripe_connect_account_id: string }>(
     `SELECT id AS entity_id, stripe_connect_account_id
@@ -494,7 +494,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
     // below still measures the roll — that reporting is worth keeping — but it
     // no longer decides who gets paid.
     ...(isPayoutDay ? userRows.map((r): UserCandidate => ({ kind: 'user', ...r }))
-                    : userRows.filter(r => catchUp.has(r.entity_id)).map((r): UserCandidate => ({ kind: 'user', ...r }))),
+                    : userRows.filter(r => catchUp.has(r.stripe_connect_account_id)).map((r): UserCandidate => ({ kind: 'user', ...r }))),
     ...(weeklyDay ? pmRows.map((r): PmCandidate => ({ kind: 'pm_company', ...r })) : []),
     ...(weeklyDay ? bizRows.map((r): BusinessCandidate => ({ kind: 'business', ...r })) : []),
   ]
@@ -502,7 +502,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
 
   for (const cand of candidates) {
     try {
-      const isCatchUp = !isPayoutDay && cand.kind === 'user' && catchUp.has(cand.entity_id)
+      const isCatchUp = !isPayoutDay && cand.kind === 'user' && catchUp.has(cand.stripe_connect_account_id)
       const fired = await processOneCandidate(cand, today, sweepDay, isCatchUp)
       if (fired === 'fired')                      result.payoutsFired++
       else if (fired === 'zero_balance')          result.skippedZeroBalance++
@@ -552,12 +552,15 @@ async function processOneCandidate(
   // it is one rule instead of a list of pairings.
   let daysSinceLastPayout: number | null = null
   if (cand.kind === 'user') {
+    // 10/5 (Nic): per Stripe ACCOUNT — "a login sits outside of the portfolio".
+    // Read by the login, paying one of a login's companies made this skip the
+    // login's other companies for days.
     const last = await query<{ days: string | null }>(
       // S652: a catch-up payout does not count against the spacing — it paid a
       // week that was missed, and must not push back the week that follows.
       `SELECT EXTRACT(EPOCH FROM (NOW() - MAX(created_at))) / 86400 AS days
-         FROM disbursements WHERE user_id = $1 AND trigger_type IS DISTINCT FROM 'catch_up'`,
-      [cand.entity_id]
+         FROM disbursements WHERE stripe_account_id = $1 AND trigger_type IS DISTINCT FROM 'catch_up'`,
+      [cand.stripe_connect_account_id]
     )
     daysSinceLastPayout = last[0]?.days == null ? null : Number(last[0].days)
     // S641: the month-end sweep is exempt. Its whole job is that nothing rolls
@@ -584,7 +587,8 @@ async function processOneCandidate(
     // side is minted from the link itself (bankFeed.finalizeConnection) and what
     // GAM is owed is netted from the balance before this runs; a link GAM cannot
     // debit is a notice on the Bank page, not a reason to keep someone's money.
-    await reconcilePlatformHeldPayments(cand.entity_id)
+    // 10/5: every company whose money lands in THIS account — not the login's.
+    await reconcilePlatformHeldForAccount(cand.stripe_connect_account_id)
   }
   // S648: business money is held on the platform too (invoices, register
   // sales); move what GAM owes the business to its account first.
@@ -704,13 +708,15 @@ async function processOneCandidate(
     // claimed onto the same cut (its own time is Stripe's clock).
     const disb = await queryOne<{ id: string }>(
       `INSERT INTO disbursements
-         (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, landlord_id)
+         (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, landlord_id, stripe_account_id)
        VALUES ($1, $4, $2, 'processing', $3, $6::timestamptz, 0,
                -- S652: the company whose Connect account this is, so the row says who
-               (SELECT id FROM landlords WHERE stripe_connect_account_id = $5 ORDER BY created_at LIMIT 1))
+               (SELECT id FROM landlords WHERE stripe_connect_account_id = $5 ORDER BY created_at LIMIT 1),
+               $5)
        ON CONFLICT (stripe_payout_id) WHERE stripe_payout_id IS NOT NULL
        DO UPDATE SET trigger_type = EXCLUDED.trigger_type, user_id = EXCLUDED.user_id,
                      landlord_id = COALESCE(disbursements.landlord_id, EXCLUDED.landlord_id),
+                     stripe_account_id = COALESCE(disbursements.stripe_account_id, EXCLUDED.stripe_account_id),
                      initiated_at = EXCLUDED.initiated_at,
                      notes = NULL
                WHERE disbursements.trigger_type = 'stripe_dashboard'

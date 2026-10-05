@@ -67,12 +67,12 @@ export async function fileConnectPayout(
     const created = await queryOne<{ id: string }>(
       `INSERT INTO disbursements
          (user_id, landlord_id, trigger_type, amount, status, stripe_payout_id, initiated_at, settled_at,
-          fee_charged, bank_name, bank_last4, notes, created_at)
-       VALUES ($1,$2,'stripe_dashboard',$3,$4,$5,$6,$7,0,$8,$9,$10,$6)
+          fee_charged, bank_name, bank_last4, notes, created_at, stripe_account_id)
+       VALUES ($1,$2,'stripe_dashboard',$3,$4,$5,$6,$7,0,$8,$9,$10,$6,$11)
        ON CONFLICT (stripe_payout_id) WHERE stripe_payout_id IS NOT NULL DO NOTHING
        RETURNING id`,
       [owner.user_id, owner.landlord_id, amount, status, p.id, initiated, settled, bank?.name ?? null, bank?.last4 ?? null,
-       'Paid out from the Stripe dashboard; recorded by GAM from Stripe.'])
+       'Paid out from the Stripe dashboard; recorded by GAM from Stripe.', owner.account])
     if (created?.id) {
       // S655: a payout made in Stripe sweeps the same balance GAM's transfers fill,
       // so it carried the transfers that landed before it. Record them, so this

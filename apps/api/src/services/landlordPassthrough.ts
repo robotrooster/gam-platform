@@ -543,6 +543,39 @@ export async function reconcilePlatformHeldPayments(
 }
 
 /**
+ * 10/5 (Nic): payouts are per Stripe CONNECT ACCOUNT — "It's not per property.
+ * It's not per company. It's per connect account... A login sits outside of the
+ * portfolio." Move the held rent of every company whose money lands in this
+ * account (one company, or several sharing one bank through one account), each
+ * with its own intent and transfer exactly as reconcilePlatformHeldPayments
+ * does — only found by the account, never by a login.
+ */
+export async function reconcilePlatformHeldForAccount(
+  stripeAccountId: string,
+): Promise<PassthroughResult> {
+  const companies = await query<{ id: string; user_id: string }>(
+    `SELECT l.id, l.user_id
+       FROM landlords l JOIN users u ON u.id = l.user_id
+      WHERE COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) = $1
+      ORDER BY l.created_at ASC`, [stripeAccountId])
+  const out: PassthroughResult = { attempted: false, payments_settled: 0, transfer_id: null, amount: 0 }
+  for (const c of companies) {
+    const reserved = await reservePlatformHeldBatch(c.user_id, c.id)
+    if (!reserved) continue
+    out.attempted = true
+    out.payments_settled += reserved.payments_settled
+    if (reserved.fullyNetted) {
+      out.transfer_id = out.transfer_id ?? `netted:${reserved.intentId}`
+      continue
+    }
+    const transferId = await executePlatformTransferIntent(reserved.intentId)
+    out.transfer_id = out.transfer_id ?? transferId
+    out.amount += reserved.transferAmount
+  }
+  return out
+}
+
+/**
  * RECOVER — re-fire any intent stuck in `pending` (its RESERVE committed but the
  * Transfer never confirmed). Safe to run repeatedly; the idempotency key dedupes
  * at Stripe. Called by the weekly cron and can be invoked by an admin/backstop.

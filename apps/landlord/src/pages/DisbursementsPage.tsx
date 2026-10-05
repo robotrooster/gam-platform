@@ -303,8 +303,11 @@ function NextPayoutFlow({ companyId }: { companyId: string }) {
   const ready = cut(data.ready, 'toYou')
   const clearing = cut(data.clearing, 'paid')
   const when = data.nextPayoutDate
-    ? new Date(data.nextPayoutDate).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })
-    : 'the next weekly run'
+    // 10/5: a date-only string is midnight UTC — the evening before in Arizona,
+    // which showed Wednesday the 7th here while the dashboard said Thursday the
+    // 8th. Read at noon UTC, as the dashboard does.
+    ? new Date(String(data.nextPayoutDate).slice(0, 10) + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })
+    : 'the next payout day'
   const step = (label: string, amount: number, sub: React.ReactNode, tone: string, active: boolean) => (
     <div style={{ flex: '1 1 180px', padding: '14px 16px', borderRadius: 10, background: active ? 'var(--bg-3)' : 'transparent',
                   border: '1px solid var(--border-1)', opacity: active ? 1 : .6 }}>
@@ -338,7 +341,7 @@ function NextPayoutFlow({ companyId }: { companyId: string }) {
         {arrow}
         {step(data.bankLinked ? `Sent to your bank ${when}` : 'Waiting for your bank', ready.total,
           data.bankLinked
-            ? 'Paid out automatically on the weekly run'
+            ? 'Paid out automatically on the next payout day (Tuesday and Friday through the 10th, then Tuesdays)'
             : <>Link your bank at <Link to="/banking" style={{ color: 'var(--gold)' }}>Banking</Link> and it goes out on the next run</>,
           'var(--green)', ready.rows.length > 0)}
       </div>

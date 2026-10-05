@@ -28,7 +28,8 @@ vi.mock('../services/connectPayouts', () => ({
   getAvailableUsdBalance: balanceMock,
 }))
 vi.mock('../services/landlordPassthrough', () => ({
-  reconcilePlatformHeldPayments: vi.fn(async () => ({
+  // 10/5: the run moves held rent per Stripe account.
+  reconcilePlatformHeldForAccount: vi.fn(async () => ({
     attempted: false, payments_settled: 0, transfer_id: null, amount: 0 })),
   recoverPendingPlatformTransfers: vi.fn(async () => ({ scanned: 0, recovered: 0, stillPending: 0 })),
 }))
@@ -71,9 +72,9 @@ async function seedPayable(opts: { lastPayoutDaysAgo?: number } = {}) {
         WHERE id = $1`, [landlordId, 'acct_weekly_' + landlordId.slice(0, 8)])
     if (opts.lastPayoutDaysAgo != null) {
       await c.query(
-        `INSERT INTO disbursements (user_id, landlord_id, amount, status, trigger_type, created_at)
-         VALUES ($1,$2,500,'pending','auto_friday', NOW() - ($3 || ' days')::interval)`,
-        [userId, landlordId, String(opts.lastPayoutDaysAgo)])
+        `INSERT INTO disbursements (user_id, landlord_id, amount, status, trigger_type, created_at, stripe_account_id)
+         VALUES ($1,$2,500,'pending','auto_friday', NOW() - ($3 || ' days')::interval, $4)`,
+        [userId, landlordId, String(opts.lastPayoutDaysAgo), 'acct_weekly_' + landlordId.slice(0, 8)])
     }
     await c.query('COMMIT')
     return { userId, landlordId }
@@ -116,9 +117,10 @@ describe('S640 weekly payout cadence', () => {
     expect(res.payoutsFired).toBe(1)
   })
 
-  // The dedup, as an interval rather than a calendar rule.
-  it('will not pay the same account twice inside five days', async () => {
-    await seedPayable({ lastPayoutDaysAgo: 2 })
+  // The dedup, as an interval rather than a calendar rule. 10/5: two days —
+  // Tuesday→Friday is three, Friday→Tuesday four.
+  it('will not pay the same account twice inside two days', async () => {
+    await seedPayable({ lastPayoutDaysAgo: 1 })
     balanceMock.mockResolvedValue(900 as any)
     const res = await processAutoPayouts(nextRunDate())
     expect(res.payoutsFired).toBe(0)

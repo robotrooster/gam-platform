@@ -23,7 +23,8 @@ vi.mock('../services/connectPayouts', () => ({
   getAvailableUsdBalance: balanceMock,
 }))
 vi.mock('../services/landlordPassthrough', () => ({
-  reconcilePlatformHeldPayments: vi.fn(async () => ({
+  // 10/5: the run moves held rent per Stripe account.
+  reconcilePlatformHeldForAccount: vi.fn(async () => ({
     attempted: false, payments_settled: 0, transfer_id: null, amount: 0 })),
   recoverPendingPlatformTransfers: vi.fn(async () => ({ scanned: 0, recovered: 0, stillPending: 0 })),
 }))
@@ -125,9 +126,9 @@ describe('S641 the sweep pays where the weekly run would not', () => {
           WHERE id = $1`, [landlordId, 'acct_sweep_' + landlordId.slice(0, 8)])
       if (lastPayoutDaysAgo != null) {
         await c.query(
-          `INSERT INTO disbursements (user_id, landlord_id, amount, status, trigger_type, created_at)
-           VALUES ($1,$2,500,'pending','auto_friday', NOW() - ($3 || ' days')::interval)`,
-          [userId, landlordId, String(lastPayoutDaysAgo)])
+          `INSERT INTO disbursements (user_id, landlord_id, amount, status, trigger_type, created_at, stripe_account_id)
+           VALUES ($1,$2,500,'pending','auto_friday', NOW() - ($3 || ' days')::interval, $4)`,
+          [userId, landlordId, String(lastPayoutDaysAgo), 'acct_sweep_' + landlordId.slice(0, 8)])
       }
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }

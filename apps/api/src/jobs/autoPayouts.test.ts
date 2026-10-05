@@ -26,7 +26,8 @@ const firePayoutMock = vi.hoisted(() => vi.fn(async () => ({ id: 'po_mock' })))
 const adminNotifyMock = vi.hoisted(() => vi.fn(async () => undefined))
 
 vi.mock('../services/landlordPassthrough', () => ({
-  reconcilePlatformHeldPayments: reconcileMock,
+  // 10/5: the run moves held rent per Stripe ACCOUNT, never per login.
+  reconcilePlatformHeldForAccount: reconcileMock,
   // S617: this was missing, so every single test in this file threw inside
   // processAutoPayouts' recovery step and dumped a stack into the run. The
   // engine catches it (recovery is best-effort and must never block a payout),
@@ -130,35 +131,51 @@ const atUtc = (isoDate: string, hour = 1) =>
   new Date(`${isoDate}T${String(hour).padStart(2, '0')}:00:00Z`)
 
 describe('shouldRunToday at the real 01:00 UTC firing instant (S617)', () => {
-  // S640: the payout is booked at Stripe on THURSDAY now. The cron fires at
-  // 01:00 UTC Thursday, which is 6pm PHOENIX WEDNESDAY — the job pushes the
-  // button the evening before, exactly as it did for the old Tuesday payout
-  // (6pm Phoenix Monday). Pinning the real instant is the whole point of these:
-  // every other fixture is noon Phoenix and would stay green either way.
-  it('is TRUE at 01:00 UTC on Thursday — 6pm Phoenix Wednesday', () => {
-    const t = atUtc('2026-07-30')
-    expect(t.toLocaleDateString('en-CA', { timeZone: 'America/Phoenix' })).toBe('2026-07-29')
+  // 10/5 (Nic): money LANDS Tuesday (and Friday through the 10th). The cron
+  // fires at 01:00 UTC on the landing day, which is 6pm PHOENIX THE DAY BEFORE.
+  it('is TRUE at 01:00 UTC on Tuesday — 6pm Phoenix Monday', () => {
+    const t = atUtc('2026-07-28')
+    expect(t.toLocaleDateString('en-CA', { timeZone: 'America/Phoenix' })).toBe('2026-07-27')
     expect(shouldRunToday(t)).toBe(true)
   })
 
-  it('is FALSE at 01:00 UTC on the other weekdays', () => {
+  it('is FALSE at 01:00 UTC on the other weekdays late in the month', () => {
     expect(shouldRunToday(atUtc('2026-07-27'))).toBe(false)
-    expect(shouldRunToday(atUtc('2026-07-28'))).toBe(false)
-    expect(shouldRunToday(atUtc('2026-07-29'))).toBe(false)
-    expect(shouldRunToday(atUtc('2026-07-31'))).toBe(false)
+    expect(shouldRunToday(atUtc('2026-07-30'))).toBe(false)   // Thursday — no longer the day
+    expect(shouldRunToday(atUtc('2026-07-31'))).toBe(false)   // Friday after the 10th
   })
 
   it('is FALSE at 01:00 UTC on the weekend', () => {
     expect(shouldRunToday(atUtc('2026-08-01'))).toBe(false)
     expect(shouldRunToday(atUtc('2026-08-02'))).toBe(false)
   })
+})
 
-  it('leaves a holiday week alone when the holiday is not the payout day', () => {
-    // Labor Day 2026 is Monday Sep 7. The payout day is Thursday, which the
-    // holiday does not touch — the shift only fires when the target day itself
-    // is a holiday.
-    expect(shouldRunToday(atUtc('2026-09-08'))).toBe(false)  // Tuesday, no longer the day
-    expect(shouldRunToday(atUtc('2026-09-10'))).toBe(true)   // 6pm Phoenix Wed Sep 9
+// ── 10/5 (Nic): TUESDAY AND FRIDAY THROUGH THE 10TH, THEN TUESDAYS ──────────
+describe('the payout days', () => {
+  it('October 2026: Fri 2, Tue 6, Fri 9, then Tuesdays only', () => {
+    const runs = Array.from({ length: 31 }, (_, i) => `2026-10-${String(i + 1).padStart(2, '0')}`)
+      .filter(d => shouldRunToday(atUtc(d)))
+    expect(runs).toEqual(['2026-10-02', '2026-10-06', '2026-10-09', '2026-10-13', '2026-10-20', '2026-10-27'])
+  })
+
+  it('a Friday after the 10th is not a payout day; the 10th itself is', () => {
+    expect(shouldRunToday(atUtc('2027-09-10'))).toBe(true)    // Friday the 10th
+    expect(shouldRunToday(atUtc('2026-09-11'))).toBe(false)   // Friday the 11th
+  })
+
+  it('a payout day on a federal holiday moves to the next business day', () => {
+    // Veterans Day 2025 is Tuesday Nov 11 → Wednesday Nov 12.
+    expect(shouldRunToday(atUtc('2025-11-11'))).toBe(false)
+    expect(shouldRunToday(atUtc('2025-11-12'))).toBe(true)
+    // Independence Day 2025 is Friday Jul 4 (inside the 1st–10th) → Monday Jul 7.
+    expect(shouldRunToday(atUtc('2025-07-04'))).toBe(false)
+    expect(shouldRunToday(atUtc('2025-07-07'))).toBe(true)
+  })
+
+  it('a holiday that is not a payout day changes nothing', () => {
+    // Labor Day 2026 is Monday Sep 7; Tuesday Sep 8 is still the day.
+    expect(shouldRunToday(atUtc('2026-09-08'))).toBe(true)
   })
 })
 
@@ -202,14 +219,14 @@ describe('nextPayoutDateUtc', () => {
   })
 })
 
-describe('shouldRunToday — Thursday gate (S640)', () => {
-  it('is TRUE on Thursday', () => {
-    expect(shouldRunToday(THURSDAY)).toBe(true)
+describe('shouldRunToday — late in the month only Tuesday (10/5)', () => {
+  it('is TRUE on Tuesday', () => {
+    expect(shouldRunToday(TUESDAY)).toBe(true)
   })
   it('is FALSE on every other weekday', () => {
     expect(shouldRunToday(MONDAY)).toBe(false)
-    expect(shouldRunToday(TUESDAY)).toBe(false)
     expect(shouldRunToday(WEDNESDAY)).toBe(false)
+    expect(shouldRunToday(THURSDAY)).toBe(false)
     expect(shouldRunToday(FRIDAY)).toBe(false)
   })
   it('is FALSE on the weekend', () => {
@@ -230,13 +247,13 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
 
   it('reconciles platform-held funds for a landlord user BEFORE firing the payout', async () => {
     const userId = await seedConnectReadyLandlord('acct_ll_1')
-    const res = await processAutoPayouts(THURSDAY)
+    const res = await processAutoPayouts(TUESDAY)
 
     expect(res.candidatesScanned).toBe(1)
     expect(res.payoutsFired).toBe(1)
 
-    // The reconcile (platform → Connect) ran for this landlord user...
-    expect(reconcileMock).toHaveBeenCalledWith(userId)
+    // The reconcile (platform → Connect) ran for this Stripe ACCOUNT...
+    expect(reconcileMock).toHaveBeenCalledWith('acct_ll_1')
     // ...and the payout (Connect → bank) fired against their account...
     expect(firePayoutMock).toHaveBeenCalledTimes(1)
     // ...in that order (transfer the owed funds, THEN sweep them out).
@@ -254,14 +271,13 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
 
   it('sweeps an ENTITY-anchored landlord (Stage 2: account on landlords, users NULL)', async () => {
     const userId = await seedEntityAnchoredLandlord('acct_entity_1')
-    const res = await processAutoPayouts(THURSDAY)
+    const res = await processAutoPayouts(TUESDAY)
 
     // The pre-Stage-2 scan (users-only) would have missed this entirely.
     expect(res.candidatesScanned).toBe(1)
     expect(res.payoutsFired).toBe(1)
-    // Reconcile keyed by the founding user (it re-resolves the entity account
-    // internally via COALESCE(entity, user)).
-    expect(reconcileMock).toHaveBeenCalledWith(userId)
+    // 10/5: reconcile keyed by the account itself.
+    expect(reconcileMock).toHaveBeenCalledWith('acct_entity_1')
     // Payout fired against the ENTITY account, not a user account.
     expect(firePayoutMock).toHaveBeenCalledTimes(1)
     expect((firePayoutMock.mock.calls as any[])[0][0]).toMatchObject({ connectAccountId: 'acct_entity_1' })
@@ -279,7 +295,7 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
         [landlordId])
       await c.query('COMMIT')
     } finally { c.release() }
-    const res = await processAutoPayouts(THURSDAY)
+    const res = await processAutoPayouts(TUESDAY)
     expect(res.candidatesScanned).toBe(0)
     expect(firePayoutMock).not.toHaveBeenCalled()
   })
@@ -290,9 +306,9 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
     reconcileMock.mockResolvedValueOnce({
       attempted: false, payments_settled: 0, transfer_id: null, amount: 0,
     })
-    const userId = await seedConnectReadyLandlord('acct_ll_2')
-    const res = await processAutoPayouts(THURSDAY)
-    expect(reconcileMock).toHaveBeenCalledWith(userId)
+    await seedConnectReadyLandlord('acct_ll_2')
+    const res = await processAutoPayouts(TUESDAY)
+    expect(reconcileMock).toHaveBeenCalledWith('acct_ll_2')
     expect(res.payoutsFired).toBe(1)
   })
 })
@@ -301,14 +317,16 @@ describe('processAutoPayouts — a transfer that landed late (S652)', () => {
   // Mountain View's Sep 16 batch could not transfer that week; the retry landed
   // it Sep 19 and it sat in the Stripe balance waiting a whole extra week.
   async function lateTransfer(userId: string, landedHoursAfter: number) {
-    const ll = await db.query(`SELECT id FROM landlords WHERE user_id=$1`, [userId])
+    const ll = await db.query(
+      `SELECT l.id, COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS acct
+         FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.user_id=$1`, [userId])
     await db.query(
       `INSERT INTO platform_transfer_intents
          (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, status,
           stripe_transfer_id, created_at, transferred_at)
-       VALUES ($1,$2,'acct_x',4154.89,4154.89,'transferred','tr_late', NOW() - interval '3 days',
+       VALUES ($1,$2,$4,4154.89,4154.89,'transferred','tr_late', NOW() - interval '3 days',
                NOW() - interval '3 days' + ($3 || ' hours')::interval)`,
-      [ll.rows[0].id, userId, String(landedHoursAfter)])
+      [ll.rows[0].id, userId, String(landedHoursAfter), ll.rows[0].acct])
   }
 
   it('pays it out on the next weekday run, even off the weekly day', async () => {
@@ -324,7 +342,7 @@ describe('processAutoPayouts — a transfer that landed late (S652)', () => {
     const userId = await seedConnectReadyLandlord('acct_late2')
     await lateTransfer(userId, 60)
     await processAutoPayouts(WEDNESDAY)                  // catch-up
-    const res = await processAutoPayouts(THURSDAY)       // the weekly day, a day later
+    const res = await processAutoPayouts(TUESDAY)       // the weekly day, a day later
     expect(res.skippedAlreadyPaidThisWeek).toBe(0)
     expect(res.payoutsFired).toBe(1)
   })
@@ -362,7 +380,7 @@ describe('a payout records what it carried', () => {
       [ll, userId])).rows[0].id
     getBalanceMock.mockResolvedValue(100)
 
-    const res = await processAutoPayouts(THURSDAY)
+    const res = await processAutoPayouts(TUESDAY)
     expect(res.payoutsFired).toBe(1)
     const d = (await db.query(`SELECT id FROM disbursements WHERE user_id=$1`, [userId])).rows[0]
     const linked = (await db.query(`SELECT disbursement_id FROM platform_transfer_intents WHERE id=$1`, [intent])).rows[0]
@@ -409,7 +427,7 @@ describe('a payout records what it carried', () => {
       return { id: 'po_after' } as any
     })
 
-    await processAutoPayouts(THURSDAY)
+    await processAutoPayouts(TUESDAY)
     await landed
 
     const d = (await db.query(`SELECT id FROM disbursements WHERE stripe_payout_id='po_after'`)).rows[0]
@@ -445,7 +463,7 @@ describe('a payout records what it carried', () => {
        VALUES ($1,'stripe_dashboard',100,'processing','po_race',NOW(),0,'Paid out from the Stripe dashboard; recorded by GAM from Stripe.',
                NOW() - interval '10 days')`,
       [userId])
-    await processAutoPayouts(THURSDAY)
+    await processAutoPayouts(TUESDAY)
     const rows = (await db.query(`SELECT trigger_type, notes FROM disbursements WHERE stripe_payout_id='po_race'`)).rows
     expect(rows).toEqual([{ trigger_type: 'auto_friday', notes: null }])
   })
@@ -462,7 +480,7 @@ describe('a payout records what it carried', () => {
                'Paid out from the Stripe dashboard; recorded by GAM from Stripe.', NOW() - interval '10 days')`,
       [userId])
     const ranAt = new Date()
-    await processAutoPayouts(THURSDAY)
+    await processAutoPayouts(TUESDAY)
     const claimed = (await db.query(
       `SELECT id, (initiated_at <= NOW()) AS on_our_clock, (initiated_at >= $1::timestamptz) AS after_start
          FROM disbursements WHERE stripe_payout_id='po_clock'`, [ranAt])).rows[0]
@@ -524,7 +542,7 @@ describe('the payout’s cut comes before its balance is read', () => {
       return { id: 'po_read' } as any
     })
 
-    await processAutoPayouts(THURSDAY)
+    await processAutoPayouts(TUESDAY)
 
     const d = (await db.query(
       `SELECT id, initiated_at <= $1::timestamptz AS cut_before_read FROM disbursements WHERE stripe_payout_id='po_read'`,
@@ -575,7 +593,7 @@ describe('one payout, one row', () => {
         `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, notes)
          VALUES ($1,'stripe_dashboard',100,'processing','po_race2',NOW(),0,'Paid out from the Stripe dashboard; recorded by GAM from Stripe.')`,
         [userId])
-      run = processAutoPayouts(THURSDAY)
+      run = processAutoPayouts(TUESDAY)
       run.catch(() => {})
       await untilSomeoneWaitsOnALock()          // the run's insert, waiting on the webhook's
       await webhook.query('COMMIT')
@@ -594,7 +612,7 @@ describe('one payout, one row', () => {
       `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, created_at)
        VALUES ($1,'catch_up',100,'settled','po_once',NOW() - interval '10 days',0,NOW() - interval '10 days')`,
       [userId])
-    await processAutoPayouts(THURSDAY)
+    await processAutoPayouts(TUESDAY)
     const rows = (await db.query(`SELECT trigger_type, status FROM disbursements WHERE stripe_payout_id='po_once'`)).rows
     expect(rows).toEqual([{ trigger_type: 'catch_up', status: 'settled' }])
   })
@@ -616,5 +634,56 @@ describe('a payout record says what GAM kept back', () => {
     expect(await intent(495, 0, 413)).toBe('82.00')            // the September platform fee
     expect(await intent(600, 50, 520)).toBe('30.00')           // a returned payment taken back is not GAM's fee
     expect(await intent(589, 0, 589)).toBe('0.00')
+  })
+})
+
+// ── 10/5 (Nic): PER STRIPE ACCOUNT, NEVER PER LOGIN ─────────────────────────
+//   "It's not per property. It's not per company. It's per connect account...
+//    A login sits outside of the portfolio. It is a window to view things."
+describe('processAutoPayouts — one payout per Stripe account', () => {
+  async function secondCompany(userId: string, account: string) {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id, billing_starts_at, stripe_connect_account_id, connect_payouts_enabled,
+                              connect_details_submitted, gam_debit_payment_method_id)
+       VALUES ($1, DATE '2000-01-01', $2, true, true, 'pm_test_bank') RETURNING id`, [userId, account])
+    return r.rows[0].id
+  }
+
+  it('one login with two companies on two accounts: both are paid in the same run', async () => {
+    firePayoutMock.mockImplementation((async (a: any) => ({ id: `po_${a.connectAccountId}` })) as any)
+    const userId = await seedEntityAnchoredLandlord('acct_mountain_view')
+    await secondCompany(userId, 'acct_oak_park')
+    const res = await processAutoPayouts(TUESDAY)
+    expect(res.candidatesScanned).toBe(2)
+    expect(res.payoutsFired).toBe(2)
+    expect(res.skippedAlreadyPaidThisWeek).toBe(0)
+    const paid = (firePayoutMock.mock.calls as any[]).map(c => c[0].connectAccountId).sort()
+    expect(paid).toEqual(['acct_mountain_view', 'acct_oak_park'])
+    const rows = await db.query(`SELECT stripe_account_id FROM disbursements ORDER BY stripe_account_id`)
+    expect(rows.rows.map((r: any) => r.stripe_account_id)).toEqual(['acct_mountain_view', 'acct_oak_park'])
+  })
+
+  // A company has at most one account (landlords_stripe_connect_account_id_uniq);
+  // two companies share one only through an older account kept on the login
+  // itself, which both fall back to.
+  it('two companies paying into ONE account: one payout', async () => {
+    const userId = await seedConnectReadyLandlord('acct_shared')
+    await db.query(`INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01')`, [userId])
+    const res = await processAutoPayouts(TUESDAY)
+    expect(res.candidatesScanned).toBe(1)
+    expect(res.payoutsFired).toBe(1)
+    expect(reconcileMock).toHaveBeenCalledWith('acct_shared')
+  })
+
+  it('a recent payout to one account never holds back the other', async () => {
+    firePayoutMock.mockImplementation((async (a: any) => ({ id: `po_${a.connectAccountId}` })) as any)
+    const userId = await seedEntityAnchoredLandlord('acct_a')
+    await secondCompany(userId, 'acct_b')
+    await db.query(
+      `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, fee_charged, stripe_account_id, created_at)
+       VALUES ($1, 'auto_friday', 50, 'settled', 'po_earlier', 0, 'acct_a', NOW() - interval '1 day')`, [userId])
+    const res = await processAutoPayouts(TUESDAY)
+    expect(res.skippedAlreadyPaidThisWeek).toBe(1)
+    expect((firePayoutMock.mock.calls as any[]).map(c => c[0].connectAccountId)).toEqual(['acct_b'])
   })
 })

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict k2AYefMRSq6OPenY0ZBpEJA0tPpVWkmPeIBprK057dais2vbXZpmN6yQTOCasm2
+\restrict 2ZTBhp1fQanPSADRpjjQwVciPbqRcvo1raJq60fmoPhfthWflQTrJ6Kcq1cOXgM
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4446,6 +4446,7 @@ CREATE TABLE public.disbursements (
     bank_account_id uuid,
     bank_name text,
     bank_last4 text,
+    stripe_account_id text,
     CONSTRAINT disbursements_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text]))),
     CONSTRAINT disbursements_trigger_type_check CHECK (((trigger_type IS NULL) OR (trigger_type = ANY (ARRAY['auto_friday'::text, 'manual_on_demand'::text, 'otp_legacy'::text, 'catch_up'::text, 'stripe_dashboard'::text]))))
 );
@@ -5788,7 +5789,7 @@ CREATE TABLE public.landlord_gam_charges (
     CONSTRAINT collected_never_exceeds_amount CHECK ((collected_amount <= amount)),
     CONSTRAINT landlord_gam_charges_amount_check CHECK ((amount > (0)::numeric)),
     CONSTRAINT landlord_gam_charges_collected_amount_check CHECK ((collected_amount >= (0)::numeric)),
-    CONSTRAINT landlord_gam_charges_kind_check CHECK ((kind = ANY (ARRAY['subscription'::text, 'manual_payment_fee'::text, 'bank_debit_cost'::text, 'device_installment'::text])))
+    CONSTRAINT landlord_gam_charges_kind_check CHECK ((kind = ANY (ARRAY['subscription'::text, 'manual_payment_fee'::text, 'bank_debit_cost'::text, 'device_installment'::text, 'screening_fee'::text])))
 );
 
 
@@ -10149,6 +10150,32 @@ CREATE TABLE public.screening_fee_accruals (
 
 
 --
+-- Name: screening_prepayments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.screening_prepayments (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid,
+    booking_id uuid,
+    tenant_id uuid,
+    email text,
+    amount numeric(10,2) NOT NULL,
+    source text NOT NULL,
+    source_id uuid,
+    status text DEFAULT 'unused'::text NOT NULL,
+    used_by_check_id uuid,
+    landlord_charge_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    used_at timestamp with time zone,
+    voided_at timestamp with time zone,
+    CONSTRAINT screening_prepayments_amount_check CHECK ((amount > (0)::numeric)),
+    CONSTRAINT screening_prepayments_source_check CHECK ((source = ANY (ARRAY['register'::text, 'pay_link'::text, 'booking_site'::text, 'schedule'::text]))),
+    CONSTRAINT screening_prepayments_status_check CHECK ((status = ANY (ARRAY['unused'::text, 'used'::text, 'void'::text])))
+);
+
+
+--
 -- Name: seasonal_tenancies; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -11891,10 +11918,13 @@ CREATE TABLE public.unit_bookings (
     cancelled_at timestamp with time zone,
     avoided_unit_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
     booked_check_out date,
+    stay_terms text,
+    screening_required boolean DEFAULT false NOT NULL,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
-    CONSTRAINT unit_bookings_status_check CHECK ((status = ANY (ARRAY['tentative'::text, 'confirmed'::text, 'checked_in'::text, 'checked_out'::text, 'cancelled'::text, 'no_show'::text])))
+    CONSTRAINT unit_bookings_status_check CHECK ((status = ANY (ARRAY['tentative'::text, 'confirmed'::text, 'checked_in'::text, 'checked_out'::text, 'cancelled'::text, 'no_show'::text]))),
+    CONSTRAINT unit_bookings_stay_terms_check CHECK (((stay_terms IS NULL) OR (stay_terms = ANY (ARRAY['lease'::text, 'stay'::text]))))
 );
 
 
@@ -12851,6 +12881,7 @@ CREATE TABLE public.utility_service_agreements (
     moveout_expected_on date,
     moveout_note text,
     final_bill_issued_at timestamp with time zone,
+    booking_id uuid,
     CONSTRAINT usa_billing_due_day_check CHECK (((billing_due_day >= 1) AND (billing_due_day <= 31))),
     CONSTRAINT usa_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
     CONSTRAINT usa_late_fee_accrual_period_check CHECK (((late_fee_accrual_period IS NULL) OR (late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text])))),
@@ -16038,6 +16069,14 @@ ALTER TABLE ONLY public.screening_fee_accruals
 
 
 --
+-- Name: screening_prepayments screening_prepayments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_prepayments
+    ADD CONSTRAINT screening_prepayments_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: seasonal_tenancies seasonal_tenancies_lease_unique; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16992,6 +17031,13 @@ CREATE INDEX credit_uses_paid_ahead_choice_idx ON public.credit_uses USING btree
 --
 
 CREATE INDEX credit_uses_refund_part_idx ON public.credit_uses USING btree (refund_part_id) WHERE (refund_part_id IS NOT NULL);
+
+
+--
+-- Name: disbursements_account_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX disbursements_account_created ON public.disbursements USING btree (stripe_account_id, created_at) WHERE (stripe_account_id IS NOT NULL);
 
 
 --
@@ -21755,6 +21801,20 @@ CREATE INDEX sales_leads_status_idx ON public.sales_leads USING btree (status, c
 
 
 --
+-- Name: screening_prepayments_one_per_booking; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX screening_prepayments_one_per_booking ON public.screening_prepayments USING btree (booking_id) WHERE ((booking_id IS NOT NULL) AND (status <> 'void'::text));
+
+
+--
+-- Name: screening_prepayments_person; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX screening_prepayments_person ON public.screening_prepayments USING btree (landlord_id, tenant_id, lower(email)) WHERE (status = 'unused'::text);
+
+
+--
 -- Name: service_interruptions_landlord_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -21983,6 +22043,13 @@ CREATE UNIQUE INDEX utility_meter_readings_one_cycle_read_per_month ON public.ut
 --
 
 CREATE UNIQUE INDEX utility_reading_runs_property_cycle_utility ON public.utility_reading_runs USING btree (property_id, billing_cycle_month, COALESCE(utility_type, 'all'::text));
+
+
+--
+-- Name: utility_service_agreements_one_per_booking; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX utility_service_agreements_one_per_booking ON public.utility_service_agreements USING btree (booking_id) WHERE (booking_id IS NOT NULL);
 
 
 --
@@ -29288,6 +29355,46 @@ ALTER TABLE ONLY public.screening_fee_accruals
 
 
 --
+-- Name: screening_prepayments screening_prepayments_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_prepayments
+    ADD CONSTRAINT screening_prepayments_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE SET NULL;
+
+
+--
+-- Name: screening_prepayments screening_prepayments_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_prepayments
+    ADD CONSTRAINT screening_prepayments_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: screening_prepayments screening_prepayments_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_prepayments
+    ADD CONSTRAINT screening_prepayments_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: screening_prepayments screening_prepayments_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_prepayments
+    ADD CONSTRAINT screening_prepayments_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: screening_prepayments screening_prepayments_used_by_check_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_prepayments
+    ADD CONSTRAINT screening_prepayments_used_by_check_id_fkey FOREIGN KEY (used_by_check_id) REFERENCES public.background_checks(id) ON DELETE SET NULL;
+
+
+--
 -- Name: seasonal_tenancies seasonal_tenancies_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -30880,6 +30987,14 @@ ALTER TABLE ONLY public.utility_reading_runs
 
 
 --
+-- Name: utility_service_agreements utility_service_agreements_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_service_agreements
+    ADD CONSTRAINT utility_service_agreements_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE SET NULL;
+
+
+--
 -- Name: utility_service_agreements utility_service_agreements_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -31019,5 +31134,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict k2AYefMRSq6OPenY0ZBpEJA0tPpVWkmPeIBprK057dais2vbXZpmN6yQTOCasm2
+\unrestrict 2ZTBhp1fQanPSADRpjjQwVciPbqRcvo1raJq60fmoPhfthWflQTrJ6Kcq1cOXgM
 
