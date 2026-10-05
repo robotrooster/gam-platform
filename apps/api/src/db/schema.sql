@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict XjqSKeyDmI5SFy9RR4o4K41ysrcPPXwLVFxRxkykcgvgRciE89477G7XK7LOSLN
+\restrict cfDFtxOHLMrYOiKIekj52AunDdKhlQ8gSeiIjCWcRibxdxprswDd4zXTLeZkeJA
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -178,6 +178,36 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: credit_remaining_moves_by_ledger(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.credit_remaining_moves_by_ledger() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  -- current_setting(..., true) is NULL when never set in this session: read
+  -- through COALESCE so NULL means "off".
+  IF COALESCE(current_setting('gam.credit_ledger', true), '') = 'on'
+     OR COALESCE(current_setting('gam.credit_backfill', true), '') = 'on' THEN
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'INSERT' AND NEW.amount_remaining <> NEW.amount_original THEN
+    RAISE EXCEPTION 'A new credit starts whole' USING ERRCODE = '23514';
+  ELSIF TG_OP = 'UPDATE' AND NEW.amount_remaining IS DISTINCT FROM OLD.amount_remaining THEN
+    RAISE EXCEPTION 'Credit balance moves only through credit_uses' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $$;
+
+
+--
+-- Name: FUNCTION credit_remaining_moves_by_ledger(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.credit_remaining_moves_by_ledger() IS 'S655 C0: amount_remaining on both credit tables moves only through credit_uses (trg_credit_uses_apply) or the deploy backfill; a new credit starts whole.';
 
 
 --
@@ -15041,14 +15071,6 @@ ALTER TABLE ONLY public.payment_reversals
 
 
 --
--- Name: payment_reversals payment_reversals_stripe_event_id_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.payment_reversals
-    ADD CONSTRAINT payment_reversals_stripe_event_id_key UNIQUE (stripe_event_id);
-
-
---
 -- Name: payments payments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23350,6 +23372,13 @@ CREATE TRIGGER trg_lease_pets_updated_at BEFORE UPDATE ON public.lease_pets FOR 
 
 
 --
+-- Name: lease_prepaid_credits trg_lease_prepaid_credits_remaining_by_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_lease_prepaid_credits_remaining_by_ledger BEFORE INSERT OR UPDATE OF amount_remaining ON public.lease_prepaid_credits FOR EACH ROW EXECUTE FUNCTION public.credit_remaining_moves_by_ledger();
+
+
+--
 -- Name: lease_tenants trg_lease_tenants_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -23620,6 +23649,13 @@ CREATE TRIGGER trg_sync_unit_delinquency AFTER INSERT OR DELETE OR UPDATE OF sta
 --
 
 CREATE TRIGGER trg_tenant_complaints_updated_at BEFORE UPDATE ON public.tenant_complaints FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: tenant_credits trg_tenant_credits_remaining_by_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_tenant_credits_remaining_by_ledger BEFORE INSERT OR UPDATE OF amount_remaining ON public.tenant_credits FOR EACH ROW EXECUTE FUNCTION public.credit_remaining_moves_by_ledger();
 
 
 --
@@ -30892,5 +30928,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict XjqSKeyDmI5SFy9RR4o4K41ysrcPPXwLVFxRxkykcgvgRciE89477G7XK7LOSLN
+\unrestrict cfDFtxOHLMrYOiKIekj52AunDdKhlQ8gSeiIjCWcRibxdxprswDd4zXTLeZkeJA
 
