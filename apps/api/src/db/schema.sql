@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 2ZTBhp1fQanPSADRpjjQwVciPbqRcvo1raJq60fmoPhfthWflQTrJ6Kcq1cOXgM
+\restrict Tjz1tvDPeSs0N9dQ6ykiDfuhRVLimyRR5aP6hyAXsLDRSwHB4vKoQOVIWukkVba
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -10154,7 +10154,7 @@ CREATE TABLE public.screening_fee_accruals (
 --
 
 CREATE TABLE public.screening_prepayments (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     landlord_id uuid NOT NULL,
     property_id uuid,
     booking_id uuid,
@@ -31134,5 +31134,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 2ZTBhp1fQanPSADRpjjQwVciPbqRcvo1raJq60fmoPhfthWflQTrJ6Kcq1cOXgM
+\unrestrict Tjz1tvDPeSs0N9dQ6ykiDfuhRVLimyRR5aP6hyAXsLDRSwHB4vKoQOVIWukkVba
 
