@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict NhmyHC4DbZ9d7UKFWsOuiSltAcQvKgDcGTEr5hYyAIRrrQWaIb9gXniIPMgenDc
+\restrict XjqSKeyDmI5SFy9RR4o4K41ysrcPPXwLVFxRxkykcgvgRciE89477G7XK7LOSLN
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -458,18 +458,6 @@ END $$;
 
 
 --
--- Name: credit_uses_kept_forever(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.credit_uses_kept_forever() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-  RAISE EXCEPTION 'Credit uses are kept forever' USING ERRCODE = '23514';
-END $$;
-
-
---
 -- Name: credit_uses_choice_target_fixed(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -480,6 +468,18 @@ BEGIN
   -- Fires only when paid_ahead_choice_id moves (the trigger's WHEN): a use's
   -- target is part of what the use IS (the same rule as refund_part_id).
   RAISE EXCEPTION 'A credit use is a record: only its status moves' USING ERRCODE = '23514';
+END $$;
+
+
+--
+-- Name: credit_uses_kept_forever(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.credit_uses_kept_forever() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  RAISE EXCEPTION 'Credit uses are kept forever' USING ERRCODE = '23514';
 END $$;
 
 
@@ -1133,7 +1133,7 @@ END $$;
 
 CREATE FUNCTION public.prepaid_fee_follows_payment() RETURNS trigger
     LANGUAGE plpgsql
-    AS $$
+    AS $_$
 DECLARE
   kind text;
 BEGIN
@@ -1167,7 +1167,7 @@ BEGIN
     END IF;
   END IF;
   RETURN NEW;
-END $$;
+END $_$;
 
 
 --
@@ -2212,7 +2212,7 @@ COMMENT ON COLUMN public.bank_deposit_allocations.reversed_at IS 'S655: the matc
 --
 
 CREATE TABLE public.bank_deposit_slip_items (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     slip_id uuid NOT NULL,
     remittance_id uuid,
     pos_transaction_id uuid,
@@ -2236,7 +2236,7 @@ COMMENT ON TABLE public.bank_deposit_slip_items IS 'S655: one receipt (tenant_re
 --
 
 CREATE TABLE public.bank_deposit_slips (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     landlord_id uuid NOT NULL,
     property_id uuid,
     deposit_date date NOT NULL,
@@ -4041,7 +4041,7 @@ CREATE TABLE public.credit_subjects (
 --
 
 CREATE TABLE public.credit_uses (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     tenant_credit_id uuid,
     prepaid_credit_id uuid,
     payment_id uuid,
@@ -4279,20 +4279,6 @@ COMMENT ON COLUMN public.deposit_returns.unpaid_balance_amount IS 'Sum of the au
 
 
 --
--- Name: COLUMN deposit_returns.closed_at_move_out_lines; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.deposit_returns.closed_at_move_out_lines IS '10/4 (decisions #46.4): the unpaid deposits and up-front last month''s rent this move-out closed as no longer owed — [{payment_id, kind: deposit|prepaid, label, amount}]. Written at finalize; NULL on returns finalized before it was recorded.';
-
-
---
--- Name: COLUMN deposit_returns.landlord_part_handed_back_on; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.deposit_returns.landlord_part_handed_back_on IS '10/4 (decisions #47a): the day the landlord handed back their own part of the refund (refund_from_landlord), as they marked it on the move-out page ("Mark handed back"). NULL: not marked yet.';
-
-
---
 -- Name: COLUMN deposit_returns.refund_from_gam; Type: COMMENT; Schema: public; Owner: -
 --
 
@@ -4304,6 +4290,20 @@ COMMENT ON COLUMN public.deposit_returns.refund_from_gam IS '10/4 (decisions #46
 --
 
 COMMENT ON COLUMN public.deposit_returns.refund_from_landlord IS '10/4 (decisions #46.3): the part of the refund the landlord hands back themselves — deposits paid to them in person or into their own bank. GAM never sends or nets this part. Written at finalize; NULL on returns finalized before it was recorded.';
+
+
+--
+-- Name: COLUMN deposit_returns.closed_at_move_out_lines; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.deposit_returns.closed_at_move_out_lines IS '10/4 (decisions #46.4): the unpaid deposits and up-front last month''s rent this move-out closed as no longer owed — [{payment_id, kind: deposit|prepaid, label, amount}]. Written at finalize; NULL on returns finalized before it was recorded.';
+
+
+--
+-- Name: COLUMN deposit_returns.landlord_part_handed_back_on; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.deposit_returns.landlord_part_handed_back_on IS '10/4 (decisions #47a): the day the landlord handed back their own part of the refund (refund_from_landlord), as they marked it on the move-out page ("Mark handed back"). NULL: not marked yet.';
 
 
 --
@@ -6280,6 +6280,13 @@ COMMENT ON COLUMN public.lease_documents.signing_window_restarted_at IS 'S637: w
 
 
 --
+-- Name: COLUMN lease_documents.issued_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_documents.issued_at IS 'S647: when the landlord signed and the lease + move-in invoice were created. NULL means not yet issued. completed_at still means every signer is done.';
+
+
+--
 -- Name: COLUMN lease_documents.renewal_unsigned_alert_14d_at; Type: COMMENT; Schema: public; Owner: -
 --
 
@@ -6298,13 +6305,6 @@ COMMENT ON COLUMN public.lease_documents.renewal_unsigned_alert_start_at IS 'S65
 --
 
 COMMENT ON COLUMN public.lease_documents.new_lease_cancel_held_at IS 'S655: when the 15-minute job could not cancel this new lease (the lease it follows ended early and nobody signed it) because money had already been paid on it, and told the landlord side and GAM. Once per document. NULL = never held.';
-
-
---
--- Name: COLUMN lease_documents.issued_at; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.lease_documents.issued_at IS 'S647: when the landlord signed and the lease + move-in invoice were created. NULL means not yet issued. completed_at still means every signer is done.';
 
 
 --
@@ -6504,7 +6504,8 @@ COMMENT ON COLUMN public.lease_prepaid_credits.left_by_choice_id IS '10/4 (decis
 COMMENT ON COLUMN public.lease_prepaid_credits.received_lease_id IS '10/4 (decisions #46.1a): the lease this money paid ahead ARRIVED on, set once when paid_ahead_carry_left moves money left as the tenant''s credit to their next lease with the landlord. NULL: it never moved (lease_id is where it arrived). Readers of where money arrived (Money received''s paid-ahead line, the owner statement) read COALESCE(received_lease_id, lease_id), so a carry never rewrites a past month or another property''s report.';
 
 
----- Name: lease_renewal_requests; Type: TABLE; Schema: public; Owner: -
+--
+-- Name: lease_renewal_requests; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.lease_renewal_requests (
@@ -7289,7 +7290,7 @@ CREATE TABLE public.otp_advances (
 --
 
 CREATE TABLE public.paid_ahead_choices (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     lease_id uuid NOT NULL,
     landlord_id uuid NOT NULL,
     left_amount numeric(12,2) NOT NULL,
@@ -7326,7 +7327,8 @@ COMMENT ON TABLE public.paid_ahead_choices IS '10/4 (decisions #46.1, #46.1a): t
 COMMENT ON COLUMN public.paid_ahead_choices.left_gam_held IS '10/4 (decisions #46.1a): of rest_amount left as the tenant''s credit, what GAM holds (it stays GAM-held until it pays one of their bills). 0 for Keep it.';
 
 
----- Name: parts_inventory; Type: TABLE; Schema: public; Owner: -
+--
+-- Name: parts_inventory; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.parts_inventory (
@@ -7455,27 +7457,6 @@ CREATE TABLE public.payments (
 
 
 --
--- Name: COLUMN payments.voided_at; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.payments.voided_at IS 'decisions #48.5: when a charge nobody owes, that a payment had already touched, was taken off (status voided). NOT NULL exactly when status = voided. The row is kept forever and left out of every balance.';
-
-
---
--- Name: COLUMN payments.void_reason; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.payments.void_reason IS 'decisions #48.5: the plain reason a voided charge is no longer owed (e.g. the reservation it was for was canceled). Set with voided_at.';
-
-
---
--- Name: COLUMN payments.released_by_deposit_return_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.payments.released_by_deposit_return_id IS '10/4 (decisions #46.3): the finalized move-out (deposit_returns.id) that released this GAM-collected deposit payment — it cleared platform_held because the money now rides a held payout item or the refund GAM owes. Set only on payments GAM collected, so leaseFeesSync.depositCollectedBySql reads such a payment as collected by GAM before and after the move-out. NULL: never released by a move-out.';
-
-
---
 -- Name: COLUMN payments.gam_supersedence_amount; Type: COMMENT; Schema: public; Owner: -
 --
 
@@ -7550,6 +7531,27 @@ COMMENT ON COLUMN public.payments.issued_credit_amount IS 'S655: dollars of this
 --
 
 COMMENT ON COLUMN public.payments.flexpay_advance_id IS 'S655: on a bill line FlexPay covered (GAM float paid it on time) and on the one FLEXPAY pull row that repays it. Covered lines are GAM-held money for allocation.';
+
+
+--
+-- Name: COLUMN payments.voided_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.voided_at IS 'decisions #48.5: when a charge nobody owes, that a payment had already touched, was taken off (status voided). NOT NULL exactly when status = voided. The row is kept forever and left out of every balance.';
+
+
+--
+-- Name: COLUMN payments.void_reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.void_reason IS 'decisions #48.5: the plain reason a voided charge is no longer owed (e.g. the reservation it was for was canceled). Set with voided_at.';
+
+
+--
+-- Name: COLUMN payments.released_by_deposit_return_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.released_by_deposit_return_id IS '10/4 (decisions #46.3): the finalized move-out (deposit_returns.id) that released this GAM-collected deposit payment — it cleared platform_held because the money now rides a held payout item or the refund GAM owes. Set only on payments GAM collected, so leaseFeesSync.depositCollectedBySql reads such a payment as collected by GAM before and after the move-out. NULL: never released by a move-out.';
 
 
 --
@@ -8384,7 +8386,7 @@ CREATE TABLE public.pos_eod_settlements (
 --
 
 CREATE TABLE public.pos_held_payments (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     landlord_id uuid NOT NULL,
     property_id uuid,
     pay_link_id uuid,
@@ -10775,7 +10777,7 @@ COMMENT ON TABLE public.state_tax_registrations IS 'Per-state sales-tax registra
 --
 
 CREATE TABLE public.stay_checkout_decisions (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     booking_id uuid NOT NULL,
     landlord_id uuid NOT NULL,
     lease_id uuid,
@@ -10815,7 +10817,7 @@ COMMENT ON TABLE public.stay_checkout_decisions IS '10/4 (decisions #37.B, #38):
 --
 
 CREATE TABLE public.stay_payments (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     booking_id uuid NOT NULL,
     landlord_id uuid NOT NULL,
     kind text NOT NULL,
@@ -10848,7 +10850,7 @@ COMMENT ON TABLE public.stay_payments IS '10/4 (decisions #37.B, #38): one row p
 --
 
 CREATE TABLE public.stay_refund_parts (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     decision_id uuid,
     booking_id uuid,
     landlord_id uuid NOT NULL,
@@ -10877,14 +10879,14 @@ CREATE TABLE public.stay_refund_parts (
     paid_ahead_choice_id uuid,
     deposit_return_id uuid,
     deposit_payment_id uuid,
-    CONSTRAINT stay_refund_parts_one_parent CHECK ((num_nonnulls(decision_id, paid_ahead_choice_id, deposit_return_id) = 1)),
-    CONSTRAINT stay_refund_parts_stay_part_has_booking CHECK (((decision_id IS NULL) OR (booking_id IS NOT NULL))),
     CONSTRAINT stay_refund_parts_amount_check CHECK (((toward_amount > (0)::numeric) AND (card_fee_back >= (0)::numeric) AND (amount = (toward_amount + card_fee_back)) AND (payout_drop >= (0)::numeric) AND (lodging_tax_share >= (0)::numeric))),
     CONSTRAINT stay_refund_parts_done_shape CHECK (((status = ANY (ARRAY['refunded'::text, 'handed_back'::text, 'credited'::text])) = (refunded_at IS NOT NULL))),
     CONSTRAINT stay_refund_parts_kind_check CHECK ((kind = ANY (ARRAY['card'::text, 'bank'::text, 'cash'::text, 'check'::text, 'money_order'::text, 'charge'::text, 'credit'::text]))),
+    CONSTRAINT stay_refund_parts_one_parent CHECK ((num_nonnulls(decision_id, paid_ahead_choice_id, deposit_return_id) = 1)),
     CONSTRAINT stay_refund_parts_reversed_shape CHECK (((reversed_at IS NULL) OR ((status = 'refunded'::text) AND (kind = ANY (ARRAY['card'::text, 'bank'::text])) AND (reversed_at >= refunded_at)))),
     CONSTRAINT stay_refund_parts_source_check CHECK (((num_nonnulls(stay_payment_id, remittance_id, prepaid_credit_id, deposit_payment_id) >= 1) OR (deposit_return_id IS NOT NULL))),
     CONSTRAINT stay_refund_parts_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'refunded'::text, 'handed_back'::text, 'credited'::text, 'failed'::text, 'replaced'::text]))),
+    CONSTRAINT stay_refund_parts_stay_part_has_booking CHECK (((decision_id IS NULL) OR (booking_id IS NOT NULL))),
     CONSTRAINT stay_refund_parts_stripe_shape CHECK (((kind <> ALL (ARRAY['card'::text, 'bank'::text])) OR (stripe_payment_intent_id IS NOT NULL)))
 );
 
@@ -10894,27 +10896,6 @@ CREATE TABLE public.stay_refund_parts (
 --
 
 COMMENT ON TABLE public.stay_refund_parts IS '10/4 (decisions #37.B, #38): each payment an early check-out refund went back to — the way it was paid, most recent first — with what the guest got back (card fee included, #38 Q4) and what the landlord''s payout dropped by.';
-
-
---
--- Name: COLUMN stay_refund_parts.deposit_payment_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.stay_refund_parts.deposit_payment_id IS '10/4 (decisions #47a): the deposit payment (payments.id, type deposit) a move-out refund part goes back to. NULL on a cash part with no Stripe payment behind it (deposit interest, a record raised without one).';
-
-
---
--- Name: COLUMN stay_refund_parts.deposit_return_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.stay_refund_parts.deposit_return_id IS '10/4 (decisions #47a): a refund part of a finalized move-out — the part of the deposit refund GAM holds, sent back the way the deposit was paid (or given back in cash at the office when that payment cannot take it). booking_id is NULL.';
-
-
---
--- Name: COLUMN stay_refund_parts.paid_ahead_choice_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.stay_refund_parts.paid_ahead_choice_id IS '10/4 (decisions #46.1): a refund part of the landlord''s choice for paid-ahead money left on an ended lease (paid_ahead_choices) instead of an early check-out decision. booking_id is the lease''s stay when it came from one, else NULL.';
 
 
 --
@@ -10929,6 +10910,27 @@ COMMENT ON COLUMN public.stay_refund_parts.reversed_at IS '10/4 fix round 2: Str
 --
 
 COMMENT ON COLUMN public.stay_refund_parts.replaces_part_id IS '10/4 fix round 2: the part this one takes the place of — a card refund Stripe sent back (reversed_at), or a failed card part given back in cash instead (status replaced).';
+
+
+--
+-- Name: COLUMN stay_refund_parts.paid_ahead_choice_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stay_refund_parts.paid_ahead_choice_id IS '10/4 (decisions #46.1): a refund part of the landlord''s choice for paid-ahead money left on an ended lease (paid_ahead_choices) instead of an early check-out decision. booking_id is the lease''s stay when it came from one, else NULL.';
+
+
+--
+-- Name: COLUMN stay_refund_parts.deposit_return_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stay_refund_parts.deposit_return_id IS '10/4 (decisions #47a): a refund part of a finalized move-out — the part of the deposit refund GAM holds, sent back the way the deposit was paid (or given back in cash at the office when that payment cannot take it). booking_id is NULL.';
+
+
+--
+-- Name: COLUMN stay_refund_parts.deposit_payment_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stay_refund_parts.deposit_payment_id IS '10/4 (decisions #47a): the deposit payment (payments.id, type deposit) a move-out refund part goes back to. NULL on a cash part with no Stripe payment behind it (deposit interest, a record raised without one).';
 
 
 --
@@ -11495,7 +11497,7 @@ COMMENT ON COLUMN public.tenant_remittances.received_by IS 'S652: who at the off
 --
 
 CREATE TABLE public.tenant_roster_drafts (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     landlord_id uuid NOT NULL,
     property_id uuid,
     unit_id uuid,
@@ -11542,17 +11544,17 @@ COMMENT ON COLUMN public.tenant_roster_drafts.unit_id IS 'NULL = not placed yet.
 
 
 --
--- Name: COLUMN tenant_roster_drafts.file_values; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.tenant_roster_drafts.file_values IS 'What the old system''s file said (rent, dates, deposit, late fee, raw names). Reference only; the lease drafts from the landlord''s setup.';
-
-
---
 -- Name: COLUMN tenant_roster_drafts.opening_balance; Type: COMMENT; Schema: public; Owner: -
 --
 
 COMMENT ON COLUMN public.tenant_roster_drafts.opening_balance IS 'Old-system balance owed. Posts once, as a carried-balance charge on the household''s lease when it issues. The household''s first person carries it.';
+
+
+--
+-- Name: COLUMN tenant_roster_drafts.file_values; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_roster_drafts.file_values IS 'What the old system''s file said (rent, dates, deposit, late fee, raw names). Reference only; the lease drafts from the landlord''s setup.';
 
 
 --
@@ -18846,7 +18848,8 @@ CREATE INDEX idx_lease_prepaid_credits_lease ON public.lease_prepaid_credits USI
 CREATE INDEX idx_lease_prepaid_credits_left ON public.lease_prepaid_credits USING btree (tenant_id) WHERE (left_by_choice_id IS NOT NULL);
 
 
----- Name: idx_lease_renewal_requests_landlord; Type: INDEX; Schema: public; Owner: -
+--
+-- Name: idx_lease_renewal_requests_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_lease_renewal_requests_landlord ON public.lease_renewal_requests USING btree (landlord_id);
@@ -19476,17 +19479,17 @@ CREATE INDEX idx_platform_revenue_ledger_reference ON public.platform_revenue_le
 
 
 --
--- Name: idx_platform_transfer_intents_pending; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_platform_transfer_intents_pending ON public.platform_transfer_intents USING btree (created_at) WHERE (status = 'pending'::text);
-
-
---
 -- Name: idx_platform_transfer_intents_disbursement; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_platform_transfer_intents_disbursement ON public.platform_transfer_intents USING btree (disbursement_id) WHERE (disbursement_id IS NOT NULL);
+
+
+--
+-- Name: idx_platform_transfer_intents_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_transfer_intents_pending ON public.platform_transfer_intents USING btree (created_at) WHERE (status = 'pending'::text);
 
 
 --
@@ -20211,6 +20214,27 @@ CREATE INDEX idx_state_tax_forms_state_year ON public.state_tax_forms USING btre
 
 
 --
+-- Name: idx_stay_refund_parts_deposit_payment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stay_refund_parts_deposit_payment ON public.stay_refund_parts USING btree (deposit_payment_id) WHERE (deposit_payment_id IS NOT NULL);
+
+
+--
+-- Name: idx_stay_refund_parts_deposit_return; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stay_refund_parts_deposit_return ON public.stay_refund_parts USING btree (deposit_return_id) WHERE (deposit_return_id IS NOT NULL);
+
+
+--
+-- Name: idx_stay_refund_parts_paid_ahead_choice; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stay_refund_parts_paid_ahead_choice ON public.stay_refund_parts USING btree (paid_ahead_choice_id) WHERE (paid_ahead_choice_id IS NOT NULL);
+
+
+--
 -- Name: idx_stripe_costs_category; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -20460,13 +20484,6 @@ CREATE INDEX idx_tenant_roster_drafts_intent ON public.tenant_roster_drafts USIN
 --
 
 CREATE INDEX idx_tenant_roster_drafts_property_live ON public.tenant_roster_drafts USING btree (property_id) WHERE ((confirmed_at IS NULL) AND (discarded_at IS NULL));
-
-
---
--- Name: tenant_roster_drafts_live_email_key; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX tenant_roster_drafts_live_email_key ON public.tenant_roster_drafts USING btree (landlord_id, lower(email)) WHERE ((confirmed_at IS NULL) AND (discarded_at IS NULL));
 
 
 --
@@ -21730,34 +21747,6 @@ CREATE UNIQUE INDEX stay_payments_site_deposit_uniq ON public.stay_payments USIN
 
 
 --
--- Name: idx_stay_refund_parts_deposit_payment; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_stay_refund_parts_deposit_payment ON public.stay_refund_parts USING btree (deposit_payment_id) WHERE (deposit_payment_id IS NOT NULL);
-
-
---
--- Name: idx_stay_refund_parts_deposit_return; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_stay_refund_parts_deposit_return ON public.stay_refund_parts USING btree (deposit_return_id) WHERE (deposit_return_id IS NOT NULL);
-
-
---
--- Name: idx_stay_refund_parts_paid_ahead_choice; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_stay_refund_parts_paid_ahead_choice ON public.stay_refund_parts USING btree (paid_ahead_choice_id) WHERE (paid_ahead_choice_id IS NOT NULL);
-
-
---
--- Name: ux_paid_ahead_choices_idem; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX ux_paid_ahead_choices_idem ON public.paid_ahead_choices USING btree (idempotency_key);
-
-
---
 -- Name: stay_refund_parts_decision_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -21804,6 +21793,13 @@ CREATE INDEX suspended_utility_held_by_unit ON public.suspended_utility_charges 
 --
 
 CREATE UNIQUE INDEX suspended_utility_one_per_meter_unit_cycle ON public.suspended_utility_charges USING btree (meter_id, unit_id, billing_cycle_month) WHERE ((released_at IS NULL) AND (cancelled_at IS NULL));
+
+
+--
+-- Name: tenant_roster_drafts_live_email_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX tenant_roster_drafts_live_email_key ON public.tenant_roster_drafts USING btree (landlord_id, lower(email)) WHERE ((confirmed_at IS NULL) AND (discarded_at IS NULL));
 
 
 --
@@ -22028,6 +22024,13 @@ CREATE UNIQUE INDEX ux_notification_preferences_user_type ON public.notification
 --
 
 CREATE UNIQUE INDEX ux_owner_use_absorption_per_cycle ON public.utility_owner_use_absorptions USING btree (meter_id, unit_id, billing_cycle_month);
+
+
+--
+-- Name: ux_paid_ahead_choices_idem; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_paid_ahead_choices_idem ON public.paid_ahead_choices USING btree (idempotency_key);
 
 
 --
@@ -23228,17 +23231,17 @@ CREATE TRIGGER trg_credit_uses_apply AFTER INSERT OR UPDATE ON public.credit_use
 
 
 --
--- Name: credit_uses trg_credit_uses_kept_forever; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER trg_credit_uses_kept_forever BEFORE DELETE ON public.credit_uses FOR EACH ROW EXECUTE FUNCTION public.credit_uses_kept_forever();
-
-
---
 -- Name: credit_uses trg_credit_uses_choice_target_fixed; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_credit_uses_choice_target_fixed BEFORE UPDATE ON public.credit_uses FOR EACH ROW WHEN ((new.paid_ahead_choice_id IS DISTINCT FROM old.paid_ahead_choice_id)) EXECUTE FUNCTION public.credit_uses_choice_target_fixed();
+
+
+--
+-- Name: credit_uses trg_credit_uses_kept_forever; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_credit_uses_kept_forever BEFORE DELETE ON public.credit_uses FOR EACH ROW EXECUTE FUNCTION public.credit_uses_kept_forever();
 
 
 --
@@ -25158,6 +25161,14 @@ ALTER TABLE ONLY public.credit_uses
 
 
 --
+-- Name: credit_uses credit_uses_paid_ahead_choice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_paid_ahead_choice_id_fkey FOREIGN KEY (paid_ahead_choice_id) REFERENCES public.paid_ahead_choices(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: credit_uses credit_uses_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25179,14 +25190,6 @@ ALTER TABLE ONLY public.credit_uses
 
 ALTER TABLE ONLY public.credit_uses
     ADD CONSTRAINT credit_uses_prepaid_credit_id_fkey FOREIGN KEY (prepaid_credit_id) REFERENCES public.lease_prepaid_credits(id);
-
-
---
--- Name: credit_uses credit_uses_paid_ahead_choice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.credit_uses
-    ADD CONSTRAINT credit_uses_paid_ahead_choice_id_fkey FOREIGN KEY (paid_ahead_choice_id) REFERENCES public.paid_ahead_choices(id) ON DELETE RESTRICT;
 
 
 --
@@ -25334,19 +25337,19 @@ ALTER TABLE ONLY public.deposit_returns
 
 
 --
--- Name: deposit_returns deposit_returns_landlord_part_handed_back_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.deposit_returns
-    ADD CONSTRAINT deposit_returns_landlord_part_handed_back_by_fkey FOREIGN KEY (landlord_part_handed_back_by) REFERENCES public.users(id);
-
-
---
 -- Name: deposit_returns deposit_returns_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.deposit_returns
     ADD CONSTRAINT deposit_returns_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: deposit_returns deposit_returns_landlord_part_handed_back_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_landlord_part_handed_back_by_fkey FOREIGN KEY (landlord_part_handed_back_by) REFERENCES public.users(id);
 
 
 --
@@ -28878,19 +28881,19 @@ ALTER TABLE ONLY public.property_transfer_requests
 
 
 --
--- Name: property_transfer_requests property_transfer_requests_transfer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.property_transfer_requests
-    ADD CONSTRAINT property_transfer_requests_transfer_id_fkey FOREIGN KEY (transfer_id) REFERENCES public.property_transfers(id) ON DELETE SET NULL;
-
-
---
 -- Name: property_transfer_requests property_transfer_requests_to_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.property_transfer_requests
     ADD CONSTRAINT property_transfer_requests_to_user_id_fkey FOREIGN KEY (to_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: property_transfer_requests property_transfer_requests_transfer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_transfer_requests
+    ADD CONSTRAINT property_transfer_requests_transfer_id_fkey FOREIGN KEY (transfer_id) REFERENCES public.property_transfers(id) ON DELETE SET NULL;
 
 
 --
@@ -29390,6 +29393,14 @@ ALTER TABLE ONLY public.stay_refund_parts
 
 
 --
+-- Name: stay_refund_parts stay_refund_parts_decision_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_decision_id_fkey FOREIGN KEY (decision_id) REFERENCES public.stay_checkout_decisions(id) ON DELETE CASCADE;
+
+
+--
 -- Name: stay_refund_parts stay_refund_parts_deposit_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -29403,14 +29414,6 @@ ALTER TABLE ONLY public.stay_refund_parts
 
 ALTER TABLE ONLY public.stay_refund_parts
     ADD CONSTRAINT stay_refund_parts_deposit_return_id_fkey FOREIGN KEY (deposit_return_id) REFERENCES public.deposit_returns(id) ON DELETE RESTRICT;
-
-
---
--- Name: stay_refund_parts stay_refund_parts_decision_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.stay_refund_parts
-    ADD CONSTRAINT stay_refund_parts_decision_id_fkey FOREIGN KEY (decision_id) REFERENCES public.stay_checkout_decisions(id) ON DELETE CASCADE;
 
 
 --
@@ -30889,5 +30892,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict NhmyHC4DbZ9d7UKFWsOuiSltAcQvKgDcGTEr5hYyAIRrrQWaIb9gXniIPMgenDc
+\unrestrict XjqSKeyDmI5SFy9RR4o4K41ysrcPPXwLVFxRxkykcgvgRciE89477G7XK7LOSLN
 
