@@ -249,6 +249,8 @@ function mapProviderStatus(raw: string): BackgroundCheckStatus {
  */
 const TERMINAL_PRODUCT_STATUSES = new Set(['clear', 'consider'])
 
+/** 10/5 (Nic): the live ID scan every order asks for — see initiate(). */
+export const CHECKR_ID_SCAN_ADD_ON = 'identity_verification'
 const CHECKR_TENANT_PRODUCTS = [
   'criminal_history', 'credit_report', 'eviction_history',
   'identity_verification', 'income_verification',
@@ -309,9 +311,14 @@ class CheckrProvider implements BackgroundProvider {
     // Applicant identity: name + email (+ DOB when the intake captured it).
     // SSN is deliberately NEVER sent — the applicant supplies it on Checkr's
     // hosted consent form, so screening PII stays off GAM servers.
-    const body = {
+    // 10/5 (Nic): "Order the ID scan." The price applicants pay has always
+    // been built on Checkr's $2.95 live ID scan (identity_verification — an
+    // add-on; Essential does not bundle it), but no order ever asked for it, so
+    // every applicant paid for a check that never ran. Every order asks now.
+    const body: { order: Record<string, unknown> } = {
       order: {
         package: pkg,
+        add_on_products: [CHECKR_ID_SCAN_ADD_ON],
         property: {
           name:    req.property.name || null,
           street:  req.property.street,
@@ -337,17 +344,44 @@ class CheckrProvider implements BackgroundProvider {
     // a retry of the SAME check (this one was retried by hand after being
     // wrongly rejected) must never create a second order the applicant is
     // charged for or asked to complete twice.
-    const res = await fetch(`${this.baseUrl}/orders`, {
+    const post = (b: unknown, key: string) => fetch(`${this.baseUrl}/orders`, {
       method: 'POST',
-      headers: { ...this.headers(), 'Idempotency-Key': `gam-bgc-${req.backgroundCheckId}` },
-      body: JSON.stringify(body),
+      headers: { ...this.headers(), 'Idempotency-Key': key },
+      body: JSON.stringify(b),
     })
+    let res = await post(body, `gam-bgc-${req.backgroundCheckId}`)
     if (!res.ok) {
       const text = await res.text()
-      return {
-        providerRef: '',
-        status: 'failed',
-        failureReason: `Checkr order create failed: ${res.status} ${text.slice(0, 200)}`,
+      // Checkr refuses an add-on the account is not set up for (422). The
+      // applicant is standing at the counter: run the check without it rather
+      // than stop them, and tell GAM at once so the add-on gets turned on.
+      // A new idempotency key — the same key with a different body is refused.
+      if (res.status === 422 && /add_on|identity_verification/i.test(text)) {
+        const { add_on_products: _dropped, ...withoutAddOn } = body.order
+        res = await post({ order: withoutAddOn }, `gam-bgc-${req.backgroundCheckId}-no-id-scan`)
+        try {
+          const { createAdminNotification } = await import('./adminNotifications')
+          await createAdminNotification({
+            severity: 'critical', category: 'checkr_id_scan_refused', emailSuperAdmins: true,
+            title: 'Checkr refused the ID scan — turn it on in Checkr',
+            body: `Checkr would not add the live ID scan (identity_verification) to a screening order, so this applicant's check ran without it. Enable the ID-scan add-on for the organization in the Checkr dashboard. Checkr said: ${text.slice(0, 300)}`,
+            context: { background_check_id: req.backgroundCheckId },
+          })
+        } catch { /* the order matters more than the notice */ }
+      } else {
+        return {
+          providerRef: '',
+          status: 'failed',
+          failureReason: `Checkr order create failed: ${res.status} ${text.slice(0, 200)}`,
+        }
+      }
+      if (!res.ok) {
+        const again = await res.text()
+        return {
+          providerRef: '',
+          status: 'failed',
+          failureReason: `Checkr order create failed: ${res.status} ${again.slice(0, 200)}`,
+        }
       }
     }
     const order = await res.json() as { id: string; status: string; application_url?: string | null }

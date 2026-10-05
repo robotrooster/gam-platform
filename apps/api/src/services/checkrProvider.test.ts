@@ -111,6 +111,28 @@ describe('CheckrProvider.initiate (Tenant orders)', () => {
     await expect(provider.initiate(happyIntake())).rejects.toThrow(/CHECKR_API_KEY/)
   })
 
+  // 10/5 (Nic): "Order the ID scan." The applicant's price includes it.
+  it('every order asks for the live ID scan add-on', async () => {
+    const spy = mockOrderResponse({ id: 'ord_1', status: 'waiting_for_applicant' })
+    await provider.initiate(happyIntake())
+    const body = JSON.parse((spy.mock.calls[0] as any)[1].body)
+    expect(body.order.add_on_products).toEqual(['identity_verification'])
+  })
+
+  it('Checkr refusing the add-on: the order still goes through without it, and GAM is told', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch' as any)
+      .mockResolvedValueOnce({ ok: false, status: 422, text: async () => '{"error":"identity_verification is not an available add-on"}' } as any)
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ id: 'ord_2', status: 'waiting_for_applicant' }) } as any)
+    const notes = await import('./adminNotifications')
+    const told = vi.spyOn(notes, 'createAdminNotification').mockResolvedValue(undefined as any)
+    const res = await provider.initiate(happyIntake())
+    expect(res.providerRef).toBe('ord_2')
+    const second = JSON.parse((spy.mock.calls[1] as any)[1].body)
+    expect(second.order.add_on_products).toBeUndefined()
+    expect((spy.mock.calls[1] as any)[1].headers['Idempotency-Key']).toBe('gam-bgc-bg-1-no-id-scan')
+    expect(told).toHaveBeenCalledWith(expect.objectContaining({ category: 'checkr_id_scan_refused', severity: 'critical' }))
+  })
+
   it('order API non-2xx → failed with status + body excerpt', async () => {
     mockOrderResponse({ error: 'invalid package' }, false, 422)
     const res = await provider.initiate(happyIntake())
