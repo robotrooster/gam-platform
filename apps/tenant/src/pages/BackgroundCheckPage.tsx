@@ -209,7 +209,13 @@ export function BackgroundCheckPage() {
         timeToComplete:Math.round((Date.now()-startTime)/1000),
         applicantPaymentIntentId:paymentIntentId,
       })
-    }).then(r => r.json())
+    }).then(async r => {
+      // 10/5: an error reply used to resolve as success and the page showed
+      // nothing. Say what the server said, once, and keep the applicant here.
+      const body = await r.json().catch(() => ({}))
+      if (!r.ok || body?.success === false) throw new Error(body?.error || 'Submission failed — please try again')
+      return body
+    })
   }, { onSuccess: () => refetch() })
   const validZip = /^\d{5}(-\d{4})?$/.test(form.zip)
   // S642: no bounce to /signup. Someone arriving without a session gets the
@@ -234,7 +240,7 @@ export function BackgroundCheckPage() {
   const STEPS = (needsAccountStep ? [ACCOUNT_STEP, ...BASE_STEPS] : BASE_STEPS) as readonly string[]
 
   const createAccountInline = async () => {
-    setAccountErr('')
+    setAccountErr(''); setExistingAccount(false)
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(form.email)) { setAccountErr('Enter a valid email address'); return false }
     if (form.password.length < 12) { setAccountErr('Password must be at least 12 characters'); return false }
     if (form.password !== form.confirmPassword) { setAccountErr('Passwords do not match'); return false }
@@ -295,6 +301,12 @@ export function BackgroundCheckPage() {
         body: JSON.stringify({ emailOtpSession: codeSession, code: code.trim() }),
       })
       const body = await res.json()
+      if (res.status === 401 && /log in|session|expired/i.test(String(body?.error || '')) && !/code/i.test(String(body?.error || ''))) {
+        // The code's sign-in pass ran out (15 minutes): start over from Continue.
+        setCodeSession(null)
+        setAccountErr('Your code timed out. Press Continue to get a new one.')
+        return
+      }
       if (!res.ok || !body?.data?.token) { setCodeErr(body?.error || 'That code did not work. Check it and try again.'); return }
       localStorage.setItem('gam_tenant_token', body.data.token)
       setHasSession(true)
@@ -313,6 +325,7 @@ export function BackgroundCheckPage() {
         body: JSON.stringify({ emailOtpSession: codeSession }),
       })
       if (res.ok) setCodeSent('A new code is on its way.')
+      else if (res.status === 401) { setCodeSession(null); setAccountErr('Your code timed out. Press Continue to get a new one.') }
       else setCodeErr('Could not send a new code. Please try again.')
     } catch { setCodeErr('Could not reach the server. Please try again.') }
   }
@@ -770,7 +783,7 @@ export function BackgroundCheckPage() {
           {paid && (
             <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'12px 20px',background:'rgba(34,197,94,.08)',border:'1px solid rgba(34,197,94,.25)',borderRadius:10,color:'#22c55e',fontWeight:700}}><Check size={18}/> Paid — click Submit below</div>
           )}
-          {submitMut.isError&&<div style={{color:'#ef4444',fontSize:'.75rem',marginTop:10,display:'flex',gap:6,justifyContent:'center'}}><AlertCircle size={12}/> Submission failed — please try again</div>}
+          {submitMut.isError&&<div style={{color:'#ef4444',fontSize:'.75rem',marginTop:10,display:'flex',gap:6,justifyContent:'center'}}><AlertCircle size={12}/> {(submitMut.error as any)?.message || 'Submission failed — please try again'}</div>}
         </div>}
       </div>
       <div style={{display:'flex',gap:10}}>
@@ -779,7 +792,7 @@ export function BackgroundCheckPage() {
           // S642: leaving the account step is what creates the account. It has
           // to succeed before the flow moves on — the next step mints a Stripe
           // PaymentIntent against the session this call establishes.
-          if(STEPS[step]===ACCOUNT_STEP){ if(!(await createAccountInline())) return }
+          if(STEPS[step]===ACCOUNT_STEP && !tok()){ if(!(await createAccountInline())) return }
           setStep(s=>s+1)
         }} disabled={!canNext[STEPS[step]]} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:canNext[STEPS[step]]?'#c9a227':'#141a22',color:canNext[STEPS[step]]?'#060809':'#4a5568',fontWeight:700,cursor:canNext[STEPS[step]]?'pointer':'not-allowed',fontSize:'.88rem'}}>{creatingAccount?'Creating your account…':'Continue →'}</button>:<button onClick={()=>submitMut.mutate()} disabled={!paid||submitMut.isLoading} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:paid?'#c9a227':'#141a22',color:paid?'#060809':'#4a5568',fontWeight:700,cursor:paid?'pointer':'not-allowed',fontSize:'.88rem'}}>{submitMut.isLoading?'Submitting...':'🔒 Submit Application'}</button>}
       </div>

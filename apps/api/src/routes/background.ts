@@ -343,9 +343,11 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
       const found = await stripeForBgc!.paymentIntents.search({
         query: `metadata['userId']:'${String(req.user!.userId).replace(/'/g, '')}' AND metadata['kind']:'background_check_intake' AND status:'succeeded'`,
         limit: 10,
+        expand: ['data.latest_charge'],
       })
       for (const pi of found.data) {
         if (pi.amount !== Math.round(fee.total * 100)) continue
+        if (chargeTakenBack(pi.latest_charge)) continue
         const used = await queryOne(`SELECT 1 FROM background_checks WHERE applicant_payment_intent_id = $1`, [pi.id])
         if (used) continue
         return res.json({
@@ -387,6 +389,12 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
  * figure instead of re-deriving a fee and hoping the two agree. Null for a mock
  * intent, which only exists outside production.
  */
+/** A charge that was refunded (any part) or disputed no longer pays for anything. */
+function chargeTakenBack(ch: string | Stripe.Charge | null | undefined): boolean {
+  if (!ch || typeof ch === 'string') return false
+  return !!(ch.refunded || (ch.amount_refunded ?? 0) > 0 || ch.disputed)
+}
+
 async function verifyPaymentIntent(
   intentId: string,
   expected: { kind: 'background_check_intake' | 'pool_report_unlock'; amountUsd: number; userId?: string; matchId?: string },
@@ -402,12 +410,18 @@ async function verifyPaymentIntent(
   }
   let pi: Stripe.PaymentIntent
   try {
-    pi = await stripeForBgc!.paymentIntents.retrieve(intentId)
+    pi = await stripeForBgc!.paymentIntents.retrieve(intentId, { expand: ['latest_charge'] })
   } catch {
     throw new AppError(400, 'Payment intent not found')
   }
   if (pi.status !== 'succeeded') {
     throw new AppError(400, `Payment not yet succeeded (status: ${pi.status})`)
+  }
+  // 10/5 review: Stripe keeps a payment 'succeeded' after it is refunded or
+  // charged back. Such a payment never pays for a screening — the browser
+  // names the intent, so this is the gate that has to say no.
+  if (chargeTakenBack(pi.latest_charge)) {
+    throw new AppError(400, 'That payment was refunded or disputed, so it can\u2019t pay for this screening. Please pay again.')
   }
   if (pi.metadata?.kind !== expected.kind) {
     throw new AppError(400, 'Payment intent kind mismatch')

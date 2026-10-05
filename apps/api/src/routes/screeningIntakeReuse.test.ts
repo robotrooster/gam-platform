@@ -91,6 +91,21 @@ describe('POST /background/payment-intent when the fee was already paid on an ea
     expect(stripe.create).toHaveBeenCalledTimes(1)
   })
 
+  it('a paid fee that was refunded or charged back is never handed back — Stripe still calls it succeeded', async () => {
+    const amountCents = Math.round((await ask()).body.data.amount * 100)
+    for (const charge of [{ refunded: true, amount_refunded: amountCents, disputed: false },
+                          { refunded: false, amount_refunded: 500, disputed: false },
+                          { refunded: false, amount_refunded: 0, disputed: true }]) {
+      stripe.create.mockClear()
+      stripe.search.mockImplementation(async () => ({ data: [{ id: 'pi_taken_back', amount: amountCents, status: 'succeeded', latest_charge: { id: 'ch_1', ...charge } }] }))
+      const res = await ask()
+      expect(res.body.data.alreadyPaid).toBeFalsy()
+      expect(stripe.create).toHaveBeenCalledTimes(1)
+    }
+    // It asked Stripe for the charge, so a refund is visible.
+    expect(stripe.search.mock.calls.at(-1)![0].expand).toEqual(['data.latest_charge'])
+  })
+
   it('a paid fee of a different amount is not handed back', async () => {
     stripe.search.mockImplementation(async () => ({ data: [{ id: 'pi_other_amount', amount: 1, status: 'succeeded' }] }))
     const res = await ask()

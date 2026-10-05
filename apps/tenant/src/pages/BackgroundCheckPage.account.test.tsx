@@ -124,6 +124,21 @@ describe('the screening account step when the email already has an account', () 
     expect(localStorage.getItem('gam_tenant_token')).toBeNull()
   })
 
+  it('when the code\u2019s 15 minutes run out, the box closes and says to press Continue for a new one — no dead end', async () => {
+    registerReply = { status: 200, body: { success: true, data: { requiresEmailOtp: true, resumed: true, emailOtpSession: 'pending-pass' } } }
+    verifyReply = { status: 401, body: { success: false, error: 'Sign-in session expired. Please log in again.' } }
+    await fillAccountStepAndContinue()
+    const box = host.querySelector('[data-testid="email-code"]') as HTMLElement
+    await act(async () => { typeInto(box.querySelector('input') as HTMLInputElement, '123456') })
+    const go = Array.from(box.querySelectorAll('button')).find(b => b.textContent === 'Continue') as HTMLButtonElement
+    await act(async () => { go.click() })
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+    expect(host.querySelector('[data-testid="email-code"]')).toBeNull()
+    expect(host.textContent).toContain('Your code timed out. Press Continue to get a new one.')
+    const cont = Array.from(host.querySelectorAll('button')).find(b => /Continue →/.test(b.textContent || '')) as HTMLButtonElement
+    expect(cont.disabled).toBe(false)
+  })
+
   it('changing the email clears the "you already have an account" box', async () => {
     registerReply = { status: 409, body: { success: false, error: 'An account with this email already exists. Sign in to continue.' } }
     await fillAccountStepAndContinue()
