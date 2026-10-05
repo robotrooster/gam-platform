@@ -1,5 +1,6 @@
 import { query, queryOne } from '../db'
 import { sendNotificationEmail } from './email'
+import type { ReplyTo } from './replyRouting'
 import { logger } from '../lib/logger'
 import { isCriticalNotificationType } from '@gam/shared'
 import { portalLink } from '../lib/portalUrls'
@@ -43,6 +44,12 @@ export async function createNotification(p: {
   // the bell falls back to a per-type route when absent.
   actionUrl?: string
   sendEmail?: boolean; emailTo?: string; emailSubject?: string; emailHtml?: string
+  /**
+   * 10/5: who gets a reply to the email (services/replyRouting). Omitted = GAM
+   * support. A notice to a resident about their home passes the property, so a
+   * reply reaches the people who run it — never GAM.
+   */
+  replyTo?: ReplyTo
 }) {
   try {
     const prefs = await queryOne<any>('SELECT * FROM notification_preferences WHERE user_id=$1 AND type=$2', [p.userId, p.type])
@@ -80,6 +87,7 @@ export async function createNotification(p: {
         userId: p.userId,
         landlordId: p.landlordId ?? null,
         notificationId,
+        replyTo: p.replyTo,
       })
       if (notificationId && messageId) {
         await query("UPDATE notifications SET email_sent=TRUE, email_sent_at=NOW() WHERE id=$1", [notificationId])

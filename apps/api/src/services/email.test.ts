@@ -35,7 +35,7 @@ vi.mock('resend', () => ({
 }))
 
 import { db } from '../db'
-import { cleanupAllSchema } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import * as email from './email'
 
 beforeEach(async () => {
@@ -878,5 +878,43 @@ describe('S655 the FlexPay enrollment email carries the terms the code keeps', (
       acceptanceId: '00000000-0000-0000-0000-000000000abe', pdfBuffer: Buffer.from('%PDF-1.4 fake'),
     })
     expect((resendSendMock.mock.calls.at(-1) as any[])[0].html).not.toContain('How FlexPay works')
+  })
+})
+
+// 10/5 (Nic): a reply about the landlord's business reaches the people who run
+// the property — never GAM. GAM's own mail still answers to GAM support.
+describe('where replies go', () => {
+  async function park() {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c, { email: 'owner@mailer-park.co' })
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      await c.query('COMMIT')
+      return { propertyId, landlordId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+  const replyOf = () => ((resendSendMock.mock.calls.at(-1) as any[])[0]).reply_to
+
+  it('mail about a property: its office email, and the log says who hears back', async () => {
+    const p = await park()
+    await db.query(`UPDATE properties SET office_email = 'office@mailer-park.co' WHERE id = $1`, [p.propertyId])
+    await email.sendNotificationEmail({ to: 'resident@mailer-test.co', subject: 'Water off Tuesday', html: '<p>x</p>',
+      notificationType: 'service_interruption', landlordId: p.landlordId, replyTo: { kind: 'property', propertyId: p.propertyId } })
+    expect(replyOf()).toEqual(['office@mailer-park.co'])
+    expect((await logRowFor('resident@mailer-test.co')).metadata.reply_to).toEqual(['office@mailer-park.co'])
+  })
+
+  it('no office email: whoever runs the property (here, the owner)', async () => {
+    const p = await park()
+    await email.sendNotificationEmail({ to: 'resident@mailer-test.co', subject: 'x', html: '<p>x</p>',
+      notificationType: 'service_interruption', replyTo: { kind: 'property', propertyId: p.propertyId } })
+    expect(replyOf()).toEqual(['owner@mailer-park.co'])
+  })
+
+  it('nothing said: GAM support, as before', async () => {
+    await email.sendNotificationEmail({ to: 'someone@mailer-test.co', subject: 'x', html: '<p>x</p>', notificationType: 'x' })
+    expect(replyOf()).toBe('support@gam.test')
+    expect((await logRowFor('someone@mailer-test.co')).metadata?.reply_to).toBeUndefined()
   })
 })

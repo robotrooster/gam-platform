@@ -3,6 +3,7 @@ import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL, FLEXPAY_TERMS }
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { portalLink } from '../lib/portalUrls'
+import { replyAddressesFor, type ReplyTo } from './replyRouting'
 import { buildDemoBookingIcs } from './demoCalendar'
 // S651: read before every send — see the comment at the send decision below.
 import { suppressionFor } from './emailSuppressions'
@@ -91,6 +92,13 @@ export interface EmailSendContext {
   relatedEntityType?: string | null
   relatedEntityId?: string | null
   metadata?: Record<string, unknown>
+  /**
+   * 10/5: who gets a reply (services/replyRouting). Omitted = GAM support.
+   * Mail about a property a landlord runs — to its residents, guests,
+   * applicants — passes { kind: 'property', propertyId } so replies reach the
+   * people who run that property, never GAM.
+   */
+  replyTo?: ReplyTo
 }
 
 /**
@@ -160,6 +168,10 @@ async function send(
   // The point is not saving an API call. It is that this row is the answer to
   // "did they get it?", and a row that says 'sent' about a message the provider
   // will discard is worse than no row, because somebody believes it.
+  // 10/5: where a reply lands. Resolved even when nothing is sent, so the log
+  // row says who would have heard back.
+  const routedReplyTo = ctx.replyTo ? await replyAddressesFor(ctx.replyTo) : null
+  if (routedReplyTo) ctx = { ...ctx, metadata: { ...(ctx.metadata ?? {}), reply_to: routedReplyTo } }
   const suppressed = willSend ? await suppressionFor(to) : null
   if (suppressed) {
     status = 'undeliverable'
@@ -181,7 +193,7 @@ async function send(
       const sendArgs: any = {
         from: senderFor(from), to, subject, html,
         text: htmlToPlainText(html),
-        reply_to: FROM_SUPPORT.replace(/^.*<|>.*$/g, '') || undefined,
+        reply_to: routedReplyTo ?? (FROM_SUPPORT.replace(/^.*<|>.*$/g, '') || undefined),
       }
       if (attachments && attachments.length > 0) sendArgs.attachments = attachments
       if (!resend) {
@@ -1477,6 +1489,8 @@ export async function sendNotificationEmail(opts: {
   userId?: string | null
   landlordId?: string | null
   notificationId?: string | null
+  /** 10/5: who gets a reply — see services/replyRouting. Omitted = GAM support. */
+  replyTo?: ReplyTo
 }): Promise<string | null> {
   return send(opts.to, opts.subject, opts.html, {
     category: `notif_${opts.notificationType}`,
@@ -1484,6 +1498,7 @@ export async function sendNotificationEmail(opts: {
     relatedEntityType: opts.notificationId ? 'notification' : null,
     relatedEntityId: opts.notificationId ?? null,
     metadata: opts.userId ? { user_id: opts.userId } : undefined,
+    replyTo: opts.replyTo,
   })
 }
 
