@@ -15,8 +15,10 @@
  *   3. Stripe registers the reader to the location when the serial is
  *      assigned; the register picks it up on its own (syncReadersFromStripe) —
  *      no pairing code.
- *   4. The price is paid in monthly pieces netted from disbursements: the first
- *      when it ships, one each month after, each its own charge line.
+ *   4. The price is paid in monthly pieces netted from the landlord's payouts:
+ *      one on the 1st of each month AFTER the month it ships, each its own
+ *      charge line (Nic 10/5: shipped in September → October, November,
+ *      December, January).
  */
 import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
@@ -182,16 +184,18 @@ export async function adminUpdateReaderOrder(id: string, patch: {
     if (stamp) sets.push(`${stamp} = COALESCE(${stamp}, NOW())`)
   }
   const row = await queryOne<any>(`UPDATE pos_reader_orders SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals)
-  // The first piece is owed the day it ships.
+  // Raise anything already due (a ship date set late can be months back).
   if (patch.status === 'shipped' || patch.status === 'delivered' || patch.status === 'registered') await raiseDueInstallments()
   return row
 }
 
 /**
- * Raise the pieces that are due: the first when the reader ships, then one on
- * each following month (counted by calendar month, so a reader shipped on the
- * 28th owes its second piece on the 1st, not 30 days later). Idempotent — the
- * count on the order is the ledger of what has been raised.
+ * Raise the pieces that are due: one on the 1st of each month after the month
+ * the reader shipped (10/5, Nic: "It's the first of each month following
+ * shipment" — a reader shipped September 29th is paid October, November,
+ * December and January; nothing is owed in the month it ships). Counted by
+ * calendar month. Idempotent — the count on the order is the ledger of what
+ * has been raised.
  */
 export async function raiseDueInstallments(now: Date = new Date()): Promise<number> {
   const client: PoolClient = await getClient()
@@ -205,7 +209,7 @@ export async function raiseDueInstallments(now: Date = new Date()): Promise<numb
     for (const o of orders.rows) {
       const shipped = new Date(o.shipped_at)
       const monthsSince = (now.getUTCFullYear() - shipped.getUTCFullYear()) * 12 + (now.getUTCMonth() - shipped.getUTCMonth())
-      const due = Math.min(o.installments, 1 + Math.max(0, monthsSince))
+      const due = Math.min(o.installments, Math.max(0, monthsSince))
       const pieces = installmentSplit(Number(o.price), o.installments)
       for (let n = o.installments_raised + 1; n <= due; n++) {
         await chargeLandlord(client, {

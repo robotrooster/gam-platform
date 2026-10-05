@@ -54,26 +54,28 @@ describe('a landlord asks for the one reader we support', () => {
     expect(again.id).not.toBe(o.id)
   })
 
-  it('the first piece is owed when it ships, the next one the following month, each its own line', async () => {
+  // 10/5 (Nic): "It's the first of each month following shipment." Shipped in
+  // September → October, November, December, January. Nothing in the ship month.
+  it('nothing is owed in the month it ships; one piece on the 1st of each month after, each its own line', async () => {
     const w = await world()
     const o = await requestReader({ landlordId: w.landlordId, propertyId: w.propertyId, shipTo, requestedByUserId: w.userId })
     await adminUpdateReaderOrder(o.id, { status: 'ordered', stripeHardwareOrderId: 'thor_123' })
-    let charges = await db.query(`SELECT * FROM landlord_gam_charges WHERE landlord_id=$1`, [w.landlordId])
-    expect(charges.rows).toHaveLength(0)     // nothing owed until it ships
     await adminUpdateReaderOrder(o.id, { status: 'shipped', serial: 'WSC123', trackingUrl: 'https://ups.example/1' })
+    let charges = await db.query(`SELECT * FROM landlord_gam_charges WHERE landlord_id=$1`, [w.landlordId])
+    expect(charges.rows).toHaveLength(0)     // the ship month owes nothing
+    // Ship it on September 29th: October 1st is piece 1.
+    await db.query(`UPDATE pos_reader_orders SET shipped_at = '2026-09-29T15:00:00Z' WHERE id=$1`, [o.id])
+    expect(await raiseDueInstallments(new Date('2026-09-30T12:00:00Z'))).toBe(0)
+    expect(await raiseDueInstallments(new Date('2026-10-01T12:00:00Z'))).toBe(1)
     charges = await db.query(`SELECT kind, amount, notes FROM landlord_gam_charges WHERE landlord_id=$1 ORDER BY created_at`, [w.landlordId])
     expect(charges.rows).toHaveLength(1)
     expect(charges.rows[0].kind).toBe('device_installment')
     expect(Number(charges.rows[0].amount)).toBe(87.5)
     expect(charges.rows[0].notes).toMatch(/payment 1 of 4/)
-    // same month again: nothing more
-    expect(await raiseDueInstallments(new Date())).toBe(0)
-    // next month: piece 2; three months on: pieces 3 and 4, then it stops
-    const shipped = (await db.query(`SELECT shipped_at FROM pos_reader_orders WHERE id=$1`, [o.id])).rows[0].shipped_at as Date
-    const plus = (m: number) => new Date(Date.UTC(shipped.getUTCFullYear(), shipped.getUTCMonth() + m, 2))
-    expect(await raiseDueInstallments(plus(1))).toBe(1)
-    expect(await raiseDueInstallments(plus(3))).toBe(2)
-    expect(await raiseDueInstallments(plus(9))).toBe(0)
+    expect(await raiseDueInstallments(new Date('2026-10-20T12:00:00Z'))).toBe(0)   // same month: nothing more
+    expect(await raiseDueInstallments(new Date('2026-11-01T12:00:00Z'))).toBe(1)   // November
+    expect(await raiseDueInstallments(new Date('2027-01-02T12:00:00Z'))).toBe(2)   // December + January
+    expect(await raiseDueInstallments(new Date('2027-06-01T12:00:00Z'))).toBe(0)   // done
     charges = await db.query(`SELECT amount FROM landlord_gam_charges WHERE landlord_id=$1`, [w.landlordId])
     expect(charges.rows).toHaveLength(4)
     expect(charges.rows.reduce((a: number, r: any) => a + Number(r.amount), 0)).toBe(350)
@@ -140,8 +142,10 @@ describe('the order finds its reader — nobody types a serial', () => {
     const r = await orderRow(o.id)
     expect(r).toMatchObject({ status: 'shipped', serial: 'STR71Z1H614000756', stripe_reader_id: 'tmr_mv' })
     expect(r.shipped_at).not.toBeNull()
-    // shipped → the plan's first piece is owed (daily job)
-    expect(await raiseDueInstallments(new Date())).toBe(1)
+    // shipped → nothing in the ship month; the plan's first piece next month
+    expect(await raiseDueInstallments(new Date())).toBe(0)
+    const next = new Date(); next.setUTCMonth(next.getUTCMonth() + 1, 2)
+    expect(await raiseDueInstallments(next)).toBe(1)
   })
 
   it('once Stripe has seen it switched on, the order is done and the morning email stays quiet', async () => {

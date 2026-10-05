@@ -3111,7 +3111,7 @@ function GetReaderCard({ propertyId, property }: { propertyId: string; property:
             <div><div className="form-label">EMAIL FOR SHIPPING UPDATES</div><input className="form-input" style={{ width:'100%' }} value={form.email} onChange={e => set('email', e.target.value)} /></div>
           </div>
           <div style={{ fontSize:'.8rem', color:'var(--text-2)' }}>
-            You are asking for one {SUPPORTED_CARD_READER.label} at ${SUPPORTED_CARD_READER.price.toFixed(2)}, paid as {pieces} monthly payments of ${piece} from your payouts, the first when it ships.
+            You are asking for one {SUPPORTED_CARD_READER.label} at ${SUPPORTED_CARD_READER.price.toFixed(2)}, paid as {pieces} monthly payments of ${piece} from your payouts, on the 1st of each month after it ships.
           </div>
           <div style={{ display:'flex', gap: 8 }}>
             <button className="btn btn-ghost" onClick={() => setShowForm(false)}>Back</button>

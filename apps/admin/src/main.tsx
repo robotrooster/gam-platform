@@ -2307,8 +2307,9 @@ function Disbursements(){
 // S652 (Nic): GAM's reader desk. A landlord asks for a card reader from the
 // register; here it gets ordered in Stripe's shop — pre-registered to the
 // property's Terminal location on the row — and the Stripe order, serial and
-// tracking are written down. "Shipped" raises the first payment; Stripe
-// registering the device flips the row to "registered" by itself.
+// tracking are written down. Payments start the 1st of the month after it
+// ships (10/5). The reader closes its own row: it turns up at the location
+// (shipped) and Stripe sees it switched on (registered) — no typed serial.
 // S652 (Nic): "I don't want to… say, oh, I missed this." The count of requests
 // nobody has ordered yet sits on the sidebar, on every admin page.
 function ReaderOrdersBadge() {
