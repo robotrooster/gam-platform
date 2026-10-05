@@ -7,11 +7,17 @@ import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { installmentSplit, SUPPORTED_CARD_READER } from '@gam/shared'
 
 vi.mock('./posTerminal', () => ({ getOrCreatePropertyLocation: vi.fn(async () => 'tml_test') }))
+// 10/5: what Stripe says is at a property's location. Default: nothing.
+const stripeReaders = vi.fn(async (_q: any): Promise<any> => ({ data: [] }))
+vi.mock('../lib/stripe', () => ({ getStripe: () => ({ terminal: { readers: { list: (q: any) => stripeReaders(q) } } }) }))
 const adminNote = vi.fn(async (_o: any) => {})
 vi.mock('./adminNotifications', () => ({ createAdminNotification: (o: any) => adminNote(o) }))
-import { requestReader, cancelReaderRequest, adminUpdateReaderOrder, raiseDueInstallments, listReaderOrders, chaseReaderOrders } from './readerOrders'
+import { requestReader, cancelReaderRequest, adminUpdateReaderOrder, raiseDueInstallments, listReaderOrders, chaseReaderOrders, syncReadersFromStripe } from './readerOrders'
 
-beforeEach(async () => { await cleanupAllSchema(); adminNote.mockClear() })
+beforeEach(async () => {
+  await cleanupAllSchema(); adminNote.mockClear()
+  stripeReaders.mockReset(); stripeReaders.mockImplementation(async () => ({ data: [] }))
+})
 
 async function world() {
   const c = await db.connect()
@@ -108,5 +114,76 @@ describe('a request cannot sit unseen', () => {
     await adminUpdateReaderOrder(o.id, { status: 'registered', serial: 'WSC1' })
     adminNote.mockClear()
     expect(await chaseReaderOrders(day6)).toEqual({ waiting: 0, sent: false })
+  })
+})
+
+// 10/5 (Nic): "the card reader arrived on Friday and it's been set up and used
+// for several days now... the system should be detecting that it's already
+// active and in use." Mountain View's order sat at Ordered with no serial while
+// its reader took card sales, and the morning email asked for the serial daily.
+describe('the order finds its reader — nobody types a serial', () => {
+  async function placed(w: any) {
+    await db.query(`UPDATE properties SET stripe_terminal_location_id = 'tml_mv' WHERE id = $1`, [w.propertyId])
+    const o = await requestReader({ landlordId: w.landlordId, propertyId: w.propertyId, shipTo, requestedByUserId: w.userId })
+    await adminUpdateReaderOrder(o.id, { status: 'ordered', stripeHardwareOrderId: 'thor_mv' })
+    adminNote.mockClear()
+    return o
+  }
+  const orderRow = async (id: string) => (await db.query(
+    `SELECT status, serial, stripe_reader_id, shipped_at, registered_at, installments_raised FROM pos_reader_orders WHERE id = $1`, [id])).rows[0]
+  const day = (n: number) => new Date(Date.now() + n * 86400000)
+
+  it('a reader that turns up at the property after the order ships the order, with Stripe\u2019s serial', async () => {
+    const w = await world(); const o = await placed(w)
+    stripeReaders.mockImplementation(async () => ({ data: [{ id: 'tmr_mv', serial_number: 'STR71Z1H614000756', label: null, status: null, last_seen_at: null }] }))
+    await syncReadersFromStripe(w.landlordId, w.propertyId)
+    const r = await orderRow(o.id)
+    expect(r).toMatchObject({ status: 'shipped', serial: 'STR71Z1H614000756', stripe_reader_id: 'tmr_mv' })
+    expect(r.shipped_at).not.toBeNull()
+    // shipped → the plan's first piece is owed (daily job)
+    expect(await raiseDueInstallments(new Date())).toBe(1)
+  })
+
+  it('once Stripe has seen it switched on, the order is done and the morning email stays quiet', async () => {
+    const w = await world(); const o = await placed(w)
+    stripeReaders.mockImplementation(async () => ({ data: [{ id: 'tmr_mv', serial_number: 'S1', label: 'Front desk', status: 'online', last_seen_at: Date.now() }] }))
+    const r = await chaseReaderOrders(day(7))
+    expect(r).toEqual({ waiting: 0, sent: false })
+    expect(adminNote).not.toHaveBeenCalled()
+    expect(await orderRow(o.id)).toMatchObject({ status: 'registered', stripe_reader_id: 'tmr_mv', serial: 'S1' })
+  })
+
+  it('with Stripe unreachable, a reader already on file after the order still ships it — no "has it shipped?"', async () => {
+    const w = await world(); const o = await placed(w)
+    await db.query(`INSERT INTO pos_terminal_readers (landlord_id, property_id, stripe_reader_id, nickname) VALUES ($1,$2,'tmr_local','Desk')`,
+      [w.landlordId, w.propertyId])
+    stripeReaders.mockImplementation(async () => { throw new Error('stripe down') })
+    await chaseReaderOrders(day(5))
+    expect(await orderRow(o.id)).toMatchObject({ status: 'shipped', stripe_reader_id: 'tmr_local' })
+    const lines = adminNote.mock.calls.map(c => c[0].body).join('\n')
+    expect(lines).not.toMatch(/CHECK STRIPE/)
+  })
+
+  it('a reader the property already had before the order is never taken for the new one', async () => {
+    const w = await world()
+    await db.query(`UPDATE properties SET stripe_terminal_location_id = 'tml_mv' WHERE id = $1`, [w.propertyId])
+    await db.query(`INSERT INTO pos_terminal_readers (landlord_id, property_id, stripe_reader_id, nickname, created_at)
+                    VALUES ($1,$2,'tmr_old','Old', NOW() - interval '30 days')`, [w.landlordId, w.propertyId])
+    const o = await placed(w)
+    await syncReadersFromStripe(w.landlordId, w.propertyId)
+    expect(await orderRow(o.id)).toMatchObject({ status: 'ordered', stripe_reader_id: null })
+    const r = await chaseReaderOrders(day(5))
+    expect(r.sent).toBe(true)
+    expect(adminNote.mock.calls[0][0].body).toMatch(/CHECK STRIPE/)
+  })
+
+  it('shipped but never switched on after ten days still asks whether it arrived', async () => {
+    const w = await world(); const o = await placed(w)
+    stripeReaders.mockImplementation(async () => ({ data: [{ id: 'tmr_mv', serial_number: 'S2', label: null, status: null, last_seen_at: null }] }))
+    await syncReadersFromStripe(w.landlordId, w.propertyId)
+    expect((await orderRow(o.id)).status).toBe('shipped')
+    const r = await chaseReaderOrders(day(12))
+    expect(r.sent).toBe(true)
+    expect(adminNote.mock.calls[0][0].body).toMatch(/NOT IN USE/)
   })
 })

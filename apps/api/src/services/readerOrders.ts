@@ -88,13 +88,22 @@ export async function requestReader(opts: {
  * The morning chase: ONE email while anything is waiting on GAM.
  *
  *   requested            → nobody has ordered it yet (every day until they do)
- *   ordered, no serial   → after 3 days: has Stripe shipped? paste the serial
- *   shipped, unregistered→ after 10 days: did it arrive, is it plugged in?
+ *   ordered, no reader   → after 3 days: has Stripe shipped it?
+ *   shipped, never online→ after 10 days: did it arrive, is it plugged in?
  *
  * One digest, not one email per order (S652: one email per thing). Silent when
  * nothing waits.
  */
 export async function chaseReaderOrders(now: Date = new Date()): Promise<{ waiting: number; sent: boolean }> {
+  // 10/5 (Nic): "the card reader arrived on Friday and it's been set up and
+  // used for several days... the system should be detecting that it's already
+  // active and in use." Ask the readers before asking a person: every property
+  // with an order GAM has placed is checked at Stripe first (and against the
+  // readers already on file if Stripe can't be reached), so an order whose
+  // reader is plugged in and working never makes this list.
+  const placed = await query<{ landlord_id: string; property_id: string }>(
+    `SELECT DISTINCT landlord_id, property_id FROM pos_reader_orders WHERE status IN ('ordered','shipped','delivered')`)
+  for (const o of placed) await syncReadersFromStripe(o.landlord_id, o.property_id)
   const rows = await query<any>(
     `SELECT o.id, o.status, o.created_at, o.ordered_at, o.shipped_at, o.serial,
             p.name AS property_name, l.business_name
@@ -107,10 +116,10 @@ export async function chaseReaderOrders(now: Date = new Date()): Promise<{ waiti
     const name = `${o.business_name ?? 'Landlord'} · ${o.property_name}`
     if (o.status === 'requested') {
       lines.push(`NOT ORDERED — ${name}: asked ${days(o.created_at)} day(s) ago`)
-    } else if (o.status === 'ordered' && !o.serial && days(o.ordered_at ?? o.created_at) >= 3) {
-      lines.push(`CHECK STRIPE — ${name}: ordered ${days(o.ordered_at ?? o.created_at)} day(s) ago, no serial yet — has it shipped?`)
+    } else if (o.status === 'ordered' && days(o.ordered_at ?? o.created_at) >= 3) {
+      lines.push(`CHECK STRIPE — ${name}: ordered ${days(o.ordered_at ?? o.created_at)} day(s) ago and no reader has shown up at the property yet — has it shipped?`)
     } else if ((o.status === 'shipped' || o.status === 'delivered') && days(o.shipped_at ?? o.created_at) >= 10) {
-      lines.push(`NOT IN USE — ${name}: shipped ${days(o.shipped_at ?? o.created_at)} day(s) ago and not registered — did it arrive, is it plugged in?`)
+      lines.push(`NOT IN USE — ${name}: shipped ${days(o.shipped_at ?? o.created_at)} day(s) ago and Stripe has never seen it switched on — did it arrive, is it plugged in?`)
     }
   }
   if (!lines.length) return { waiting: 0, sent: false }
@@ -223,12 +232,13 @@ export async function raiseDueInstallments(now: Date = new Date()): Promise<numb
 export async function syncReadersFromStripe(landlordId: string, propertyId: string): Promise<number> {
   const p = await queryOne<{ stripe_terminal_location_id: string | null }>(
     `SELECT stripe_terminal_location_id FROM properties WHERE id = $1 AND landlord_id = $2`, [propertyId, landlordId])
-  if (!p?.stripe_terminal_location_id) return 0
   let added = 0
-  try {
+  const seen = new Map<string, SeenReader>()
+  if (p?.stripe_terminal_location_id) try {
     const readers = await getStripe().terminal.readers.list({ location: p.stripe_terminal_location_id, limit: 100 })
     for (const r of readers.data) {
       if (r.status === 'offline' && (r as any).deleted) continue
+      seen.set(r.id, { serial: r.serial_number ?? null, lastSeenAt: (r as any).last_seen_at ?? null })
       const nickname = r.label || `${SUPPORTED_CARD_READER.label} ${r.serial_number?.slice(-4) ?? ''}`.trim()
       const known = await queryOne<{ id: string }>(
         `SELECT id FROM pos_terminal_readers WHERE stripe_reader_id = $1`, [r.id])
@@ -238,14 +248,78 @@ export async function syncReadersFromStripe(landlordId: string, propertyId: stri
           [landlordId, propertyId, r.id, nickname])
         added++
       }
-      if (r.serial_number) {
-        await query(
-          `UPDATE pos_reader_orders SET status = 'registered', registered_at = COALESCE(registered_at, NOW()),
-                  stripe_reader_id = $2, updated_at = NOW()
-            WHERE property_id = $1 AND serial = $3 AND status <> 'cancelled' AND status <> 'registered'`,
-          [propertyId, r.id, r.serial_number])
-      }
     }
   } catch (e) { logger.warn({ err: e, propertyId }, '[reader-sync] could not list readers at Stripe') }
+  // Runs even when Stripe could not be reached: the readers already on file
+  // still say whether the order's reader has turned up. Only for this
+  // landlord's property (the caller's scope).
+  if (p) await reconcileReaderOrders(propertyId, seen)
   return added
+}
+
+/** What Stripe said about one reader on this pass. */
+export interface SeenReader { serial: string | null; lastSeenAt: number | null }
+
+/**
+ * 10/5 — the order finds its reader; nobody types a serial.
+ *
+ * The only link from an order to its reader used to be a serial typed on the
+ * desk. Nobody typed it, so Mountain View's order sat at Ordered for a week
+ * while its reader took card sales, and the morning email kept asking for it.
+ * The reader carries the answer:
+ *
+ *   - Stripe puts a pre-registered reader at the property's location when the
+ *     order ships, so a reader that turns up there after the order was placed
+ *     IS that order's reader (a property has one open order at a time —
+ *     requestReader refuses a second). The order is shipped, from the moment
+ *     GAM first saw the reader, and takes Stripe's serial.
+ *   - A reader Stripe has seen online has been unpacked and switched on: the
+ *     order is done (registered).
+ *
+ * A typed serial or an already-linked reader still wins. A reader linked to one
+ * order is never claimed by another. Requests GAM has not ordered are left alone.
+ * The payment plan starts from shipped_at through the daily installment job.
+ */
+export async function reconcileReaderOrders(propertyId: string, seen: Map<string, SeenReader> = new Map()): Promise<number> {
+  const orders = await query<any>(
+    `SELECT * FROM pos_reader_orders WHERE property_id = $1 AND status IN ('ordered','shipped','delivered') ORDER BY created_at`,
+    [propertyId])
+  let moved = 0
+  for (const o of orders) {
+    const bySerial = o.serial ? [...seen.entries()].find(([, s]) => s.serial === o.serial)?.[0] ?? null : null
+    const reader = await queryOne<{ stripe_reader_id: string; created_at: string }>(
+      o.stripe_reader_id || bySerial
+        ? `SELECT stripe_reader_id, created_at FROM pos_terminal_readers WHERE property_id = $1 AND stripe_reader_id = $2`
+        : `SELECT r.stripe_reader_id, r.created_at
+             FROM pos_terminal_readers r
+            WHERE r.property_id = $1
+              AND r.created_at >= $2::timestamptz
+              AND NOT EXISTS (SELECT 1 FROM pos_reader_orders x WHERE x.stripe_reader_id = r.stripe_reader_id AND x.id <> $3)
+            ORDER BY r.created_at LIMIT 1`,
+      o.stripe_reader_id || bySerial
+        ? [propertyId, o.stripe_reader_id || bySerial]
+        : [propertyId, o.ordered_at ?? o.created_at, o.id])
+    if (!reader) continue
+    const s = seen.get(reader.stripe_reader_id)
+    const inUse = s?.lastSeenAt != null
+    const r = await query(
+      `UPDATE pos_reader_orders
+          SET stripe_reader_id = $2,
+              serial        = COALESCE(serial, $3),
+              shipped_at    = COALESCE(shipped_at, $4::timestamptz),
+              status        = CASE WHEN $5 THEN 'registered' WHEN status = 'ordered' THEN 'shipped' ELSE status END,
+              delivered_at  = CASE WHEN $5 THEN COALESCE(delivered_at, NOW()) ELSE delivered_at END,
+              registered_at = CASE WHEN $5 THEN COALESCE(registered_at, NOW()) ELSE registered_at END,
+              updated_at    = NOW()
+        WHERE id = $1
+          AND (stripe_reader_id IS DISTINCT FROM $2 OR serial IS NULL AND $3::text IS NOT NULL
+               OR shipped_at IS NULL OR status = 'ordered' OR $5)
+        RETURNING id`,
+      [o.id, reader.stripe_reader_id, s?.serial ?? null, reader.created_at, inUse])
+    if (r.length) {
+      moved++
+      logger.info({ orderId: o.id, readerId: reader.stripe_reader_id, inUse }, '[reader-order] matched to its reader')
+    }
+  }
+  return moved
 }
