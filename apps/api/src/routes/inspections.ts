@@ -1024,10 +1024,14 @@ inspectionsRouter.post('/:id/finalize', requirePerm('inspections.manage'), async
         const { getPropertyResponsibleParty } = await import('../services/responsibleParty')
         const targets = await getPropertyResponsibleParty(unitCtx.property_id)
         if (targets) {
-          for (const recipient of targets.primaries) {
+          // 10/5: the tenant's copy rides the FIRST recipient only. A property
+          // run by a management company has one primary per active staff
+          // member, and the tenant was getting one identical email per staff
+          // member (S652: one email per thing).
+          for (const [i, recipient] of targets.primaries.entries()) {
             await notifyInspectionFinalized({
-              tenantUserId:    tenantPing?.user_id,
-              tenantEmail:     tenantPing?.email,
+              tenantUserId:    i === 0 ? tenantPing?.user_id : undefined,
+              tenantEmail:     i === 0 ? tenantPing?.email : undefined,
               landlordUserId:  recipient.user_id,
               landlordId:      insp.landlord_id,
               landlordEmail:   recipient.email,

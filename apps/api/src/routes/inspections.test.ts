@@ -768,6 +768,28 @@ describe('POST /inspections/:id/sign — sign-off state machine', () => {
 // ─── POST /inspections/:id/finalize ───────────────────────────────
 
 describe('POST /inspections/:id/finalize', () => {
+  // 10/5: a property run by a management company has one recipient per active
+  // staff member. Each gets the landlord-side notice; the TENANT gets one.
+  it('with several staff on the property, every staff member is told and the tenant hears once', async () => {
+    const f = await seedFixture()
+    getResponsiblePartyMock.mockResolvedValue({
+      primaries: [
+        { user_id: f.landlordUserId, email: 'a@pm.test', phone: null },
+        { user_id: f.landlordUserId, email: 'b@pm.test', phone: null },
+        { user_id: f.landlordUserId, email: 'c@pm.test', phone: null },
+      ],
+      additionals: [],
+    } as any)
+    const id = await createInspection(f, { status: 'landlord_signed' })
+    const res = await request(buildApp())
+      .post(`/api/inspections/${id}/finalize`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    const calls = notifyFinalizedMock.mock.calls.map((c: any[]) => c[0])
+    expect(calls.map((c: any) => c.landlordEmail)).toEqual(['a@pm.test', 'b@pm.test', 'c@pm.test'])
+    expect(calls.filter((c: any) => c.tenantEmail)).toHaveLength(1)
+  })
+
   it('landlord finalizes from landlord_signed → status=finalized, ledger emitter fires', async () => {
     const f = await seedFixture()
     const id = await createInspection(f, { status: 'landlord_signed' })

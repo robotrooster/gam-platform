@@ -66,11 +66,13 @@ export async function processOperationalNudges(): Promise<OperationalNudgesResul
         ? await getPropertyResponsibleParty(row.property_id)
         : null
       const recipients = targets?.primaries ?? []
-      for (const recipient of recipients) {
+      // 10/5: the tenant's reminder rides the FIRST recipient only — one per
+      // management-company staff member was N identical emails to the tenant.
+      for (const [i, recipient] of recipients.entries()) {
         await notifyInspectionScheduledReminder({
-          tenantUserId: row.tenant_user_id ?? undefined,
-          tenantEmail:  row.tenant_email ?? undefined,
-          tenantPhone:  row.tenant_phone ?? undefined,
+          tenantUserId: i === 0 ? row.tenant_user_id ?? undefined : undefined,
+          tenantEmail:  i === 0 ? row.tenant_email ?? undefined : undefined,
+          tenantPhone:  i === 0 ? row.tenant_phone ?? undefined : undefined,
           landlordUserId: recipient.user_id,
           landlordId:     row.landlord_id,
           landlordEmail:  recipient.email,
