@@ -2575,7 +2575,13 @@ export const UNIT_TYPE_ICON: Record<UnitType, string> = {
 //     hotel_room) → 5% of booking revenue short-term (the Airbnb-competitor
 //     lane, higher value + more GAM does). A motel room is FURNISHED, not a bare
 //     site → 5%, same category as a cabin/apartment STR (Nic S577). The gap vs
-//     monthly $2 is intentional and guarded by the auto-lease-at-threshold rule.
+//     monthly $2 is intentional.
+//   • A MONTH STAY WITH NO LEASE (10/5, Nic R12) is a stay: it counts exactly
+//     like a nightly or weekly one — nights/30 on a bare site, the revenue % on
+//     a furnished one. This used to be guarded by drafting a lease at 30 nights;
+//     no lease is drafted automatically any more (a 30+ night guest chooses a
+//     lease or a stay). A month stay a lease covers is counted by the lease,
+//     once (services/billableUnits feeCountedStaySql).
 //   • NON-LODGING space (parking, land_lot, commercial) → monthly $2; the rare
 //     short-term booking bills 5% (5% never gouges cheap space, whereas a $2/30
 //     minimum would — e.g. 25¢ on a $5 parking day). Truly hourly casual space
@@ -4077,6 +4083,44 @@ export type StayPaymentMethod = typeof STAY_PAYMENT_METHODS[number]
 /** How a register refund was paid back (pos_refunds_method_check). 'card': back to the card through Stripe (#37.B). */
 export const POS_REFUND_METHODS = ['cash', 'check', 'charge', 'card'] as const
 export type PosRefundMethod = typeof POS_REFUND_METHODS[number]
+
+// ── 10/5 (Nic): PREPAID STAYS — the two night counts every door uses ──
+//
+// Counted on the guest's CONTINUOUS stay at one property: back-to-back stays
+// of the same person add up (services/stayTerms continuousStayNights).
+//   - 22+ nights (more than three weeks): a background check is required. Its
+//     fee rides on the payment that sells or extends the stay, and check-in
+//     waits for the results and the landlord's decision.
+//   - 30+ nights: lease or stay? Online the guest chooses; at the register, on
+//     a pay link or on the schedule the front counter does. No lease is ever
+//     drafted automatically.
+export const STAY_SCREENING_NIGHTS = 22
+export const STAY_LEASE_CHOICE_NIGHTS = 30
+/** unit_bookings.stay_terms (unit_bookings_stay_terms_check). NULL = not asked. */
+export const STAY_TERMS = ['lease', 'stay'] as const
+export type StayTerms = typeof STAY_TERMS[number]
+export const STAY_TERMS_LABEL: Record<StayTerms, string> = {
+  lease: 'Lease',
+  stay: 'Stay (no lease)',
+}
+
+/** "November 4, 2026" from a YYYY-MM-DD calendar day (no time zone shift). */
+export function longCalendarDate(ymd: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(ymd))
+  if (!m) return String(ymd)
+  const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+    'August', 'September', 'October', 'November', 'December']
+  return `${months[Number(m[2]) - 1]} ${Number(m[3])}, ${m[1]}`
+}
+
+/**
+ * 10/5 (Nic, R13): the one sentence a 30+ night stay with no lease carries on
+ * its receipt, pay link and booking confirmation. `checkOutYmd` is the day the
+ * paid time runs out (the stay's check-out).
+ */
+export function stayHeldWords(checkOutYmd: string): string {
+  return `Your site is held through ${longCalendarDate(checkOutYmd)}. Without a lease it can be booked by someone else after that — sign a lease to keep it for as long as you're here.`
+}
 
 // ── Paid-ahead money left on an ended lease: the landlord's choice (decisions #46.1) ──
 //

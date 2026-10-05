@@ -21,10 +21,11 @@
  * overlaps any day of the billing month.
  *
  * Short-stay nights: SUM of all nights from unit_bookings on the property
- * where lease_type IN ('nightly','weekly') and status NOT IN
- * ('cancelled','no_show'), clamped to the billing month via
- * LEAST(check_out, month_end+1d) - GREATEST(check_in, month_start).
- * EVERY night counts — no exclusion for units that also had a lease.
+ * where lease_type IN ('nightly','weekly') — and, since 10/5 (R12), a month
+ * stay with no lease (services/billableUnits feeCountedStaySql) — clamped to
+ * the billing month via LEAST(check_out, month_end+1d) - GREATEST(check_in,
+ * month_start). EVERY nightly/weekly night counts — no exclusion for units
+ * that also had a lease.
  *
  * Per-property fee = rate × total_billable + STR fee. NO per-property floor.
  *
@@ -56,7 +57,7 @@
 import { getClient, query } from '../db'
 import { chargeLandlord } from '../services/landlordGamAccount'
 import { activateBillingForOccupancy } from '../services/billingActivation'
-import { billableUnitsForProperty } from '../services/billableUnits'
+import { billableUnitsForProperty, feeCountedStaySql } from '../services/billableUnits'
 import { stayRevenueInMonthSql } from '../services/platformFee'
 import { NIGHTS_AGGREGATION_UNIT_TYPES, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
 import type { PoolClient } from 'pg'
@@ -495,7 +496,9 @@ async function accrueOneProperty(
         JOIN units u ON u.id = b.unit_id
        WHERE u.property_id = $1
          AND u.unit_type <> ALL($3::text[])
-         AND b.lease_type IN ('nightly', 'weekly')
+         -- 10/5 (Nic, R12): a month stay with no lease bills like any stay
+         -- (services/billableUnits — the same rule as the nights above).
+         AND ${feeCountedStaySql('b', '$2::date')}
          AND b.status NOT IN ('cancelled', 'no_show')
          AND b.check_in  <  $2::date + INTERVAL '1 month'
          AND b.check_out >  $2::date

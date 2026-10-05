@@ -254,13 +254,53 @@ async function chargebackUnderLock(
   }
 
   const feeCents = input.feeCents > 0 ? input.feeCents : 1500
-  const owedBack = (Math.max(0, input.amountCents) + feeCents) / 100
+  // 10/5 (Nic, A5): a background check paid by card with a stay is GAM's money
+  // — it never went into the landlord's held share — so a chargeback does not
+  // take it from the landlord. Their share of the disputed amount is what is
+  // netted (pro rata when the dispute is for part of the charge).
+  const gamScreening = payee.landlord_id ? await gamHeldScreeningIn(client, pi) : null
+  const disputedCents = Math.max(0, input.amountCents)
+  const gamCents = gamScreening && gamScreening.chargeCents > 0
+    ? Math.min(gamScreening.amountCents, Math.round(gamScreening.amountCents * Math.min(1, disputedCents / gamScreening.chargeCents)))
+    : 0
+  const owedBack = (disputedCents - gamCents + feeCents) / 100
   const recorded = await recordHeldItem({
     landlordId: payee.landlord_id, businessId: payee.business_id,
     sourceType: 'dispute', sourceId: input.stripeDisputeId,
     amount: -owedBack, description: `Chargeback on a ${payee.what} (includes Stripe's dispute fee)`,
   }, client)
   if (!recorded) return { handled: false, reason: 'already recorded' }
-  logger.warn({ ...payee, pi, owedBack }, '[chargeback] held charge disputed — nets against the next payout')
+  if (gamScreening && gamCents > 0) {
+    // The card company took the check's money back, so the paid check no
+    // longer waits for the guest (one they already used stays used).
+    const { voidScreeningPrepayment } = await import('./stayTerms')
+    for (const id of gamScreening.ids) await voidScreeningPrepayment(client, { prepaymentId: id })
+  }
+  logger.warn({ ...payee, pi, owedBack, gamScreening: gamCents / 100 }, '[chargeback] held charge disputed — nets against the next payout')
   return { handled: true }
+}
+
+/**
+ * The background-check money GAM kept from a card charge (A5): prepayments
+ * with no landlord charge line whose sale, pay link or booking-site stay is the
+ * charge. Returns the charge's own total so a partial dispute is shared pro rata.
+ */
+async function gamHeldScreeningIn(client: PoolClient, pi: string): Promise<{
+  ids: string[]; amountCents: number; chargeCents: number
+} | null> {
+  const rows = (await client.query<{ id: string; amount: string; charge_total: string }>(
+    `SELECT sp.id, sp.amount::text AS amount, t.total::text AS charge_total
+       FROM pos_transactions t
+       JOIN screening_prepayments sp ON sp.source_id = t.id OR (t.pay_link_id IS NOT NULL AND sp.source_id = t.pay_link_id)
+      WHERE t.stripe_payment_intent_id = $1 AND sp.status <> 'void' AND sp.landlord_charge_id IS NULL
+     UNION
+     SELECT sp.id, sp.amount::text, (COALESCE(b.deposit_amount, 0) + sp.amount)::text
+       FROM unit_bookings b
+       JOIN screening_prepayments sp ON sp.booking_id = b.id AND sp.source = 'booking_site'
+      WHERE b.stripe_payment_intent_id = $1 AND sp.status <> 'void' AND sp.landlord_charge_id IS NULL`,
+    [pi])).rows
+  if (!rows.length) return null
+  const amountCents = rows.reduce((s, r) => s + Math.round(parseFloat(r.amount) * 100), 0)
+  const chargeCents = Math.max(amountCents, Math.round(parseFloat(rows[0].charge_total) * 100))
+  return { ids: rows.map(r => r.id), amountCents, chargeCents }
 }

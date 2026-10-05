@@ -1007,47 +1007,6 @@ export async function createInvoiceCheckoutSession(
   return { sessionId: session.id, hostedUrl: session.url }
 }
 
-// ── Booking deposit checkout (S517 / public property booking) ──
-// A public stay-booking guest pays a deposit on Stripe's hosted Checkout.
-// S648 (Nic): card only, with the card fee on top; the charge is GAM's, the
-// deposit is held for the landlord and paid in their weekly payout. The
-// webhook confirms the booking on checkout.session.completed
-// (gam_purpose='booking_deposit').
-export interface CreateBookingDepositCheckoutOpts {
-  amountCents:                 number   // the deposit
-  cardFeeCents:                number   // added on top, GAM's
-  unitLabel:                   string
-  guestEmail?:                 string | null
-  successUrl:                  string
-  cancelUrl:                   string
-  metadata?:                   Record<string, string>
-}
-
-export async function createBookingDepositCheckoutSession(
-  opts: CreateBookingDepositCheckoutOpts,
-): Promise<InvoiceCheckoutResult> {
-  const stripe = getStripe()
-  const session = await stripe.checkout.sessions.create({
-    mode: 'payment',
-    payment_method_types: ['card'],
-    line_items: [
-      { quantity: 1, price_data: { currency: 'usd', unit_amount: opts.amountCents,
-          product_data: { name: `Stay deposit — ${opts.unitLabel}` } } },
-      ...(opts.cardFeeCents > 0 ? [{ quantity: 1, price_data: { currency: 'usd', unit_amount: opts.cardFeeCents,
-          product_data: { name: 'Card processing fee' } } }] : []),
-    ],
-    payment_intent_data: {
-      metadata: { gam_purpose: 'booking_deposit', ...(opts.metadata ?? {}) },
-    },
-    metadata: { gam_purpose: 'booking_deposit', ...(opts.metadata ?? {}) },
-    customer_email: opts.guestEmail ?? undefined,
-    success_url: opts.successUrl,
-    cancel_url:  opts.cancelUrl,
-  })
-  if (!session.url) throw new AppError(500, 'Stripe returned a Checkout Session with no URL')
-  return { sessionId: session.id, hostedUrl: session.url }
-}
-
 /**
  * S648 — a register pay link's card page (routes/posPayLinks.ts). Card only,
  * charged on GAM's account like rent: the landlord's share goes out in the

@@ -192,9 +192,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     // 10/5: where this property's residents' and guests' replies go. Asked when
     // the property is set up; edited later on the property's page.
     officeEmail: property?.officeEmail || '',
-    // S526: weekly-lease jurisdictions — auto-drafts a lease at 7+ day stays
-    // instead of 30+ (see services/bookingLeaseDraft.ts).
-    weeklyLeaseMode: property?.weeklyLeaseMode ?? false,
     // S247: per-property subleasing toggle. Drives the master switch
     // on whether tenants at this property can request subleases at
     // all. AND'd with leases.subleasingAllowed in the request route.
@@ -674,36 +671,9 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 </div>
               </div>
             </label>
-
-            {/* S526: weekly-lease mode. Long stays auto-draft a lease for
-                review — 30+ days by default; this drops the threshold to 7+
-                for jurisdictions where weekly leases are the norm. */}
-            <label style={{
-              display:        'flex',
-              alignItems:     'flex-start',
-              gap:            10,
-              padding:        12,
-              marginTop:      8,
-              borderRadius:   8,
-              border:         `1px solid ${form.weeklyLeaseMode ? 'var(--gold)' : 'var(--border-0)'}`,
-              background:     form.weeklyLeaseMode ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
-              cursor:         'pointer',
-              fontSize:       '.78rem',
-            }}>
-              <input
-                type="checkbox"
-                checked={form.weeklyLeaseMode}
-                onChange={e => setForm(f => ({ ...f, weeklyLeaseMode: e.target.checked }))}
-                style={{ marginTop: 3 }}
-              />
-              <div>
-                <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Weekly leases</div>
-                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.5 }}>
-                  Stays of 30+ days automatically draft a lease for your review. Turn this on where you
-                  run weekly leases — the draft threshold drops to 7+ days instead.
-                </div>
-              </div>
-            </label>
+            {/* 10/5 (Nic, R14): no "Weekly leases" toggle — no lease is ever
+                drafted automatically, so there is no threshold for it to move.
+                A long stay's lease is the counter's or the guest's choice. */}
           </div>
 
           {/* S247: per-property subleasing toggle. Master switch driven
@@ -853,7 +823,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 </div>
                 <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6 }}>
                   The account you verified with Stripe. Rent for this property pays out there on the
-                  weekly run — nothing to set up here.{' '}
+                  next payout day (Tuesday and Friday through the 10th, then Tuesdays) — nothing to set up here.{' '}
                   <Link to="/banking" style={{ color: 'var(--gold)', textDecoration: 'underline' }}>
                     Change it
                   </Link>

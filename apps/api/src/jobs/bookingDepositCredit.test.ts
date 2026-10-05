@@ -14,7 +14,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant } from '../test/dbHelpers'
 import { generateMoveInInvoice, STAY_DEPOSIT_CREDIT_NOTE } from './moveInBundle'
-import { maybeDraftLeaseFromBooking } from '../services/bookingLeaseDraft'
+import { draftLeaseFromStay } from '../services/stayTerms'
 
 beforeEach(async () => { await cleanupAllSchema() })
 
@@ -144,7 +144,8 @@ describe("a long stay's deposit on the lease's first bill", () => {
   })
 })
 
-describe('the drafted lease tells the landlord about the deposit', () => {
+// 10/5 (Nic, R3/R4): a lease is drafted from a stay only when lease was chosen.
+describe('the lease chosen for a stay tells the landlord about the deposit', () => {
   async function longStay(paid: 'deposit' | 'none' | 'whole' | 'stamped') {
     const c = await getClient()
     try {
@@ -169,26 +170,26 @@ describe('the drafted lease tells the landlord about the deposit', () => {
     `SELECT body FROM notifications WHERE type = 'lease_drafted_from_booking'`).then(r => r.rows[0].body)
 
   it('a paid deposit: names the amount and says it comes off the first bill', async () => {
-    const r = await maybeDraftLeaseFromBooking(await longStay('deposit'))
+    const r = await draftLeaseFromStay(await longStay('deposit'))
     expect(r.drafted).toBe(true)
     expect(await body()).toContain("The $150.00 deposit already paid on the reservation comes off the lease's first bill. "
       + "Anything more than that bill's rent is kept as credit toward the next one.")
   })
 
   it('no deposit paid yet: says what the code does — one paid before the lease is signed comes off its first bill', async () => {
-    const r = await maybeDraftLeaseFromBooking(await longStay('none'))
+    const r = await draftLeaseFromStay(await longStay('none'))
     expect(r.drafted).toBe(true)
     expect(await body()).toContain('A deposit paid on the reservation before the lease is signed comes off its first bill.')
   })
 
   it('a stay paid whole: names the whole amount', async () => {
-    const r = await maybeDraftLeaseFromBooking(await longStay('whole'))
+    const r = await draftLeaseFromStay(await longStay('whole'))
     expect(r.drafted).toBe(true)
     expect(await body()).toContain("The $1400.00 already paid for the whole stay comes off the lease's first bill.")
   })
 
   it('a payment stamped with no separate deposit amount is the whole stay, as the first bill counts it', async () => {
-    const r = await maybeDraftLeaseFromBooking(await longStay('stamped'))
+    const r = await draftLeaseFromStay(await longStay('stamped'))
     expect(r.drafted).toBe(true)
     expect(await body()).toContain("The $1400.00 already paid for the whole stay comes off the lease's first bill.")
   })

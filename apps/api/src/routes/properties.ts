@@ -1488,10 +1488,9 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // per property when they want to offer FlexCharge at that Location.
     const flexchargeEnabled =
       typeof raw.flexchargeEnabled === 'boolean' ? raw.flexchargeEnabled : undefined
-    // S526: weekly-lease jurisdictions — drops the auto-lease-draft threshold
-    // for long stays from 30 days to 7 (services/bookingLeaseDraft.ts).
-    const weeklyLeaseMode =
-      typeof raw.weeklyLeaseMode === 'boolean' ? raw.weeklyLeaseMode : undefined
+    // 10/5 (Nic, R14): weekly_lease_mode only moved the auto-lease-draft
+    // threshold, and no lease is drafted on its own any more (R3). The setting
+    // is gone: weeklyLeaseMode is no longer read, and the column is left as it is.
     // S537 (Nic): partial payments reset the eviction clock — a landlord
     // preparing to act can refuse anything under the full outstanding
     // balance. Tenant portal's Pay Now enforces it server-side.
@@ -1614,7 +1613,7 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
         UPDATE properties SET
           name        = COALESCE($1, name),
           street1     = COALESCE($2, street1),
-          street2     = CASE WHEN $23::boolean THEN $3 ELSE street2 END,
+          street2     = CASE WHEN $22::boolean THEN $3 ELSE street2 END,
           city        = COALESCE($4, city),
           state       = COALESCE($5, state),
           zip         = COALESCE($6, zip),
@@ -1626,13 +1625,12 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
           late_fee_initial_type   = COALESCE($12, late_fee_initial_type),
           subleasing_allowed      = COALESCE($13, subleasing_allowed),
           flexcharge_enabled      = COALESCE($14, flexcharge_enabled),
-          weekly_lease_mode       = COALESCE($15, weekly_lease_mode),
-          default_occupancy_mode  = COALESCE($17, default_occupancy_mode),
-          operator_owns_land      = COALESCE($18, operator_owns_land),
-          lease_signing_email = CASE WHEN $19::boolean THEN $20 ELSE lease_signing_email END,
-          lease_signing_name  = CASE WHEN $21::boolean THEN $22 ELSE lease_signing_name  END,
+          default_occupancy_mode  = COALESCE($16, default_occupancy_mode),
+          operator_owns_land      = COALESCE($17, operator_owns_land),
+          lease_signing_email = CASE WHEN $18::boolean THEN $19 ELSE lease_signing_email END,
+          lease_signing_name  = CASE WHEN $20::boolean THEN $21 ELSE lease_signing_name  END,
           updated_at  = NOW()
-        WHERE id=$16 RETURNING *`,
+        WHERE id=$15 RETURNING *`,
         [name||null, street1||null, street2||null, city||null, state||null,
          zip||null, type||null,
          reqAck === undefined ? null : reqAck,
@@ -1642,7 +1640,6 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
          lateFeeInitialType ?? null,
          subleasingAllowed === undefined ? null : subleasingAllowed,
          flexchargeEnabled === undefined ? null : flexchargeEnabled,
-         weeklyLeaseMode === undefined ? null : weeklyLeaseMode,
          req.params.id,
          defaultOccupancyMode ?? null,
          typeof raw.operatorOwnsLand === 'boolean' ? raw.operatorOwnsLand : null,

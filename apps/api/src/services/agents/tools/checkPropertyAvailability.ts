@@ -1,15 +1,22 @@
 /**
  * Tool: check_availability (visitor). A real quote for THIS property on specific
  * dates — which site types are open and the exact total (auto-tiered
- * nightly/weekly/monthly, prorated, with lodging tax and deposit). Hard-scoped to
+ * nightly/weekly/monthly, with lodging tax and deposit). Hard-scoped to
  * actor.propertyId. Read-only — it never holds a site; use create_booking_checkout
  * to reserve. Mirrors the public booking site's availability engine exactly
  * (same source), so the number the agent quotes matches the booking form.
+ *
+ * 10/5 (Nic, review F5): what is due now is typeAvailability's own figure —
+ * the same one create_booking_checkout charges. 22+ nights carries the
+ * background check's fixed fee (R8); 30+ nights is the guest's choice of a
+ * lease or a stay (R2), and each is priced (a stay pays its first calendar
+ * month, never prorated — R5).
  */
 
 import { DateTime } from 'luxon'
 import {
-  resolvePropertyById, bookableUnits, groupSiteTypes, resolveSiteType, typeAvailability,
+  resolvePropertyById, bookableUnits, groupSiteTypes, resolveSiteType, typeAvailability, quoteScreeningFee,
+  LEASE_OR_STAY_WORDS,
 } from '../../propertyBookingQuote'
 import type { AgentTool, AgentActor } from './types'
 
@@ -20,9 +27,10 @@ export const checkPropertyAvailability: AgentTool = {
   description:
     'Check open site types and the EXACT total for THIS property on specific dates. Use once the guest gives a ' +
     'check-in and check-out ("are you open Aug 2–6?", "what would 5 nights on a pull-through run?"). Returns ' +
-    'each type’s availability, the auto-tiered total (nightly/weekly/monthly, prorated + tax), and the deposit ' +
-    'due now. If a type is full it may offer a shorter stay that fits. Dates are YYYY-MM-DD. Read-only — does ' +
-    'not hold anything.',
+    'each type’s availability, the auto-tiered total (nightly/weekly/monthly + tax), and dueNow — everything ' +
+    'the guest pays to book, including the background check on stays over three weeks. For 30 nights or more ' +
+    'it returns longStay instead: the guest chooses a lease or a stay, and each is priced. If a type is full it ' +
+    'may offer a shorter stay that fits. Dates are YYYY-MM-DD. Read-only — does not hold anything.',
   parameters: {
     type: 'object',
     properties: {
@@ -100,9 +108,11 @@ export const checkPropertyAvailability: AgentTool = {
     if (units.length === 0) return { ok: true, nights, siteTypes: [], note: 'This property has no bookable sites published yet.' }
 
     const wanted = args.siteTypeId ? [resolveSiteType(units, String(args.siteTypeId))] : groupSiteTypes(units)
+    // R8: the check's fee depends only on the dates, so it is worked out once.
+    const screeningFee = await quoteScreeningFee(prop, checkIn, checkOut)
     const siteTypes = []
     for (const t of wanted) {
-      const a = await typeAvailability(prop, t, nights, checkIn, checkOut)
+      const a = await typeAvailability(prop, t, nights, checkIn, checkOut, { screeningFee })
       siteTypes.push({
         id: t.id,
         name: t.name,
@@ -111,10 +121,28 @@ export const checkPropertyAvailability: AgentTool = {
         unavailableReason: a.unavailableReason,
         tier: a.tier,
         total: a.total,
-        // S648: card only, card fee on top.
+        // S648: card only; the card fee follows the property's choice.
         deposit: a.depositAmount,
-        cardFee: a.depositCardFee,
-        depositDueNow: a.depositAmount == null ? null : Math.round((a.depositAmount + (a.depositCardFee ?? 0)) * 100) / 100,
+        // 10/5 (R8): the background check's fixed fee on the charge (null under 22 nights).
+        backgroundCheckFee: a.screeningFee,
+        // Under 30 nights: the whole charge to book — deposit, check, card fee.
+        dueNow: a.dueNow,
+        // 30+ nights (R2/R5): the lease or stay choice, each priced as checkout charges it.
+        longStay: a.longStay
+          ? {
+              words: a.longStay.words,
+              lease: {
+                dueNow: a.longStay.lease.dueNow,
+                monthlyRent: a.longStay.lease.monthlyRent,
+                rentWords: a.longStay.lease.rentWords,
+              },
+              stay: {
+                dueNow: a.longStay.stay.dueNow,
+                paidThrough: a.longStay.stay.checkOut,
+                heldWords: a.longStay.stay.heldWords,
+              },
+            }
+          : null,
         taxIncluded: a.taxable ? a.tax : 0,
         // If full for the whole range, the longest stay from the same check-in that WOULD fit.
         alternativeStay: a.altStay,
@@ -129,9 +157,14 @@ export const checkPropertyAvailability: AgentTool = {
       depositPct: Number(prop.booking_deposit_pct),
       siteTypes,
       note:
-        'Totals are the full stay in US dollars, tax included where it applies; depositDueNow is what the guest ' +
-        'pays now to reserve (the rest is due per the host). To actually book an available type, confirm the ' +
-        'details with the guest and use create_booking_checkout.',
+        'Totals are the full stay in US dollars, tax included where it applies. dueNow.total is what the guest ' +
+        'pays now to book (the rest is due per the host). backgroundCheckFee, when set, is part of that charge and ' +
+        'cannot be removed — a background check is required for stays over three weeks. When longStay is set ' +
+        '(30 nights or more), quote BOTH choices and ask the guest, in these words: "' + LEASE_OR_STAY_WORDS + '" ' +
+        'A lease pays lease.dueNow.total today and the lease bills the rest. A stay pays stay.dueNow.total today ' +
+        'for its first month, through stay.paidThrough; later months are added one at a time. Never choose for ' +
+        'them. To actually book an available type, confirm the details with the guest and use ' +
+        'create_booking_checkout (with stayTerms when longStay is set).',
     }
   },
 }

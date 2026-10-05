@@ -1,6 +1,7 @@
 import { query, queryOne } from '../db'
 import { NIGHTS_AGGREGATION_UNIT_TYPES } from '@gam/shared'
 import { soldCheckOutSql } from './registerStay'
+import { feeCountedStaySql, feeCountedNightsStatusSql } from './billableUnits'
 
 // SQL literal list of the nights/30-aggregation unit types ('rv_spot').
 // Short-stays on every OTHER type bill str_fee_pct of revenue instead.
@@ -201,20 +202,31 @@ export async function platformFeesByProperty(
       -- is never charged twice for the one space. No mid-month conflict —
       -- the incoming landlord is inside the no-double-bill grace until their
       -- second cycle, and that cycle is wholly theirs.
+      --
+      -- 10/5: the same two conditions the bill applies (services/billableUnits)
+      -- — the payer agreed or the landlord attested, else no invoice goes out
+      -- and the bill charges nothing; and not a stay's own agreement (R11),
+      -- whose space is counted by the stay's nights below.
       (SELECT COUNT(DISTINCT sa.unit_id)::int
          FROM utility_service_agreements sa JOIN units u ON u.id = sa.unit_id
         WHERE u.property_id = p.id AND sa.status = 'active'
           AND sa.superseded_by_lease_id IS NULL
           AND sa.start_date <= (m.month + INTERVAL '1 month' - INTERVAL '1 day')
-          AND (sa.end_date IS NULL OR sa.end_date >= m.month)) AS utility_service,
+          AND (sa.end_date IS NULL OR sa.end_date >= m.month)
+          AND (sa.payer_accepted_at IS NOT NULL OR sa.payer_attested_at IS NOT NULL)
+          AND sa.booking_id IS NULL) AS utility_service,
       COALESCE((SELECT SUM(GREATEST(
             LEAST(b.check_out, m.month + INTERVAL '1 month')::date
               - GREATEST(b.check_in, m.month)::date, 0))
          FROM unit_bookings b JOIN units u ON u.id = b.unit_id
         WHERE u.property_id = p.id
           AND u.unit_type IN (${AGG_TYPES_SQL})
-          AND b.lease_type IN ('nightly','weekly')
-          AND b.status NOT IN ('cancelled','no_show')
+          -- 10/5 (Nic, R12): which stays count, and by which status, is the
+          -- bill's own rule (services/billableUnits) — a month stay with no
+          -- lease included; a stay cancelled on or after arrival still held
+          -- the site.
+          AND ${feeCountedStaySql('b', 'm.month')}
+          AND ${feeCountedNightsStatusSql('b')}
           AND b.check_in  < m.month + INTERVAL '1 month'
           AND b.check_out > m.month), 0)::int AS nights,
       -- 10/3 (decisions #33): split by the length sold (stayRevenueInMonthSql).
@@ -222,7 +234,7 @@ export async function platformFeesByProperty(
          FROM unit_bookings b JOIN units u ON u.id = b.unit_id
         WHERE u.property_id = p.id
           AND u.unit_type NOT IN (${AGG_TYPES_SQL})
-          AND b.lease_type IN ('nightly','weekly')
+          AND ${feeCountedStaySql('b', 'm.month')}
           AND b.status NOT IN ('cancelled','no_show')
           AND b.check_in  < m.month + INTERVAL '1 month'
           AND b.check_out > m.month), 0) AS str_revenue

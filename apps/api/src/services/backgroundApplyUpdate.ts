@@ -41,16 +41,24 @@ export async function applyProviderUpdate(args: {
     }
   }
 
+  // 10/5 (Nic, A6): a provider update never overwrites the landlord's
+  // decision. A late 'complete' (or any progress event) on a check already
+  // approved or denied keeps that decision — and the approval's own expiry —
+  // and only fills in the report it carries. Before, a webhook arriving after
+  // the approval turned it back into 'complete' and asked for a second one.
   const expiresClause = update.status === 'complete'
-    ? `, expires_at = NOW() + ${SCREENING_VALID_INTERVAL_SQL}`
+    ? `, expires_at = CASE WHEN status IN ('approved', 'denied') THEN expires_at
+                           ELSE NOW() + ${SCREENING_VALID_INTERVAL_SQL} END`
     : ''
   // COALESCE keeps an existing summary when this event carries none — Checkr
   // Tenant sends summary-less progress events (applicant.visited,
   // product.completed) that must not null a previously stored report.
   await query(`
     UPDATE background_checks
-    SET status=$1, report_summary=COALESCE($2::jsonb, report_summary),
-        failure_reason=$3, webhook_received_at=NOW()${expiresClause}
+    SET status = CASE WHEN status IN ('approved', 'denied') THEN status ELSE $1 END,
+        report_summary=COALESCE($2::jsonb, report_summary),
+        failure_reason = CASE WHEN status IN ('approved', 'denied') THEN failure_reason ELSE $3 END,
+        webhook_received_at=NOW()${expiresClause}
     WHERE id=$4`,
     [update.status, update.reportSummary ? JSON.stringify(update.reportSummary) : null,
      update.failureReason || null, check.id])

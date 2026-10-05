@@ -558,6 +558,85 @@ describe('generateBillsForMeter — rubs', () => {
     expect(Number(b2.charge_amount)).toBe(60)
   })
 
+  // 10/5 (Nic): "stay guests would share any RUBS billing — just count them all
+  // as one person … then the other tenants are paying for their cost."
+  async function seedStaySite(base: BaseCtx, checkIn: string, checkOut: string, status = 'confirmed'): Promise<string> {
+    const c = await db.connect()
+    try {
+      const unitId = await seedUnit(c, { propertyId: base.propertyId, landlordId: base.landlordId })
+      await c.query(
+        `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, lease_type, status, guest_name)
+         VALUES ($1, $2, $3, $4, 'nightly', $5, 'Stay Guest')`,
+        [unitId, base.landlordId, checkIn, checkOut, status])
+      return unitId
+    } finally { c.release() }
+  }
+
+  it('occupant_count: a site with a stay and no lease counts as one person — the tenant pays only their share', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedRubsMeter(base, 'occupant_count')
+    await setMeterRateBase(meterId, 1, 0)
+    const leased = await seedUnitWithActiveTenant(base)                    // 1 tenant
+    const stay = await seedStaySite(base, '2026-05-10', '2026-05-14')     // a guest, 4 nights
+    const empty = await seedStaySite(base, '2026-05-10', '2026-05-14', 'cancelled')
+    await attachMeterToUnit(meterId, leased.unitId)
+    await attachMeterToUnit(meterId, stay)
+    await attachMeterToUnit(meterId, empty)
+    await seedReading(meterId, '2026-05-01', 90, base.landlordUserId)
+    // 2 people (tenant + guest): the tenant's half is 45, not the whole 90.
+    // The short stay's utilities are in its rate — its half is billed to nobody.
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(1)
+    const { rows } = await db.query<any>(`SELECT unit_id, charge_amount FROM utility_bills`)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].unit_id).toBe(leased.unitId)
+    expect(Number(rows[0].charge_amount)).toBe(45)
+  })
+
+  it('rented_spaces: a site with a stay in the cycle is a rented space; a stay outside it is not', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedRubsMeter(base, 'rented_spaces')
+    await setMeterRateBase(meterId, 1, 0)
+    const leased = await seedUnitWithActiveTenant(base)
+    const stay = await seedStaySite(base, '2026-05-30', '2026-06-02')     // touches May
+    const later = await seedStaySite(base, '2026-06-01', '2026-06-05')    // June only
+    for (const u of [leased.unitId, stay, later]) await attachMeterToUnit(meterId, u)
+    await seedReading(meterId, '2026-05-01', 90, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const { rows } = await db.query<any>(`SELECT charge_amount FROM utility_bills WHERE unit_id = $1`, [leased.unitId])
+    expect(Number(rows[0].charge_amount)).toBe(45)
+  })
+
+  // 10/5 (Nic): "if their share was $10, and they were only there a third of
+  // the month, then it would be $3.33."
+  it('a stay billed through its utility agreement pays its share only for the days it was there', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedRubsMeter(base, 'occupant_count')
+    await setMeterRateBase(meterId, 1, 0)
+    const leased = await seedUnitWithActiveTenant(base)
+    const staySite = await seedStaySite(base, '2026-05-21', '2026-06-20')   // 11 of May's 31 nights (21st–31st)
+    const c = await db.connect()
+    let guestTenantId = ''
+    try { guestTenantId = await seedTenant(c) } finally { c.release() }
+    const { rows: [bk] } = await db.query<any>(`SELECT id FROM unit_bookings WHERE unit_id = $1`, [staySite])
+    await db.query(
+      `INSERT INTO utility_service_agreements (landlord_id, unit_id, tenant_id, start_date, booking_id)
+       VALUES ($1, $2, $3, '2026-05-21', $4)`, [base.landlordId, staySite, guestTenantId, bk.id])
+    await attachMeterToUnit(meterId, leased.unitId)
+    await attachMeterToUnit(meterId, staySite)
+    await db.query(
+      `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id)
+       VALUES ($1, '2026-05-31', 90, '2026-05-01', $2)`, [meterId, base.landlordUserId])
+    const res = await generateBillsForMeter(meterId, new Date(Date.UTC(2026, 4, 1)))
+    expect(res.billsCreated).toBe(2)
+    const amount = async (u: string) => Number((await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE unit_id = $1`, [u])).rows[0].charge_amount)
+    // Two people → 45 each. The tenant pays their whole 45 (never the guest's);
+    // the guest pays 45 × 11/31 = 15.97; the other 29.03 stays with the landlord.
+    expect(await amount(leased.unitId)).toBe(45)
+    expect(await amount(staySite)).toBe(15.97)
+  })
+
   it('total basis = 0 → noop with reason (e.g., sqft method but all units sqft null)', async () => {
     const base = await seedBaseProperty()
     const meterId = await seedRubsMeter(base, 'sqft')

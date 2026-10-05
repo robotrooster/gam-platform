@@ -7,12 +7,14 @@ import { query, queryOne, getClient } from '../db'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { AppError } from '../middleware/errorHandler'
 import { todayIn } from '../lib/timezone'
+import { STAY_TERMS, stayHeldWords, type StayTerms } from '@gam/shared'
 import {
-  computeStayTotal, bookStay, joinWaitlist, getWaitlistClaim, claimWaitlistSpot, UnitFullError,
+  computeStayTotal, bookStay, joinWaitlist, getWaitlistClaim, claimWaitlistSpot, claimQuote, UnitFullError,
+  StayTermsNeededError, storefrontUrl,
 } from '../services/propertyBooking'
 import {
   type PropertyRow, type SiteType,
-  resolveProperty, bookableUnits, groupSiteTypes, resolveSiteType, typeRates, typeAvailability,
+  resolveProperty, bookableUnits, groupSiteTypes, resolveSiteType, typeRates, typeAvailability, quoteScreeningFee,
 } from '../services/propertyBookingQuote'
 import { rankUnitsBestFit } from '../services/scheduleCompression'
 
@@ -211,7 +213,8 @@ publicPropertyBookingRouter.get('/property/:slug/stay/:token', async (req, res, 
     const guest = await resolveBookingGuestToken(req.params.token)
     if (!guest) throw new AppError(404, 'This stay link is invalid or has expired')
     const stay = await queryOne<any>(
-      `SELECT b.id, b.guest_name, b.check_in, b.check_out, b.nights, b.status
+      `SELECT b.id, b.guest_name, b.check_in, b.check_out, b.nights, b.status, b.stay_terms,
+              b.check_out::text AS check_out_ymd
          FROM unit_bookings b JOIN units u ON u.id = b.unit_id
         WHERE b.id = $1 AND u.property_id = $2`, [guest.bookingId, prop.id])
     if (!stay || stay.status === 'cancelled') throw new AppError(404, 'This stay link is invalid or has expired')
@@ -221,6 +224,9 @@ publicPropertyBookingRouter.get('/property/:slug/stay/:token', async (req, res, 
         guestName: stay.guest_name,
         checkIn: stay.check_in, checkOut: stay.check_out, nights: stay.nights,
         status: stay.status, propertyName: prop.name,
+        // 10/5 (R13): a 30+ night stay with no lease is held only through
+        // what is paid — the stay's own check-out, which "Add a month" moves.
+        heldWords: stay.stay_terms === 'stay' ? stayHeldWords(stay.check_out_ymd) : null,
       },
     })
   } catch (e) { next(e) }
@@ -256,10 +262,11 @@ publicPropertyBookingRouter.post('/property/:slug/stay-link', publicWriteLimiter
   } catch (e) { next(e) }
 })
 
-/** The stay page on the property's own site (path-slug dev / subdomain prod). */
+/** The stay page on the property's own site (path-slug dev / subdomain prod).
+ *  S636: through storefrontUrl, whose production fallback is the public
+ *  template — this copy fell back to localhost and mailed dead links. */
 function storefrontStayUrl(slug: string, token: string): string {
-  const template = process.env.STOREFRONT_URL_TEMPLATE || 'http://localhost:3015/{slug}'
-  return template.replace('{slug}', slug) + `/stay/${token}`
+  return storefrontUrl(slug, `/stay/${token}`)
 }
 
 // POST /property/:slug/stay/:token/amenity/:areaId/reserve — the guest's
@@ -397,16 +404,18 @@ publicPropertyBookingRouter.get('/property/:slug/availability', async (req, res,
     if (ci.toISODate()! < todayIn(prop.timezone)) throw new AppError(400, 'Check-in is in the past')
 
     const units = await bookableUnits(prop.id)
+    // 10/5 (R8): the background check's fee is the same for every site type.
+    const screeningFee = await quoteScreeningFee(prop, q.checkIn, q.checkOut)
 
     if (q.siteTypeId) {
       const siteType = resolveSiteType(units, q.siteTypeId)
-      const a = await typeAvailability(prop, siteType, nights, q.checkIn, q.checkOut)
+      const a = await typeAvailability(prop, siteType, nights, q.checkIn, q.checkOut, { screeningFee })
       return res.json({ success: true, data: { ...a, nights } })
     }
 
     const siteTypes = []
     for (const t of groupSiteTypes(units)) {
-      const a = await typeAvailability(prop, t, nights, q.checkIn, q.checkOut)
+      const a = await typeAvailability(prop, t, nights, q.checkIn, q.checkOut, { screeningFee })
       siteTypes.push({
         id: t.id,
         name: t.name,
@@ -443,7 +452,14 @@ const guestBody = z.object({
   // S547: optional question submitted WITH the reservation (the standalone
   // contact form lives on the home page, not the booking page).
   note: z.string().max(2000).optional(),
+  // 10/5 (Nic, R2): a stay of 30+ nights — the guest's choice, a lease or a stay.
+  stayTerms: z.enum(STAY_TERMS).optional(),
 })
+
+/** 10/5 (R2): a 30+ night stay with no answer yet — the page asks, then books again. */
+function stayTermsNeeded(res: any, e: StayTermsNeededError) {
+  return res.status(409).json({ success: false, needsStayTerms: true, error: e.message, words: e.words })
+}
 
 // ── POST /property/:slug/book — tentative hold + Stripe deposit checkout ──
 publicPropertyBookingRouter.post('/property/:slug/book', publicWriteLimiter, async (req, res, next) => {
@@ -484,6 +500,7 @@ publicPropertyBookingRouter.post('/property/:slug/book', publicWriteLimiter, asy
     }
     return res.status(409).json({ success: false, full: true, error: lastFull?.message || 'Those dates are full' })
   } catch (e) {
+    if (e instanceof StayTermsNeededError) return stayTermsNeeded(res, e)
     next(e)
   }
 })
@@ -499,12 +516,16 @@ publicPropertyBookingRouter.get('/property/:slug/booking/:id', async (req, res, 
     if (!z.string().uuid().safeParse(req.params.id).success) throw new AppError(404, 'Booking not found')
     const b = await queryOne<any>(
       `SELECT b.status, b.check_in, b.check_out, b.nights, b.guest_name,
-              b.deposit_amount, b.total_amount, b.hold_expires_at
+              b.deposit_amount, b.total_amount, b.hold_expires_at, b.stay_terms,
+              b.check_out::text AS check_out_ymd,
+              (SELECT sp.amount FROM screening_prepayments sp
+                WHERE sp.booking_id = b.id AND sp.status <> 'void' LIMIT 1) AS screening_paid
          FROM unit_bookings b
          JOIN units u ON u.id = b.unit_id
         WHERE b.id = $1 AND u.property_id = $2`,
       [req.params.id, prop.id])
     if (!b) throw new AppError(404, 'Booking not found')
+    const terms = b.stay_terms as StayTerms | null
     res.json({
       success: true,
       data: {
@@ -515,6 +536,12 @@ publicPropertyBookingRouter.get('/property/:slug/booking/:id', async (req, res, 
         total: b.total_amount != null ? Number(b.total_amount) : null,
         holdExpiresAt: b.hold_expires_at,
         propertyName: prop.name,
+        // 10/5 (Nic): the lease-or-stay answer and what it means for them.
+        // R13: a stay with no lease is held only through what is paid.
+        leaseChosen: terms === 'lease',
+        heldWords: terms === 'stay' ? stayHeldWords(b.check_out_ymd) : null,
+        // R8: the background check paid with this booking (its link is emailed).
+        screeningPaid: b.screening_paid != null ? Number(b.screening_paid) : null,
       },
     })
   } catch (e) { next(e) }
@@ -540,6 +567,13 @@ publicPropertyBookingRouter.get('/property/:slug/claim/:token', async (req, res,
     const w = await getWaitlistClaim(req.params.token)
     if (!w || w.booking_slug !== req.params.slug) throw new AppError(404, 'Claim link not found')
     const expired = w.status !== 'notified' || !w.claim_expires_at || new Date(w.claim_expires_at) < new Date()
+    // 10/5 (Nic): what claiming charges — the same plan the claim's checkout
+    // uses — and, for 30+ nights, the lease-or-stay choice priced both ways.
+    // A claim that can no longer be booked (its dates passed) shows none.
+    const quote = expired ? null : await claimQuote(req.params.token).catch(e => {
+      if (e instanceof AppError) return null
+      throw e
+    })
     res.json({
       success: true,
       data: {
@@ -551,6 +585,7 @@ publicPropertyBookingRouter.get('/property/:slug/claim/:token', async (req, res,
         guestName: w.guest_name,
         claimExpiresAt: w.claim_expires_at,
         expired,
+        quote,
       },
     })
   } catch (e) { next(e) }
@@ -559,13 +594,20 @@ publicPropertyBookingRouter.get('/property/:slug/claim/:token', async (req, res,
 // ── POST /property/:slug/claim/:token — claim → booking + deposit ──
 publicPropertyBookingRouter.post('/property/:slug/claim/:token', async (req, res, next) => {
   try {
-    const { stayType } = z.object({ stayType: z.enum(['nightly', 'weekly']).default('nightly') }).parse(req.body)
-    const r = await claimWaitlistSpot(req.params.token, stayType)
+    // stayType is legacy (pricing tiers by length) and ignored.
+    const { stayTerms } = z.object({
+      stayType: z.enum(['nightly', 'weekly']).optional(),
+      stayTerms: z.enum(STAY_TERMS).optional(),
+    }).parse(req.body)
+    const w = await getWaitlistClaim(req.params.token)
+    if (!w || w.booking_slug !== req.params.slug) throw new AppError(404, 'Claim link not found')
+    const r = await claimWaitlistSpot(req.params.token, stayTerms ?? null)
     res.json({ success: true, data: r })
   } catch (e) {
     if (e instanceof UnitFullError) {
       return res.status(409).json({ success: false, full: true, error: 'Those dates were just taken' })
     }
+    if (e instanceof StayTermsNeededError) return stayTermsNeeded(res, e)
     next(e)
   }
 })

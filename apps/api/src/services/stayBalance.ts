@@ -4,8 +4,8 @@
  *   "If somebody pays a 10% deposit on a week long stay, the other 90% needs to
  *    generate on the day they're due to arrive."
  *
- * A stay under the lease threshold (30 nights, or 7 at a weekly-lease park) has
- * no lease, so nothing ever billed what was left after the deposit. On the
+ * A stay with no lease had nothing that billed what was left after the
+ * deposit. On the
  * morning of arrival the guest is emailed a pay link for the balance — the same
  * pay-link machinery as the register, so the money lands with GAM and is held
  * for the landlord's weekly payout, and the card fee follows the property's
@@ -13,7 +13,9 @@
  *
  * Longer stays are not billed here: their booking lease bills the rest of the
  * arrival month on arrival day and monthly after that — never the whole stay up
- * front.
+ * front. 10/5 (Nic): nor is a stay whose guest chose a lease (stay_terms
+ * 'lease'); a no-lease stay of 30+ nights is booked and paid a month at a time,
+ * so it has no balance left to bill.
  */
 import { DateTime } from 'luxon'
 import { query } from '../db'
@@ -41,6 +43,10 @@ export async function billStayBalances(now: Date = new Date()): Promise<{ billed
         AND b.balance_billed_at IS NULL
         AND b.guest_email IS NOT NULL
         AND b.total_amount > COALESCE(b.deposit_amount, 0)
+        -- 10/5 (Nic, R2/R4): a stay that answered 'lease' is billed by its
+        -- lease, never here — even while that lease is still being drafted
+        -- (or its draft failed and a person must redo it).
+        AND b.stay_terms IS DISTINCT FROM 'lease'
         AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id)`)
   let billed = 0, failed = 0
   for (const b of rows) {

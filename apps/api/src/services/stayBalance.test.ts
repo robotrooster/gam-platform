@@ -76,6 +76,17 @@ describe('the rest of a short stay, on arrival day', () => {
     expect((await billStayBalances(NOW)).billed).toBe(0)
   })
 
+  // 10/5 (Nic, review M13): a stay whose guest chose a lease is billed by
+  // that lease — even before (or if) its draft lease is written.
+  it('never bills the rest of a stay that answered lease, with or without its lease drafted', async () => {
+    const s = await seedStay({ checkOut: '2026-11-20' })
+    await db.query(`UPDATE unit_bookings SET stay_terms = 'lease', lease_type = 'month_to_month', nights = 46, total_amount = 1400 WHERE id = $1`, [s.bookingId])
+    expect((await billStayBalances(NOW)).billed).toBe(0)
+    expect(emailPayLinkMock).not.toHaveBeenCalled()
+    const { rows: [b] } = await db.query<any>(`SELECT balance_billed_at FROM unit_bookings WHERE id = $1`, [s.bookingId])
+    expect(b.balance_billed_at).toBeNull()
+  })
+
   it('follows the property when it absorbs the card fee, and marks the balance paid', async () => {
     const s = await seedStay({ payer: 'landlord' })
     await billStayBalances(NOW)

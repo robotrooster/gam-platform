@@ -18,8 +18,15 @@ export interface PayLinkCartLine { id: string | null; name: string; qty: number;
   /** 10/3 (review): a stay's figure as the register shows it — the server refuses the link if its nights cost something else now. */
   stayTotal?: number }
 
-/** 10/3 (decisions #9): the site, arrival and guest of a stay in the cart — the link holds the site for them. */
-export interface PayLinkStay { unitId: string; checkIn: string; guestName: string; guestPhone?: string | null }
+/**
+ * 10/3 (decisions #9): the site, arrival and guest of a stay in the cart — the link holds the site for them.
+ * 10/5 (Nic): with what the stay needs, as the server quoted it at the register — the guest's email, the
+ * counter's lease answer, the stay a month is added to, the background check's fee (and its line's name),
+ * and the held-through words for a 30+ night stay with no lease.
+ */
+export interface PayLinkStay { unitId: string; checkIn: string; guestName: string; guestPhone?: string | null
+  guestEmail?: string | null; stayTerms?: 'lease' | 'stay' | null; extendBookingId?: string | null
+  screeningFee?: number | null; screeningLineName?: string | null; heldWords?: string | null }
 
 /** "Email a pay link" — the current cart, sent to one person to pay by card. */
 export function SendPayLinkModal({ propertyId, cart, stay = null, discountAmount, total, customerPaysFee = true, person: initialPerson = null, onClose, onSent }: {
@@ -52,7 +59,10 @@ export function SendPayLinkModal({ propertyId, cart, stay = null, discountAmount
   const send = useMutation(
     () => apiPost('/pos/pay-links', {
       propertyId, items: cart, discountAmount,
-      ...(stay ? { stay: { unitId: stay.unitId, checkIn: stay.checkIn, guestName: stay.guestName, guestPhone: stay.guestPhone || null } } : {}),
+      ...(stay ? { stay: stay.extendBookingId
+        ? { extendBookingId: stay.extendBookingId, guestEmail: stay.guestEmail || null, stayTerms: stay.stayTerms || null, screeningFee: stay.screeningFee || null }
+        : { unitId: stay.unitId, checkIn: stay.checkIn, guestName: stay.guestName, guestPhone: stay.guestPhone || null,
+            guestEmail: stay.guestEmail || null, stayTerms: stay.stayTerms || null, screeningFee: stay.screeningFee || null } } : {}),
       customer: { name: name.trim() || undefined, email: email.trim(), phone: phone.trim() || undefined },
       // 10/2 (review): someone from outside this company goes as their sealed
       // pick — their record here is made with the link, never at the pick.
@@ -83,9 +93,13 @@ export function SendPayLinkModal({ propertyId, cart, stay = null, discountAmount
         </div>
         <div style={{ display: 'grid', gap: 4, fontSize: '.85rem', marginBottom: 12 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-3)' }}>Cart</span><span className="mono">{fmt(total)}</span></div>
+          {/* 10/5 (Nic, R8): the background check goes on the link as its own line and cannot be taken off. */}
+          {stay?.screeningFee ? <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.78rem' }}><span style={{ color: 'var(--text-3)' }}>Includes {stay.screeningLineName || 'a background check'}</span><span className="mono">{fmt(stay.screeningFee)}</span></div> : null}
           {fee > 0 && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-3)' }}>Card processing fee</span><span className="mono">{fmt(fee)}</span></div>}
           <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700 }}><span>They pay</span><span className="mono" style={{ color: 'var(--gold)' }}>{fmt(total + fee)}</span></div>
         </div>
+        {/* 10/5 (Nic, R13): a 30+ night stay with no lease is held only through what is paid — said before it goes out. */}
+        {stay?.heldWords && <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 12, lineHeight: 1.5 }}>{stay.heldWords}</div>}
         {/* S649 (Nic): find the person instead of retyping them — by any part
             of a name, email or phone. 10/2: someone from outside this company
             shows as a name and a masked hint; their email is typed here. */}

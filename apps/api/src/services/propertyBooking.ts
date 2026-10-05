@@ -3,13 +3,20 @@ import { DateTime } from 'luxon'
 import type { PoolClient } from 'pg'
 import { getClient, query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
-import { createBookingDepositCheckoutSession } from './stripeConnect'
+import { getStripe } from '../lib/stripe'
 import { recordHeldItem } from './heldPayouts'
-import { maybeDraftLeaseFromBooking } from './bookingLeaseDraft'
 import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
-import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, SHORT_STAY_LOCKED_UNIT_TYPES, processingFeeFor, cardFeeSplit, type CardFeePayer } from '@gam/shared'
+import {
+  WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT,
+  SHORT_STAY_LOCKED_UNIT_TYPES, processingFeeFor, stayHeldWords, longCalendarDate,
+  STAY_LEASE_CHOICE_NIGHTS, type CardFeePayer, type StayTerms,
+} from '@gam/shared'
+import {
+  stayNeeds, chooseStayTerms, recordScreeningPrepayment, type StayNeeds, type RecordedPrepayment,
+} from './stayTerms'
+import { LEASE_OR_STAY_WORDS, dueNowFor, firstStayMonth, leaseFromStay, type DueNow } from './propertyBookingQuote'
 
 // ============================================================
 // S517 / Walkthrough #11 — public property booking + waitlist.
@@ -84,17 +91,20 @@ interface PropertyRow {
   nightly_rate: string | null; weekly_rate: string | null; monthly_rate: string | null
   short_term_tax_rate: string | null
   timezone: string | null
+  rent_due_mode: string | null
+  rent_due_day: number | null
 }
 interface UnitRow {
   id: string; unit_number: string
   nightly_rate: string | null; weekly_rate: string | null; monthly_rate: string | null
+  rent_amount: string | null
   min_stay_nights: number | null; max_stay_nights: number | null; is_bookable: boolean
 }
 
 async function resolvePropertyBySlug(slug: string): Promise<PropertyRow> {
   const prop = await queryOne<PropertyRow>(
     `SELECT id, landlord_id, name, booking_slug, booking_deposit_pct, booking_monthly_deposit, booking_card_fee_payer,
-            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate, timezone
+            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate, timezone, rent_due_mode, rent_due_day
        FROM properties WHERE booking_slug=$1 AND public_booking_enabled=TRUE`, [slug])
   if (!prop) throw new AppError(404, 'Booking site not found')
   return prop
@@ -102,7 +112,7 @@ async function resolvePropertyBySlug(slug: string): Promise<PropertyRow> {
 
 async function resolveUnit(propertyId: string, unitId: string): Promise<UnitRow> {
   const unit = await queryOne<UnitRow & { unit_type?: string }>(
-    `SELECT u.id, u.unit_number, u.unit_type, u.nightly_rate, u.weekly_rate, u.monthly_rate,
+    `SELECT u.id, u.unit_number, u.unit_type, u.nightly_rate, u.weekly_rate, u.monthly_rate, u.rent_amount,
             u.min_stay_nights, u.max_stay_nights, u.is_bookable
        FROM units u
       WHERE u.id=$1 AND u.property_id=$2`, [unitId, propertyId])
@@ -116,6 +126,16 @@ async function resolveUnit(propertyId: string, unitId: string): Promise<UnitRow>
 }
 
 interface StayQuote { nights: number; base: number; tax: number; total: number; deposit: number; tier: 'nightly' | 'weekly' | 'monthly' }
+
+/** The rates a stay on this unit prices from: the unit's, else the property default. */
+function stayRates(unit: UnitRow, prop: PropertyRow): { nightly: number | null; weekly: number | null; monthly: number | null } {
+  const num = (x: string | null) => x != null ? Number(x) : null
+  return {
+    nightly: num(unit.nightly_rate) ?? num(prop.nightly_rate),
+    weekly:  num(unit.weekly_rate)  ?? num(prop.weekly_rate),
+    monthly: num(unit.monthly_rate) ?? num(prop.monthly_rate),
+  }
+}
 
 /** Validate the requested stay against the unit's rules and price it + the deposit.
  *  Pricing is AUTO-TIERED by length (guest does not pick a billing type — Nic
@@ -139,13 +159,9 @@ function quoteStay(unit: UnitRow, prop: PropertyRow, checkIn: string, checkOut: 
   // the subtype owns pricing and the DB trigger keeps its units on it — so the
   // separate site-type tier that used to sit in front of this is gone, along
   // with the chance of the two tiers disagreeing.
-  const num = (x: string | null) => x != null ? Number(x) : null
-  const monthlyRate = num(unit.monthly_rate) ?? num(prop.monthly_rate)
-  const price = computeStayPrice(
-    { nightly: num(unit.nightly_rate) ?? num(prop.nightly_rate),
-      weekly:  num(unit.weekly_rate)  ?? num(prop.weekly_rate),
-      monthly: monthlyRate },
-    Number(prop.short_term_tax_rate || 0), nights)
+  const rates = stayRates(unit, prop)
+  const monthlyRate = rates.monthly
+  const price = computeStayPrice(rates, Number(prop.short_term_tax_rate || 0), nights)
   if (price.total <= 0) throw new AppError(400, 'No rate is configured for this unit')
   // S547 (Nic): monthly-tier stays bill calendar-aligned (prorated arrival →
   // flat months on the 1st → prorated departure); the booking total is the
@@ -271,19 +287,153 @@ interface GuestBooking {
   // any compatible unit. 'none' = no requirement (any site).
   requiredSiteLayout?: string | null
   requiredAmpService?: string | null
+  // 10/5 (Nic, R2): the guest's answer for a stay of 30+ nights — a lease or a
+  // stay. Required once their continuous stay here reaches 30 nights.
+  stayTerms?: StayTerms | null
 }
 
-export interface BookingDepositResult { bookingId: string; depositAmount: number; cardFee: number; total: number; checkoutUrl: string }
+export interface BookingDepositResult {
+  bookingId: string
+  /** The stay's part of the charge: a deposit, or a no-lease stay's first month. */
+  depositAmount: number
+  /** GAM's card fee on the whole charge (0 when the property covers it). */
+  cardFee: number
+  /** What the booking itself covers (a no-lease stay: its first month). */
+  total: number
+  checkoutUrl: string
+  /** 10/5 (R8): the background check on this charge — 0 when none is due. */
+  screeningFee: number
+  /** Everything charged now: the stay's part + the check + the card fee. */
+  dueNow: number
+  /** The booking's own check-out: a no-lease stay of 30+ nights is booked a month at a time (R5). */
+  checkOut: string
+  stayTerms: StayTerms | null
+  /** R13: "Your site is held through …" — a 30+ night stay with no lease. */
+  heldWords: string | null
+}
 
 /**
- * Create a tentative booking holding the dates, then a Stripe deposit checkout.
- * Throws UnitFullError when the dates are taken (the caller offers the waitlist).
+ * 10/5 (Nic, R2): a stay of 30+ continuous nights can't be booked until the
+ * guest has chosen a lease or a stay. The booking page asks before paying;
+ * this catches the case it could not see (a guest whose back-to-back stays
+ * here add up to 30).
+ */
+export class StayTermsNeededError extends AppError {
+  readonly words = LEASE_OR_STAY_WORDS
+  constructor() { super(409, 'A stay of 30 nights or more needs a choice first: a lease or a stay.') }
+}
+
+/** What a booking-site stay books and charges for this guest — the one plan the checkout charges and the claim page shows. */
+interface StayPlan {
+  needs: StayNeeds
+  terms: StayTerms | null
+  checkOut: string
+  nights: number
+  tier: 'nightly' | 'weekly' | 'monthly'
+  /** The stay's part of the charge: a deposit, or a no-lease stay's first month. */
+  stayPart: number
+  /** What the booking covers. */
+  total: number
+  due: DueNow
+  heldWords: string | null
+}
+
+/**
+ * 10/5 (Nic): the long-stay rules for a booking-site stay, from
+ * services/stayTerms — never decided here.
+ *   R7     the guest's back-to-back stays at this property add up (by email);
+ *   R2     30+ nights → lease or stay (StayTermsNeededError until answered);
+ *   R5     a STAY books and pays its first month only, at the monthly rate;
+ *          a LEASE pays today's deposit and the lease bills the rest;
+ *   R1/R8  22+ nights with no check on file → the background check's fee is
+ *          a fixed line on this charge.
+ */
+async function planStay(
+  prop: PropertyRow, unit: UnitRow,
+  o: { checkIn: string; checkOut: string; email: string; stayTerms?: StayTerms | null },
+): Promise<StayPlan> {
+  const quote = quoteStay(unit, prop, o.checkIn, o.checkOut)
+  const ask = (checkOut: string, stayTerms: StayTerms | null) => stayNeeds({
+    landlordId: prop.landlord_id, propertyId: prop.id, email: o.email,
+    checkIn: o.checkIn, checkOut, stayTerms,
+  })
+  let needs = await ask(o.checkOut, o.stayTerms ?? null)
+  if (needs.leaseChoice === 'needed') throw new StayTermsNeededError()
+  const terms: StayTerms | null = needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null
+
+  // R5: a stay asked for 30+ nights with no lease is booked a month at a time.
+  // (A short stay that continues one only inherits the answer — it is priced
+  // as the short stay it is.)
+  const first = terms === 'stay' && quote.nights >= STAY_LEASE_CHOICE_NIGHTS
+    ? firstStayMonth(o.checkIn, o.checkOut, stayRates(unit, prop), Number(prop.short_term_tax_rate || 0))
+    : null
+  // The rules for the dates actually booked.
+  if (first && first.checkOut !== o.checkOut) needs = await ask(first.checkOut, terms)
+
+  const screening = needs.screening === 'fee_due' ? needs.screeningFee?.amount ?? 0 : 0
+  const stayPart = first ? first.amount : quote.deposit
+  const checkOut = first?.checkOut ?? o.checkOut
+  return {
+    needs, terms, checkOut,
+    nights: first ? first.nights : quote.nights,
+    tier: first ? 'monthly' : quote.tier,
+    stayPart,
+    total: first ? first.amount : quote.total,
+    due: dueNowFor(stayPart, screening, prop.booking_card_fee_payer),
+    heldWords: terms === 'stay' ? stayHeldWords(checkOut) : null,
+  }
+}
+
+/**
+ * The booking site's Stripe checkout, line by line: the stay's part (a deposit,
+ * or a no-lease stay's first month), the background check when one is due
+ * (10/5, R8: its own line, never folded into the stay and never removable),
+ * and GAM's card fee. Card only; the charge is GAM's (S648) and the webhook
+ * confirms the booking on checkout.session.completed (gam_purpose
+ * 'booking_deposit'), as before. The check's fee rides in the metadata
+ * (gam_screening_fee) so the confirmation reads what was charged (M12).
+ */
+async function createSiteCheckoutSession(o: {
+  lines: Array<{ name: string; cents: number }>
+  guestEmail: string
+  successUrl: string
+  cancelUrl: string
+  metadata: Record<string, string>
+}): Promise<{ sessionId: string; hostedUrl: string }> {
+  const metadata = { gam_purpose: 'booking_deposit', ...o.metadata }
+  const session = await getStripe().checkout.sessions.create({
+    mode: 'payment',
+    payment_method_types: ['card'],
+    line_items: o.lines.filter(l => l.cents > 0).map(l => ({
+      quantity: 1,
+      price_data: { currency: 'usd', unit_amount: l.cents, product_data: { name: l.name.slice(0, 250) } },
+    })),
+    payment_intent_data: { metadata },
+    metadata,
+    customer_email: o.guestEmail,
+    success_url: o.successUrl,
+    cancel_url: o.cancelUrl,
+  })
+  if (!session.url) throw new AppError(500, 'Stripe returned a Checkout Session with no URL')
+  return { sessionId: session.id, hostedUrl: session.url }
+}
+
+/**
+ * Create a tentative booking holding the dates, then a Stripe checkout.
+ * Throws UnitFullError when the dates are taken (the caller offers the
+ * waitlist) and StayTermsNeededError when a 30+ night stay has no answer yet.
  * Concurrency-safe via a per-unit advisory lock inside the transaction.
+ *
+ * 10/5 (Nic, R3): no lease is drafted here, or anywhere, on its own. A lease
+ * is drafted only when the guest chose one, once their payment lands
+ * (confirmBookingDeposit → stayTerms.chooseStayTerms).
  */
 export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult> {
   const prop = await resolvePropertyBySlug(opts.slug)
   const unit = await resolveUnit(prop.id, opts.unitId)
-  const quote = quoteStay(unit, prop, opts.checkIn, opts.checkOut)
+  const plan = await planStay(prop, unit, {
+    checkIn: opts.checkIn, checkOut: opts.checkOut, email: opts.guestEmail, stayTerms: opts.stayTerms,
+  })
   const connect = await landlordConnect(prop.landlord_id)
   // S547 dev-mock: demo landlords have no Connect account, so outside
   // production a Connect-less landlord gets a SIMULATED deposit checkout and
@@ -296,7 +446,7 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
   try {
     await client.query('BEGIN')
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`unit_booking:${unit.id}`])
-    if (await hasConflict(client, unit.id, opts.checkIn, opts.checkOut)) {
+    if (await hasConflict(client, unit.id, opts.checkIn, plan.checkOut)) {
       await client.query('ROLLBACK')
       throw new UnitFullError()
     }
@@ -306,26 +456,22 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
          (unit_id, landlord_id, lease_type, check_in, check_out, nights,
           guest_name, guest_email, guest_phone, nightly_rate, weekly_rate,
           total_amount, deposit_amount, platform_fee, status, source, hold_expires_at,
-          required_site_layout, required_amp_service, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,'tentative','public',$14,$15,$16,$17)
+          required_site_layout, required_amp_service, notes, stay_terms, screening_required)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,'tentative','public',$14,$15,$16,$17,$18,$19)
        RETURNING id`,
       // unit_bookings.lease_type has no 'monthly' — 30+ night stays store as
       // month_to_month (pre-existing gap: monthly-tier public bookings always
-      // violated the CHECK; surfaced by the S547 long-stay flow).
-      [unit.id, prop.landlord_id, quote.tier === 'monthly' ? 'month_to_month' : quote.tier, opts.checkIn, opts.checkOut, quote.nights,
+      // violated the CHECK; surfaced by the S547 long-stay flow). A month of a
+      // no-lease stay is one too, whatever its nights (a February is 28).
+      [unit.id, prop.landlord_id, plan.tier === 'monthly' ? 'month_to_month' : plan.tier, opts.checkIn, plan.checkOut, plan.nights,
        opts.guestName, opts.guestEmail, opts.guestPhone ?? null,
-       unit.nightly_rate, unit.weekly_rate, quote.total, quote.deposit, holdExpires,
+       unit.nightly_rate, unit.weekly_rate, plan.total, plan.stayPart, holdExpires,
        opts.requiredSiteLayout ?? 'none', opts.requiredAmpService ?? 'none',
-       opts.note?.trim() || null])
+       opts.note?.trim() || null,
+       // R2: the answer is saved with the stay; R9: check-in waits on screening.
+       plan.terms, plan.needs.screening !== 'not_needed'])
     const bookingId = ins.rows[0].id
     await client.query('COMMIT')
-
-    // S547: public long stays get the same S526 treatment as staff-created
-    // ones — 30+ nights (7+ weekly-lease mode) drafts a lease for landlord
-    // review, so monthly invoicing takes over from the reservation.
-    // Best-effort: a draft failure never fails the booking.
-    maybeDraftLeaseFromBooking(bookingId)
-      .catch(err => logger.error({ err, bookingId }, '[propertyBooking] lease draft from public booking failed'))
 
     // S547: every public booking emails the guest their STAY LINK — the
     // tokened page on the property's site where amenities are booked (Nic:
@@ -340,6 +486,12 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
         { landlordId: prop.landlord_id, replyTo: { kind: 'property', propertyId: prop.id } })
     })().catch(err => logger.error({ err, bookingId }, '[propertyBooking] guest stay-link email failed'))
 
+    const result = (checkoutUrl: string): BookingDepositResult => ({
+      bookingId, depositAmount: plan.stayPart, cardFee: plan.due.cardFee, total: plan.total, checkoutUrl,
+      screeningFee: plan.due.screening, dueNow: plan.due.total,
+      checkOut: plan.checkOut, stayTerms: plan.terms, heldWords: plan.heldWords,
+    })
+
     if (mockCheckout) {
       // Mirror the real path: stamp a session id, then confirm through the
       // same function the Stripe webhook calls.
@@ -348,27 +500,34 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
         [mockSession, bookingId])
       await confirmBookingDeposit(bookingId, mockSession)
       logger.warn({ bookingId }, '[propertyBooking] dev-mock checkout — landlord has no Connect account, deposit simulated, booking auto-confirmed')
-      return { bookingId, depositAmount: quote.deposit, cardFee: 0, total: quote.total,
-               checkoutUrl: storefrontUrl(prop.booking_slug, `/booked?booking=${bookingId}`) }
+      return { ...result(storefrontUrl(prop.booking_slug, `/booked?booking=${bookingId}`)), cardFee: 0, dueNow: round2(plan.due.stay + plan.due.screening) }
     }
 
-    // S648: GAM's charge; the deposit is held for the landlord (whose payout
-    // account the gate above requires). GAM's card fee is added on top unless
-    // the property absorbs it, in which case it comes out of the payout.
-    const guestCardFee = cardFeeSplit(quote.deposit, prop.booking_card_fee_payer).charged - quote.deposit
-    const checkout = await createBookingDepositCheckoutSession({
-      amountCents: Math.round(quote.deposit * 100),
-      cardFeeCents: Math.round(guestCardFee * 100),
-      unitLabel: `${prop.name} · Unit ${unit.unit_number}`,
+    // S648: GAM's charge; the stay's money is held for the landlord (whose
+    // payout account the gate above requires). GAM's card fee is on the whole
+    // charge — on top unless the property covers it, then it comes out of the
+    // payout. W-20: no site number — the site is assigned the morning of
+    // check-in and the nightly packer may move it before then.
+    const checkout = await createSiteCheckoutSession({
+      lines: [
+        { name: plan.terms === 'stay' && plan.tier === 'monthly'
+            ? `First month — ${prop.name}, through ${longCalendarDate(plan.checkOut)}`
+            : `Stay deposit — ${prop.name}`,
+          cents: Math.round(plan.due.stay * 100) },
+        { name: 'Background check — required for stays over three weeks', cents: Math.round(plan.due.screening * 100) },
+        { name: 'Card processing fee', cents: Math.round(plan.due.cardFee * 100) },
+      ],
       guestEmail: opts.guestEmail,
       successUrl: storefrontUrl(prop.booking_slug, `/booked?booking=${bookingId}`),
       cancelUrl:  storefrontUrl(prop.booking_slug),
-      metadata: { gam_booking_id: bookingId, gam_landlord_id: prop.landlord_id },
+      metadata: {
+        gam_booking_id: bookingId, gam_landlord_id: prop.landlord_id,
+        ...(plan.due.screening > 0 ? { gam_screening_fee: plan.due.screening.toFixed(2) } : {}),
+      },
     })
     await query(`UPDATE unit_bookings SET stripe_checkout_session_id=$1, updated_at=now() WHERE id=$2`,
       [checkout.sessionId, bookingId])
-    return { bookingId, depositAmount: quote.deposit, total: quote.total, checkoutUrl: checkout.hostedUrl,
-             cardFee: Math.round(guestCardFee * 100) / 100 }
+    return result(checkout.hostedUrl)
   } catch (e) {
     try { await client.query('ROLLBACK') } catch {}
     throw e
@@ -378,50 +537,170 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
 }
 
 /**
+ * The claim page's figures for a promoted waitlister — the same plan the
+ * claim's checkout charges (planStay). For a 30+ night stay, both answers are
+ * priced so the guest chooses before paying (R2).
+ */
+export async function claimQuote(token: string): Promise<null | {
+  nights: number
+  screeningFee: number | null
+  askStayTerms: boolean
+  words: string | null
+  dueNow: DueNow | null
+  lease: { dueNow: DueNow; monthlyRent: number | null; rentWords: string } | null
+  stay: { dueNow: DueNow; checkOut: string; heldWords: string | null } | null
+}> {
+  const w = await getWaitlistClaim(token)
+  if (!w) return null
+  const prop = await resolvePropertyBySlug(w.booking_slug)
+  const unit = await resolveUnit(prop.id, w.unit_id)
+  const o = { checkIn: w.check_in_ymd, checkOut: w.check_out_ymd, email: w.guest_email }
+  try {
+    const plain = await planStay(prop, unit, o)
+    return {
+      nights: plain.needs.nights, screeningFee: plain.due.screening || null,
+      askStayTerms: false, words: null, dueNow: plain.due, lease: null, stay: null,
+    }
+  } catch (e) {
+    if (!(e instanceof StayTermsNeededError)) throw e
+  }
+  const lease = await planStay(prop, unit, { ...o, stayTerms: 'lease' })
+  const stay = await planStay(prop, unit, { ...o, stayTerms: 'stay' })
+  return {
+    nights: lease.needs.nights, screeningFee: lease.due.screening || null,
+    askStayTerms: true, words: LEASE_OR_STAY_WORDS, dueNow: null,
+    lease: { dueNow: lease.due, ...leaseFromStay(prop, unit, stayRates(unit, prop).monthly, o.checkIn) },
+    stay: { dueNow: stay.due, checkOut: stay.checkOut, heldWords: stay.heldWords },
+  }
+}
+
+const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
+
+/**
+ * 10/5 (R8, review M12): the background check a booking-site charge carried —
+ * exactly the fee its Stripe checkout was built with (bookStay's
+ * gam_screening_fee metadata), never worked out again now. Between the hold and
+ * the payment the fee's price can change, or a check can come on file; the
+ * money already charged is what counts. 0 when the checkout carried none.
+ *
+ * `fromCheckout` is that metadata value when the caller already holds the
+ * session (undefined = not known, so the session is read from Stripe).
+ */
+async function screeningCarried(
+  bookingId: string, sessionId: string, chargedCents: number, fromCheckout: string | number | null | undefined,
+): Promise<number> {
+  const b = await queryOne<{ deposit_amount: string | null; payer: CardFeePayer; status: string; screening_required: boolean }>(
+    `SELECT b.deposit_amount::text AS deposit_amount, p.booking_card_fee_payer AS payer, b.status, b.screening_required
+       FROM unit_bookings b JOIN units u ON u.id = b.unit_id JOIN properties p ON p.id = u.property_id
+      WHERE b.id = $1 AND b.stripe_checkout_session_id = $2`, [bookingId, sessionId])
+  // bookStay marks a stay that needs screening when it takes the hold; any
+  // other booking's checkout never carried the line.
+  if (!b || b.status !== 'tentative' || !b.screening_required) return 0
+  let raw = fromCheckout
+  if (raw === undefined) {
+    // A failed read throws: confirming without knowing whose money the charge
+    // is would hold GAM's check money for the landlord.
+    const session = await getStripe().checkout.sessions.retrieve(sessionId)
+    raw = session.metadata?.gam_screening_fee ?? null
+  }
+  const fee = round2(Number(raw ?? 0))
+  if (!(fee > 0)) return 0
+  const cents = (n: number) => Math.round(n * 100)
+  if (cents(fee) > chargedCents) {
+    logger.error({ bookingId, fee, chargedCents },
+      '[propertyBooking] the checkout\'s background check is more than was charged — no screening recorded; a person should look')
+    return 0
+  }
+  if (cents(dueNowFor(Number(b.deposit_amount ?? 0), fee, b.payer).total) !== chargedCents) {
+    logger.error({ bookingId, fee, chargedCents },
+      '[propertyBooking] booking-site charge differs from the stay plus its background check — the check is recorded as the checkout carried it; a person should look')
+  }
+  return fee
+}
+
+/**
  * Mark a booking's deposit paid + confirm it (webhook-driven, idempotent).
  * S648: the deposit is GAM's to hold until the landlord's weekly payout; the
  * held item is written with the confirmation so neither happens without the
  * other. `paid` carries the checkout's PaymentIntent and amount (absent for
  * the dev mock, which moves no money).
+ *
+ * 10/5 (Nic): a background check on the charge (R8) is GAM's screening money —
+ * never held for the landlord or counted as stay money (an early check-out
+ * must not refund it to the card). It is recorded as a paid screening waiting
+ * for the guest, who is emailed the link. Then the 30+ night answer is acted
+ * on (R2): a lease is drafted for the landlord, or the stay is recorded and
+ * the landlord told.
  */
 export async function confirmBookingDeposit(
   bookingId: string, sessionId: string,
-  paid?: { paymentIntentId: string | null; amountTotalCents: number | null },
+  paid?: {
+    paymentIntentId: string | null; amountTotalCents: number | null
+    /** The checkout's gam_screening_fee metadata, when the caller holds the session (omit to read it from Stripe). */
+    screeningFee?: string | number | null
+  },
 ): Promise<void> {
+  const chargedCents = paid?.amountTotalCents ?? 0
+  const screening = paid ? await screeningCarried(bookingId, sessionId, chargedCents, paid.screeningFee) : 0
   const client = await getClient()
+  let confirmed: { stay_terms: StayTerms | null } | null = null
+  let prepaid: RecordedPrepayment | null = null
   try {
     await client.query('BEGIN')
-    const b = (await client.query<{ landlord_id: string; deposit_amount: string | null }>(
-      `UPDATE unit_bookings
-          SET status='confirmed', deposit_paid_at=COALESCE(deposit_paid_at, now()),
+    const b = (await client.query<{
+      landlord_id: string; deposit_amount: string | null; total_amount: string | null; stay_terms: StayTerms | null
+      guest_email: string | null; tenant_id: string | null; property_id: string
+    }>(
+      `UPDATE unit_bookings b
+          SET status='confirmed', deposit_paid_at=COALESCE(b.deposit_paid_at, now()),
               hold_expires_at=NULL, updated_at=now(),
-              stripe_payment_intent_id=COALESCE(stripe_payment_intent_id, $3)
-        WHERE id=$1 AND stripe_checkout_session_id=$2 AND status='tentative'
-        RETURNING landlord_id, deposit_amount::text AS deposit_amount`,
+              stripe_payment_intent_id=COALESCE(b.stripe_payment_intent_id, $3)
+         FROM units u
+        WHERE b.id=$1 AND u.id = b.unit_id AND b.stripe_checkout_session_id=$2 AND b.status='tentative'
+        RETURNING b.landlord_id, b.deposit_amount::text AS deposit_amount, b.total_amount::text AS total_amount, b.stay_terms,
+                  b.guest_email, b.tenant_id, u.property_id`,
       [bookingId, sessionId, paid?.paymentIntentId ?? null])).rows[0]
+    confirmed = b ?? null
     if (b && paid) {
       const deposit = Number(b.deposit_amount ?? 0)
-      // GAM's fee comes out whoever paid it: on top (charged = deposit + fee)
-      // or absorbed (charged = deposit).
-      const cardFee = processingFeeFor({ amount: deposit, paymentMethod: 'card' })
-      const depositCents = Math.round(deposit * 100)
-      if (paid.amountTotalCents !== depositCents && paid.amountTotalCents !== depositCents + Math.round(cardFee * 100)) {
-        logger.error({ bookingId, deposit, cardFee, got: paid.amountTotalCents }, '[propertyBooking] deposit amount mismatch — holding what was charged, less the card fee')
+      const charged = chargedCents / 100
+      // GAM's fee is on the whole charge (the stay's part + any check), and
+      // comes out whoever paid it: on top (charged = base + fee) or absorbed
+      // (charged = base).
+      const base = round2(deposit + screening)
+      const cardFee = processingFeeFor({ amount: base, paymentMethod: 'card' })
+      const baseCents = Math.round(base * 100)
+      if (chargedCents !== baseCents && chargedCents !== baseCents + Math.round(cardFee * 100)) {
+        logger.error({ bookingId, deposit, screening, cardFee, got: chargedCents }, '[propertyBooking] deposit amount mismatch — holding what was charged, less the card fee')
       }
-      const held = Math.round(((paid.amountTotalCents ?? 0) / 100 - cardFee) * 100) / 100
+      const held = round2(charged - cardFee - screening)
       if (held > 0) {
         await recordHeldItem({
           landlordId: b.landlord_id, sourceType: 'booking_deposit', sourceId: bookingId,
-          amount: held, description: 'Stay deposit',
+          // A no-lease stay's first month is paid whole, not as a deposit (R5).
+          amount: held, description: Number(b.total_amount) > 0 && Number(b.total_amount) === deposit ? 'Stay payment' : 'Stay deposit',
         }, client)
       }
       // 10/4 (decisions #37.B, #38): the deposit is a payment toward the stay,
-      // itemized — an early check-out gives it back to this card.
+      // itemized — an early check-out gives it back to this card. Only the
+      // stay's share of the card fee rides with it; the check's share is GAM's.
       if (paid.paymentIntentId) {
+        const share = base > 0 ? deposit / base : 1
+        const onTop = Math.max(0, charged - base)
         const { recordSiteDeposit } = await import('./stayPayments')
         await recordSiteDeposit(client, {
           bookingId, landlordId: b.landlord_id, paymentIntentId: paid.paymentIntentId,
-          deposit, charged: (paid.amountTotalCents ?? 0) / 100, gamFee: cardFee,
+          deposit, charged: round2(deposit + onTop * share), gamFee: round2(cardFee * share),
+        })
+      }
+      if (screening > 0) {
+        prepaid = await recordScreeningPrepayment(client, {
+          landlordId: b.landlord_id, propertyId: b.property_id, bookingId,
+          tenantId: b.tenant_id, email: b.guest_email, amount: screening, source: 'booking_site',
+          // 10/5 (A5): the check's money was kept out of the landlord's held
+          // share above — it is already on GAM's balance, so nothing is charged
+          // back to the landlord.
+          collectedBy: 'gam',
         })
       }
     }
@@ -431,6 +710,14 @@ export async function confirmBookingDeposit(
     throw e
   } finally {
     client.release()
+  }
+
+  // After commit: the guest's paid screening link, then the 30+ night answer.
+  // Neither undoes the confirmation if it fails.
+  if (prepaid) await prepaid.afterCommit()
+  if (confirmed?.stay_terms) {
+    await chooseStayTerms(bookingId, confirmed.stay_terms).catch(err =>
+      logger.error({ err, bookingId }, '[propertyBooking] acting on the lease-or-stay answer failed'))
   }
 }
 
@@ -476,12 +763,15 @@ export async function promoteNextWaitlister(unitId: string): Promise<boolean> {
       [unitId, propId])
     if (active.rows.length > 0) { await client.query('COMMIT'); return false }
 
+    // S654: the calendar days as text — a pg DATE arrives as local midnight,
+    // and its UTC string is the day before on any server east of UTC.
     const waiting = await client.query<any>(
-      `SELECT * FROM unit_booking_waitlists
+      `SELECT *, check_in::text AS check_in_ymd, check_out::text AS check_out_ymd
+         FROM unit_booking_waitlists
         WHERE (unit_id=$1 OR (unit_id IS NULL AND property_id=$2)) AND status='waiting'
         ORDER BY created_at ASC`, [unitId, propId])
     for (const w of waiting.rows) {
-      if (await hasConflict(client, unitId, w.check_in, w.check_out)) continue
+      if (await hasConflict(client, unitId, w.check_in_ymd, w.check_out_ymd)) continue
       const token = crypto.randomBytes(24).toString('hex')
       const expires = DateTime.now().plus({ minutes: WAITLIST_CLAIM_WINDOW_MINUTES }).toISO()
       // Pin a property-wide waiter to the freed unit so the claim books it.
@@ -504,14 +794,29 @@ export async function promoteNextWaitlister(unitId: string): Promise<boolean> {
 }
 
 async function emailClaimLink(w: any, token: string): Promise<void> {
-  const slugRow = await queryOne<{ booking_slug: string; name: string }>(
-    `SELECT booking_slug, name FROM properties WHERE id=$1`, [w.property_id])
+  const slugRow = await queryOne<{ booking_slug: string; name: string; landlord_id: string }>(
+    `SELECT booking_slug, name, landlord_id FROM properties WHERE id=$1`, [w.property_id])
   if (!slugRow) return
   const url = storefrontUrl(slugRow.booking_slug, `/claim/${token}`)
+  const esc = (x: string) => String(x ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  // 10/5 (Nic): what a long stay asks of them before they pay — the background
+  // check's fee (R8, from stayNeeds) and the lease-or-stay choice (R2).
+  const needs = await stayNeeds({
+    landlordId: slugRow.landlord_id, propertyId: w.property_id, email: w.guest_email,
+    checkIn: w.check_in_ymd, checkOut: w.check_out_ymd,
+  }).catch(err => { logger.error({ err, waitlist_id: w.id }, '[waitlist] long-stay rules for the claim email failed'); return null })
+  const longStay = [
+    needs?.screening === 'fee_due' && needs.screeningFee
+      ? `<p>Your stay is longer than three weeks, so a background check is required before check-in. Its $${needs.screeningFee.amount.toFixed(2)} fee is added when you pay.</p>`
+      : '',
+    needs?.leaseChoice === 'needed'
+      ? `<p>It's 30 nights or more, so when you claim it you'll choose a lease or a stay. ${esc(LEASE_OR_STAY_WORDS)}</p>`
+      : '',
+  ].join('')
   const html = `
     <h2>A spot just opened up</h2>
-    <p>Good news ${w.guest_name} — a stay at <b>${slugRow.name}</b> for ${w.check_in} → ${w.check_out} is now available.</p>
-    <p>You have <b>1 hour</b> to claim it before it rolls to the next person.</p>
+    <p>Good news ${esc(w.guest_name)} — a stay at <b>${esc(slugRow.name)}</b> for ${longCalendarDate(w.check_in_ymd)} to ${longCalendarDate(w.check_out_ymd)} is now available.</p>
+    <p>You have <b>1 hour</b> to claim it before it rolls to the next person.</p>${longStay}
     <p><a href="${url}" style="display:inline-block;padding:12px 20px;background:#c9a227;color:#10141f;border-radius:8px;text-decoration:none;font-weight:700">Claim your stay</a></p>
     <p style="color:#888;font-size:12px">${url}</p>`
   await sendNotificationEmail({
@@ -535,8 +840,12 @@ export async function getWaitlistClaim(token: string): Promise<any | null> {
       WHERE w.claim_token=$1`, [token])
 }
 
-/** Claim a promoted waitlist spot → a tentative booking + deposit checkout. */
-export async function claimWaitlistSpot(token: string, _stayType?: 'nightly' | 'weekly'): Promise<BookingDepositResult> {
+/**
+ * Claim a promoted waitlist spot → a tentative booking + checkout. 10/5: a
+ * 30+ night claim carries the guest's lease-or-stay answer (R2), like any
+ * booking-site stay.
+ */
+export async function claimWaitlistSpot(token: string, stayTerms?: StayTerms | null): Promise<BookingDepositResult> {
   const w = await getWaitlistClaim(token)
   if (!w) throw new AppError(404, 'Claim link not found')
   if (w.status !== 'notified') throw new AppError(409, 'This claim is no longer available')
@@ -549,6 +858,7 @@ export async function claimWaitlistSpot(token: string, _stayType?: 'nightly' | '
     // and its UTC string is the day before on any server east of UTC.
     checkIn: w.check_in_ymd,
     checkOut: w.check_out_ymd,
+    stayTerms: stayTerms ?? null,
   })
   await query(`UPDATE unit_booking_waitlists SET status='claimed', claimed_booking_id=$1, updated_at=now() WHERE id=$2`,
     [result.bookingId, w.id])

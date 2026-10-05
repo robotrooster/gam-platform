@@ -12,9 +12,14 @@
  * no subtype pool into a "general" RV Site type.
  */
 
+import { DateTime } from 'luxon'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
-import { computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, processingFeeFor, type CardFeePayer } from '@gam/shared'
+import {
+  computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, processingFeeFor, cardFeeSplit,
+  STAY_LEASE_CHOICE_NIGHTS, STAY_SCREENING_NIGHTS, stayHeldWords, leaseDueDay, dueDayLabel, type CardFeePayer,
+} from '@gam/shared'
+import { stayNeeds } from './stayTerms'
 
 export interface PropertyRow {
   id: string
@@ -41,6 +46,9 @@ export interface PropertyRow {
   short_term_tax_rate: string | null
   /** S654: the park's IANA zone — "today" for a stay is the park's today. */
   timezone: string | null
+  /** 10/5 (R4): a lease drafted from a stay is due per the property's rent-due setting. */
+  rent_due_mode: string | null
+  rent_due_day: number | null
 }
 
 /** Resolve a property by its public booking slug, 404 unless enabled. */
@@ -49,7 +57,7 @@ export async function resolveProperty(slug: string): Promise<PropertyRow> {
     `SELECT id, landlord_id, booking_slug, name, city, state, booking_intro, booking_about, booking_area, booking_deposit_pct,
             booking_monthly_deposit, booking_utilities_billed, booking_card_fee_payer,
             street1, zip, office_phone, office_email, office_hours,
-            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate, timezone
+            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate, timezone, rent_due_mode, rent_due_day
        FROM properties
       WHERE booking_slug = $1 AND public_booking_enabled = TRUE`,
     [slug])
@@ -63,7 +71,7 @@ export async function resolvePropertyById(propertyId: string): Promise<PropertyR
     `SELECT id, landlord_id, booking_slug, name, city, state, booking_intro, booking_about, booking_area, booking_deposit_pct,
             booking_monthly_deposit, booking_utilities_billed, booking_card_fee_payer,
             street1, zip, office_phone, office_email, office_hours,
-            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate, timezone
+            nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate, timezone, rent_due_mode, rent_due_day
        FROM properties
       WHERE id = $1 AND public_booking_enabled = TRUE`,
     [propertyId])
@@ -72,7 +80,7 @@ export async function resolvePropertyById(propertyId: string): Promise<PropertyR
 /** Units that the public can book: bookable + allow a short-term stay type. */
 export async function bookableUnits(propertyId: string) {
   return query<any>(
-    `SELECT u.id, u.unit_number, u.unit_type, u.nightly_rate, u.weekly_rate, u.monthly_rate,
+    `SELECT u.id, u.unit_number, u.unit_type, u.nightly_rate, u.weekly_rate, u.monthly_rate, u.rent_amount,
             u.min_stay_nights, u.max_stay_nights, u.check_in_time, u.check_out_time,
             u.lease_types_allowed, u.subtype_id,
             s.name AS subtype_name, s.unit_type AS subtype_unit_type, s.rv_site_layout AS subtype_layout,
@@ -134,10 +142,106 @@ export function typeRates(t: SiteType) {
   }
 }
 
+// ── 10/5 (Nic): PREPAID STAYS on the booking site ──────────────────────────
+//
+//   "If they're booking online, it will ask them a lease guarantees your spot
+//    indefinitely and the stay only guarantees it for the time that you've paid
+//    ahead of time. And if they choose to just do the stay, that's fine. If they
+//    choose to do the lease, then it drafts one for me."
+//
+// The rules themselves live in services/stayTerms (stayNeeds); this is only
+// what the booking site QUOTES from them, so the guest sees the same figures
+// the checkout then charges (services/propertyBooking bookStay).
+
+/** R2: what the guest reads before choosing — word for word, on every booking-site door. */
+export const LEASE_OR_STAY_WORDS =
+  'A lease holds your site for as long as you stay. A stay holds it only through the time you\'ve paid for.'
+
+const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
+
+/**
+ * What the guest pays now, line by line: the stay's part (a deposit, or a
+ * no-lease stay's first month), the background check (R8 — a fixed line that
+ * cannot be removed; 0 when none is due) and GAM's card fee on the whole of it
+ * (0 when the property covers the fee). The checkout charges exactly this.
+ */
+export interface DueNow { stay: number; screening: number; cardFee: number; total: number }
+export function dueNowFor(stay: number, screening: number, payer: CardFeePayer): DueNow {
+  const base = round2(stay + screening)
+  const split = cardFeeSplit(base, payer)
+  return { stay: round2(stay), screening: round2(screening), cardFee: round2(split.charged - base), total: split.charged }
+}
+
+/**
+ * 10/5 (Nic, R5): a stay of 30+ nights with no lease is paid one month at a
+ * time online. The booking covers the first calendar month only — the 4th to
+ * the 4th, never past the check-out asked for — at the monthly rate, never
+ * prorated. Later months are added at the counter, on a pay link or on the
+ * schedule ("Add a month"). With no monthly rate set, those nights are priced
+ * by length like any stay.
+ */
+export function firstStayMonth(
+  checkIn: string, checkOut: string,
+  rates: { nightly: number | null; weekly: number | null; monthly: number | null },
+  taxRatePct: number,
+): { checkOut: string; nights: number; amount: number } {
+  const monthOut = DateTime.fromISO(checkIn).plus({ months: 1 }).toISODate()!
+  const out = checkOut < monthOut ? checkOut : monthOut
+  const nights = Math.round(DateTime.fromISO(out).diff(DateTime.fromISO(checkIn), 'days').days)
+  const amount = rates.monthly != null
+    ? round2(Number(rates.monthly))
+    : computeStayPrice(rates, taxRatePct, nights).total
+  return { checkOut: out, nights, amount }
+}
+
+/**
+ * R4: the lease a guest asks for, as the booking site describes it — the same
+ * rent draftLeaseFromStay (services/stayTerms) writes on the draft (the unit's
+ * monthly rent, else its monthly stay rate), due per the PROPERTY's rent-due
+ * setting (leaseDueDay). A check-in off the due day makes the first bill
+ * prorated; what was paid on the reservation comes off that bill.
+ */
+export function leaseFromStay(
+  prop: Pick<PropertyRow, 'rent_due_mode' | 'rent_due_day'>,
+  unit: { rent_amount?: string | number | null },
+  monthlyRate: number | null,
+  checkIn: string,
+): { monthlyRent: number | null; rentWords: string } {
+  const monthlyRent = Number(unit.rent_amount) > 0 ? Number(unit.rent_amount)
+    : monthlyRate != null && monthlyRate > 0 ? monthlyRate : null
+  const dueDay = leaseDueDay({ mode: prop.rent_due_mode ?? 'fixed_day', propertyDay: prop.rent_due_day ?? 1, startIso: checkIn })
+  const prorated = Number(checkIn.slice(8, 10)) !== dueDay
+  return {
+    monthlyRent,
+    rentWords: `Rent is due on the ${dueDayLabel(dueDay)} of each month.`
+      + (prorated ? ' Your first month is prorated to the days you\'re here.' : '')
+      + ' What you pay today comes off your first bill.',
+  }
+}
+
+/**
+ * R1/R8: the background-check fee a stay of these dates carries — null under
+ * 22 nights. Quoted before we know who is booking; the guest's own history (a
+ * check already on file, back-to-back stays that add up) is looked at when
+ * they book (propertyBooking bookStay asks stayNeeds again with their email).
+ */
+export async function quoteScreeningFee(
+  prop: Pick<PropertyRow, 'id' | 'landlord_id'>, checkIn: string, checkOut: string,
+): Promise<number | null> {
+  const nights = Math.round(DateTime.fromISO(checkOut).diff(DateTime.fromISO(checkIn), 'days').days)
+  if (!(nights >= STAY_SCREENING_NIGHTS)) return null
+  const needs = await stayNeeds({ landlordId: prop.landlord_id, propertyId: prop.id, checkIn, checkOut })
+  return needs.screeningFee?.amount ?? null
+}
+
 /** W-20: availability = ANY unit of the site type free for the window
  *  (guests never see per-unit inventory). Returns the quote fields shared by
- *  both response shapes. */
-export async function typeAvailability(prop: PropertyRow, siteType: SiteType, nights: number, checkIn: string, checkOut: string) {
+ *  both response shapes. `screeningFee` may be passed in when the caller
+ *  quotes several site types for the same dates (it never depends on the type). */
+export async function typeAvailability(
+  prop: PropertyRow, siteType: SiteType, nights: number, checkIn: string, checkOut: string,
+  opts: { screeningFee?: number | null } = {},
+) {
   let freeUnit: any = null
   for (const u of siteType.units) {
     // S593: mirror the write-time guard (services/propertyBooking.hasConflict) —
@@ -181,9 +285,10 @@ export async function typeAvailability(prop: PropertyRow, siteType: SiteType, ni
     monthly: rep.monthly_rate ?? prop.monthly_rate,
   }
   const price = computeStayPrice(rates, Number(prop.short_term_tax_rate || 0), nights)
-  // S547 (Nic): 30+ night stays bill like residents — prorated arrival month
-  // (monthly/30), flat monthly on the 1st, prorated departure. The quote
-  // total is the schedule sum so quote and invoices can never disagree.
+  // S547: a 30+ night stay's total is priced on the calendar months it spans.
+  // 10/5 (R5): that is the whole stay asked for, as an estimate — nothing bills
+  // it as a lump. A lease bills by the property's rent-due setting; a stay is
+  // paid a month at a time (longStay below).
   const monthlyBilling = price.tier === 'monthly' && rates.monthly != null
     ? computeMonthlyStaySchedule(checkIn, checkOut, Number(rates.monthly))
     : null
@@ -196,6 +301,32 @@ export async function typeAvailability(prop: PropertyRow, siteType: SiteType, ni
   const depositAmount = total == null ? null
     : monthlyBilling ? Math.round(Math.min(monthlyFlat, Number(rates.monthly)) * 100) / 100
     : Math.round(total * (depositPct / 100) * 100) / 100
+
+  // 10/5 (R1/R8, R2/R5): the background check and the lease-or-stay choice.
+  const screeningFee = opts.screeningFee !== undefined
+    ? opts.screeningFee
+    : await quoteScreeningFee(prop, checkIn, checkOut)
+  const screening = screeningFee ?? 0
+  const payer = prop.booking_card_fee_payer
+  const num = (v: any) => (v == null ? null : Number(v))
+  const longStay = nights >= STAY_LEASE_CHOICE_NIGHTS && depositAmount != null
+    ? (() => {
+        const monthlyRate = num(rates.monthly)
+        const first = firstStayMonth(checkIn, checkOut,
+          { nightly: num(rates.nightly), weekly: num(rates.weekly), monthly: monthlyRate },
+          Number(prop.short_term_tax_rate || 0))
+        return {
+          words: LEASE_OR_STAY_WORDS,
+          monthlyRate,
+          lease: { dueNow: dueNowFor(depositAmount, screening, payer), ...leaseFromStay(prop, rep, monthlyRate, checkIn) },
+          stay: {
+            checkOut: first.checkOut, nights: first.nights,
+            dueNow: dueNowFor(first.amount, screening, payer),
+            heldWords: stayHeldWords(first.checkOut),
+          },
+        }
+      })()
+    : null
 
   const minStay = rep.min_stay_nights
   const maxStay = rep.max_stay_nights
@@ -245,14 +376,19 @@ export async function typeAvailability(prop: PropertyRow, siteType: SiteType, ni
     taxable: monthlyBilling ? false : price.taxable,
     total, depositPct, depositAmount,
     // S648 (Nic): deposits are card only; the card fee is added on top unless
-    // the landlord absorbs it (then this is 0).
+    // the landlord absorbs it (then this is 0). The deposit's own fee — what a
+    // stay with no background check pays; dueNow below is the whole charge.
     depositCardFee: depositAmount == null ? null
       : prop.booking_card_fee_payer === 'landlord' ? 0
       : processingFeeFor({ amount: depositAmount, paymentMethod: 'card' }),
-    // Present only on monthly-tier stays: the calendar-aligned invoice plan.
-    monthlyBilling: monthlyBilling
-      ? { monthlyRate: Number(rates.monthly), segments: monthlyBilling.segments }
-      : null,
+    // 10/5 (R8): the background check's fixed line on the checkout, null when
+    // the stay is under 22 nights.
+    screeningFee,
+    // Under 30 nights: the whole charge to reserve — deposit, check, card fee.
+    dueNow: depositAmount != null && !longStay ? dueNowFor(depositAmount, screening, payer) : null,
+    // 30+ nights (R2): the guest chooses, and each choice is priced. Lease:
+    // the deposit today, then the lease bills. Stay: the first month today.
+    longStay,
   }
 }
 

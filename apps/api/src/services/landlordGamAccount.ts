@@ -39,8 +39,11 @@ export interface GamCharge {
    * bank_debit_cost    — S651: what an ACH pull cost, kept as its own line so
    *                      the landlord sees two numbers they can each check
    *                      rather than one lump they can only dispute
+   * screening_fee      — 10/5 (Nic): a background check paid inside a stay's
+   *                      payment is GAM's money, card or cash; it comes out of
+   *                      the landlord's next payout (services/stayTerms)
    */
-  kind: 'subscription' | 'bank_debit_cost' | 'device_installment'
+  kind: 'subscription' | 'bank_debit_cost' | 'device_installment' | 'screening_fee'
   amount: number
   /** what produced this, so a retry cannot bill twice */
   sourceType: string

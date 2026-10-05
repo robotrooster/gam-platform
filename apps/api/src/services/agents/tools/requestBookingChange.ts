@@ -26,6 +26,9 @@ import type { AgentTool, AgentActor } from './types'
 import { loadGuestBookingContext } from './getGuestBooking'
 import { findStayConflict } from '../../unitAvailability'
 import { findStaffWithPermission } from '../../staffNotify'
+import { continuousStayNights, syncStayUtilityAgreement } from '../../stayTerms'
+import { logger } from '../../../lib/logger'
+import { STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGHTS } from '@gam/shared'
 
 function normalizeType(raw: string): BookingChangeRequestType | null {
   const v = raw.trim().toLowerCase().replace(/[\s-]+/g, '_')
@@ -40,6 +43,7 @@ export const requestBookingChange: AgentTool = {
     'Change the guest’s stay — a late checkout, an early check-in, an extra night, or some other request. ' +
     'When the schedule has room, late checkout / early check-in / extra night are CONFIRMED automatically and ' +
     'the host is notified; if the schedule is tight (or for "other" requests) it goes to the host to decide. ' +
+    'An extra night that makes the stay 22 or 30 nights in a row also goes to the host to decide. ' +
     'An EXTRA NIGHT COSTS MONEY, so it is two steps: call once without `confirmed` and you get the price ' +
     'back — tell them what it costs and ask if they want it — then call again with confirmed: true. Never ' +
     'book a paid night off "is it available?"; being available is not being agreed to.\n' +
@@ -146,7 +150,36 @@ export const requestBookingChange: AgentTool = {
     }
     let autoApproved = false
     let newCheckOut: string | null = null
-    if (b.unit_id && ['late_checkout', 'early_checkin', 'extra_night'].includes(type)) {
+    // 10/5 (Nic, R1/R2): one more night can make a stay more than three weeks
+    // (a background check before check-in, with its fee) or 30 nights (lease or
+    // stay — the desk's answer, and "either way, it goes to me"). The assistant
+    // can take neither, so an extra night that crosses 22 or 30 continuous
+    // nights (back-to-back stays add up, R7) is never confirmed on its own: it
+    // goes to the host to decide, like a night the schedule has no room for.
+    let crossesStayRule = false
+    let crossNote = ''
+    if (type === 'extra_night' && b.unit_id && b.property_id) {
+      const checkIn = dayOnly(b.check_in)
+      const before = await continuousStayNights({
+        propertyId: b.property_id, bookingId: actor.bookingId,
+        checkIn, checkOut: dayOnly(b.check_out),
+      })
+      const after = await continuousStayNights({
+        propertyId: b.property_id, bookingId: actor.bookingId,
+        checkIn, checkOut: addDays(b.check_out, 1),
+      })
+      const crossesCheck = before.nights < STAY_SCREENING_NIGHTS && after.nights >= STAY_SCREENING_NIGHTS
+      const crossesLease = before.nights < STAY_LEASE_CHOICE_NIGHTS && after.nights >= STAY_LEASE_CHOICE_NIGHTS
+      crossesStayRule = crossesCheck || crossesLease
+      if (crossesStayRule) {
+        crossNote = ` One more night makes it ${after.nights} nights in a row, which `
+          + (crossesLease
+              ? 'needs a lease or a stay chosen for it'
+              : 'needs a background check before check-in')
+          + ', so it was not confirmed automatically. Make the change on the schedule, where you will be asked.'
+      }
+    }
+    if (b.unit_id && !crossesStayRule && ['late_checkout', 'early_checkin', 'extra_night'].includes(type)) {
       // The night(s) the change would occupy: late checkout + extra night
       // both need the unit free on the departure day; early check-in needs
       // the night before arrival free (a same-day-turnover predecessor
@@ -160,12 +193,21 @@ export const requestBookingChange: AgentTool = {
         if (type === 'extra_night') {
           newCheckOut = addDays(b.check_out, 1)
           await query(
+            // 10/3 (decisions #33): booked_check_out is the length the stay
+            // is sold for, and the extra night is sold — it moves with check_out
+            // (as a schedule edit and an added month move it).
             `UPDATE unit_bookings
                 SET check_out = check_out + INTERVAL '1 day',
+                    booked_check_out = CASE WHEN booked_check_out IS NULL THEN NULL
+                                            ELSE GREATEST(booked_check_out, (check_out + INTERVAL '1 day')::date) END,
                     nights = COALESCE(nights, 0) + 1
               WHERE id = $1`,
             [actor.bookingId]
           )
+          // R11: a stay's utility agreement (a 30+ night stay with no lease)
+          // follows its new check-out. Best-effort — the night is booked.
+          await syncStayUtilityAgreement(actor.bookingId).catch((err) =>
+            logger.error({ err, bookingId: actor.bookingId }, '[guest-agent] stay utility agreement did not follow the extra night'))
         }
       }
     }
@@ -196,7 +238,7 @@ export const requestBookingChange: AgentTool = {
       ? `${b.guest_name ?? 'A guest'} at ${where}: ${label.toLowerCase()}${details ? ` — ${details}` : ''}` +
         (newCheckOut ? `. Checkout is now ${newCheckOut}.` : '.') +
         ' The schedule had room, so it was confirmed automatically.'
-      : `${b.guest_name ?? 'A guest'} at ${where} requested ${label.toLowerCase()}${details ? ` — ${details}` : ''}.`
+      : `${b.guest_name ?? 'A guest'} at ${where} requested ${label.toLowerCase()}${details ? ` — ${details}` : ''}.${crossNote}`
     for (const userId of recipients.keys()) {
       await createNotification({
         userId,

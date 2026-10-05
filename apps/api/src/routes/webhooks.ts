@@ -598,6 +598,10 @@ webhooksRouter.post('/stripe', async (req, res) => {
               paymentIntentId: typeof session.payment_intent === 'string'
                 ? session.payment_intent : session.payment_intent?.id ?? null,
               amountTotalCents: session.amount_total,
+              // 10/5 (M12): the background-check fee the checkout was built
+              // with, straight from the session in hand — no second Stripe
+              // read, which could fail and leave a paid booking unconfirmed.
+              screeningFee: session.metadata?.gam_screening_fee ?? null,
             })
             logger.info({ booking_id: bookingId, session_id: session.id }, '[webhook] booking deposit confirmed')
           } catch (e) {

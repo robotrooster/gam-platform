@@ -425,10 +425,12 @@ export function LeasesPage() {
                           Review
                         </span>
                       )}
-                      {/* S526: auto-drafted from a 30+/7+ day reservation. */}
+                      {/* 10/5 (Nic, R3): drafted from a long stay because a lease was
+                          chosen for it (by the guest online, or the front counter) —
+                          never automatically any more. */}
                       {l.leaseSource === 'booking_draft' && (
                         <span
-                          title="Drafted automatically from a long-stay reservation — attach the tenant and complete the terms"
+                          title="Drafted from a long-stay reservation when a lease was chosen for it — attach the tenant, check the terms and send it for signature"
                           style={{
                             display: 'inline-flex',
                             alignItems: 'center',

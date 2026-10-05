@@ -368,18 +368,22 @@ export async function emailBookingSiteChanged(
   )
 }
 
-// S547 (Nic): landlord-INITIATED screening request for a long-stay guest.
-// Sent only when the landlord explicitly chooses to screen — the system
-// never auto-sends a background check to a prospect.
-export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = 'http://localhost:3002/background', ctx?: { landlordId?: string; replyTo?: ReplyTo }) {
-  await send(guestEmail, `${propertyName} — screening needed for your extended stay`,
-    base(h('One more step for your extended stay') +
+// S547 (Nic): screening request for a long-stay guest.
+// 10/5 (Nic): a stay of more than three weeks needs a background check before
+// check-in, and its fee is taken with the stay's payment — `prepaid` says so,
+// so the guest is never asked to pay for it again.
+export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = 'http://localhost:3002/background', ctx?: { landlordId?: string; replyTo?: ReplyTo; prepaid?: boolean }) {
+  await send(guestEmail, `${propertyName} — background check for your stay`,
+    base(h('One more step before check-in') +
       p(`Hi ${guestName || 'there'},`) +
-      p(`<strong style="color:#eef1f8">${propertyName}</strong> asks guests staying 30 nights or longer to complete a routine background screening before the lease is finalized.`) +
-      p('Sign in to your GAM account (or create one with this email address) and complete the screening from your portal — it takes a few minutes.') +
-      btn('Complete screening', portalUrl)
+      p(`<strong style="color:#eef1f8">${propertyName}</strong> asks guests staying more than three weeks to complete a background check before check-in.`) +
+      (ctx?.prepaid
+        ? p('The check is already paid for — it was part of your stay\'s payment, so there is nothing more to pay.')
+        : '') +
+      p('Sign in to your GAM account (or create one with this email address) and complete the check from your portal — it takes a few minutes.') +
+      btn('Complete background check', portalUrl)
     ),
-    { category: 'background_screening_request', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo }
+    { category: 'background_screening_request', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo, metadata: { prepaid: !!ctx?.prepaid } }
   )
 }
 
@@ -1869,6 +1873,14 @@ export async function emailPayLink(args: {
   amount: number
   cardFee: number
   url: string
+  /**
+   * 10/5 (Nic): a sentence the payer reads before paying — R13's "Your site is
+   * held through …" for a 30+ night stay with no lease, or what the background
+   * check on the link is for. Plain text; escaped here.
+   */
+  note?: string | null
+  /** A link with no expiry (a deposit or a background check) — the email does not say 14 days. */
+  neverExpires?: boolean
   ctx?: { landlordId?: string; payLinkId?: string; replyTo?: ReplyTo }
 }) {
   const money = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -1880,8 +1892,9 @@ export async function emailPayLink(args: {
       p(`<strong style="color:#eef1f8">${args.label}:</strong> ${money(args.amount)}<br>` +
         (args.cardFee > 0 ? `<strong style="color:#eef1f8">Card processing fee:</strong> ${money(args.cardFee)}<br>` : '') +
         `<strong style="color:#eef1f8">Total:</strong> ${money(args.amount + args.cardFee)}`) +
+      (args.note ? p(escapeHtml(args.note)) : '') +
       btn('Pay by card', args.url) +
-      p('The link works for 14 days. To pay another way, contact the office.')
+      p(args.neverExpires ? 'To pay another way, contact the office.' : 'The link works for 14 days. To pay another way, contact the office.')
     ),
     {
       category: 'pos_pay_link',
@@ -2302,11 +2315,14 @@ export async function emailPosReceipt(
   total: number,
   pdf: Buffer,
   ctx: EmailSendContext = {},
+  /** 10/5 (Nic, R13): a sentence under the total — how long a stay with no lease holds their site (stayHeldWords). */
+  opts: { note?: string | null } = {},
 ): Promise<string | null> {
   const subject = `Receipt ${receiptNumber} — ${operatorName}`
   const html = base(`
     <h2 style="margin:0 0 12px;color:#e8e6e3;font-size:1.05rem">Receipt from ${operatorName}</h2>
     <p style="color:#9b9894;font-size:.9rem;margin:0 0 8px">Total: <strong style="color:#c9a227">$${total.toFixed(2)}</strong></p>
+    ${opts.note ? `<p style="color:#9b9894;font-size:.9rem;margin:0 0 8px">${escapeHtml(opts.note)}</p>` : ''}
     <p style="color:#9b9894;font-size:.9rem;margin:0">Your itemized receipt is attached as a PDF.</p>
   `)
   return send(to, subject, html, { ...ctx, category: ctx.category ?? 'pos_receipt' }, 'noreply',

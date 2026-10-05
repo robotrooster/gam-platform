@@ -256,18 +256,18 @@ describe('one price, and it is the site\'s', () => {
         stay: { unitId: f.unitId, checkIn: '2026-10-01', guestName: 'Dale Carter' },
       })
     expect(res.status).toBe(409)
-    expect(res.body.error).toBe('Site RV 01 has no stay rate set, and neither does the property, so this stay cannot be priced — nothing was charged. '
-      + 'Set the site\'s nightly rate (or the property\'s), then press Charge again.')
+    expect(res.body.error).toBe('Site RV 01 has no monthly rate set, and neither does the property, so this stay cannot be priced — nothing was charged. '
+      + 'Set the site\'s monthly rate (or the property\'s), then press Charge again.')
     expect(await query('SELECT 1 FROM pos_transactions')).toHaveLength(0)
     expect(await query('SELECT 1 FROM unit_bookings')).toHaveLength(0)
   })
 
-  it('10/3 (decisions #9): a month with no monthly rate costs what the schedule charges for those nights — never the catalog price', async () => {
+  it('10/5 (Nic, R5): a month with no monthly rate is refused — never a month cut into nights or weeks, never the catalog price', async () => {
+    // "point of sale cannot prorate a stay": a month is sold at the monthly
+    // rate or not at all. (The schedule would tier 31 nights at the weekly
+    // rate — $885.71 — which is a prorated week.)
     const f = await seed('month', 589, { night: 40, week: 200, month: null })
     await query(`UPDATE properties SET monthly_rate = NULL WHERE id = $1`, [f.propertyId])
-    const { priceStayBySchedule } = await import('../services/registerStay')
-    const schedule = await priceStayBySchedule(db, f.unitId, '2026-10-01', '2026-11-01')
-    expect(schedule.total).toBe(885.71)   // 31 nights at the weekly rate, as the schedule prices it
     const res = await request(buildApp()).post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.token}`)
       .send({
@@ -275,10 +275,9 @@ describe('one price, and it is the site\'s', () => {
         paymentMethod: 'cash', propertyId: f.propertyId,
         stay: { unitId: f.unitId, checkIn: '2026-10-01', guestName: 'Dale Carter' },
       })
-    expect(res.status, JSON.stringify(res.body)).toBe(201)
-    expect(Number(res.body.data.total)).toBe(885.71)
-    const [b] = await query<any>(`SELECT total_amount::float AS total FROM unit_bookings WHERE unit_id = $1`, [f.unitId])
-    expect(b.total).toBe(885.71)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/^Site RV 01 has no monthly rate set/)
+    expect(await query('SELECT 1 FROM pos_transactions')).toHaveLength(0)
   })
 
   it('a cashier with no pricing permission can still ring a stay', async () => {

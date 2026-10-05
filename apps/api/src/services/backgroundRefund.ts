@@ -114,6 +114,13 @@ export async function sweepStaleBackgroundChecks(): Promise<{ swept: number; ref
         `UPDATE tenants SET background_check_status='cancelled' WHERE background_check_id=$1`,
         [row.id]
       )
+      // 10/5 (Nic, R8 — F12): a check paid with a stay has no payment of its
+      // own to refund. Its screening goes back to waiting for the guest (and
+      // the margin booked for it comes back off the book), the same as when
+      // the guest cancels it themselves (routes/background /:id/cancel).
+      const { restorePrepaidScreening } = await import('./stayTerms')
+      const prepaid = await restorePrepaidScreening(row.id)
+      if (prepaid.restored) continue
       const r = await refundBackgroundCheckPayment(row.id)
       if (r.refunded) refunded++
     } catch (e) {

@@ -16,8 +16,17 @@ const STATUS_MAP: Record<string, string> = {
   processing: 'badge-blue', complete: 'badge-green',
   failed: 'badge-red', cancelled: 'badge-muted', expired: 'badge-muted',
 }
-// Statuses the API's /decision route will accept a decision for.
-const DECIDABLE = new Set(['complete', 'submitted', 'processing'])
+// Statuses the API's /decision route will accept a decision for. 10/5 (Nic,
+// A6): only once the results are back — a decision before then is refused.
+const DECIDABLE = new Set(['complete'])
+// Still on its way to a result: submitted to the screener, or being worked.
+const RESULTS_PENDING = new Set(['submitted', 'processing'])
+
+// 10/5 (Nic, R10/A8): a guest screened for a STAY. Their approval clears the
+// stay for check-in; it is never waiting on a space or a lease here — a stay
+// that chose a lease already has its own draft on the Leases page.
+const stayDay = (ymd: string | null | undefined) =>
+  ymd ? new Date(String(ymd).slice(0, 10) + 'T00:00:00').toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' }) : null
 
 type Cra = { name: string; address: string; phone: string; website: string | null }
 
@@ -86,9 +95,10 @@ export function BackgroundChecksPage() {
                   </td>
                   <td>
                     <span className={`badge ${STATUS_MAP[c.status] || 'badge-muted'}`}>{humanize(c.status) || '—'}</span>
-                    {c.status === 'approved' && c.housed && <span className="badge badge-muted" style={{marginLeft:4}} title="A lease exists for them">Housed</span>}
-                    {c.status === 'approved' && !c.housed && c.parkedAt && <span className="badge badge-muted" style={{marginLeft:4}} title={c.parkedNote || 'Set aside — not moving in for now'}>Not moving in for now</span>}
-                    {c.status === 'approved' && !c.housed && !c.parkedAt && <span className="badge badge-gold" style={{marginLeft:4}} title="Approved — pick a space and draft the lease">Needs a lease</span>}
+                    {c.status === 'approved' && c.clearedForStay && <span className="badge badge-muted" style={{marginLeft:4}} title="Screened for their stay — they can be checked in">Cleared for their stay</span>}
+                    {c.status === 'approved' && !c.clearedForStay && c.housed && <span className="badge badge-muted" style={{marginLeft:4}} title="A lease exists for them">Housed</span>}
+                    {c.status === 'approved' && !c.clearedForStay && !c.housed && c.parkedAt && <span className="badge badge-muted" style={{marginLeft:4}} title={c.parkedNote || 'Set aside — not moving in for now'}>Not moving in for now</span>}
+                    {c.status === 'approved' && !c.clearedForStay && !c.housed && !c.parkedAt && <span className="badge badge-gold" style={{marginLeft:4}} title="Approved — pick a space and draft the lease">Needs a lease</span>}
                   </td>
                   <td style={{textAlign:'right',color:'var(--text-3)',fontSize:'.8rem'}}>Review →</td>
                 </tr>
@@ -155,7 +165,9 @@ function ReviewModal({ check, onClose, onDecided }: {
   // refetched yet), so the approved state is tracked here too.
   const [approvedNow, setApprovedNow] = useState(false)
   const isApproved = check.status === 'approved' || approvedNow
-  const needsUnit = isApproved && !check.unitId
+  // A guest screened for a stay: their check only clears check-in (R10/A8).
+  const forStay = !!check.stayBookingId
+  const needsUnit = isApproved && !check.unitId && !forStay
   const { data: vacants = [] } = useQuery<any[]>(
     ['vacant-units', check.propertyId],
     () => apiGet(`/units?propertyId=${check.propertyId}`),
@@ -197,6 +209,14 @@ function ReviewModal({ check, onClose, onDecided }: {
     setBusy(decision)
     try {
       const res: any = await apiPatch(`/background/${check.id}/decision`, { decision })
+      if (decision === 'approved' && res?.stay) {
+        // A stay guest: cleared for check-in, nothing to draft (R10/A8).
+        toast(res.stay.leaseId
+          ? 'Approved — cleared for their stay. Their lease is already drafted on the Leases page.'
+          : 'Approved — cleared for their stay. Check them in from the schedule.')
+        onDecided(null)
+        return
+      }
       if (decision === 'approved' && res?.alreadyApproved) {
         // An older screen: it was approved already — show the next step here.
         toast(res.needsUnit ? 'Already approved. Which space are they taking?' : 'Already approved. Draft their lease, or mark them not moving in for now.')
@@ -381,13 +401,37 @@ function ReviewModal({ check, onClose, onDecided }: {
             </div>
           )}
 
+          {RESULTS_PENDING.has(check.status) && (
+            <div style={{marginTop:12,fontSize:'.8rem',color:'var(--text-2)'}}>The results aren't back yet. You can approve or deny once they are.</div>
+          )}
+
+          {forStay && (
+            <div style={{marginTop:12,fontSize:'.8rem',color:'var(--text-2)',lineHeight:1.5}}>
+              {isApproved
+                ? 'Cleared for their stay'
+                : 'Screened for their stay'}
+              {check.stayCheckIn ? ` — check-in ${stayDay(check.stayCheckIn)}` : ''}
+              {check.stayCheckOut ? `, check-out ${stayDay(check.stayCheckOut)}` : ''}.
+              {isApproved ? ' They can be checked in from the schedule.'
+                : check.status === 'denied' ? ' You can still check them in from the schedule if you choose to.'
+                : check.status === 'complete' ? ' Check-in waits for your decision.'
+                : ' Check-in waits for the results and your decision.'}
+              {check.stayLeaseId ? ' They chose a lease — it is already drafted on the Leases page.' : ''}
+            </div>
+          )}
+
           {check.status === 'denied' && (
             <div style={{marginTop:12,fontSize:'.8rem',color:'var(--text-2)'}}>This applicant was denied{check.decidedAt ? ` on ${new Date(check.decidedAt).toLocaleDateString()}` : ''}. If a screening report factored into the decision, federal law requires sending an adverse-action notice.</div>
           )}
         </div>
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onClose} disabled={!!busy}>Close</button>
-          {isApproved && !check.housed && (
+          {isApproved && forStay && check.stayLeaseId && (
+            <button className="btn btn-primary" onClick={() => { window.location.href = `/leases?open=${check.stayLeaseId}` }}>
+              Open their lease
+            </button>
+          )}
+          {isApproved && !forStay && !check.housed && (
             check.parkedAt ? (
               <button className="btn btn-ghost" onClick={() => park('unpark')} disabled={parking}
                 title={check.parkedNote ? `Set aside: ${check.parkedNote}` : 'Set aside — not moving in for now'}>
@@ -403,7 +447,7 @@ function ReviewModal({ check, onClose, onDecided }: {
               </div>
             )
           )}
-          {isApproved && (
+          {isApproved && !forStay && (
             <>
               {needsUnit && (
                 <select className="input" style={{maxWidth:220}} value={pickedUnit} onChange={e => setPickedUnit(e.target.value)}>

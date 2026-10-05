@@ -402,8 +402,8 @@ describe('S561 landlord-owned adverse action', () => {
       .send({ ...happyPayload({ landlordId: f.landlordId, unitId: f.unitId }), ssn: undefined })
     expect(sub.status).toBe(201)
     const checkId = sub.body.data.id
-    // Make the check decidable.
-    await db.query(`UPDATE background_checks SET status='processing' WHERE id=$1`, [checkId])
+    // Make the check decidable: 10/5 (Nic, A6) — only once the results are back.
+    await db.query(`UPDATE background_checks SET status='complete' WHERE id=$1`, [checkId])
     return { f, checkId }
   }
 
@@ -447,7 +447,7 @@ describe('S561 landlord-owned adverse action', () => {
   })
 
   it('adverse-action send is rejected for a non-denied applicant', async () => {
-    const { f, checkId } = await denyFixture()  // status = 'processing', not denied
+    const { f, checkId } = await denyFixture()  // status = 'complete', not denied
     const res = await request(buildApp())
       .post(`/api/background/${checkId}/adverse-action`)
       .set('Authorization', `Bearer ${f.landlordToken}`)

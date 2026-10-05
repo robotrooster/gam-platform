@@ -13,10 +13,14 @@ Every rate on this site is set by this property's owner and read live, so what y
 
 ## Getting a real number
 
-A rate card is not a quote. Give your actual check-in and check-out dates and you get a firm total for those dates — the stay prorated correctly, the deposit, and the tax, all for the type you're looking at.
+A rate card is not a quote. Give your actual check-in and check-out dates and you get a firm total for those dates — the stay at its nightly, weekly or monthly rate (stays are never prorated), the deposit, and the tax, all for the type you're looking at.
 
 That's the number to book on. Anything before it is an estimate.
 
 ## Monthly stays
 
 Longer stays are priced monthly, and at some properties utilities are billed separately on a monthly stay rather than included. Whether that applies here is a property setting, so it gets checked rather than assumed.
+
+A stay of 30 nights or more comes with a choice: a **lease** holds your site for as long as you stay; a **stay** holds it only through the time you've paid for. Either is fine. A stay is paid one calendar month at a time at the monthly rate, never prorated, and you add months as you go. A lease takes a deposit now, and rent is then billed on this property's rent schedule — whether the first month is prorated depends on that schedule, so it gets checked rather than assumed.
+
+Staying more than three weeks (22 nights or more) also needs a background check before check-in. If you don't already have one on file with this property, its fee is added to your payment, and the link to fill it out is emailed to you — already paid.

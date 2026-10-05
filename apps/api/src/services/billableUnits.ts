@@ -32,9 +32,71 @@
  *     of the utilities.
  *   - SHORT STAYS, as nights ÷ 30. A reservation sitting in a spot is that spot
  *     being occupied, and the aggregate is how a nightly park is billed without
- *     charging $2 for a one-night stay.
+ *     charging $2 for a one-night stay. 10/5 (R12): a month stay with no lease
+ *     is a stay too, and counts the same way (feeCountedStaySql).
  */
 import type { PoolClient } from 'pg'
+
+/**
+ * 10/5 (Nic, R12) — WHICH STAYS THE FEE COUNTS, as SQL. One rule for the
+ * accrual (nights here, STR revenue in jobs/platformFeeAccrual) and the
+ * landlord's estimate (services/platformFee), so the two cannot drift.
+ *
+ * Nightly and weekly stays always counted. A month stay ('month_to_month' —
+ * what the register, a pay link, the booking site and the schedule write for a
+ * stay sold by the month) used to pay GAM only through the lease drafted for it
+ * automatically at 30 nights. No lease is drafted automatically any more (R3):
+ * a guest who chooses a stay over a lease holds the site through what they
+ * paid, and that stay now counts by its nights like any other.
+ *
+ * A stay that chose a LEASE is never also counted as stay nights (M6): for a
+ * month the lease drafted from it (leases.source_booking_id) was already ACTIVE
+ * when that month began, the lease counts the space ($2 for the month) and
+ * every dollar is counted once — the
+ * register writes a 30+ night stay rung up by the night or week as a nightly
+ * or weekly booking, so this holds whatever the booking's type. A lease still
+ * pending counts nothing, so until it is signed the stay's nights carry the
+ * space.
+ *
+ * A month stay is also left out when an active lease on the same site overlaps
+ * its dates (a lease offered on the stay but drafted through the signing
+ * packet, which carries no booking id). Nightly and weekly stays keep S652's
+ * rule otherwise: their nights count even on a unit that also had someone
+ * else's lease that month.
+ *
+ * `b` is the unit_bookings alias.
+ */
+export function feeCountedStaySql(b: string, month: string): string {
+  // Only for a month the lease already paid for up front: a lease bills the
+  // month STARTING, from the first run at which it is active (signed), while
+  // nights bill in arrears. A lease signed on Dec 20 first pays for January,
+  // so December's stay nights still count — otherwise December is billed by
+  // nobody. `month` is the month whose nights are being counted.
+  return `(NOT EXISTS (
+             SELECT 1 FROM leases fs
+              WHERE fs.status = 'active' AND fs.source_booking_id = ${b}.id
+                AND COALESCE(fs.signed_at, fs.start_date::timestamptz) < (${month})::date
+                AND fs.start_date < ((${month})::date + INTERVAL '1 month'))
+       AND (${b}.lease_type IN ('nightly', 'weekly')
+            OR (${b}.lease_type = 'month_to_month'
+                AND NOT EXISTS (
+                  SELECT 1 FROM leases fl
+                   WHERE fl.status = 'active'
+                     AND fl.unit_id = ${b}.unit_id
+                     AND fl.start_date < ${b}.check_out
+                     AND (fl.end_date IS NULL OR fl.end_date >= ${b}.check_in)))))`
+}
+
+/**
+ * S652 (Nic) — which stays' NIGHTS count, by status: a stay cancelled before
+ * arrival never happened; one cancelled on or after arrival held the site (see
+ * the nights query below for his words). The landlord's estimate reads the
+ * same rule so it quotes what the bill charges.
+ */
+export function feeCountedNightsStatusSql(b: string): string {
+  return `NOT (${b}.status = 'cancelled'
+                AND (${b}.cancelled_at IS NULL OR ${b}.cancelled_at::date < ${b}.check_in))`
+}
 
 export interface BillableUnits {
   longTerm: number
@@ -156,13 +218,20 @@ export async function billableUnitsForProperty(
        AND sa.start_date <= ($2::date + INTERVAL '1 month' - INTERVAL '1 day')
        AND (sa.end_date IS NULL OR sa.end_date >= $2::date)
        AND (sa.payer_accepted_at IS NOT NULL OR sa.payer_attested_at IS NOT NULL)
+       -- 10/5 (Nic, R11/R12): a 30+ night stay with no lease pays its site's
+       -- utilities through an agreement tied to the stay (booking_id). That
+       -- space is the STAY's, and its nights already count below — the $2
+       -- here would count the one space twice.
+       AND sa.booking_id IS NULL
   `, [propertyId, monthIso])
   const utilityServiceUnitCount = usRes.rows[0].c
 
   // ── Short-stay nights ────────────────────────────────────────────────
   // SUM of nights in the billing month across all short-stay bookings
-  // on this property. Every night counts; bookings on units that ALSO
-  // had a lease this month still contribute their nights (no exclusion).
+  // on this property. Every night counts; nightly/weekly bookings on units
+  // that ALSO had a lease this month still contribute their nights (no
+  // exclusion). 10/5 (R12): a month stay with no lease counts here too —
+  // feeCountedStaySql above.
   const ssRes = await client.query<{ nights: number | null }>(`
     SELECT COALESCE(SUM(
         GREATEST(
@@ -175,7 +244,7 @@ export async function billableUnitsForProperty(
       JOIN units u ON u.id = b.unit_id
      WHERE u.property_id = $1
        AND u.unit_type = ANY($3::text[])
-       AND b.lease_type IN ('nightly', 'weekly')
+       AND ${feeCountedStaySql('b', '$2::date')}
        -- S652 (Nic): "If somebody cancels that stay prior to the date of the
        -- reservation, then those nights don't get counted for the aggregate...
        -- if the reservation was never cancelled, we have no way to know" — so
@@ -191,8 +260,7 @@ export async function billableUnitsForProperty(
        -- cannot occur (a trigger stamps every cancellation, and the existing
        -- rows were backfilled), and if it somehow did, billing a landlord for a
        -- stay that never happened is a worse failure than missing $2.
-       AND NOT (b.status = 'cancelled'
-                AND (b.cancelled_at IS NULL OR b.cancelled_at::date < b.check_in))
+       AND ${feeCountedNightsStatusSql('b')}
        AND b.check_in  <  $2::date + INTERVAL '1 month'
        AND b.check_out >  $2::date
     -- S650: nights are billed IN ARREARS — you cannot count them before the

@@ -1,86 +1,29 @@
 /**
- * S639 (Nic): "When the reservation is longer than thirty days, don't have me
- * manually click on a thing to send a request for screening. Longer than thirty
- * days, they automatically get the link for the background check."
+ * The guest-history read every long-stay decision leans on
+ * (guestScreeningContext): an approved check this account may rely on, and
+ * whether the guest has rented or stayed here continuously since.
  *
- * The landlord notification already warned that screening some guests and not
- * others in the same situation can be considered discriminatory — and then
- * handed the landlord a button that makes exactly that choice, guest by guest,
- * looking at somebody's name. The consistent policy is the automatic one.
+ * S639 drafted a lease and emailed a screening link once a reservation crossed
+ * 30 nights. 10/5 (Nic, R3): "No automatic lease anywhere" — that is gone
+ * (services/stayTerms owns the lease/stay choice and the prepaid screening,
+ * stayTerms.test.ts), and the old auto-draft (maybeDraftLeaseFromBooking) is
+ * deleted.
  */
-import { vi, describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { randomUUID } from 'crypto'
-
-const { screeningMock } = vi.hoisted(() => ({ screeningMock: vi.fn(async (..._a: any[]) => 'msg_mock') }))
-vi.mock('../services/email', async (orig) => ({
-  ...(await orig<Record<string, unknown>>()),
-  emailBackgroundCheckScreeningRequest: screeningMock,
-}))
-vi.mock('./email', async (orig) => ({
-  ...(await orig<Record<string, unknown>>()),
-  emailBackgroundCheckScreeningRequest: screeningMock,
-}))
 
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
-import { maybeDraftLeaseFromBooking } from './bookingLeaseDraft'
+import { guestScreeningContext, screeningHistorySentence } from './bookingLeaseDraft'
 
-beforeEach(async () => { await cleanupAllSchema(); screeningMock.mockClear() })
+beforeEach(async () => { await cleanupAllSchema() })
 
-async function seedBooking(nights: number, guestEmail: string | null) {
-  const c = await getClient()
-  try {
-    await c.query('BEGIN')
-    const { userId, landlordId } = await seedLandlord(c)
-    const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
-    const unitId = await seedUnit(c, { propertyId, landlordId })
-    await c.query(`UPDATE units SET rent_amount = 900 WHERE id = $1`, [unitId])
-    const { rows: [b] } = await c.query<{ id: string }>(
-      `INSERT INTO unit_bookings
-         (unit_id, landlord_id, guest_name, guest_email, check_in, check_out, status, lease_type, total_amount)
-       VALUES ($1, $2, 'Long Stayer', $3, CURRENT_DATE,
-               (CURRENT_DATE + ($4 || ' days')::interval)::date, 'confirmed', 'month_to_month', 900)
-       RETURNING id`,
-      [unitId, landlordId, guestEmail, nights])
-    await c.query('COMMIT')
-    return b.id
-  } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
-}
-
-describe('S639 a long stay is screened automatically', () => {
-  it('emails the guest a background-check link when the stay crosses the threshold', async () => {
-    const email = `s639-guest-${randomUUID().slice(0, 6)}@test.dev`
-    const bookingId = await seedBooking(45, email)
-    const r = await maybeDraftLeaseFromBooking(bookingId)
-    expect(r.drafted).toBe(true)
-    // Nobody had to decide. That is the point.
-    expect(screeningMock).toHaveBeenCalledTimes(1)
-    expect(String(screeningMock.mock.calls[0][0])).toBe(email)
-    // 10/4: the link names this landlord, park and site — without them the
-    // guest lands in the renter-pool check instead of this landlord's.
-    const link = new URL(String(screeningMock.mock.calls[0][3]))
-    const b = (await db.query<any>(`SELECT b.landlord_id, b.unit_id, u.property_id FROM unit_bookings b JOIN units u ON u.id = b.unit_id WHERE b.id = $1`, [bookingId])).rows[0]
-    expect(link.pathname).toBe('/background-check')
-    expect(link.searchParams.get('landlordId')).toBe(b.landlord_id)
-    expect(link.searchParams.get('propertyId')).toBe(b.property_id)
-    expect(link.searchParams.get('unitId')).toBe(b.unit_id)
-  })
-
-  it('does not screen a short stay — no lease, no email', async () => {
-    const bookingId = await seedBooking(5, `s639-short-${randomUUID().slice(0, 6)}@test.dev`)
-    const r = await maybeDraftLeaseFromBooking(bookingId)
-    expect(r.drafted).toBe(false)
-    expect(screeningMock).not.toHaveBeenCalled()
-  })
-
-  it('drafts the lease even when there is no guest email to screen', async () => {
-    const bookingId = await seedBooking(45, null)
-    const r = await maybeDraftLeaseFromBooking(bookingId)
-    // The lease still exists — a missing address must not cost them the tenancy.
-    expect(r.drafted).toBe(true)
-    expect(screeningMock).not.toHaveBeenCalled()
+describe('10/5 R3: no automatic lease', () => {
+  it('the threshold auto-draft is gone — nothing is left to call it', async () => {
+    const mod = await import('./bookingLeaseDraft')
+    expect('maybeDraftLeaseFromBooking' in mod).toBe(false)
   })
 })
 
@@ -126,35 +69,30 @@ async function seedHistory(
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
 
-async function draftNotice(): Promise<any> {
-  const { rows } = await db.query(
-    `SELECT data FROM notifications WHERE type = 'lease_drafted_from_booking'`)
-  expect(rows).toHaveLength(1)
-  return rows[0].data
+/** The history the long-stay notices read, for this booking's guest and company. */
+async function contextFor(bookingId: string) {
+  const { rows: [b] } = await db.query(
+    `SELECT guest_email, landlord_id FROM unit_bookings WHERE id = $1`, [bookingId])
+  return guestScreeningContext(b.guest_email, b.landlord_id, null)
 }
 
 describe('S654 continuity since an approved check', () => {
-  it('a lease starting 5 days after the check and ending 10 days ago is continuous — no screening email', async () => {
+  it('a lease starting 5 days after the check and ending 10 days ago is continuous', async () => {
     const email = `cont-${randomUUID().slice(0, 6)}@test.dev`
     const bookingId = await seedHistory(email, 90, [{ startAgo: 85, endAgo: 10, status: 'expired' }])
-    const r = await maybeDraftLeaseFromBooking(bookingId)
-    expect(r.drafted).toBe(true)
-    const data = await draftNotice()
-    expect(data.approvedCheckAt).toBeTruthy()
-    expect(data.continuousTenancySince).toBe(true)
-    expect(screeningMock).not.toHaveBeenCalled()
+    const ctx = await contextFor(bookingId)
+    expect(ctx.approvedCheckAt).toBeTruthy()
+    expect(ctx.continuousTenancySince).toBe(true)
+    expect(screeningHistorySentence(ctx)).toMatch(/no new check is needed/)
   })
 
-  it('an old check with a long gap before the current lease is NOT continuous — screened once', async () => {
+  it('an old check with a long gap before the current lease is NOT continuous', async () => {
     const email = `gap-${randomUUID().slice(0, 6)}@test.dev`
     const bookingId = await seedHistory(email, 200, [{ startAgo: 20, endAgo: null, status: 'active' }])
-    const r = await maybeDraftLeaseFromBooking(bookingId)
-    expect(r.drafted).toBe(true)
-    const data = await draftNotice()
-    expect(data.approvedCheckAt).toBeTruthy()
-    expect(data.continuousTenancySince).toBe(false)
-    expect(screeningMock).toHaveBeenCalledTimes(1)
-    expect(String(screeningMock.mock.calls[0][0])).toBe(email)
+    const ctx = await contextFor(bookingId)
+    expect(ctx.approvedCheckAt).toBeTruthy()
+    expect(ctx.continuousTenancySince).toBe(false)
+    expect(screeningHistorySentence(ctx)).toMatch(/haven't stayed with you continuously since/)
   })
 })
 
@@ -204,51 +142,35 @@ describe('S655 another company’s check and leases never count', () => {
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
   }
 
-  it('a guest approved and housed by another company is screened like anyone else, and B is told nothing about A', async () => {
+  it('a guest approved and housed by another company reads as nothing on file to B', async () => {
     const email = `else-${randomUUID().slice(0, 6)}@test.dev`
-    const bookingId = await seedApprovedElsewhere(email)
-    const r = await maybeDraftLeaseFromBooking(bookingId)
-    expect(r.drafted).toBe(true)
-    const data = await draftNotice()
-    expect(data.approvedCheckAt).toBeNull()
-    expect(data.continuousTenancySince).toBe(false)
-    expect(screeningMock).toHaveBeenCalledTimes(1)
-    const { rows: [n] } = await db.query<{ body: string }>(
-      `SELECT body FROM notifications WHERE type = 'lease_drafted_from_booking'`)
-    expect(n.body).not.toMatch(/passed a/i)
-    expect(n.body).toMatch(/No background check with you is on file/)
+    const ctx = await contextFor(await seedApprovedElsewhere(email))
+    expect(ctx.approvedCheckAt).toBeNull()
+    expect(ctx.continuousTenancySince).toBe(false)
+    const said = screeningHistorySentence(ctx)
+    expect(said).not.toMatch(/passed a/i)
+    expect(said).toMatch(/No background check with you is on file/)
   })
 
   it('a check another company ran stays that company’s, even with the share box ticked — not counted, not revealed', async () => {
     const email = `shared-${randomUUID().slice(0, 6)}@test.dev`
-    const bookingId = await seedApprovedElsewhere(email, { pooled: true })
-    const r = await maybeDraftLeaseFromBooking(bookingId)
-    expect(r.drafted).toBe(true)
-    const data = await draftNotice()
-    expect(data.approvedCheckAt).toBeNull()
-    expect(data.continuousTenancySince).toBe(false)
-    expect(screeningMock).toHaveBeenCalledTimes(1)
-    const { rows: [n] } = await db.query<{ body: string }>(
-      `SELECT body FROM notifications WHERE type = 'lease_drafted_from_booking'`)
-    expect(n.body).not.toMatch(/passed a/i)
-    expect(n.body).toMatch(/No background check with you is on file/)
+    const ctx = await contextFor(await seedApprovedElsewhere(email, { pooled: true }))
+    expect(ctx.approvedCheckAt).toBeNull()
+    expect(ctx.continuousTenancySince).toBe(false)
+    expect(screeningHistorySentence(ctx)).not.toMatch(/passed a/i)
   })
 
   it('a check the guest ran through GAM’s renter pool still counts', async () => {
     const email = `pool-${randomUUID().slice(0, 6)}@test.dev`
-    const bookingId = await seedApprovedElsewhere(email, { pooled: true, viaPoolAccount: true })
-    await maybeDraftLeaseFromBooking(bookingId)
-    const data = await draftNotice()
-    expect(data.approvedCheckAt).toBeTruthy()
+    const ctx = await contextFor(await seedApprovedElsewhere(email, { pooled: true, viaPoolAccount: true }))
+    expect(ctx.approvedCheckAt).toBeTruthy()
     // Their leases elsewhere are still not this company's business.
-    expect(data.continuousTenancySince).toBe(false)
+    expect(ctx.continuousTenancySince).toBe(false)
   })
 
   it('a renter-pool intake the guest did NOT agree to share does not count', async () => {
     const email = `nopool-${randomUUID().slice(0, 6)}@test.dev`
-    const bookingId = await seedApprovedElsewhere(email, { pooled: false, viaPoolAccount: true })
-    await maybeDraftLeaseFromBooking(bookingId)
-    const data = await draftNotice()
-    expect(data.approvedCheckAt).toBeNull()
+    const ctx = await contextFor(await seedApprovedElsewhere(email, { pooled: false, viaPoolAccount: true }))
+    expect(ctx.approvedCheckAt).toBeNull()
   })
 })

@@ -893,7 +893,8 @@ describe('PATCH /api/units/:id/bookings/:bookingId — early check-out (S655)', 
     const stay = await seedStay(f, {
       checkIn: '2026-09-01', checkOut: '2026-10-31', leaseType: 'month_to_month', total: 3000,
     })
-    const out = await patchStay(f, stay, { checkOut: '2026-11-02' })
+    // 10/5 (Nic, R2): a longer stay of 30+ nights carries the desk's lease-or-stay answer.
+    const out = await patchStay(f, stay, { checkOut: '2026-11-02', stayTerms: 'stay' })
     expect(out.status, JSON.stringify(out.body)).toBe(200)
     const afterOut = computeMonthlyStaySchedule('2026-09-01', '2026-11-02', 1500).total
     expect(afterOut).toBe(3050)
@@ -3155,17 +3156,18 @@ describe('PATCH /api/units/:id/bookings/:bookingId — early check-out (S655)', 
       total: 2000, paid: 500, owed: 1500, leaseBillsRest: false,
     })
 
-    // Made on the schedule for 40 nights: its lease bills the stay, the
-    // register takes only the deposit — already paid, so nothing. An early
+    // Made on the schedule for 40 nights with a lease chosen (10/5, R2 — a
+    // lease bills a stay only when one was chosen): its lease bills the stay,
+    // the register takes only the deposit — already paid, so nothing. An early
     // check-out on Oct 2 (22 nights) used to make it a short stay the counter
     // charged whole: $1,600 asked where nothing was due.
     const g = await seedStayFixture()
     const direct = (await db.query<{ id: string }>(
       `INSERT INTO unit_bookings
          (landlord_id, unit_id, guest_name, lease_type, check_in, check_out, nights, total_amount, platform_fee,
-          status, source, deposit_amount, deposit_paid_at)
+          status, source, deposit_amount, deposit_paid_at, stay_terms)
        VALUES ($1, $2, 'Pat Ruiz', 'month_to_month', '2026-09-10', '2026-10-20', 40, 1750, 0,
-               'checked_in', 'direct', 150, NOW())
+               'checked_in', 'direct', 150, NOW(), 'lease')
        RETURNING id`, [g.landlordId, g.unitId])).rows[0].id
     const before2 = await reservationDue(db, direct)
     expect(before2).toMatchObject({ leaseBillsRest: true, depositDue: 150, owed: 0, paidInFull: true })

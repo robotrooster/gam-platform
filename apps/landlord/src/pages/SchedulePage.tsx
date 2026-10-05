@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect, useMemo, useLayoutEffect } from 'react'
 import { useUrlTab } from '../lib/useUrlTab'
-import { useLocation } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, type BookingStatus, camelizeKeys } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, type BookingStatus, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate } from '@gam/shared'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
 import { OutOfOrderModal } from './OutOfOrderModal'
@@ -313,6 +313,23 @@ export function SchedulePage() {
   const [customAmenity, setCustomAmenity] = useState('')
   const [newResvOpen, setNewResvOpen] = useState(false)
   const [detailBooking, setDetailBooking] = useState<any>(null)
+  // 10/5 (Nic, R2): lease or no lease — asked when a save makes a stay 30+
+  // nights in a row. The answer rides on the same save, sent again.
+  const [termsAsk, setTermsAsk] = useState<{ question: string; resend: (t: StayTerms) => void } | null>(null)
+  const termsAnswer = useRef<StayTerms | null>(null)
+  // The answer the last save carried, kept so a save asked a second thing (how
+  // the background check is paid, below) is sent again with it.
+  const lastTerms = useRef<StayTerms | null>(null)
+  // 10/5 (Nic, A2): a stay that needs the background check's fee can't be
+  // confirmed straight onto the schedule — the desk picks how it is paid: a pay
+  // link emailed to the guest, or the register. The pick rides on the same save.
+  const [feeRoute, setFeeRoute] = useState<{ message: string; canSendLink: boolean; resend: (m: 'link' | 'register') => void } | null>(null)
+  const payRouteAnswer = useRef<'link' | 'register' | null>(null)
+  // 10/5 (Nic, R9): a check-in refused because the background check isn't
+  // back and decided yet — shown in its own window, with no override.
+  const [screeningWait, setScreeningWait] = useState<{ message: string; waitingOn: string } | null>(null)
+  // 10/5 (Nic, R6): the stay a month is being added to.
+  const [addMonthFor, setAddMonthFor] = useState<any | null>(null)
   // Final fix (fix pass 1, decisions #53): the stay whose Cancel reservation
   // confirm is open (it reads, fresh, what canceling it changes).
   const [cancelFor, setCancelFor] = useState<any>(null)
@@ -653,10 +670,21 @@ export function SchedulePage() {
   // the owner's to-do / notification (?checkout=<booking>&unit=<site>).
   const [checkOutFor, setCheckOutFor] = useState<{ unitId: string; bookingId: string } | null>(null)
   const location = useLocation()
+  const navigate = useNavigate()
   useEffect(() => {
     const sp = new URLSearchParams(location.search)
     const b = sp.get('checkout'), u = sp.get('unit')
     if (b && u) setCheckOutFor({ unitId: u, bookingId: b })
+    // 10/5: the landlord's "Long stay — no lease" notice opens the stay itself
+    // (?booking=<stay>&unit=<site>), wherever it sits on the calendar.
+    const open = sp.get('booking')
+    if (open && u) {
+      apiGet<any[]>(`/units/${u}/bookings`).then((rows) => {
+        const hit = (rows || []).find((r: any) => r.id === open)
+        if (hit) setDetailBooking({ ...hit, checkIn: dayOnly(hit.checkIn), checkOut: dayOnly(hit.checkOut) })
+        else toast.error('That reservation is no longer on the schedule.')
+      }).catch(() => toast.error('That reservation could not be opened.'))
+    }
   }, [location.search])
   const days = getDaysInRange(fromDate, toDate)
 
@@ -670,6 +698,56 @@ export function SchedulePage() {
     setBookFirst(''); setBookLast('')
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
   }
+  // 10/5 (Nic, R2): "it's the front counter person that's clicking lease or no
+  // lease." A save that makes a stay 30+ nights in a row is refused with
+  // 'stay_terms_needed' until the desk answers; the answer then goes with the
+  // same save, sent again (withTerms takes it once).
+  const withTerms = () => {
+    const t = termsAnswer.current
+    termsAnswer.current = null
+    lastTerms.current = t
+    return t ? { stayTerms: t } : {}
+  }
+  const askTermsIf = (e: any, resend: () => void): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'stay_terms_needed') return false
+    setTermsAsk({ question: body.error, resend: (t) => { termsAnswer.current = t; setTermsAsk(null); resend() } })
+    return true
+  }
+  // A2: the pay route picked in the window below, taken once by the next save.
+  const withPayRoute = (fallback: 'link' | 'register' | null) => {
+    const m = payRouteAnswer.current ?? fallback
+    payRouteAnswer.current = null
+    return m ? { sendDepositLink: m === 'link', payAtRegister: m === 'register' } : {}
+  }
+  const askFeeRouteIf = (e: any, resend: () => void): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'screening_fee_route_needed') return false
+    const terms = lastTerms.current
+    setFeeRoute({
+      message: body.error, canSendLink: !!body.canSendLink,
+      resend: (m) => { payRouteAnswer.current = m; termsAnswer.current = terms; setFeeRoute(null); resend() },
+    })
+    return true
+  }
+  // What a new stay needs, said once it is saved — the server's own figures.
+  const sayStaySaved = (stay: any) => {
+    if (!stay) return
+    if (stay.terms === 'lease' && stay.leaseId) toast('Lease chosen — a draft lease is waiting on the Leases page.')
+    if (stay.screening === 'fee_due' && stay.screeningFee != null) {
+      // M3: a change that made the stay need the check emails a pay link for its fee.
+      if (stay.screeningFeeLink) {
+        toast(`This stay is now more than three weeks, so check-in waits for a background check. `
+          + `A pay link for its ${fmt(stay.screeningFee)} fee was emailed to ${stay.emailedTo || 'the guest'}.`)
+      } else {
+        toast(stay.screeningFeeUncollected
+          ? `This stay needs a background check before check-in. Its ${fmt(stay.screeningFee)} fee has not been sent to the guest — add their email, or ring it up at the register.`
+          : `This stay needs a background check before check-in. Its ${fmt(stay.screeningFee)} fee is on the stay's payment.`)
+      }
+    } else if (stay.screening === 'on_file') {
+      toast('This stay needs a background check before check-in — the guest already has one on file.')
+    }
+  }
   const createBookingMut = useMutation(
     () => {
       const nights = Math.round((new Date(newBooking.checkOut+'T12:00:00').getTime() - new Date(newBooking.checkIn+'T12:00:00').getTime())/86400000)
@@ -682,9 +760,18 @@ export function SchedulePage() {
         guestPhone: newBooking.guestPhone.trim(),
         leaseType, checkIn: newBooking.checkIn, checkOut: newBooking.checkOut,
         source: 'direct',
+        ...withTerms(),
+        ...withPayRoute(null),
       })
     },
-    { onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); closeBookModal() } }
+    {
+      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); closeBookModal() },
+      onError: (e: any) => {
+        if (askTermsIf(e, () => createBookingMut.mutate())) return
+        if (askFeeRouteIf(e, () => createBookingMut.mutate())) return
+        toast.error(e?.response?.data?.error || 'Could not create the reservation.')
+      },
+    }
   )
 
   // "New Reservation" flow: dates → contact → pick an available unit (the pick
@@ -749,12 +836,16 @@ export function SchedulePage() {
       // Nic's two exits. A deposit link is right for somebody who rang in
       // February about March, and absurd for a man standing at the desk with
       // his rig idling outside — he pays at the till, three feet away.
-      sendDepositLink: payMode === 'link',
-      payAtRegister:   payMode === 'register',
+      ...withPayRoute(payMode),
+      ...withTerms(),
     }),
     {
-      onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); closeNewResv() },
-      onError: (e: any) => setResvError(e?.response?.data?.error || e?.message || 'Could not create the reservation'),
+      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); closeNewResv() },
+      onError: (e: any, u: any) => {
+        if (askTermsIf(e, () => createResvMut.mutate(u))) return
+        if (askFeeRouteIf(e, () => createResvMut.mutate(u))) return
+        setResvError(e?.response?.data?.error || e?.message || 'Could not create the reservation')
+      },
     }
   )
   // All units full for the dates → add the guest to a property-wide waitlist
@@ -820,12 +911,14 @@ export function SchedulePage() {
   const moveBookingMut = useMutation(
     (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string}) =>
       apiPatch(`/units/${payload.unitId}/bookings/${payload.bookingId}`, {
-        unitId: payload.unitId, checkIn: payload.checkIn, checkOut: payload.checkOut
+        unitId: payload.unitId, checkIn: payload.checkIn, checkOut: payload.checkOut, ...withTerms(),
       }),
     {
-      onSuccess: () => { qc.invalidateQueries('schedule') },
-      onError: (e: any) => {
+      // 10/5 (M3): a drag that made the stay need a background check says what was sent.
+      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); sayStaySaved(r?.stay) },
+      onError: (e: any, payload) => {
         if (takeLatestIfChanged(e)) return
+        if (askTermsIf(e, () => moveBookingMut.mutate(payload))) return
         toast.error(saveError(e, 'Cannot move reservation — date conflict on that unit.'))
       }
     }
@@ -845,10 +938,21 @@ export function SchedulePage() {
   const [checkInBusy, setCheckInBusy] = useState(false)
   const doCheckIn = (b: any, override = false) =>
     apiPatch(`/units/${b.unitId}/bookings/${b.id}`, { status: 'checked_in', ...(override ? { overrideMeterRead: true } : {}) })
+  // 10/5 (Nic, R9): a stay of more than three weeks checks in only once its
+  // background check is back and decided. The refusal is shown as it is, in
+  // its own window — there is no override.
+  const screeningWaitIf = (e: any): boolean => {
+    const data = e?.response?.data
+    if (e?.response?.status !== 409 || data?.code !== 'screening_pending') return false
+    setScreeningWait({ message: data.error, waitingOn: data.waitingOn })
+    qc.invalidateQueries('schedule')
+    return true
+  }
   const checkInMut = useMutation((b: any) => doCheckIn(b), {
     onSuccess: () => { qc.invalidateQueries('schedule'); toast('Guest checked in'); setDetailBooking(null) },
     onError: (e: any) => {
       if (takeLatestIfChanged(e)) return
+      if (screeningWaitIf(e)) return
       const data = e?.response?.data
       if (data?.code === 'meter_read_due') { setCheckInPrompt({ booking: detailBooking, meters: data.meters || [], canOverride: !!data.canOverride }); return }
       toast.error(data?.error || 'Could not check the guest in.')
@@ -867,6 +971,7 @@ export function SchedulePage() {
       setCheckInPrompt(null); setDetailBooking(null)
     } catch (e: any) {
       if (takeLatestIfChanged(e)) { setCheckInPrompt(null); return }
+      if (screeningWaitIf(e)) { setCheckInPrompt(null); return }
       toast.error(e?.response?.data?.error || 'Could not complete check-in.')
     }
     finally { setCheckInBusy(false) }
@@ -881,6 +986,7 @@ export function SchedulePage() {
       setCheckInPrompt(null); setDetailBooking(null)
     } catch (e: any) {
       if (takeLatestIfChanged(e)) { setCheckInPrompt(null); return }
+      if (screeningWaitIf(e)) { setCheckInPrompt(null); return }
       toast.error(e?.response?.data?.error || 'Could not check in.')
     }
     finally { setCheckInBusy(false) }
@@ -899,6 +1005,25 @@ export function SchedulePage() {
       onError: (e: any) => { if (!takeLatestIfChanged(e)) toast.error(saveError(e, 'Could not update the site lock.')) },
     }
   )
+
+  // 10/5 (Nic, R2/R4): a stay with no lease can be offered one later — the
+  // same month-to-month draft a lease chosen at booking makes. It waits on the
+  // Leases page for the landlord to review and send for signature.
+  const offerLease = async (d: any) => {
+    const ok = await appConfirm(
+      'Draft a lease for this stay? It is month-to-month with no end date, so it holds the site for as long as '
+      + 'they stay. The draft waits on your Leases page to be reviewed and sent for signature.',
+      { title: 'Offer a lease', confirmLabel: 'Draft the lease' })
+    if (!ok) return
+    try {
+      const r: any = await apiPost(`/units/${d.unitId}/bookings/${d.id}/offer-lease`)
+      qc.invalidateQueries('schedule'); qc.invalidateQueries('leases')
+      setDetailBooking((prev: any) => prev && prev.id === d.id ? { ...prev, stayLeaseId: r?.data?.leaseId, stayTerms: 'lease' } : prev)
+      toast('Draft lease ready on the Leases page.')
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || 'The lease could not be drafted.')
+    }
+  }
 
   // Edit an existing reservation (guest contact, dates, unit, notes). The
   // backend reprices on a date/unit change and COALESCEs unchanged fields.
@@ -920,6 +1045,7 @@ export function SchedulePage() {
           const propId = units.find((u:any)=>u.id===vars.form.unitId)?.propertyId
           return units.filter((u:any)=>u.propertyId===propId && toks.includes(String(u.unitNumber||'').toLowerCase().replace(/\s+/g,''))).map((u:any)=>u.id)
         })(),
+        ...withTerms(),
       }),
     {
       onSuccess: (resp:any) => {
@@ -930,9 +1056,12 @@ export function SchedulePage() {
         const b = resp
         setDetailBooking((prev:any)=> prev && b?.id ? mergeLatestStay(prev, b) : prev)
         setEditForm(null); setEditError('')
+        // 10/5: what the longer stay needs (M3: the check's pay link, when one was emailed).
+        sayStaySaved(b?.stay)
       },
-      onError: (e:any) => {
+      onError: (e:any, vars) => {
         if (takeLatestIfChanged(e, { inForm: true })) return
+        if (askTermsIf(e, () => editBookingMut.mutate(vars))) return
         setEditError(e?.response?.data?.error || e?.message || 'Could not save changes.')
       },
     }
@@ -2435,7 +2564,17 @@ export function SchedulePage() {
         // W-18: payment state — paid in full, deposit-only (show balance), or unpaid.
         const total = d.totalAmount != null ? Number(d.totalAmount) : null
         const depositPaid = !isLease && !!d.depositPaidAt && d.depositAmount != null ? Number(d.depositAmount) : null
-        const closeDetail = () => { setDetailBooking(null); setEditForm(null); setEditError('') }
+        const closeDetail = () => {
+          setDetailBooking(null); setEditForm(null); setEditError('')
+          // 10/5: a stay opened from a notice (?booking=&unit=) does not open again on the next visit.
+          try {
+            const url = new URL(window.location.href)
+            if (url.searchParams.has('booking')) {
+              url.searchParams.delete('booking'); url.searchParams.delete('unit')
+              window.history.replaceState(null, '', url.toString())
+            }
+          } catch { /* nothing to tidy */ }
+        }
         const isEditing = !isLease && !!editForm
         // Live re-price preview while editing (unit rate → property default).
         const eu = isEditing ? units.find((u:any)=>u.id===editForm!.unitId) : null
@@ -2524,13 +2663,32 @@ export function SchedulePage() {
                   </div></>
                 )}
                 <div style={{color:'var(--text-3)'}}>Status</div><div>{isLease ? humanize(d.status) : bookingStatusWords(d.status)}</div>
+                {/* 10/5 (Nic, R2): lease or stay — the desk's answer for a stay of 30+ nights. */}
+                {!isLease && (d.stayLeaseId || d.stayTerms) && (
+                  <><div style={{color:'var(--text-3)'}}>Lease or stay</div>
+                  <div>
+                    {d.stayLeaseId || d.stayTerms === 'lease' ? STAY_TERMS_LABEL.lease : STAY_TERMS_LABEL[d.stayTerms as StayTerms]}
+                    {d.stayLeaseId && (
+                      <button className="btn btn-ghost btn-sm" style={{marginLeft:8,padding:'1px 8px',fontSize:'.7rem'}}
+                        onClick={()=>navigate(`/leases?open=${d.stayLeaseId}`)}>Open the lease</button>
+                    )}
+                    {!d.stayLeaseId && d.stayTerms === 'stay' && d.checkOut && (
+                      <div style={{fontSize:'.74rem',color:'var(--text-3)',marginTop:2}}>Held through {longCalendarDate(dayOnly(d.checkOut))} — after that the site can be booked by someone else.</div>
+                    )}
+                  </div></>
+                )}
+                {/* 10/5 (Nic, R9): check-in waits on the background check. */}
+                {!isLease && d.screeningBlock && (
+                  <><div style={{color:'var(--text-3)'}}>Check-in</div>
+                  <div style={{color:'var(--amber)'}}>{d.screeningBlock.message}</div></>
+                )}
                 {!isLease && (d.avoidedUnitIds||[]).length>0 && <><div style={{color:'var(--text-3)'}}>Avoids</div><div>{(d.avoidedUnitIds as string[]).map(id=>unitNumberOf(id)).filter(Boolean).join(', ')}</div></>}
                 {d.notes && <><div style={{color:'var(--text-3)'}}>Notes</div><div>{d.notes}</div></>}
               </div>
               {isLease ? (
                 <div style={{marginTop:16,fontSize:'.78rem',color:'var(--text-3)'}}>Leases are managed on the Leases page.</div>
               ) : (
-                <div style={{display:'flex',gap:8,marginTop:18}}>
+                <div style={{display:'flex',flexWrap:'wrap',gap:8,marginTop:18}}>
                   {can('guest_access') && <button className="btn btn-ghost btn-sm" onClick={()=>copyStayLink(d)}>Copy stay link</button>}
                   {can('schedule.edit_reservation') && d.status!=='cancelled' && <button className="btn btn-ghost btn-sm" onClick={()=>startEdit(d)}>Edit</button>}
                   {/* S559: front-desk check-in (guard prompts a closing read if the prior guest's meter is unread). */}
@@ -2538,6 +2696,16 @@ export function SchedulePage() {
                     <button className="btn btn-primary btn-sm" disabled={checkInMut.isLoading} onClick={()=>checkInMut.mutate(d)}>
                       {checkInMut.isLoading?'…':'Check in'}
                     </button>
+                  )}
+                  {/* 10/5 (Nic, R6): extend this same stay by a calendar month, rung up at the register. */}
+                  {can('schedule.edit_reservation') && ['confirmed','checked_in'].includes(d.status)
+                    && !d.stayLeaseId && d.stayTerms !== 'lease' && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>setAddMonthFor(d)}>Add a month</button>
+                  )}
+                  {/* 10/5 (Nic, R2/R4): a stay with no lease can be offered one. */}
+                  {can('schedule.edit_reservation') && ['tentative','confirmed','checked_in'].includes(d.status)
+                    && !d.stayLeaseId && d.stayTerms !== 'lease' && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>offerLease(d)}>Offer a lease</button>
                   )}
                   {/* 10/4 (decisions #38): check out — on the day or early — and settle the money. */}
                   {can('guests.check_out') && d.status === 'checked_in' && (
@@ -2588,6 +2756,36 @@ export function SchedulePage() {
         <CheckInReadModal prompt={checkInPrompt} busy={checkInBusy}
           onRead={submitCheckInReads} onOverride={overrideCheckIn}
           onClose={()=>{ if (!checkInBusy) setCheckInPrompt(null) }} />
+      )}
+
+      {screeningWait && (
+        <div className="modal-overlay" onClick={()=>setScreeningWait(null)}>
+          <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+            <div className="modal-title">Check-in is waiting on the background check</div>
+            <div style={{ fontSize: '.84rem', color: 'var(--text-2)', margin: '10px 0 16px', lineHeight: 1.5 }}>{screeningWait.message}</div>
+            <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setScreeningWait(null)}>Close</button>
+              {can('tenants.run_background_check') && (
+                <button className="btn btn-primary btn-sm" onClick={()=>{ setScreeningWait(null); navigate('/background') }}>Open Background Checks</button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {addMonthFor && (
+        <AddMonthModal booking={addMonthFor} onClose={()=>setAddMonthFor(null)}
+          onDone={(r: any) => {
+            setAddMonthFor(null); setDetailBooking(null)
+            qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history')
+            if (r?.extended === false) {
+              qc.invalidateQueries('leases')
+              toast('Lease chosen — a draft lease is waiting on the Leases page. No month was added; the lease bills each month.')
+            } else {
+              const to = r?.addedMonth?.newCheckOut
+              toast(`A month added${to ? ` — check-out is now ${longCalendarDate(to)}` : ''}. It is on the stay's register ticket to be rung up.`)
+            }
+          }} />
       )}
 
       {/* ── NEW RESERVATION — dates → what's available → the space → who ──
@@ -2981,6 +3179,28 @@ export function SchedulePage() {
           </div>
         </div>
       )}
+
+      {/* 10/5: the questions a save can come back with — drawn last, so they
+          open above the reservation form that sent the save. */}
+      {termsAsk && (
+        <StayTermsModal question={termsAsk.question} onChoose={termsAsk.resend} onClose={()=>setTermsAsk(null)} />
+      )}
+
+      {feeRoute && (
+        <div className="modal-overlay" onClick={()=>setFeeRoute(null)}>
+          <div className="modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+            <div className="modal-title">How will the background check be paid?</div>
+            <div style={{ fontSize: '.84rem', color: 'var(--text-2)', margin: '10px 0 16px', lineHeight: 1.5 }}>{feeRoute.message}</div>
+            <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setFeeRoute(null)}>Cancel</button>
+              {feeRoute.canSendLink && (
+                <button className="btn btn-primary btn-sm" onClick={()=>feeRoute.resend('link')}>Email a pay link</button>
+              )}
+              <button className="btn btn-primary btn-sm" onClick={()=>feeRoute.resend('register')}>Send to the register</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -3186,6 +3406,107 @@ function CheckInReadModal({ prompt, busy, onRead, onOverride, onClose }: {
           <button className="btn btn-primary" disabled={!allFilled || busy} onClick={() => onRead(values)}>
             {busy ? '…' : 'Record & check in'}
           </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 10/5 (Nic, R2): "does this person get a lease or just a stay?" Asked of the
+// front counter when a save makes a guest's stay 30+ nights in a row (back-to-
+// back stays add up). The question's words are the server's (stayTermsQuestion).
+// Either way the landlord is told; a lease is drafted for them to review.
+function StayTermsModal({ question, onChoose, onClose }: {
+  question: string
+  onChoose: (t: StayTerms) => void
+  onClose: () => void
+}) {
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Lease or stay?</div>
+        <div style={{ fontSize: '.84rem', color: 'var(--text-2)', margin: '10px 0 16px', lineHeight: 1.5 }}>{question}</div>
+        <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
+          {STAY_TERMS.map(t => (
+            <button key={t} className="btn btn-primary btn-sm" onClick={() => onChoose(t)}>{STAY_TERMS_LABEL[t]}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 10/5 (Nic, R6): Add a month — the guest's current stay runs one calendar
+// month longer, priced at the site's monthly rate on its own, and the month is
+// put on the stay's register ticket to be rung up. Every figure shown is the
+// server's quote (GET .../add-month). A stay that reaches 30 nights asks lease
+// or stay first; a lease chosen here drafts the lease instead of adding the
+// month. A stay that reaches three weeks carries the background check's fee
+// on the same ticket when nothing is on file.
+function AddMonthModal({ booking, onClose, onDone }: {
+  booking: any
+  onClose: () => void
+  onDone: (result: any) => void
+}) {
+  const [quote, setQuote] = useState<any>(null)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    let live = true
+    apiGet(`/units/${booking.unitId}/bookings/${booking.id}/add-month`)
+      .then((q) => { if (live) setQuote(q) })
+      .catch((e: any) => { if (live) setErr(e?.response?.data?.error || 'The month could not be priced.') })
+    return () => { live = false }
+  }, [booking.id, booking.unitId])
+  const send = async (stayTerms?: StayTerms) => {
+    setBusy(true); setErr('')
+    try {
+      const r: any = await apiPost(`/units/${booking.unitId}/bookings/${booking.id}/add-month`, stayTerms ? { stayTerms } : {})
+      onDone(r?.data)
+    } catch (e: any) {
+      const body = e?.response?.data
+      if (body?.code === 'stay_terms_needed') setQuote((q: any) => q ? { ...q, leaseChoice: 'needed', question: body.error } : q)
+      else setErr(body?.error || 'The month could not be added.')
+    } finally { setBusy(false) }
+  }
+  const asking = quote?.leaseChoice === 'needed'
+  return (
+    <div className="modal-overlay" onClick={() => { if (!busy) onClose() }}>
+      <div className="modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Add a month · {booking.guestName || 'Guest'}</div>
+        {!quote && !err && <div style={{ fontSize: '.84rem', color: 'var(--text-3)', margin: '12px 0' }}>Pricing the month…</div>}
+        {quote && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '8px 14px', fontSize: '.84rem', margin: '12px 0' }}>
+            <div style={{ color: 'var(--text-3)' }}>Check-out</div>
+            <div>{longCalendarDate(quote.fromCheckOut)} → <strong>{longCalendarDate(quote.newCheckOut)}</strong> <span style={{ color: 'var(--text-3)' }}>({quote.addedNights} nights added)</span></div>
+            <div style={{ color: 'var(--text-3)' }}>The month</div>
+            <div style={{ color: 'var(--gold)', fontWeight: 600 }}>{fmt(quote.monthPrice)}</div>
+            {quote.screeningFee != null && (<>
+              <div style={{ color: 'var(--text-3)' }}>Background check</div>
+              <div>{fmt(quote.screeningFee)} <span style={{ color: 'var(--text-3)' }}>— the stay is now more than three weeks and nothing is on file, so the check's fee goes on the same ticket.</span></div>
+            </>)}
+            <div style={{ color: 'var(--text-3)' }}>Paid</div>
+            <div>At the register — the month goes on the stay's ticket.</div>
+          </div>
+        )}
+        {asking && (
+          <div style={{ fontSize: '.84rem', color: 'var(--text-2)', lineHeight: 1.5, marginBottom: 8 }}>
+            {quote.question}
+            {quote.heldThrough && <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginTop: 6 }}>With a stay, the guest is told: “{quote.heldThrough}”</div>}
+          </div>
+        )}
+        {err && <div style={{ fontSize: '.78rem', color: 'var(--red,#ff6b81)', marginBottom: 8 }}>{err}</div>}
+        <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn btn-ghost btn-sm" disabled={busy} onClick={onClose}>Cancel</button>
+          {quote && asking && STAY_TERMS.map(t => (
+            <button key={t} className="btn btn-primary btn-sm" disabled={busy} onClick={() => send(t)}>
+              {t === 'lease' ? 'Lease (draft it instead)' : `${STAY_TERMS_LABEL[t]} — add the month`}
+            </button>
+          ))}
+          {quote && !asking && (
+            <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => send()}>{busy ? 'Adding…' : 'Add the month'}</button>
+          )}
         </div>
       </div>
     </div>

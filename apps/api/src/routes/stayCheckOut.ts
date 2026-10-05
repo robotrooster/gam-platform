@@ -28,6 +28,8 @@ import { requireAuth, requirePerm, userHasPerm, assertPropertyInScope } from '..
 import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { queryOne } from '../db'
+import { logger } from '../lib/logger'
+import { syncStayUtilityAgreement } from '../services/stayTerms'
 import {
   quoteEarlyCheckOut, decideEarlyCheckOut, retryRefundPart, givePartBackInCash, previewRefund, resumeStaleParts, healLeaseEnd,
   CheckoutChanged, poolQ,
@@ -65,6 +67,15 @@ stayCheckOutRouter.get('/:unitId/bookings/:bookingId/check-out', requirePerm(...
     // long stay whose lease did not end on the day they left is ended now.
     await resumeStaleParts(b.id)
     await healLeaseEnd(b.id, req.user!.userId)
+    // 10/5 (Nic, R11 — M8): and a checked-out stay's utility agreement that
+    // still runs (a check-out saved before it could be ended) ends on the day
+    // they left. No change for a stay still here.
+    const out = await queryOne<{ x: number }>(
+      `SELECT 1 AS x FROM unit_bookings WHERE id = $1 AND status = 'checked_out'`, [b.id])
+    if (out) {
+      await syncStayUtilityAgreement(b.id).catch((err) =>
+        logger.error({ err, bookingId: b.id }, '[check-out] could not bring the stay\'s utility agreement in step'))
+    }
     const quote = await quoteEarlyCheckOut(poolQ, b.id, {
       leftOn: day(req.query.leftOn), canRefund: userHasPerm(req.user, 'pos.refund'), canCheckOut: userHasPerm(req.user, 'guests.check_out') })
     res.json({ success: true, data: quote })

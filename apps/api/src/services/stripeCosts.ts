@@ -2292,6 +2292,29 @@ export async function loadPlatformBalanceBook(): Promise<PlatformBalanceBook> {
     screeningKeptC += kept
     checkrC += charged - kept
   }
+  // 10/5 (Nic, A5): a background check paid WITH A STAY has no applicant
+  // payment of its own (applicant_payment_intent_id is NULL), so it was counted
+  // above nowhere. Paid by card or online, its amount sits on GAM's balance;
+  // paid in cash at the counter, it reaches GAM only as the 'screening_fee'
+  // charge taken from the landlord's payout (counted here by what was
+  // collected, and left out of landlordChargesCollected below so it is counted
+  // once). GAM's part is the margin booked when the check it paid for was
+  // submitted — nothing while it waits for the guest; the rest is Checkr's.
+  const prepaidChecks = await query<any>(`
+    SELECT (CASE WHEN sp.landlord_charge_id IS NULL THEN sp.amount
+                 ELSE COALESCE(c.collected_amount, 0) END)::float AS charged,
+           (SELECT SUM(l.amount) FROM platform_revenue_ledger l
+             WHERE l.type = 'screening_margin' AND l.reference_type = 'background_check'
+               AND l.reference_id = sp.used_by_check_id)::float AS margin
+      FROM screening_prepayments sp
+      LEFT JOIN landlord_gam_charges c ON c.id = sp.landlord_charge_id
+     WHERE sp.status <> 'void'`)
+  for (const r of prepaidChecks) {
+    const charged = cents(num(r.charged))
+    const kept = Math.min(charged, Math.max(0, cents(num(r.margin))))
+    screeningKeptC += kept
+    checkrC += charged - kept
+  }
 
   const tenantClearing = await query<any>(`
     SELECT r.id, r.stripe_payment_intent_id AS pi, r.amount::float AS amount, r.payment_method, r.created_at,
@@ -2457,7 +2480,8 @@ export async function loadPlatformBalanceBook(): Promise<PlatformBalanceBook> {
     .map(kind => ({ kind, label: GAM_BILL_LINE_KIND_LABEL[kind], amount: round2(num(billLines.find(b => b.kind === kind)?.amt)) }))
     .filter(b => b.amount !== 0)
   const [charges] = await query<any>(
-    `SELECT COALESCE(SUM(collected_amount), 0)::float AS amt FROM landlord_gam_charges`)
+    // A stay's background check is counted with the screenings above (A5).
+    `SELECT COALESCE(SUM(collected_amount), 0)::float AS amt FROM landlord_gam_charges WHERE kind <> 'screening_fee'`)
   const [flex] = await query<any>(`
     SELECT COALESCE(SUM(amount), 0)::float AS amt FROM platform_revenue_ledger
      WHERE type = 'flexpay_subscription'

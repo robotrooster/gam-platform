@@ -57,6 +57,21 @@ export const AGENT_CANNOT_MOVE_STARTED_STAY =
   'The assistant cannot move a stay that has started to another site: the new site\u2019s price is a ' +
   'money decision. Move it on the schedule.'
 
+/**
+ * 10/5 (Nic, R2): "it's the front counter person that's clicking lease or no
+ * lease." The answer to a 30+ night stay is the desk's, made on the schedule
+ * where the choice is explained — never the assistant's. The dispatcher sends
+ * every argument it is given as the body, so the booking calls refuse one
+ * that carries an answer (`stayTerms`) before anything is sent.
+ */
+export const AGENT_CANNOT_CHOOSE_STAY_TERMS =
+  'The assistant cannot choose a lease or a stay for a reservation. Someone at the desk chooses that on the ' +
+  'schedule, where they will be asked when the stay is 30 nights or more.'
+
+export async function refuseAgentStayTerms(args: Record<string, unknown>): Promise<string | null> {
+  return args.stayTerms != null && args.stayTerms !== '' ? AGENT_CANNOT_CHOOSE_STAY_TERMS : null
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /** A day the booking PATCH would read: its first ten characters as YYYY-MM-DD, else null. */
@@ -101,6 +116,9 @@ function sentDay(v: unknown): string | null {
  * to the endpoint, which says so.
  */
 export async function refuseAgentCheckOut(args: Record<string, unknown>): Promise<string | null> {
+  // 10/5 (R2): the lease-or-stay answer is the desk's (refuseAgentStayTerms).
+  const termsRefused = await refuseAgentStayTerms(args)
+  if (termsRefused) return termsRefused
   const status = String(args.status ?? '').toLowerCase().replace(/[\s_-]+/g, '')
   if (status === 'checkedout') return AGENT_CANNOT_CHECK_OUT
   const outDay = sentDay(args.checkOut)
@@ -4083,7 +4101,15 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'another booking is refused; read that back rather than moving somebody.\n' +
       'requiredSiteLayout and requiredAmpService are what the RIG needs — a 50-amp pull-through is ' +
       'not a preference, it is whether they can plug in. Ask if they mentioned a rig at all.\n' +
-      'Nothing is emailed to the guest by this. Guest access is sent separately.',
+      'Nothing is emailed to the guest by this. Guest access is sent separately.\n' +
+      // 10/5 (Nic, R2/A2, F10): the desk answers lease or stay, and a stay that
+      // needs the background check's fee is paid through a pay link or the register.
+      'A stay of 30 nights or more in a row (back-to-back stays of the same guest at the park add up) is ' +
+      'refused until someone at the desk chooses a lease or a stay for it — you cannot choose; tell them to ' +
+      'book it on the schedule, where they will be asked. A stay of more than three weeks needs the guest\u2019s ' +
+      'email, and when the guest has no background check on file it cannot be booked here at all: its check\u2019s ' +
+      'fee is paid with the stay, so tell them to book it on the schedule and send the guest a pay link or ring ' +
+      'it up at the register. When a refusal says either of these, pass its words on and do not try again.',
     params: {
       unitId: { type: 'string', description: 'The unit or spot, from a lookup.' },
       leaseType: { type: 'string', description: 'nightly, weekly, month_to_month, long_term, or lease_hold.' },
@@ -4103,6 +4129,8 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     },
     required: ['unitId', 'leaseType', 'checkIn', 'checkOut'],
     confirmFirst: true,
+    // 10/5 (R2): lease or stay is the desk's answer, not the assistant's.
+    refuse: refuseAgentStayTerms,
   },
   {
     id: 'update_unit_booking',
@@ -4118,7 +4146,13 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'You cannot check a guest out, early or on the day, and you make no money decision about a ' +
       'stay. When a guest has left or is leaving, tell them to check the guest out on the schedule. ' +
       'Once a stay has started you may only make it longer or change the details; once it is over, ' +
-      'only the notes and the guest\u2019s details.',
+      'only the notes and the guest\u2019s details.\n' +
+      // 10/5 (Nic, R2/R9): the counter answers lease or stay, and check-in waits on screening.
+      'You cannot check in a guest staying more than three weeks until their background check results ' +
+      'are back and the landlord has approved or denied it — if the check-in is refused for that, say what ' +
+      'it is waiting on, in the refusal\u2019s words, and do not try again. A change that makes a stay 30 ' +
+      'nights or more is refused until someone at the desk chooses a lease or a stay for it: tell them to ' +
+      'make that change on the schedule, where they will be asked.',
     params: {
       unitId: { type: 'string', description: 'The unit the booking is on now, from a lookup. Never a different unit: this does not move the stay.' },
       bookingId: { type: 'string', description: 'The booking id, from a lookup.' },
@@ -4135,8 +4169,54 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     },
     required: ['unitId', 'bookingId'],
     confirmFirst: true,
-    // decisions #38 Q6: refused before it is sent, whatever the wording above.
+    // decisions #38 Q6: refused before it is sent, whatever the wording above
+    // (10/5, R2: and never with a lease-or-stay answer of its own).
     refuse: refuseAgentCheckOut,
+  },
+  // 10/5 (Nic, R6): Add a month — the same booking, one more calendar month at
+  // the monthly rate, put on the stay's register ticket to be rung up there.
+  // The lease-or-stay answer is the desk's, never the assistant's (R2).
+  {
+    id: 'add_month_to_stay',
+    audience: 'landlord', method: 'POST',
+    path: '/api/units/:unitId/bookings/:bookingId/add-month',
+    pathParams: ['unitId', 'bookingId'],
+    description:
+      'Add a month to a guest\u2019s stay with no lease — the same reservation runs one calendar month longer, ' +
+      'at the monthly rate. Use for "the Hendersons want another month".\n' +
+      'Nothing is charged by this: the month goes on the stay\u2019s register ticket and is paid at the register. ' +
+      'Tell them the new check-out day and the month\u2019s price from the reply, and any background check fee it ' +
+      'names. It is refused when anybody holds a night of that month, when the stay still owes money, or when ' +
+      'the stay has a lease. When the longer stay reaches 30 nights in a row it is refused until someone at the ' +
+      'desk chooses a lease or a stay — you cannot choose; tell them to add the month on the schedule, where ' +
+      'they will be asked.',
+    params: {
+      unitId: { type: 'string', description: 'The unit the stay is on, from a lookup.' },
+      bookingId: { type: 'string', description: 'The booking id, from a lookup.' },
+    },
+    required: ['unitId', 'bookingId'],
+    confirmFirst: true,
+    refuse: refuseAgentStayTerms,
+  },
+  // 10/5 (Nic, R2/R4): Offer a lease — drafts the month-to-month lease for the
+  // landlord to review. Nothing is signed or sent to the guest by it.
+  {
+    id: 'offer_lease_for_stay',
+    audience: 'landlord', method: 'POST',
+    path: '/api/units/:unitId/bookings/:bookingId/offer-lease',
+    pathParams: ['unitId', 'bookingId'],
+    description:
+      'Draft a lease for a guest who is staying without one. Use for "put the Hendersons on a lease".\n' +
+      'The draft is month-to-month with no end date, so it holds the site for as long as they stay, at the ' +
+      'site\u2019s monthly rent, billed by the property\u2019s rent-due setting. It waits on the Leases page for ' +
+      'the landlord to review and send for signature — nothing is signed or sent to the guest by this. A stay ' +
+      'that already has a lease drafted keeps that one.',
+    params: {
+      unitId: { type: 'string', description: 'The unit the stay is on, from a lookup.' },
+      bookingId: { type: 'string', description: 'The booking id, from a lookup.' },
+    },
+    required: ['unitId', 'bookingId'],
+    confirmFirst: true,
   },
   {
     id: 'send_guest_access',

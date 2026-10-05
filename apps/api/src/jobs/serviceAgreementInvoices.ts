@@ -51,6 +51,8 @@ export interface ServiceInvoiceResult {
 
 interface ActiveAgreement {
   id: string
+  /** 'active', or 'ended' with charges still to send (its final bill). */
+  status: string
   landlord_id: string
   unit_id: string
   tenant_id: string
@@ -83,9 +85,19 @@ async function runServiceGeneration(
     const catchupStart = todayInTz.minus({ days: CATCHUP_DAYS })
     const windowStart = catchupStart > agreementStart ? catchupStart : agreementStart
     const windowEnd = agreementEnd && agreementEnd < todayInTz ? agreementEnd : todayInTz
-    if (windowEnd < windowStart) continue
+    const dueDates = windowEnd < windowStart ? [] : dueDatesInRange(windowStart, windowEnd, sa.billing_due_day)
 
-    const dueDates = dueDatesInRange(windowStart, windowEnd, sa.billing_due_day)
+    // 10/5 (Nic, prepaid stays — M7): an ENDED agreement still owes what was
+    // used inside its dates — a stay's check-out read bills its last stretch
+    // after the stay is over, and a month read can land after it ended. Those
+    // charges have no due date of its own left, so they go out on a final
+    // bill dated today, the way a departing lease's final utilities do
+    // (invoiceGeneration generateFinalUtilityInvoice). Only an agreement with
+    // charges still to send is read here (AGREEMENT_SELECT).
+    if (sa.status === 'ended') {
+      const today = todayInTz.toISODate()!
+      if (!dueDates.includes(today)) dueDates.push(today)
+    }
     if (dueDates.length === 0) continue
 
     for (const dueDate of dueDates) {
@@ -256,14 +268,22 @@ async function insertUtilityRow(
 // the loser would produce an invoice that is empty or, worse, a second document
 // for charges already billed.
 const AGREEMENT_SELECT = `
-  SELECT sa.id, sa.landlord_id, sa.unit_id, sa.tenant_id, sa.billing_due_day,
+  SELECT sa.id, sa.status, sa.landlord_id, sa.unit_id, sa.tenant_id, sa.billing_due_day,
          to_char(sa.start_date, 'YYYY-MM-DD') AS start_date,
          to_char(sa.end_date,   'YYYY-MM-DD') AS end_date,
          COALESCE(p.timezone, 'America/Phoenix') AS property_tz
     FROM utility_service_agreements sa
     JOIN units u ON u.id = sa.unit_id
     JOIN properties p ON p.id = u.property_id
-   WHERE sa.status = 'active'
+   WHERE (sa.status = 'active'
+          -- 10/5 (M7): an ended agreement with charges still to send — its
+          -- final bill (runServiceGeneration).
+          OR (sa.status = 'ended' AND EXISTS (
+                SELECT 1 FROM utility_bills ub
+                 WHERE ub.service_agreement_id = sa.id AND ub.payment_id IS NULL
+                   AND ub.status IN ('unbilled', 'billed')
+                   -- a meter that did not move after they left is no final bill
+                   AND ub.charge_amount + ub.tax_amount > 0)))
      -- S616 (Nic): nobody is invoiced by GAM without having agreed to be.
      -- Either the payer accepted their portal invite, or the landlord attested
      -- that they agreed off-platform (the arrangements that predate GAM).

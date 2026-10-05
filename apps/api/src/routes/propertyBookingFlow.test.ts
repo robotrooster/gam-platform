@@ -4,22 +4,39 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { processingFeeFor } from '@gam/shared'
+import { DateTime } from 'luxon'
+import { processingFeeFor, stayHeldWords } from '@gam/shared'
 
-let sessionN = 0
-vi.mock('../services/stripeConnect', async (orig) => {
-  const actual = await (orig() as any)
+// 10/5: the booking site builds its own checkout (services/propertyBooking
+// createSiteCheckoutSession) so a background check can ride as its own line.
+// The confirmation reads the check's fee back off the checkout it was built
+// with (M12), so sessions keep their metadata.
+const { sessionsCreate, sessionsRetrieve, screeningEmail } = vi.hoisted(() => {
+  let n = 0
+  const made = new Map<string, any>()
   return {
-    ...actual,
-    createBookingDepositCheckoutSession: vi.fn(async () => ({
-      sessionId: `cs_test_${++sessionN}`,
-      hostedUrl: 'https://checkout.stripe.test/session',
-    })),
+    sessionsCreate: vi.fn(async (p: any) => {
+      const id = `cs_test_${++n}`
+      made.set(id, { id, metadata: p.metadata ?? {} })
+      return { id, url: 'https://checkout.stripe.test/session' }
+    }),
+    sessionsRetrieve: vi.fn(async (id: string) => made.get(id) ?? { id, metadata: {} }),
+    screeningEmail: vi.fn(async (..._a: any[]) => 'msg_test'),
   }
+})
+vi.mock('../lib/stripe', async (orig) => {
+  const actual = await (orig() as any)
+  return { ...actual, getStripe: () => ({ checkout: { sessions: { create: sessionsCreate, retrieve: sessionsRetrieve } } }) }
 })
 vi.mock('../services/email', async (orig) => {
   const actual = await (orig() as any)
-  return { ...actual, sendNotificationEmail: vi.fn(async () => 'msg_test') }
+  return {
+    ...actual,
+    sendNotificationEmail: vi.fn(async () => 'msg_test'),
+    emailGuestStayLink: vi.fn(async () => 'msg_test'),
+    emailBackgroundCheckScreeningRequest: screeningEmail,
+    emailUtilityServiceInvite: vi.fn(async () => 'msg_test'),
+  }
 })
 
 import express from 'express'
@@ -39,7 +56,11 @@ function buildApp() {
   return app
 }
 
-beforeEach(async () => { await cleanupAllSchema() })
+beforeEach(async () => { await cleanupAllSchema(); sessionsCreate.mockClear(); sessionsRetrieve.mockClear(); screeningEmail.mockClear() })
+
+/** The checkout's lines, in cents, by name. */
+const lines = (call: any): Record<string, number> => Object.fromEntries(
+  call.line_items.map((l: any) => [l.price_data.product_data.name, l.price_data.unit_amount]))
 
 // S654: N days from the property's today (seeded properties default to
 // America/Phoenix, the test DB's zone too). Local setDate + UTC toISOString
@@ -94,13 +115,14 @@ describe('POST /book', () => {
   // S648 (Nic): deposits are card only with the card fee on top, charged by GAM.
   it('the deposit checkout adds the card fee and pays nobody directly', async () => {
     await seedSite()
-    const { createBookingDepositCheckoutSession } = await import('../services/stripeConnect')
     const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
     expect(res.body.data.cardFee).toBe(processingFeeFor({ amount: 60, paymentMethod: 'card' }))
-    const arg = (createBookingDepositCheckoutSession as any).mock.calls.at(-1)[0]
-    expect(arg.amountCents).toBe(6000)
-    expect(arg.cardFeeCents).toBe(Math.round(processingFeeFor({ amount: 60, paymentMethod: 'card' }) * 100))
-    expect(arg.landlordConnectAccountId).toBeUndefined()
+    expect(res.body.data.screeningFee).toBe(0)
+    const arg = sessionsCreate.mock.calls.at(-1)![0]
+    expect(Object.values(lines(arg))).toEqual([6000, Math.round(processingFeeFor({ amount: 60, paymentMethod: 'card' }) * 100)])
+    expect(arg.payment_intent_data.transfer_data).toBeUndefined()
+    expect(arg.metadata.gam_purpose).toBe('booking_deposit')
+    expect(arg.metadata.gam_booking_id).toBe(res.body.data.bookingId)
   })
 
   it('no landlord Connect → 409 in production', async () => {
@@ -196,10 +218,9 @@ describe('deposit confirmation', () => {
   it('S648: when the landlord absorbs the fee the guest pays the deposit alone, and the fee comes out of the payout', async () => {
     const s = await seedSite()
     await db.query(`UPDATE properties SET booking_card_fee_payer = 'landlord' WHERE id = $1`, [s.propertyId])
-    const { createBookingDepositCheckoutSession } = await import('../services/stripeConnect')
     const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
     expect(res.body.data.cardFee).toBe(0)
-    expect((createBookingDepositCheckoutSession as any).mock.calls.at(-1)[0].cardFeeCents).toBe(0)
+    expect(Object.values(lines(sessionsCreate.mock.calls.at(-1)![0]))).toEqual([6000])
     const id = res.body.data.bookingId
     const sess = (await db.query<any>('SELECT stripe_checkout_session_id FROM unit_bookings WHERE id=$1', [id])).rows[0].stripe_checkout_session_id
     await confirmBookingDeposit(id, sess, { paymentIntentId: 'pi_abs', amountTotalCents: 6000 })
@@ -310,5 +331,189 @@ describe('sweep', () => {
     expect(r.promoted).toBe(1)
     const w = (await db.query<any>(`SELECT status FROM unit_booking_waitlists WHERE unit_id=$1`, [s.unitId])).rows[0]
     expect(w.status).toBe('notified')
+  })
+})
+
+// ── 10/5 (Nic): PREPAID STAYS on the booking site ─────────────────────────────
+//
+//   "If they're booking online, it will ask them a lease guarantees your spot
+//    indefinitely and the stay only guarantees it for the time that you've
+//    paid ahead of time. ... If they choose to do the lease, then it drafts
+//    one for me."
+describe('10/5 long stays on the booking site', () => {
+  const round2 = (n: number) => Math.round(n * 100) / 100
+  const cents = (n: number) => Math.round(n * 100)
+
+  async function seedLongSite(opts: { connect?: boolean } = {}) {
+    const s = await seedSite(opts)
+    await db.query(`UPDATE units SET monthly_rate = 900 WHERE id = $1`, [s.unitId])
+    return s
+  }
+  /** The background check's fixed line: the applicant intake price before processing. */
+  async function checkFee(): Promise<number> {
+    const { screeningIntakeFee } = await import('./background')
+    const f = await screeningIntakeFee(null)
+    return round2(f.screening + f.gamFee + f.tax)
+  }
+  const monthOut = (ymd: string) => DateTime.fromISO(ymd).plus({ months: 1 }).toISODate()!
+  const sessionOf = async (id: string) =>
+    (await db.query<any>('SELECT stripe_checkout_session_id FROM unit_bookings WHERE id=$1', [id])).rows[0].stripe_checkout_session_id
+
+  it('R2: a 30+ night stay is not booked until the guest chooses a lease or a stay', async () => {
+    await seedLongSite()
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(plusDays(10), plusDays(75)))
+    expect(res.status).toBe(409)
+    expect(res.body.needsStayTerms).toBe(true)
+    expect(res.body.words).toBe("A lease holds your site for as long as you stay. A stay holds it only through the time you've paid for.")
+    expect((await db.query('SELECT 1 FROM unit_bookings')).rows).toHaveLength(0)
+    expect(sessionsCreate).not.toHaveBeenCalled()
+  })
+
+  it('STAY (R5): books and charges the first calendar month only, the check as its own line, held-through words', async () => {
+    await seedLongSite()
+    const fee = await checkFee()
+    const ci = plusDays(10)
+    const res = await request(buildApp()).post('/api/public/property/sunny/book')
+      .send({ ...guest(ci, plusDays(75)), stayTerms: 'stay' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const out = monthOut(ci)
+    const b = (await db.query<any>(
+      `SELECT check_out::text AS check_out, stay_terms, screening_required, deposit_amount::text, total_amount::text, lease_type
+         FROM unit_bookings WHERE id = $1`, [res.body.data.bookingId])).rows[0]
+    expect(b).toEqual({ check_out: out, stay_terms: 'stay', screening_required: true,
+                        deposit_amount: '900.00', total_amount: '900.00', lease_type: 'month_to_month' })
+    const card = processingFeeFor({ amount: 900 + fee, paymentMethod: 'card' })
+    expect(res.body.data).toMatchObject({
+      checkOut: out, stayTerms: 'stay', depositAmount: 900, screeningFee: fee, cardFee: card,
+      dueNow: round2(900 + fee + card), heldWords: stayHeldWords(out),
+    })
+    const l = lines(sessionsCreate.mock.calls.at(-1)![0])
+    expect(Object.values(l)).toEqual([90000, cents(fee), cents(card)])
+    expect(Object.keys(l)[1]).toMatch(/^Background check/)
+    expect(sessionsCreate.mock.calls.at(-1)![0].metadata.gam_screening_fee).toBe(fee.toFixed(2))
+  })
+
+  it('R3: nothing is drafted at the hold; a STAY once paid is recorded, the check prepaid, the landlord told — no lease', async () => {
+    const s = await seedLongSite()
+    const fee = await checkFee()
+    const res = await request(buildApp()).post('/api/public/property/sunny/book')
+      .send({ ...guest(plusDays(10), plusDays(75)), stayTerms: 'stay' })
+    const id = res.body.data.bookingId
+    expect((await db.query('SELECT 1 FROM leases WHERE source_booking_id = $1', [id])).rows).toHaveLength(0)
+
+    await confirmBookingDeposit(id, await sessionOf(id), { paymentIntentId: 'pi_stay', amountTotalCents: cents(res.body.data.dueNow) })
+    expect((await db.query('SELECT 1 FROM leases WHERE source_booking_id = $1', [id])).rows).toHaveLength(0)
+    const n = (await db.query<any>(`SELECT type FROM notifications WHERE data->>'bookingId' = $1`, [id])).rows
+    expect(n.map(r => r.type)).toEqual(['long_stay_no_lease'])
+    const sp = (await db.query<any>(`SELECT amount::text, source, status FROM screening_prepayments WHERE booking_id = $1`, [id])).rows
+    expect(sp).toEqual([{ amount: fee.toFixed(2), source: 'booking_site', status: 'unused' }])
+    expect(screeningEmail).toHaveBeenCalledTimes(1)
+    // The landlord's payout holds the month, never GAM's screening money.
+    const held = (await db.query<any>(`SELECT amount::text, description FROM held_payout_items WHERE landlord_id = $1`, [s.landlordId])).rows
+    expect(held).toEqual([{ amount: '900.00', description: 'Stay payment' }])
+    // 10/5 (Nic, A5): paid online, the check's money is already on GAM's
+    // balance — nothing is charged back to the landlord (never both).
+    const charge = (await db.query<any>(`SELECT kind, amount::text FROM landlord_gam_charges WHERE landlord_id = $1`, [s.landlordId])).rows
+    expect(charge).toEqual([])
+  })
+
+  it('LEASE (R4): today\'s deposit and the check; once paid a month-to-month draft lease waits for the landlord', async () => {
+    const s = await seedLongSite()
+    const fee = await checkFee()
+    const res = await request(buildApp()).post('/api/public/property/sunny/book')
+      .send({ ...guest(plusDays(10), plusDays(75)), stayTerms: 'lease' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const id = res.body.data.bookingId
+    // The flat long-stay deposit ($150 default, capped at a month), the whole stay asked for.
+    expect(res.body.data).toMatchObject({ depositAmount: 150, screeningFee: fee, stayTerms: 'lease', heldWords: null, checkOut: plusDays(75) })
+    expect((await db.query('SELECT 1 FROM leases WHERE source_booking_id = $1', [id])).rows).toHaveLength(0)
+
+    const charged = cents(res.body.data.dueNow)
+    await confirmBookingDeposit(id, await sessionOf(id), { paymentIntentId: 'pi_lease', amountTotalCents: charged })
+    const lease = (await db.query<any>(
+      `SELECT lease_type, status, end_date, lease_source FROM leases WHERE source_booking_id = $1`, [id])).rows
+    expect(lease).toEqual([{ lease_type: 'month_to_month', status: 'pending', end_date: null, lease_source: 'booking_draft' }])
+    const n = (await db.query<any>(`SELECT type FROM notifications WHERE data->>'bookingId' = $1`, [id])).rows
+    expect(n.map(r => r.type)).toEqual(['lease_drafted_from_booking'])
+    // An early check-out gives back only the stay's share — never the check.
+    const pay = (await db.query<any>(`SELECT toward_stay::text FROM stay_payments WHERE booking_id = $1`, [id])).rows
+    expect(pay).toEqual([{ toward_stay: '150.00' }])
+    const held = (await db.query<any>(`SELECT amount::text FROM held_payout_items WHERE landlord_id = $1`, [s.landlordId])).rows
+    expect(held).toEqual([{ amount: '150.00' }])
+  })
+
+  it('a stay of 22–29 nights carries the check but asks nothing', async () => {
+    await seedLongSite()
+    const fee = await checkFee()
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(plusDays(10), plusDays(35)))
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data).toMatchObject({ screeningFee: fee, stayTerms: null, heldWords: null })
+    const b = (await db.query<any>(`SELECT stay_terms, screening_required FROM unit_bookings WHERE id = $1`, [res.body.data.bookingId])).rows[0]
+    expect(b).toEqual({ stay_terms: null, screening_required: true })
+  })
+
+  it('M12: the check recorded is the one the checkout charged, even if a check came on file since the hold', async () => {
+    const s = await seedLongSite()
+    const fee = await checkFee()
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(plusDays(10), plusDays(35)))
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const id = res.body.data.bookingId
+    const deposit = res.body.data.depositAmount
+    // Between the hold and the payment, a paid check lands for this guest —
+    // stayNeeds would now say none is due, but the money was already charged.
+    await db.query(
+      `INSERT INTO screening_prepayments (landlord_id, email, amount, source, status)
+       VALUES ($1, $2, $3, 'register', 'unused')`, [s.landlordId, guest(plusDays(10), plusDays(35)).guestEmail, fee])
+    sessionsRetrieve.mockClear()
+    await confirmBookingDeposit(id, await sessionOf(id), { paymentIntentId: 'pi_m12', amountTotalCents: cents(res.body.data.dueNow) })
+    expect(sessionsRetrieve).toHaveBeenCalledTimes(1)
+    const sp = (await db.query<any>(`SELECT amount::text, source FROM screening_prepayments WHERE booking_id = $1`, [id])).rows
+    expect(sp).toEqual([{ amount: fee.toFixed(2), source: 'booking_site' }])
+    // GAM's check money stays out of the landlord's held share (A5).
+    const held = (await db.query<any>(`SELECT amount::text FROM held_payout_items WHERE landlord_id = $1`, [s.landlordId])).rows
+    expect(held).toEqual([{ amount: deposit.toFixed(2) }])
+    expect((await db.query(`SELECT 1 FROM landlord_gam_charges WHERE landlord_id = $1`, [s.landlordId])).rows).toHaveLength(0)
+  })
+
+  it('a checkout that carried no check records no screening and holds the stay part as before', async () => {
+    const s = await seedLongSite()
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(plusDays(10), plusDays(35)))
+    const id = res.body.data.bookingId
+    const deposit = res.body.data.depositAmount
+    const charged = cents(deposit + processingFeeFor({ amount: deposit, paymentMethod: 'card' }))
+    // The caller holding the session passes its (absent) gam_screening_fee.
+    await confirmBookingDeposit(id, await sessionOf(id), { paymentIntentId: 'pi_x', amountTotalCents: charged, screeningFee: null })
+    expect((await db.query('SELECT 1 FROM screening_prepayments')).rows).toHaveLength(0)
+    const held = (await db.query<any>(`SELECT amount::text FROM held_payout_items WHERE landlord_id = $1`, [s.landlordId])).rows
+    expect(held).toEqual([{ amount: deposit.toFixed(2) }])
+  })
+
+  it('the confirmation page says what the choice means (R13)', async () => {
+    await seedLongSite({ connect: false })   // dev-mock: confirmed at once
+    const ci = plusDays(10)
+    const res = await request(buildApp()).post('/api/public/property/sunny/book')
+      .send({ ...guest(ci, plusDays(75)), stayTerms: 'stay' })
+    const page = await request(buildApp()).get(`/api/public/property/sunny/booking/${res.body.data.bookingId}`)
+    expect(page.body.data).toMatchObject({ status: 'confirmed', leaseChosen: false, heldWords: stayHeldWords(monthOut(ci)) })
+  })
+
+  it('a 30+ night waitlist claim asks the same question, then books', async () => {
+    const s = await seedLongSite()
+    await db.query(
+      `INSERT INTO unit_booking_waitlists (unit_id, property_id, landlord_id, guest_name, guest_email, check_in, check_out)
+       VALUES ($1,$2,$3,'Pat','pat@guest.dev',$4,$5)`,
+      [s.unitId, s.propertyId, s.landlordId, plusDays(10), plusDays(75)])
+    await promoteNextWaitlister(s.unitId)
+    const token = (await db.query<any>(`SELECT claim_token FROM unit_booking_waitlists WHERE unit_id=$1`, [s.unitId])).rows[0].claim_token
+
+    const info = await request(buildApp()).get(`/api/public/property/sunny/claim/${token}`)
+    expect(info.body.data.quote).toMatchObject({ askStayTerms: true, lease: { dueNow: { stay: 150 } }, stay: { dueNow: { stay: 900 } } })
+
+    const no = await request(buildApp()).post(`/api/public/property/sunny/claim/${token}`).send({})
+    expect(no.status).toBe(409)
+    expect(no.body.needsStayTerms).toBe(true)
+    const yes = await request(buildApp()).post(`/api/public/property/sunny/claim/${token}`).send({ stayTerms: 'stay' })
+    expect(yes.status, JSON.stringify(yes.body)).toBe(200)
+    expect(yes.body.data.stayTerms).toBe('stay')
   })
 })

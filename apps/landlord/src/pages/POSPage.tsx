@@ -11,7 +11,7 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiPut, apiDel } from '../lib/api'
-import { humanize, processingFeeFor, rvSiteFactsLabel, SUPPORTED_CARD_READER, READER_ORDER_STATUS_LABEL } from '@gam/shared'
+import { humanize, processingFeeFor, rvSiteFactsLabel, SUPPORTED_CARD_READER, READER_ORDER_STATUS_LABEL, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 import { appConfirm, appPrompt } from '../components/dialogs'
 import { SendPayLinkModal, PayLinksTab } from './POSPayLinks'
@@ -65,6 +65,8 @@ function cartFromTicket(t: any): CartItem[] {
     id: i.id || `open-${t.id}-${n}`, name: i.name || 'Item', price: Number(i.price) || 0, qty: Number(i.qty) || 1,
     tax: Number(i.tax) || 0, cat: i.cat || '', icon: '📦', chargeEligible: true, stayUnit: null,
     reservation: !!i.reservation,
+    // 10/5 (Nic, R8): a link's background check stays on it — it cannot be taken off.
+    fixed: !!i.screening,
     ...(i.reservation && Number(i.nights) > 0 ? { nights: Number(i.nights) } : {}),
   }))
 }
@@ -263,8 +265,15 @@ const LAUNCH_HIDE_CHARGE = true
 // nights cost by the schedule's own pricing (the same figure a pay link and the
 // schedule charge), with the lodging tax inside it. Changing its nights clears
 // them — the site is picked again for the new length.
+// 10/5 (Nic): `stayEmail` / `stayTerms` / `stayExtend` / `screeningFee` — the
+// guest's email, the counter's lease answer, the stay a month is added to and
+// the background check's fee the server quoted (POST /pos/stays/quote); they
+// ride on the stay's line so every pricing call (the reader's too) prices the
+// same stay. `fixed` — a line the register cannot take off (a pay link's
+// background check).
 interface CartItem { id:string; name:string; price:number; qty:number; tax:number; cat:string; icon:string; chargeEligible:boolean; stayUnit?:'night'|'week'|'month'|null; reservation?:boolean; nights?:number
-  stayUnitId?:string; stayCheckIn?:string; stayTotal?:number; stayTax?:number }
+  stayUnitId?:string; stayCheckIn?:string; stayTotal?:number; stayTax?:number
+  stayEmail?:string|null; stayTerms?:StayTerms|null; stayExtend?:string|null; screeningFee?:number|null; fixed?:boolean }
 
 /** 10/3 (decisions #9): a stay whose site and arrival are picked shows what its nights cost; anything else, price × quantity. */
 const stayPriced = (i: CartItem) => !!i.stayUnit && !i.reservation && typeof i.stayTotal === 'number'
@@ -274,7 +283,7 @@ const lineAmount = (i: CartItem) => stayPriced(i) ? Math.round(((i.stayTotal ?? 
 const lineTax = (i: CartItem) => stayPriced(i) ? (i.stayTax ?? 0) : i.price * i.qty * i.tax
 /** A stay's nights changed: its site and price are picked again for the new length. */
 const unpriceStay = <T extends CartItem>(i: T): T => {
-  const { stayUnitId: _u, stayCheckIn: _c, stayTotal: _t, stayTax: _x, ...rest } = i
+  const { stayUnitId: _u, stayCheckIn: _c, stayTotal: _t, stayTax: _x, stayEmail: _e, stayTerms: _l, stayExtend: _m, screeningFee: _f, ...rest } = i
   return rest as T
 }
 
@@ -292,7 +301,10 @@ function wireLine(i: CartItem, ticketId: string | null, linkId: string | null = 
            // 10/3 (decisions #9): a stay carries its site, arrival and the figure
            // the register shows, so every pricing call prices the same nights the
            // same way — and refuses a figure that is not what they cost now.
-           ...(stayPriced(i) && i.stayUnitId ? { stayUnitId: i.stayUnitId, stayCheckIn: i.stayCheckIn, stayTotal: i.stayTotal } : {}) }
+           ...(stayPriced(i) && i.stayUnitId ? { stayUnitId: i.stayUnitId, stayCheckIn: i.stayCheckIn, stayTotal: i.stayTotal,
+             // 10/5: who it is for, the lease answer, the month added and the background check's fee as shown.
+             ...(i.stayEmail ? { stayEmail: i.stayEmail } : {}), ...(i.stayTerms ? { stayTerms: i.stayTerms } : {}),
+             ...(i.stayExtend ? { stayExtend: i.stayExtend } : {}), ...(i.screeningFee ? { screeningFee: i.screeningFee } : {}) } : {}) }
 }
 
 
@@ -973,7 +985,11 @@ export function POSPage() {
     const line = cart.find(x => x.id === id)
     if (line) void setQty(id, line.qty + delta)
   }
-  const subtotal = cart.reduce((s,i) => s+lineAmount(i), 0)
+  // 10/5 (Nic, R8): the background check's fee the server quoted for the stay
+  // in the cart — its own line, which the server adds and the register cannot
+  // take off. Shown here so the cart says what Charge takes.
+  const screeningDue = stayLine && stayPriced(stayLine) ? Number(stayLine.screeningFee) || 0 : 0
+  const subtotal = cart.reduce((s,i) => s+lineAmount(i), 0) + screeningDue
   // 10/3 (review, decisions #9): a stay is charged at the schedule's price —
   // a sale with a stay (or a reservation) in it takes no discount, and the
   // server refuses one. The box says so instead of offering it.
@@ -1637,6 +1653,18 @@ export function POSPage() {
             {receipt.method==='cash'&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--text-2)'}}><span>Received</span><span>{fmt(receipt.cashReceived ?? receipt.total)}</span></div>}
             {receipt.method==='cash'&&receipt.changeDue>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--gold)',fontWeight:700}}><span>Give change</span><span>{fmt(receipt.changeDue)}</span></div>}
           </div>
+          {/* 10/5 (Nic): what the stay sold here means — the server's own words
+              (R13: a 30+ night stay with no lease is held only through what is
+              paid), the paid background check and where its link went (R8), and
+              a lease drafted for the landlord (R2). */}
+          {receipt.stayBooking && (receipt.stayBooking.heldWords || receipt.stayBooking.screeningFee || receipt.stayBooking.leaseId) && (
+            <div style={{textAlign:'left',border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 12px',marginBottom:12,fontSize:'.8rem',display:'grid',gap:6,color:'var(--text-2)',lineHeight:1.45}}>
+              {receipt.stayBooking.heldWords && <div>{receipt.stayBooking.heldWords}</div>}
+              {receipt.stayBooking.screeningFee && <div>
+                Their background check is paid ({fmt(Number(receipt.stayBooking.screeningFee))}).{receipt.stayBooking.screeningEmail ? ` The link to fill it out was emailed to ${receipt.stayBooking.screeningEmail}.` : ''} Check-in waits for the results and the owner's decision.
+              </div>}
+              {receipt.stayBooking.leaseId && <div>A month-to-month lease was drafted for the owner to review and send for signature.</div>}
+            </div>)}
           {/* 10/2 (Nic): who the sale was for — typed and picked, exactly as at
               the register. A sale that names nobody (or only a card) opens ready
               to type; linking it fills in every other sale on the same card. */}
@@ -1828,6 +1856,10 @@ export function POSPage() {
                     <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>
                       {i.nights ? `${i.nights} night${i.nights===1?'':'s'} · ` : ''}reservation price · change it on the schedule
                     </div>
+                  ) : i.fixed ? (
+                    <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>
+                      required · cannot be taken off
+                    </div>
                   ) : (
                   <div style={{display:'flex',alignItems:'center',gap:4}}>
                     <button onClick={()=>updateQty(i.id,-1)} style={{background:'var(--bg-3)',border:'none',borderRadius:3,width:20,height:20,cursor:'pointer',fontWeight:700}}>-</button>
@@ -1837,6 +1869,14 @@ export function POSPage() {
                   )}
                   <div style={{fontSize:'.82rem',fontWeight:600,minWidth:44,textAlign:'right'}}>{fmt(lineAmount(i))}</div>
                 </div>))}
+                {/* 10/5 (Nic, R8): a stay over three weeks with no background
+                    check on file carries the check's fee — the server adds it
+                    to the sale, and nobody can take it off. */}
+                {screeningDue>0 && (<div style={{display:'flex',alignItems:'center',gap:6,padding:'7px 0',borderBottom:'1px solid var(--border-1)'}}>
+                  <div style={{flex:1,minWidth:0,fontSize:'.8rem',fontWeight:500}}>{stay?.screeningLineName || 'Background check'}</div>
+                  <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>required · cannot be taken off</div>
+                  <div style={{fontSize:'.82rem',fontWeight:600,minWidth:44,textAlign:'right'}}>{fmt(screeningDue)}</div>
+                </div>)}
               </div>
             )}
             {/* S650: the discount box is for staff allowed to discount; the server refuses it otherwise. */}
@@ -1967,10 +2007,15 @@ export function POSPage() {
                 so the button says what it needs instead of failing on submit.
                 Once set, the site and dates show above it. */}
             {stayInCart && (stayReady
-              ? <button className="btn btn-primary btn-sm" style={{width:'100%',marginBottom:6,textAlign:'left'}}
-                        onClick={()=>setStayModal(true)}>
-                  {stay.siteLabel} · {stay.checkIn} → {stay.checkOut} · {stay.guestName}
-                </button>
+              ? <>
+                  <button className="btn btn-primary btn-sm" style={{width:'100%',marginBottom:6,textAlign:'left'}}
+                          onClick={()=>setStayModal(true)}>
+                    {stay.extendBookingId ? 'Add a month · ' : ''}{stay.siteLabel} · {stay.checkIn} → {stay.checkOut} · {stay.guestName}
+                    {stay.stayTerms ? ` · ${STAY_TERMS_LABEL[stay.stayTerms as StayTerms]}` : ''}
+                  </button>
+                  {/* 10/5 (Nic, R13): a 30+ night stay with no lease is held only through what is paid. */}
+                  {stay.heldWords && <div style={{fontSize:'.7rem',color:'var(--text-3)',marginBottom:6,lineHeight:1.45}}>{stay.heldWords}</div>}
+                </>
               : stay ? <div style={{fontSize:'.72rem',color:'var(--amber)',marginBottom:6}}>The nights changed — pick the site again for the new dates.</div>
               : null)}
             <button className="btn btn-primary" style={{width:'100%'}} disabled={
@@ -2038,7 +2083,10 @@ export function POSPage() {
                 cart={cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax, cat: i.cat,
                                        // 10/3 (review): the stay's figure as shown — the link never goes out at another.
                                        ...(stayPriced(i) ? { stayTotal: i.stayTotal } : {}) }))}
-                stay={stayInCart && stayReady && stay ? { unitId: stay.unitId, checkIn: stay.checkIn, guestName: stay.guestName, guestPhone: stay.guestPhone || null } : null}
+                stay={stayInCart && stayReady && stay ? { unitId: stay.unitId, checkIn: stay.checkIn, guestName: stay.guestName, guestPhone: stay.guestPhone || null,
+                                                          guestEmail: stay.guestEmail || null, stayTerms: stay.stayTerms || null,
+                                                          extendBookingId: stay.extendBookingId || null, screeningFee: stay.screeningFee || null,
+                                                          screeningLineName: stay.screeningLineName || null, heldWords: stay.heldWords || null } : null}
                 discountAmount={discountAmt}
                 total={discountedSubtotal + taxAmount}
                 customerPaysFee={!absorbsCardFee}
@@ -2907,6 +2955,12 @@ export function POSPage() {
             propertyId={registerProperty}
             initial={stay}
             onCancel={()=>setStayModal(false)}
+            onLeaseDrafted={(message:string)=>{
+              // 10/5 (Nic, M5): Add a month answered lease sells no month — the
+              // lease was drafted instead, so the month comes out of the cart.
+              setCart(c=>c.filter(i=>i.id!==stayLine.id)); setStay(null); setStayModal(false)
+              toastOnce(message)
+            }}
             onDone={(d:any)=>{
               setStay(d); setStayModal(false)
               // The site carries the rate. Writing it onto the cart line is what
@@ -2914,8 +2968,13 @@ export function POSPage() {
               // all one number instead of four. 10/3 (decisions #9, #21): what
               // these nights cost on that site by the schedule's own pricing,
               // the lodging tax inside it — the figure Charge and a link take.
+              // 10/5 (Nic): with what the stay needs — the guest's email, the
+              // lease answer, the month added and the background check's fee —
+              // all as the server quoted them (POST /pos/stays/quote).
               setCart(c=>c.map(i=>i.id===stayLine.id ? { ...i, price: d.rate != null ? Number(d.rate) : i.price,
-                stayUnitId: d.unitId, stayCheckIn: d.checkIn, stayTotal: Number(d.lineTotal), stayTax: Number(d.lodgingTax) || 0 } : i))
+                stayUnitId: d.unitId, stayCheckIn: d.checkIn, stayTotal: Number(d.lineTotal), stayTax: Number(d.lodgingTax) || 0,
+                stayEmail: d.guestEmail || null, stayTerms: d.stayTerms || null, stayExtend: d.extendBookingId || null,
+                screeningFee: d.screeningFee != null ? Number(d.screeningFee) : null } : i))
             }}
           />
         </div>
@@ -2933,16 +2992,33 @@ export function POSPage() {
  * lease, or an out-of-order window. Showing every site and letting the sale
  * fail afterwards would put the error in front of a customer standing at the
  * counter instead of in front of the cashier choosing.
+ *
+ * 10/5 (Nic): and what the stay needs, from the server (POST /pos/stays/quote)
+ * — never worked out here. The price is whole nights, weeks or months, never
+ * prorated (R5). A stay over three weeks in a row needs the guest's email and,
+ * with no background check on file, carries the check's fee (R1/R8). A stay of
+ * 30+ nights needs the counter's answer: lease or no lease (R2) — "it's the
+ * front counter person that's clicking lease or no lease." A monthly stay can
+ * instead add a month to a stay that is here now (R6).
  */
-function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
+function StayDetailsModal({ line, propertyId, initial, onCancel, onDone, onLeaseDrafted }: {
   line: any; propertyId: string; initial: any
   onCancel: () => void; onDone: (d: any) => void
+  /** 10/5 (Nic, M5): Add a month answered lease — the lease was drafted and no month is sold. */
+  onLeaseDrafted: (message: string) => void
 }) {
   const today = new Date().toISOString().slice(0, 10)
-  const [checkIn, setCheckIn] = useState<string>(initial?.checkIn || today)
-  const [unitId, setUnitId] = useState<string>(initial?.unitId || '')
+  const canExtend = line.stayUnit === 'month' && Number(line.qty) === 1
+  const [mode, setMode] = useState<'new' | 'extend'>(canExtend && initial?.extendBookingId ? 'extend' : 'new')
+  const [checkIn, setCheckIn] = useState<string>(initial?.extendBookingId ? today : (initial?.checkIn || today))
+  const [unitId, setUnitId] = useState<string>(initial?.extendBookingId ? '' : (initial?.unitId || ''))
   const [guestName, setGuestName] = useState<string>(initial?.guestName || '')
   const [guestPhone, setGuestPhone] = useState<string>(initial?.guestPhone || '')
+  const [guestEmail, setGuestEmail] = useState<string>(initial?.guestEmail || '')
+  const [stayTerms, setStayTerms] = useState<StayTerms | null>(initial?.stayTerms || null)
+  const [extendId, setExtendId] = useState<string>(initial?.extendBookingId || '')
+  const [findStay, setFindStay] = useState<string>('')
+  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(guestEmail.trim())
 
   // 10/3 (review, front desk foolproof): what is free is read FRESH every time
   // the picker opens (never a list from before the last sale or link took a
@@ -2950,7 +3026,7 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
   const { data, isFetching, error } = useQuery<any>(
     ['stay-availability', propertyId, checkIn, line.stayUnit, line.qty],
     () => apiGet(`/pos/stays/available?propertyId=${propertyId}&checkIn=${checkIn}&stayUnit=${line.stayUnit}&qty=${line.qty}`),
-    { enabled: !!propertyId && !!checkIn, retry: false, keepPreviousData: true, staleTime: 0, refetchOnMount: 'always' },
+    { enabled: mode === 'new' && !!propertyId && !!checkIn, retry: false, keepPreviousData: true, staleTime: 0, refetchOnMount: 'always' },
   )
   const units: any[] = data?.units ?? []
   // A site chosen for one set of dates may not be free for another, so the
@@ -2959,21 +3035,87 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
     if (unitId && units.length && !units.some((u: any) => u.id === unitId)) setUnitId('')
   }, [units, unitId])
 
+  // 10/5 (Nic, R6): the stays here now that a month can be added to.
+  const current = useQuery<any[]>(
+    ['stays-current', propertyId, findStay.trim()],
+    () => apiGet(`/pos/stays/current?propertyId=${propertyId}&q=${encodeURIComponent(findStay.trim())}`),
+    { enabled: mode === 'extend' && !!propertyId, retry: false, keepPreviousData: true, staleTime: 0 },
+  )
+  const stays: any[] = Array.isArray(current.data) ? current.data : []
+  const pickedStay = stays.find((x: any) => x.bookingId === extendId)
+
+  // 10/5: what the stay comes to and needs — the server's figures, read every
+  // time the site, dates, email or answer changes.
+  const quoteBody = mode === 'extend'
+    ? (extendId ? { propertyId, itemId: line.id, qty: line.qty, extendBookingId: extendId, guestEmail: emailOk ? guestEmail.trim() : null, stayTerms } : null)
+    : (unitId && checkIn ? { propertyId, itemId: line.id, qty: line.qty, unitId, checkIn, guestEmail: emailOk ? guestEmail.trim() : null, stayTerms } : null)
+  const quote = useQuery<any>(
+    ['stay-quote', JSON.stringify(quoteBody)],
+    () => apiPost('/pos/stays/quote', quoteBody).then((r: any) => r.data),
+    { enabled: !!quoteBody, retry: false, staleTime: 0, keepPreviousData: false },
+  )
+  const q: any = quote.data ?? null
+  // A guest who comes back the same day as another of their stays ends is the
+  // same stay (their nights add up); the answer they gave then stands.
+  useEffect(() => {
+    if (q && !stayTerms && (q.terms === 'lease' || q.terms === 'stay')) setStayTerms(q.terms)
+  }, [q?.terms])   // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (mode === 'extend' && pickedStay?.guestEmail && !guestEmail) setGuestEmail(pickedStay.guestEmail)
+  }, [pickedStay?.bookingId])   // eslint-disable-line react-hooks/exhaustive-deps
+
   const lengthLabel = line.stayUnit === 'night' ? `${line.qty} night${line.qty === 1 ? '' : 's'}`
     : line.stayUnit === 'week' ? `${line.qty} week${line.qty === 1 ? '' : 's'}`
     : `${line.qty} month${line.qty === 1 ? '' : 's'}`
 
   const picked = units.find((u: any) => u.id === unitId)
-  // 10/3 (decisions #9): a site is picked by what these nights cost on it (the schedule's price).
-  const ready = !!unitId && picked?.lineTotal != null && !!checkIn && !!guestName.trim() && !isFetching
+  const needsAnswer = q?.leaseChoice === 'needed' && !stayTerms
+  const needsEmail = !!q?.needsEmail && !emailOk
+  // 10/3 (decisions #9): a site is picked by what these nights cost on it; 10/5: once the server has said what the stay needs.
+  const ready = !!q && !quote.isFetching && !quote.error && !needsAnswer && !needsEmail
+    && (mode === 'extend' ? !!extendId : (!!unitId && picked?.lineTotal != null && !!checkIn && !!guestName.trim() && !isFetching))
+  const quoteError = (quote.error as any)?.response?.data?.error
+  // 10/5 (Nic, M5): a month is sold only as a stay. Answered lease, the lease
+  // is drafted instead (it bills the months from here on) and nothing is charged.
+  const leaseInstead = mode === 'extend' && !!q?.leaseInstead
+  const draftLease = useMutation(
+    () => apiPost('/pos/stays/lease', { propertyId, bookingId: extendId }).then((r: any) => r.data),
+    { onSuccess: (d: any) => onLeaseDrafted(d?.message || 'Their lease is drafted for the owner to review and send. Nothing was charged.'),
+      onError: (e: any) => toastOnce(errorMessage(e, 'Their lease could not be drafted — check the connection and press Draft their lease again.'), { error: true }) })
 
   return (
     <>
       <div className="modal-title" style={{marginBottom:4}}>{line.name}</div>
       <div style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:14}}>
-        {lengthLabel}{data?.checkOut ? ` · ${checkIn} → ${data.checkOut}` : ''}
+        {mode === 'extend' ? 'Add a month to their stay' : <>{lengthLabel}{data?.checkOut ? ` · ${checkIn} → ${data.checkOut}` : ''}</>}
       </div>
 
+      {canExtend && (
+        <div style={{display:'flex',gap:16,marginBottom:12,fontSize:'.82rem'}}>
+          <label style={{display:'flex',alignItems:'center',gap:4,cursor:'pointer'}}>
+            <input type="radio" checked={mode==='new'} onChange={()=>{ setMode('new'); setExtendId('') }} /> A new stay
+          </label>
+          <label style={{display:'flex',alignItems:'center',gap:4,cursor:'pointer'}}>
+            <input type="radio" checked={mode==='extend'} onChange={()=>{ setMode('extend'); setUnitId('') }} /> Add a month to a stay here now
+          </label>
+        </div>)}
+
+      {mode === 'extend' ? (<>
+        <label style={{fontSize:'.78rem',color:'var(--text-2)'}}>Their stay</label>
+        <input className="input" style={{width:'100%',marginBottom:6}} placeholder="Find by name, email or site"
+               value={findStay} onChange={e=>setFindStay(e.target.value)} />
+        {current.error
+          ? <div style={{fontSize:'.78rem',color:'var(--red)',marginBottom:12}}>{(current.error as any)?.response?.data?.error || 'Could not look the stays up.'}</div>
+          : stays.length
+            ? <select className="input" style={{width:'100%',marginBottom:12}} value={extendId} onChange={e=>setExtendId(e.target.value)}>
+                <option value="">Pick their stay…</option>
+                {stays.map((x:any)=>(
+                  <option key={x.bookingId} value={x.bookingId}>
+                    {[x.guestName || 'Guest', `site ${x.unitNumber}`, `${x.checkIn} → ${x.checkOut}`].join(' · ')}
+                  </option>))}
+              </select>
+            : <div style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:12}}>{current.isFetching ? 'Looking…' : 'No stay here now matches. A stay with a lease is not listed — its lease holds the site.'}</div>}
+      </>) : (<>
       <label style={{fontSize:'.78rem',color:'var(--text-2)'}}>Arriving</label>
       <input type="date" className="input" style={{width:'100%',marginBottom:12}}
              value={checkIn} min={today} onChange={e=>setCheckIn(e.target.value)} />
@@ -3026,19 +3168,77 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
       <label style={{fontSize:'.78rem',color:'var(--text-2)'}}>Who is it for</label>
       <input className="input" style={{width:'100%',marginBottom:12}} placeholder="Name"
              value={guestName} onChange={e=>setGuestName(e.target.value)} />
-      <input className="input" style={{width:'100%',marginBottom:16}} placeholder="Phone (optional)"
+      <input className="input" style={{width:'100%',marginBottom:12}} placeholder="Phone (optional)"
              value={guestPhone} onChange={e=>setGuestPhone(e.target.value)} />
+      </>)}
+      <input className="input" type="email" style={{width:'100%',marginBottom:4}}
+             placeholder="Email (needed for a stay over three weeks)"
+             value={guestEmail} onChange={e=>setGuestEmail(e.target.value)} />
+      {needsEmail && <div style={{fontSize:'.72rem',color:'var(--amber)',marginBottom:8}}>
+        This comes to {q.nights} nights in a row — type their email. Their background check goes to it, and their back-to-back stays add up by it.
+      </div>}
+
+      {/* 10/5 (Nic): what the stay comes to and needs — the server's figures. */}
+      {quoteBody && (quote.isFetching
+        ? <div style={{fontSize:'.78rem',color:'var(--text-3)',margin:'10px 0'}}>Checking what this stay needs…</div>
+        : quoteError
+          ? <div style={{fontSize:'.78rem',color:'var(--red)',margin:'10px 0'}}>{quoteError}</div>
+          : q && (
+            <div style={{border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 12px',margin:'10px 0 14px',fontSize:'.8rem',display:'grid',gap:6}}>
+              {!leaseInstead && <div style={{display:'flex',justifyContent:'space-between',gap:8}}>
+                <span style={{color:'var(--text-2)'}}>{q.depositOnly ? 'Lease deposit now — the lease bills the rest' : q.what}</span>
+                <span className="mono">{fmt(Number(q.charge))}</span>
+              </div>}
+              {q.screeningFee && !leaseInstead && <div style={{display:'flex',justifyContent:'space-between',gap:8}}>
+                <span style={{color:'var(--text-2)'}}>{q.screeningLineName}</span><span className="mono">{fmt(Number(q.screeningFee))}</span>
+              </div>}
+              {q.screening === 'fee_due' && !leaseInstead && <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.45}}>
+                {q.nights} nights in a row is more than three weeks, so a background check is required. Its fee goes on this sale and cannot be taken off; the link to fill it out is emailed to them, and check-in waits for the results and your decision.
+              </div>}
+              {q.screening === 'on_file' && <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.45}}>
+                {q.nights} nights in a row — their background check is already on file or paid for, so nothing is added. Check-in waits for its results and your decision.
+              </div>}
+              {q.leaseOrStayWords && (<>
+                <div style={{color:'var(--text-2)',lineHeight:1.45}}>{q.nights} nights in a row — ask them: lease or no lease? {q.leaseOrStayWords}</div>
+                <div style={{display:'flex',gap:16}}>
+                  {STAY_TERMS.map(t => (
+                    <label key={t} style={{display:'flex',alignItems:'center',gap:4,cursor:'pointer'}}>
+                      <input type="radio" checked={stayTerms===t} onChange={()=>setStayTerms(t)} /> {STAY_TERMS_LABEL[t]}
+                    </label>))}
+                </div>
+                {stayTerms === 'lease' && (leaseInstead
+                  ? <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.45}}>{q.leaseInsteadWords}</div>
+                  : <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.45}}>
+                      A month-to-month lease is drafted for the owner to review and send. It bills from check-in by the property's rent settings.
+                    </div>)}
+                {q.heldWords && <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.45}}>{q.heldWords}</div>}
+              </>)}
+            </div>))}
 
       <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
         <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
-        <button className="btn btn-primary" disabled={!ready} title={isFetching ? 'Checking what is free…' : undefined} onClick={()=>onDone({
-          unitId, checkIn, guestName: guestName.trim(), guestPhone: guestPhone.trim() || null,
-          checkOut: data?.checkOut,
-          siteLabel: units.find((u:any)=>u.id===unitId)?.unitNumber ?? 'Site',
-          rate: units.find((u:any)=>u.id===unitId)?.rate ?? null,
-          lineTotal: units.find((u:any)=>u.id===unitId)?.lineTotal ?? null,
-          lodgingTax: units.find((u:any)=>u.id===unitId)?.lodgingTax ?? 0,
-        })}>{isFetching && !!unitId ? 'Checking…' : 'Use this site'}</button>
+        {leaseInstead ? (
+          <button className="btn btn-primary" disabled={!ready || draftLease.isLoading} onClick={()=>draftLease.mutate()}>
+            {draftLease.isLoading ? 'Drafting…' : 'Draft their lease'}
+          </button>
+        ) : (
+        <button className="btn btn-primary" disabled={!ready} title={isFetching || quote.isFetching ? 'Checking…' : undefined} onClick={()=>onDone({
+          ...(mode === 'extend'
+            ? { extendBookingId: extendId, unitId: q.unitId, checkIn: q.checkIn, guestName: pickedStay?.guestName || q.extend?.guestName || 'Guest',
+                guestPhone: null, siteLabel: q.unitNumber, rate: null }
+            : { unitId, checkIn, guestName: guestName.trim(), guestPhone: guestPhone.trim() || null,
+                siteLabel: units.find((u:any)=>u.id===unitId)?.unitNumber ?? 'Site', rate: units.find((u:any)=>u.id===unitId)?.rate ?? null }),
+          checkOut: q.checkOut,
+          guestEmail: emailOk ? guestEmail.trim() : null,
+          stayTerms: q.terms ?? stayTerms ?? null,
+          // What the stay line charges (the stay, or a lease's deposit) and the lodging tax inside it.
+          lineTotal: q.charge,
+          lodgingTax: q.lodgingTax ?? 0,
+          screeningFee: q.screeningFee ?? null,
+          screeningLineName: q.screeningLineName,
+          heldWords: q.heldWords ?? null,
+        })}>{(isFetching && !!unitId) || quote.isFetching ? 'Checking…' : mode === 'extend' ? 'Add this month' : 'Use this site'}</button>
+        )}
       </div>
     </>
   )

@@ -986,6 +986,23 @@ function stayTaxPctSql(b: string, pr: string): string {
 }
 
 /**
+ * 10/5 (Nic, M10/A5): the background check a register sale (alias `t`, a
+ * pos_transactions row) carried — the fee recorded for it as the guest's
+ * prepaid check, by the sale itself (the register, a schedule ticket) or by
+ * the pay link it paid. GAM's screening money, never the landlord's income: by
+ * card GAM keeps it, in cash GAM takes it back from their payout. A fee that
+ * was not recorded (the stay already had one) stays the landlord's to give
+ * back, and so stays in the sale.
+ */
+const saleScreeningSql = (t: string) => `COALESCE((SELECT SUM(ssp.amount) FROM screening_prepayments ssp
+     WHERE ssp.status <> 'void' AND ssp.source_id IN (${t}.id, ${t}.pay_link_id)), 0)`
+
+/** The background-check lines an unpaid pay link (alias `pl`) carries — not the landlord's to bill. */
+const linkScreeningSql = (pl: string) => `COALESCE((SELECT SUM((sle->>'price')::numeric * COALESCE((sle->>'qty')::numeric, 1))
+     FROM jsonb_array_elements(CASE WHEN jsonb_typeof(${pl}.items) = 'array' THEN ${pl}.items ELSE '[]'::jsonb END) sle
+    WHERE sle->>'screening' = 'true' AND sle->>'id' IS NULL), 0)`
+
+/**
  * The instant a reservation's money (alias `b`, a unit_bookings row) counted
  * as a stay under Money billed, or NULL when nothing was paid toward it: the
  * register sale or pay link that paid it (a sale through a one-time link is
@@ -1033,7 +1050,7 @@ function reservationPaymentsSql(b: string): string {
                       WHERE rph.source_type = 'booking_deposit' AND rph.source_id = ${x}.id::text)
       UNION ALL
       SELECT rps.at, rpt.id::text, ${localDay('rps.at', `COALESCE(rpp.timezone, 'America/Phoenix')`)},
-             rpt.subtotal - rpt.discount_amount
+             rpt.subtotal - rpt.discount_amount - ${saleScreeningSql('rpt')}
         FROM pos_transactions rpt
         LEFT JOIN pos_pay_links rpl ON rpl.id = rpt.pay_link_id
         LEFT JOIN properties rpp ON rpp.id = rpt.property_id
@@ -1556,11 +1573,13 @@ function billedBranches(): string[] {
     // link already past its expiry.
     `SELECT pl.landlord_id, pl.property_id, NULL::uuid, NULL::uuid, NULL::uuid, NULL::date,
             ${localDay('pl.created_at', TZ('pr'))},
-            'registerAndStays', 'stays_and_pay_links', 'stillOwed', (pl.subtotal - pl.discount_amount), TRUE, NULL::uuid
+            'registerAndStays', 'stays_and_pay_links', 'stillOwed', (pl.subtotal - pl.discount_amount - ${linkScreeningSql('pl')}), TRUE, NULL::uuid
        FROM pos_pay_links pl
        LEFT JOIN properties pr ON pr.id = pl.property_id
       WHERE ${LL('pl.landlord_id')} AND pl.kind = 'one_time' AND pl.status = 'open'
         AND (pl.expires_at IS NULL OR pl.expires_at > now())
+        -- 10/5 (M10): a link for nothing but a background check bills the landlord nothing.
+        AND (pl.subtotal - pl.discount_amount - ${linkScreeningSql('pl')}) > 0
         AND NOT EXISTS (
               SELECT 1 FROM pos_pay_links nl
                WHERE pl.booking_id IS NOT NULL AND nl.booking_id = pl.booking_id AND nl.id <> pl.id
@@ -1704,7 +1723,7 @@ function siteDepositSql(b: string): string {
         WHERE sdh.source_type = 'booking_deposit' AND sdh.source_id = ${x}.id::text
         ORDER BY sdh.created_at, sdh.id LIMIT 1),
       ${x}.deposit_amount - COALESCE((
-        SELECT SUM(sdt.subtotal - sdt.discount_amount + sdt.tax_amount) FROM pos_transactions sdt
+        SELECT SUM(sdt.subtotal - sdt.discount_amount + sdt.tax_amount - ${saleScreeningSql('sdt')}) FROM pos_transactions sdt
          WHERE sdt.landlord_id = ${x}.landlord_id AND sdt.created_at > ${x}.deposit_paid_at
            AND (sdt.id = ${x}.pos_transaction_id
                 OR EXISTS (SELECT 1 FROM pos_pay_links sdl WHERE sdl.id = sdt.pay_link_id AND sdl.booking_id = ${x}.id)
@@ -1722,8 +1741,9 @@ function sharedBranches(basis: IncomeBasis): string[] {
             OR EXISTS (SELECT 1 FROM pos_open_tickets ot WHERE ot.id = t.open_ticket_id AND ot.booking_id IS NOT NULL)
           THEN 'stays_and_pay_links' ELSE 'register_sales' END`
   // Pre-tax share of a refund: the refund times (net sale) / (net sale + tax).
+  // 10/5 (M10): the background check is never refunded and never the sale's income — left out of the share.
   const preTax = (amt: string) =>
-    `ROUND(${amt} * (t.subtotal - t.discount_amount) / NULLIF(t.subtotal - t.discount_amount + t.tax_amount, 0), 2)`
+    `ROUND(${amt} * (t.subtotal - t.discount_amount - ${saleScreeningSql('t')}) / NULLIF(t.subtotal - t.discount_amount - ${saleScreeningSql('t')} + t.tax_amount, 0), 2)`
   // A booking-site deposit's pre-tax share: the deposit over (1 + the stay's
   // short-stay tax rate, stayTaxPctSql).
   const stayTaxPct = stayTaxPctSql
@@ -1744,7 +1764,7 @@ function sharedBranches(basis: IncomeBasis): string[] {
     // Register sales, stays and pay links: net of tax and card fee, on the sale day.
     `SELECT t.landlord_id, t.property_id, NULL::uuid, NULL::uuid, NULL::uuid, NULL::date,
             ${localDay(saleTs, TZ('pr'))},
-            'registerAndStays', ${stayCategory}, 'paid', (t.subtotal - t.discount_amount), TRUE, NULL::uuid
+            'registerAndStays', ${stayCategory}, 'paid', (t.subtotal - t.discount_amount - ${saleScreeningSql('t')}), TRUE, NULL::uuid
        FROM pos_transactions t
        LEFT JOIN pos_pay_links lk ON lk.id = t.pay_link_id
        LEFT JOIN properties pr ON pr.id = t.property_id
@@ -1804,7 +1824,7 @@ function sharedBranches(basis: IncomeBasis): string[] {
        LEFT JOIN connect_disputes cd ON cd.stripe_dispute_id = regexp_replace(h.source_id, ':returned_on_win$', '')
        LEFT JOIN LATERAL (
          SELECT t.property_id, NULL::uuid AS unit_id, pr.timezone AS tz, ${stayCategory} AS category,
-                ROUND(LEAST(cd.amount, t.total) * (t.subtotal - t.discount_amount) / NULLIF(t.total, 0), 2) AS sale,
+                ROUND(LEAST(cd.amount, t.total) * (t.subtotal - t.discount_amount - ${saleScreeningSql('t')}) / NULLIF(t.total, 0), 2) AS sale,
                 ROUND(LEAST(cd.amount, t.total) * t.tax_amount / NULLIF(t.total, 0), 2) AS tax
            FROM pos_transactions t
            LEFT JOIN properties pr ON pr.id = t.property_id

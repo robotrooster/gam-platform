@@ -1,43 +1,66 @@
 import { query, queryOne } from '../db'
-import { logger } from '../lib/logger'
-import { createNotification } from './notifications'
 import { todayIn, dateIn } from '../lib/timezone'
 import { pooledCheckSql } from './onboardingWindow'
 
 // S547 (Nic): the long-stay ping is a DECISION for the landlord — screen
-// first, or send the lease directly if they know the guest. The system never
-// auto-sends a background check. To inform that decision we surface the
-// guest's history WITH THIS ACCOUNT: prior completed stays with this landlord,
-// an approved background check run for this account (or shared by the guest
-// through the renter pool), and whether they've rented from this account
-// continuously since that check (approved check + continuous tenancy since
-// = no new check needed). S655: never another company's checks or leases.
-const CONTINUITY_GAP_DAYS = 30   // move-between-units grace when chaining leases
+// first, or send the lease directly if they know the guest. To inform that
+// decision we surface the guest's history WITH THIS ACCOUNT: prior completed
+// stays with this account, an approved background check run for this account
+// (or shared by the guest through the renter pool), and whether they've rented
+// from this account continuously since that check (approved check + continuous
+// tenancy since = no new check needed). S655: never another company's checks
+// or leases.
+//
+// 10/5 (Nic, prepaid stays): most long-stay guests never sign a lease, so their
+// STAYS at this account count toward "continuously since" the same as leases —
+// otherwise an approved guest who keeps paying ahead month after month would be
+// re-screened (and re-charged) on every new stay. The person is found by their
+// tenant account when the caller knows it, else by the guest's email.
+const CONTINUITY_GAP_DAYS = 30   // move-between-units grace when chaining leases and stays
 
-interface GuestScreeningContext {
+export interface GuestScreeningContext {
   priorStays: number
   approvedCheckAt: string | null           // date of latest approved GAM check
-  continuousTenancySince: boolean          // leases chain from that check to today
+  /** That check's row, so a caller can tell the check run for THIS stay from an older one. */
+  approvedCheckId: string | null
+  approvedCheckCreatedAt: string | null    // ISO instant the check row was made
+  continuousTenancySince: boolean          // leases and stays chain from that check to today
 }
 
-async function guestScreeningContext(
-  guestEmail: string | null, landlordId: string, tz: string | null,
+export async function guestScreeningContext(
+  guestEmail: string | null, landlordId: string, tz: string | null, tenantId?: string | null,
 ): Promise<GuestScreeningContext> {
-  const out: GuestScreeningContext = { priorStays: 0, approvedCheckAt: null, continuousTenancySince: false }
-  if (!guestEmail) return out
+  const out: GuestScreeningContext = {
+    priorStays: 0, approvedCheckAt: null, approvedCheckId: null, approvedCheckCreatedAt: null,
+    continuousTenancySince: false,
+  }
+  const person = tenantId
+    ? await queryOne<{ user_id: string; tenant_id: string | null; email: string | null }>(
+        `SELECT u.id AS user_id, t.id AS tenant_id, u.email
+           FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [tenantId])
+    : guestEmail
+    ? await queryOne<{ user_id: string; tenant_id: string | null; email: string | null }>(
+        `SELECT u.id AS user_id, t.id AS tenant_id, u.email
+           FROM users u LEFT JOIN tenants t ON t.user_id = u.id
+          WHERE LOWER(u.email) = LOWER($1) LIMIT 1`, [guestEmail])
+    : null
+  const email = (guestEmail || person?.email || '').trim().toLowerCase() || null
+  const personTenant = person?.tenant_id ?? tenantId ?? null
+  if (!email && !personTenant) return out
 
-  const person = await queryOne<{ user_id: string; tenant_id: string | null }>(
-    `SELECT u.id AS user_id, t.id AS tenant_id
-       FROM users u LEFT JOIN tenants t ON t.user_id = u.id
-      WHERE LOWER(u.email) = LOWER($1) LIMIT 1`, [guestEmail])
+  // The guest's stays at this account (any of its companies), by their tenant
+  // account or the email on the booking.
+  const staysSql = `FROM unit_bookings b
+      WHERE b.landlord_id IN (SELECT public.account_companies($1))
+        AND ((b.tenant_id IS NOT NULL AND b.tenant_id = $2::uuid)
+             OR ($3::text IS NOT NULL AND LOWER(b.guest_email) = $3::text))`
 
   // S654: a stay is "prior" once its check-out is before the park's today —
   // the same calendar the continuity walk below counts from.
   const stays = await queryOne<{ n: string }>(
-    `SELECT COUNT(*) AS n FROM unit_bookings
-      WHERE LOWER(guest_email) = LOWER($1) AND landlord_id = $2
-        AND status IN ('checked_out', 'confirmed', 'checked_in')
-        AND check_out < $3::date`, [guestEmail, landlordId, todayIn(tz)])
+    `SELECT COUNT(*) AS n ${staysSql}
+        AND b.status IN ('checked_out', 'confirmed', 'checked_in')
+        AND b.check_out < $4::date`, [landlordId, personTenant, email, todayIn(tz)])
   out.priorStays = Number(stays?.n ?? 0)
   if (!person) return out
 
@@ -53,8 +76,8 @@ async function guestScreeningContext(
   // "Renter pool" means a check run through GAM's pool intake (no company),
   // not any check with the share box ticked — a check another company ran is
   // that company's decision even when the applicant agreed to share it.
-  const check = await queryOne<{ at: string }>(
-    `SELECT COALESCE(bc.decided_at, bc.created_at) AS at FROM background_checks bc
+  const check = await queryOne<{ id: string; at: string; created_at: Date }>(
+    `SELECT bc.id, COALESCE(bc.decided_at, bc.created_at) AS at, bc.created_at FROM background_checks bc
       WHERE bc.status = 'approved' AND (bc.user_id = $1 OR bc.tenant_id = $2)
         AND (${pooledCheckSql('bc')} OR bc.landlord_id IN (SELECT public.account_companies($3)))
       ORDER BY COALESCE(bc.decided_at, bc.created_at) DESC LIMIT 1`,
@@ -64,37 +87,61 @@ async function guestScreeningContext(
   // approved on the property's calendar; the UTC day reads as tomorrow for a
   // check decided after 5 pm in Phoenix.
   out.approvedCheckAt = dateIn(tz, new Date(check.at))
+  out.approvedCheckId = check.id
+  out.approvedCheckCreatedAt = new Date(check.created_at).toISOString()
 
-  if (person.tenant_id) {
-    // Continuous = their leases with THIS account (any of its companies, via
-    // the lease_tenants junction), merged with a small move-between-properties
-    // grace, cover check-date → today. S655: it walked leases at every GAM
-    // landlord, which told this company where else the guest had lived.
-    // S654: ::text — pg hands a bare DATE back as a JS Date, and String(Date)
-    // .slice(0, 10) is "Fri Jul 10", which made every lease below an Invalid
-    // Date: the walk never advanced and continuity was judged off the check
-    // date alone.
-    const leases = await query<{ start_date: string; end_date: string | null }>(
-      `SELECT l.start_date::text AS start_date, l.end_date::text AS end_date
-         FROM leases l
-         JOIN lease_tenants lt ON lt.lease_id = l.id
-        WHERE lt.tenant_id = $1 AND l.status NOT IN ('pending', 'cancelled')
-          AND l.landlord_id IN (SELECT public.account_companies($2))
-        ORDER BY l.start_date ASC`, [person.tenant_id, landlordId])
-    let cover = new Date(out.approvedCheckAt + 'T12:00:00Z')
-    // S654: today is the property's calendar day, anchored at noon UTC like
-    // the lease dates, so the 30-day grace is counted in whole days and does
-    // not flip with the hour.
-    const today = new Date(todayIn(tz) + 'T12:00:00Z')
-    for (const l of leases) {
-      const s = new Date(String(l.start_date).slice(0, 10) + 'T12:00:00Z')
-      const e = l.end_date ? new Date(String(l.end_date).slice(0, 10) + 'T12:00:00Z') : today
-      if (s.getTime() - cover.getTime() > CONTINUITY_GAP_DAYS * 86400000) break
-      if (e > cover) cover = e
-    }
-    out.continuousTenancySince = today.getTime() - cover.getTime() <= CONTINUITY_GAP_DAYS * 86400000
+  // Continuous = their leases with THIS account (any of its companies, via
+  // the lease_tenants junction) and — 10/5 — their stays here, merged with a
+  // small move-between-spaces grace, cover check-date → today. S655: it walked
+  // leases at every GAM landlord, which told this company where else the guest
+  // had lived.
+  // S654: ::text — pg hands a bare DATE back as a JS Date, and String(Date)
+  // .slice(0, 10) is "Fri Jul 10", which made every lease below an Invalid
+  // Date: the walk never advanced and continuity was judged off the check
+  // date alone.
+  const leases = person.tenant_id
+    ? await query<{ start_date: string; end_date: string | null }>(
+        `SELECT l.start_date::text AS start_date, l.end_date::text AS end_date
+           FROM leases l
+           JOIN lease_tenants lt ON lt.lease_id = l.id
+          WHERE lt.tenant_id = $1 AND l.status NOT IN ('pending', 'cancelled')
+            AND l.landlord_id IN (SELECT public.account_companies($2))`, [person.tenant_id, landlordId])
+    : []
+  const stayRows = await query<{ start_date: string; end_date: string }>(
+    `SELECT b.check_in::text AS start_date, b.check_out::text AS end_date ${staysSql}
+        AND b.status IN ('confirmed', 'checked_in', 'checked_out')`,
+    [landlordId, personTenant, email])
+  const spans = [...leases, ...stayRows]
+    .sort((a, b) => String(a.start_date).localeCompare(String(b.start_date)))
+  let cover = new Date(out.approvedCheckAt + 'T12:00:00Z')
+  // S654: today is the property's calendar day, anchored at noon UTC like
+  // the lease dates, so the 30-day grace is counted in whole days and does
+  // not flip with the hour.
+  const today = new Date(todayIn(tz) + 'T12:00:00Z')
+  for (const l of spans) {
+    const s = new Date(String(l.start_date).slice(0, 10) + 'T12:00:00Z')
+    const e = l.end_date ? new Date(String(l.end_date).slice(0, 10) + 'T12:00:00Z') : today
+    if (s.getTime() - cover.getTime() > CONTINUITY_GAP_DAYS * 86400000) break
+    if (e > cover) cover = e
   }
+  out.continuousTenancySince = today.getTime() - cover.getTime() <= CONTINUITY_GAP_DAYS * 86400000
   return out
+}
+
+/**
+ * The landlord-facing sentence about what this account already knows of the
+ * guest (S547/S655): an approved check and continuity since, prior stays, or
+ * nothing on file. Everything here is this account's own record (plus a check
+ * the guest shared through the renter pool) — never another company's.
+ */
+export function screeningHistorySentence(ctx: GuestScreeningContext): string {
+  return ctx.approvedCheckAt && ctx.continuousTenancySince
+    ? ` They passed a background check on ${ctx.approvedCheckAt} and have stayed with you continuously since — no new check is needed.`
+    : ctx.approvedCheckAt
+    ? ` They passed a background check on ${ctx.approvedCheckAt}, but haven't stayed with you continuously since.`
+    : ctx.priorStays > 0
+    ? ` They've stayed with you ${ctx.priorStays} time${ctx.priorStays === 1 ? '' : 's'} before; no background check with you is on file.`
+    : ' No background check with you is on file for this guest.'
 }
 
 /**
@@ -105,170 +152,32 @@ async function guestScreeningContext(
  * deposit amount. The ONE definition: the lease drafted from the reservation
  * takes this off its first bill (jobs/moveInBundle) and the landlord's notice
  * here names the same amount.
+ *
+ * 10/5 (Nic, prepaid stays — M4): a lease chosen AFTER the stay began starts
+ * on the day it is drafted (services/stayTerms draftLeaseFromStay), not back on
+ * the check-in day. The nights already stayed before it were the stay's and
+ * were paid as the stay, so they are not credited to the lease: what comes off
+ * its first bill is only what was paid for the nights from the lease's first
+ * day on — the stay's price for those nights, by night, out of what was paid.
+ * Credited once, on that first bill (dated the lease's start, today).
  */
-export const RESERVATION_PAID_SQL =
+const PAID_TOWARD_SQL =
   `(CASE WHEN b.balance_paid_at IS NOT NULL THEN b.total_amount
          WHEN b.deposit_paid_at IS NOT NULL THEN COALESCE(b.deposit_amount, b.total_amount)
     END)`
+const NIGHTS_STAYED_BEFORE_LEASE_SQL =
+  `COALESCE((SELECT ROUND(b.total_amount * (LEAST(sl.start_date, b.check_out) - b.check_in)::numeric
+                          / NULLIF(b.check_out - b.check_in, 0), 2)
+               FROM leases sl
+              WHERE sl.source_booking_id = b.id AND sl.start_date > b.check_in
+              ORDER BY sl.created_at DESC LIMIT 1), 0)`
+export const RESERVATION_PAID_SQL =
+  `(CASE WHEN ${PAID_TOWARD_SQL} IS NOT NULL
+         THEN GREATEST(${PAID_TOWARD_SQL} - ${NIGHTS_STAYED_BEFORE_LEASE_SQL}, 0)
+    END)`
 
-// S526 (Nic): "anyone staying 30 or more days needs to be drafted a lease
-// automatically" — guests often just keep staying. When a reservation is
-// created or its dates change and the stay meets the property's threshold
-// (30 days; 7 when the property runs weekly leases — weekly_lease_mode),
-// draft a PENDING lease from the booking for the landlord to review:
-//   * lease_source 'booking_draft', needs_review TRUE (landlord completes:
-//     attach the tenant account, adjust rent/terms, send for signature)
-//   * rent = the unit's monthly rent (fallback: its monthly stay rate)
-//   * idempotent per booking via the unique source_booking_id index —
-//     re-checks (extend, move) never create a second draft.
-// Best-effort by design: callers .catch() so a draft failure never fails
-// the reservation itself.
-export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ drafted: boolean; leaseId?: string }> {
-  const booking = await queryOne<any>(
-    `SELECT b.id, b.unit_id, b.landlord_id, b.status, b.check_in, b.check_out, b.guest_name, b.guest_email,
-            ${RESERVATION_PAID_SQL}::text AS paid_toward_stay,
-            -- the whole stay: paid in full, or a payment stamped with no separate deposit amount
-            (b.balance_paid_at IS NOT NULL OR (b.deposit_paid_at IS NOT NULL AND b.deposit_amount IS NULL)) AS paid_whole,
-            u.rent_amount, u.monthly_rate, u.unit_number,
-            p.weekly_lease_mode, p.timezone
-       FROM unit_bookings b
-       JOIN units u ON u.id = b.unit_id
-       JOIN properties p ON p.id = u.property_id
-      WHERE b.id = $1`,
-    [bookingId],
-  )
-  if (!booking) return { drafted: false }
-  if (['cancelled', 'no_show', 'checked_out'].includes(booking.status)) return { drafted: false }
-
-  const nights = Math.round(
-    (new Date(booking.check_out).getTime() - new Date(booking.check_in).getTime()) / 86400000,
-  )
-  const threshold = booking.weekly_lease_mode ? 7 : 30
-  if (nights < threshold) return { drafted: false }
-
-  // One draft per booking — the unique partial index backs this up.
-  const existing = await queryOne<{ id: string }>(
-    `SELECT id FROM leases WHERE source_booking_id = $1`,
-    [bookingId],
-  )
-  if (existing) return { drafted: false, leaseId: existing.id }
-
-  const rent = Number(booking.rent_amount) > 0
-    ? Number(booking.rent_amount)
-    : Number(booking.monthly_rate) > 0 ? Number(booking.monthly_rate) : 0
-
-  const rows = await query<any>(
-    `INSERT INTO leases
-       (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date,
-        needs_review, lease_source, source_booking_id)
-     VALUES ($1, $2, $3, 'fixed_term', 'pending', $4, $5, TRUE, 'booking_draft', $6)
-     ON CONFLICT (source_booking_id) WHERE source_booking_id IS NOT NULL DO NOTHING
-     RETURNING id`,
-    [booking.unit_id, booking.landlord_id, rent, booking.check_in, booking.check_out, bookingId],
-  )
-  const leaseId = rows[0]?.id
-  if (leaseId) {
-    logger.info({ bookingId, leaseId, nights, threshold },
-      '[booking-lease-draft] stay met the lease threshold — draft lease created')
-    // In-app heads-up to the landlord — the draft needs a tenant + review.
-    // Best-effort: a notification failure never unwinds the draft.
-    try {
-      const owner = await queryOne<{ user_id: string }>(
-        `SELECT user_id FROM landlords WHERE id = $1`, [booking.landlord_id])
-      if (owner) {
-        const ctx = await guestScreeningContext(booking.guest_email, booking.landlord_id, booking.timezone)
-
-        // ── S639 (Nic): A LONG STAY IS SCREENED AUTOMATICALLY ───────────────
-        //
-        // "When the reservation is longer than thirty days, don't have me
-        // manually click on a thing to send a request for screening. Longer
-        // than thirty days, they automatically get the link for the background
-        // check."
-        //
-        // The notification below already warned that screening some guests and
-        // not others in the same situation can be considered discriminatory —
-        // and then handed the landlord a button that makes exactly that choice,
-        // guest by guest, at the moment they are looking at somebody's name.
-        // The consistent policy is the automatic one: every stay that crosses
-        // the threshold gets the same email, so there is no judgment call to
-        // apply unevenly.
-        //
-        // Skipped for a guest who already passed a GAM check and has had
-        // continuous tenancy since — that is the same rule the landlord was
-        // being told to apply by hand, and asking them to pay for a second
-        // check they do not need is its own unfairness.
-        const alreadyCleared = !!ctx.approvedCheckAt && !!ctx.continuousTenancySince
-        let screeningEmailed = false
-        if (booking.guest_email && !alreadyCleared) {
-          try {
-            const { emailBackgroundCheckScreeningRequest } = await import('./email')
-            const prop = await queryOne<{ name: string; id: string }>(
-              `SELECT p.name, p.id FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
-              [booking.unit_id])
-            // 10/4: the link names this landlord, park and site. Without them the
-            // tenant page has nobody in scope and runs the guest through the
-            // speculative renter-pool check — not this landlord's screening.
-            const qs = new URLSearchParams({ landlordId: booking.landlord_id, unitId: booking.unit_id })
-            if (prop?.id) qs.set('propertyId', prop.id)
-            await emailBackgroundCheckScreeningRequest(
-              booking.guest_email, booking.guest_name, prop?.name || 'the property',
-              `${(process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com').replace(/\/$/, '')}/background-check?${qs.toString()}`,
-              // 10/5: replies reach the people who run this property (services/replyRouting).
-              { landlordId: booking.landlord_id, replyTo: prop?.id ? { kind: 'property', propertyId: prop.id } : undefined })
-            screeningEmailed = true
-            logger.info({ bookingId, leaseId, nights },
-              '[booking-lease-draft] screening request emailed automatically to long-stay guest')
-          } catch (e) {
-            logger.error({ err: e, bookingId }, '[booking-lease-draft] auto screening email failed')
-          }
-        }
-        // S655: everything here is this account's own record (plus a check the
-        // guest shared through the renter pool) — never another company's.
-        const history = ctx.approvedCheckAt && ctx.continuousTenancySince
-          ? ` They passed a background check on ${ctx.approvedCheckAt} and have rented from you continuously since — no new check is needed.`
-          : ctx.approvedCheckAt
-          ? ` They passed a background check on ${ctx.approvedCheckAt}, but haven't rented from you continuously since.`
-          : ctx.priorStays > 0
-          ? ` They've stayed with you ${ctx.priorStays} time${ctx.priorStays === 1 ? '' : 's'} before; no background check with you is on file.`
-          : ' No background check with you is on file for this guest.'
-        // 10/3 (decisions #15): what was paid toward the reservation (at the
-        // register or on the booking site) is part of the stay's price — the
-        // lease's first bill takes it off the rent (jobs/moveInBundle), so the
-        // landlord is told it will not be billed twice. Said as the code does
-        // it: the first bill is written when the lease is signed, from what has
-        // been paid by then (RESERVATION_PAID_SQL), and what that bill's rent
-        // does not use is kept as credit toward the next one.
-        const paidTowardStay = Number(booking.paid_toward_stay ?? 0)
-        const depositLine = paidTowardStay > 0
-          ? (booking.paid_whole
-              ? ` The $${paidTowardStay.toFixed(2)} already paid for the whole stay comes off the lease's first bill.`
-              : ` The $${paidTowardStay.toFixed(2)} deposit already paid on the reservation comes off the lease's first bill.`)
-            + ' Anything more than that bill\'s rent is kept as credit toward the next one.'
-          : ' A deposit paid on the reservation before the lease is signed comes off its first bill.'
-        await createNotification({
-          userId: owner.user_id,
-          landlordId: booking.landlord_id,
-          type: 'lease_drafted_from_booking',
-          title: screeningEmailed ? 'Long stay — screening sent' : 'Long stay — draft lease ready',
-          body: `${booking.guest_name || 'A guest'} is requesting a ${nights}-night stay on unit ${booking.unit_number}. A draft lease is ready on your Leases page.${history} `
-            + (screeningEmailed
-                ? 'A background-check link has been emailed to them automatically, as it is for every stay over the threshold — nothing to do until it comes back.'
-                : alreadyCleared
-                ? 'No screening was sent: they already passed a background check and have rented from you continuously since.'
-                : 'No screening was sent because the reservation has no guest email on file.')
-            + depositLine,
-          data: {
-            leaseId, bookingId,
-            priorStays: ctx.priorStays,
-            approvedCheckAt: ctx.approvedCheckAt,
-            continuousTenancySince: ctx.continuousTenancySince,
-          },
-          actionUrl: `/leases?open=${leaseId}`,   // S527 W-1: deep-link to the draft
-        })
-      }
-    } catch (err) {
-      logger.error({ err, bookingId, leaseId }, '[booking-lease-draft] notification failed')
-    }
-  }
-  return { drafted: !!leaseId, leaseId }
-}
+// S526 drafted a lease automatically once a reservation reached 30 nights (7
+// at weekly-lease parks). 10/5 (Nic, R3): "No automatic lease anywhere." A
+// lease from a stay is drafted ONLY when lease was chosen — services/stayTerms
+// draftLeaseFromStay — and screening rides on the payment (stayTerms
+// recordScreeningPrepayment). The old auto-draft is gone.

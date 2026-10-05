@@ -18,10 +18,11 @@ import { PAUSED_CYCLE_NOTE, PAUSED_CYCLE_MARKER_SQL } from './utilityPausedCycle
 //   rubs — Ratio Utility Billing System. One master meter serves multiple
 //     units. The master cycle reading is allocated across units by the
 //     configured rubs_allocation_method:
-//       occupant_count — number of active lease tenants per unit
+//       occupant_count — number of active lease tenants per unit (a site
+//                        with a stay and no lease counts as one person)
 //       sqft           — units.sqft
 //       bedrooms       — units.bedrooms
-//       rented_spaces  — 1/N across the units actually LEASED
+//       rented_spaces  — 1/N across the units actually LEASED or stayed on
 //       fixture_count  — units.water_fixture_count
 //       unit_type_weight / hybrid — see rubs_weights
 //     Each unit's share of the base_fee is allocated by the same ratio.
@@ -706,6 +707,40 @@ async function allocationBases(
     return Number(pending?.count || 0)
   }
 
+  /**
+   * 10/5 (Nic): "stay guests would share any RUBS billing — just count them all
+   * as one person. It's never going to be a perfect situation, but one person on
+   * a RUBS situation is better than not counting them at all; then the other
+   * tenants are paying for their cost, for their usage."
+   *
+   * A site someone STAYED on during the cycle — any stay, one night to months,
+   * with no lease — is occupied for the split: one rented space, one person.
+   * A stay that pays its own utilities (30+ nights with no lease, R11 — the
+   * agreement tied to the stay) is billed that share (tryInsertBill). A shorter
+   * stay's utilities are included in its rate, so its share is billed to nobody
+   * and stays with the landlord, the way an owner-occupied space's does — never
+   * divided among the tenants.
+   */
+  const hadStay = async (unitId: string): Promise<boolean> => {
+    const stay = await queryOne<{ n: number }>(`
+      SELECT 1 AS n FROM unit_bookings b
+       WHERE b.unit_id = $1
+         AND b.status IN ('confirmed', 'checked_in', 'checked_out')
+         AND b.check_in < ($2::date + interval '1 month')::date
+         AND b.check_out > $2::date
+      UNION ALL
+      SELECT 1 AS n FROM utility_service_agreements sa
+       WHERE sa.unit_id = $1 AND sa.booking_id IS NOT NULL
+         AND (sa.status = 'active' OR (sa.status = 'ended' AND sa.end_date IS NOT NULL))
+         -- a stay that never happened (cancelled before arrival, no-show) ends
+         -- the day it began: nobody stayed, nobody counted.
+         AND (sa.end_date IS NULL OR sa.end_date > sa.start_date)
+         AND sa.start_date < ($2::date + interval '1 month')::date
+         AND COALESCE(sa.end_date, 'infinity'::date) > $2::date
+      LIMIT 1`, [unitId, cycleIso])
+    return !!stay
+  }
+
   /** Is this space rented for the cycle? Measured the same way tryInsertBill
    *  attributes a bill — the lease covering the START of the cycle month — so a
    *  space that turned over mid-month counts once, not twice. */
@@ -720,7 +755,8 @@ async function allocationBases(
          AND ${leaseInForceOn('$2::date')}
          -- S650: a lease asleep for the whole cycle takes no share.
          AND NOT (COALESCE(l.is_hibernating, FALSE) AND l.hibernated_at <= $2::date)`, [unitId, cycleIso])
-    return Number(r?.n || 0) > 0
+    if (Number(r?.n || 0) > 0) return true
+    return hadStay(unitId)
   }
 
   const out: Array<{ unitId: string; basis: number }> = []
@@ -762,9 +798,11 @@ async function allocationBases(
       // is "how many people live in a space with no lease to count from",
       // which is exactly as true next door as it is for an owner.
       case 'occupant_count':
+        // 10/5 (Nic): a site with a stay and no one else to count is one person
+        // (hadStay) — never zero, which would put the guest's water on the tenants.
         basis = (u.status === 'owner_use' || u.status === 'utility_service')
           ? Math.max(1, Number(u.owner_household_size || 1))
-          : await occupants(u.unit_id)
+          : (await occupants(u.unit_id)) || (await hadStay(u.unit_id) ? 1 : 0)
         break
       // Per plumbing fixture — an old and still widespread water basis, on the
       // theory that fixtures proxy draw better than floor area. A unit with no
@@ -1679,6 +1717,7 @@ export async function generateBillsForMeter(
       usageAmount: null,
       allocationMethod: meter.rubs_allocation_method,
       allocationBasis: a.basis,
+      pooledShare: true,
       ratePerUnit,
       baseFeeShare: a.baseFeeShare,
       chargeAmount: a.chargeAmount,
@@ -2003,6 +2042,9 @@ interface InsertBillArgs {
    *  master's closing date, which is what dates its billing period. */
   readingStartDate?: string | Date | null
   readingEndDate?: string | Date | null
+  /** 10/5 (Nic): a share of a pooled master (RUBS). A stay billed through its
+   *  utility agreement pays it only for the part of the month it was there. */
+  pooledShare?: boolean
   /** 10/3 (final sweep): this is a move-out read (billMoveOutRead). It bills
    *  the household it closes out, even when the read lands after that
    *  household's last day — a late final read folds the gap days into the
@@ -2394,14 +2436,73 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
   // asks "does the signed lease pass this utility through", and the whole point
   // of a service agreement is that utilities are the ONLY thing owed. Agreeing
   // to the service IS the responsibility.
+  //
+  // 10/5 (Nic, prepaid stays — M7): a STAY of 30+ nights with no lease pays
+  // its site's utilities through an agreement tied to the stay (booking_id,
+  // services/stayTerms syncStayUtilityAgreement), and it is billed the way a
+  // lease that starts or ends mid-cycle is:
+  //   - only usage inside its own dates. The meter's span (the read before →
+  //     this read) is billed to the stay only when its dates overlap it — it
+  //     arrived before the read's day and was still there after the read
+  //     before — and no OTHER guest stayed on the site inside that span (the
+  //     turnover read at their departure, which check-in waits for, is what
+  //     normally starts the span on the day the stay began).
+  //   - its final stretch even after it ended. An agreement that has ended
+  //     still bills the spans its dates cover: the check-out read is a
+  //     move-out read (services/utilityReadingRuns) that bills it from the
+  //     read before to the day they left, and a month read with no check-out
+  //     read in between folds those days in (S548, as a late final read does
+  //     for a departing lease).
+  // The other-guest test is for a metered span only; a flat or pooled charge
+  // for the month goes to the stay its dates overlap.
+  // A move-out read prefers the agreement it closes out (ended by the read's
+  // day), then the newest — the lease rule above. A month read prefers the one
+  // in place at the read before, then the newest.
+  // A serviced space (no stay behind it) keeps its rule — any agreement in
+  // force during the cycle month — now including one ended inside the cycle,
+  // so the month it ended is still billed.
   let serviceAgreementId: string | null = null
   if (!lt) {
-    const sa = await queryOne<{ id: string; tenant_id: string }>(`
-      SELECT id, tenant_id FROM utility_service_agreements
-       WHERE unit_id = $1 AND status = 'active'
-         AND start_date <= ($2::date + interval '1 month' - interval '1 day')
-         AND (end_date IS NULL OR end_date >= $2::date)
-       LIMIT 1`, [args.unitId, args.cycleMonth])
+    const spanStart = isoDay(args.readingStartDate) ?? args.cycleMonth
+    const spanEnd = isoDay(args.readingEndDate) ?? lastDayOfCycle(args.cycleMonth)
+    const sa = await queryOne<{ id: string; tenant_id: string; month_part: string }>(`
+      SELECT sa.id, sa.tenant_id,
+             -- 10/5 (Nic): the part of the cycle month a STAY was there (nights
+             -- inside the month ÷ days in the month); 1 for a serviced space.
+             CASE WHEN sa.booking_id IS NULL THEN 1
+                  ELSE GREATEST(0, LEAST(COALESCE(sa.end_date, 'infinity'::date), ($2::date + interval '1 month')::date)
+                                   - GREATEST(sa.start_date, $2::date))::numeric
+                       / (($2::date + interval '1 month')::date - $2::date)
+             END::text AS month_part
+        FROM utility_service_agreements sa
+       WHERE sa.unit_id = $1
+         AND (sa.status = 'active' OR (sa.status = 'ended' AND sa.end_date IS NOT NULL))
+         AND (
+           (sa.booking_id IS NULL AND NOT $5::boolean
+             AND sa.start_date <= ($2::date + interval '1 month' - interval '1 day')
+             AND (sa.end_date IS NULL OR sa.end_date >= $2::date))
+           OR ((sa.booking_id IS NOT NULL OR $5::boolean)
+             -- a stay agreement ended the day it began (cancelled before
+             -- arrival, a no-show) covers no night and bills nothing.
+             AND (sa.booking_id IS NULL OR sa.end_date IS NULL OR sa.end_date > sa.start_date)
+             AND sa.start_date < $4::date
+             AND COALESCE(sa.end_date, 'infinity'::date) > $3::date
+             AND (sa.booking_id IS NULL OR NOT $6::boolean OR NOT EXISTS (
+               SELECT 1 FROM unit_bookings ob
+                WHERE ob.unit_id = sa.unit_id AND ob.id <> sa.booking_id
+                  AND ob.status IN ('confirmed', 'checked_in', 'checked_out')
+                  AND ob.check_in < $4::date AND ob.check_out > $3::date
+                  -- the same guest's back-to-back stay on this site is still them
+                  AND NOT EXISTS (SELECT 1 FROM utility_service_agreements osa
+                                   WHERE osa.booking_id = ob.id AND osa.tenant_id = sa.tenant_id))))
+         )
+       ORDER BY CASE WHEN $5::boolean THEN COALESCE(sa.end_date, 'infinity'::date) <= $4::date
+                     ELSE sa.start_date <= $3::date END DESC,
+                sa.start_date DESC
+       LIMIT 1`, [args.unitId, args.cycleMonth, spanStart, spanEnd, !!args.moveOut,
+                  // A METERED span (both reads dated): whose usage it holds is a
+                  // question of who was there. A flat or pooled charge is not.
+                  !!(isoDay(args.readingStartDate) && isoDay(args.readingEndDate))])
     if (!sa) {
       // S629: no lease and no service agreement. If the unit has people INVITED
       // to it, this is onboarding rather than a vacancy — they are living there
@@ -2424,6 +2525,22 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
     }
     serviceAgreementId = sa.id
     lt = { lease_id: null as any, tenant_id: sa.tenant_id }
+    // 10/5 (Nic): "we would just do a prorated amount for the days they were
+    // there in that month pertaining to their share of the water bill. So if
+    // their share was $10, and they were only there a third of the month, then
+    // it would be $3.33." The stay still counts as one whole person in the split
+    // (allocationBases — so the tenants never carry the guest); the guest pays
+    // for their days, and the rest of the share stays with the landlord.
+    const part = Number(sa.month_part)
+    if (args.pooledShare && part >= 0 && part < 1) {
+      args = {
+        ...args,
+        chargeAmount: round2(args.chargeAmount * part),
+        baseFeeShare: round2(args.baseFeeShare * part),
+        ...(args.taxAmount != null ? { taxAmount: round2(args.taxAmount * part) } : {}),
+      }
+      if (!(args.chargeAmount > 0)) return false
+    }
   } else {
     // S650 (Nic): a HIBERNATING lease is asleep — "nothing bills". Asleep for
     // the whole cycle means no utility bill either; the landlord absorbs any

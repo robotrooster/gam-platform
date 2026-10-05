@@ -752,7 +752,7 @@ export async function promptTenantDateMeterReads(
 export async function getReadsDue(propertyId: string) {
   return query<any>(`
     WITH departures AS (
-      SELECT l.unit_id, l.end_date AS departed_on, l.id AS lease_id,
+      SELECT l.unit_id, l.end_date AS departed_on, l.id AS lease_id, FALSE AS stay_bills,
              (SELECT us.first_name || ' ' || us.last_name
                 FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id
                 JOIN users us ON us.id = t.user_id
@@ -762,7 +762,13 @@ export async function getReadsDue(propertyId: string) {
          AND l.end_date <= CURRENT_DATE AND l.end_date >= CURRENT_DATE - INTERVAL '60 days'
          AND l.status IN ('active','ended','expired')
       UNION ALL
-      SELECT b.unit_id, b.check_out AS departed_on, NULL::uuid AS lease_id, b.guest_name AS who
+      -- 10/5 (Nic, prepaid stays — M7): a stay of 30+ nights with no lease
+      -- pays its site's utilities (a utility service agreement tied to the
+      -- stay). Its check-out read is a move-out read that bills its last
+      -- stretch, the same as a departing lease's.
+      SELECT b.unit_id, b.check_out AS departed_on, NULL::uuid AS lease_id,
+             EXISTS (SELECT 1 FROM utility_service_agreements sa WHERE sa.booking_id = b.id) AS stay_bills,
+             b.guest_name AS who
         FROM unit_bookings b JOIN units u ON u.id = b.unit_id
        WHERE u.property_id = $1
          AND b.check_out >= CURRENT_DATE - INTERVAL '60 days'
@@ -771,7 +777,7 @@ export async function getReadsDue(propertyId: string) {
     )
     SELECT d.unit_id, u.unit_number, d.departed_on, d.lease_id, d.who,
            m.id AS meter_id, m.label AS meter_label, m.utility_type,
-           CASE WHEN d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)
+           CASE WHEN (d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) OR d.stay_bills
                 THEN 'move_out_final' ELSE 'stay_turnover' END AS reason
       FROM departures d
       JOIN units u ON u.id = d.unit_id
@@ -794,13 +800,16 @@ export async function getReadsDue(propertyId: string) {
 export async function unitPendingReads(unitId: string) {
   return query<any>(`
     WITH departures AS (
-      SELECT l.end_date AS departed_on, l.id AS lease_id
+      SELECT l.end_date AS departed_on, l.id AS lease_id, FALSE AS stay_bills
         FROM leases l
        WHERE l.unit_id = $1 AND l.end_date IS NOT NULL
          AND l.end_date <= CURRENT_DATE AND l.end_date >= CURRENT_DATE - INTERVAL '60 days'
          AND l.status IN ('active','ended','expired')
       UNION ALL
-      SELECT b.check_out AS departed_on, NULL::uuid AS lease_id
+      -- 10/5 (M7): a stay that pays its site's utilities is read out with a
+      -- move-out read that bills it (see getReadsDue).
+      SELECT b.check_out AS departed_on, NULL::uuid AS lease_id,
+             EXISTS (SELECT 1 FROM utility_service_agreements sa WHERE sa.booking_id = b.id) AS stay_bills
         FROM unit_bookings b
        WHERE b.unit_id = $1
          AND b.check_out >= CURRENT_DATE - INTERVAL '60 days'
@@ -811,7 +820,7 @@ export async function unitPendingReads(unitId: string) {
     -- twice). A billing move-out wins over a turnover; its lease rides along
     -- so the read bills that household.
     SELECT DISTINCT ON (m.id) m.id AS meter_id, m.label AS meter_label, m.utility_type,
-           CASE WHEN d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)
+           CASE WHEN (d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) OR d.stay_bills
                 THEN 'move_out_final' ELSE 'stay_turnover' END AS reason,
            CASE WHEN d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)
                 THEN d.lease_id END AS lease_id
@@ -825,7 +834,7 @@ export async function unitPendingReads(unitId: string) {
         SELECT 1 FROM utility_meter_readings r
          WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)
      ORDER BY m.id,
-              (d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) DESC,
+              ((d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) OR d.stay_bills) DESC,
               d.departed_on DESC`,
     [unitId])
 }

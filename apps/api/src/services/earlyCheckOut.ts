@@ -1043,6 +1043,11 @@ export async function decideEarlyCheckOut(input: DecideInput): Promise<DecideRes
     const { expireClosedLinks } = await import('../routes/posPayLinks')
     await expireClosedLinks(closedLinks).catch((err) => logger.warn({ err, bookingId: input.bookingId }, '[early-checkout] could not close a pay page'))
   }
+  // 10/5 (Nic, R11 — M8): a no-lease stay of 30+ nights pays its site's
+  // utilities through an agreement tied to the stay. It ends on the day they
+  // left, early or on time, so it stops billing a guest who has gone (and its
+  // last stretch is billed by the check-out read).
+  await syncStayUtilities(input.bookingId)
 
   // #38 Q8: the lease ends on the day they left — moved by the schedule's own
   // lease sync (rent past it dropped, the last month repriced, rent already
@@ -1064,6 +1069,20 @@ export async function decideEarlyCheckOut(input: DecideInput): Promise<DecideRes
   const out = await finishDecision(decisionId, input.bookingId)
   if (handBack.length) out.words = [...handBack, ...out.words.filter((w) => !handBack.includes(w))]
   return out
+}
+
+/**
+ * R11 (M8): keep a stay's utility agreement in step after a check-out or an
+ * early departure (services/stayTerms syncStayUtilityAgreement). Best-effort
+ * after the commit — the check-out stands either way; a failure is logged.
+ */
+async function syncStayUtilities(bookingId: string): Promise<void> {
+  try {
+    const { syncStayUtilityAgreement } = await import('./stayTerms')
+    await syncStayUtilityAgreement(bookingId)
+  } catch (err) {
+    logger.error({ err, bookingId }, '[early-checkout] could not end the stay\'s utility agreement on the day they left')
+  }
 }
 
 /** What the desk reads when the lease could not be ended on the day they left. */
@@ -2263,6 +2282,8 @@ export async function onCheckOutUndone(client: PoolClient, bookingId: string,
 export async function afterPatchEarlyCheckOut(bookingId: string, actorUserId: string): Promise<string | null> {
   const s = await loadStay(poolQ, bookingId)
   if (!s || s.status !== 'checked_out') return null
+  // R11 (M8): the stay's utility agreement ends on the day they left.
+  await syncStayUtilities(bookingId)
   // #38 Q8: the lease ends on the day they left. A failure is reported (GAM
   // and the owner) and tried again by healLeaseEnd; the response says so.
   if (s.lease_id && !(await endLeaseOnLeftDay(bookingId))) return LEASE_NOT_ENDED_WORDS

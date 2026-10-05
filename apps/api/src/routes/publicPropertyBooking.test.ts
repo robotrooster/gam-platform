@@ -12,6 +12,8 @@ import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/
 import { publicPropertyBookingRouter, computeStayTotal } from './publicPropertyBooking'
 import { errorHandler } from '../middleware/errorHandler'
 import { todayIn, addDaysTo } from '../lib/timezone'
+import { DateTime } from 'luxon'
+import { processingFeeFor, stayHeldWords } from '@gam/shared'
 
 const { emailGuestStayLinkMock } = vi.hoisted(() => ({
   emailGuestStayLinkMock: vi.fn(async () => 'msg'),
@@ -259,5 +261,59 @@ describe('GET claim link', () => {
     expect(res.body.data.checkIn).toBe(plusDays(10))
     expect(res.body.data.checkOut).toBe(plusDays(12))
     expect(res.body.data.expired).toBe(false)
+  })
+})
+
+// ── 10/5 (Nic): the quote for a long stay ────────────────────────────────────
+describe('GET availability — 10/5 long stays', () => {
+  const round2 = (n: number) => Math.round(n * 100) / 100
+  async function longSite() {
+    const s = await seedSite()
+    await db.query(`UPDATE units SET monthly_rate = 900 WHERE id = $1`, [s.unitId])
+    await db.query(`UPDATE properties SET rent_due_mode = 'fixed_day', rent_due_day = 1 WHERE id = $1`, [s.propertyId])
+    return s
+  }
+  async function checkFee(): Promise<number> {
+    const { screeningIntakeFee } = await import('./background')
+    const f = await screeningIntakeFee(null)
+    return round2(f.screening + f.gamFee + f.tax)
+  }
+  const quote = async (from: number, to: number) => (await request(buildApp())
+    .get(`/api/public/property/sunny-rv-park/availability?checkIn=${plusDays(from)}&checkOut=${plusDays(to)}`)).body.data
+
+  it('under 22 nights: no background check, no question', async () => {
+    await longSite()
+    const t = (await quote(30, 33)).siteTypes[0]
+    expect(t.screeningFee).toBeNull()
+    expect(t.longStay).toBeNull()
+    expect(t.dueNow).toEqual({ stay: 60, screening: 0, cardFee: processingFeeFor({ amount: 60, paymentMethod: 'card' }),
+                               total: round2(60 + processingFeeFor({ amount: 60, paymentMethod: 'card' })) })
+  })
+
+  it('22–29 nights: the background check is a line of what is due now', async () => {
+    await longSite()
+    const fee = await checkFee()
+    const t = (await quote(30, 55)).siteTypes[0]
+    expect(t.screeningFee).toBe(fee)
+    expect(t.longStay).toBeNull()
+    expect(t.dueNow.screening).toBe(fee)
+    expect(t.dueNow.total).toBe(round2(t.dueNow.stay + fee + processingFeeFor({ amount: t.dueNow.stay + fee, paymentMethod: 'card' })))
+  })
+
+  it('30+ nights: both answers priced — lease deposit or the first month — with the R2 words', async () => {
+    await longSite()
+    const fee = await checkFee()
+    const ci = plusDays(30)
+    const t = (await quote(30, 95)).siteTypes[0]
+    const out = DateTime.fromISO(ci).plus({ months: 1 }).toISODate()!
+    expect(t.dueNow).toBeNull()
+    expect(t.longStay.words).toBe("A lease holds your site for as long as you stay. A stay holds it only through the time you've paid for.")
+    expect(t.longStay.monthlyRate).toBe(900)
+    // Lease: the flat long-stay deposit ($150 default) today; rent is the unit's monthly rent.
+    expect(t.longStay.lease.dueNow).toMatchObject({ stay: 150, screening: fee })
+    expect(t.longStay.lease.monthlyRent).toBe(1000)
+    expect(t.longStay.lease.rentWords).toMatch(/^Rent is due on the 1st of each month\./)
+    // Stay: one calendar month at the monthly rate, never prorated, held through its end.
+    expect(t.longStay.stay).toMatchObject({ checkOut: out, dueNow: { stay: 900, screening: fee }, heldWords: stayHeldWords(out) })
   })
 })

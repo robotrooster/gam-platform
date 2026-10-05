@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { insertPosSale } from '../services/posSale'
 import { recordSaleTowardStay } from '../services/stayPayments'
-import { cardFeeSplit, type CardFeePayer } from '@gam/shared'
+import { cardFeeSplit, STAY_TERMS, STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGHTS, stayHeldWords, type CardFeePayer, type StayTerms } from '@gam/shared'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 import { db, query, queryOne, getClient } from '../db'
@@ -13,6 +13,7 @@ import { holdForTheCart, createConnectionToken, registerReader, listReaders, arc
 import crypto from 'crypto'
 import { DateTime } from 'luxon'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 import { replyToProperty } from '../services/replyRouting'
 import { resolveLandlordTarget, ownsLandlord, landlordScopeIds } from '../lib/landlordScope'
 import { cardIdentityFromIntent, findOrCreateCustomerForCard, startSaveCardPrompt, readSaveCardAnswer, saveCardForCustomer, mergePosCustomers, readSaleCard, type CardIdentity, type CardCustomer } from '../services/posCustomerCards'
@@ -23,13 +24,17 @@ import {
   linkSaleToPerson, undoLink, saleTimeUndo, letGoOfPick, searchPeople, peopleQueryGuard, peopleSearchLimiter, crossCompanyLimiter,
   type CardOutcome, type LinkTarget, type StandIn,
 } from '../services/posPeople'
-import { reservationDue, releaseReservationTickets, ticketCarriesStay, stayItemIdsIn, stayTaxRate, taxInsidePayment, checkOutFor, priceStayBySchedule, type ReservationDue } from '../services/registerStay'
+import { reservationDue, releaseReservationTickets, ticketCarriesStay, stayItemIdsIn, stayTaxRate, taxInsidePayment, checkOutFor,
+  priceWholeStay, wholeStayPrice, leaseDepositFor, stayExtensionQuote, extendStayByMonth, payTowardStay, SCREENING_LINE_NAME,
+  type ReservationDue, type StayExtension } from '../services/registerStay'
+import { stayNeeds, recordScreeningPrepayment, markScreeningRequired, chooseStayTerms, screeningCollectedBy, continuousStayNights, screeningPaidForStay, type StayNeeds } from '../services/stayTerms'
 import {
   LINK_PAID_ONLINE, LINK_PAGE_STUCK, reservationNoDiscountWords, reservationPaidWords, reservationWhat, reservationLineName,
   closeLinkPageNow, closeOtherLinkCheckouts, closeIfPaidInFull, expireClosedLinks, linkOpenedMeanwhileWords,
   linkStayOf, linkBookingLines, assertLinkBookingLinesKept, linkReservation, linkReservationLine, linkReservationNowWords,
   linkAsksNow, linkReservationGoneWords, settleLinkBooking, closeStaleLinkPages, assertLinkStayWhole, linkStayNightsNowWords,
   reservationSaleLine, withLodgingTax, linkStayAsSent, tellLandlordIfLeftOwed,
+  linkScreeningLine, isScreeningLine, recordLinkScreening, afterLinkPaid, feeOnlyLinkNotPayable,
   type ClosedLink, type PagesClosed, type LinkReservation,
 } from './posPayLinks'
 
@@ -582,6 +587,60 @@ function assertCatalogItems(lines: { itemId?: string | null }[]): void {
   }
 }
 
+/** 10/5 (A5): what the clerk is told when a background check is rung on a charge account. */
+const CHARGE_ACCOUNT_NO_SCREENING = 'A background check cannot go on a charge account — it is paid when the stay is sold. '
+  + 'Take cash, a check or a card for this sale, then press Charge again. Nothing was charged.'
+/** 10/5 (A5): a check recorded for the stay a moment ago, by another payment — this sale is not taken. */
+const SCREENING_PAID_MEANWHILE = 'This guest\'s background check was paid a moment ago some other way — nothing was charged here. '
+  + 'Press Clear, then open the stay or ticket again.'
+
+/** A cart line that is a ticket's or link's background-check line: the same name and fee, one of it. */
+function isScreeningCartLine(it: any, own: { name: string; price: number }): boolean {
+  return !it?.id && String(it?.name ?? '') === own.name
+    && Math.round((Number(it?.price) || 0) * 100) === Math.round(own.price * 100) && Number(it?.qty) === 1
+}
+
+/**
+ * 10/5 (Nic, M2): the background-check line on a ticket the schedule handed
+ * the till (a reservation's ticket — booking_id), as the server wrote it.
+ * Null for any other ticket.
+ */
+async function ticketScreeningOf(landlordId: string, ticketId: unknown): Promise<{ name: string; price: number; bookingId: string } | null> {
+  if (typeof ticketId !== 'string' || !/^[0-9a-f-]{36}$/i.test(ticketId)) return null
+  const t = await queryOne<{ booking_id: string | null; items: any }>(
+    `SELECT booking_id, items FROM pos_open_tickets WHERE id = $1 AND landlord_id = $2`, [ticketId, landlordId])
+  if (!t?.booking_id) return null
+  const l = (Array.isArray(t.items) ? t.items : []).find(isScreeningLine)
+  if (!l || !(Number(l.price) > 0)) return null
+  // 10/5 (M3): the check was paid another way since the ticket was written (a
+  // link, another leg of the stay) — one fee per stay, never two. The line
+  // comes off the ticket and the clerk opens it again; nothing is charged.
+  if (await screeningPaidForStay(t.booking_id)) {
+    await query(
+      `UPDATE pos_open_tickets SET items = $2::jsonb, updated_at = NOW() WHERE id = $1 AND status = 'open'`,
+      [ticketId, JSON.stringify((t.items as any[]).filter((i) => !isScreeningLine(i)))])
+    throw new AppError(409, 'This guest\'s background check is already paid, so it was taken off this ticket — nothing was charged. '
+      + 'Press Clear, open the ticket again, then press Charge.')
+  }
+  return { name: String(l.name ?? SCREENING_LINE_NAME), price: round2(Number(l.price) || 0), bookingId: t.booking_id }
+}
+
+/** The background-check line a reservation ticket carries, exactly as the schedule wrote it (or null). */
+async function ticketScreeningLineAsWritten(landlordId: string, ticketId: unknown): Promise<any | null> {
+  if (typeof ticketId !== 'string' || !/^[0-9a-f-]{36}$/i.test(ticketId)) return null
+  const t = await queryOne<{ booking_id: string | null; items: any }>(
+    `SELECT booking_id, items FROM pos_open_tickets WHERE id = $1 AND landlord_id = $2`, [ticketId, landlordId])
+  if (!t?.booking_id) return null
+  return (Array.isArray(t.items) ? t.items : []).find(isScreeningLine) ?? null
+}
+/** A placeholder id that only stands in while a ticket's form is read (never written). */
+const ZERO_UUID = '00000000-0000-4000-8000-000000000000'
+
+/** A background check already recorded for this stay (not void) — its fee is not GAM's a second time. */
+async function screeningAlreadyPaid(bookingId: string): Promise<boolean> {
+  return !!(await queryOne(`SELECT 1 FROM screening_prepayments WHERE booking_id = $1 AND status <> 'void'`, [bookingId]))
+}
+
 /**
  * 10/2 (front desk foolproof): a cart line whose price or tax is below zero
  * (or not a number) is refused in the clerk's words, with the button to press —
@@ -833,8 +892,25 @@ export async function assertCashierPricing(req: any, lines: { itemId?: string | 
  * register's own) is refused before any money moves — never charged a number
  * the cashier did not see. One with no figure of its own is charged the
  * schedule's (the browser's price for a stay is never used).
+ *
+ * 10/5 (Nic, R5) — EXCEPT THAT THE REGISTER NEVER PRORATES. "Point of sale
+ * cannot prorate a stay": the figure is now whole nights, weeks or months at
+ * the site's rate for one of them (registerStay priceWholeStay), not the
+ * schedule's tiering — a month is the monthly rate, never cut into calendar
+ * pieces. Everything above about one figure, shown and charged, still holds.
  */
-interface CounterStayAt { unitId: string; checkIn: string }
+interface CounterStayAt {
+  unitId: string | null
+  checkIn: string | null
+  /** 10/5 (Nic, R7): the guest's email — whose back-to-back stays add up, and where a paid background check goes. */
+  guestEmail: string | null
+  /** 10/5 (Nic, R2): the counter's answer for a stay of 30+ nights — lease or no lease. */
+  stayTerms: StayTerms | null
+  /** 10/5 (Nic, R6): "Add a month" — the stay here now that the month lengthens. */
+  extendBookingId: string | null
+  /** 10/5 (Nic, R8): the background check's fee as the register shows it — refused when it is not the server's. */
+  screeningFee: number | null
+}
 
 /**
  * 10/3 (review): a stay rung at the counter whose site and dates are not
@@ -845,12 +921,30 @@ interface CounterStayAt { unitId: string; checkIn: string }
  */
 const UNPRICED_STAY = Symbol('stay not priced yet')
 
-/** The site and arrival a stay is rung for — on the sale, else on the stay's cart line. */
+const strOrNull = (x: unknown): string | null => (typeof x === 'string' && x.trim() ? x.trim() : null)
+
+/**
+ * The site and arrival a stay is rung for — on the sale, else on the stay's
+ * cart line (the card reader's calls carry only the cart). 10/5: with the
+ * guest's email, the counter's lease answer, the stay a month is added to and
+ * the background check's fee as shown, read the same two places.
+ */
 function counterStayAt(items: any[], stay: unknown): CounterStayAt | null {
-  const s: any = stay
-  if (s && typeof s.unitId === 'string' && s.unitId && typeof s.checkIn === 'string' && s.checkIn) return { unitId: s.unitId, checkIn: s.checkIn }
-  const line = (Array.isArray(items) ? items : []).find((i: any) => typeof i?.stayUnitId === 'string' && i.stayUnitId && typeof i?.stayCheckIn === 'string' && i.stayCheckIn)
-  return line ? { unitId: String(line.stayUnitId), checkIn: String(line.stayCheckIn) } : null
+  const s: any = stay && typeof stay === 'object' ? stay : null
+  const line: any = (Array.isArray(items) ? items : []).find((i: any) =>
+    (strOrNull(i?.stayUnitId) && strOrNull(i?.stayCheckIn)) || strOrNull(i?.stayExtend))
+  const unitId = strOrNull(s?.unitId) ?? strOrNull(line?.stayUnitId)
+  const checkIn = strOrNull(s?.checkIn) ?? strOrNull(line?.stayCheckIn)
+  const extendBookingId = strOrNull(s?.extendBookingId) ?? strOrNull(line?.stayExtend)
+  if (!(unitId && checkIn) && !extendBookingId) return null
+  const terms = s?.stayTerms ?? line?.stayTerms
+  const fee = s?.screeningFee ?? line?.screeningFee
+  return {
+    unitId, checkIn, extendBookingId,
+    guestEmail: strOrNull(s?.guestEmail) ?? strOrNull(line?.stayEmail),
+    stayTerms: (STAY_TERMS as readonly string[]).includes(terms) ? terms as StayTerms : null,
+    screeningFee: fee == null || fee === '' || !Number.isFinite(Number(fee)) ? null : Number(fee),
+  }
 }
 
 /**
@@ -892,17 +986,89 @@ export const counterStayNoDiscountWords = (press: string) =>
   `A stay is charged at the schedule's price — take the discount off, then press ${press} again. `
   + 'To charge less for the stay, change its price on the schedule; to discount other items, ring them on a sale of their own.'
 
-async function priceCounterStay(landlordId: string, propertyId: string | null, items: any[], at: CounterStayAt | null, press: string, discountAmount?: unknown): Promise<{
+/**
+ * 10/5 (Nic) — WHAT A STAY RUNG AT THE COUNTER COMES TO, AND WHAT IT NEEDS.
+ * Every pricing call (the quote, the card reader's charge and breakdown, the
+ * sale, the stay picker's own quote) reads it here:
+ *   - R5: priced in WHOLE nights, weeks or months at the rate for what one is
+ *     (registerStay priceWholeStay) — never prorated;
+ *   - R6: "Add a month" lengthens the stay that is here now by one calendar
+ *     month at the monthly rate (registerStay stayExtensionQuote);
+ *   - R1/R7/R8: the guest's continuous nights at this property (stayTerms
+ *     stayNeeds) — 22+ with no check on file adds the background check's fee
+ *     as a line of its own the clerk cannot take off;
+ *   - R2: 30+ nights is a lease or a stay, and the counter must say which. A
+ *     lease is paid its deposit now (its lease bills the rest); a stay is paid
+ *     whole and holds the site only through what is paid.
+ */
+export interface CounterStayPlan {
+  ext: StayExtension | null
+  unitId: string
+  unitNumber: string
+  /** The first night this sale pays for, and the check-out it pays through. */
+  checkIn: string
+  checkOut: string
+  /** The stay's own price: a new booking's whole price, or the month added. */
+  stayTotal: number
+  /** What this sale takes for it: its price, or (a lease chosen) its deposit. */
+  charge: number
+  /** The lodging tax inside `charge` (none in a deposit or a month). */
+  tax: { amount: number; rate: number }
+  needs: StayNeeds
+  /** The lease-or-stay answer that stands (given now, or by an earlier stay of the same continuous stay). */
+  terms: StayTerms | null
+  email: string | null
+  /** The background check's fee this sale carries (0 for none). */
+  screeningFee: number
+  /** "3 nights at site RV 01 (Oct 1 → Oct 4)" */
+  what: string
+}
+
+/** The background check's own line on a sale — added by the server only. */
+const SCREENING_LINE = Symbol('screening line')
+
+/** 10/5 (Nic, R2): what the counter asks for a stay of 30+ nights, in the words the guest is told online. */
+export const LEASE_OR_STAY_WORDS = 'A lease holds their site for as long as they stay. A stay holds it only through the time they have paid for.'
+
+/**
+ * 10/5: a stay that needs an answer is refused before any money moves —
+ * an email for 22+ continuous nights (R7: the check is sent to it and the
+ * nights add up by it), lease or no lease for 30+ (R2), and the background
+ * check's fee shown on the register before it is charged (R8).
+ */
+/**
+ * 10/5 (Nic, M5): "Add a month" answered LEASE sells no month — the lease is
+ * drafted instead (POST /pos/stays/lease) and bills the months from then on,
+ * exactly as the schedule's Add a month does. Selling the month is only for a stay.
+ */
+export const ADD_MONTH_LEASE_WORDS = 'They chose a lease, so no month is sold here — the lease holds their site and bills the months from now on. '
+  + 'Press Draft their lease in the stay window; it goes to the Leases page for the owner to review and send. Nothing was charged.'
+
+function assertStayAnswered(plan: CounterStayPlan, press: string): void {
+  if (plan.ext && plan.terms === 'lease') throw new AppError(409, ADD_MONTH_LEASE_WORDS)
+  if (plan.needs.nights >= STAY_SCREENING_NIGHTS && !plan.email) {
+    throw new AppError(400, `This stay comes to ${plan.needs.nights} nights in a row — a stay over three weeks needs the guest's email (their background check is sent to it). `
+      + `Tap the site and dates above Charge, type their email, press Use this site, then press ${press} again.`)
+  }
+  if (plan.needs.leaseChoice === 'needed') {
+    throw new AppError(409, `This stay comes to ${plan.needs.nights} nights in a row, so ask them: lease or no lease? ${LEASE_OR_STAY_WORDS} `
+      + `Tap the site and dates above Charge, press Lease or No lease, then press ${press} again. Nothing was charged.`)
+  }
+}
+
+async function priceCounterStay(landlordId: string, propertyId: string | null, items: any[], at: CounterStayAt | null, press: string, discountAmount?: unknown,
+                                opts: { strict?: boolean } = {}): Promise<{
   items: any[]; stayLines: { itemId: string; qty: number; stayUnit: 'night' | 'week' | 'month'; name: string; lineTotal: number }[]
+  plan: CounterStayPlan | null
 }> {
   const lines = Array.isArray(items) ? items : []
   const ids = [...new Set(lines.map((it: any) => lowerId(it?.id)).filter((x: string) => /^[0-9a-f-]{36}$/.test(x)))]
-  if (!ids.length) return { items: lines, stayLines: [] }
+  if (!ids.length) return { items: lines, stayLines: [], plan: null }
   const rows = await query<{ id: string; name: string; stay_unit: string }>(
     `SELECT id, name, stay_unit FROM pos_items
       WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND stay_unit IS NOT NULL`,
     [ids, landlordId])
-  if (!rows.length) return { items: lines, stayLines: [] }
+  if (!rows.length) return { items: lines, stayLines: [], plan: null }
   const at_ = lines.map((it: any, n: number) => (rows.some((r) => r.id === lowerId(it?.id)) ? n : -1)).filter((n) => n >= 0)
   if (at_.length > 1) {
     // Two stay lines is a stay whose length depends on which line you read.
@@ -921,29 +1087,78 @@ async function priceCounterStay(landlordId: string, propertyId: string | null, i
   // so the customer's screen on the reader leaves it off until it is priced.
   if (!at) {
     return { items: lines.map((it: any, k: number) => (k === n ? { ...it, [UNPRICED_STAY]: true } : it)),
-             stayLines: [{ itemId: row.id, qty, stayUnit, name: row.name, lineTotal: 0 }] }
+             stayLines: [{ itemId: row.id, qty, stayUnit, name: row.name, lineTotal: 0 }], plan: null }
   }
   if (!propertyId) throw new AppError(400, `Pick the property at the top of the register first, then press ${press} again.`)
-  // The site has to be this property's before anything about it is read.
-  const site = /^[0-9a-f-]{36}$/i.test(at.unitId) ? await queryOne<{ id: string }>(
-    `SELECT id FROM units WHERE id = $1 AND property_id = $2 AND landlord_id = $3 AND retired_at IS NULL`,
-    [at.unitId, propertyId, landlordId]) : null
-  if (!site) throw new AppError(400, `That site is not at this property — pick the site again, then press ${press} again.`)
-  const checkOut = checkOutFor(at.checkIn, stayUnit, qty)
-  const priced = await priceStayBySchedule(db, at.unitId, at.checkIn, checkOut,
-    (unit) => `Site ${unit} has no stay rate set, and neither does the property, so this stay cannot be priced — nothing was charged. `
-      + `Set the site's nightly rate (or the property's), then press ${press} again.`)
-  const what = reservationWhat({ nights: priced.nights, unitNumber: priced.unitNumber, checkIn: at.checkIn, checkOut })
-  const shown = line?.stayTotal
-  if (shown != null && shown !== '' && Math.round(Number(shown) * 100) !== Math.round(priced.total * 100)) {
-    throw new AppError(409, counterStayNowWords(what, priced.total, press))
+
+  let plan: CounterStayPlan
+  if (at.extendBookingId) {
+    // 10/5 (Nic, R6): Add a month — one month, on the stay that is here now.
+    if (stayUnit !== 'month' || qty !== 1) {
+      throw new AppError(400, `Add a month adds one month — ring it with the monthly stay at a quantity of 1, then press ${press} again.`)
+    }
+    const ext = await stayExtensionQuote(db, { landlordId, propertyId, bookingId: at.extendBookingId })
+    if ((at.unitId && at.unitId.toLowerCase() !== ext.unitId) || (at.checkIn && at.checkIn !== ext.fromCheckOut)) {
+      throw new AppError(409, `That stay changed a moment ago — nothing was charged. Tap the stay above Charge, pick it again, then press ${press} again.`)
+    }
+    const email = at.guestEmail ?? ext.guestEmail
+    const needs = await stayNeeds({ landlordId, propertyId, bookingId: ext.bookingId, tenantId: ext.tenantId, email,
+      checkIn: ext.checkIn, checkOut: ext.checkOut, stayTerms: at.stayTerms })
+    plan = {
+      ext, unitId: ext.unitId, unitNumber: ext.unitNumber, checkIn: ext.fromCheckOut, checkOut: ext.checkOut,
+      stayTotal: ext.price, charge: ext.price, tax: { amount: 0, rate: 0 }, needs,
+      terms: needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null,
+      email, screeningFee: needs.screening === 'fee_due' ? needs.screeningFee?.amount ?? 0 : 0,
+      what: `a month added to their stay — ${reservationWhat({ nights: ext.addedNights, unitNumber: ext.unitNumber, checkIn: ext.fromCheckOut, checkOut: ext.checkOut })}`,
+    }
+  } else {
+    if (!at.unitId || !at.checkIn) throw new AppError(400, `A stay needs a site and an arrival date before it can be charged — press Pick a site and dates, then press ${press} again.`)
+    // The site has to be this property's before anything about it is read.
+    const site = /^[0-9a-f-]{36}$/i.test(at.unitId) ? await queryOne<{ id: string }>(
+      `SELECT id FROM units WHERE id = $1 AND property_id = $2 AND landlord_id = $3 AND retired_at IS NULL`,
+      [at.unitId, propertyId, landlordId]) : null
+    if (!site) throw new AppError(400, `That site is not at this property — pick the site again, then press ${press} again.`)
+    // 10/5 (Nic, R5): whole nights, weeks or months — never prorated.
+    const priced = await priceWholeStay(db, at.unitId, stayUnit, qty, at.checkIn,
+      (unit, word) => `Site ${unit} has no ${word} rate set, and neither does the property, so this stay cannot be priced — nothing was charged. `
+        + `Set the site's ${word} rate (or the property's), then press ${press} again.`)
+    const needs = await stayNeeds({ landlordId, propertyId, email: at.guestEmail, checkIn: at.checkIn, checkOut: priced.checkOut, stayTerms: at.stayTerms })
+    const terms = needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null
+    // R2/R4: a lease is paid its deposit now; its lease bills the rest (and prorates, by the property's setting).
+    const lease = terms === 'lease'
+    const charge = lease ? await leaseDepositFor(db, at.unitId, priced.total, priced.nights) : priced.total
+    plan = {
+      ext: null, unitId: at.unitId, unitNumber: priced.unitNumber, checkIn: at.checkIn, checkOut: priced.checkOut,
+      stayTotal: priced.total, charge, tax: lease ? { amount: 0, rate: 0 } : { amount: priced.tax, rate: priced.taxRate },
+      needs, terms, email: at.guestEmail,
+      screeningFee: needs.screening === 'fee_due' ? needs.screeningFee?.amount ?? 0 : 0,
+      what: reservationWhat({ nights: priced.nights, unitNumber: priced.unitNumber, checkIn: at.checkIn, checkOut: priced.checkOut }),
+    }
   }
+  if (opts.strict) assertStayAnswered(plan, press)
+  const shown = line?.stayTotal
+  if (shown != null && shown !== '' && Math.round(Number(shown) * 100) !== Math.round(plan.charge * 100)) {
+    throw new AppError(409, counterStayNowWords(plan.what, plan.charge, press))
+  }
+  // R8: the fee the register shows is the fee charged — and a fee the register
+  // never showed is never charged.
+  if (plan.screeningFee > 0 && (at.screeningFee != null || opts.strict)
+      && Math.round((at.screeningFee ?? -1) * 100) !== Math.round(plan.screeningFee * 100)) {
+    throw new AppError(409, `This stay comes to ${plan.needs.nights} nights in a row and needs a background check — its ${money(plan.screeningFee)} fee goes on this sale, and the register shows something else, so nothing was charged. `
+      + `Tap the site and dates above Charge, press Use this site, then press ${press} again.`)
+  }
+  const leaseTail = plan.terms === 'lease' && !plan.ext ? ' — the deposit now; its lease bills the rest' : ''
   const priced_ = lines.map((it: any, k: number) => (k !== n ? it : {
-    id: row.id, name: `${row.name} — ${what}`.slice(0, 160), qty: 1, price: priced.total, tax: 0, stay: true,
+    id: row.id, name: `${row.name} — ${plan.what}${leaseTail}`.slice(0, 160), qty: 1, price: plan.charge, tax: 0, stay: true,
     ...(it?.cat ? { cat: it.cat } : {}),
-    [RESERVATION_LINE]: true, [STAY_TAX]: { amount: priced.tax, rate: priced.taxRate },
+    [RESERVATION_LINE]: true, [STAY_TAX]: plan.tax,
   }))
-  return { items: priced_, stayLines: [{ itemId: row.id, qty, stayUnit, name: row.name, lineTotal: priced.total }] }
+  // R8: the background check's fee is its own line, added here and nowhere
+  // else — the cart cannot take it off, because the cart never had it.
+  if (plan.screeningFee > 0) {
+    priced_.push({ id: null, name: SCREENING_LINE_NAME, qty: 1, price: plan.screeningFee, tax: 0, [SCREENING_LINE]: true })
+  }
+  return { items: priced_, stayLines: [{ itemId: row.id, qty, stayUnit, name: row.name, lineTotal: plan.stayTotal }], plan }
 }
 
 const RESERVATION_NOT_WAITING = 'That reservation is no longer waiting to be paid — it was canceled or marked a no-show, and nothing was charged. Press Clear, then look the reservation up on the schedule.'
@@ -1168,25 +1383,27 @@ async function priceLinkCart(link: any, items: any[], discountAmount: unknown, p
  * card is about to be charged — a stay with no site and dates is refused first.
  */
 async function cartAsCharged(landlordId: string, propertyId: string | null, items: any[], openTicketId: unknown, discountAmount: unknown, press: string,
-                             payLinkId?: unknown, opts: { stay?: unknown; needSite?: boolean } = {}): Promise<{ items: any[]; reservation: { ticketId: string; due: ReservationDue } | null; link: LinkReservation | null }> {
+                             payLinkId?: unknown, opts: { stay?: unknown; needSite?: boolean } = {}): Promise<{ items: any[]; reservation: { ticketId: string; due: ReservationDue } | null; link: LinkReservation | null
+                                                                                                             stayPlan: CounterStayPlan | null }> {
   const linkNamed = namedLinkOf(items, payLinkId)
   if (linkNamed && namedTicketOf(items, openTicketId)) throw new AppError(400, ONE_TICKET_OR_LINK)
   if (linkNamed) {
     const link = await openLinkAt(landlordId, propertyId, linkNamed)
     const r = await priceLinkCart(link, items, discountAmount, press)
-    return { items: r.items, reservation: null, link: r.res }
+    return { items: r.items, reservation: null, link: r.res, stayPlan: null }
   }
   const t = await reservationTicketOf(landlordId, items, openTicketId, propertyId)
   if (!t) {
     // 10/3 (decisions #9): a stay rung straight here costs what the schedule charges for its nights.
-    const c = await priceCounterStay(landlordId, propertyId, items, counterStayAt(items, opts.stay), press, discountAmount)
+    // 10/5: a card about to be charged needs the stay's answers too (assertStayAnswered).
+    const c = await priceCounterStay(landlordId, propertyId, items, counterStayAt(items, opts.stay), press, discountAmount, { strict: opts.needSite })
     if (opts.needSite && c.stayLines.some((l) => !(l.lineTotal > 0))) {
       throw new AppError(400, `A stay needs a site and an arrival date before it can be charged — press Pick a site and dates, then press ${press} again.`)
     }
-    return { items: c.items, reservation: null, link: null }
+    return { items: c.items, reservation: null, link: null, stayPlan: c.plan }
   }
   const r = await priceReservationCart(landlordId, t.bookingId, items, discountAmount, press)
-  return { items: r.items, reservation: { ticketId: t.ticketId, due: r.due }, link: null }
+  return { items: r.items, reservation: { ticketId: t.ticketId, due: r.due }, link: null, stayPlan: null }
 }
 
 /**
@@ -1387,7 +1604,9 @@ posRouter.post('/cart-quote', requirePerm('pos.ring_sale'), async (req, res, nex
     const totals = await serverCartTotals(posLandlordId(req), priced.items, paymentMethod, discountAmount, surcharge, propertyId)
     const line = priced.link ? priced.items.find((i: any) => i[RESERVATION_LINE]) : null
     res.json({ success: true, data: { ...totals,
-      ...(line ? { reservationLine: { name: line.name, price: line.price, nights: line.nights ?? null } } : {}) } })
+      ...(line ? { reservationLine: { name: line.name, price: line.price, nights: line.nights ?? null } } : {}),
+      // 10/5: what a stay rung here needs (the same answer the stay picker gets).
+      ...(priced.stayPlan ? { stay: stayPlanOut(priced.stayPlan) } : {}) } })
   } catch (e) { next(e) }
 })
 
@@ -1408,7 +1627,7 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
     if (!['night', 'week', 'month'].includes(stayUnit)) throw new AppError(400, 'That stay length could not be read — take the stay out of the cart, add it again, then pick the dates.')
     await assertPropertyInScope(req.user, propertyId)
 
-    const { checkOutFor, nightsBetween, scheduleStayPrice } = await import('../services/registerStay')
+    const { checkOutFor, nightsBetween } = await import('../services/registerStay')
     const checkOut = checkOutFor(checkIn, stayUnit, qty)
 
     const { STAY_RATE_COLUMN } = await import('../services/registerStay')
@@ -1476,16 +1695,17 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
     // with no rate for this length is still LISTED — dropping it would read as
     // "occupied", which is a lie about a site that is standing empty — but it
     // cannot be picked until somebody sets the rate.
-    // 10/3 (decisions #9, #21): what the stay costs on each site is the
-    // schedule's price for those nights (scheduleStayPrice — tiered rates, the
-    // property's lodging tax inside), the same figure the sale, a pay link and
-    // the schedule charge; `lodgingTax` is the tax inside it. A site the
-    // schedule cannot price has no lineTotal and cannot be picked.
+    // 10/5 (Nic, R5): what the stay costs on each site is whole nights, weeks
+    // or months at the site's rate for one of them (wholeStayPrice — never
+    // prorated; the property's lodging tax inside under 30 nights), the same
+    // figure the sale and a pay link charge; `lodgingTax` is the tax inside
+    // it. A site with no rate for this length has no lineTotal and cannot be
+    // picked.
     res.json({ success: true, data: {
       checkIn, checkOut, nights: nightsBetween(checkIn, checkOut),
       stayUnit,
       units: units.map(({ nightly_rate_, weekly_rate_, monthly_rate_, lodging_tax_pct_, ...u }: any) => {
-        const priced = scheduleStayPrice({ nightly: nightly_rate_, weekly: weekly_rate_, monthly: monthly_rate_ }, lodging_tax_pct_, checkIn, checkOut)
+        const priced = wholeStayPrice({ nightly: nightly_rate_, weekly: weekly_rate_, monthly: monthly_rate_ }, lodging_tax_pct_, stayUnit, qty, checkIn)
         return {
           ...u,
           rate: u.rate ?? null,
@@ -1494,6 +1714,124 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
         }
       }),
     } })
+  } catch (e) { next(e) }
+})
+
+/**
+ * 10/5: a stay's plan as the register is handed it — every figure the stay
+ * picker, the cart and the Send-link window show is one of these, never a
+ * second copy of the arithmetic in the browser.
+ */
+function stayPlanOut(plan: CounterStayPlan) {
+  const longStay = plan.needs.nights >= STAY_LEASE_CHOICE_NIGHTS
+  return {
+    unitId: plan.unitId, unitNumber: plan.unitNumber, checkIn: plan.checkIn, checkOut: plan.checkOut,
+    what: plan.what,
+    /** The guest's nights in a row at this property, this stay (or month) included. */
+    nights: plan.needs.nights,
+    stayTotal: plan.stayTotal, charge: plan.charge, lodgingTax: plan.tax.amount,
+    depositOnly: plan.terms === 'lease' && !plan.ext,
+    needsEmail: plan.needs.nights >= STAY_SCREENING_NIGHTS,
+    screening: plan.needs.screening,
+    screeningFee: plan.screeningFee > 0 ? plan.screeningFee : null,
+    screeningLineName: SCREENING_LINE_NAME,
+    leaseChoice: plan.needs.leaseChoice,
+    terms: plan.terms,
+    leaseOrStayWords: longStay ? LEASE_OR_STAY_WORDS : null,
+    // R13: a 30+ night stay with no lease is held only through what is paid.
+    heldWords: longStay && plan.terms === 'stay' ? stayHeldWords(plan.checkOut) : null,
+    // M5: Add a month answered lease — no month is sold; the lease is drafted instead (POST /pos/stays/lease).
+    leaseInstead: !!plan.ext && plan.terms === 'lease',
+    leaseInsteadWords: plan.ext && plan.terms === 'lease'
+      ? 'They chose a lease, so no month is sold — their lease holds the site and bills the months from here on. It is drafted for the owner to review and send. Nothing is charged here.'
+      : null,
+    extend: plan.ext ? { bookingId: plan.ext.bookingId, guestName: plan.ext.guestName, fromCheckOut: plan.ext.fromCheckOut, checkOut: plan.ext.checkOut } : null,
+  }
+}
+
+// POST /api/pos/stays/quote — 10/5 (Nic): what a stay picked at the register
+// comes to and what it needs, before anything is charged or sent. The stay
+// picker asks it every time the site, dates, email or answer changes, and the
+// cart shows exactly what it says: the stay's figure (whole nights, weeks or
+// months — R5), the background check's fee when one is due (R8), whether the
+// counter must answer lease or no lease (R2), and the held-through words (R13).
+// Body: { propertyId, itemId, qty, unitId?, checkIn?, guestEmail?, stayTerms?, extendBookingId? }.
+posRouter.post('/stays/quote', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const b = req.body ?? {}
+    const propertyId = strOrNull(b.propertyId)
+    if (!propertyId || !/^[0-9a-f-]{36}$/i.test(propertyId)) throw new AppError(400, 'Pick the property at the top of the register first, then pick the stay again.')
+    await assertPropertyInScope(req.user, propertyId)
+    await assertPropertyIsLandlords(posLandlordId(req), propertyId)
+    const itemId = lowerId(b.itemId)
+    if (!/^[0-9a-f-]{36}$/.test(itemId)) throw new AppError(400, 'That stay could not be read — take it out of the cart, add it again, then pick the dates.')
+    const qty = Number(b.qty)
+    const at = counterStayAt([], b)
+    if (!at) throw new AppError(400, 'Pick a site and an arrival date — or the stay to add a month to — first.')
+    const c = await priceCounterStay(posLandlordId(req), propertyId, [{ id: itemId, qty, price: 0 }], { ...at, screeningFee: null },
+      'Use this site')
+    if (!c.plan) throw new AppError(400, 'That item is not a stay — take it out of the cart, then add the stay again.')
+    res.json({ success: true, data: stayPlanOut(c.plan) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/pos/stays/lease — 10/5 (Nic, M5): "Add a month" answered lease.
+// No month is sold: the stay's lease is drafted for the owner (stayTerms
+// chooseStayTerms — month to month, starting today, billed by the property's
+// rent settings) and the landlord is told. The same rule as the schedule's Add
+// a month. Body: { propertyId, bookingId }. Nothing is charged.
+posRouter.post('/stays/lease', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const propertyId = strOrNull(req.body?.propertyId)
+    const bookingId = lowerId(req.body?.bookingId)
+    if (!propertyId || !/^[0-9a-f-]{36}$/i.test(propertyId)) throw new AppError(400, 'Pick the property at the top of the register first, then pick the stay again.')
+    if (!/^[0-9a-f-]{36}$/.test(bookingId)) throw new AppError(400, 'Pick their stay again, then press Draft their lease.')
+    await assertPropertyInScope(req.user, propertyId)
+    await assertPropertyIsLandlords(posLandlordId(req), propertyId)
+    // The register's own test for a stay a month could be added to (here now,
+    // paid up, no lease yet) — a lease is drafted only for a stay it could have lengthened.
+    const ext = await stayExtensionQuote(db, { landlordId: posLandlordId(req), propertyId, bookingId })
+    const needs = await stayNeeds({ landlordId: posLandlordId(req), propertyId, bookingId: ext.bookingId, tenantId: ext.tenantId,
+      email: ext.guestEmail, checkIn: ext.checkIn, checkOut: ext.checkOut, stayTerms: 'lease' })
+    if (needs.leaseChoice !== 'lease') {
+      throw new AppError(409, `Their stay with the month added comes to ${needs.nights} nights in a row — a lease is offered from 30. Sell the month as a stay instead.`)
+    }
+    const chosen = await chooseStayTerms(ext.bookingId, 'lease', { byUserId: req.user!.userId })
+    if (!chosen?.leaseId) throw new AppError(409, 'Their lease could not be drafted just now — nothing was charged. Press Draft their lease again in a moment.')
+    res.json({ success: true, data: { leaseId: chosen.leaseId,
+      message: 'Their lease is drafted — the owner reviews and sends it from the Leases page. No month was sold and nothing was charged.' } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/pos/stays/current?propertyId=&q= — 10/5 (Nic, R6): the stays here
+// now (or coming) that "Add a month" can lengthen — confirmed or checked in,
+// not over, with no lease (a lease holds its site for as long as they stay).
+// Found by part of the guest's name, email or the site.
+posRouter.get('/stays/current', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const propertyId = String(req.query.propertyId ?? '')
+    if (!/^[0-9a-f-]{36}$/i.test(propertyId)) throw new AppError(400, 'Pick the property at the top of the register first, then look the stay up again.')
+    await assertPropertyInScope(req.user, propertyId)
+    await assertPropertyIsLandlords(posLandlordId(req), propertyId)
+    const q = String(req.query.q ?? '').trim().slice(0, 80)
+    const tz = await queryOne<{ timezone: string | null }>(`SELECT timezone FROM properties WHERE id = $1`, [propertyId])
+    const rows = await query<any>(
+      `SELECT b.id AS booking_id, b.guest_name, b.guest_email, b.unit_id, b.status, b.stay_terms,
+              COALESCE(NULLIF(u.display_label, ''), u.unit_number) AS unit_number,
+              to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(b.check_out, 'YYYY-MM-DD') AS check_out
+         FROM unit_bookings b
+         JOIN units u ON u.id = b.unit_id
+        WHERE u.property_id = $1 AND b.landlord_id = $2
+          AND b.status IN ('confirmed', 'checked_in')
+          AND b.check_out >= $4::date
+          AND b.stay_terms IS DISTINCT FROM 'lease'
+          AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id AND l.status IN ('pending', 'active'))
+          AND ($3 = '' OR b.guest_name ILIKE '%' || $3 || '%' OR b.guest_email ILIKE '%' || $3 || '%'
+               OR u.unit_number ILIKE '%' || $3 || '%' OR COALESCE(u.display_label, '') ILIKE '%' || $3 || '%')
+        ORDER BY b.check_out, u.unit_number
+        LIMIT 25`,
+      [propertyId, posLandlordId(req), q.replace(/[%_\\]/g, ''), todayIn(tz?.timezone ?? null)])
+    res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
 
@@ -1694,12 +2032,21 @@ const ticketUpdateSchema = ticketSchema.extend({ propertyId: z.string().uuid().o
 
 posRouter.put('/tickets/:id', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
   try {
-    const body = parseForStaff(ticketUpdateSchema, req.body, TICKET_WORDS, TICKET_OTHERWISE)
+    const landlordId = posLandlordId(req)
+    // 10/5 (Nic, M2): a reservation ticket's background-check line is the
+    // schedule's, not the cart's — whatever the register sends for it is set
+    // aside and the ticket keeps its own line exactly as written (it cannot be
+    // taken off, and its fee cannot be changed here).
+    const ownScreening = await ticketScreeningLineAsWritten(landlordId, req.params.id)
+    const sent = Array.isArray(req.body?.items) ? req.body.items : req.body?.items
+    const sentRest = Array.isArray(sent) ? sent.filter((i: any) => !(i && !i.id && (i.screening === true || i.name === SCREENING_LINE_NAME))) : sent
+    const onlyScreening = !!ownScreening && Array.isArray(sentRest) && sentRest.length === 0
+    const body = parseForStaff(ticketUpdateSchema, { ...req.body, items: onlyScreening ? [{ id: ZERO_UUID, qty: 1 }] : sentRest }, TICKET_WORDS, TICKET_OTHERWISE)
+    if (onlyScreening) body.items = []
     body.items = lowerLineIds(body.items)   // 10/2 (review): ids as the database writes them
     if (body.tenantId && body.posCustomerId) {
       throw new AppError(400, 'A ticket is for one person — remove one of them (×), then press Clear again.')
     }
-    const landlordId = posLandlordId(req)
     const id = String(req.params.id)
     const t = /^[0-9a-f-]{36}$/i.test(id) ? await queryOne<any>(
       `SELECT id, property_id, status, tenant_id, pos_customer_id, booking_id, landlord_id, items FROM pos_open_tickets WHERE id = $1 AND landlord_id = $2`,
@@ -1714,6 +2061,8 @@ posRouter.put('/tickets/:id', requirePerm('pos.ring_sale'), async (req: any, res
     // reservation is over and the stay came off it; then it is an ordinary ticket.
     await assertTicketLines(landlordId, body.items, { reservation: !!t.booking_id && await ticketCarriesStay(db, t) })
     await assertWholeStays(landlordId, body.items, 'Clear')   // 10/2 (review): a reservation's stay is whole nights
+    // M2: its background check goes back on as the schedule wrote it.
+    if (ownScreening) body.items = [...body.items, ownScreening] as any
 
     const named = !!(body.tenantId || body.posCustomerId)
     const tenantId = named ? (body.tenantId ?? null) : t.tenant_id
@@ -1945,8 +2294,12 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // (A link for a reservation has no typed lines of its own left here — they
     // are its reservation, charged as the one line above.)
     const linkOwnLeft = new Map<string, number>()
-    for (const l of (payLink && !linkRes && Array.isArray(payLink.items) ? payLink.items : [])) {
+    // 10/5 (Nic, R8): a link's background-check line is its own too, whatever
+    // else the link pays — and it is never left off (linkScreening below).
+    const linkScreening = payLink ? linkScreeningLine(payLink) : null
+    for (const l of (payLink && Array.isArray(payLink.items) ? payLink.items : [])) {
       if (l?.id) continue
+      if (linkRes && !isScreeningLine(l)) continue
       const k = `${String(l?.name ?? '')}|${(Number(l?.price) || 0).toFixed(2)}`
       linkOwnLeft.set(k, (linkOwnLeft.get(k) ?? 0) + (Number(l?.qty) || 0))
     }
@@ -1959,7 +2312,39 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       linkOwnLeft.set(k, have - q)
       return true
     }
-    assertCatalogItems(items.filter((it: any) => !linkOwnLine(it)).map((it: any) => ({ itemId: it.id })))
+    // 10/5 (Nic, M2): a reservation ticket from the schedule carries the
+    // stay's background check as a fixed line of its own (routes/units
+    // screeningFeeTicketLine) — the ticket's line at the ticket's figure is
+    // charged like a link's (never a register item, never left off); one
+    // typed at the counter is not.
+    const ticketScreening = !payLink && openTicketId ? await ticketScreeningOf(posLandlordId(req), openTicketId) : null
+    let ticketScreeningLeft = ticketScreening ? 1 : 0
+    const ticketScreeningLine = (it: any): boolean => {
+      if (!ticketScreening || it?.id || ticketScreeningLeft <= 0) return false
+      if (!isScreeningCartLine(it, ticketScreening)) return false
+      ticketScreeningLeft--
+      return true
+    }
+    assertCatalogItems(items.filter((it: any) => !linkOwnLine(it) && !ticketScreeningLine(it)).map((it: any) => ({ itemId: it.id })))
+    if (linkScreening && !items.some((it: any) => isScreeningCartLine(it, linkScreening))) {
+      throw new AppError(400, `This link carries the guest's background check (${money(linkScreening.price)}) — it cannot be taken off. `
+        + 'Press Clear, open the link again from the list, then press Charge.')
+    }
+    if (ticketScreening && !items.some((it: any) => isScreeningCartLine(it, ticketScreening))) {
+      throw new AppError(400, `This ticket carries the guest's background check (${money(ticketScreening.price)}) — it cannot be taken off. `
+        + 'Press Clear, open the ticket again from the list, then press Charge.')
+    }
+    // 10/5 (A5): a background check is GAM's the moment the sale is made, so
+    // it never goes on a charge account (whose money the landlord is owed
+    // later, or never) — refused, and the guest pays it some other way.
+    if (paymentMethod === 'charge' && (linkScreening || ticketScreening)) throw new AppError(400, CHARGE_ACCOUNT_NO_SCREENING)
+    // 10/5 (Nic, A2): a link for a stay's background check alone is settled
+    // only while the stay stands and its check is not already paid for.
+    if (payLink) {
+      const why = await feeOnlyLinkNotPayable(db, payLink)
+      if (why === 'stay_gone') throw new AppError(409, 'That link is for the background check of a stay that was canceled — nothing was charged. Close the link under Pay Links.')
+      if (why === 'paid') throw new AppError(409, 'That guest\'s background check is already paid — nothing was charged. Close the link under Pay Links.')
+    }
     // 10/2 (review): a stay on a pay link was priced from its site, and its
     // site held, when the link was sent. Settling the link charges THOSE
     // nights at THAT price — nothing else that is a stay. A stay line the link
@@ -2089,6 +2474,9 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // link is charged as sent, stay lines included, at the prices on it.)
     let reservation: ReservationDue | null = null
     let stayLines: any[] = []
+    // 10/5 (Nic): the stay rung here — priced whole (R5), a month added (R6),
+    // what it needs (R1/R2/R8) — read once and written as it was priced.
+    let stayPlan: CounterStayPlan | null = null
     let pricedItems: any[]
     if (ticketBookingId) {
       const r = await priceReservationCart(posLandlordId(req), ticketBookingId, items, discountAmount, 'Charge')
@@ -2103,10 +2491,16 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       // 10/3 (decisions #9, #21): priced by the schedule's own pricing for the
       // nights picked (priceCounterStay) — the same figure a pay link and the
       // schedule charge for them — as one line with its lodging tax inside.
-      const hasStayAt = !!(stay && typeof stay.unitId === 'string' && stay.unitId && typeof stay.checkIn === 'string' && stay.checkIn)
-      const counter = payLink ? { items, stayLines: [] as any[] }
-        : await priceCounterStay(posLandlordId(req), propertyId, items, hasStayAt ? { unitId: stay.unitId, checkIn: stay.checkIn } : null, 'Charge', discountAmount)
+      // 10/5: or the stay a month is added to (R6), with the guest's email and
+      // the counter's lease answer — every answer the stay needs is checked
+      // here, before any money moves (assertStayAnswered).
+      const stayAt = stay ? counterStayAt([], stay) : null
+      const hasStayAt = !!stayAt
+      const counter = payLink ? { items, stayLines: [] as any[], plan: null }
+        : await priceCounterStay(posLandlordId(req), propertyId, items, stayAt, 'Charge', discountAmount, { strict: true })
       stayLines = counter.stayLines
+      stayPlan = counter.plan
+      if (paymentMethod === 'charge' && (stayPlan?.screeningFee ?? 0) > 0) throw new AppError(400, CHARGE_ACCOUNT_NO_SCREENING)
       if (stayLines.length && !hasStayAt) {
         throw new AppError(400,
           'A stay needs a site and an arrival date before it can be rung up — pick them for the stay in the cart, then press Charge again.')
@@ -2195,6 +2589,21 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     }
     // Links the sale closes (its reservation paid in full); their card pages are closed once it commits.
     let closedWithSale: ClosedLink[] = []
+    let linkScreeningAfterCommit: (() => Promise<void>) | null = null
+
+    // 10/5 (Nic, A5) — THE BACKGROUND CHECK IS GAM'S MONEY, NEVER BOTH WAYS.
+    // A card (the reader, a card on file) lands on GAM's balance: the check's
+    // part stays there — out of the landlord's payout share — and nothing is
+    // charged back. Cash, a check or a money order is in the landlord's drawer:
+    // GAM takes the fee from their next payout (recordScreeningPrepayment).
+    // One already recorded for the stay is not GAM's twice — it stays the
+    // landlord's to give back (and is logged).
+    const screeningCollector = screeningCollectedBy(paymentMethod)
+    const screeningAmount = (stayPlan?.screeningFee ?? 0) > 0 ? stayPlan!.screeningFee
+      : ticketScreening?.price ?? linkScreening?.price ?? 0
+    const screeningBooking = ticketScreening?.bookingId ?? linkScreening?.bookingId ?? stayPlan?.ext?.bookingId ?? null
+    const gamKeeps = screeningAmount > 0 && screeningCollector === 'gam'
+      && !(screeningBooking && await screeningAlreadyPaid(screeningBooking)) ? round2(screeningAmount) : 0
 
     // S652 — CHARGE THE CARD THEY ALREADY GAVE US.
     //
@@ -2337,7 +2746,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           changeGiven, platformFee, stripePaymentIntentId: stripePaymentIntentId ?? cardOnFileIntentId,
           discountAmount: discountAmt, discountReason,
           ...(paymentMethod === 'card' || paymentMethod === 'card_on_file'
-            ? { payoutOwed: round2(total - cardFee) } : {}),
+            ? { payoutOwed: round2(Math.max(0, total - cardFee - gamKeeps)) } : {}),
           // 10/3 (decisions #21): a reservation's line is recorded at its price
           // less the lodging tax inside it, with that tax on the line.
           items: pricedItems.map((it: any) => (it?.[RESERVATION_LINE] ? reservationSaleLine(it, it[STAY_TAX]) : it)), taxBreakdown,
@@ -2389,6 +2798,11 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
             // A link with no reservation of its own (a stay balance link marks its balance paid).
             await settleLinkBooking(client, payLink, tx.id, null)
           }
+          // 10/5 (Nic, R8/A5): the background check it carried is GAM's, waiting
+          // for the guest — by who holds the money for this tender.
+          const rec = await recordLinkScreening(client, payLink, screeningCollector)
+          if (gamKeeps > 0 && !(rec && rec.gamKeeps > 0)) throw new AppError(409, SCREENING_PAID_MEANWHILE)
+          linkScreeningAfterCommit = rec?.afterCommit ?? null
         }
       } catch (e: any) {
         // UNIQUE on pos_transactions_stripe_pi_uniq — same PI already
@@ -2459,6 +2873,20 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           checkOut: confirmed.rows[0].check_out,
           nights: confirmed.rows[0].nights,
         }
+      } else if (stayLines.length && stayPlan?.ext) {
+        // 10/5 (Nic, R6): Add a month — the SAME booking runs a calendar month
+        // longer, the month at the monthly rate on its own, paid here. A site
+        // somebody else has for any of those nights is refused (a month never
+        // moves another guest's hold) and the sale rolls back.
+        const ext = await extendStayByMonth(client, { landlordId: posLandlordId(req), propertyId, bookingId: stayPlan.ext.bookingId })
+        if (Math.round(ext.price * 100) !== Math.round(stayPlan.charge * 100) || ext.checkOut !== stayPlan.checkOut) {
+          throw new AppError(409, `That stay changed a moment ago — nothing was charged. Tap the stay above Charge, pick it again, then press Charge again.`)
+        }
+        if (stayPlan.email && !ext.guestEmail) {
+          await client.query(`UPDATE unit_bookings SET guest_email = $2 WHERE id = $1 AND guest_email IS NULL`, [ext.bookingId, stayPlan.email])
+        }
+        await payTowardStay(client, { bookingId: ext.bookingId, saleId: tx.id, amount: stayPlan.charge })
+        stayBooking = { bookingId: ext.bookingId, checkIn: ext.checkIn, checkOut: ext.checkOut, nights: ext.nights }
       } else if (stayLines.length) {
         const { createStayBooking, checkOutFor } = await import('../services/registerStay')
         // 10/3 (S652 standing rule: an unpaid hold has no timer and yields to
@@ -2495,21 +2923,71 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           displacedHolds = await clearUnpaidHolds(client, stay.unitId, stay.checkIn, stayOut,
             'A paid sale at the counter took this site')
         }
+        // 10/5 (Nic, R2): a lease chosen at the counter is paid its deposit
+        // here — recorded as the deposit, its lease bills the rest (and
+        // prorates by the property's setting); a stay is paid whole.
+        const leaseChosen = stayPlan?.terms === 'lease'
         stayBooking = await createStayBooking(client, {
           landlordId: posLandlordId(req),
           propertyId,
           posTransactionId: tx.id,
           lines: stayLines,
-          details: stay,
+          details: { ...stay, guestEmail: stayPlan?.email ?? stay?.guestEmail ?? null },
+          stayTerms: stayPlan?.terms ?? null,
+          screeningRequired: (stayPlan?.needs.nights ?? 0) >= STAY_SCREENING_NIGHTS,
+          depositAmount: leaseChosen ? stayPlan!.charge : null,
         })
         // 10/2 (review): paid in full at the counter — nothing left to bill on arrival day.
-        await client.query(
-          `UPDATE unit_bookings SET balance_billed_at = COALESCE(balance_billed_at, NOW()), balance_paid_at = COALESCE(balance_paid_at, NOW())
-            WHERE id = $1`, [stayBooking.bookingId])
+        if (!leaseChosen) {
+          await client.query(
+            `UPDATE unit_bookings SET balance_billed_at = COALESCE(balance_billed_at, NOW()), balance_paid_at = COALESCE(balance_paid_at, NOW())
+              WHERE id = $1`, [stayBooking.bookingId])
+        }
         // 10/4 (decisions #37.B, #38): the stay's share of this sale, itemized
-        // (never more than the sale took before its card fee).
+        // (never more than the sale took before its card fee — or its
+        // background check, which is GAM's, never the stay's).
         await recordSaleTowardStay(client, { bookingId: stayBooking.bookingId, saleId: tx.id,
-          toward: Math.min(Number(stayLines[0].lineTotal) || 0, round2(total - surchargeAmt)) })
+          toward: Math.min(Number(stayPlan?.charge ?? stayLines[0].lineTotal) || 0, round2(total - surchargeAmt - (stayPlan?.screeningFee ?? 0))) })
+      }
+      // 10/5 (Nic, R8): the background check's fee taken with the stay is
+      // GAM's screening money — recorded as a check waiting for the guest
+      // (their link is emailed once the sale stands) and taken from the
+      // landlord's next payout, cash or card alike. A guest with a check on
+      // file pays nothing, but check-in still waits on it (R9).
+      let screeningAfterCommit: (() => Promise<void>) | null = null
+      if (stayPlan && stayBooking) {
+        if (stayPlan.screeningFee > 0) {
+          const rec = await recordScreeningPrepayment(client, {
+            landlordId: posLandlordId(req), propertyId, bookingId: stayBooking.bookingId,
+            email: stayPlan.email, amount: stayPlan.screeningFee, source: 'register', sourceId: tx.id,
+            // 10/5 (A5): by card GAM already has it (kept out of the payout
+            // share above); in cash or by check the landlord does.
+            collectedBy: screeningCollector,
+          })
+          if (!rec.created) {
+            if (gamKeeps > 0) throw new AppError(409, SCREENING_PAID_MEANWHILE)
+            logger.error({ bookingId: stayBooking.bookingId, saleId: tx.id }, '[POS] a background-check fee was taken for a stay that already had one recorded — left in the sale for the landlord to give back')
+          }
+          screeningAfterCommit = rec.afterCommit
+        } else if (stayPlan.needs.nights >= STAY_SCREENING_NIGHTS) {
+          await markScreeningRequired(client, stayBooking.bookingId)
+        }
+      }
+      // 10/5 (Nic, M2): a reservation ticket's background check — sold from
+      // the schedule, settled here — is recorded as the guest's prepaid check.
+      if (ticketScreening) {
+        const b = (await client.query<{ guest_email: string | null; tenant_id: string | null }>(
+          `SELECT guest_email, tenant_id FROM unit_bookings WHERE id = $1`, [ticketScreening.bookingId])).rows[0]
+        const rec = await recordScreeningPrepayment(client, {
+          landlordId: posLandlordId(req), propertyId, bookingId: ticketScreening.bookingId,
+          tenantId: b?.tenant_id ?? null, email: b?.guest_email ?? null,
+          amount: ticketScreening.price, source: 'schedule', sourceId: tx.id, collectedBy: screeningCollector,
+        })
+        if (!rec.created) {
+          if (gamKeeps > 0) throw new AppError(409, SCREENING_PAID_MEANWHILE)
+          logger.error({ bookingId: ticketScreening.bookingId, saleId: tx.id }, '[POS] a ticket\'s background-check fee was taken for a stay that already had one recorded — left in the sale for the landlord to give back')
+        }
+        screeningAfterCommit = rec.afterCommit
       }
 
       // S254: post the FlexCharge transaction record. Has its own row-lock
@@ -2541,6 +3019,20 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       await client.query('COMMIT')
       txnOpen = false
       await expireClosedLinks(closedWithSale)
+      // 10/5 (Nic, R8): the guest's (already paid) background-check link.
+      if (screeningAfterCommit) await screeningAfterCommit()
+      // 10/5 (Nic, R2): "either way, it goes to me" — a lease chosen drafts it
+      // for the landlord; a stay with no lease is billed its site's utilities
+      // (R11) and the landlord is told. Never a reason to undo the sale.
+      let leaseId: string | null = null
+      if (stayPlan?.terms && stayBooking && stayPlan.needs.nights >= STAY_LEASE_CHOICE_NIGHTS) {
+        const chosen = await chooseStayTerms(stayBooking.bookingId, stayPlan.terms, { byUserId: req.user!.userId })
+          .catch((e) => { logger.error({ err: e, bookingId: stayBooking!.bookingId, saleId: tx.id }, '[POS] the lease-or-stay answer could not be carried out after the sale'); return null })
+        leaseId = chosen?.leaseId ?? null
+      }
+      // A pay link settled here: its background check, and its lease-or-stay answer, the same as paid online.
+      if (linkScreeningAfterCommit) await linkScreeningAfterCommit()
+      if (payLink) await afterLinkPaid(payLink, req.user!.userId)
       if (displacedHolds.length) {
         await import('../services/holdDisplacement')
           .then((m) => m.notifyDisplacedHolds(posLandlordId(req), propertyId, displacedHolds))
@@ -2635,7 +3127,16 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       const saleLines = pricedItems.map((it: any) => (it?.[RESERVATION_LINE] ? reservationSaleLine(it, it[STAY_TAX]) : it))
         .filter((it: any) => Number(it?.qty) > 0)
         .map((it: any) => ({ id: it.id ?? null, name: String(it.name ?? 'Item'), qty: Number(it.qty) || 0, price: Number(it.price) || 0, tax: Number(it.tax) || 0 }))
-      res.status(201).json({ success: true, data: { ...tx, stayBooking, customer: customerOut, items: saleLines } })
+      // 10/5 (Nic, R13): a 30+ night stay with no lease is held only through
+      // what is paid — the receipt says so (stayHeldWords, the one sentence).
+      const stayOut = stayBooking ? {
+        ...stayBooking,
+        terms: stayPlan?.terms ?? null, leaseId,
+        heldWords: stayPlan && stayPlan.terms === 'stay' && stayPlan.needs.nights >= STAY_LEASE_CHOICE_NIGHTS ? stayHeldWords(stayBooking.checkOut) : null,
+        screeningFee: stayPlan && stayPlan.screeningFee > 0 ? stayPlan.screeningFee : null,
+        screeningEmail: stayPlan && stayPlan.screeningFee > 0 ? stayPlan.email : null,
+      } : null
+      res.status(201).json({ success: true, data: { ...tx, stayBooking: stayOut, customer: customerOut, items: saleLines } })
     } catch (e) {
       if (txnOpen) await client.query('ROLLBACK').catch(() => {})
       await releaseCardOnFile()
@@ -3318,14 +3819,26 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
       throw new AppError(409, `This sale has a $${waiting.toFixed(2)} refund to the card waiting for a guest who left early, so nothing was refunded here. `
         + `Finish that first on the schedule: open the stay's Check out window and press Try again, or Give it back in cash instead.`)
     }
-    const remaining = Math.round((txTotalNum - priorRefunded) * 100) / 100
+    // 10/5 (Nic, R8): a background check paid with a stay is GAM's and is not
+    // refunded ("charged whether or not they complete the check") — the
+    // drawer never hands it back, and it is taken from the landlord's payout.
+    const screeningKept = Number((await client.query<{ s: string }>(
+      `SELECT COALESCE(SUM(amount), 0)::text AS s FROM screening_prepayments
+        WHERE status <> 'void' AND source_id IS NOT NULL AND source_id IN ($1, $2)`,
+      [tx.id, tx.pay_link_id ?? tx.id])).rows[0].s)
+    const remaining = Math.round((txTotalNum - priorRefunded - screeningKept) * 100) / 100
+    if (screeningKept > 0 && refundAmt > remaining + 0.005) {
+      throw new AppError(400, `$${screeningKept.toFixed(2)} of this sale is the guest's background check, which is not refunded — `
+        + `$${Math.max(0, remaining).toFixed(2)} at most can be refunded here. Change the amount, then press Refund again.`)
+    }
     if (refundAmt > remaining + 0.005) {
       throw new AppError(400, priorRefunded > 0
         ? `That is more than is left to refund — $${remaining.toFixed(2)} at most ($${priorRefunded.toFixed(2)} was already refunded). Change the amount, then press Refund again.`
         : `That is more than the sale — $${txTotalNum.toFixed(2)} at most. Change the amount, then press Refund again.`)
     }
     const cumulativeRefunded = Math.round((priorRefunded + refundAmt) * 100) / 100
-    const isFullRefund = cumulativeRefunded >= txTotalNum - 0.005
+    // Everything that can be refunded was (a background check it carried stays GAM's).
+    const isFullRefund = cumulativeRefunded >= txTotalNum - screeningKept - 0.005
 
     await client.query(`INSERT INTO pos_refunds (transaction_id,landlord_id,amount,reason,items,refund_method)
       VALUES ($1,$2,$3,$4,$5,$6)`,
@@ -4207,6 +4720,32 @@ posRouter.post('/transactions/:id/email-receipt', requirePerm('pos.ring_sale'), 
   } catch (e) { next(e) }
 })
 
+/**
+ * 10/5 (Nic, R13): the sentence a receipt carries for the stay a sale paid
+ * for — "Your site is held through …" — when it is a stay of 30+ nights in a
+ * row with no lease (held only through what is paid). The stay as it stands
+ * now: a month added since moves the date. Null for anything else.
+ */
+async function saleHeldWords(tx: { id: string; pay_link_id?: string | null; open_ticket_id?: string | null }): Promise<string | null> {
+  const b = await queryOne<{ id: string; stay_terms: StayTerms | null; check_in: string; check_out: string
+                             guest_email: string | null; tenant_id: string | null; property_id: string }>(
+    `SELECT b.id, b.stay_terms, to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+            b.guest_email, b.tenant_id, u.property_id
+       FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+      WHERE b.status NOT IN ('cancelled', 'no_show')
+        AND (b.pos_transaction_id = $1
+             OR EXISTS (SELECT 1 FROM stay_payments sp WHERE sp.booking_id = b.id AND sp.pos_transaction_id = $1)
+             OR b.id = (SELECT booking_id FROM pos_pay_links WHERE id = $2::uuid)
+             OR b.id = (SELECT booking_id FROM pos_open_tickets WHERE id = $3::uuid))
+      ORDER BY b.check_out DESC LIMIT 1`, [tx.id, tx.pay_link_id ?? null, tx.open_ticket_id ?? null])
+  if (!b || b.stay_terms === 'lease') return null
+  const chain = await continuousStayNights({ propertyId: b.property_id, bookingId: b.id, tenantId: b.tenant_id,
+    email: b.guest_email, checkIn: b.check_in, checkOut: b.check_out })
+  // A stay later in a back-to-back run carries the answer given for the run.
+  const terms = b.stay_terms ?? [...chain.terms].reverse().find((t) => t != null) ?? null
+  return terms === 'stay' && chain.nights >= STAY_LEASE_CHOICE_NIGHTS ? stayHeldWords(b.check_out) : null
+}
+
 async function emailReceiptForSale(transactionId: string, email: string, landlordIds: string[],
                                    opts: { standIn?: StandIn | null } = {}): Promise<string> {
   {
@@ -4233,6 +4772,9 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
     const lines = items.map(l => ({ description: String(l.item_name), quantity: Number(l.qty), unitPrice: Number(l.unit_price), lineTotal: Number(l.subtotal) }))
     if (Number(tx.surcharge) > 0) lines.push({ description: 'Card processing fee', quantity: 1, unitPrice: Number(tx.surcharge), lineTotal: Number(tx.surcharge) })
     const receiptNumber = String(tx.id).slice(0, 8).toUpperCase()
+    // 10/5 (Nic, R13): a stay with no lease is held only through what is paid — the receipt says so.
+    const heldWords = await saleHeldWords(tx).catch((e) => {
+      logger.warn({ err: e, saleId: tx.id }, '[POS] could not read the held-through date for the receipt'); return null })
     const { renderPosReceiptPdf } = await import('../services/businessPdf')
     const buffer = await renderPosReceiptPdf({
       business: { name: tx.property_name || tx.business_name || 'Register', email: null, phone: null,
@@ -4248,11 +4790,13 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
       lines,
       subtotal: Math.round((Number(tx.subtotal) + Number(tx.surcharge || 0)) * 100) / 100,
       discountAmount: Number(tx.discount_amount || 0), taxAmount: Number(tx.tax_amount || 0), tipAmount: 0, totalAmount: Number(tx.total),
+      note: heldWords,
     } as any)
     const { emailPosReceipt } = await import('../services/email')
     await emailPosReceipt(email, tx.property_name || tx.business_name || 'GAM', receiptNumber, Number(tx.total), buffer,
       // 10/5: replies reach the people who run this property (services/replyRouting).
-      { relatedEntityType: 'pos_transaction', relatedEntityId: tx.id, replyTo: replyToProperty(tx.property_id) } as any)
+      { relatedEntityType: 'pos_transaction', relatedEntityId: tx.id, replyTo: replyToProperty(tx.property_id) } as any,
+      { note: heldWords })
     // 10/2: never on a resident's record — their email is their account's. And
     // the receipt has already gone out: what follows is bookkeeping, so a
     // failure in it is logged, never reported as a receipt that did not send.

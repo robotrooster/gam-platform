@@ -16,7 +16,7 @@
  * to /inquiry and land as landlord notifications + property_inquiries.
  */
 // S540: self-hosted fonts — no render-blocking external stylesheet
-import { readBeatMs, typeBeatMs, readGapMs, noticeDelayMs, PAUSE_BEFORE_TYPING_MS } from '@gam/shared'
+import { readBeatMs, typeBeatMs, readGapMs, noticeDelayMs, PAUSE_BEFORE_TYPING_MS, STAY_TERMS_LABEL, type StayTerms } from '@gam/shared'
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
 import '@fontsource/syne/800.css'
@@ -325,7 +325,18 @@ function Shell({ children }: { children: React.ReactNode }) {
 // The guest never clicks into a site type that turns out to be full: one
 // availability call prices every type for the chosen dates, available types
 // render as pick-cards, full ones dim to a waitlist option.
-interface BillingSegment { from: string; to: string; nights: number; amount: number; fullMonth: boolean }
+// 10/5 (Nic): what is charged now, line by line — the stay's part, the
+// background check (stays over three weeks; a fixed line) and GAM's card fee.
+// Every figure is the server's (services/propertyBookingQuote dueNowFor); the
+// page only prints them.
+interface DueNow { stay: number; screening: number; cardFee: number; total: number }
+// 30+ nights (R2): the guest chooses a lease or a stay, each priced.
+interface LongStay {
+  words: string
+  monthlyRate: number | null
+  lease: { dueNow: DueNow; monthlyRent: number | null; rentWords: string }
+  stay: { checkOut: string; nights: number; dueNow: DueNow; heldWords: string }
+}
 interface TypeAvail {
   id: string; name: string; unitType: string
   available: boolean; unavailableReason: string | null
@@ -333,8 +344,66 @@ interface TypeAvail {
   // S648: deposits are card only, with the card fee on top
   depositCardFee: number | null
   minStayNights: number | null; checkInTime: string | null; checkOutTime: string | null
-  monthlyBilling: { monthlyRate: number; segments: BillingSegment[] } | null
+  screeningFee: number | null
+  dueNow: DueNow | null
+  longStay: LongStay | null
   altStay: { checkOut: string; nights: number } | null
+}
+/** "Due now: $60.00 deposit + $42.94 background check + $4.19 card fee" */
+function dueNowWords(d: DueNow, stayWord: string): string {
+  return [
+    `Due now: ${money(d.stay)} ${stayWord}`,
+    d.screening > 0 ? `${money(d.screening)} background check` : null,
+    d.cardFee > 0 ? `${money(d.cardFee)} card fee` : null,
+  ].filter(Boolean).join(' + ')
+}
+const SCREENING_NOTE = 'Stays over three weeks need a background check before check-in. Its fee is part of '
+  + 'today’s payment and can’t be removed; the link to fill it out is emailed to you once you’ve paid. '
+  + 'If you already have one on file with us, it isn’t charged again.'
+
+/** The two answers, priced (a booking quote's longStay, or a claim quote). */
+interface ChoicePricing {
+  lease: { dueNow: DueNow; monthlyRent: number | null; rentWords: string }
+  stay: { checkOut: string; dueNow: DueNow; heldWords: string | null }
+}
+
+/** R2: lease or stay — two cards, each with what it costs today. */
+function StayTermsChoice({ longStay, words, checkIn, terms, onPick }: {
+  longStay: ChoicePricing | null; words: string; checkIn: string
+  terms: StayTerms | null; onPick: (t: StayTerms) => void
+}) {
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <p style={{ color: 'var(--t0)', marginBottom: 10 }}>
+        {longStay
+          ? 'Your stay is 30 nights or more, so choose how you’d like to stay.'
+          : 'With the stay you already have with us, this adds up to 30 nights or more, so choose how you’d like to stay.'} {words}
+      </p>
+      <div className="grid g2">
+        <div className={`card st-card${terms === 'lease' ? ' sel' : ''}`} onClick={() => onPick('lease')}>
+          <div style={{ fontFamily: 'var(--fd)', color: 'var(--t0)', fontWeight: 700 }}>{STAY_TERMS_LABEL.lease}</div>
+          {longStay && (
+            <div className="rate" style={{ marginTop: 6 }}>
+              {longStay.lease.monthlyRent != null && <>{money(longStay.lease.monthlyRent)}/month. </>}
+              {longStay.lease.rentWords}
+              <br />{dueNowWords(longStay.lease.dueNow, 'deposit')}
+            </div>
+          )}
+        </div>
+        <div className={`card st-card${terms === 'stay' ? ' sel' : ''}`} onClick={() => onPick('stay')}>
+          <div style={{ fontFamily: 'var(--fd)', color: 'var(--t0)', fontWeight: 700 }}>{STAY_TERMS_LABEL.stay}</div>
+          {longStay && (
+            <div className="rate" style={{ marginTop: 6 }}>
+              Paid one month at a time. Today covers {monthDay(checkIn)} to {monthDay(longStay.stay.checkOut)}; add more months with the office.
+              <br />{dueNowWords(longStay.stay.dueNow, 'first month')}
+            </div>
+          )}
+        </div>
+      </div>
+      {terms === 'stay' && longStay?.stay.heldWords && <div className="alert a-warn">{longStay.stay.heldWords}</div>}
+      {terms === 'lease' && <div className="rate" style={{ marginTop: 8 }}>The office reviews your lease and emails it to you to sign.</div>}
+    </div>
+  )
 }
 const monthDay = (iso: string) => new Date(iso + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 interface AvailResult { nights: number; depositPct: number; utilitiesBilled: boolean; siteTypes: TypeAvail[] }
@@ -361,8 +430,12 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
   const [booking, setBooking] = useState(false)
   const [justFilled, setJustFilled] = useState(false)
   const [waitlisted, setWaitlisted] = useState(false)
+  // 10/5 (R2): the guest's lease-or-stay answer; askTerms when the server
+  // found their stays here add up to 30+ nights though these dates alone don't.
+  const [terms, setTerms] = useState<StayTerms | null>(null)
+  const [askTerms, setAskTerms] = useState<string | null>(null)
 
-  const reset = () => { setAvail(null); setTypeId(''); setError(null); setJustFilled(false); setWaitlisted(false) }
+  const reset = () => { setAvail(null); setTypeId(''); setError(null); setJustFilled(false); setWaitlisted(false); setTerms(null); setAskTerms(null) }
 
   const check = async (checkOutOverride?: string) => {
     setChecking(true); reset()
@@ -385,12 +458,16 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
         siteTypeId: typeId, checkIn, checkOut,
         guestName: guest.name, guestEmail: guest.email, guestPhone: guest.phone || undefined,
         note: guest.note.trim() || undefined,
+        stayTerms: terms ?? undefined,
       })
       // Deposit checkout finishes the reservation; the hold is already on
       // the landlord's calendar.
       window.location.href = r.data.data.checkoutUrl
     } catch (e: any) {
       if (e?.response?.status === 409 && e?.response?.data?.full) setJustFilled(true)
+      else if (e?.response?.status === 409 && e?.response?.data?.needsStayTerms) {
+        setAskTerms(e.response.data.words); setTerms(null)
+      }
       else setError(e?.response?.data?.error || 'Booking failed — please try again')
     } finally { setBooking(false) }
   }
@@ -410,6 +487,11 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
 
   const sel = avail?.siteTypes.find(t => t.id === typeId) ?? null
   const selOpen = !!sel && sel.available && !justFilled
+  // What Reserve charges: the chosen option's figures for 30+ nights.
+  const selDue: DueNow | null = !sel ? null
+    : sel.longStay ? (terms ? sel.longStay[terms].dueNow : null)
+    : sel.dueNow
+  const needsTerms = !!sel?.longStay || !!askTerms
   const anyOpen = !!avail && avail.siteTypes.some(t => t.available)
   const nightsLabel = avail ? `${avail.nights} night${avail.nights === 1 ? '' : 's'}` : ''
 
@@ -433,7 +515,7 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
       <div key={t.id}
         className={`card st-card${t.id === typeId ? ' sel' : ''}`}
         style={selectable ? undefined : { opacity: .55, cursor: 'default' }}
-        onClick={() => { if (selectable) { setTypeId(t.id); setJustFilled(false); setWaitlisted(false) } }}>
+        onClick={() => { if (selectable) { setTypeId(t.id); setJustFilled(false); setWaitlisted(false); setTerms(null); setAskTerms(null) } }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
           <div style={{ fontFamily: 'var(--fd)', color: 'var(--t0)', fontWeight: 700 }}>{t.name}</div>
           {t.available
@@ -445,10 +527,11 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
         <div className="rate" style={{ marginTop: 8 }}>
           {t.available && t.total != null ? (
             <>
-              {t.monthlyBilling ? (
+              {t.longStay && t.longStay.monthlyRate != null ? (
                 <>
-                  <span className="price" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{money(t.monthlyBilling.monthlyRate)}/month</span>
+                  <span className="price" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{money(t.longStay.monthlyRate)}/month</span>
                   {avail!.utilitiesBilled && <> plus utilities</>} · {nightsLabel}
+                  <br />A lease, or a stay paid a month at a time — you choose before paying
                 </>
               ) : (
                 <>
@@ -456,7 +539,7 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
                   {t.tax > 0 && <><br />incl. {money(t.tax)} lodging tax</>}
                 </>
               )}
-              <br />Due now: {money(t.depositAmount)} deposit{t.depositCardFee ? <> + {money(t.depositCardFee)} card fee</> : null}
+              {t.dueNow && <><br />{dueNowWords(t.dueNow, 'deposit')}</>}
             </>
           ) : t.unavailableReason === 'booked' ? (
             <>
@@ -535,16 +618,17 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
                     <span className="rate">{checkIn} → {checkOut} · {nightsLabel}</span>
                     {selOpen && sel.total != null && (
                       <>
-                        <span className="price" style={{ fontSize: '1.15rem', fontWeight: 700 }}>{sel.monthlyBilling ? `${money(sel.monthlyBilling.monthlyRate)}/mo${avail!.utilitiesBilled ? ' + utilities' : ''}` : money(sel.total)}</span>
-                        <span className="rate">Due now: {money(sel.depositAmount)} deposit{sel.depositCardFee ? <> + {money(sel.depositCardFee)} card fee</> : null}</span>
+                        <span className="price" style={{ fontSize: '1.15rem', fontWeight: 700 }}>{sel.longStay && sel.longStay.monthlyRate != null ? `${money(sel.longStay.monthlyRate)}/mo${avail!.utilitiesBilled ? ' + utilities' : ''}` : money(sel.total)}</span>
+                        {sel.dueNow && <span className="rate">{dueNowWords(sel.dueNow, 'deposit')}</span>}
                       </>
                     )}
                   </div>
-                  {selOpen && sel.monthlyBilling && (
-                    <div className="rate" style={{ marginBottom: 14 }}>
-                      Invoiced monthly on the 1st — your first and last months are prorated to the days you stay.
-                      {avail!.utilitiesBilled && ' Utilities are billed separately.'}
-                    </div>
+                  {selOpen && needsTerms && (
+                    <StayTermsChoice longStay={sel.longStay} words={sel.longStay?.words ?? askTerms ?? ''}
+                      checkIn={checkIn} terms={terms} onPick={t => { setTerms(t); setError(null) }} />
+                  )}
+                  {selOpen && sel.screeningFee != null && (
+                    <div className="rate" style={{ marginBottom: 14 }}>{SCREENING_NOTE}</div>
                   )}
                   <div className="grid g3">
                     <div><label className="fl">Name</label><input className="inp" value={guest.name} onChange={e => setGuest({ ...guest, name: e.target.value })} /></div>
@@ -559,8 +643,11 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
                   </div>
                   <div style={{ marginTop: 14, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                     {selOpen ? (
-                      <button className="btn btn-p" disabled={booking || !guest.name || !guest.email} onClick={book}>
-                        {booking ? 'Holding your dates…' : `Reserve — pay ${money((sel.depositAmount ?? 0) + (sel.depositCardFee ?? 0))} by card`}
+                      <button className="btn btn-p" disabled={booking || !guest.name || !guest.email || (needsTerms && !terms)} onClick={book}>
+                        {booking ? 'Holding your dates…'
+                          : needsTerms && !terms ? 'Choose a lease or a stay'
+                          : selDue ? `Reserve — pay ${money(selDue.total)} by card`
+                          : 'Reserve — pay by card'}
                       </button>
                     ) : (
                       <button className="btn btn-p" disabled={booking || !guest.name || !guest.email} onClick={joinWaitlist}>
@@ -622,8 +709,8 @@ function BookedView({ slug, propertyName }: { slug: string; propertyName: string
     <section className="wrap">
       {!bookingId || notFound ? (
         <>
-          <h2>Deposit received</h2>
-          <div className="alert a-ok">Thanks — your payment went through. A confirmation email with your reservation details is on its way.</div>
+          <h2>Payment received</h2>
+          <div className="alert a-ok">Thanks — your payment went through. Your stay link is in your email; your reservation details are there.</div>
         </>
       ) : !info ? (
         <p>Checking your reservation…</p>
@@ -634,7 +721,25 @@ function BookedView({ slug, propertyName }: { slug: string; propertyName: string
             <div style={{ marginBottom: 8 }}><span className="badge b-green">Confirmed</span></div>
             <p style={{ color: 'var(--t0)' }}>{propertyName}</p>
             <p className="rate" style={{ marginTop: 6 }}>{dates}</p>
-            <p className="rate" style={{ marginTop: 6 }}>Deposit paid: <span className="price">{money(info.depositAmount)}</span> · Stay total: <span className="price">{money(info.total)}</span></p>
+            {info.heldWords && Number(info.depositAmount) >= Number(info.total) - 0.005 ? (
+              // 10/5 (R5/R13): a stay with no lease whose first month was paid
+              // whole. One that only paid a deposit (a short stay continuing an
+              // earlier one) is told its deposit and the stay's total below.
+              <p className="rate" style={{ marginTop: 6 }}>First month paid: <span className="price">{money(info.depositAmount)}</span></p>
+            ) : info.leaseChosen ? (
+              <p className="rate" style={{ marginTop: 6 }}>Deposit paid: <span className="price">{money(info.depositAmount)}</span></p>
+            ) : (
+              <p className="rate" style={{ marginTop: 6 }}>Deposit paid: <span className="price">{money(info.depositAmount)}</span> · Stay total: <span className="price">{money(info.total)}</span></p>
+            )}
+            {info.heldWords && <div className="alert a-warn">{info.heldWords}</div>}
+            {info.leaseChosen && (
+              <p className="rate" style={{ marginTop: 10 }}>You asked for a lease. {propertyName} will review it and email it to you to sign. What you paid today comes off your first bill.</p>
+            )}
+            {info.screeningPaid != null && (
+              <p className="rate" style={{ marginTop: 10 }}>
+                Your background check (<span className="price">{money(info.screeningPaid)}</span>) is paid. We’ve emailed you the link to fill it out — check-in waits until the results are back and {propertyName} has reviewed them.
+              </p>
+            )}
             <p className="rate" style={{ marginTop: 10 }}>Your exact site number is assigned and emailed to you the morning of check-in.</p>
             <p className="rate" style={{ marginTop: 6 }}>Check your email for your private <b>stay link</b> — reserve amenities and manage your stay from there.</p>
           </div>
@@ -646,13 +751,13 @@ function BookedView({ slug, propertyName }: { slug: string; propertyName: string
             <p className="rate">{dates}</p>
             <p style={{ marginTop: 10 }}>{polls < 10
               ? 'Hang tight — we’re confirming your deposit with the payment processor…'
-              : 'Your deposit is processing. You’ll get a confirmation email the moment it clears — no need to stay on this page.'}</p>
+              : 'Your payment is processing. Come back to this page in a few minutes to see your reservation confirmed.'}</p>
           </div>
         </>
       ) : (
         <>
           <h2>Reservation status</h2>
-          <div className="alert a-warn">This reservation is no longer active. If you believe that’s wrong, reply to your confirmation email or send us an inquiry.</div>
+          <div className="alert a-warn">This reservation is no longer active. If you believe that’s wrong, reply to your stay link email or send us a message from the home page.</div>
           <p style={{ marginTop: 12 }}><a href={pageHref(slug, 'book')} style={{ color: 'var(--gold)' }}>Back to booking</a></p>
         </>
       )}
@@ -848,6 +953,7 @@ function StayPage({ slug, token, profile }: { slug: string; token: string; profi
           <p className="rate" style={{ marginTop: 6 }}>
             {String(stay.checkIn).slice(0, 10)} → {String(stay.checkOut).slice(0, 10)} · {stay.nights} night{stay.nights === 1 ? '' : 's'}
           </p>
+          {stay.heldWords && <div className="alert a-warn">{stay.heldWords}</div>}
           <p className="rate" style={{ marginTop: 6 }}>Your exact site number is assigned and emailed to you the morning of check-in.</p>
         </div>
       </section>
@@ -900,12 +1006,22 @@ function InquirySection({ slug, propertyName }: { slug: string; propertyName: st
   )
 }
 
+/** What claiming charges, from the server's claim quote: the chosen option's figures for 30+ nights. */
+function claimDue(q: any, terms: StayTerms | null): DueNow | null {
+  if (!q) return null
+  if (q.askStayTerms) return terms && q[terms] ? q[terms].dueNow : null
+  return q.dueNow ?? null
+}
+
 // ── Waitlist claim landing (/claim/:token) ──
 function ClaimView({ slug, token }: { slug: string; token: string }) {
   const [info, setInfo] = useState<any>(null)
   const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [gone, setGone] = useState(false)
+  // 10/5 (R2): a 30+ night claim needs the guest's lease-or-stay answer.
+  const [terms, setTerms] = useState<StayTerms | null>(null)
+  const [askTerms, setAskTerms] = useState<string | null>(null)
 
   useEffect(() => {
     api.get(`/property/${slug}/claim/${token}`)
@@ -916,10 +1032,11 @@ function ClaimView({ slug, token }: { slug: string; token: string }) {
   const claim = async () => {
     setBusy(true)
     try {
-      const r = await api.post(`/property/${slug}/claim/${token}`, {})
+      const r = await api.post(`/property/${slug}/claim/${token}`, { stayTerms: terms ?? undefined })
       window.location.href = r.data.data.checkoutUrl
     } catch (e: any) {
-      if (e?.response?.status === 409) setGone(true)
+      if (e?.response?.status === 409 && e?.response?.data?.needsStayTerms) { setAskTerms(e.response.data.words); setTerms(null) }
+      else if (e?.response?.status === 409) setGone(true)
       else setErr(e?.response?.data?.error || 'Could not claim — please try again')
     } finally { setBusy(false) }
   }
@@ -940,7 +1057,19 @@ function ClaimView({ slug, token }: { slug: string; token: string }) {
         ) : (
           <>
             {info.claimExpiresAt && <div className="rate" style={{ marginBottom: 12 }}>Claim by {new Date(info.claimExpiresAt).toLocaleString()}</div>}
-            <button className="btn btn-p" disabled={busy} onClick={claim}>{busy ? 'Claiming…' : 'Claim & pay deposit'}</button>
+            {(info.quote?.askStayTerms || askTerms) && (
+              <StayTermsChoice
+                longStay={info.quote?.lease && info.quote?.stay ? { lease: info.quote.lease, stay: info.quote.stay } : null}
+                words={info.quote?.words ?? askTerms ?? ''} checkIn={info.checkIn}
+                terms={terms} onPick={setTerms} />
+            )}
+            {info.quote?.dueNow && <div className="rate" style={{ marginBottom: 12 }}>{dueNowWords(info.quote.dueNow, 'deposit')}</div>}
+            {info.quote?.screeningFee != null && <div className="rate" style={{ marginBottom: 12 }}>{SCREENING_NOTE}</div>}
+            <button className="btn btn-p" disabled={busy || ((info.quote?.askStayTerms || !!askTerms) && !terms)} onClick={claim}>
+              {busy ? 'Claiming…'
+                : (info.quote?.askStayTerms || askTerms) && !terms ? 'Choose a lease or a stay'
+                : `Claim & pay${claimDue(info.quote, terms) ? ` ${money(claimDue(info.quote, terms)!.total)}` : ''}`}
+            </button>
           </>
         )}
       </div>

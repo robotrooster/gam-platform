@@ -1958,8 +1958,13 @@ const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recur
 // S655: likewise a FlexPay $25 taken back because its pull was taken back by
 // the bank (services/flexpay handleFlexPayPullReversed) is an 'adjustment' that
 // corrects the FlexPay slice, so it nets inside it.
+// 10/5 (Nic, prepaid stays): a screening margin taken back because the check
+// paid with a stay was cancelled before a report (services/stayTerms
+// restorePrepaidScreening) corrects the Background Checks slice.
 const SLICE_TYPE_SQL = `CASE WHEN type = 'adjustment' AND reference_type = 'processing_margin_true_up'
                              THEN 'banking_spread'
+                             WHEN type = 'adjustment' AND reference_type = 'screening_margin_reversal'
+                             THEN 'screening_margin'
                              WHEN type = 'adjustment' AND reference_type LIKE 'flexpay_advance_reversal%'
                              THEN 'flexpay_subscription'
                              ELSE type END`

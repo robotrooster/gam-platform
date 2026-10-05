@@ -34,7 +34,7 @@
  */
 import type { PoolClient } from 'pg'
 import { DateTime } from 'luxon'
-import { computeStayPrice, computeMonthlyStaySchedule } from '@gam/shared'
+import { computeStayPrice, computeMonthlyStaySchedule, longCalendarDate, type StayTerms } from '@gam/shared'
 import { AppError } from '../middleware/errorHandler'
 
 export interface StayLine {
@@ -169,6 +169,22 @@ export async function createStayBooking(
      */
     status?: 'confirmed' | 'tentative'
     source?: string
+    /**
+     * 10/5 (Nic, R2): the counter's answer for a 30+ night stay — 'lease' or
+     * 'stay' (no lease). Null under 30 nights. The lease itself is drafted by
+     * services/stayTerms (chooseStayTerms) once the sale has committed.
+     */
+    stayTerms?: StayTerms | null
+    /** The resident the sale names, so their back-to-back stays add up (R7). */
+    tenantId?: string | null
+    /** 10/5 (Nic, R1/R9): a stay of 22+ continuous nights — check-in waits on its background check. */
+    screeningRequired?: boolean
+    /**
+     * 10/5: a stay its LEASE bills (stayTerms 'lease') is paid only its
+     * deposit at the counter — recorded as the deposit, never as the stay paid
+     * in full (reservationDue: the lease bills the rest).
+     */
+    depositAmount?: number | null
   },
 ): Promise<{ bookingId: string; checkIn: string; checkOut: string; nights: number }> {
   const { lines, details } = opts
@@ -212,9 +228,11 @@ export async function createStayBooking(
     `INSERT INTO unit_bookings
        (unit_id, landlord_id, guest_name, guest_email, guest_phone,
         check_in, check_out, nights, total_amount, status, lease_type,
-        source, pos_transaction_id, deposit_paid_at, notes, booked_check_out)
+        source, pos_transaction_id, deposit_paid_at, notes, booked_check_out,
+        stay_terms, tenant_id, screening_required, deposit_amount)
      VALUES ($1,$2,$3,$4,$5,$6::date,$7::date,$8,$9,$13,$10,
-             $14,$11, CASE WHEN $13 = 'confirmed' THEN NOW() ELSE NULL END, $12, $7::date)
+             $14,$11, CASE WHEN $13 = 'confirmed' THEN NOW() ELSE NULL END, $12, $7::date,
+             $15, $16, $17, $18)
      RETURNING id`,
     [details.unitId, opts.landlordId, details.guestName.trim(),
      details.guestEmail?.trim() || null, details.guestPhone?.trim() || null,
@@ -225,7 +243,9 @@ export async function createStayBooking(
      // 'monthly', and every month stay rung at the register failed on it.
      bookingLeaseTypeFor(line.stayUnit),
      opts.posTransactionId, details.notes?.trim() || null,
-     opts.status ?? 'confirmed', opts.source ?? 'register'])
+     opts.status ?? 'confirmed', opts.source ?? 'register',
+     opts.stayTerms ?? null, opts.tenantId ?? null, opts.screeningRequired === true,
+     opts.depositAmount != null ? Math.round(opts.depositAmount * 100) / 100 : null])
 
   return { bookingId: ins.rows[0].id, checkIn, checkOut, nights }
 }
@@ -245,19 +265,21 @@ export async function createStayBooking(
  *     and a stay link write it that way), so nothing is left either.
  *
  * 10/3 (decisions #15) — A RESERVATION THAT BECOMES A LEASE IS NEVER CHARGED
- * WHOLE AT THE REGISTER. A stay at or over the lease threshold (30 nights, or 7
- * at a weekly-lease park — services/bookingLeaseDraft) drafts a lease, and the
- * lease bills the stay: the arrival month on arrival day, monthly after that
- * (services/bookingLeaseBilling). The register takes only what is due NOW — the
- * deposit the booking site would have asked for the same stay
- * (services/propertyBooking depositForStay), or the one already on the
- * reservation — and the lease bills the rest. Taking the whole quote here as
- * well billed the stay twice the moment the lease was signed. `owed` is then
- * what the register may still take (the deposit, less what was paid toward it)
- * and `leaseBillsRest` says so. Only a reservation a lease bills counts: one
- * with a lease drafted from it, or one the schedule or the booking site made
- * (they draft one at that length). A stay the register sold itself (source
- * 'register') drafts no lease, so it is charged whole as before.
+ * WHOLE AT THE REGISTER. The lease bills the stay: the arrival month on
+ * arrival day, monthly after that (services/bookingLeaseBilling). The register
+ * takes only what is due NOW — the deposit the booking site would have asked
+ * for the same stay (services/propertyBooking depositForStay), or the one
+ * already on the reservation — and the lease bills the rest. Taking the whole
+ * quote here as well billed the stay twice the moment the lease was signed.
+ * `owed` is then what the register may still take (the deposit, less what was
+ * paid toward it) and `leaseBillsRest` says so.
+ *
+ * 10/5 (Nic, R3/R14): a lease bills a stay ONLY when one was chosen — a lease
+ * drafted from it, or the guest's (or the counter's) answer 'lease'
+ * (stay_terms). Length alone never makes a lease any more ("the stay only
+ * guarantees it for the time that you've paid ahead of time"), so a 30+ night
+ * stay with no lease is owed whole, wherever it was made, and a park's
+ * weekly-lease setting no longer moves anything.
  */
 export interface ReservationDue {
   bookingId: string
@@ -326,8 +348,43 @@ export interface ReservationDue {
 export const soldCheckOutSql = (b: string): string =>
   `GREATEST(COALESCE(${b}.booked_check_out, ${b}.check_out), ${b}.check_out)`
 
-/** The lease threshold for a property: 30 nights, or 7 when it runs weekly leases (services/bookingLeaseDraft). */
-export const leaseThresholdNights = (weeklyLeaseMode: boolean | null | undefined): number => (weeklyLeaseMode ? 7 : 30)
+/**
+ * The deposit the booking site quotes for the same nights on the same site
+ * (services/propertyBooking depositForStay) — what a stay its lease bills is
+ * paid at the register. `p` carries the property's deposit settings and the
+ * stay's rates (the site's, else the property's).
+ */
+async function longStayDeposit(p: {
+  booking_deposit_pct: string | number | null; booking_monthly_deposit: string | number | null
+  short_term_tax_rate: string | number | null
+  nightly_rate: number | null; weekly_rate: number | null; monthly_rate: number | null
+}, total: number, nights: number): Promise<number> {
+  const { depositForStay } = await import('./propertyBooking')
+  const price = computeStayPrice(
+    { nightly: p.nightly_rate, weekly: p.weekly_rate, monthly: p.monthly_rate },
+    Number(p.short_term_tax_rate || 0), nights)
+  return depositForStay(
+    { booking_deposit_pct: p.booking_deposit_pct ?? 0, booking_monthly_deposit: p.booking_monthly_deposit },
+    { tier: price.tier, total, monthlyRate: p.monthly_rate ?? null })
+}
+
+/**
+ * 10/5 (Nic, R2/R4): the deposit a NEW stay its lease will bill is paid at the
+ * counter (or on its link) — the same deposit reservationDue asks of a stay a
+ * lease bills (longStayDeposit), from the site's rates and the property's
+ * deposit settings. Never more than the stay's own price.
+ */
+export async function leaseDepositFor(q: Pick<PoolClient, 'query'>, unitId: string, total: number, nights: number): Promise<number> {
+  const r = (await q.query<any>(
+    `SELECT p.booking_deposit_pct, p.booking_monthly_deposit, p.short_term_tax_rate,
+            COALESCE(u.nightly_rate, p.nightly_rate)::float AS nightly_rate,
+            COALESCE(u.weekly_rate, p.weekly_rate)::float AS weekly_rate,
+            COALESCE(u.monthly_rate, p.monthly_rate)::float AS monthly_rate
+       FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [unitId])).rows[0]
+  if (!r) return 0
+  const d = await longStayDeposit(r, total, nights)
+  return Math.round(Math.min(total, Math.max(0, d)) * 100) / 100
+}
 
 export async function reservationDue(
   q: Pick<PoolClient, 'query'>, bookingId: string, opts: { lock?: boolean } = {},
@@ -340,8 +397,7 @@ export async function reservationDue(
             COALESCE(b.total_amount, 0)::float AS total, b.deposit_amount::float AS deposit_amount,
             (b.deposit_paid_at IS NOT NULL) AS deposit_paid, (b.balance_paid_at IS NOT NULL) AS balance_paid,
             (b.displaced_at IS NOT NULL AND b.displaced_from_unit IS NOT DISTINCT FROM b.unit_id) AS displaced,
-            b.balance_pay_link_id,
-            COALESCE(p.weekly_lease_mode, FALSE) AS weekly_lease_mode,
+            b.balance_pay_link_id, b.stay_terms,
             p.booking_deposit_pct, p.booking_monthly_deposit, p.short_term_tax_rate,
             COALESCE(u.nightly_rate, p.nightly_rate)::float AS nightly_rate,
             COALESCE(u.weekly_rate, p.weekly_rate)::float AS weekly_rate,
@@ -362,24 +418,14 @@ export async function reservationDue(
   const bookedNights = nightsBetween(r.check_in, r.booked_check_out)
   // decisions #15: a stay its lease bills — one a lease was drafted from (the
   // same test the arrival-day run uses to leave it alone, services/stayBalance),
-  // or one at or over the threshold that the schedule or the booking site made
-  // (they draft its lease as it is made).
-  const leaseBillsRest = total > 0 && (r.has_lease === true
-    || (bookedNights >= leaseThresholdNights(r.weekly_lease_mode) && (r.source ?? 'direct') !== 'register'))
+  // or one whose lease was chosen (10/5, R2: stay_terms 'lease' — its draft
+  // follows the sale that chose it).
+  const leaseBillsRest = total > 0 && (r.has_lease === true || r.stay_terms === 'lease')
   let depositDue: number | null = null
   if (leaseBillsRest) {
-    if (r.deposit_amount != null) {
-      depositDue = round(Number(r.deposit_amount) || 0)
-    } else {
-      // The deposit the booking site quotes for the same nights on the same site.
-      const { depositForStay } = await import('./propertyBooking')
-      const price = computeStayPrice(
-        { nightly: r.nightly_rate, weekly: r.weekly_rate, monthly: r.monthly_rate },
-        Number(r.short_term_tax_rate || 0), bookedNights)
-      depositDue = depositForStay(
-        { booking_deposit_pct: r.booking_deposit_pct ?? 0, booking_monthly_deposit: r.booking_monthly_deposit },
-        { tier: price.tier, total, monthlyRate: r.monthly_rate ?? null })
-    }
+    depositDue = r.deposit_amount != null
+      ? round(Number(r.deposit_amount) || 0)
+      : await longStayDeposit(r, total, bookedNights)
     depositDue = Math.min(total, Math.max(0, depositDue))
   }
   const paid = r.balance_paid ? total
@@ -505,6 +551,267 @@ export async function priceStayBySchedule(
   return { ...priced, unitNumber: u.unit_number }
 }
 
+// ── 10/5 (Nic, R5): THE REGISTER NEVER PRORATES A STAY ───────────────────
+
+/**
+ * 10/5 (Nic, R8): the name the background check's fee goes by on a register
+ * sale, a pay link, the card page and the receipt — its own line, added by the
+ * server only, that the clerk cannot take off.
+ */
+export const SCREENING_LINE_NAME = 'Background check (required for a stay over three weeks)'
+
+const round2 = (n: number) => Math.round(n * 100) / 100
+
+/** The pricing tier one of each is sold at. */
+const TIER_OF: Record<StayUnit, 'nightly' | 'weekly' | 'monthly'> = { night: 'nightly', week: 'weekly', month: 'monthly' }
+/** "nightly", "weekly", "monthly" — the rate a stay of these is sold at, in the clerk's words. */
+export const STAY_RATE_WORD: Record<StayUnit, string> = { night: 'nightly', week: 'weekly', month: 'monthly' }
+
+export interface WholeStayPrice {
+  total: number; base: number; tax: number; taxRate: number; nights: number
+  tier: 'nightly' | 'weekly' | 'monthly'
+  /** The rate one of these is sold at (the site's, else the property's); null when neither has one. */
+  rate: number | null
+  checkOut: string
+}
+
+/**
+ * 10/5 (Nic, R5) — "point of sale cannot prorate a stay." The register (and a
+ * link sent from it) sells a stay in WHOLE nights, weeks or months, each at the
+ * rate for what one of them is: three nights are three times the nightly rate,
+ * two weeks twice the weekly rate, a month the monthly rate — never a month cut
+ * into calendar pieces, never a week priced as nights. The rate is the site's,
+ * else the property's ("one price, and it is the site's", S652). The
+ * property's short-term lodging tax is added to nights and weeks under 30
+ * nights (decisions #21); a month is the monthly tier and is never taxed.
+ * Prorating belongs to a lease, by the property's rent-due setting (R4).
+ * `total` is 0 (and `rate` null) when nothing prices one of these.
+ */
+export function wholeStayPrice(
+  rates: { nightly: number | string | null; weekly: number | string | null; monthly: number | string | null },
+  taxPct: number | string | null, stayUnit: StayUnit, qty: number, checkIn: string,
+): WholeStayPrice {
+  const checkOut = checkOutFor(checkIn, stayUnit, qty)
+  const nights = nightsBetween(checkIn, checkOut)
+  const tier = TIER_OF[stayUnit]
+  const raw = stayUnit === 'night' ? rates.nightly : stayUnit === 'week' ? rates.weekly : rates.monthly
+  const rate = raw == null || raw === '' ? null : Number(raw)
+  if (rate == null || !(rate > 0)) return { total: 0, base: 0, tax: 0, taxRate: 0, nights, tier, rate: null, checkOut }
+  const base = round2(rate * qty)
+  const pct = Number(taxPct || 0)
+  const taxRate = stayUnit !== 'month' && nights < 30 && pct > 0 ? pct / 100 : 0
+  const tax = round2(base * taxRate)
+  return { total: round2(base + tax), base, tax, taxRate, nights, tier, rate, checkOut }
+}
+
+/** The site's rates (else the property's) and the property's lodging tax, read once. */
+async function siteRates(q: Pick<PoolClient, 'query'>, unitId: string): Promise<{
+  unit_number: string; nightly_rate: number | null; weekly_rate: number | null; monthly_rate: number | null
+  short_term_tax_rate: number | null; property_id: string
+} | null> {
+  return (await q.query<any>(
+    `SELECT COALESCE(NULLIF(u.display_label, ''), u.unit_number) AS unit_number, u.property_id,
+            COALESCE(u.nightly_rate, p.nightly_rate)::float AS nightly_rate,
+            COALESCE(u.weekly_rate, p.weekly_rate)::float AS weekly_rate,
+            COALESCE(u.monthly_rate, p.monthly_rate)::float AS monthly_rate,
+            p.short_term_tax_rate::float AS short_term_tax_rate
+       FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [unitId])).rows[0] ?? null
+}
+
+/**
+ * wholeStayPrice for a site, read from the database. Refuses (in the clerk's
+ * words — `noRateWords`, or "nothing was charged" by default) a site that has
+ * no rate for what one of these is.
+ */
+export async function priceWholeStay(
+  q: Pick<PoolClient, 'query'>, unitId: string, stayUnit: StayUnit, qty: number, checkIn: string,
+  noRateWords?: (unitNumber: string, rateWord: string) => string,
+): Promise<WholeStayPrice & { unitNumber: string }> {
+  const u = await siteRates(q, unitId)
+  if (!u) throw new AppError(404, 'That site is not on this account any more — pick the site again.')
+  const priced = wholeStayPrice({ nightly: u.nightly_rate, weekly: u.weekly_rate, monthly: u.monthly_rate },
+    u.short_term_tax_rate, stayUnit, qty, checkIn)
+  if (!(priced.total > 0)) {
+    const word = STAY_RATE_WORD[stayUnit]
+    throw new AppError(409, noRateWords ? noRateWords(u.unit_number, word)
+      : `Site ${u.unit_number} has no ${word} rate set, and neither does the property, so this stay cannot be priced — nothing was charged. `
+        + `Set the site's ${word} rate (or the property's), then press Charge again.`)
+  }
+  return { ...priced, unitNumber: u.unit_number }
+}
+
+// ── 10/5 (Nic, R6): ADD A MONTH TO THE STAY THAT IS HERE NOW ─────────────
+
+/**
+ * What adding a month to a guest's current stay comes to — read, never
+ * written (extendStayByMonth writes it). The SAME booking is lengthened by one
+ * calendar month from its check-out, and the month is priced on its own at the
+ * monthly rate (the site's, else the property's): no reprice of the whole
+ * stay, no proration (R5, R6).
+ */
+export interface StayExtension {
+  bookingId: string
+  unitId: string
+  unitNumber: string
+  propertyId: string
+  checkIn: string
+  /** The stay's check-out now — the first night of the added month. */
+  fromCheckOut: string
+  /** Its check-out with the month added. */
+  checkOut: string
+  /** Nights on the stay with the month added. */
+  nights: number
+  addedNights: number
+  /** The added month, at the monthly rate. */
+  price: number
+  /** Paid toward the stay before the month (all of it — nothing may be owed). */
+  paidBefore: number
+  guestName: string | null
+  guestEmail: string | null
+  tenantId: string | null
+  stayTerms: StayTerms | null
+}
+
+/** What the clerk is told when the month cannot be added (`nothing`: 'charged' or 'sent'). */
+const extendWords = {
+  gone: (n: string) => `That stay is not on the schedule any more — nothing was ${n}. Pick the stay again.`,
+  over: (n: string) => `That stay has ended (checked out, canceled or a no-show) — nothing was ${n}. Ring a new stay with a site and dates instead.`,
+  unpaid: (n: string) => `That stay is not paid yet — nothing was ${n}. Settle it first (open its ticket or pay link from the open list), then add a month.`,
+  lease: (n: string) => `That stay has a lease — the lease holds the site for as long as they stay and bills each month, so there is no month to add — nothing was ${n}.`,
+  owes: (owed: number, n: string) => `That stay still owes $${owed.toFixed(2)} — nothing was ${n}. Take that first (open its ticket or pay link from the open list), then add a month.`,
+  noRate: (unit: string, n: string) => `Site ${unit} has no monthly rate set, and neither does the property, so a month cannot be priced — nothing was ${n}. Set the site's monthly rate (or the property's), then try again.`,
+  taken: (unit: string, from: string, to: string, n: string) => `Site ${unit} is not free for the whole month from ${longCalendarDate(from)} to ${longCalendarDate(to)} — someone else has it for some of those nights, so the stay cannot be lengthened there. Nothing was ${n}. Ring a new stay on another site instead.`,
+}
+
+export async function stayExtensionQuote(
+  q: Pick<PoolClient, 'query'>, args: { landlordId: string; propertyId: string; bookingId: string; nothing?: 'charged' | 'sent'; lock?: boolean },
+): Promise<StayExtension> {
+  const n = args.nothing ?? 'charged'
+  if (!/^[0-9a-f-]{36}$/i.test(String(args.bookingId ?? ''))) throw new AppError(404, extendWords.gone(n))
+  const b = (await q.query<any>(
+    `SELECT b.id, b.unit_id, b.status, b.landlord_id, u.property_id,
+            to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+            b.guest_name, b.guest_email, b.tenant_id, b.stay_terms,
+            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id AND l.status IN ('pending', 'active')) AS has_lease
+       FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+      WHERE b.id = $1${args.lock ? ' FOR UPDATE OF b' : ''}`, [args.bookingId])).rows[0]
+  if (!b || b.property_id !== args.propertyId || b.landlord_id !== args.landlordId) throw new AppError(404, extendWords.gone(n))
+  if (['cancelled', 'no_show', 'checked_out'].includes(b.status)) throw new AppError(409, extendWords.over(n))
+  if (b.status === 'tentative') throw new AppError(409, extendWords.unpaid(n))
+  if (b.has_lease || b.stay_terms === 'lease') throw new AppError(409, extendWords.lease(n))
+  const due = await reservationDue(q, b.id)
+  if (!due || due.closed) throw new AppError(409, extendWords.over(n))
+  if (due.owed > 0.005) throw new AppError(409, extendWords.owes(due.owed, n))
+  const u = await siteRates(q, b.unit_id)
+  const monthly = u?.monthly_rate != null ? Number(u.monthly_rate) : null
+  if (!u || monthly == null || !(monthly > 0)) throw new AppError(409, extendWords.noRate(u?.unit_number ?? '—', n))
+  const checkOut = checkOutFor(b.check_out, 'month', 1)
+  return {
+    bookingId: b.id, unitId: b.unit_id, unitNumber: u.unit_number, propertyId: b.property_id,
+    checkIn: b.check_in, fromCheckOut: b.check_out, checkOut,
+    nights: nightsBetween(b.check_in, checkOut), addedNights: nightsBetween(b.check_out, checkOut),
+    price: round2(monthly), paidBefore: due.paid,
+    guestName: b.guest_name ?? null, guestEmail: b.guest_email ?? null, tenantId: b.tenant_id ?? null,
+    stayTerms: b.stay_terms ?? null,
+  }
+}
+
+/**
+ * 10/5 (Nic, R6) — "Add a month" EXTENDS the stay: the same booking's
+ * check-out (and the length it is sold for, booked_check_out) move one
+ * calendar month, its price grows by the month, and what was paid before is
+ * kept as paid toward it — so the month is what is owed now, paid by the sale
+ * or the link that added it (payTowardStay / settleLinkBooking). Refused, in
+ * plain words, when anyone else has the site for any night of that month (a
+ * paid month never moves somebody else's hold).
+ *
+ * Runs in the caller's transaction. Lock order as the schedule takes it: the
+ * site's row, the booking, then the site's two stay locks.
+ */
+export async function extendStayByMonth(
+  client: PoolClient, args: { landlordId: string; propertyId: string; bookingId: string; nothing?: 'charged' | 'sent' },
+): Promise<StayExtension> {
+  const n = args.nothing ?? 'charged'
+  const first = await stayExtensionQuote(client, { ...args })
+  await client.query(`SELECT id FROM units WHERE id = $1 FOR KEY SHARE`, [first.unitId])
+  const ext = await stayExtensionQuote(client, { ...args, lock: true })
+  if (ext.unitId !== first.unitId || ext.fromCheckOut !== first.fromCheckOut) {
+    throw new AppError(409, `That stay changed a moment ago — nothing was ${n}. Pick the stay again.`)
+  }
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`unit-booking:${ext.unitId}`])
+  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`unit_booking:${ext.unitId}`])
+  // The stay ends on the month's first night, so it never reads as in the way of itself.
+  if (!await siteIsFree(client, ext.unitId, ext.fromCheckOut, ext.checkOut)) {
+    throw new AppError(409, extendWords.taken(ext.unitNumber, ext.fromCheckOut, ext.checkOut, n))
+  }
+  const upd = await client.query(
+    `UPDATE unit_bookings
+        SET check_out = $2::date, booked_check_out = $2::date, nights = $3,
+            total_amount = COALESCE(total_amount, 0) + $4::numeric,
+            deposit_amount = $5::numeric, deposit_paid_at = COALESCE(deposit_paid_at, NOW()),
+            balance_paid_at = NULL, updated_at = NOW()
+      WHERE id = $1 AND check_out = $6::date RETURNING id`,
+    [ext.bookingId, ext.checkOut, ext.nights, ext.price, ext.paidBefore, ext.fromCheckOut])
+  if (!upd.rows.length) throw new AppError(409, `That stay changed a moment ago — nothing was ${n}. Pick the stay again.`)
+  return ext
+}
+
+/**
+ * A month added by a pay link that was closed before anything was paid on it
+ * goes again: the stay's check-out and price go back to what they were, and a
+ * stay that was paid whole before reads as paid whole again. Only while the
+ * stay still ends where the month left it and nothing was paid toward the
+ * month. Returns whether it was undone.
+ */
+export async function undoStayExtension(
+  client: Pick<PoolClient, 'query'>, ext: { bookingId: string; fromCheckOut: string; checkOut: string; price: number },
+): Promise<boolean> {
+  const r = await client.query(
+    `UPDATE unit_bookings
+        SET check_out = $2::date, booked_check_out = $2::date, nights = ($2::date - check_in),
+            total_amount = total_amount - $4::numeric,
+            balance_paid_at = CASE WHEN COALESCE(deposit_amount, 0) >= total_amount - $4::numeric - 0.005
+                                   THEN COALESCE(balance_paid_at, NOW()) ELSE balance_paid_at END,
+            updated_at = NOW()
+      WHERE id = $1 AND check_out = $3::date AND status IN ('confirmed', 'checked_in')
+        AND COALESCE(deposit_amount, 0) <= total_amount - $4::numeric + 0.005
+      RETURNING id`,
+    [ext.bookingId, ext.fromCheckOut, ext.checkOut, round2(ext.price)])
+  return r.rows.length > 0
+}
+
+/**
+ * Money a sale at the counter paid toward a stay already on the schedule (a
+ * month added to it): added to what was paid before, and once that covers the
+ * stay's price its balance is stamped billed and paid — the same rule a pay
+ * link follows (posPayLinks settleLinkBooking). Itemized by how it was paid
+ * (decisions #37.B, #38).
+ */
+export async function payTowardStay(
+  client: PoolClient, o: { bookingId: string; saleId: string; amount: number },
+): Promise<void> {
+  const amount = round2(Math.max(0, Number(o.amount) || 0))
+  if (!(amount > 0)) return
+  const b = (await client.query<{ total: number; deposit_amount: number | null; deposit_paid: boolean }>(
+    `SELECT COALESCE(total_amount, 0)::float AS total, deposit_amount::float AS deposit_amount,
+            (deposit_paid_at IS NOT NULL) AS deposit_paid
+       FROM unit_bookings WHERE id = $1 FOR UPDATE`, [o.bookingId])).rows[0]
+  if (!b) return
+  const before = b.deposit_paid ? (b.deposit_amount == null ? Number(b.total) : Number(b.deposit_amount)) : 0
+  const paidNow = round2(before + amount)
+  const whole = paidNow >= Number(b.total) - 0.005
+  await client.query(
+    `UPDATE unit_bookings
+        SET deposit_amount = $2::numeric, deposit_paid_at = COALESCE(deposit_paid_at, NOW()),
+            pos_transaction_id = COALESCE(pos_transaction_id, $3),
+            balance_billed_at = CASE WHEN $4::boolean THEN COALESCE(balance_billed_at, NOW()) ELSE balance_billed_at END,
+            balance_paid_at   = CASE WHEN $4::boolean THEN COALESCE(balance_paid_at, NOW()) ELSE balance_paid_at END,
+            updated_at = NOW()
+      WHERE id = $1`, [o.bookingId, paidNow, o.saleId, whole])
+  const { recordSaleTowardStay } = await import('./stayPayments')
+  await recordSaleTowardStay(client, { bookingId: o.bookingId, saleId: o.saleId, toward: amount })
+}
+
 /**
  * 10/3 (review) — A RESERVATION THAT IS OVER LEAVES THE REST OF ITS TICKET
  * OWED.
@@ -531,10 +838,18 @@ export async function releaseReservationTickets(
         AND ($3::uuid IS NULL OR id = $3::uuid)
       FOR UPDATE`, [bookingId, opts.exceptTicketId ?? null, opts.onlyTicketId ?? null])).rows
   const out = { voided: [] as string[], kept: [] as string[] }
+  // 10/5 (Nic, M2): the background check a ticket carries stays on it only
+  // while it is still owed — the stay stands (paid in full some other way, or
+  // its lease bills it) and no check is recorded for it yet. A cancelled or
+  // no-show stay needs no check; one already paid is never asked twice.
+  const screeningGone = tickets.length ? !!(await q.query<{ gone: boolean }>(
+    `SELECT (b.id IS NULL OR b.status IN ('cancelled', 'no_show')
+             OR EXISTS (SELECT 1 FROM screening_prepayments sp WHERE sp.booking_id = $1 AND sp.status <> 'void')) AS gone
+       FROM (SELECT $1::uuid AS id) x LEFT JOIN unit_bookings b ON b.id = x.id`, [bookingId])).rows[0]?.gone : false
   for (const t of tickets) {
     const items = Array.isArray(t.items) ? t.items : []
     const stays = await stayItemIdsIn(q, t.landlord_id, items)
-    const rest = items.filter((i: any) => !stays.has(lowerItemId(i?.id)))
+    const rest = items.filter((i: any) => !stays.has(lowerItemId(i?.id)) && !(screeningGone && !i?.id && i?.screening === true))
     if (!rest.length) {
       await q.query(
         `UPDATE pos_open_tickets SET status = 'voided', voided_at = NOW(), updated_at = NOW(), void_reason = $2

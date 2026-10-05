@@ -7,6 +7,7 @@ import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFi
 import { AppError } from '../middleware/errorHandler'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { canonicalUnitNumber, UNIT_TYPE_PREFIX, BOOKING_STATUSES, BOOKING_STATUS_LABEL, SUB_PERMISSION_LABEL, PERMISSION_CATALOG, type BookingStatus } from '@gam/shared'
+import { STAY_TERMS, STAY_SCREENING_NIGHTS, stayHeldWords, type StayTerms } from '@gam/shared'
 import { centsWords, NEVER_MOVED_IN_NOTE, NEVER_MOVED_IN_REASON } from '../lib/unwindIssuedLease'
 import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE, type StayConflict } from '../services/unitAvailability'
@@ -16,11 +17,14 @@ import { todayIn, addDaysTo } from '../lib/timezone'
 import { promoteNextWaitlister } from '../services/propertyBooking'
 import { linkUnitToSubtype } from '../services/unitSubtype'
 import { recordBookingEvent, recordBookingChange } from '../services/bookingEvents'
-import { maybeDraftLeaseFromBooking } from '../services/bookingLeaseDraft'
+import {
+  stayNeeds, markScreeningRequired, chooseStayTerms, draftLeaseFromStay, syncStayUtilityAgreement, checkInBlock,
+  continuousStayNights, type StayNeeds, type CheckInBlock,
+} from '../services/stayTerms'
 import { unitPendingReads } from '../services/utilityReadingRuns'
 import { syncLeaseWithBookingDates } from '../services/bookingLeaseBilling'
 import { bookedDayBeforeEarlyCheckOut, checkOutChangeRefusal, onCheckOutUndone, afterPatchEarlyCheckOut, refundNeedsRetrySql, healLeaseEnds } from '../services/earlyCheckOut'
-import { scheduleStayPrice } from '../services/registerStay'
+import { scheduleStayPrice, stayExtensionQuote, extendStayByMonth, SCREENING_LINE_NAME, type StayExtension } from '../services/registerStay'
 import { assertLateFeeDecision } from '../services/lateFeePolicy'
 import { replyToProperty } from '../services/replyRouting'
 import {
@@ -410,6 +414,172 @@ async function lockSitesForStays(client: PoolClient, unitIds: string[]): Promise
 // S655: the statuses in which a guest still holds their site. Moving a
 // checked-out stay back to one of these is undoing the check-out.
 const SITE_HOLDING_STATUSES = ['tentative', 'confirmed', 'checked_in']
+
+// ── 10/5 (Nic): PREPAID STAYS ON THE SCHEDULE ────────────────────────────────
+//
+//   "At the point of sale, same thing, except it's the front counter person
+//    that's clicking lease or no lease. And either way, it goes to me."
+//
+// The rules live in services/stayTerms. The schedule asks stayNeeds() whenever
+// it makes a stay or changes a stay's dates or site, and does what it says:
+//   - R2: 30+ continuous nights with no answer yet → the save is refused with
+//     code 'stay_terms_needed'; the screen asks staff lease or no lease, then
+//     sends the same save again with `stayTerms`. Lease drafts one for the
+//     landlord (draftLeaseFromStay); a stay is held only through what is paid.
+//   - R1/R8: 22+ → the stay is marked as one whose check-in waits on a
+//     background check. The schedule takes no money itself, so the check's fee
+//     rides on the deposit link or the register ticket it hands the stay to.
+//   - R3: nothing here ever drafts a lease on its own.
+
+/** The counter's version of the question the guest is asked online (R2). */
+export function stayTermsQuestion(nights: number): string {
+  return `This guest is staying ${nights} nights in a row, so they get a lease or a stay. `
+    + 'A lease holds the site for as long as they stay. A stay holds it only through the time they\'ve paid for. '
+    + 'Choose one and the change is saved.'
+}
+
+/** The refusal a 30+ night save gets until staff answer lease or no lease. */
+const stayTermsNeededBody = (needs: StayNeeds) => ({
+  success: false as const,
+  code: 'stay_terms_needed' as const,
+  error: stayTermsQuestion(needs.nights),
+  nights: needs.nights,
+})
+
+/** R7: a stay this long has to reach the guest — the check is sent to them and matched by their email. */
+const LONG_STAY_NEEDS_EMAIL =
+  'A stay of more than three weeks needs the guest\'s email, so their background check can be sent to them. '
+  + 'Add their email, then save again.'
+
+/**
+ * 10/5 (Nic, A2): "it must go out as a pay link or a register ticket." A stay
+ * that needs the background check's fee (22+ continuous nights, nothing on
+ * file) cannot be confirmed straight onto the schedule: the schedule takes no
+ * money, and the fee has to ride on the stay's payment. The save is refused
+ * with code 'screening_fee_route_needed', and the screen offers the two ways
+ * that carry the fee — a deposit link emailed to the guest, or the register.
+ */
+function screeningFeeRouteBody(needs: StayNeeds, hasEmail: boolean) {
+  const fee = needs.screeningFee?.amount ?? 0
+  return {
+    success: false as const,
+    code: 'screening_fee_route_needed' as const,
+    error: `This guest is staying ${needs.nights} nights in a row, so they need a background check before check-in, `
+      + `and none is on file. Its ${fmtMoney(fee)} fee is paid with the stay, so this reservation can't be confirmed `
+      + 'straight onto the schedule. '
+      + (hasEmail
+          ? 'Email the guest a pay link, or send the stay to the register to be paid there.'
+          : 'Send the stay to the register to be paid there, or add the guest\'s email to send them a pay link.'),
+    nights: needs.nights,
+    screeningFee: fee,
+    canSendLink: hasEmail,
+  }
+}
+const fmtMoney = (n: number) => `$${(Math.round(n * 100) / 100).toFixed(2)}`
+
+/**
+ * Is the background check's fee already on its way for this continuous stay —
+ * on an open register ticket or an unpaid pay link of any stay in it (R7), or
+ * already paid? Then a longer stay is not sent a second fee (M3): one fee per
+ * stay, never two.
+ */
+async function screeningFeeAlreadyCarried(bookingIds: string[]): Promise<boolean> {
+  if (!bookingIds.length) return false
+  const carried = await queryOne<{ x: number }>(
+    `SELECT 1 AS x FROM pos_open_tickets t
+      WHERE t.booking_id = ANY($1::uuid[]) AND t.status = 'open'
+        AND EXISTS (SELECT 1 FROM jsonb_array_elements(
+                      CASE WHEN jsonb_typeof(t.items) = 'array' THEN t.items ELSE '[]'::jsonb END) i
+                     WHERE i->>'${SCREENING_FEE_LINE_FLAG}' = 'true')
+     UNION ALL
+     SELECT 1 AS x FROM pos_pay_links l
+      WHERE l.status = 'open'
+        AND EXISTS (SELECT 1 FROM jsonb_array_elements(
+                      CASE WHEN jsonb_typeof(l.items) = 'array' THEN l.items ELSE '[]'::jsonb END) i
+                     WHERE i->>'${SCREENING_FEE_LINE_FLAG}' = 'true'
+                       -- a deposit link names the stay on the link; a link for
+                       -- the check alone (createScreeningFeeLink) names it on its line.
+                       AND (l.booking_id = ANY($1::uuid[])
+                            OR (l.booking_id IS NULL AND i->>'bookingId' = ANY($1::text[]))))
+     UNION ALL
+     -- already paid for this continuous stay: nothing more to carry.
+     SELECT 1 AS x FROM screening_prepayments sp
+      WHERE sp.booking_id = ANY($1::uuid[]) AND sp.status <> 'void'
+     LIMIT 1`, [bookingIds])
+  return !!carried
+}
+
+/** The answer to the R2 question in a request body, or null. A value that is not one is refused in words. */
+function stayTermsIn(raw: unknown): StayTerms | null {
+  if (raw == null || raw === '') return null
+  if (!(STAY_TERMS as readonly unknown[]).includes(raw)) {
+    throw new AppError(400, 'Choose Lease or Stay (no lease) for this reservation, then save again.')
+  }
+  return raw as StayTerms
+}
+
+/**
+ * 10/5 (Nic, R8): the line a register ticket carries for a stay's background
+ * check when nothing is on file — a fixed price (stayNeeds().screeningFee, the
+ * server's own figure), marked so the register knows it for what it is: GAM's
+ * screening money, never the stay's price, and not removable — named as the
+ * register names its own (SCREENING_LINE_NAME), with the same mark a pay
+ * link's screening line carries (routes/posPayLinks isScreeningLine). When
+ * the register settles the ticket it records the prepaid screening
+ * (services/stayTerms recordScreeningPrepayment, source 'schedule').
+ */
+export const SCREENING_FEE_LINE_FLAG = 'screening'
+export function screeningFeeTicketLine(amount: number): Record<string, unknown> {
+  return { id: null, name: SCREENING_LINE_NAME, qty: 1, price: amount, tax: 0, [SCREENING_FEE_LINE_FLAG]: true }
+}
+
+/** The lease drafted from this stay that still runs (pending or active), if any. */
+async function stayLeaseOf(bookingId: string): Promise<{ id: string; status: string; openEnded: boolean } | null> {
+  const l = await queryOne<{ id: string; status: string; open_ended: boolean }>(
+    `SELECT id, status, (end_date IS NULL) AS open_ended FROM leases
+      WHERE source_booking_id = $1 AND status IN ('pending', 'active')
+      ORDER BY created_at DESC LIMIT 1`, [bookingId])
+  return l ? { id: l.id, status: l.status, openEnded: l.open_ended } : null
+}
+
+/**
+ * After a stay is saved (made, re-dated, moved or given another month): what
+ * stayNeeds() said, carried out. Best-effort after the commit — the stay is
+ * real either way, and a failure is logged, never thrown at the desk.
+ *   - 22+ nights: check-in waits on a background check (R1, R9).
+ *   - The counter's lease-or-stay answer, when one was asked for: lease drafts
+ *     it (R4) and tells the landlord; stay bills the site's utilities (R11)
+ *     and tells the landlord (R2: "either way, it goes to me"). A stay that
+ *     continues one already answered "stay" carries the same answer.
+ *   - Otherwise the stay's utility agreement (if any) follows its new dates.
+ */
+async function afterStaySaved(bookingId: string, needs: StayNeeds | null, given: StayTerms | null,
+                              byUserId: string): Promise<{ terms: StayTerms | null; leaseId: string | null }> {
+  const out: { terms: StayTerms | null; leaseId: string | null } = { terms: null, leaseId: null }
+  try {
+    if (needs && needs.nights >= STAY_SCREENING_NIGHTS) await markScreeningRequired(null, bookingId)
+    const answer: StayTerms | null = !needs ? null
+      : given && needs.leaseChoice === given ? given
+      : !given && needs.leaseChoice === 'stay' ? 'stay'
+      : null
+    if (answer) {
+      const r = await chooseStayTerms(bookingId, answer, { byUserId })
+      out.terms = answer
+      out.leaseId = r.leaseId ?? null
+    } else {
+      await syncStayUtilityAgreement(bookingId, { byUserId })
+    }
+  } catch (err) {
+    logger.error({ err, bookingId }, '[booking] stay terms follow-through failed')
+  }
+  return out
+}
+
+/** The 409 a check-in waiting on screening gets (R9). No override — owners included. */
+const screeningPendingBody = (block: CheckInBlock) => ({
+  success: false as const, code: block.code, waitingOn: block.waitingOn,
+  error: block.message, checkId: block.checkId ?? null,
+})
 
 // 10/3 (review, fix pass 2): what a booking PATCH from somebody WITHOUT "Edit /
 // move / cancel reservations" may do — check a guest in, check one out, or
@@ -2205,6 +2375,33 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     })
     if (conflict) throw new AppError(409, STAY_CONFLICT_MESSAGE[conflict])
 
+    // ── 10/5 (Nic): LEASE OR STAY, AND THE BACKGROUND CHECK (services/stayTerms)
+    //
+    // Asked before anything is written. A stay that reaches 30 continuous
+    // nights (back-to-back stays of the same guest at this park add up, R7)
+    // needs the counter's answer — lease or no lease — and is refused with
+    // 'stay_terms_needed' until it has one. One that reaches 22 needs a way to
+    // reach the guest: their check is emailed to them and matched by email.
+    const stayTermsGiven = stayTermsIn(req.body?.stayTerms)
+    const needs = await stayNeeds({
+      landlordId: unit.landlord_id, propertyId: unit.property_id,
+      tenantId: body.tenantId ?? null, email: body.guestEmail ?? null,
+      checkIn: body.checkIn, checkOut: body.checkOut, stayTerms: stayTermsGiven,
+    })
+    if (needs.nights >= STAY_SCREENING_NIGHTS && !needs.chain.email && !needs.chain.tenantId) {
+      throw new AppError(400, LONG_STAY_NEEDS_EMAIL)
+    }
+    if (needs.leaseChoice === 'needed') return void res.status(409).json(stayTermsNeededBody(needs))
+    // A2: the check's fee rides on a deposit link or a register ticket — never
+    // a stay confirmed straight onto the schedule (screeningFeeRouteBody).
+    // One fee per continuous stay (M3): a back-to-back leg whose ticket or link
+    // already carries it (or that already paid it) is not charged it again.
+    const feeDue = needs.screening === 'fee_due' && (needs.screeningFee?.amount ?? 0) > 0
+      && !(needs.chain.bookingIds.length && await screeningFeeAlreadyCarried(needs.chain.bookingIds).catch(() => false))
+    if (feeDue && !wantsDeposit && !wantsRegister) {
+      return void res.status(409).json(screeningFeeRouteBody(needs, !!body.guestEmail))
+    }
+
     const nights = dayDiff(body.checkIn, body.checkOut)
     // Price authoritatively from the UNIT's stay rates, falling back to the
     // PROPERTY default per rate when the unit hasn't been configured separately
@@ -2323,10 +2520,14 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       detail: { check_in: body.checkIn, check_out: body.checkOut, lease_type: body.leaseType, source: body.source ?? 'direct' },
     }).catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] event record failed'))
 
-    // S526: 30+ day stays (7+ in weekly-lease mode) get a lease drafted
-    // automatically for the landlord to review. Best-effort.
-    maybeDraftLeaseFromBooking(booking.id)
-      .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] lease draft failed'))
+    // 10/5 (Nic, R3): no lease is drafted on its own any more (S526's 30-night
+    // auto-draft is gone). The counter's answer is carried out here: a lease
+    // chosen drafts one for the landlord, a stay bills its site's utilities, and
+    // the landlord is told either way. 22+ nights: check-in waits on screening.
+    const stayDone = await afterStaySaved(booking.id, needs, stayTermsGiven, req.user!.userId)
+    // R8: nothing on file → the check's fee rides on the payment this stay is
+    // handed to below (the schedule takes no money itself).
+    const screeningFee = feeDue && needs.screeningFee ? needs.screeningFee.amount : null
 
     // Booking guests with no GAM account get a stay-assistant link by email
     // (a host can also issue a QR from the booking). Best-effort — a missing
@@ -2349,9 +2550,14 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
         const { quoteStayDeposit } = await import('../services/propertyBooking')
         const depositAmount = await quoteStayDeposit(unit.id, body.checkIn, body.checkOut)
         const { createBookingDepositLink } = await import('./posPayLinks')
+        // 10/5 (R8, A2): the background check's fee goes on the link as its own
+        // fixed line (`screeningFee`, the server's figure) — a $0 deposit still
+        // makes a link for the fee alone; the link records the prepaid
+        // screening when it is paid (routes/posPayLinks).
         depositLink = await createBookingDepositLink({
           bookingId: booking.id, landlordId: unit.landlord_id, propertyId: unit.property_id,
           amount: depositAmount, guestName: booking.guest_name, guestEmail: booking.guest_email,
+          ...(screeningFee ? { screeningFee } : {}),
         })
       } catch (err) {
         // The reservation is real and on the board; only the link failed. Say
@@ -2389,12 +2595,16 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
         const qty = item.stay_unit === 'night' ? nights
           : item.stay_unit === 'week' ? Math.max(1, Math.round(nights / 7))
           : Math.max(1, Math.round(nights / 30))
+        // 10/5 (R8): the background check rides on the ticket as a fixed line
+        // when nothing is on file (screeningFeeTicketLine).
+        const lines: Record<string, unknown>[] = [{ id: item.id, name: item.name, qty, price: 0, tax: 0 }]
+        if (screeningFee) lines.push(screeningFeeTicketLine(screeningFee))
         const ticket = await queryOne<any>(
           `INSERT INTO pos_open_tickets
              (landlord_id, property_id, created_by, tenant_id, pos_customer_id, items, note, booking_id)
            VALUES ($1,$2,$3,$4,NULL,$5::jsonb,$6,$7) RETURNING id`,
           [unit.landlord_id, unit.property_id, req.user!.userId, body.tenantId ?? null,
-           JSON.stringify([{ id: item.id, name: item.name, qty, price: 0, tax: 0 }]),
+           JSON.stringify(lines),
            `${booking.guest_name || 'Guest'} · site ${unit.unit_number} · ${body.checkIn} → ${body.checkOut}`,
            booking.id])
         registerTicketId = ticket.id
@@ -2407,7 +2617,19 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       }
     }
 
-    res.status(201).json({ success: true, data: { ...booking, depositLink, registerTicketId } })
+    // 10/5: what the stay needs, for the screen to say — the server's figures.
+    // A 30+ night stay with no lease is held only through its check-out (R13).
+    const stay = {
+      nights: needs.nights,
+      terms: stayDone.terms ?? (needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null),
+      leaseId: stayDone.leaseId,
+      screening: needs.screening,
+      screeningFee,
+      // Fee due but no link or ticket to carry it: nothing collected it yet.
+      screeningFeeUncollected: !!screeningFee && !depositLink && !registerTicketId,
+      heldThrough: needs.leaseChoice === 'stay' ? stayHeldWords(needs.chain.checkOut) : null,
+    }
+    res.status(201).json({ success: true, data: { ...booking, depositLink, registerTicketId, stay } })
   } catch (e) { next(e) }
 })
 
@@ -3184,6 +3406,12 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     if ((checkInChanged || checkOutChanged) && dayDiff(newCheckIn, newCheckOut) < 1) {
       throw new AppError(400, 'Check-out has to be at least one day after check-in.')
     }
+
+    // 10/5 (Nic, R2/R6): what a longer stay needs is asked below, once the
+    // new nights are known to be free (stayAsk).
+    const stayTermsGiven = stayTermsIn(req.body?.stayTerms)
+    let stayAsk: StayNeeds | null = null
+
     // W-20: set when the extension fallback moved the EXTENDING guest to a
     // different site — surfaced in the response so staff can tell them.
     let extendedGuestMovedTo: { unitId: string; unitNumber: string } | null = null
@@ -3243,12 +3471,57 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       let conflict = await findStayConflict(newUnitId, {
         checkIn: newCheckIn, checkOut: newCheckOut, excludeBookingId: booking.id,
       })
+
+      // ── 10/5 (Nic, R2/R6): A LONGER STAY ASKS WHAT IT NEEDS
+      //
+      // A date change that makes the stay longer (an Edit, a drag of the bar's
+      // edge, the landlord agent) and leaves the guest's continuous stay at 30+
+      // nights with no lease or stay answer yet is refused with
+      // 'stay_terms_needed', and the screen asks staff. Asked once the nights
+      // are known to be free (a site that can't be had is refused first, as it
+      // always was) and before anything is moved — the W-20 relocation below
+      // included. A stay a lease was drafted from has its answer. One that
+      // newly reaches 22 nights with no lease needs a way to reach the guest
+      // (R7); after the save its check-in waits on a background check. A
+      // shorter stay, or a site move at the same length, asks nothing — a stay
+      // booked before 10/5 is left as it was until it is lengthened (R15).
+      const extendsOwnSite = conflict === 'booking' && !unitId && (checkIn || checkOut)
+      if (conflict && !extendsOwnSite) throw new AppError(409, STAY_CONFLICT_MESSAGE[conflict])
+      let nightsBefore = dayDiff(booking.check_in_day, booking.check_out_day)
+      let lengthens = (checkInChanged || checkOutChanged) && dayDiff(newCheckIn, newCheckOut) > nightsBefore
+      // A drag that keeps the stay's own length can still make the guest's
+      // CONTINUOUS stay longer (R7) — moved to start on their other stay's
+      // check-out. Compared by the continuous nights before and after, so it
+      // asks what a longer stay needs exactly as a lengthened bar does.
+      if ((checkInChanged || checkOutChanged) && !lengthens && SITE_HOLDING_STATUSES.includes(status || booking.status)) {
+        const chainOf = (ci: string, co: string) => continuousStayNights({
+          propertyId: targetUnit.property_id, bookingId: booking.id, checkIn: ci, checkOut: co,
+        })
+        const [before, after] = await Promise.all([
+          chainOf(booking.check_in_day, booking.check_out_day), chainOf(newCheckIn, newCheckOut)])
+        if (after.nights > before.nights) { lengthens = true; nightsBefore = before.nights }
+      }
+      if (lengthens && SITE_HOLDING_STATUSES.includes(status || booking.status)) {
+        const hasLease = !!(await stayLeaseOf(booking.id))
+        stayAsk = await stayNeeds({
+          landlordId: booking.landlord_id, propertyId: targetUnit.property_id, bookingId: booking.id,
+          checkIn: newCheckIn, checkOut: newCheckOut,
+          stayTerms: stayTermsGiven ?? (hasLease ? 'lease' : null),
+        })
+        if (stayAsk.leaseChoice === 'needed') return void res.status(409).json(stayTermsNeededBody(stayAsk))
+        if (!hasLease && stayAsk.nights >= STAY_SCREENING_NIGHTS && nightsBefore < STAY_SCREENING_NIGHTS
+            && !stayAsk.chain.email && !stayAsk.chain.tenantId
+            && !(typeof guestEmail === 'string' && guestEmail.trim())) {
+          throw new AppError(400, LONG_STAY_NEEDS_EMAIL)
+        }
+      }
+
       // W-20 extension protection (Nic): the sitting guest extending on
       // their OWN site takes priority — the incoming reservation gets
       // relocated to a compatible open site (it hasn't been revealed yet,
       // so the incoming guest never sees the move). Only for same-unit
       // date changes; a deliberate unit swap into a conflict still 409s.
-      if (conflict === 'booking' && !unitId && (checkIn || checkOut)) {
+      if (extendsOwnSite) {
         const { relocateBlockingBookings, rankUnitsBestFit } =
           await import('../services/scheduleCompression')
         // S655 (Step 6 fix round 6): the move below is written on its own,
@@ -3323,6 +3596,30 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // would block the back-out and stamp a "closing" read for a guest who never
     // left. On a different site it is a new arrival there, and the guard holds.
     const sameGuestBackOnSite = booking.status === 'checked_out' && newUnitId === booking.unit_id
+
+    // ── 10/5 (Nic, R9): CHECK-IN WAITS ON THE BACKGROUND CHECK
+    //
+    // A stay of more than three weeks checks in only once its check's results
+    // are back AND the landlord has decided — approved or denied (after a
+    // denial the landlord may still check them in). No override, owners
+    // included, and whatever the permissions: the desk is told plainly what it
+    // is waiting on. Asked before the meter-read prompt, so nobody takes a
+    // closing read and is then refused; asked again inside the save, after
+    // the stay's row is locked (a decision undone in between is honored).
+    // Putting back a check-out is not an arrival — the guest was already in.
+    const arriving = status === 'checked_in' && booking.status !== 'checked_in' && booking.status !== 'checked_out'
+    if (arriving) {
+      const block = await checkInBlock(booking.id)
+      if (block) {
+        if (relocated.length) {
+          const moved = relocated
+          relocated = []
+          await putRelocatedBack(moved)
+        }
+        return void res.status(409).json(screeningPendingBody(block))
+      }
+    }
+
     if (status === 'checked_in' && booking.status !== 'checked_in' && !sameGuestBackOnSite) {
       const pending = await unitPendingReads(newUnitId)
       const isOwner = ['landlord', 'admin', 'super_admin'].includes(req.user!.role)
@@ -3436,6 +3733,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // (below), so the after-commit history diff leaves it out.
     let statusRecordedInSave = false
     let changedBySomeoneElse = false
+    let screeningBlockedInSave: CheckInBlock | null = null
     let failure: unknown = null
     // 10/3 (review, fix pass 2): a write the database ended to break a
     // deadlock did nothing, so it runs again from the top, like a reservation
@@ -3448,6 +3746,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       leaseClosedOnCancel = null
       stopAfterCancel = []
       statusRecordedInSave = false
+      screeningBlockedInSave = null
       const tx = await getClient()
       try {
         await tx.query('BEGIN')
@@ -3468,6 +3767,14 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         if (await stayChangedSince(tx, booking)) {
           changedBySomeoneElse = true
           throw new AppError(409, reservationChanged)
+        }
+        // 10/5 (R9): the screening gate again, with the stay's row locked.
+        if (arriving) {
+          const blockNow = await checkInBlock(booking.id)
+          if (blockNow) {
+            screeningBlockedInSave = blockNow
+            throw new AppError(409, blockNow.message)
+          }
         }
         // Step 9 final fix (fix pass 2, review LOW): the closed-lease check
         // again, now that the stay's row is locked. "They never moved in" on
@@ -3779,6 +4086,14 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       }
       return answerChanged()
     }
+    if (failure && screeningBlockedInSave) {
+      if (relocated.length) {
+        const moved = relocated
+        relocated = []
+        await putRelocatedBack(moved)
+      }
+      return void res.status(409).json(screeningPendingBody(screeningBlockedInSave))
+    }
     // Still deadlocked after every try: nothing was written. (The catch below
     // puts back a reservation an extension moved for this save.)
     if (isDeadlock(failure)) throw new AppError(409, SAVED_AT_THE_SAME_MOMENT)
@@ -3809,10 +4124,51 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] lease could not follow the put-back check-out'))
     }
 
-    // S526: an extension can push the stay over the lease threshold (30d, or
-    // 7d in weekly-lease mode) — re-check on every edit. Best-effort.
-    maybeDraftLeaseFromBooking(booking.id)
-      .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] lease draft failed'))
+    // 10/5 (Nic, R3): an edit never drafts a lease on its own any more (the
+    // S526 re-check on every save — a check-in click included — is gone). What
+    // the new dates need was asked above; carried out here: the counter's
+    // lease-or-stay answer, check-in waiting on screening at 22+ nights, and
+    // the stay's utility agreement kept in step with its dates, its site and
+    // its status (ended at check-out, cancellation or no-show — R11).
+    const stayDone = await afterStaySaved(booking.id, stayAsk, stayTermsGiven, req.user!.userId)
+
+    // 10/5 (Nic, A2/M3): "A schedule edit/drag that makes an existing stay need
+    // the fee creates and emails a pay link for the fee automatically (check-in
+    // waits anyway)." Only when the longer stay needs the fee, the stay still
+    // holds its site, and no open ticket or unpaid link of this continuous stay
+    // already carries it — one fee, never two. A fee-only link
+    // (routes/posPayLinks createScreeningFeeLink) records the prepaid screening
+    // when it is paid. No email to send it to: the screen is told it was not
+    // collected.
+    let screeningFeeLink: { id: string; url: string } | null = null
+    let screeningFeeUncollected = false
+    const feeNow = stayAsk && stayAsk.screening === 'fee_due' ? stayAsk.screeningFee?.amount ?? 0 : 0
+    if (stayAsk && feeNow > 0 && SITE_HOLDING_STATUSES.includes(updated.status)
+        && !(await screeningFeeAlreadyCarried(stayAsk.chain.bookingIds.length ? stayAsk.chain.bookingIds : [booking.id])
+          .catch(() => false))) {
+      const to = (typeof updated.guest_email === 'string' && updated.guest_email.trim()) || stayAsk.chain.email
+      if (!to) {
+        screeningFeeUncollected = true
+      } else {
+        try {
+          const { createScreeningFeeLink } = await import('./posPayLinks')
+          screeningFeeLink = await createScreeningFeeLink({
+            bookingId: booking.id, landlordId: booking.landlord_id,
+            propertyId: targetUnit?.property_id ?? updated.property_id,
+            amount: feeNow, guestName: updated.guest_name ?? null, guestEmail: to,
+          })
+          if (!screeningFeeLink) screeningFeeUncollected = true
+        } catch (err) {
+          screeningFeeUncollected = true
+          logger.error({ err, bookingId: booking.id }, '[booking] background-check fee link failed')
+        }
+      }
+    }
+
+    // 10/5 (Nic): a stay canceled or marked a no-show keeps the background
+    // check its payment carried — "a paid screening fee is not refunded on
+    // denial or no-show", and the paid check keeps waiting for the guest. Only
+    // a payment taken back voids it (services/heldPayouts, chargebacks).
 
     // S548 (Nic): the Master Schedule is the source of truth for what a
     // long-stay guest owes. A date change flows into the lease: pending
@@ -3823,7 +4179,19 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // S655 (fix round 2): not after an early check-out the edit left in place
     // (keepsEarlyCheckOut) — the sync reads the stored check-out as the lease's
     // end, and that day is the day the guest left, not a deliberate shortening.
-    if (datesOrUnitChanged && !keepsEarlyCheckOut) {
+    //
+    // 10/5 (Nic, R4): not for a lease chosen for a stay. That lease is
+    // month-to-month with no end date — it holds the site for as long as the
+    // guest stays — so the stay's check-out never becomes its end. While it is
+    // still a draft, its start follows the arrival day.
+    const openLease = datesOrUnitChanged && !keepsEarlyCheckOut ? await stayLeaseOf(booking.id) : null
+    if (openLease?.openEnded) {
+      if (openLease.status === 'pending' && checkInChanged) {
+        await query(`UPDATE leases SET start_date = $2, updated_at = NOW() WHERE id = $1 AND status = 'pending'`,
+          [openLease.id, newCheckIn])
+          .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] stay lease start did not follow the arrival'))
+      }
+    } else if (datesOrUnitChanged && !keepsEarlyCheckOut) {
       syncLeaseWithBookingDates(booking.id)
         .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] lease-billing sync failed'))
     }
@@ -3921,6 +4289,18 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       ...(leaseNote ? { leaseNote } : {}),
       ...(moneyDecisionNeeded ? { moneyDecisionNeeded } : {}),
       ...(leaseClosedOnCancel ? { leaseClosed: leaseClosedWords(guest, leaseClosedOnCancel) } : {}),
+      // 10/5: what the new dates need — the server's figures, for the screen to say.
+      ...(stayAsk ? { stay: {
+        nights: stayAsk.nights,
+        terms: stayDone.terms ?? (stayAsk.leaseChoice === 'lease' || stayAsk.leaseChoice === 'stay' ? stayAsk.leaseChoice : null),
+        leaseId: stayDone.leaseId,
+        screening: stayAsk.screening,
+        screeningFee: stayAsk.screening === 'fee_due' ? stayAsk.screeningFee?.amount ?? null : null,
+        // M3: the fee-only pay link emailed for the check, or that nothing collected it.
+        screeningFeeLink,
+        screeningFeeUncollected,
+        emailedTo: screeningFeeLink ? ((typeof updated.guest_email === 'string' && updated.guest_email.trim()) || stayAsk.chain.email) : null,
+      } } : {}),
     }
     res.json({
       success: true,
@@ -3954,6 +4334,220 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     }
     next(e)
   }
+})
+
+// ── 10/5 (Nic, R6): ADD A MONTH ──────────────────────────────────────────────
+//
+// "Add a month" EXTENDS the guest's current stay — the same reservation, never
+// a second one stacked behind it: its check-out, and the length it is sold
+// for, move forward one calendar month, and the added month is priced at the
+// monthly rate ON ITS OWN (no reprice of the whole stay, no proration — R5).
+// The register's own quote and write do it (services/registerStay
+// stayExtensionQuote / extendStayByMonth), so the schedule, the counter and a
+// pay link add the same month at the same price under the same rules: a stay
+// under way and paid up so far, no lease, nobody else on any night of the
+// month (an unpaid month never moves a guest who paid — the W-20 extension
+// rule is for the schedule's own date edits).
+//
+// The schedule takes no money: the month goes to the register on the stay's
+// ticket, with the background check's fee when the longer stay now needs one
+// and nothing is on file (R8). The longer stay asks what stayNeeds() asks:
+// 30+ continuous nights with no answer yet → lease or no lease first (R2), and
+// a lease chosen there drafts the lease INSTEAD of adding the month (the lease
+// bills the months from then on).
+interface AddMonthPlan {
+  booking: any
+  ext: StayExtension
+  needs: StayNeeds
+}
+
+async function planAddMonth(req: any, given: StayTerms | null): Promise<AddMonthPlan> {
+  const booking = await queryOne<any>(
+    `SELECT b.id, b.unit_id, b.landlord_id, b.guest_name, b.tenant_id, u.property_id
+       FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+      WHERE b.id = $1 AND b.unit_id = $2`, [req.params.bookingId, req.params.id])
+  if (!booking) throw new AppError(404, 'Booking not found')
+  if (!canManageLandlordResource(req.user, booking.landlord_id)) throw new AppError(403, 'Forbidden')
+  await assertPropertyInScope(req.user, booking.property_id)
+  // The register's own rules for a month added to a stay (services/registerStay
+  // stayExtensionQuote): a stay that is under way and paid up, with no lease,
+  // on a site with a monthly rate — the same quote the counter and a pay link give.
+  const ext = await stayExtensionQuote(db, {
+    landlordId: booking.landlord_id, propertyId: booking.property_id, bookingId: booking.id,
+  })
+  const needs = await stayNeeds({
+    landlordId: booking.landlord_id, propertyId: booking.property_id, bookingId: booking.id,
+    checkIn: ext.checkIn, checkOut: ext.checkOut, stayTerms: given,
+  })
+  return { booking, ext, needs }
+}
+
+/** What the confirm window shows — every figure the server's. */
+const addMonthQuote = ({ ext, needs }: AddMonthPlan) => ({
+  fromCheckOut: ext.fromCheckOut,
+  newCheckOut: ext.checkOut,
+  addedNights: ext.addedNights,
+  monthPrice: ext.price,
+  nights: needs.nights,
+  leaseChoice: needs.leaseChoice,
+  question: needs.leaseChoice === 'needed' ? stayTermsQuestion(needs.nights) : null,
+  screening: needs.screening,
+  screeningFee: needs.screening === 'fee_due' ? needs.screeningFee?.amount ?? null : null,
+  heldThrough: needs.leaseChoice === 'stay' || needs.leaseChoice === 'needed'
+    ? stayHeldWords(needs.chain.checkOut > ext.checkOut ? needs.chain.checkOut : ext.checkOut)
+    : null,
+})
+
+// GET /api/units/:id/bookings/:bookingId/add-month — the quote (nothing written).
+unitsRouter.get('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edit_reservation'), async (req, res, next) => {
+  try {
+    const plan = await planAddMonth(req, null)
+    res.json({ success: true, data: addMonthQuote(plan) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/units/:id/bookings/:bookingId/add-month — { stayTerms? }
+unitsRouter.post('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edit_reservation'), async (req, res, next) => {
+  try {
+    const given = stayTermsIn(req.body?.stayTerms)
+    const plan = await planAddMonth(req, given)
+    const { booking, ext, needs } = plan
+    if (needs.leaseChoice === 'needed') return void res.status(409).json(stayTermsNeededBody(needs))
+    if (needs.nights >= STAY_SCREENING_NIGHTS && !needs.chain.email && !needs.chain.tenantId) {
+      throw new AppError(400, LONG_STAY_NEEDS_EMAIL)
+    }
+
+    // R2/R4: the counter chose a lease — it is drafted for the landlord and
+    // holds the site from here, so no month is added on top of it.
+    if (given === 'lease' && needs.leaseChoice === 'lease') {
+      const done = await afterStaySaved(booking.id, needs, given, req.user!.userId)
+      return void res.json({ success: true, data: { extended: false, leaseId: done.leaseId } })
+    }
+    // A stay of this continuous stay already answered lease (R2): no month is
+    // sold on top of the lease — the same refusal the register and a pay link give.
+    if (needs.leaseChoice === 'lease') {
+      throw new AppError(409, 'They chose a lease, so no month is added here — the lease holds their site and bills the months from now on. '
+        + 'Their lease is on the Leases page. Nothing was changed.')
+    }
+
+    // The register button the month is rung up on. Checked before anything is
+    // written: a park that has not set one up cannot take the month here.
+    const item = await queryOne<{ id: string; name: string }>(
+      `SELECT id, name FROM pos_items
+        WHERE property_id = $1 AND landlord_id = $2 AND is_active = TRUE AND stay_unit = 'month'
+        ORDER BY created_at LIMIT 1`, [ext.propertyId, booking.landlord_id])
+    if (!item) {
+      throw new AppError(409,
+        'This property has no register button for a month\'s stay, so the month can\'t be rung up. '
+        + 'Add one under Register items, then try again.')
+    }
+
+    // One fee per continuous stay (M3): not when an open ticket or unpaid link
+    // of the stay already carries it, or it is already paid.
+    const screeningFee = needs.screening === 'fee_due' && needs.screeningFee
+      && !(await screeningFeeAlreadyCarried(needs.chain.bookingIds.length ? needs.chain.bookingIds : [booking.id]).catch(() => false))
+      ? needs.screeningFee.amount : null
+    let ticketId: string | null = null
+    const tx = await getClient()
+    try {
+      await tx.query('BEGIN')
+      // The register's own write (services/registerStay extendStayByMonth):
+      // the same booking lengthened, the month added to its price, what was
+      // paid before kept as paid — under the schedule's lock order, refused if
+      // anybody else holds a night of the month.
+      const done = await extendStayByMonth(tx, {
+        landlordId: booking.landlord_id, propertyId: ext.propertyId, bookingId: booking.id,
+      })
+      await recordBookingEvent({
+        client: tx, bookingId: booking.id, unitId: done.unitId, landlordId: booking.landlord_id,
+        actorUserId: req.user!.userId, eventType: 'dates_changed',
+        summary: `${booking.guest_name || 'Guest'}: a month added — check-out moved from `
+          + `${longDay(done.fromCheckOut)} to ${longDay(done.checkOut)} (${done.addedNights} days added)`,
+        detail: {
+          from: { check_in: done.checkIn, check_out: done.fromCheckOut },
+          to: { check_in: done.checkIn, check_out: done.checkOut },
+          delta: `${done.addedNights} days added`, added_month: true, month_price: done.price,
+        },
+      })
+      // To the till: the stay's open ticket when it has one (the register
+      // charges what the reservation owes, the month included); otherwise a
+      // new one for the month. The check's fee rides on it, once.
+      const open = (await tx.query<{ id: string; items: any }>(
+        `SELECT id, items FROM pos_open_tickets
+          WHERE booking_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
+        [booking.id])).rows[0]
+      if (open) {
+        ticketId = open.id
+        const items: any[] = Array.isArray(open.items) ? open.items : []
+        if (screeningFee && !items.some((i: any) => i?.[SCREENING_FEE_LINE_FLAG])) {
+          await tx.query(`UPDATE pos_open_tickets SET items = $2::jsonb, updated_at = NOW() WHERE id = $1`,
+            [open.id, JSON.stringify([...items, screeningFeeTicketLine(screeningFee)])])
+        }
+      } else {
+        const lines: Record<string, unknown>[] = [{ id: item.id, name: item.name, qty: 1, price: 0, tax: 0 }]
+        if (screeningFee) lines.push(screeningFeeTicketLine(screeningFee))
+        ticketId = (await tx.query<{ id: string }>(
+          `INSERT INTO pos_open_tickets
+             (landlord_id, property_id, created_by, tenant_id, pos_customer_id, items, note, booking_id)
+           VALUES ($1,$2,$3,$4,NULL,$5::jsonb,$6,$7) RETURNING id`,
+          [booking.landlord_id, ext.propertyId, req.user!.userId, booking.tenant_id ?? null,
+           JSON.stringify(lines),
+           `${booking.guest_name || 'Guest'} · site ${done.unitNumber} · a month added · ${done.fromCheckOut} → ${done.checkOut}`,
+           booking.id])).rows[0].id
+      }
+      await tx.query('COMMIT')
+    } catch (e) {
+      await tx.query('ROLLBACK').catch(() => {})
+      if (isDeadlock(e) || isLockBusy(e)) throw new AppError(409, SAVED_AT_THE_SAME_MOMENT)
+      throw e
+    } finally { tx.release() }
+
+    // What the longer stay needs: 22+ → check-in waits on screening; the
+    // counter's "stay" answer (or one the stay already had) → its utilities
+    // follow the new check-out and the landlord is told; otherwise the stay's
+    // utility agreement, if any, moves with it.
+    const done = await afterStaySaved(booking.id, needs, given, req.user!.userId)
+    const updated = await queryOne<any>('SELECT * FROM unit_bookings WHERE id = $1', [booking.id])
+    res.json({
+      success: true,
+      data: {
+        extended: true,
+        booking: updated,
+        addedMonth: {
+          ...addMonthQuote(plan),
+          terms: done.terms ?? (needs.leaseChoice === 'stay' ? 'stay' : null),
+          registerTicketId: ticketId,
+        },
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+// ── 10/5 (Nic, R2/R4): OFFER A LEASE ─────────────────────────────────────────
+//
+// A stay with no lease can be given one later — the same draft a lease chosen
+// at booking makes (draftLeaseFromStay): month-to-month, no end date, billed
+// per the property's rent-due setting, with what was paid on the stay coming
+// off its first bill. The landlord is told; the draft waits on the Leases
+// page for the tenant to be attached and the lease sent for signature.
+unitsRouter.post('/:id/bookings/:bookingId/offer-lease', requirePerm('schedule.edit_reservation'), async (req, res, next) => {
+  try {
+    const booking = await queryOne<any>(
+      `SELECT b.id, b.status, b.landlord_id, b.guest_name, u.property_id
+         FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+        WHERE b.id = $1 AND b.unit_id = $2`, [req.params.bookingId, req.params.id])
+    if (!booking) throw new AppError(404, 'Booking not found')
+    if (!canManageLandlordResource(req.user, booking.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, booking.property_id)
+    if (!SITE_HOLDING_STATUSES.includes(booking.status)) {
+      throw new AppError(409, `This reservation is ${bookingStatusLabel(booking.status)}, so there is no stay to offer a lease for.`)
+    }
+    const existing = await stayLeaseOf(booking.id)
+    if (existing) return void res.json({ success: true, data: { leaseId: existing.id, drafted: false } })
+    const r = await draftLeaseFromStay(booking.id, { byUserId: req.user!.userId })
+    if (!r.leaseId) throw new AppError(409, 'The lease could not be drafted for this stay. Open the stay again and retry.')
+    res.status(201).json({ success: true, data: { leaseId: r.leaseId, drafted: r.drafted } })
+  } catch (e) { next(e) }
 })
 
 // PATCH /api/units/:id/bookings/:bookingId/acknowledge — S179 / B3.
@@ -4070,7 +4664,11 @@ unitsRouter.get('/schedule/master', requirePerm(
              p.requires_booking_acknowledgment,
              EXISTS (SELECT 1 FROM stay_checkout_decisions d
                       WHERE d.booking_id = b.id AND d.status = 'pending') AS money_decision_pending,
-             ${refundNeedsRetrySql('b')} AS refund_needs_retry
+             ${refundNeedsRetrySql('b')} AS refund_needs_retry,
+             -- 10/5: the lease drafted from the stay (a lease chosen, or offered
+             -- later), so the window shows it instead of "Offer a lease".
+             (SELECT l.id FROM leases l WHERE l.source_booking_id = b.id AND l.status IN ('pending', 'active')
+               ORDER BY l.created_at DESC LIMIT 1) AS stay_lease_id
       FROM unit_bookings b
       JOIN units u ON u.id = b.unit_id
       JOIN properties p ON p.id = u.property_id
@@ -4079,6 +4677,19 @@ unitsRouter.get('/schedule/master', requirePerm(
         AND ($4::uuid[] IS NULL OR u.property_id = ANY($4::uuid[]))
         AND ($5::uuid IS NULL OR u.property_id = $5)
       ORDER BY b.check_in`, [callerLandlordIds, fromDate, toDate, scopedIds, oneProperty])
+
+    // 10/5 (Nic, R9): a stay not yet checked in whose check-in waits on its
+    // background check says so on the schedule — what it is waiting on, in the
+    // same words the Check in button would be refused with (checkInBlock).
+    for (const b of bookings) {
+      b.screening_block = null
+      if (!['tentative', 'confirmed'].includes(b.status)) continue
+      if (!b.screening_required && dayDiff(b.check_in, b.check_out) < STAY_SCREENING_NIGHTS) continue
+      b.screening_block = await checkInBlock(b.id).catch((err) => {
+        logger.error({ err, bookingId: b.id }, '[schedule] screening state could not be read')
+        return null
+      })
+    }
 
     // Get active leases in range
     //

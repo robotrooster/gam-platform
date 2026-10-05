@@ -57,6 +57,13 @@ function ScreeningCardForm({ amountLabel, onPaid }: { amountLabel: string; onPai
 }
 
 const tok = () => localStorage.getItem('gam_tenant_token')
+/** The company the link names (the emailed stay check, a park's QR code), if any. */
+const linkLandlordId = () => new URLSearchParams(window.location.search).get('landlordId') || ''
+/** The link's unit when the link names a company; otherwise the guest's own, then the link's. */
+const linkUnitId = (own: string | null | undefined) => {
+  const q = new URLSearchParams(window.location.search)
+  return q.get('landlordId') ? (q.get('unitId') || '') : (own || q.get('unitId') || '')
+}
 const get = (p: string) => fetch(`${API}/api${p}`,{headers:{Authorization:`Bearer ${tok()}`}}).then(r=>r.json()).then(r=>r.data??r)
 
 const inp = { width:'100%', padding:'9px 12px', border:'1px solid #1e2530', borderRadius:8, background:'#0a0d10', color:'#eef1f8', fontSize:'.85rem', outline:'none', boxSizing:'border-box' as const }
@@ -102,6 +109,9 @@ export function BackgroundCheckPage() {
   const [step, setStep] = useState(0)
   const [paid, setPaid] = useState(false)
   const [paymentIntentId, setPaymentIntentId] = useState<string>('')
+  // 10/5 (Nic): a check paid with the applicant's stay — Submit claims it
+  // instead of a card payment, and nothing is charged here.
+  const [screeningPrepaymentId, setScreeningPrepaymentId] = useState<string>('')
   const [paymentClientSecret, setPaymentClientSecret] = useState<string>('')
   const [paymentTestMode, setPaymentTestMode] = useState(false)
   const [paymentInitError, setPaymentInitError] = useState<string>('')
@@ -128,8 +138,11 @@ export function BackgroundCheckPage() {
   // S551: fee breakdown + provider from the API. When the landlord screens
   // via Checkr Tenant, Checkr collects SSN/identity on ITS hosted apply flow
   // — GAM's form drops those fields entirely.
-  const priceLandlordId = (me as any)?.landlordId || new URLSearchParams(window.location.search).get('landlordId') || ''
-  const priceUnitId = (me as any)?.unitId || new URLSearchParams(window.location.search).get('unitId') || ''
+  // 10/5 (Nic, A4): a link that names a property (the emailed stay check, a
+  // park's QR code) wins over the guest's home company — a resident of another
+  // company staying here 22+ nights is screened here, on the check they paid for.
+  const priceLandlordId = linkLandlordId() || (me as any)?.landlordId || ''
+  const priceUnitId = linkUnitId((me as any)?.unitId) || ''
   const { data: price } = useQuery(['bg-price', priceLandlordId, priceUnitId], () => get(`/background/price?landlordId=${priceLandlordId}&unitId=${priceUnitId}`))
   // S564: no landlord/property in scope → renter-pool intake. The applicant pays
   // GAM directly for their own portable report (the landlord route instead bills
@@ -190,8 +203,8 @@ export function BackgroundCheckPage() {
         // SPECULATIVE renter-pool intake, and his screening filed itself under
         // the GAM shell landlord instead of the park he was standing in. Nic
         // saw no notification because it was never his check.
-        landlordId:(me as any)?.landlordId||new URLSearchParams(window.location.search).get('landlordId')||null,
-        unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null,
+        landlordId:linkLandlordId()||(me as any)?.landlordId||null,
+        unitId:linkUnitId((me as any)?.unitId)||null,
         // S636: carried in by the property's QR code, so a walk-up's check
         // binds to the park they scanned at.
         propertyId:new URLSearchParams(window.location.search).get('propertyId')||null,
@@ -207,7 +220,8 @@ export function BackgroundCheckPage() {
         desiredTermMonths: form.stay && form.stay !== 'mtm' ? Number(form.stay) : null,
         desiredMonthToMonth: form.stay === 'mtm',
         timeToComplete:Math.round((Date.now()-startTime)/1000),
-        applicantPaymentIntentId:paymentIntentId,
+        applicantPaymentIntentId:paymentIntentId||null,
+        screeningPrepaymentId:screeningPrepaymentId||null,
       })
     }).then(async r => {
       // 10/5: an error reply used to resolve as success and the page showed
@@ -336,7 +350,7 @@ export function BackgroundCheckPage() {
   // clientSecret to confirm, and submit attaches the intentId.
   useEffect(() => {
     if (STEPS[step] !== 'Review & Pay') return
-    if (paymentClientSecret || paymentIntentId) return
+    if (paymentClientSecret || paymentIntentId || screeningPrepaymentId) return
     let cancelled = false
     ;(async () => {
       try {
@@ -357,14 +371,20 @@ export function BackgroundCheckPage() {
           // S551: same landlord/unit inputs as /submit so the state-cap fee
           // resolves identically on both calls.
           body: JSON.stringify({
-            landlordId: (me as any)?.landlordId || params.get('landlordId') || null,
-            unitId: (me as any)?.unitId || params.get('unitId') || null,
+            landlordId: linkLandlordId() || (me as any)?.landlordId || null,
+            unitId: linkUnitId((me as any)?.unitId) || null,
             propertyId: params.get('propertyId') || null,
           }),
         }).then(r => r.json())
         if (cancelled) return
         if (!piRes.success) {
           setPaymentInitError(piRes.error || 'Failed to initialize payment')
+          return
+        }
+        if (piRes.data.alreadyPaid && piRes.data.screeningPrepaymentId) {
+          // 10/5 (Nic): paid with their stay — the check waits for them.
+          setScreeningPrepaymentId(piRes.data.screeningPrepaymentId)
+          setPaid(true)
           return
         }
         if (piRes.data.alreadyPaid && piRes.data.intentId) {
@@ -744,7 +764,7 @@ export function BackgroundCheckPage() {
               be the device with the camera — but the copy assumed a phone and
               read like a dead end on a desktop. It now names the way out. */}
               {providerCollectsPii ? 'After payment, Checkr emails you a secure link to finish identity verification — a photo of your ID and a selfie. It takes about two minutes. On a computer without a camera, open that email on your phone and finish there.' : ''}</div>
-          {price && (
+          {price && !screeningPrepaymentId && (
             <div style={{background:'#141a22',border:'1px solid #1e2530',borderRadius:12,padding:16,marginBottom:16,textAlign:'left',fontSize:'.82rem',color:'#b8c4d8'}}>
               {/* S636 (Nic): "why is it showing a service fee of five dollars?
                   That's our markup, but it needs to be blended into the
@@ -781,7 +801,7 @@ export function BackgroundCheckPage() {
             <div style={{fontSize:'.78rem',color:'#ef4444',marginBottom:12}}>Card payment isn't configured — please contact support.</div>
           )}
           {paid && (
-            <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'12px 20px',background:'rgba(34,197,94,.08)',border:'1px solid rgba(34,197,94,.25)',borderRadius:10,color:'#22c55e',fontWeight:700}}><Check size={18}/> Paid — click Submit below</div>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'12px 20px',background:'rgba(34,197,94,.08)',border:'1px solid rgba(34,197,94,.25)',borderRadius:10,color:'#22c55e',fontWeight:700}}><Check size={18}/> {screeningPrepaymentId ? 'Already paid with your stay — nothing more to pay. Click Submit below.' : 'Paid — click Submit below'}</div>
           )}
           {submitMut.isError&&<div style={{color:'#ef4444',fontSize:'.75rem',marginTop:10,display:'flex',gap:6,justifyContent:'center'}}><AlertCircle size={12}/> {(submitMut.error as any)?.message || 'Submission failed — please try again'}</div>}
         </div>}

@@ -21,6 +21,7 @@ Either way you'll be told which of the two happened. Nothing is promised before 
 - Confirm the specifics first — which night, what time — so the request that reaches your host is the one you meant.
 - Check-in instructions, gate codes, parking and property rules come from your host.
 - A stay change may change your total. Your host settles that with you.
+- A stay that grows past three weeks (22 nights or more) needs a background check before check-in, and one of 30 nights or more asks whether you want a lease (it holds your site for as long as you stay) or a stay (it holds it through the time you've paid for). A stay is paid a calendar month at a time and is never prorated; a lease is billed on the property's rent schedule.
 
 ## Anything else
 
