@@ -279,6 +279,36 @@ export async function residentRecord(q: Q, landlordId: string, tenantId: string)
   return again.rows[0].id
 }
 
+/**
+ * 10/5 (Nic): everyone who runs a background check for a company — approved or
+ * not — is a customer at that company's register, found by name with their
+ * email ready, so a pay link is two clicks. They gave this company their name
+ * and email by applying, so this company's record holds them (pos_customers
+ * .email — never their live account contact, which still follows the
+ * lives-here rule). Nothing about the screening is shown at the register.
+ * The legal name from the application fills a blank record name; an email
+ * another record here already holds is left off (one record per address).
+ */
+export async function applicantRegisterRecord(
+  q: Q, landlordId: string, tenantId: string, legal: { firstName?: string | null; lastName?: string | null },
+): Promise<string> {
+  const id = await residentRecord(q, landlordId, tenantId)
+  await q.query(
+    `UPDATE pos_customers c
+        SET first_name = CASE WHEN COALESCE(c.first_name, '') = '' THEN $3 ELSE c.first_name END,
+            last_name  = CASE WHEN COALESCE(c.last_name, '')  = '' THEN $4 ELSE c.last_name END,
+            email = COALESCE(c.email, (
+              SELECT lower(u.email) FROM tenants t JOIN users u ON u.id = t.user_id
+               WHERE t.id = c.tenant_id
+                 AND NOT EXISTS (SELECT 1 FROM pos_customers o
+                                  WHERE o.landlord_id = c.landlord_id AND o.id <> c.id
+                                    AND o.archived_at IS NULL AND lower(o.email) = lower(u.email)))),
+            updated_at = NOW()
+      WHERE c.id = $1 AND c.landlord_id = $2`,
+    [id, landlordId, String(legal.firstName ?? '').trim(), String(legal.lastName ?? '').trim()])
+  return id
+}
+
 // ── Stand-ins and cards ──────────────────────────────────────────────────
 
 interface RecordState {

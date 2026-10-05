@@ -13,7 +13,7 @@ import { getPoolIntakeShell, isPoolIntakeLandlord } from '../services/poolIntake
 import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
 import { PROCESSING_FEES, SCREENING_VALID_INTERVAL_SQL } from '@gam/shared'
 import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
-import { query, queryOne } from '../db'
+import { db, query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { recordScreeningEarnings } from '../services/platformRevenue'
@@ -663,6 +663,15 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
         throw new AppError(409, 'This payment has already been used to submit a background check')
       }
       throw e
+    }
+
+    // 10/5 (Nic): an applicant is a customer at this company's register from
+    // the moment they apply — approved or not — so a pay link is two clicks.
+    // Not for the renter pool (no company yet). Never blocks the screening.
+    if (!isSpeculative && effectiveLandlordId && tenant?.id) {
+      const { applicantRegisterRecord } = await import('../services/posPeople')
+      await applicantRegisterRecord(db, effectiveLandlordId, tenant.id, { firstName, lastName })
+        .catch((err: unknown) => logger.warn({ err, checkId: check?.id }, '[background] could not add the applicant to the register'))
     }
 
     // S650 (Nic): "Where is that $5 from that first background check?" The
