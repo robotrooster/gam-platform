@@ -959,6 +959,40 @@ authRouter.patch('/me', requireAuth, async (req, res, next) => {
   } catch(e) { next(e) }
 })
 
+/**
+ * 10/5: an address that already has an account, coming back through the
+ * screening's account step. A security review (same day) ruled out continuing
+ * on the password alone: the inline step creates accounts for any address with
+ * no proof of the inbox, so a password is not proof of the person. What may be
+ * continued here, with an EMAILED CODE typed on the screening page itself, is
+ * the account this step leaves behind when an applicant stops part-way:
+ *   - a tenant account (never staff, a landlord or a business),
+ *   - its address never proven (a proven address signs in the normal way —
+ *     /login with its own emailed code, returning to the screening),
+ *   - no authenticator 2FA, not locked out.
+ * The code proves the inbox (and marks it verified, at /email-otp/verify), so
+ * whoever typed the password cannot get in without it.
+ */
+async function unprovenTenantAccount(userId: string): Promise<{
+  id: string; email: string; password_hash: string | null; tenant_id: string; locked_until: string | null
+} | null> {
+  const u = await queryOne<{
+    id: string; email: string; role: string; password_hash: string | null
+    email_verified: boolean | null; totp_enabled: boolean | null
+    locked_until: string | null; tenant_id: string | null
+  }>(
+    `SELECT u.id, u.email, u.role, u.password_hash, u.email_verified, u.totp_enabled,
+            u.locked_until::text AS locked_until,
+            (SELECT t.id FROM tenants t WHERE t.user_id = u.id LIMIT 1) AS tenant_id
+       FROM users u WHERE u.id = $1`, [userId])
+  if (!u || u.role !== 'tenant' || !u.tenant_id) return null
+  if (u.email_verified === true || u.totp_enabled === true) return null
+  return { id: u.id, email: u.email, password_hash: u.password_hash, tenant_id: u.tenant_id, locked_until: u.locked_until }
+}
+
+// Same cost as a real compare, so a refusal takes as long as a check would.
+const DUMMY_HASH = '$2a$12$C6UzMDM.H6dfI/f/IKcEeO5S2wEIqdgP5nnUKdlCuFXzUJ.Cd94Jm'
+
 // POST /api/auth/register-prospect — public, creates tenant account from listings page
 authRouter.post('/register-prospect', async (req, res, next) => {
   try {
@@ -990,8 +1024,51 @@ authRouter.post('/register-prospect', async (req, res, next) => {
     }
 
     // Check email not already taken
-    const existing = await queryOne('SELECT id FROM users WHERE lower(email)=lower($1)', [email])
-    if (existing) throw new AppError(409, 'An account with this email already exists. Please sign in.')
+    const existing = await queryOne<{ id: string }>('SELECT id FROM users WHERE lower(email)=lower($1)', [email])
+    if (existing) {
+      // 10/5 (Nic): an applicant who stopped after this account step and came
+      // back to finish was stuck — "already exists, please sign in" on a page
+      // with no way to sign in. An unproven tenant account with the password
+      // set at this step continues ON THIS PAGE behind an emailed code
+      // (unprovenTenantAccount). Every other account signs in normally; the
+      // page offers that, returning here.
+      const acct = inline ? await unprovenTenantAccount(existing.id) : null
+      if (acct) {
+        if (acct.locked_until && new Date(acct.locked_until) > new Date()) {
+          throw new AppError(409, 'An account with this email already exists. Sign in to continue.')
+        }
+        const valid = !!acct.password_hash && await bcrypt.compare(password, acct.password_hash)
+        if (!valid) {
+          // Counted exactly as /login counts it, so this door is no easier to
+          // guess through than the sign-in page.
+          await db.query(
+            `UPDATE users
+                SET failed_login_count = failed_login_count + 1,
+                    locked_until = CASE
+                      WHEN failed_login_count + 1 >= $2
+                        THEN NOW() + ($3 || ' minutes')::interval
+                      ELSE locked_until
+                    END
+              WHERE id = $1`,
+            [acct.id, LOGIN_FAIL_LIMIT, LOGIN_LOCK_MINUTES])
+          throw new AppError(409, 'An account with this email already exists. Sign in to continue.')
+        }
+        await db.query(`UPDATE users SET failed_login_count = 0, locked_until = NULL WHERE id = $1`, [acct.id])
+        const emailOtpSession = signEmailOtpSessionToken({
+          userId: acct.id, role: 'tenant', email: acct.email, profileId: acct.tenant_id,
+          landlordId: landlordId || null,
+          landlordIds: null, businessId: null, staffRole: null, permissions: null,
+        })
+        await issueEmailOtp(acct.id, acct.email)
+        return res.status(200).json({
+          success: true,
+          data: { requiresEmailOtp: true, emailOtpSession, resumed: true,
+            user: { id: acct.id, email: acct.email, firstName: '', lastName: '', role: 'tenant', profileId: acct.tenant_id } }
+        })
+      }
+      await bcrypt.compare(password, DUMMY_HASH)
+      throw new AppError(409, 'An account with this email already exists. Sign in to continue.')
+    }
 
     const hash = await bcrypt.hash(password, 12)
 

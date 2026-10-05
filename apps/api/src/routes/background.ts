@@ -331,6 +331,32 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
       bgcCustomerId = null
     }
 
+    // 10/5: an applicant who paid on an earlier visit and left before pressing
+    // Submit comes back to this step. Charging again would take the fee twice
+    // and leave the first payment unused. A paid screening fee of the same
+    // amount that no check has used yet is handed back instead, and the page
+    // goes straight to Submit; /submit verifies it like any intent, and the
+    // unique index on applicant_payment_intent_id keeps it to one check.
+    // Best-effort: Stripe's search can trail a payment by about a minute, and
+    // a failure here only means a fresh intent, as before.
+    try {
+      const found = await stripeForBgc!.paymentIntents.search({
+        query: `metadata['userId']:'${String(req.user!.userId).replace(/'/g, '')}' AND metadata['kind']:'background_check_intake' AND status:'succeeded'`,
+        limit: 10,
+      })
+      for (const pi of found.data) {
+        if (pi.amount !== Math.round(fee.total * 100)) continue
+        const used = await queryOne(`SELECT 1 FROM background_checks WHERE applicant_payment_intent_id = $1`, [pi.id])
+        if (used) continue
+        return res.json({
+          success: true,
+          data: { clientSecret: null, intentId: pi.id, amount: fee.total, breakdown: fee, feeWaived: false, alreadyPaid: true, testMode: false },
+        })
+      }
+    } catch (e) {
+      logger.warn({ err: e, user_id: req.user!.userId }, '[bgc] could not look for an earlier paid screening fee — starting a new one')
+    }
+
     const intent = await stripeForBgc!.paymentIntents.create({
       amount: Math.round(fee.total * 100),
       currency: 'usd',

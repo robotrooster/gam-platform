@@ -822,6 +822,109 @@ describe('POST /api/auth/register-prospect', () => {
       expect(res.status).toBe(400)
     })
 
+    // 10/5 (Nic, an applicant stuck at the Mountain View counter): someone who
+    // stopped after the account step and came back got "already exists, please
+    // sign in" on a page with no way to sign in. A same-day security review
+    // ruled out continuing on the password alone (the inline step makes
+    // accounts for any address without proof of the inbox), so an unproven
+    // tenant account continues behind an EMAILED CODE typed on the page.
+    describe('coming back to an unfinished screening (10/5)', () => {
+      const PW = 'correct horse battery'
+      const start = async (email: string, password = PW) => request(buildApp())
+        .post('/api/auth/register-prospect')
+        .send({ email, password, acceptedTerms: true, inline: true })
+
+      it('the same email and password get an emailed code for the same account — never a session on the password alone', async () => {
+        const email = `inline-resume-${Date.now()}@gam.dev`
+        const first = await start(email)
+        expect(first.status).toBe(201)
+        const again = await start(email)
+        expect(again.status).toBe(200)
+        expect(again.body.data.resumed).toBe(true)
+        expect(again.body.data.requiresEmailOtp).toBe(true)
+        expect(again.body.data.token).toBeUndefined()
+        expect(again.body.data.emailOtpSession).toEqual(expect.any(String))
+        const pending = jwt.decode(again.body.data.emailOtpSession) as any
+        expect(pending.userId).toBe(first.body.data.user.id)
+        const { rows: codes } = await db.query<any>(
+          `SELECT 1 FROM login_email_otps WHERE user_id = $1 AND consumed_at IS NULL`, [first.body.data.user.id])
+        expect(codes.length).toBeGreaterThan(0)
+        const { rows } = await db.query<any>(`SELECT id FROM users WHERE lower(email) = lower($1)`, [email])
+        expect(rows).toHaveLength(1)
+      })
+
+      it('the emailed code finishes it: a real session, and the address is now proven', async () => {
+        const email = `inline-resume-code-${Date.now()}@gam.dev`
+        const first = await start(email)
+        const again = await start(email)
+        // The code the route just sent: replace it with a known one for the test.
+        const known = '135792'
+        await db.query(`UPDATE login_email_otps SET code_hash = $2 WHERE user_id = $1 AND consumed_at IS NULL`,
+          [first.body.data.user.id, await bcrypt.hash(known, 4)])
+        const app = express(); app.use(express.json()); app.use('/api/auth/email-otp', emailOtpRouter); app.use(errorHandler)
+        const v = await request(app).post('/api/auth/email-otp/verify')
+          .send({ emailOtpSession: again.body.data.emailOtpSession, code: known })
+        expect(v.status).toBe(200)
+        expect((jwt.decode(v.body.data.token) as any).userId).toBe(first.body.data.user.id)
+        const { rows: [u] } = await db.query<any>(`SELECT email_verified FROM users WHERE id = $1`, [first.body.data.user.id])
+        expect(u.email_verified).toBe(true)
+        // Proven now: it signs in the normal way from here on.
+        expect((await start(email)).status).toBe(409)
+      })
+
+      it('a different password gets nothing, counts as a failed sign-in, and five lock the account', async () => {
+        const email = `inline-resume-wrongpw-${Date.now()}@gam.dev`
+        const first = await start(email)
+        const again = await start(email, 'a different long password')
+        expect(again.status).toBe(409)
+        expect(again.body.data).toBeUndefined()
+        expect(again.body.error).toMatch(/sign in to continue/i)
+        const { rows: [u1] } = await db.query<any>(`SELECT failed_login_count FROM users WHERE id = $1`, [first.body.data.user.id])
+        expect(u1.failed_login_count).toBe(1)
+        for (let i = 0; i < 4; i++) await start(email, 'a different long password')
+        const { rows: [u2] } = await db.query<any>(`SELECT locked_until FROM users WHERE id = $1`, [first.body.data.user.id])
+        expect(u2.locked_until).not.toBeNull()
+        // Locked: even the right password gets no code.
+        const locked = await start(email)
+        expect(locked.status).toBe(409)
+        expect(locked.body.data).toBeUndefined()
+      })
+
+      it('an account whose address is proven signs in the normal way: 409 even with the right password', async () => {
+        const email = `inline-resume-verified-${Date.now()}@gam.dev`
+        await start(email)
+        await db.query(`UPDATE users SET email_verified = TRUE WHERE lower(email) = lower($1)`, [email])
+        expect((await start(email)).status).toBe(409)
+      })
+
+      it('an account with an authenticator app is never continued here', async () => {
+        const email = `inline-resume-totp-${Date.now()}@gam.dev`
+        await start(email)
+        await db.query(`UPDATE users SET totp_enabled = TRUE WHERE lower(email) = lower($1)`, [email])
+        expect((await start(email)).status).toBe(409)
+      })
+
+      it('a landlord or staff account is never continued here', async () => {
+        const c = await db.connect()
+        let email = ''
+        try { email = `inline-resume-ll-${Date.now()}@gam.dev`; await seedLandlord(c, { email }) } finally { c.release() }
+        await db.query(`UPDATE users SET email_verified = FALSE, password_hash = $2 WHERE lower(email) = lower($1)`,
+          [email, await bcrypt.hash(PW, 4)])
+        const res = await start(email)
+        expect(res.status).toBe(409)
+        expect(res.body.data).toBeUndefined()
+      })
+
+      it('an existing account is never continued WITHOUT inline (the old contract)', async () => {
+        const email = `inline-resume-notinline-${Date.now()}@gam.dev`
+        await start(email)
+        const res = await request(buildApp())
+          .post('/api/auth/register-prospect')
+          .send({ email, password: PW, firstName: 'Pat', lastName: 'Doe', acceptedTerms: true })
+        expect(res.status).toBe(409)
+      })
+    })
+
     it('WITHOUT inline, a name is still required (the old contract is intact)', async () => {
       const res = await request(buildApp())
         .post('/api/auth/register-prospect')
@@ -874,7 +977,7 @@ describe('POST /api/auth/register-prospect', () => {
     const res = await request(buildApp())
       .post('/api/auth/register-prospect').send(body)
     expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/Please sign in/i)
+    expect(res.body.error).toMatch(/sign in/i)
   })
 
   it('missing firstName → 400', async () => {

@@ -217,6 +217,14 @@ export function BackgroundCheckPage() {
   // email + password when they continue past it.
   const [creatingAccount, setCreatingAccount] = useState(false)
   const [accountErr, setAccountErr] = useState('')
+  const [existingAccount, setExistingAccount] = useState(false)
+  // 10/5: an unfinished screening account continues behind an emailed code,
+  // typed here, so the applicant never leaves this page.
+  const [codeSession, setCodeSession] = useState<string | null>(null)
+  const [code, setCode] = useState('')
+  const [codeBusy, setCodeBusy] = useState(false)
+  const [codeErr, setCodeErr] = useState('')
+  const [codeSent, setCodeSent] = useState('')
   // Frozen at mount, NOT derived from hasSession. Creating the account flips
   // hasSession true, and a reactive STEPS would drop the account step from the
   // array at that instant — the index the flow had just advanced to would then
@@ -250,6 +258,20 @@ export function BackgroundCheckPage() {
         }),
       })
       const body = await res.json()
+      // 10/5: an address that already has an account was a dead end here
+      // ("please sign in" with no way to). Coming back with the same password
+      // to an unfinished screening continues on its own (the API answers with a
+      // session); any other existing account gets a sign-in that returns to
+      // this screening, and a password reset.
+      if (res.status === 409) {
+        setExistingAccount(true)
+        return false
+      }
+      if (res.ok && body?.data?.requiresEmailOtp && body?.data?.emailOtpSession) {
+        setCodeSession(body.data.emailOtpSession)
+        setCode(''); setCodeErr(''); setCodeSent('')
+        return false
+      }
       if (!res.ok || !body?.data?.token) {
         setAccountErr(body?.error || 'Could not create your account. Please try again.')
         return false
@@ -263,6 +285,36 @@ export function BackgroundCheckPage() {
     } finally {
       setCreatingAccount(false)
     }
+  }
+  const verifyCode = async () => {
+    if (!codeSession) return
+    setCodeErr(''); setCodeBusy(true)
+    try {
+      const res = await fetch(`${API}/api/auth/email-otp/verify`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emailOtpSession: codeSession, code: code.trim() }),
+      })
+      const body = await res.json()
+      if (!res.ok || !body?.data?.token) { setCodeErr(body?.error || 'That code did not work. Check it and try again.'); return }
+      localStorage.setItem('gam_tenant_token', body.data.token)
+      setHasSession(true)
+      setCodeSession(null)
+      setStep(s => s + 1)
+    } catch {
+      setCodeErr('Could not reach the server. Please try again.')
+    } finally { setCodeBusy(false) }
+  }
+  const resendCode = async () => {
+    if (!codeSession) return
+    setCodeErr(''); setCodeSent('')
+    try {
+      const res = await fetch(`${API}/api/auth/email-otp/resend`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emailOtpSession: codeSession }),
+      })
+      if (res.ok) setCodeSent('A new code is on its way.')
+      else setCodeErr('Could not send a new code. Please try again.')
+    } catch { setCodeErr('Could not reach the server. Please try again.') }
   }
   // S583: re-verify (GAM's own endpoint) whenever any address field changes —
   // S84: on entering step 5, ensure tenant account exists (so we have a
@@ -300,6 +352,13 @@ export function BackgroundCheckPage() {
         if (cancelled) return
         if (!piRes.success) {
           setPaymentInitError(piRes.error || 'Failed to initialize payment')
+          return
+        }
+        if (piRes.data.alreadyPaid && piRes.data.intentId) {
+          // 10/5: paid on an earlier visit and never submitted — that payment
+          // is used; nothing is charged again.
+          setPaymentIntentId(piRes.data.intentId)
+          setPaid(true)
           return
         }
         if (piRes.data.feeWaived) {
@@ -346,7 +405,7 @@ export function BackgroundCheckPage() {
     // is the thing the terms govern. The consent step drops its own copy in
     // that case rather than asking twice for the same acceptance.
     [ACCOUNT_STEP]: !!(form.email && form.password && form.confirmPassword
-      && form.acceptedTerms && !creatingAccount),
+      && form.acceptedTerms && !creatingAccount && !codeSession),
     'Consent': !!((providerCollectsPii||(form.consentCredit&&form.consentCriminal))
       && form.acceptedTerms && (invitedResident || (form.moveIn && form.stay))
       && (!isSpeculative || (form.consentPool && validZip))
@@ -511,7 +570,7 @@ export function BackgroundCheckPage() {
           </div>
           <label style={lbl}>Email address *</label>
           <input style={inp} type="email" autoComplete="email" value={form.email}
-            onChange={e=>set('email',e.target.value)} placeholder="you@example.com"/>
+            onChange={e=>{set('email',e.target.value); setExistingAccount(false); setCodeSession(null)}} placeholder="you@example.com"/>
           <label style={{...lbl,marginTop:12}}>Password *</label>
           <input style={inp} type="password" autoComplete="new-password" value={form.password}
             onChange={e=>set('password',e.target.value)} placeholder="At least 12 characters"/>
@@ -529,6 +588,36 @@ export function BackgroundCheckPage() {
             </span>
           </label>
           {accountErr&&<div style={{marginTop:14,padding:'10px 14px',borderRadius:8,background:'rgba(239,68,68,.08)',border:'1px solid rgba(239,68,68,.25)',color:'#ef4444',fontSize:'.8rem'}}>{accountErr}</div>}
+          {codeSession&&<div data-testid="email-code" style={{marginTop:14,padding:'14px 16px',borderRadius:8,background:'rgba(201,162,39,.08)',border:'1px solid rgba(201,162,39,.35)'}}>
+            <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>Welcome back — check your email</div>
+            <div style={{fontSize:'.78rem',color:'#b8c4d8',lineHeight:1.55,marginBottom:12}}>
+              You started a screening with {form.email.trim()} before. We emailed you a 6-digit code. Type it here to pick up where you left off.
+            </div>
+            <input style={{...inp,letterSpacing:'.3em',fontSize:'1.1rem',textAlign:'center'}} inputMode="numeric" autoComplete="one-time-code"
+              maxLength={6} value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,''))} placeholder="000000" aria-label="6-digit code"/>
+            {codeErr&&<div style={{marginTop:8,color:'#ef4444',fontSize:'.78rem'}}>{codeErr}</div>}
+            {codeSent&&<div style={{marginTop:8,color:'#7a8aaa',fontSize:'.78rem'}}>{codeSent}</div>}
+            <div style={{display:'flex',gap:10,flexWrap:'wrap',alignItems:'center',marginTop:12}}>
+              <button onClick={verifyCode} disabled={code.length!==6||codeBusy}
+                style={{padding:'10px 22px',borderRadius:8,border:'none',background:code.length===6&&!codeBusy?'#c9a227':'#141a22',color:code.length===6&&!codeBusy?'#060809':'#4a5568',fontWeight:700,cursor:code.length===6&&!codeBusy?'pointer':'not-allowed',fontSize:'.85rem'}}>
+                {codeBusy?'Checking…':'Continue'}
+              </button>
+              <button onClick={resendCode} style={{background:'none',border:'none',color:'#c9a227',fontSize:'.8rem',cursor:'pointer',padding:0}}>Send a new code</button>
+            </div>
+          </div>}
+          {existingAccount&&<div data-testid="existing-account" style={{marginTop:14,padding:'14px 16px',borderRadius:8,background:'rgba(201,162,39,.08)',border:'1px solid rgba(201,162,39,.35)'}}>
+            <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>You already have an account with {form.email.trim()}</div>
+            <div style={{fontSize:'.78rem',color:'#b8c4d8',lineHeight:1.55,marginBottom:12}}>
+              Sign in and you'll come straight back here to finish your screening.
+            </div>
+            <div style={{display:'flex',gap:10,flexWrap:'wrap',alignItems:'center'}}>
+              <a href={`/login?to=${encodeURIComponent(window.location.pathname + window.location.search)}`}
+                style={{padding:'10px 22px',borderRadius:8,background:'#c9a227',color:'#060809',fontWeight:700,textDecoration:'none',fontSize:'.85rem'}}>
+                Sign in to continue
+              </a>
+              <a href="/forgot-password" style={{color:'#c9a227',fontSize:'.8rem'}}>Forgot your password?</a>
+            </div>
+          </div>}
         </div>}
         {STEPS[step]==='Consent'&&<div>
           {/* S642: Checkr's Tenant order will not open without a name, so it is
