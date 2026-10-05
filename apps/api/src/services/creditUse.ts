@@ -3224,8 +3224,13 @@ export async function clawBackDisputedCharge(
   // recovered as — never the credit's whole original amount when some of it
   // went somewhere nothing here recovers (a move-out's pool, say). The rest
   // is told to GAM, never left on nobody in silence.
-  const leftOn = toCents((await client.query<{ r: string }>(
-    `SELECT amount_remaining::text AS r FROM lease_prepaid_credits WHERE id = $1`, [credit.id])).rows[0]?.r ?? 0)
+  // Reads the credit withdrawDisputedCredit just voided, on purpose: what is
+  // left on the withdrawn credit is part of what the dispute covered. Not a
+  // balance shown to anyone, so voided_at is read, never filtered (the money
+  // backfill's paid-ahead-reader scan requires every such read to say which).
+  const leftOn = toCents((await client.query<{ r: string; voided_at: string | null }>(
+    `SELECT amount_remaining::text AS r, voided_at::text AS voided_at FROM lease_prepaid_credits WHERE id = $1`,
+    [credit.id])).rows[0]?.r ?? 0)
   const covered = leftOn + heldCents + choice.cents
   const short = toCents(k.amountOriginal) - covered
   if (short > 0) await alertDisputeShort(k, short, true)
