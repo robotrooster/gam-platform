@@ -145,3 +145,35 @@ describe('S654 runLateBalanceDigest', () => {
     expect(digestMock).not.toHaveBeenCalled()
   })
 })
+
+// S655 (Nic, 10/2): "saved credit doesn't stop a late fee unless it covers the
+// whole bill" — and it does not make a late bill look smaller either. The
+// digest is the full overdue balance, late fees included (the portal's figure).
+describe('S655 the digest is the full overdue balance', () => {
+  it('saved credit smaller than the bill does not lower the overdue figure', async () => {
+    const p = await company()
+    const t = await resident('Mike Twentyfive')
+    await owes(p, t, 'MH 25', daysAgo(10), [['rent', 460]])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, status, created_by)
+       VALUES ($1,$2,NULL,10,10,'goodwill','test','active',$3)`, [p.landlordId, t, p.userId])
+    await runLateBalanceDigest()
+    const { items } = digestMock.mock.calls[0][0]
+    expect(items).toEqual([expect.objectContaining({ tenantId: t, amount: 460 })])
+  })
+
+  it('a late fee on an overdue bill is in the digest with its bill', async () => {
+    const p = await company()
+    const t = await resident('Lucy Late')
+    const s = await owes(p, t, 'RV 12', daysAgo(10), [['rent', 440]])
+    const inv = (await db.query<{ id: string }>(`SELECT id FROM invoices WHERE lease_id = $1`, [s.leaseId])).rows[0].id
+    // charged two days ago, on a bill due ten days ago
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'late_fee',15,'pending',$6,'LATEFEE')`,
+      [inv, s.unitId, s.leaseId, t, p.landlordId, daysAgo(2)])
+    await runLateBalanceDigest()
+    const { items } = digestMock.mock.calls[0][0]
+    expect(items).toEqual([expect.objectContaining({ tenantId: t, amount: 455, daysLate: 10 })])
+  })
+})

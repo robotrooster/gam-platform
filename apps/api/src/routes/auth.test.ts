@@ -29,6 +29,8 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
 import { randomUUID } from 'crypto'
+import { readFileSync } from 'fs'
+import { join } from 'path'
 
 // Email is mocked at module level so /register and /register-prospect
 // don't try to send real verification emails through Resend. Pattern
@@ -51,7 +53,8 @@ vi.mock('../services/email', async (importOriginal) => {
 })
 
 import { db } from '../db'
-import { authRouter, mintAndSendVerifyEmail } from './auth'
+import { authRouter, mintAndSendVerifyEmail, RENEWAL_LOCKED_STATUS } from './auth'
+import { isAuthRejection } from '@gam/shared'
 import { signEmailFactorToken, signEmailOtpSessionToken, emailOtpRouter, issueEmailOtp } from './emailOtp'
 import { errorHandler } from '../middleware/errorHandler'
 import { cleanupAllSchema, seedLandlord, seedTenant } from '../test/dbHelpers'
@@ -516,6 +519,71 @@ describe('POST /api/auth/refresh', () => {
   it('no auth → 401', async () => {
     const res = await request(buildApp()).post('/api/auth/refresh').send({})
     expect(res.status).toBe(401)
+  })
+
+  // Final sweep (10/3): A LOCK IS NOT A SIGN-OUT. A lock answered the renewal
+  // 401, every portal reads a 401 from renewal as "this pass is dead", and a
+  // tenant signed in on their phone was thrown out without a word.
+  async function lockedTenantWithPass(): Promise<{ userId: string; pass: string }> {
+    const { rows: [u] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'tenant', 'Lo', 'Cked', TRUE) RETURNING id`, [`locked-${randomUUID()}@example.com`])
+    await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [u.id])
+    // A pass signed two days ago: old enough that the app asks to renew it.
+    const pass = jwt.sign({ userId: u.id, role: 'tenant', email: 'l@test.dev', profileId: null,
+      iat: Math.floor(Date.now() / 1000) - 2 * 86400 }, process.env.JWT_SECRET!, { expiresIn: '7d' })
+    await db.query(`UPDATE users SET failed_login_count = 5, locked_until = NOW() + INTERVAL '10 minutes' WHERE id = $1`, [u.id])
+    return { userId: u.id, pass }
+  }
+
+  it('a temporary lock answers "locked" (423), not a rejection: the pass stays good and renews after the lock', async () => {
+    const { userId, pass } = await lockedTenantWithPass()
+    const r = await request(buildApp()).post('/api/auth/refresh').set('Authorization', `Bearer ${pass}`).send({})
+    expect(r.status).toBe(RENEWAL_LOCKED_STATUS)
+    expect(r.status).toBe(423)
+    expect(r.body.success).toBe(false)
+    expect(r.body.data).toBeUndefined()           // no new pass while locked
+    expect(r.body.error).toBe('Your account is temporarily locked after too many sign-in attempts. You are still signed in; '
+      + 'your sign-in renews on its own once the lock ends.')
+    // The rule every portal's renewal uses to decide on a sign-out lets it go.
+    expect(isAuthRejection({ response: { status: r.status } })).toBe(false)
+    // The pass the app holds keeps working.
+    expect((await request(buildApp()).get('/api/auth/me').set('Authorization', `Bearer ${pass}`)).status).toBe(200)
+    // The lock ends; the next renewal goes through.
+    await db.query(`UPDATE users SET locked_until = NOW() - INTERVAL '1 minute' WHERE id = $1`, [userId])
+    const after = await request(buildApp()).post('/api/auth/refresh').set('Authorization', `Bearer ${pass}`).send({})
+    expect(after.status).toBe(200)
+    expect((jwt.decode(after.body.data.token) as any).userId).toBe(userId)
+  })
+
+  // The tenant app keeps its own copy of the "locked" answer (it cannot import
+  // the API). If one copy changed and the other did not, the app would stop
+  // reading a lock as "keep the pass". This pins the two together until the
+  // number moves into @gam/shared.
+  it('the tenant app\'s "locked" answer is the same number the API sends', () => {
+    const tenantRenewal = readFileSync(join(__dirname, '../../../tenant/src/lib/sessionRenewal.ts'), 'utf8')
+    const m = tenantRenewal.match(/export const RENEWAL_LOCKED_STATUS\s*=\s*(\d+)/)
+    expect(m, 'apps/tenant/src/lib/sessionRenewal.ts no longer declares RENEWAL_LOCKED_STATUS').not.toBeNull()
+    expect(Number(m![1])).toBe(RENEWAL_LOCKED_STATUS)
+  })
+
+  it('a lock never shields a pass a password change revoked: still 401', async () => {
+    const { userId, pass } = await lockedTenantWithPass()
+    await db.query(`UPDATE users SET sessions_valid_from = NOW() WHERE id = $1`, [userId])
+    const r = await request(buildApp()).post('/api/auth/refresh').set('Authorization', `Bearer ${pass}`).send({})
+    expect(r.status).toBe(401)
+    expect(r.body.error).toBe('Your password was changed. Please sign in again.')
+  })
+
+  it('a lock never shields a worker whose access was pulled: still 403', async () => {
+    const { rows: [u] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified, locked_until)
+       VALUES ($1, 'x', 'property_manager', 'Pulled', 'Worker', TRUE, NOW() + INTERVAL '10 minutes') RETURNING id`,
+      [`pulled-${randomUUID()}@example.com`])
+    const pass = jwt.sign({ userId: u.id, role: 'property_manager', email: 'p@test.dev', profileId: null },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const r = await request(buildApp()).post('/api/auth/refresh').set('Authorization', `Bearer ${pass}`).send({})
+    expect(r.status).toBe(403)
   })
 })
 

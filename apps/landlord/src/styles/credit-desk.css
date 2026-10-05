@@ -1,0 +1,220 @@
+/* S655 money plan, Step 14: the landlord payment screens — the desk window
+   (Record payment / Post a payment), Outstanding Balances, the Payments ledger,
+   the Front Desk money lines and the tenant page's credit card. Every class the
+   new markup uses has its rule here; globals.css is not touched. Colors come
+   from the theme tokens, so light and dark both work. */
+
+/* ── The desk window ─────────────────────────────────────── */
+.cd-window {
+  max-width: 520px; width: 95vw; max-height: 90vh;
+  display: flex; flex-direction: column;
+}
+.cd-window-body {
+  /* A flex child scrolls only when it may shrink below its content (S637). */
+  flex: 1; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 12px; padding-bottom: 4px;
+}
+.cd-head { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; flex-shrink: 0; }
+.cd-title { margin-bottom: 0; }
+.cd-sub { font-size: .76rem; color: var(--text-3); line-height: 1.5; }
+.cd-muted { font-size: .8rem; color: var(--text-3); padding: 8px 0; }
+.cd-strong { font-size: .85rem; font-weight: 600; color: var(--text-0); }
+.cd-gold { font-size: .8rem; font-weight: 600; color: var(--gold); line-height: 1.45; }
+.cd-stack { display: flex; flex-direction: column; gap: 8px; }
+.cd-msg { margin: 0; font-size: .8rem; line-height: 1.5; }
+.cd-note { font-size: .74rem; color: var(--text-2); line-height: 1.5; }
+.cd-done-line { font-size: .82rem; font-weight: 600; color: var(--green); }
+
+.cd-bill {
+  background: var(--bg-3); border: 1px solid var(--border-0); border-radius: 10px;
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 4px;
+}
+.cd-bill-group { display: flex; flex-direction: column; gap: 3px; }
+.cd-section-label {
+  font-size: .66rem; font-weight: 700; color: var(--text-3);
+  text-transform: uppercase; letter-spacing: .07em; margin-top: 4px;
+}
+.cd-section-sub { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.cd-line {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+  font-size: .8rem; color: var(--text-1);
+}
+.cd-line-label { min-width: 0; }
+.cd-line-meta { font-size: .7rem; color: var(--text-3); font-weight: 400; }
+.cd-line-muted { color: var(--text-3); font-size: .76rem; }
+.cd-line-total {
+  font-weight: 800; color: var(--text-0);
+  border-top: 1px solid var(--border-1); padding-top: 6px; margin-top: 3px;
+}
+
+/* Credit beside the bill, and the Use / Save question. */
+.cd-credit {
+  border: 1px solid rgba(201,162,39,.35); background: var(--gold-bg);
+  border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.cd-credit-head { font-size: .84rem; font-weight: 700; color: var(--text-0); }
+.cd-credit-ask { font-size: .76rem; color: var(--text-2); }
+.cd-choice { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.cd-choice .btn { width: 100%; justify-content: center; white-space: normal; line-height: 1.3; }
+.cd-chosen {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  font-size: .8rem; color: var(--text-1);
+}
+
+/* Choices that are picked, not pressed: how they paid, change or keep. */
+.cd-methods { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.cd-surplus { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.cd-option {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  text-align: left; padding: 9px 11px; border-radius: 9px; cursor: pointer;
+  background: var(--bg-2); border: 1px solid var(--border-1); color: var(--text-0);
+  font-family: var(--font-body); min-width: 0;
+}
+.cd-option:hover { border-color: var(--border-2); }
+.cd-option.on { background: var(--gold-bg); border: 1.5px solid var(--gold); }
+.cd-option:disabled { opacity: .55; cursor: not-allowed; }
+.cd-option:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.cd-option-title { font-size: .8rem; font-weight: 700; }
+.cd-option.on .cd-option-title { color: var(--gold); }
+.cd-option-sub { font-size: .68rem; color: var(--text-3); line-height: 1.35; }
+.cd-over { font-size: .88rem; font-weight: 800; color: var(--gold); }
+
+.cd-field { display: flex; flex-direction: column; gap: 4px; }
+.cd-field-label { font-size: .75rem; color: var(--text-3); }
+.cd-field .form-input, .cd-field .form-select { width: 100%; }
+.cd-inline { display: flex; gap: 8px; align-items: center; }
+
+.cd-confirm {
+  border: 1px solid rgba(245,158,11,.35); background: var(--amber-bg);
+  border-radius: 10px; padding: 10px 12px; font-size: .8rem; color: var(--text-0);
+  display: flex; flex-direction: column; gap: 8px; line-height: 1.5;
+}
+.cd-prior {
+  border-top: 1px solid var(--border-0); padding-top: 10px;
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-start;
+}
+
+.cd-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.cd-footer { margin-top: 14px; flex-shrink: 0; }
+.cd-grow { flex: 1; justify-content: center; }
+
+/* After Record: the change to hand back stays up until Done (decisions #16's rule). */
+.cd-change {
+  text-align: center; padding: 14px; border-radius: 12px; margin-bottom: 12px;
+  background: var(--gold-bg); border: 1.5px solid var(--gold);
+}
+.cd-change-label { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--text-2); }
+.cd-change-amount { font-size: 2rem; font-weight: 800; color: var(--gold); }
+
+/* The card reader at the desk. */
+.cd-reader-block {
+  margin-top: 4px; padding: 10px 12px; border: 1px solid var(--border-1); border-radius: 8px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.cd-reader-total { font-size: .98rem; font-weight: 800; color: var(--gold); }
+
+/* A person attached to a form, by name, with a way to take them off. */
+.cd-person { display: flex; align-items: center; gap: 8px; }
+.cd-x {
+  border: 1px solid var(--border-1); background: var(--bg-3); color: var(--text-2);
+  width: 24px; height: 24px; border-radius: 999px; cursor: pointer; line-height: 1;
+  font-size: .9rem; display: inline-flex; align-items: center; justify-content: center;
+}
+.cd-x:hover { color: var(--text-0); border-color: var(--border-2); }
+
+/* The "who is paying?" picker (Record payment at the top of Outstanding). */
+.cd-picker-results {
+  display: flex; flex-direction: column; border: 1px solid var(--border-1);
+  border-radius: 8px; overflow: hidden; max-height: 46vh; overflow-y: auto;
+}
+.cd-picker-item {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  text-align: left; padding: 9px 11px; background: transparent; border: none;
+  border-bottom: 1px solid var(--border-0); cursor: pointer; color: var(--text-0);
+  font-family: var(--font-body); font-size: .82rem; width: 100%;
+}
+.cd-picker-item:last-child { border-bottom: none; }
+.cd-picker-item:hover { background: var(--bg-3); }
+.cd-picker-meta { font-size: .72rem; color: var(--text-3); }
+.cd-picker-owes { font-size: .74rem; font-weight: 700; color: var(--gold); white-space: nowrap; }
+.cd-picker-side { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; text-align: right; max-width: 60%; }
+.cd-picker-note { font-size: .72rem; color: var(--amber); line-height: 1.4; text-align: right; max-width: 60%; }
+.cd-picker-side .cd-picker-note { max-width: none; }
+/* Someone who cannot be taken here: words, nothing to press. */
+.cd-picker-info { cursor: default; }
+.cd-picker-info:hover { background: transparent; }
+
+/* ── Outstanding Balances ────────────────────────────────── */
+.cd-page-actions { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
+.cd-grand { text-align: right; }
+.cd-grand-label { font-size: .72rem; color: var(--text-3); text-transform: uppercase; letter-spacing: .05em; }
+.cd-grand-amount { font-size: 1.3rem; font-weight: 700; color: var(--gold); }
+.cd-grand-sub { font-size: .72rem; color: var(--text-3); }
+.cd-notice { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
+.cd-notice > span { flex: 1; }
+.cd-folder { cursor: pointer; background: var(--bg-2); }
+.cd-folder td { font-weight: 700; padding: 12px 16px; }
+.cd-folder-inner { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cd-folder-meta { font-weight: 400; font-size: .78rem; color: var(--text-3); }
+.cd-folder-total { color: var(--gold); }
+.cd-row { cursor: pointer; }
+.cd-name { font-weight: 500; padding-left: 32px; }
+.cd-caret { color: var(--text-3); margin-right: 6px; font-size: .7rem; }
+.cd-tag { margin-left: 6px; vertical-align: middle; }
+.cd-owed { text-align: right; font-weight: 600; color: var(--gold); white-space: nowrap; }
+.cd-owed-sub { font-size: .68rem; color: var(--text-3); font-weight: 400; white-space: normal; }
+.cd-owed-credit { font-size: .7rem; color: var(--green); font-weight: 600; white-space: normal; }
+.cd-months { font-size: .74rem; color: var(--text-2); line-height: 1.45; min-width: 150px; }
+.cd-late { font-size: .74rem; font-weight: 600; color: var(--amber); white-space: nowrap; }
+.cd-late.long { color: var(--red); }
+.cd-contact { font-size: .82rem; }
+.cd-contact a { color: var(--text-2); }
+.cd-contact a.cd-phone { color: var(--gold); }
+.cd-record-cell { text-align: right; white-space: nowrap; }
+.cd-record-cell .btn + .btn { margin-left: 6px; }
+.cd-breakdown-cell { padding: 0; background: rgba(255,255,255,.015); }
+
+/* ── The Payments ledger ─────────────────────────────────── */
+.cd-ledger-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.cd-ledger-bar .cd-month-select { width: auto; min-width: 170px; flex: 0 0 auto; }
+.cd-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: .78rem; color: var(--text-2); cursor: pointer; }
+.cd-month-title { font-size: 1rem; font-weight: 700; color: var(--text-0); margin: 0; }
+.cd-month-head {
+  padding: 12px 16px; border-bottom: 1px solid var(--border-0);
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+}
+.cd-totals { display: flex; gap: 18px; flex-wrap: wrap; font-size: .78rem; color: var(--text-2); margin-left: auto; }
+.cd-totals strong { color: var(--text-0); font-family: var(--font-mono); }
+.cd-pointer {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid var(--border-0); font-size: .8rem; color: var(--text-1);
+}
+.cd-ledger-row { cursor: pointer; }
+.cd-ledger-sub { font-size: .68rem; color: var(--text-3); }
+.cd-ledger-items td { background: var(--bg-3); font-size: .76rem; color: var(--text-2); }
+.cd-ledger-items td.cd-ledger-indent { padding-left: 28px; }
+.cd-timing-late { color: var(--amber); font-weight: 600; }
+/* Why a payment came back: the bank's reason and the zero-tolerance mark. */
+.cd-return { color: var(--red); white-space: normal; }
+.cd-strong-sub { font-weight: 700; }
+.cd-empty { padding: 28px 16px; text-align: center; color: var(--text-3); font-size: .84rem; }
+.cd-worktrade-head {
+  padding: 10px 16px; border-top: 1px solid var(--border-0); border-bottom: 1px solid var(--border-0);
+  font-size: .76rem; font-weight: 700; color: var(--text-2); text-transform: uppercase; letter-spacing: .05em;
+}
+.cd-worktrade-line { padding: 8px 16px; font-size: .8rem; color: var(--text-1); border-bottom: 1px solid var(--border-0); }
+.cd-worktrade-line:last-child { border-bottom: none; }
+
+/* ── The tenant page: credit on their account ────────────── */
+.cd-credit-card .data-row { padding: 6px 0; }
+.cd-credit-lead { font-size: .85rem; color: var(--text-0); margin-bottom: 8px; line-height: 1.5; }
+
+/* ── Phones ──────────────────────────────────────────────── */
+@media (max-width: 640px) {
+  .cd-window { width: calc(100vw - 32px); max-height: 92vh; }
+  .cd-choice, .cd-surplus { grid-template-columns: 1fr; }
+  .cd-page-actions { width: 100%; justify-content: space-between; }
+  .cd-grand { text-align: left; }
+  .cd-totals { margin-left: 0; }
+  .cd-name { padding-left: 16px; }
+}

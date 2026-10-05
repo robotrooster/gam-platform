@@ -14,6 +14,10 @@
 // lease rent (actual active leases only — never short-term bookings) that FULLY
 // COVERS the amount owed. Covering influx in-window → netting; else → ACH pull.
 //
+// S655 (Step 10): a dispute writes one record per row it reopened, so the
+// decision is made ONCE PER EVENT on the sum of its open landlord records
+// (decideEventRecovery) — never one decision per row.
+//
 // The actual Stripe money movement for an ACH pull (bank debit / transfer
 // reversal) is C4/live-gated — this engine makes the DECISION and sets the DB
 // state; the netting is applied inside the Tuesday batch, and the ACH-pull
@@ -125,68 +129,116 @@ export async function anticipatedLeaseInflux(
 }
 
 export interface RecoveryDecision {
+  /** The first record of the event decided (older callers). */
   reversalId: string
+  /** Every record this decision stamped: one event, one landlord. */
+  reversalIds: string[]
+  stripeEventId: string
+  landlordId: string
   method:     'netting' | 'ach_pull'
   needed:     number
   influx:     number
 }
 
 /**
- * Decide how to reclaim a single open reversal's rent from the landlord, and
- * stamp the decision. No-op if the reversal is already decided/resolved.
- *   - netting  → recovery_status 'scheduled_netting' (the Tuesday batch nets it)
- *   - ach_pull → recovery_status stays 'pending' with method 'ach_pull' (the
- *                C4 executor performs the actual Stripe bank debit)
+ * S655 (money plan Step 10): ONE recovery per event. A dispute or return
+ * reopens every row its charge paid, one payment_reversals record per row;
+ * the landlord is still owed back what that ONE event took from them, so the
+ * decision is made once, on the sum of the event's open landlord records
+ * (recovery_status 'pending', no method yet), and stamped on all of them.
+ * Deciding per row would compare each row alone against the influx: a $900
+ * rent and a $100 water reversed together could be split across netting and an
+ * ACH pull (two pulls for one event, or a pull for $100 that the $1,000 influx
+ * would have covered). Records GAM recovers from nobody (GAM's own rows, $0
+ * records, a row no owner share was paid on) are 'not_needed', and a record
+ * whose loss came wholly out of the landlord's share GAM still held (withheld,
+ * paymentReversal.settleLandlordSide) is 'recovered' already — neither is
+ * here. A record's `reversed_amount - recovered_amount` is exactly what was
+ * paid out to the landlord and must come back (its withheld share and any
+ * GAM-first money are in recovered_amount from the start).
+ * No-op when nothing of the event is waiting on a decision.
+ */
+export async function decideEventRecovery(
+  stripeEventId: string,
+  asOf?: string,
+): Promise<RecoveryDecision[]> {
+  const groups = await query<{ landlord_id: string; ids: string[]; needed: string }>(
+    `SELECT landlord_id,
+            array_agg(id ORDER BY id)::text[] AS ids,
+            SUM(reversed_amount - recovered_amount)::text AS needed
+       FROM payment_reversals
+      WHERE stripe_event_id = $1 AND status <> 'resolved'
+        AND recovery_status = 'pending' AND recovery_method IS NULL
+        AND landlord_id IS NOT NULL
+      GROUP BY landlord_id
+      ORDER BY landlord_id`,
+    [stripeEventId]
+  )
+  const out: RecoveryDecision[] = []
+  for (const g of groups) {
+    // GAM reclaims the reversed money from the landlord. The reversal fee is the
+    // tenant's (billed on the reopened bill), never clawed from the landlord.
+    const needed = Math.round(parseFloat(g.needed) * 100) / 100
+    const influx = await anticipatedLeaseInflux(g.landlord_id, REVERSAL_NETTING_WINDOW_DAYS, asOf)
+    const method: 'netting' | 'ach_pull' = influx >= needed ? 'netting' : 'ach_pull'
+    const recoveryStatus = method === 'netting' ? 'scheduled_netting' : 'pending'
+    const stamped = await query<{ id: string }>(
+      `UPDATE payment_reversals
+          SET recovery_method = $2, recovery_status = $3, status = 'recovering', updated_at = NOW()
+        WHERE id = ANY($1::uuid[]) AND recovery_method IS NULL AND recovery_status = 'pending'
+          AND status <> 'resolved'
+        RETURNING id`,
+      [g.ids, method, recoveryStatus]
+    )
+    if (stamped.length === 0) continue
+    const ids = stamped.map(r => r.id).sort()
+    logger.info({ stripeEventId, landlordId: g.landlord_id, reversalIds: ids, method, needed, influx },
+      '[reversal_recovery] decided once for the event')
+    out.push({ reversalId: ids[0], reversalIds: ids, stripeEventId, landlordId: g.landlord_id, method, needed, influx })
+  }
+  return out
+}
+
+/**
+ * Decide the recovery for the event a record belongs to (older callers, which
+ * hold one record id): every open record of that event is decided together.
+ * Null when nothing of it waits on a decision.
  */
 export async function decideReversalRecovery(
   reversalId: string,
   asOf?: string,
 ): Promise<RecoveryDecision | null> {
-  const rev = await queryOne<{ landlord_id: string; reversed_amount: string; recovered_amount: string }>(
-    `SELECT landlord_id,
-            reversed_amount::text  AS reversed_amount,
-            recovered_amount::text AS recovered_amount
-       FROM payment_reversals
+  const rev = await queryOne<{ stripe_event_id: string; landlord_id: string | null }>(
+    `SELECT stripe_event_id, landlord_id FROM payment_reversals
       WHERE id = $1 AND status <> 'resolved'
         AND recovery_status = 'pending' AND recovery_method IS NULL`,
     [reversalId]
   )
   if (!rev) return null
-
-  // GAM reclaims the reversed RENT from the landlord. The reversal fee is the
-  // tenant's (billed on the reopened invoice), never clawed from the landlord.
-  const needed = parseFloat(rev.reversed_amount) - parseFloat(rev.recovered_amount)
-  const influx = await anticipatedLeaseInflux(rev.landlord_id, REVERSAL_NETTING_WINDOW_DAYS, asOf)
-  const method: 'netting' | 'ach_pull' = influx >= needed ? 'netting' : 'ach_pull'
-  const recoveryStatus = method === 'netting' ? 'scheduled_netting' : 'pending'
-
-  await query(
-    `UPDATE payment_reversals
-        SET recovery_method = $2, recovery_status = $3, status = 'recovering', updated_at = NOW()
-      WHERE id = $1`,
-    [reversalId, method, recoveryStatus]
-  )
-  logger.info({ reversalId, method, needed, influx }, '[reversal_recovery] decided')
-  return { reversalId, method, needed, influx }
+  const decided = await decideEventRecovery(rev.stripe_event_id, asOf)
+  return decided.find(d => d.reversalIds.includes(reversalId)) ?? null
 }
 
 /**
- * Scan freshly-opened reversals awaiting a recovery decision and decide each.
- * Cron entry (runs alongside the daily money jobs).
+ * Scan reversals awaiting a recovery decision and decide each EVENT once.
+ * Cron entry (runs alongside the daily money jobs). Counts are per decision
+ * (one event and landlord), never per row.
  */
 export async function processPendingReversalRecoveries(): Promise<{ decided: number; netting: number; achPull: number }> {
-  const rows = await query<{ id: string }>(
-    `SELECT id FROM payment_reversals
-      WHERE status <> 'resolved' AND recovery_status = 'pending' AND recovery_method IS NULL`
+  const events = await query<{ stripe_event_id: string }>(
+    `SELECT DISTINCT stripe_event_id FROM payment_reversals
+      WHERE status <> 'resolved' AND recovery_status = 'pending' AND recovery_method IS NULL
+      ORDER BY stripe_event_id`
   )
   let netting = 0, achPull = 0
-  for (const row of rows) {
+  for (const e of events) {
     try {
-      const d = await decideReversalRecovery(row.id)
-      if (d?.method === 'netting') netting++
-      else if (d?.method === 'ach_pull') achPull++
-    } catch (e) {
-      logger.error({ err: e, reversalId: row.id }, '[reversal_recovery] decision failed')
+      for (const d of await decideEventRecovery(e.stripe_event_id)) {
+        if (d.method === 'netting') netting++
+        else achPull++
+      }
+    } catch (err) {
+      logger.error({ err, stripeEventId: e.stripe_event_id }, '[reversal_recovery] decision failed')
     }
   }
   return { decided: netting + achPull, netting, achPull }

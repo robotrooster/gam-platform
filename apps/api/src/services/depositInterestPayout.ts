@@ -14,14 +14,23 @@
  * either way. So this pays annually wherever anything is owed, rather than
  * modeling thirteen cadences and getting one wrong.
  *
- * AS A CREDIT, not cash: it lands on the tenant's balance and comes off their
- * next bill automatically. Cash would mean opening a payout rail to a tenant
- * GAM may have no account for, to hand them money they are about to hand back
- * as rent.
+ * AS A CREDIT, not cash: it lands on the tenant's account. Cash would mean
+ * opening a payout rail to a tenant GAM may have no account for, to hand them
+ * money they are about to hand back as rent.
+ *
+ * S655 (Nic, 10/2): like every credit, it pays a bill BY ITSELF only when it
+ * covers the whole bill (the check runs the moment it is credited); otherwise
+ * it waits and the tenant can use it when they pay. It is GAM-FUNDED credit —
+ * only deposits GAM holds in escrow accrue, so the interest is GAM's money —
+ * which is why, unlike a credit the landlord gives, the rent it pays is the
+ * landlord's income the day it is used and is paid out to them with the weekly
+ * batch, with no processing fee (services/creditUse, allocation).
  */
 import { getClient, query } from '../db'
 import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
+import { lockHousehold } from './moneyPredicates'
+import { createIssuedCredit, runWholeBillCheckAfterCommit } from './creditUse'
 
 export interface PayoutResult {
   scanned: number
@@ -53,6 +62,16 @@ export async function payAnnualDepositInterest(asOf?: Date): Promise<PayoutResul
   // deposit through depositReturn, and paying again would double-pay.
   // S654: the year is measured to the property's today, not UTC's (UTC is
   // tomorrow after 5 pm in Phoenix, which paid a day early at month's end).
+  //
+  // ONE ROW PER DEPOSIT, credited on the lease the deposit is on NOW
+  // (security_deposits.lease_id), never the lease each month accrued under
+  // (fix round 1). A renewal moves the deposit record onto the new lease; the
+  // months before it accrued under the lease that has since ended. A credit
+  // tied to that lease can pay only that lease's bills (the credit ledger's
+  // rule), and its bills are done — the interest would sit on the account and
+  // never pay anything. Grouping by the accrual's lease also split one
+  // deposit's year into two rows, and whichever the run reached first took all
+  // of it (the sweep re-reads every unpaid month of the deposit).
   const due = await query<{
     security_deposit_id: string
     lease_id: string
@@ -63,7 +82,7 @@ export async function payAnnualDepositInterest(asOf?: Date): Promise<PayoutResul
     oldest: string
   }>(
     `SELECT a.security_deposit_id,
-            a.lease_id,
+            sd.lease_id,
             sd.tenant_id,
             l.landlord_id,
             SUM(a.interest_amount)::text AS owed,
@@ -71,13 +90,13 @@ export async function payAnnualDepositInterest(asOf?: Date): Promise<PayoutResul
             MIN(a.accrual_month)::text   AS oldest
        FROM security_deposit_interest_accruals a
        JOIN security_deposits sd ON sd.id = a.security_deposit_id
-       JOIN leases l             ON l.id = a.lease_id
+       JOIN leases l             ON l.id = sd.lease_id
        JOIN units u              ON u.id = l.unit_id
        JOIN properties p         ON p.id = u.property_id
       WHERE a.paid_at IS NULL
         AND a.interest_amount > 0
         AND sd.disbursed_at IS NULL
-      GROUP BY a.security_deposit_id, a.lease_id, sd.tenant_id, l.landlord_id, p.timezone
+      GROUP BY a.security_deposit_id, sd.lease_id, sd.tenant_id, l.landlord_id, p.timezone
      HAVING MIN(a.accrual_month)
               <= (($1::timestamptz AT TIME ZONE p.timezone)::date - INTERVAL '12 months')
         AND SUM(a.interest_amount) >= $2`,
@@ -87,8 +106,17 @@ export async function payAnnualDepositInterest(asOf?: Date): Promise<PayoutResul
 
   for (const d of due) {
     const client = await getClient()
+    let credited = false
     try {
       await client.query('BEGIN')
+      // S655: every writer of a household's money takes its lock first.
+      await lockHousehold(client, d.tenant_id, d.landlord_id)
+
+      // The lease the deposit is on now, read fresh and held: a renewal signed
+      // since the scan has moved it, and the credit follows it.
+      const onLease = (await client.query<{ lease_id: string }>(
+        `SELECT lease_id FROM security_deposits WHERE id = $1 FOR UPDATE`, [d.security_deposit_id])).rows[0]?.lease_id
+        ?? d.lease_id
 
       // Re-read the accrual ids INSIDE the transaction and lock them. Without
       // this, two overlapping runs would each see the same unpaid months and
@@ -110,22 +138,23 @@ export async function payAnnualDepositInterest(asOf?: Date): Promise<PayoutResul
         continue
       }
 
-      const credit = await client.query<{ id: string }>(
-        `INSERT INTO tenant_credits
-           (landlord_id, tenant_id, lease_id, amount_original, amount_remaining,
-            category, reason, status)
-         VALUES ($1,$2,$3,$4,$4,'deposit_interest',$5,'active')
-         RETURNING id`,
-        [d.landlord_id, d.tenant_id, d.lease_id, amount,
-         `Statutory interest on your security deposit — ${rows.rows.length} month(s) through ${d.oldest}`])
+      // Through the one credit service, so it is the same record every other
+      // credit is (category deposit_interest = GAM-funded).
+      const creditId = await createIssuedCredit(client, {
+        landlordId: d.landlord_id, tenantId: d.tenant_id, leaseId: onLease,
+        amount, category: 'deposit_interest',
+        reason: `Statutory interest on your security deposit — ${rows.rows.length} month(s) through ${d.oldest}`,
+        createdBy: null,
+      })
 
       await client.query(
         `UPDATE security_deposit_interest_accruals
             SET paid_at = NOW(), paid_credit_id = $2
           WHERE id = ANY($1::uuid[])`,
-        [rows.rows.map(r => r.id), credit.rows[0].id])
+        [rows.rows.map(r => r.id), creditId])
 
       await client.query('COMMIT')
+      credited = true
       out.paid++
       out.totalCredited = Math.round((out.totalCredited + amount) * 100) / 100
       logger.info({ security_deposit_id: d.security_deposit_id, amount, months: rows.rows.length },
@@ -139,6 +168,12 @@ export async function payAnnualDepositInterest(asOf?: Date): Promise<PayoutResul
         '[deposit-interest] could not credit — will retry next run')
     } finally {
       client.release()
+    }
+    // The whole-bill rule, after the credit is committed, in its own
+    // transaction: interest that covers the tenant's whole open bill pays it
+    // now. Never throws — the interest is already credited.
+    if (credited) {
+      await runWholeBillCheckAfterCommit({ tenantId: d.tenant_id, landlordId: d.landlord_id })
     }
   }
 

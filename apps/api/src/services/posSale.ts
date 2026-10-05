@@ -8,6 +8,8 @@
  */
 import type { PoolClient } from 'pg'
 import { recordHeldItem } from './heldPayouts'
+import { recordPlatformRevenueOnceCommitted, type CommittedBookingOutcome } from './platformRevenue'
+import { query } from '../db'
 import { logger } from '../lib/logger'
 
 export interface PosSaleInput {
@@ -41,11 +43,31 @@ export interface PosSaleInput {
  * account (it carries a PaymentIntent) puts money in GAM's hands; the card fee
  * on top is GAM's cut, the rest is the landlord's. Cash is already in the
  * drawer and a store charge hasn't been paid yet.
+ *
+ * 10/4 (early check-out plan, BUG-A): a card ON FILE is charged on GAM's
+ * account too (services/posCardOnFile — the saved card lives on GAM's platform
+ * customer), so its sale is owed to the landlord the same way. It used to
+ * return 0 for 'card_on_file': the money landed on GAM's balance and the
+ * landlord was never paid for it (and a refund of such a sale would have
+ * netted against a payout that was never credited).
  */
 export function cardPayoutOwed(s: Pick<PosSaleInput, 'paymentMethod' | 'stripePaymentIntentId' | 'total' | 'surcharge' | 'payoutOwed'>): number {
-  if (s.paymentMethod !== 'card' || !s.stripePaymentIntentId) return 0
+  if ((s.paymentMethod !== 'card' && s.paymentMethod !== 'card_on_file') || !s.stripePaymentIntentId) return 0
   const owed = s.payoutOwed ?? (Number(s.total) - Number(s.surcharge || 0))
   return Math.max(0, Math.round(owed * 100) / 100)
+}
+
+/**
+ * 10/3: GAM's card fee on a card sale that landed on GAM's account (it carries
+ * a PaymentIntent): the counter's card or card on file, or a pay link. It is
+ * the sale's platform fee — GAM's fee is always taken, whether the customer
+ * paid it on top or the landlord covered it — never a cash or store-account
+ * sale's.
+ */
+export function cardSaleGamFee(s: Pick<PosSaleInput, 'paymentMethod' | 'stripePaymentIntentId' | 'platformFee' | 'surcharge'>): number {
+  if ((s.paymentMethod !== 'card' && s.paymentMethod !== 'card_on_file') || !s.stripePaymentIntentId) return 0
+  const fee = Number(s.platformFee ?? s.surcharge ?? 0)
+  return fee > 0 ? Math.round(fee * 100) / 100 : 0
 }
 
 /**
@@ -55,7 +77,11 @@ export function cardPayoutOwed(s: Pick<PosSaleInput, 'paymentMethod' | 'stripePa
  * when this PaymentIntent was already recorded, so callers can treat a retry as
  * a no-op.
  */
-export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promise<{ tx: any; needsPO: any[] }> {
+export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promise<{
+  tx: any; needsPO: any[]
+  /** GAM's card fee on the sale, booked once the sale commits (resolves then; nothing to wait on for callers). */
+  cardFeeBooked: Promise<CommittedBookingOutcome | 'no_fee'>
+}> {
   const txRes = await client.query(`INSERT INTO pos_transactions
     (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason,tax_breakdown,paid_online)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17) RETURNING *`,
@@ -73,6 +99,33 @@ export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promis
       landlordId: s.landlordId, sourceType: 'pos_sale', sourceId: tx.id,
       amount: owed, description: 'Register card sale',
     }, client)
+  }
+  // 10/3 (Nic's admin cards): GAM's card fee on a card sale charged on GAM's
+  // account is GAM's earnings. Never booked before: the register and pay-link
+  // fees sat on GAM's balance as money nobody had written down, while Stripe's
+  // cost of those charges was already counted in the day's card costs. Booked
+  // like a card rent payment's spread (the whole fee; the month's true-up
+  // subtracts what Stripe actually took), once per sale.
+  // 10/3 (review): booked once the sale COMMITS, never inside its transaction —
+  // the counter captures the card after this and before COMMIT, and the
+  // ledger's lock held through that Stripe call stalled every other writer of
+  // GAM's earnings. A sale that rolls back books nothing; one whose booking is
+  // missed (a restart) is booked by the nightly true-up.
+  const gamCardFee = cardSaleGamFee(s)
+  let cardFeeBooked: Promise<CommittedBookingOutcome | 'no_fee'> = Promise.resolve('no_fee')
+  if (gamCardFee > 0) {
+    const { rows: [x] } = await client.query<{ xid: string }>(`SELECT pg_current_xact_id()::text AS xid`)
+    cardFeeBooked = recordPlatformRevenueOnceCommitted({
+      type: 'banking_spread',
+      amount: gamCardFee,
+      customerFeeCharged: gamCardFee,
+      referenceId: tx.id,
+      referenceType: 'pos_transaction',
+      propertyId: s.propertyId ?? null,
+      notes: s.paidOnline ? 'Card fee on a pay link payment' : 'Card fee on a register card sale',
+    }, x.xid, {
+      stillThere: async () => (await query(`SELECT 1 FROM pos_transactions WHERE id = $1`, [tx.id])).length > 0,
+    })
   }
 
   // Insert line items and decrement stock.
@@ -114,5 +167,5 @@ export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promis
   // sale leaves one line of its own, independent of the HTTP summary.
   logger.info({ transactionId: tx.id, propertyId: s.propertyId ?? null, landlordId: s.landlordId, cashierId: s.cashierId ?? null,
                 method: s.paymentMethod, total: tx.total, items: s.items.length }, '[pos] sale recorded')
-  return { tx, needsPO }
+  return { tx, needsPO, cardFeeBooked }
 }

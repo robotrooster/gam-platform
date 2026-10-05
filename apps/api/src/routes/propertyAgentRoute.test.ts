@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
-import { getClient } from '../db'
+import { db, getClient } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -42,6 +42,9 @@ async function seedPublishedProperty(slug: string, enabled = true): Promise<stri
 
 beforeEach(async () => {
   await cleanupAllSchema()
+  // 10/4: the assistants sit behind one switch; these tests need it on.
+  await db.query(`INSERT INTO system_features (key, enabled, description) VALUES ('ai_assistants_enabled', TRUE, 'test')
+                  ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
   runAgentSessionMock.mockReset()
   runAgentSessionMock.mockResolvedValue({
     reply: 'Hi!', handledBy: { name: 'Skye', tier: 'entry' }, escalations: [], toolInvocations: [],

@@ -10,7 +10,9 @@ import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordId
 // S640: the dashboard shows the date the payout ENGINE will fire, never its own guess.
 import { nextPayoutDateUtc } from '../jobs/autoPayouts'
 // S642: one definition of rent collected this month, shared with Reports and admin.
-import { collectedRentMtd } from '../lib/rentCollected'
+import { rentCollectedFrom, incomeCardFrom } from '../lib/rentCollected'
+import { parseIncomeBasis, basisMeta, incomeEvents, byMonth, breakdownFrom } from '../services/incomeBasis'
+import { todayIn as todayInZone } from '../lib/timezone'
 import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue, emailSigningRequest } from '../services/email'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { createNotification } from '../services/notifications'
@@ -627,6 +629,8 @@ landlordsRouter.get('/:id', async (req, res, next) => {
 
 landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
   try {
+    // S655: the "Money received" / "Money billed" switch (default Money received).
+    const basis = parseIncomeBasis(req.query.basis)
     const meAggregate = req.params.id === 'me' && req.user!.role === 'landlord'
     // S605 (Nic): a landlord who co-owns another entity was seeing a dashboard
     // for ONE of them while their Properties list showed all of them — Oak Park
@@ -802,37 +806,59 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // $8,915.95, but the KPI card only shows collected this month $8,020. That's
     // a nine hundred dollar difference, and I'm trying to figure out why."
     //
-    // Three separate disagreements with collected_mtd below, only one of which
-    // was biting: this summed EVERY payment type while the card counts rent
-    // only. The $895.95 was 14 settled utility payments — both figures right,
-    // neither one labeled. The trend is a REVENUE line and should keep counting
-    // everything; it now returns the split so the tooltip can say so instead of
-    // silently contradicting the card.
+    // The trend is a REVENUE line (everything), the card counts rent; the trend
+    // returns the split so the tooltip can say so.
     //
-    // The other two were latent and are fixed here:
-    //   · status IN ('completed','settled') — 'completed' is not a payment
-    //     status and never has been (settled / pending / processing are), so the
-    //     extra value did nothing but suggest a state that does not exist.
-    //   · bucketed by created_at — the month a charge ROW was made, not the
-    //     month the money arrived. ACH takes about four business days, so rent
-    //     created on the 30th and settled on the 3rd belongs to the next month
-    //     and was being drawn into this one. Nothing crosses a boundary in the
-    //     data today, which is luck rather than design; at month end it would
-    //     have inflated the closing month and hollowed out the new one.
-    const trend = await query<any>(`
-      SELECT
-        TO_CHAR(DATE_TRUNC('month', COALESCE(p.settled_at, p.created_at)), 'Mon') as month,
-        COALESCE(SUM(p.amount),0)::float as revenue,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.type = 'rent'), 0)::float as rent_revenue,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.type <> 'rent'), 0)::float as other_revenue
-      FROM payments p
-      WHERE p.landlord_id = ANY($1)
-        AND p.status = 'settled'
-        AND COALESCE(p.settled_at, p.created_at) >= NOW() - INTERVAL '6 months'
-        AND ($2::uuid IS NULL OR p.unit_id IN (
-              SELECT id FROM units WHERE property_id = $2))
-      GROUP BY DATE_TRUNC('month', COALESCE(p.settled_at, p.created_at))
-      ORDER BY DATE_TRUNC('month', COALESCE(p.settled_at, p.created_at)) ASC`, [scopeIds, propertyFilter])
+    // S655 (decision #4): the trend and the property-health card read the SAME
+    // category totals as the property report (services/incomeBasis), under the
+    // same switch, so the card, its tooltip and the report agree to the cent.
+    // It used to sum EVERY settled row — deposits held for tenants and GAM's
+    // own fees included — by a month that ignored the property's calendar.
+    const trendMonths: string[] = []
+    {
+      const today = todayInZone(null)
+      const ty = Number(today.slice(0, 4)), tm = Number(today.slice(5, 7))
+      for (let i = 5; i >= 0; i--) trendMonths.push(new Date(Date.UTC(ty, tm - 1 - i, 1)).toISOString().slice(0, 7))
+    }
+    const trendScope = {
+      landlordIds: scopeIds, propertyIds: propertyFilter ? [propertyFilter] : null,
+      start: `${trendMonths[0]}-01`,
+      end: new Date(Date.UTC(Number(trendMonths[5].slice(0, 4)), Number(trendMonths[5].slice(5, 7)), 0)).toISOString().slice(0, 10),
+    }
+    // Both ways, read once: the trend uses the chosen one, the cards both.
+    const [billedTrend, receivedTrend] = await Promise.all([
+      incomeEvents({ ...trendScope, basis: 'billed' }),
+      incomeEvents({ ...trendScope, basis: 'received' }),
+    ])
+    const billedByMonth = byMonth(billedTrend)
+    const receivedByMonth = basis === 'received' ? byMonth(receivedTrend) : null
+    const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+    const trendBreakdowns = trendMonths.map(ym => ({
+      ym,
+      b: breakdownFrom(basis, billedByMonth.get(ym) ?? [], receivedByMonth ? (receivedByMonth.get(ym) ?? []) : null),
+    }))
+    const trend = trendBreakdowns.map(({ ym, b }) => {
+      const rent = b.categories.find(c => c.category === 'space_rent')?.amount ?? 0
+      return {
+        month: MON[Number(ym.slice(5, 7)) - 1],
+        period: ym,
+        revenue: b.total,
+        rent_revenue: rent,
+        other_revenue: Math.round((b.total - rent) * 100) / 100,
+        categories: b.categories.filter(c => c.amount !== 0 || c.billed !== 0)
+          .map(c => ({ category: c.category, label: c.label, amount: c.amount, billed: c.billed, collected: c.collected })),
+        lines: b.lines,
+      }
+    })
+    // The property-health card: this month's category totals, the same figures
+    // the property report shows for the same month and switch.
+    const thisMonth = trendBreakdowns[trendBreakdowns.length - 1]
+    const propertyHealth = {
+      period: thisMonth.ym,
+      categories: thisMonth.b.categories,
+      lines: thisMonth.b.lines,
+      total: thisMonth.b.total,
+    }
 
     // Real maintenance stats
     const [maintenance] = await query<any>(`
@@ -921,8 +947,18 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     //   outstanding   — unpaid (pending+partial) invoice balances
     // S642 (Nic): one shared definition with the admin overview and Reports —
     // settled PLUS ACH still clearing. See lib/rentCollected.
-    const collected = await collectedRentMtd(scopeIds, propertyFilter)
-    const collectedRow = { collected_mtd: collected.collected }
+    // S655: the rent card follows the switch — rent that ARRIVED this month
+    // (Money received; money still clearing is its own figure beside it) or the
+    // part of this month's rent bills collected so far (Money billed). The
+    // income card is every line: "Money received this month $A, incl. $X paid
+    // ahead for later bills, + $Y still clearing" / "Money billed this month $B:
+    // collected so far · clearing · still owed".
+    // The same facts as the trend's current month (lib/rentCollected's rules).
+    const thisMonthRx = byMonth(receivedTrend).get(thisMonth.ym) ?? []
+    const thisMonthBx = billedByMonth.get(thisMonth.ym) ?? []
+    const collected = rentCollectedFrom(thisMonthRx, thisMonthBx, 'rent', basis)
+    const collectedRow = { collected_mtd: basis === 'received' ? collected.collected : collected.billed.collected }
+    const incomeCard = incomeCardFrom(rentCollectedFrom(thisMonthRx, thisMonthBx, 'all', basis), basis)
     // ── S640 (Nic): A SUSPENDED WORK-TRADE CHARGE IS NOT OUTSTANDING ───────
     //
     //   "It's not outstanding... not good to have that integrated everywhere
@@ -1091,7 +1127,12 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const occupancyRate = occupancyRateFrom(
       stats?.active_units || 0, nightsRow?.nights || 0, totalUnits)
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, platformFeeUnits, collected_mtd: collectedRow?.collected_mtd||0, collected_in_flight: collected.inFlight, outstanding: outstandingRow?.outstanding||0,
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, platformFeeUnits, collected_mtd: collectedRow?.collected_mtd||0, collected_in_flight: basis === 'received' ? collected.inFlight : collected.billed.clearing, outstanding: outstandingRow?.outstanding||0,
+      // S655: the rent card's other figures, both ways, and the income card.
+      rent_card: { basis, received: { amount: collected.collected, clearing: collected.inFlight }, billed: collected.billed },
+      income_card: incomeCard,
+      property_health: propertyHealth,
+      basis: basisMeta(basis),
       work_trade_suspended: outstandingRow?.work_trade_suspended||0,
       // S640: what is actually going out on the next weekly run, and what is
       // still clearing behind it.
@@ -2201,6 +2242,32 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       href: `/properties/${r.id}?tab=units`,
     }))
 
+    // 10/4 (decisions #38 Q5): an early check-out's money question left
+    // waiting on a stay (staff without "Issue refunds" checked an overpaid guest
+    // out, or the stay was checked out off the schedule) — the owner decides it.
+    const { pendingMoneyTodos } = await import('../services/earlyCheckOut')
+    const stayMoney = await pendingMoneyTodos(scopeIds).catch((err) => {
+      logger.error({ err }, '[todos] early check-out money questions failed')
+      return [] as Awaited<ReturnType<typeof pendingMoneyTodos>>
+    })
+    // 10/4 (decisions #46.1): every ended lease still waiting on the landlord's
+    // choice for the money paid ahead on it (and any refund of it not gone out).
+    const { paidAheadChoiceTodos } = await import('../services/paidAheadChoice')
+    const paidAhead = await paidAheadChoiceTodos(scopeIds).catch((err) => {
+      logger.error({ err }, '[todos] paid-ahead money choices failed')
+      return [] as Awaited<ReturnType<typeof paidAheadChoiceTodos>>
+    })
+
+    // 10/4 (decisions #47a): every finalized move-out with part of its refund
+    // still to go back — a part GAM sends that its original payment could not
+    // take (give it back in cash at the office, or try again), and the
+    // landlord's own part not yet marked handed back.
+    const { depositRefundTodos } = await import('../services/depositRefundSend')
+    const depositRefunds = await depositRefundTodos(scopeIds).catch((err) => {
+      logger.error({ err }, '[todos] deposit refunds failed')
+      return [] as Awaited<ReturnType<typeof depositRefundTodos>>
+    })
+
     res.json({
       success: true,
       data: {
@@ -2210,6 +2277,9 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         workTrade,
         onboarding,
         homeInventory,
+        stayMoney,
+        paidAhead,
+        depositRefunds,
         counts: {
           leases: leases.length,
           ach: ach.length,
@@ -2217,8 +2287,12 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
           workTrade: workTrade.length,
           onboarding: onboarding.length,
           homeInventory: homeInventory.length,
+          stayMoney: stayMoney.length,
+          paidAhead: paidAhead.length,
+          depositRefunds: depositRefunds.length,
           total: leases.length + ach.length + maintenance.length + workTrade.length
-                 + onboarding.length + homeInventory.length,
+                 + onboarding.length + homeInventory.length + stayMoney.length + paidAhead.length
+                 + depositRefunds.length,
         },
       },
     })
@@ -6257,47 +6331,61 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
 // which is a poor way to collect a utility charge that landed mid-month and
 // that nobody was expecting.
 //
-// The figure is computed here, from the ledger, under the SAME rules as the
-// outstanding-balances page — never passed in by the caller. Specifically:
+// The figure is computed here, from the ledger, under the SAME rule as the
+// Outstanding Balances page and the portal (services/openBalances
+// openBalanceSql) — never passed in by the caller. The SAME rows too: a charge
+// is the person's when it is billed to them or sits on their bill
+// (COALESCE(p.tenant_id, inv.tenant_id), as the Outstanding row groups it),
+// with or without a unit, so the email total is the row's balance:
 //   · work-trade suspended rows are excluded. They are settled in hours at
 //     month close, not cash, and Nic has already had to say twice that showing
 //     them as owing is "a false number". Emailing one would be worse.
-//   · in-flight ACH ('processing') is excluded — they have already paid.
-//   · credit on account comes off the TOTAL, not off individual lines. Nic:
-//     "The credit doesn't settle individual items. It takes just the total
-//     down. It's not separatable."
-// A resident who nets to zero is not emailed at all, and the caller is told so.
+//   · money in flight (an ACH clearing) is excluded — they have already paid.
+//   · S655 (Nic, 10/2): THE FULL BALANCE. Credit is not taken off it; the email
+//     says "You have $X credit available — you can use it when you pay" beside
+//     it. Credit applies by itself only when it covers a whole bill (and then
+//     that bill is paid and is not here); otherwise they choose when they pay.
+//   · decisions #17: each line names what it is ("Water", "Electric", "Trash"),
+//     never a generic "Utilities".
 landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
   requirePerm('payments.view'), async (req, res, next) => {
     try {
       const tenantId = z.string().uuid().parse(req.params.tenantId)
+      const { openBalanceSql, openAmountSql, creditBeside } = await import('../services/openBalances')
+      const { chargeLabel, chargeDetail, chargeLabelColumnsSql } = await import('../services/invoiceNotice')
       const all = await query<any>(`
-        SELECT p.id, p.type, p.amount::float AS amount, p.notes, p.landlord_id, p.lease_id,
+        SELECT p.id, p.type, ${openAmountSql('p')}::float AS amount, p.notes, p.entry_description,
+               ${chargeLabelColumnsSql('p')},
+               p.landlord_id, p.lease_id,
                to_char(p.due_date, 'YYYY-MM-DD') AS due_date,
-               to_char(p.due_date, 'Mon D, YYYY') AS due_label,
+               to_char(p.due_date, 'Mon FMDD, YYYY') AS due_label,
                u.id AS tenant_user_id, u.email, u.first_name,
                TRIM(CONCAT_WS(' ', u.first_name, u.last_name)) AS tenant_name,
-               un.unit_number, pr.name AS property_name,
+               un.unit_number, pr.id AS property_id, pr.name AS property_name,
                COALESCE(NULLIF(la.business_name, ''),
                         NULLIF(TRIM(lu.first_name || ' ' || lu.last_name), ''),
                         'Your landlord') AS landlord_name
           FROM payments p
-          JOIN tenants t  ON t.id = p.tenant_id
-          JOIN users   u  ON u.id = t.user_id
-          JOIN units   un ON un.id = p.unit_id
-          JOIN properties pr ON pr.id = un.property_id
+          LEFT JOIN invoices inv ON inv.id = p.invoice_id
+          JOIN tenants t  ON t.id = COALESCE(p.tenant_id, inv.tenant_id)
+          LEFT JOIN users u  ON u.id = t.user_id
+          LEFT JOIN units un ON un.id = p.unit_id
+          LEFT JOIN properties pr ON pr.id = un.property_id
           JOIN landlords la ON la.id = p.landlord_id
-          JOIN users lu ON lu.id = la.user_id
-         WHERE p.tenant_id = $1
-           AND p.work_trade_suspended_at IS NULL
-           -- S654: the rows the resident's portal counts as owed. A pending row
-           -- with a payment already started is in flight, not owed.
-           AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
-                OR p.status = 'failed')
+          LEFT JOIN users lu ON lu.id = la.user_id
+         WHERE COALESCE(p.tenant_id, inv.tenant_id) = $1
+           AND ${openBalanceSql('p')}
+           AND ${openAmountSql('p')} > 0
          ORDER BY p.due_date, p.created_at`, [tenantId])
       // S654: only charges the caller's company billed. Another landlord's bill
       // is theirs to remind about, and never shown to this one.
-      const rows = all.filter((r: any) => canAccessLandlordResource(req.user, r.landlord_id))
+      // S655: and a property-locked staffer (getScopedPropertyIds) reminds only
+      // about charges at THEIR properties — the same lock as the Outstanding
+      // list they pressed the button from. A charge at another of the
+      // company's parks is not theirs to read out or email.
+      const scopedProps = await getScopedPropertyIds(req.user)
+      const rows = all.filter((r: any) => canAccessLandlordResource(req.user, r.landlord_id)
+        && (scopedProps === null || scopedProps.includes(r.property_id)))
       if (!rows.length) {
         return res.json({ success: true, data: { sent: false, reason: 'They do not owe anything right now.' } })
       }
@@ -6305,47 +6393,29 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
         return res.json({ success: true, data: { sent: false, reason: 'No email address on file for them.' } })
       }
 
-      const gross = Math.round(rows.reduce((s: number, r: any) => s + Number(r.amount), 0) * 100) / 100
-      // S654: only credit those same companies gave; another landlord's credit
-      // is not this landlord's to take off.
+      const total = Math.round(rows.reduce((s: number, r: any) => s + Math.round(Number(r.amount) * 100), 0)) / 100
+      // S654: only credit those same companies gave or hold. Another landlord's
+      // credit is not this landlord's to mention.
       const landlordIds = Array.from(new Set(rows.map((r: any) => String(r.landlord_id))))
-      const creditRow = await queryOne<{ credit: string }>(
-        `SELECT COALESCE(SUM(amount_remaining), 0)::text AS credit
-           FROM tenant_credits
-          WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
-            AND landlord_id = ANY($2::uuid[])`, [tenantId, landlordIds])
-      // S653 (Nic): the headline is what they will actually be asked for —
-      // paid-ahead money this month may use (capped by their monthly draw)
-      // comes off too, exactly as it does when they pay.
-      let prepaidApplied = 0
-      const leaseIdForDraw = rows.find((r: any) => r.lease_id)?.lease_id ?? null
-      if (leaseIdForDraw) {
-        const { prepaidDrawAvailable } = await import('../services/prepaidRelease')
-        const { db } = await import('../db')
-        const month = String(rows[0].due_date ?? new Date().toISOString()).slice(0, 7) + '-01'
-        prepaidApplied = Math.min(gross, (await prepaidDrawAvailable(db as any, leaseIdForDraw, month)).available)
-      }
-      const creditApplied = Math.min(Number(creditRow?.credit ?? 0), Math.max(0, gross - prepaidApplied))
-      const total = Math.round((gross - prepaidApplied - creditApplied) * 100) / 100
-      if (total <= 0) {
-        return res.json({ success: true, data: { sent: false,
-          reason: 'Their credit on account covers everything owed.' } })
-      }
+      // A property-locked staffer: only the credit of the leases at their properties.
+      const leaseScope = scopedProps === null ? null
+        : Array.from(new Set(rows.map((r: any) => r.lease_id).filter(Boolean))) as string[]
+      const creditAvailable = (await creditBeside({ tenantId, landlordIds, leaseIds: leaseScope })).usable
 
-      const label = (r: any) => {
-        const note = String(r.notes ?? '').split(' — ')[0].trim()
-        if (r.type === 'utility') return note || 'Utilities'
-        if (r.type === 'rent') return 'Rent'
-        if (r.type === 'deposit') return note || 'Security deposit'
-        return note || r.type
-      }
-      const unitLabel = `${rows[0].property_name} — ${rows[0].unit_number}`
+      // The space the charges are at; a charge on no space (a fee billed to the
+      // person, not a unit) is still on the Outstanding row, so it is still here.
+      const at = rows.find((r: any) => r.property_name) ?? rows[0]
+      const unitLabel = at.property_name
+        ? (at.unit_number ? `${at.property_name} — ${at.unit_number}` : at.property_name)
+        : rows[0].landlord_name
       const id = await emailBalanceDue(rows[0].email, {
         tenantName: rows[0].first_name || rows[0].tenant_name || 'there',
         unitLabel,
         total,
-        creditApplied: Math.round((creditApplied + prepaidApplied) * 100) / 100,
-        lines: rows.map((r: any) => ({ label: label(r), amount: Number(r.amount), dueDate: r.due_label })),
+        creditAvailable,
+        lines: rows.map((r: any) => ({
+          label: chargeLabel(r), detail: chargeDetail(r), amount: Number(r.amount), dueDate: r.due_label,
+        })),
         // S654: the same Pay now link the bill carries, so opening it from the
         // tenant's own inbox skips the emailed code (password still required).
         portalUrl: payNowLink({ tenant_user_id: rows[0].tenant_user_id, tenant_email: rows[0].email }),
@@ -6353,7 +6423,7 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
       }, { landlordId: rows[0].landlord_id, tenantId })
 
       res.json({ success: true, data: {
-        sent: !!id, to: rows[0].email, total, creditApplied, lines: rows.length,
+        sent: !!id, to: rows[0].email, total, creditAvailable, lines: rows.length,
       } })
     } catch (e) { next(e) }
   })
@@ -6477,10 +6547,25 @@ landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (
 // fine and must not be flagged — landscapebygutierrez@icloud.com bounced on the
 // 13th and delivered on the 14th, 15th and 16th, and nagging about it would
 // teach everyone to ignore this.
+//
+// WHO SEES WHOM. The company filter alone let a property-scoped staff member
+// (Mountain View's front desk, say) read bounces for residents of every other
+// park the company runs, and let any viewer read another company's unit number
+// and the subject line of another company's email. Now:
+//   - scoped staff (getScopedPropertyIds) see only people with a place at one
+//     of THEIR properties: on a lease there, or an open invitation to it. A row
+//     with no resident behind it (a team invitation) is the owner's to see;
+//   - the unit shown is one of THIS company's units (and, for scoped staff, one
+//     at their properties), never a unit the person rents from someone else;
+//   - the reply never carries a message's subject or category. The outcome
+//     still comes from the address's latest verdict from any sender: it says
+//     whether the ADDRESS works, not what anybody sent to it.
 landlordsRouter.get('/me/undelivered-email', requirePerm('tenants.create'), async (req: any, res, next) => {
   try {
     const landlordIds = landlordScopeIds(req.user!)
     if (!landlordIds.length) throw new AppError(400, 'No landlord scope on this user')
+    // null = every property of the company (owners, all-properties staff).
+    const scopedPropertyIds = await getScopedPropertyIds(req.user)
 
     const rows = await query<any>(
       `WITH mine AS (
@@ -6516,7 +6601,6 @@ landlordsRouter.get('/me/undelivered-email', requirePerm('tenants.create'), asyn
          SELECT DISTINCT ON (lower(e.to_email))
                 lower(e.to_email) AS em,
                 COALESCE(e.last_event, e.status) AS outcome,
-                e.subject, e.category, e.created_at,
                 COALESCE(e.last_event_at, e.created_at) AS decided_at
            FROM email_send_log e
            JOIN mine m ON m.em = lower(e.to_email)
@@ -6532,14 +6616,18 @@ landlordsRouter.get('/me/undelivered-email', requirePerm('tenants.create'), asyn
               -- suppression says every future one will be discarded in silence.
               CASE WHEN sup.email IS NOT NULL THEN 'suppressed' ELSE v.outcome END AS outcome,
               sup.origin AS suppression_origin,
-              v.subject, v.category, v.decided_at,
+              v.decided_at,
               u.first_name, u.last_name,
               -- who this is, if GAM knows: a tenant on one of their units, or
-              -- somebody still sitting on an unaccepted invite
+              -- somebody still sitting on an unaccepted invite. Only THIS
+              -- company's units, and only the viewer's properties when scoped.
               (SELECT un.unit_number FROM lease_tenants lt
                  JOIN leases l  ON l.id = lt.lease_id
                  JOIN units  un ON un.id = l.unit_id
-                WHERE lt.tenant_id = t.id AND lt.status = 'active'
+                WHERE lt.tenant_id = t.id
+                  AND lt.status IN ('active', 'pending_add', 'pending_remove')
+                  AND l.landlord_id = ANY($1::uuid[])
+                  AND ($2::uuid[] IS NULL OR un.property_id = ANY($2::uuid[]))
                 ORDER BY l.created_at DESC LIMIT 1) AS unit_number,
               -- A tenant invite does not live in the invitations table (that
               -- one is team roles only; its CHECK refuses 'tenant'). The
@@ -6549,17 +6637,35 @@ landlordsRouter.get('/me/undelivered-email', requirePerm('tenants.create'), asyn
                  FROM pending_tenant_intents pti
                  JOIN units un ON un.id = pti.unit_id
                 WHERE pti.tenant_id = t.id
+                  AND pti.landlord_id = ANY($1::uuid[])
                   AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
+                  AND ($2::uuid[] IS NULL OR un.property_id = ANY($2::uuid[]))
                 ORDER BY pti.created_at DESC LIMIT 1) AS invited_unit_number
          FROM verdict v
          LEFT JOIN users u   ON lower(u.email) = v.em
          LEFT JOIN tenants t ON t.user_id = u.id
          LEFT JOIN email_suppressions sup ON sup.email = v.em
-        WHERE v.outcome IN ('bounced', 'complained', 'failed', 'undeliverable')
-           OR sup.email IS NOT NULL
+        WHERE (v.outcome IN ('bounced', 'complained', 'failed', 'undeliverable')
+               OR sup.email IS NOT NULL)
+          -- Scoped staff: only people with a place at one of their properties.
+          AND ($2::uuid[] IS NULL
+               OR EXISTS (SELECT 1 FROM lease_tenants lt
+                            JOIN leases l  ON l.id = lt.lease_id
+                            JOIN units  un ON un.id = l.unit_id
+                           WHERE lt.tenant_id = t.id
+                             AND lt.status IN ('active', 'pending_add', 'pending_remove')
+                             AND l.landlord_id = ANY($1::uuid[])
+                             AND un.property_id = ANY($2::uuid[]))
+               OR EXISTS (SELECT 1 FROM pending_tenant_intents pti
+                            LEFT JOIN units un ON un.id = pti.unit_id
+                           WHERE pti.tenant_id = t.id
+                             AND pti.landlord_id = ANY($1::uuid[])
+                             AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
+                             AND (un.property_id = ANY($2::uuid[])
+                                  OR pti.property_id = ANY($2::uuid[]))))
         ORDER BY v.decided_at DESC
         LIMIT 100`,
-      [landlordIds])
+      [landlordIds, scopedPropertyIds])
 
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }

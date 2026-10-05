@@ -28,7 +28,10 @@ vi.mock('../services/email', async (orig) => {
   return { ...actual, emailLoginCode: vi.fn(async (to: string, code: string) => { sentCodes.push(code); sentTo.push(to); return 'msg_mock' }) }
 })
 
-import { emailOtpRouter, signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
+import {
+  emailOtpRouter, signEmailOtpSessionToken, issueEmailOtp,
+  PENDING_PASS_EMAIL_CHANGED, PENDING_PASS_PASSWORD_CHANGED,
+} from './emailOtp'
 import { authRouter } from './auth'
 import { tenantsRouter } from './tenants'
 
@@ -407,7 +410,7 @@ describe('a pending pass from before the login email changed', () => {
 
     const res = await request(buildApp()).post('/api/auth/email-otp/resend').send({ emailOtpSession: pass })
     expect(res.status).toBe(401)
-    expect(res.body.error).toBe('Your sign-in email changed. Please sign in again.')
+    expect(res.body.error).toBe(PENDING_PASS_EMAIL_CHANGED)
     expect(sentTo).toEqual([])
     const rows = (await db.query<{ consumed_at: Date | null; attempts: number }>(
       `SELECT consumed_at, attempts FROM login_email_otps WHERE user_id = $1`, [u.id])).rows
@@ -424,7 +427,7 @@ describe('a pending pass from before the login email changed', () => {
 
     const refused = await request(buildApp()).post('/api/auth/email-otp/verify').send({ emailOtpSession: pass, code: oldCode })
     expect(refused.status).toBe(401)
-    expect(refused.body.error).toBe('Your sign-in email changed. Please sign in again.')
+    expect(refused.body.error).toBe(PENDING_PASS_EMAIL_CHANGED)
     expect(refused.body.data?.token).toBeUndefined()
     const after = (await db.query<{ email_verified: boolean }>(`SELECT email_verified FROM users WHERE id = $1`, [u.id])).rows[0]
     expect(after.email_verified).toBe(false)
@@ -460,5 +463,123 @@ describe('a pending pass from before the login email changed', () => {
     expect(ok.status).toBe(200)
     expect((jwt.decode(ok.body.data.token) as any).email).toBe(u.email)
     expect(ok.body.data.user.email).toBe(u.email)
+  })
+})
+
+// ── A dead pending pass sends the person back to the sign-in form ──────────
+//
+// Every portal's code screen (landlord, tenant, invite, business, POS, admin,
+// Support, GAM Books, PM) drops the pending pass and returns to the sign-in
+// form only when the refusal matches /session/i. A refusal without that word
+// left the person on the code screen typing codes that could never work, and a
+// reload brought the dead pass back. This pins the contract for every way a
+// pending pass dies, at both endpoints.
+describe('every refusal of a dead pending pass says "session", so the portal returns to sign-in', () => {
+  const pendingPassAt = (u: { id: string; email: string }, iat: number) =>
+    jwt.sign({ userId: u.id, role: 'super_admin', email: u.email, profileId: null,
+               purpose: 'email_otp_pending', iat }, process.env.JWT_SECRET!, { expiresIn: 15 * 60 })
+
+  for (const endpoint of ['verify', 'resend'] as const) {
+    it(`/${endpoint}: password changed since the pass was minted`, async () => {
+      const u = await seedOwner()
+      const before = pendingPassAt(u, Math.floor(Date.now() / 1000) - 60)
+      await db.query(`UPDATE users SET sessions_valid_from = NOW() WHERE id = $1`, [u.id])
+      const code = await issueEmailOtp(u.id, u.email, { skipSend: true })
+      const res = await request(buildApp()).post(`/api/auth/email-otp/${endpoint}`)
+        .send(endpoint === 'verify' ? { emailOtpSession: before, code } : { emailOtpSession: before })
+      expect(res.status).toBe(401)
+      expect(res.body.error).toBe(PENDING_PASS_PASSWORD_CHANGED)
+      expect(res.body.error).toMatch(/session/i)
+      expect(res.body.error).toMatch(/password was changed/i)
+      expect(res.body.error).toMatch(/sign in again/i)
+    })
+
+    it(`/${endpoint}: sign-in email changed since the pass was minted`, async () => {
+      const u = await seedOwner()
+      const pass = signEmailOtpSessionToken({ userId: u.id, role: 'super_admin', email: u.email, profileId: null })
+      const code = await issueEmailOtp(u.id, u.email, { skipSend: true })
+      await db.query(`UPDATE users SET email = $2 WHERE id = $1`, [u.id, `moved-${randomUUID()}@test.dev`])
+      const res = await request(buildApp()).post(`/api/auth/email-otp/${endpoint}`)
+        .send(endpoint === 'verify' ? { emailOtpSession: pass, code } : { emailOtpSession: pass })
+      expect(res.status).toBe(401)
+      expect(res.body.error).toBe(PENDING_PASS_EMAIL_CHANGED)
+      expect(res.body.error).toMatch(/session/i)
+      expect(res.body.error).toMatch(/sign in again/i)
+    })
+
+    it(`/${endpoint}: the account is gone, or the pass is forged or expired`, async () => {
+      const ghost = signEmailOtpSessionToken({ userId: randomUUID(), role: 'super_admin', email: 'ghost@test.dev', profileId: null })
+      const forged = jwt.sign({ userId: randomUUID(), purpose: 'totp_pending' }, process.env.JWT_SECRET!, { expiresIn: 60 })
+      const expired = jwt.sign({ userId: randomUUID(), purpose: 'email_otp_pending',
+                                 exp: Math.floor(Date.now() / 1000) - 10 }, process.env.JWT_SECRET!)
+      for (const pass of [ghost, forged, expired]) {
+        const res = await request(buildApp()).post(`/api/auth/email-otp/${endpoint}`)
+          .send(endpoint === 'verify' ? { emailOtpSession: pass, code: '000000' } : { emailOtpSession: pass })
+        expect(res.status).toBe(401)
+        expect(res.body.error).toMatch(/session/i)
+      }
+    })
+  }
+
+  it('a wrong or expired CODE is not a dead session: the person stays on the code screen', async () => {
+    // The opposite half of the contract: these are fixed by typing again or
+    // asking for a new code, so they must NOT read as an ended session.
+    const u = await seedOwner()
+    const pass = signEmailOtpSessionToken({ userId: u.id, role: 'super_admin', email: u.email, profileId: null })
+    await issueEmailOtp(u.id, u.email, { skipSend: true })
+    const wrong = await request(buildApp()).post('/api/auth/email-otp/verify').send({ emailOtpSession: pass, code: '999999x' })
+    expect(wrong.status).toBe(401)
+    expect(wrong.body.error).not.toMatch(/session/i)
+    await db.query(`UPDATE login_email_otps SET expires_at = NOW() - INTERVAL '1 minute' WHERE user_id = $1`, [u.id])
+    const expired = await request(buildApp()).post('/api/auth/email-otp/verify').send({ emailOtpSession: pass, code: '123456' })
+    expect(expired.status).toBe(401)
+    expect(expired.body.error).not.toMatch(/session/i)
+  })
+})
+
+// ── The code marks only the address it was checked against ────────────────
+//
+// liveAccountForPendingPass checks the address before the code lookup and the
+// bcrypt compare. A landlord correcting the resident's address (new address,
+// email_verified=FALSE) can land in between; the code proves the OLD inbox and
+// must not mark the NEW, unproven address verified.
+describe('/email-otp/verify: an address corrected mid-check is not marked verified', () => {
+  it('the new address stays unverified when the correction lands during the code check', async () => {
+    const u = await seedOwner()
+    await db.query(`UPDATE users SET email_verified = FALSE, email_verified_at = NULL WHERE id = $1`, [u.id])
+    const pass = signEmailOtpSessionToken({ userId: u.id, role: 'super_admin', email: u.email, profileId: null })
+    const code = await issueEmailOtp(u.id, u.email, { skipSend: true })
+    const moved = `corrected-${randomUUID()}@test.dev`
+
+    const original = bcrypt.compare.bind(bcrypt) as (s: string, h: string) => Promise<boolean>
+    const spy = vi.spyOn(bcrypt, 'compare').mockImplementationOnce((async (s: string, h: string) => {
+      await db.query(`UPDATE users SET email = $2, email_verified = FALSE, email_verified_at = NULL WHERE id = $1`, [u.id, moved])
+      return original(s, h)
+    }) as any)
+    try {
+      const res = await request(buildApp()).post('/api/auth/email-otp/verify').send({ emailOtpSession: pass, code })
+      expect(spy).toHaveBeenCalled()
+      // The code was right for the address the sign-in started with.
+      expect(res.status, JSON.stringify(res.body)).toBe(200)
+    } finally { spy.mockRestore() }
+
+    const after = (await db.query<{ email: string; email_verified: boolean; email_verified_at: Date | null }>(
+      `SELECT email, email_verified, email_verified_at FROM users WHERE id = $1`, [u.id])).rows[0]
+    expect(after.email).toBe(moved)
+    expect(after.email_verified).toBe(false)
+    expect(after.email_verified_at).toBeNull()
+  })
+
+  it('with no correction, the first code still verifies the address', async () => {
+    const u = await seedOwner()
+    await db.query(`UPDATE users SET email_verified = FALSE, email_verified_at = NULL WHERE id = $1`, [u.id])
+    const pass = signEmailOtpSessionToken({ userId: u.id, role: 'super_admin', email: u.email.toUpperCase(), profileId: null })
+    const code = await issueEmailOtp(u.id, u.email, { skipSend: true })
+    const res = await request(buildApp()).post('/api/auth/email-otp/verify').send({ emailOtpSession: pass, code })
+    expect(res.status).toBe(200)
+    const after = (await db.query<{ email_verified: boolean; email_verified_at: Date | null }>(
+      `SELECT email_verified, email_verified_at FROM users WHERE id = $1`, [u.id])).rows[0]
+    expect(after.email_verified).toBe(true)
+    expect(after.email_verified_at).not.toBeNull()
   })
 })

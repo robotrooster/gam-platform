@@ -18,7 +18,7 @@
  *     `skipped` count.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest'
 
 vi.mock('../services/supersedence', () => ({
   computeTenantGamOutstandingTotal: vi.fn(async () => 0),
@@ -43,13 +43,19 @@ vi.mock('../services/stripeConnect', async () => {
   }
 })
 
+const { paymentIntentsCancelMock, paymentIntentsRetrieveMock } = vi.hoisted(() => ({
+  paymentIntentsCancelMock: vi.fn(async (id: string) => ({ id, status: 'canceled' })),
+  // decisions.md #48.4: what Stripe says a charge is now (default: on its way).
+  paymentIntentsRetrieveMock: vi.fn(async (id: string): Promise<any> => ({ id, status: 'processing' })),
+}))
 vi.mock('../lib/stripe', () => {
   const paymentMethodsRetrieve = vi.fn(async () => ({
     id: 'pm_x',
     card: { brand: 'visa', last4: '1111', country: 'US' },
   }))
   return {
-    getStripe: () => ({ paymentMethods: { retrieve: paymentMethodsRetrieve } }),
+    getStripe: () => ({ paymentMethods: { retrieve: paymentMethodsRetrieve },
+      paymentIntents: { cancel: paymentIntentsCancelMock, retrieve: paymentIntentsRetrieveMock } }),
     createTenantAchSetup: vi.fn(),
   }
 })
@@ -62,7 +68,7 @@ import { db } from '../db'
 // S624: assert the FEE, not a figure — bind to the constant so a repricing never
 // leaves a stale literal behind. Same rule the fee-label copy follows
 // (PROCESSING_FEES → derived labels).
-import { PROCESSING_FEES } from '@gam/shared'
+import { PROCESSING_FEES, processingFeeFor } from '@gam/shared'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedUserBankAccount,
@@ -71,6 +77,10 @@ import { resolveTargetLease } from '../services/rentCharge'
 import { paymentsRouter } from './payments'
 import { errorHandler } from '../middleware/errorHandler'
 import * as stripeConnect from '../services/stripeConnect'
+import { createAdminNotification } from '../services/adminNotifications'
+import { camelCaseKeys } from '../lib/caseConversion'
+import fs from 'fs'
+import path from 'path'
 
 function buildApp() {
   const app = express()
@@ -135,6 +145,26 @@ async function seed(): Promise<Fixture> {
   finally { c.release() }
 }
 
+/**
+ * A staff member of landlord A with a property scope row (S655: the payments
+ * list follows getScopedPropertyIds, as the balances list does).
+ */
+async function staffToken(
+  f: Fixture,
+  role: 'property_manager' | 'onsite_manager',
+  o: { propertyIds?: string[]; all?: boolean; perms: Record<string, boolean> },
+): Promise<string> {
+  const { rows: [u] } = await db.query<{ id: string }>(
+    `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+     VALUES ($1,'x',$2,'Staff','Member',TRUE) RETURNING id`, [`staff-${randomUUID()}@t.dev`, role])
+  const table = role === 'property_manager' ? 'property_manager_scopes' : 'onsite_manager_scopes'
+  await db.query(
+    `INSERT INTO ${table} (user_id, landlord_id, property_ids, all_properties, permissions)
+     VALUES ($1,$2,$3,$4,$5::jsonb)`,
+    [u.id, f.aLid, o.propertyIds ?? [], o.all === true, JSON.stringify(o.perms)])
+  return sign({ userId: u.id, role, email: 'staff@t.dev', profileId: null, landlordId: f.aLid, permissions: o.perms })
+}
+
 // S414: dueOffsetMonths lets a test seed multiple payments per unit/type
 // without colliding on the ux_payments_unit_type_due_date_active UNIQUE
 // constraint (added in S414 to bulletproof /initiate-rent-collection).
@@ -144,16 +174,17 @@ async function seedPayment(opts: {
   unitId: string; tenantId: string; landlordId: string
   type?: string; amount?: number; status?: string
   dueOffsetMonths?: number
+  leaseId?: string | null
 }): Promise<string> {
   const offset = opts.dueOffsetMonths ?? (__seedPaymentCounter++)
   const { rows: [{ id }] } = await db.query<{ id: string }>(
     `INSERT INTO payments
        (unit_id, tenant_id, landlord_id, type, amount, status,
-        entry_description, due_date)
-     VALUES ($1,$2,$3,$4,$5,$6,'RENT',CURRENT_DATE + ($7 || ' months')::interval)
+        entry_description, due_date, lease_id)
+     VALUES ($1,$2,$3,$4,$5,$6,'RENT',CURRENT_DATE + ($7 || ' months')::interval, $8)
      RETURNING id`,
     [opts.unitId, opts.tenantId, opts.landlordId,
-     opts.type ?? 'rent', opts.amount ?? 1000, opts.status ?? 'pending', offset])
+     opts.type ?? 'rent', opts.amount ?? 1000, opts.status ?? 'pending', offset, opts.leaseId ?? null])
   return id
 }
 beforeEach(() => { __seedPaymentCounter = 0 })
@@ -232,10 +263,8 @@ describe('GET /api/payments', () => {
   it('team-role with landlordId + payments.view_all → sees landlord payments', async () => {
     const f = await seed()
     const pA = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
-    const teamWithPerm = sign({ userId: randomUUID(), role: 'property_manager',
-                                  email: 'pm@t.dev', profileId: randomUUID(),
-                                  landlordId: f.aLid,
-                                  permissions: { 'payments.view_all': true } })
+    // S655: what a staffer sees follows their property scope; this one has every property.
+    const teamWithPerm = await staffToken(f, 'property_manager', { all: true, perms: { 'payments.view_all': true } })
     const res = await request(buildApp()).get('/api/payments')
       .set('Authorization', `Bearer ${teamWithPerm}`)
     expect(res.status).toBe(200)
@@ -377,6 +406,23 @@ describe('POST /api/payments/initiate-rent-collection', () => {
 // ─── POST /api/payments/:id/handle-return ───────────────────
 
 describe('POST /api/payments/:id/handle-return', () => {
+  // A return reopens every row its debit paid: one payment_reversals record per
+  // row. Contract step C0 drops the old UNIQUE(stripe_event_id) that allowed only
+  // one; it is dropped for this block only and put back after only if it was
+  // there (as paymentReversal.test.ts does), so later suites see the schema this
+  // block found — before C0 on a plain run, after C0 on the final run.
+  let hadOldConstraint = false
+  beforeAll(async () => {
+    hadOldConstraint = (await db.query(
+      `SELECT 1 FROM pg_constraint WHERE conname = 'payment_reversals_stripe_event_id_key'`)).rowCount === 1
+    await db.query(`ALTER TABLE payment_reversals DROP CONSTRAINT IF EXISTS payment_reversals_stripe_event_id_key`)
+  })
+  afterAll(async () => {
+    if (!hadOldConstraint) return
+    await cleanupAllSchema()
+    await db.query(`ALTER TABLE payment_reversals ADD CONSTRAINT payment_reversals_stripe_event_id_key UNIQUE (stripe_event_id)`)
+  })
+
   it('non-admin → 403', async () => {
     const f = await seed()
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id,
@@ -405,51 +451,614 @@ describe('POST /api/payments/:id/handle-return', () => {
     expect(res.status).toBe(404)
   })
 
-  it('non-zero-tolerance R01: status→returned, monitoring log, no ACH suspension', async () => {
+  // Fix pass (Step 8): a settled bank debit the bank sent back. Its rent and
+  // utility settled on one ACH debit; the return reopens both through
+  // paymentReversal (money plan §3 two-row model).
+  async function seedSettledDebit(f: Fixture, pi: string, opts: { method?: 'ach' | 'card'; manual?: string | null } = {}) {
+    const rent = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id,
+                                     amount: 1000, dueOffsetMonths: -1 })
+    const util = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id,
+                                     type: 'utility', amount: 50, dueOffsetMonths: -1 })
+    const { rows: [rem] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       payment_method, stripe_payment_intent_id, status, gross_amount, processing_fee_amount)
+       VALUES ($1,$2,$3,1050,1050,0,$4,$5,'settled',1056,6) RETURNING id`,
+      [f.tenant1Id, f.lease1Id, f.aLid, opts.method ?? 'ach', pi])
+    for (const [id, amt] of [[rent, 1000], [util, 50]] as const) {
+      await db.query(`INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied) VALUES ($1,$2,$3)`, [rem.id, id, amt])
+    }
+    await db.query(
+      `UPDATE payments SET status='settled', settled_at=NOW(), platform_held=TRUE, stripe_payment_intent_id=$2,
+              manual_method=$3
+        WHERE id = ANY($1::uuid[])`, [[rent, util], pi, opts.manual ?? null])
+    return { rent, util, remittanceId: rem.id }
+  }
+  const owedOnce = async (f: Fixture) => {
+    const { listOpenTenantBalances } = await import('../services/openBalances')
+    const { getMyPayments } = await import('../services/agents/tools/getMyPayments')
+    const list = await listOpenTenantBalances({ landlordIds: [f.aLid] })
+    const outstanding = list.reduce((s, r) => s + Number(r.balance), 0)
+    const agent: any = await getMyPayments.execute({}, { userId: f.tenant1UserId, role: 'tenant', profileId: f.tenant1Id, landlordIds: [] } as any)
+    return { list, outstanding, agent: agent.outstandingBalance as number }
+  }
+
+  it('a return on a settled bank debit reopens every row it paid, owed exactly once on Outstanding and in get_my_payment_status', async () => {
     const f = await seed()
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id,
-                                     landlordId: f.aLid })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+    const d = await seedSettledDebit(f, 'pi_ret_settled')
+    const res = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
       .set('Authorization', `Bearer ${f.tokenAdmin}`)
-      .send({ returnCode: 'R01' })
+      .send({ returnCode: 'R01', returnFee: 4 })
     expect(res.status).toBe(200)
+    expect(res.body.data.outcome).toBe('reopened')
     expect(res.body.data.zeroTolerance).toBe(false)
-    const { rows: [p] } = await db.query<any>(
-      `SELECT status, return_code, zero_tolerance_flag FROM payments WHERE id=$1`, [pid])
-    expect(p.status).toBe('returned')
-    expect(p.return_code).toBe('R01')
-    expect(p.zero_tolerance_flag).toBe(false)
-    const { rows: [t] } = await db.query<any>(
-      `SELECT ach_verified FROM tenants WHERE id=$1`, [f.tenant1Id])
-    // Pre-existing default is FALSE; setupEligible wasn't called, so we
-    // pin "not flipped" relative to its pre-call value.
-    expect(t.ach_verified).toBe(false)
+    expect(res.body.data.owedAgain).toBe(1050)
+    expect(res.body.data.reopened).toHaveLength(2)
+    // The originals are 'returned' with the bank's code; nothing is owed on them.
+    const { rows: orig } = await db.query<any>(
+      `SELECT status, return_code, zero_tolerance_flag FROM payments WHERE id = ANY($1::uuid[]) ORDER BY amount`, [[d.rent, d.util]])
+    expect(orig).toEqual([
+      { status: 'returned', return_code: 'R01', zero_tolerance_flag: false },
+      { status: 'returned', return_code: 'R01', zero_tolerance_flag: false },
+    ])
+    // A fresh owed row per original, at its money part.
+    const { rows: fresh } = await db.query<any>(
+      `SELECT p.type, p.amount::float AS amount, p.status FROM payments p
+         JOIN payment_reversals pr ON pr.id = p.reversal_id
+        WHERE pr.stripe_event_id = 'manual_return:pi_ret_settled' ORDER BY p.amount`)
+    expect(fresh).toEqual([
+      { type: 'utility', amount: 50, status: 'pending' },
+      { type: 'rent', amount: 1000, status: 'pending' },
+    ])
+    const { rows: rv } = await db.query<any>(
+      `SELECT reversal_type FROM payment_reversals WHERE stripe_event_id = 'manual_return:pi_ret_settled'`)
+    expect(rv.every((r: any) => r.reversal_type === 'ach_return')).toBe(true)
+    // Owed once: the reopened $1,050 plus the $4 return fee passed to the
+    // tenant at cost — never the originals as well.
+    const { rows: [fee] } = await db.query<{ amt: string | null }>(
+      `SELECT SUM(amount)::text AS amt FROM payments
+        WHERE tenant_id = $1 AND status = 'pending' AND reversal_id IS NULL AND id <> ALL($2::uuid[])`,
+      [f.tenant1Id, [d.rent, d.util]])
+    const feeOwed = Number(fee.amt ?? 0)
+    expect(feeOwed).toBe(4)
+    const o = await owedOnce(f)
+    expect(o.agent).toBeCloseTo(1054, 2)
+    expect(o.list).toHaveLength(1)
+    expect(o.outstanding).toBeCloseTo(1054, 2)
+    // NACHA log, and no bank-payment block for a retryable code.
+    const { rows: logs } = await db.query<any>(`SELECT event_type, amount::float AS amount FROM ach_monitoring_log WHERE payment_id=$1`, [d.rent])
+    // The whole debit the bank pulled ($1,050 of charges + the $6 fee on top), not the pressed row's $1,000.
+    expect(logs).toEqual([{ event_type: 'return_received', amount: 1056 }])
+    const { rows: [t] } = await db.query<any>(`SELECT ach_suspended_at FROM tenants WHERE id=$1`, [f.tenant1Id])
+    expect(t.ach_suspended_at).toBeNull()
   })
 
-  it('zero-tolerance R10: status→returned + tenant ach_verified flipped FALSE + extra log row', async () => {
+  // Fix pass (rev8): the same as the dispute webhook (webhooks.ts) — a bank
+  // return of a move-out balance charge recorded here marks the move-out as
+  // not collected, so the owner's move-out page says it is owed again.
+  it('a bank return recorded by hand on a move-out balance charge marks the move-out as came back unpaid, as the webhook does', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_gap')
+    const c = await db.connect()
+    let draftId: string
+    try {
+      const { seedDepositReturnDraft } = await import('../test/dbHelpers')
+      draftId = await seedDepositReturnDraft(c as any, {
+        leaseId: f.lease1Id, tenantId: f.tenant1Id, landlordId: f.aLid, totalDeposit: 0,
+        damageLines: [{ description: 'Broken window', amount: 1000 }],
+      })
+    } finally { c.release() }
+    await db.query(`UPDATE deposit_returns SET gap_payment_id = $2, finalized_at = NOW() WHERE id = $1`, [draftId!, d.rent])
+    const res = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 4 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.outcome).toBe('reopened')
+    const { GAP_CHARGE_REASON } = await import('../services/depositReturn')
+    const { rows: [dr] } = await db.query<any>(
+      `SELECT gap_charge_failed, gap_charge_failure_reason FROM deposit_returns WHERE id = $1`, [draftId!])
+    expect(dr).toEqual({ gap_charge_failed: true, gap_charge_failure_reason: GAP_CHARGE_REASON.cameBack('ach') })
+  })
+
+  it('a bank return recorded by hand on an ordinary bill leaves every move-out alone', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_nogap')
+    const c = await db.connect()
+    let draftId: string
+    try {
+      const { seedDepositReturnDraft } = await import('../test/dbHelpers')
+      draftId = await seedDepositReturnDraft(c as any, { leaseId: f.lease1Id, tenantId: f.tenant1Id, landlordId: f.aLid, totalDeposit: 0 })
+    } finally { c.release() }
+    const res = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 4 })
+    expect(res.status).toBe(200)
+    const { rows: [dr] } = await db.query<any>(`SELECT gap_charge_failed FROM deposit_returns WHERE id = $1`, [draftId!])
+    expect(dr.gap_charge_failed).toBe(false)
+  })
+
+  it('the NACHA log records the whole debit whichever of its rows is pressed', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_util_press')
+    const res = await request(buildApp()).post(`/api/payments/${d.util}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 4 })
+    expect(res.status).toBe(200)
+    const { rows: logs } = await db.query<any>(
+      `SELECT payment_id, amount::float AS amount FROM ach_monitoring_log WHERE event_type = 'return_received'`)
+    expect(logs).toEqual([{ payment_id: d.util, amount: 1056 }])
+  })
+
+  it('before contract step C0, a return on a debit that paid two charges is refused in plain words and changes nothing', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_prec0')
+    await db.query(`ALTER TABLE payment_reversals ADD CONSTRAINT payment_reversals_stripe_event_id_key UNIQUE (stripe_event_id)`)
+    try {
+      const res = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
+        .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 4 })
+      expect(res.status).toBe(409)
+      expect(res.body.error).toMatch(/C0/)
+    } finally {
+      await db.query(`ALTER TABLE payment_reversals DROP CONSTRAINT IF EXISTS payment_reversals_stripe_event_id_key`)
+    }
+    const { rows } = await db.query<any>(`SELECT status, return_code FROM payments WHERE id = ANY($1::uuid[])`, [[d.rent, d.util]])
+    expect(rows).toEqual([{ status: 'settled', return_code: null }, { status: 'settled', return_code: null }])
+    const { rows: [n] } = await db.query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM payment_reversals`)
+    expect(Number(n.n)).toBe(0)
+    const { rows: logs } = await db.query<any>(`SELECT 1 FROM ach_monitoring_log WHERE payment_id=$1`, [d.rent])
+    expect(logs).toHaveLength(0)
+  })
+
+  it('a return recorded twice is refused the second time and nothing is reopened again', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_twice')
+    const first = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 4 })
+    expect(first.status).toBe(200)
+    for (const id of [d.rent, d.util]) {
+      const again = await request(buildApp()).post(`/api/payments/${id}/handle-return`)
+        .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 4 })
+      expect(again.status).toBe(409)
+      expect(again.body.error).toMatch(/already recorded/)
+    }
+    const { rows: [n] } = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM payments WHERE reversal_id IS NOT NULL`)
+    expect(Number(n.n)).toBe(2)
+  })
+
+  it('a settled debit needs the return fee Stripe charged, and nothing changes without it', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_nofee')
+    const res = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/returnFee/)
+    const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [d.rent])
+    expect(p.status).toBe('settled')
+    const { rows: [n] } = await db.query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM payment_reversals`)
+    expect(Number(n.n)).toBe(0)
+  })
+
+  it('zero-tolerance R10 on a settled debit: reopened as unauthorized, bank payments suspended, extra log row', async () => {
     const f = await seed()
     await db.query(`UPDATE tenants SET ach_verified=TRUE WHERE id=$1`, [f.tenant1Id])
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id,
-                                     landlordId: f.aLid })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+    const d = await seedSettledDebit(f, 'pi_ret_r10')
+    const res = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
       .set('Authorization', `Bearer ${f.tokenAdmin}`)
-      .send({ returnCode: 'R10' })
+      .send({ returnCode: 'R10', returnFee: 0 })
     expect(res.status).toBe(200)
     expect(res.body.data.zeroTolerance).toBe(true)
     expect(res.body.data.action).toMatch(/suspended/)
+    // S655: the NACHA block is its own column; ach_verified keeps meaning
+    // "has a verified bank", and every bank charge is refused while suspended.
     const { rows: [t] } = await db.query<any>(
-      `SELECT ach_verified FROM tenants WHERE id=$1`, [f.tenant1Id])
-    expect(t.ach_verified).toBe(false)
+      `SELECT ach_verified, ach_suspended_at FROM tenants WHERE id=$1`, [f.tenant1Id])
+    expect(t.ach_suspended_at).not.toBeNull()
+    expect(t.ach_verified).toBe(true)
     const { rows: logs } = await db.query<any>(
-      `SELECT event_type FROM ach_monitoring_log WHERE payment_id=$1 ORDER BY event_type`,
-      [pid])
+      `SELECT event_type FROM ach_monitoring_log WHERE payment_id=$1 ORDER BY event_type`, [d.rent])
     expect(logs.map(l => l.event_type)).toEqual(['return_received', 'zero_tolerance_block'])
+    const { rows: rv } = await db.query<any>(
+      `SELECT DISTINCT reversal_type FROM payment_reversals WHERE stripe_event_id = 'manual_return:pi_ret_r10'`)
+    expect(rv).toEqual([{ reversal_type: 'ach_unauthorized' }])
+    const { rows: [p] } = await db.query<any>(`SELECT zero_tolerance_flag FROM payments WHERE id=$1`, [d.rent])
+    expect(p.zero_tolerance_flag).toBe(true)
+  })
+
+  it('a return whose second step did not finish is finished when it is recorded again', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_resume')
+    // The reversal ran (as the route runs it) but the codes were never written.
+    const { handlePaymentReversal } = await import('../services/paymentReversal')
+    await handlePaymentReversal({
+      paymentIntentId: 'pi_ret_resume', reversalType: 'ach_return', reversalFee: 0,
+      stripeEventId: 'manual_return:pi_ret_resume', rawEvent: {},
+    })
+    const res = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 0 })
+    expect(res.status).toBe(200)
+    const { rows } = await db.query<any>(
+      `SELECT return_code FROM payments WHERE id = ANY($1::uuid[])`, [[d.rent, d.util]])
+    expect(rows.map(r => r.return_code)).toEqual(['R01', 'R01'])
+    const { rows: [n] } = await db.query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM payments WHERE reversal_id IS NOT NULL`)
+    expect(Number(n.n)).toBe(2)
+  })
+
+  it('a card payment is refused — a chargeback arrives from Stripe as a dispute', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_card', { method: 'card' })
+    const res = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 4 })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/card payment/)
+    const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [d.rent])
+    expect(p.status).toBe('settled')
+  })
+
+  it('money recorded by hand is refused — there is no bank debit to return', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_manual', { manual: 'cash' })
+    const res = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 0 })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/recorded by hand/)
+  })
+
+  it('a debit still on its way is refused — Stripe reports its own failure', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    await db.query(`UPDATE payments SET status='processing', stripe_payment_intent_id='pi_ret_inflight' WHERE id=$1`, [pid])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/still on its way/)
+    const { rows: [p] } = await db.query<any>(`SELECT status, return_code FROM payments WHERE id=$1`, [pid])
+    expect(p).toEqual({ status: 'processing', return_code: null })
+  })
+
+  it('a charge never sent to the bank is refused and stays owed as it is', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/never sent to the bank/)
+    const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [pid])
+    expect(p.status).toBe('pending')
+  })
+
+  it('a failed debit keeps owing on its own row with the code written; a retryable code keeps its retry', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    await db.query(`UPDATE payments SET status='failed', stripe_payment_intent_id='pi_ret_failed_r01',
+                           next_retry_at = NOW() + INTERVAL '2 days' WHERE id=$1`, [pid])
+    paymentIntentsCancelMock.mockClear()
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.outcome).toBe('failed')
+    expect(res.body.data.action).toMatch(/a scheduled retry still runs/)
+    const { rows: [p] } = await db.query<any>(`SELECT status, return_code, next_retry_at FROM payments WHERE id=$1`, [pid])
+    expect(p.status).toBe('failed')
+    expect(p.return_code).toBe('R01')
+    expect(p.next_retry_at).not.toBeNull()
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+    const o = await owedOnce(f)
+    expect(o.agent).toBe(1000)
+  })
+
+  it('a do-not-retry code on a failed debit cancels its scheduled retry and gives back the credit it set aside', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    const { rows: [credit] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,100,100,'goodwill') RETURNING id`, [f.aLid, f.tenant1Id, f.lease1Id])
+    const { rows: [rem] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       payment_method, stripe_payment_intent_id, status)
+       VALUES ($1,$2,$3,900,900,0,'ach','pi_ret_failed_r02','processing') RETURNING id`, [f.tenant1Id, f.lease1Id, f.aLid])
+    await db.query(`UPDATE payments SET status='failed', stripe_payment_intent_id='pi_ret_failed_r02',
+                           next_retry_at = NOW() + INTERVAL '2 days' WHERE id=$1`, [pid])
+    await db.query(
+      `INSERT INTO credit_uses (tenant_credit_id, payment_id, remittance_id, lease_id, amount, billing_month, source, status)
+       VALUES ($1,$2,$3,$4,100,date_trunc('month', CURRENT_DATE)::date,'portal','held')`, [credit.id, pid, rem.id, f.lease1Id])
+    paymentIntentsCancelMock.mockClear()
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R02' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.action).toMatch(/no retry/)
+    const { rows: [p] } = await db.query<any>(`SELECT status, return_code, next_retry_at FROM payments WHERE id=$1`, [pid])
+    expect(p).toEqual({ status: 'failed', return_code: 'R02', next_retry_at: null })
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_ret_failed_r02')
+    const { rows: uses } = await db.query<any>(`SELECT status, release_reason FROM credit_uses`)
+    expect(uses).toEqual([{ status: 'released', release_reason: 'superseded' }])
+    const { rows: [c] } = await db.query<any>(`SELECT amount_remaining::float AS left FROM tenant_credits WHERE id=$1`, [credit.id])
+    expect(c.left).toBe(100)
+  })
+
+  // S655: credit a payment set aside goes back through the payment's own
+  // failure or return event. Marking the row returned here would strand it.
+  it('a payment with account credit set aside on it is refused, and nothing changes', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    const { rows: [credit] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,100,100,'goodwill') RETURNING id`, [f.aLid, f.tenant1Id, f.lease1Id])
+    const { rows: [rem] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       payment_method, status)
+       VALUES ($1,$2,$3,900,900,0,'ach','processing') RETURNING id`, [f.tenant1Id, f.lease1Id, f.aLid])
+    await db.query(
+      `INSERT INTO credit_uses (tenant_credit_id, payment_id, remittance_id, lease_id, amount, billing_month, source, status)
+       VALUES ($1,$2,$3,$4,100,date_trunc('month', CURRENT_DATE)::date,'portal','held')`, [credit.id, pid, rem.id, f.lease1Id])
+    await db.query(`UPDATE payments SET status='processing', stripe_payment_intent_id='pi_held_return' WHERE id=$1`, [pid])
+    await db.query(`UPDATE tenant_remittances SET stripe_payment_intent_id='pi_held_return' WHERE id=$1`, [rem.id])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R10' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/credit set aside/)
+    const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [pid])
+    expect(p.status).toBe('processing')
+    const { rows: [t] } = await db.query<any>(`SELECT ach_suspended_at FROM tenants WHERE id=$1`, [f.tenant1Id])
+    expect(t.ach_suspended_at).toBeNull()
+  })
+
+  // Fix pass 2: two presses at the same moment are one return. The money was
+  // already safe (one reopen, one fee); now the NACHA log counts it once too
+  // and the second press is told plainly.
+  it('two presses of handle-return at the same moment: one 200, one 409, one NACHA log row, one reopen, one return fee', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_race')
+    const press = (id: string) => request(buildApp()).post(`/api/payments/${id}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 4 })
+    const answers = await Promise.all([press(d.rent), press(d.rent)])
+    expect(answers.map(a => a.status).sort()).toEqual([200, 409])
+    const lost = answers.find(a => a.status === 409)!
+    expect(lost.body.error).toBe('This return is already recorded. The amount is owed again on its reopened charge.')
+    const won = answers.find(a => a.status === 200)!
+    expect(won.body.data.reopened).toHaveLength(2)
+    const { rows: logs } = await db.query<any>(
+      `SELECT notes FROM ach_monitoring_log WHERE event_type = 'return_received'`)
+    expect(logs).toEqual([{ notes: 'manual_return:pi_ret_race' }])
+    const { rows: [n] } = await db.query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM payments WHERE reversal_id IS NOT NULL`)
+    expect(Number(n.n)).toBe(2)
+    const { rows: [fees] } = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM payments WHERE entry_description = 'RETURNFEE'`)
+    expect(Number(fees.n)).toBe(1)
+    const { rows: codes } = await db.query<any>(`SELECT return_code FROM payments WHERE id = ANY($1::uuid[])`, [[d.rent, d.util]])
+    expect(codes.map(r => r.return_code)).toEqual(['R01', 'R01'])
+  })
+
+  it('a press whose return another press recorded while it waited is refused, and writes no code and no NACHA log', async () => {
+    const f = await seed()
+    const d = await seedSettledDebit(f, 'pi_ret_waited')
+    // The other press's record landed after this press saw the rows settled.
+    await db.query(
+      `INSERT INTO payment_reversals (payment_id, reversal_type, reversed_amount, stripe_event_id, raw_event)
+       VALUES ($1,'ach_return',0,'manual_return:pi_ret_waited','{}'::jsonb)`, [d.util])
+    const res = await request(buildApp()).post(`/api/payments/${d.rent}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R10', returnFee: 4 })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('This return is already recorded. The amount is owed again on its reopened charge.')
+    const { rows } = await db.query<any>(
+      `SELECT status, return_code FROM payments WHERE id = ANY($1::uuid[])`, [[d.rent, d.util]])
+    expect(rows).toEqual([{ status: 'settled', return_code: null }, { status: 'settled', return_code: null }])
+    const { rows: logs } = await db.query<any>(`SELECT 1 FROM ach_monitoring_log`)
+    expect(logs).toHaveLength(0)
+    const { rows: [t] } = await db.query<any>(`SELECT ach_suspended_at FROM tenants WHERE id=$1`, [f.tenant1Id])
+    expect(t.ach_suspended_at).toBeNull()
+  })
+
+  it('finishing a half-recorded return names the charges it reopened and what is owed on them', async () => {
+    const f = await seed()
+    await seedSettledDebit(f, 'pi_ret_resume_named')
+    const { handlePaymentReversal } = await import('../services/paymentReversal')
+    await handlePaymentReversal({
+      paymentIntentId: 'pi_ret_resume_named', reversalType: 'ach_return', reversalFee: 0,
+      stripeEventId: 'manual_return:pi_ret_resume_named', rawEvent: {},
+    })
+    const { rows: [rent] } = await db.query<{ id: string }>(
+      `SELECT id FROM payments WHERE stripe_payment_intent_id = 'pi_ret_resume_named' AND type = 'rent' AND reversal_id IS NULL`)
+    const res = await request(buildApp()).post(`/api/payments/${rent.id}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 0 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.reopened).toHaveLength(2)
+    expect(res.body.data.owedAgain).toBe(1050)
+    expect(res.body.data.action).toMatch(/^Reopened — \$1050\.00 is owed again on 2 new charges\./)
+  })
+
+  it('a failed debit with no retry scheduled says no retry is scheduled, even for a retryable code', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    await db.query(`UPDATE payments SET status='failed', stripe_payment_intent_id='pi_ret_failed_final',
+                           retry_count = 2, next_retry_at = NULL WHERE id=$1`, [pid])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.action).toBe('The payment stays failed and is still owed on its own charge (no retry is scheduled).')
+    expect(res.body.data.action).not.toMatch(/still runs/)
+  })
+
+  it('a failed debit with a retry scheduled says the retry still runs', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    await db.query(`UPDATE payments SET status='failed', stripe_payment_intent_id='pi_ret_failed_next',
+                           next_retry_at = NOW() + INTERVAL '1 day' WHERE id=$1`, [pid])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.action).toBe('The payment stays failed and is still owed on its own charge (a scheduled retry still runs).')
+  })
+
+  it('a failed card payment is refused like a settled one: no bank code, no NACHA log, no bank-payment block', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    await db.query(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       payment_method, stripe_payment_intent_id, status)
+       VALUES ($1,$2,$3,1000,1000,0,'card','pi_ret_failed_card','failed')`, [f.tenant1Id, f.lease1Id, f.aLid])
+    await db.query(`UPDATE payments SET status='failed', stripe_payment_intent_id='pi_ret_failed_card' WHERE id=$1`, [pid])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R10' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe(
+      'This was a card payment. A card chargeback comes from Stripe as a dispute and is handled there, not recorded here.')
+    const { rows: [p] } = await db.query<any>(`SELECT return_code, zero_tolerance_flag FROM payments WHERE id=$1`, [pid])
+    expect(p).toEqual({ return_code: null, zero_tolerance_flag: false })
+    const { rows: logs } = await db.query<any>(`SELECT 1 FROM ach_monitoring_log`)
+    expect(logs).toHaveLength(0)
+    const { rows: [t] } = await db.query<any>(`SELECT ach_suspended_at FROM tenants WHERE id=$1`, [f.tenant1Id])
+    expect(t.ach_suspended_at).toBeNull()
+  })
+
+  it('a failed row with no bank debit behind it is refused: no code, no NACHA log, no bank-payment block', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    await db.query(`UPDATE payments SET status='failed' WHERE id=$1`, [pid])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R10' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('This charge was never sent to the bank, so there is no return to record. It is still owed as it is.')
+    const { rows: [p] } = await db.query<any>(`SELECT status, return_code, zero_tolerance_flag FROM payments WHERE id=$1`, [pid])
+    expect(p).toEqual({ status: 'failed', return_code: null, zero_tolerance_flag: false })
+    const { rows: logs } = await db.query<any>(`SELECT 1 FROM ach_monitoring_log`)
+    expect(logs).toHaveLength(0)
+    const { rows: [t] } = await db.query<any>(`SELECT ach_suspended_at FROM tenants WHERE id=$1`, [f.tenant1Id])
+    expect(t.ach_suspended_at).toBeNull()
+  })
+
+  it('a failed row recorded by hand is refused: no code, no NACHA log, no bank-payment block', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    await db.query(`UPDATE payments SET status='failed', manual_method='check', stripe_payment_intent_id='pi_ret_failed_check' WHERE id=$1`, [pid])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R10' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/recorded by hand/)
+    const { rows: [p] } = await db.query<any>(`SELECT return_code, zero_tolerance_flag FROM payments WHERE id=$1`, [pid])
+    expect(p).toEqual({ return_code: null, zero_tolerance_flag: false })
+    const { rows: logs } = await db.query<any>(`SELECT 1 FROM ach_monitoring_log`)
+    expect(logs).toHaveLength(0)
+    const { rows: [t] } = await db.query<any>(`SELECT ach_suspended_at FROM tenants WHERE id=$1`, [f.tenant1Id])
+    expect(t.ach_suspended_at).toBeNull()
+  })
+
+  it('a failed debit recorded twice is refused the second time, with one NACHA log row; its code is on every row of the debit', async () => {
+    const f = await seed()
+    const rent = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    const util = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id,
+                                     type: 'utility', amount: 50 })
+    await db.query(`UPDATE payments SET status='failed', stripe_payment_intent_id='pi_ret_failed_twice',
+                           next_retry_at = NOW() + INTERVAL '2 days' WHERE id = ANY($1::uuid[])`, [[rent, util]])
+    const first = await request(buildApp()).post(`/api/payments/${rent}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01' })
+    expect(first.status).toBe(200)
+    const again = await request(buildApp()).post(`/api/payments/${util}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01' })
+    expect(again.status).toBe(409)
+    expect(again.body.error).toBe('This return is already recorded on this failed payment. It is still owed on its own charge.')
+    // No receipt on this debit: the log falls back to its rows' money ($1,000 rent + $50 utility).
+    const { rows: logs } = await db.query<any>(
+      `SELECT notes, amount::float AS amount FROM ach_monitoring_log WHERE event_type = 'return_received'`)
+    expect(logs).toEqual([{ notes: 'manual_return:pi_ret_failed_twice:attempt0', amount: 1050 }])
+    const { rows: codes } = await db.query<any>(`SELECT return_code FROM payments WHERE id = ANY($1::uuid[])`, [[rent, util]])
+    expect(codes.map(r => r.return_code)).toEqual(['R01', 'R01'])
+  })
+
+  it('a retry of a failed debit that fails again is a new return and can be recorded', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    await db.query(`UPDATE payments SET status='failed', stripe_payment_intent_id='pi_ret_failed_retry',
+                           next_retry_at = NOW() + INTERVAL '2 days' WHERE id=$1`, [pid])
+    const first = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01' })
+    expect(first.status).toBe(200)
+    // The retry confirms the same intent again (achRetry), and the bank sends it back too.
+    await db.query(`UPDATE payments SET retry_count = 1, next_retry_at = NULL WHERE id=$1`, [pid])
+    const second = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01' })
+    expect(second.status).toBe(200)
+    const { rows: logs } = await db.query<any>(
+      `SELECT notes FROM ach_monitoring_log WHERE event_type = 'return_received' ORDER BY notes`)
+    expect(logs).toEqual([
+      { notes: 'manual_return:pi_ret_failed_retry:attempt0' },
+      { notes: 'manual_return:pi_ret_failed_retry:attempt1' },
+    ])
+  })
+
+  // A later bill paid with a bank debit and paid-ahead credit; the charge that
+  // funded the credit is disputed first, so the bill's row goes 'returned' for
+  // the credit part only. Its own bank money still stands, and the bank's
+  // return of that debit reopens it (paymentReversal reopens such a row).
+  it('a row returned only for its paid-ahead part reopens for its own money when its bank debit comes back', async () => {
+    const f = await seed()
+    const { createPaidAhead } = await import('../services/creditUse')
+    const { handlePaymentReversal } = await import('../services/paymentReversal')
+    // The funding card payment: nothing owed, all of it paid ahead.
+    const { rows: [fund] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       payment_method, stripe_payment_intent_id, status)
+       VALUES ($1,$2,$3,200,0,200,'card','pi_fund_for_return','settled') RETURNING id`, [f.tenant1Id, f.lease1Id, f.aLid])
+    const c = await db.connect()
+    let credit: string
+    try {
+      credit = await createPaidAhead(c as any, { leaseId: f.lease1Id, tenantId: f.tenant1Id, amount: 200, fundedBy: 'gam',
+                                                 receivedAt: new Date(), sourceRemittanceId: fund.id })
+    } finally { c.release() }
+    // The bill: $1,000 rent paid $800 by bank debit and $200 of the credit.
+    const rent = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id,
+                                     dueOffsetMonths: -1 })
+    const { rows: [rem] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       payment_method, stripe_payment_intent_id, status, gross_amount, processing_fee_amount)
+       VALUES ($1,$2,$3,800,800,0,'ach','pi_ret_after_spend','settled',806,6) RETURNING id`, [f.tenant1Id, f.lease1Id, f.aLid])
+    await db.query(`INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied) VALUES ($1,$2,800)`, [rem.id, rent])
+    await db.query(
+      `INSERT INTO credit_uses (prepaid_credit_id, payment_id, lease_id, remittance_id, amount, billing_month, source, status, applied_at)
+       VALUES ($1,$2,$3,$4,200,date_trunc('month', CURRENT_DATE - INTERVAL '1 month')::date,'portal','applied',NOW())`,
+      [credit!, rent, f.lease1Id, rem.id])
+    await db.query(
+      `UPDATE payments SET status='settled', settled_at=NOW(), platform_held=TRUE, stripe_payment_intent_id='pi_ret_after_spend'
+        WHERE id=$1`, [rent])
+    // The funding charge is disputed: the $200 spend is undone and the row goes 'returned' for it.
+    const rev = await handlePaymentReversal({ paymentIntentId: 'pi_fund_for_return', reversalType: 'card_dispute',
+                                              reversalFee: 0, stripeEventId: 'evt_fund_for_return', rawEvent: {} })
+    expect(rev.handled).toBe(true)
+    const { rows: [before] } = await db.query<any>(`SELECT status, return_code FROM payments WHERE id=$1`, [rent])
+    expect(before.status).toBe('returned')
+
+    const res = await request(buildApp()).post(`/api/payments/${rent}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 4 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.outcome).toBe('reopened')
+    expect(res.body.data.reopened).toEqual([expect.objectContaining({ paymentId: rent, owedAgain: 800 })])
+    expect(res.body.data.owedAgain).toBe(800)
+    const { rows: [after] } = await db.query<any>(`SELECT status, return_code FROM payments WHERE id=$1`, [rent])
+    expect(after).toEqual({ status: 'returned', return_code: 'R01' })
+    // Owed again once each: the $200 the dispute undid and the $800 the bank took back, plus the $4 fee.
+    const { rows: owed } = await db.query<any>(
+      `SELECT amount::float AS amount FROM payments WHERE tenant_id = $1 AND status = 'pending' ORDER BY amount`, [f.tenant1Id])
+    expect(owed.map(r => r.amount)).toEqual([4, 200, 800])
+    const { rows: logs } = await db.query<any>(`SELECT notes FROM ach_monitoring_log WHERE event_type = 'return_received'`)
+    expect(logs).toEqual([{ notes: 'manual_return:pi_ret_after_spend' }])
+  })
+
+  it('a row returned by another event with no reversed paid-ahead credit is refused as already recorded, and nothing is logged', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    // An earlier return of another kind: no reversed credit use, so no money of its own is left to reopen here.
+    await db.query(`UPDATE payments SET status='returned', return_code='card_dispute', stripe_payment_intent_id='pi_ret_other' WHERE id=$1`, [pid])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/handle-return`)
+      .set('Authorization', `Bearer ${f.tokenAdmin}`).send({ returnCode: 'R01', returnFee: 4 })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/already recorded/)
+    const { rows: logs } = await db.query<any>(`SELECT 1 FROM ach_monitoring_log`)
+    expect(logs).toHaveLength(0)
   })
 })
 
-// ─── POST /api/payments/:id/pay ─────────────────────────────
+// ─── POST /api/payments/pay-balance — the one way a tenant pays ─────────────
+// S655: the per-row POST /:id/pay is retired; every rule it carried (the fee on
+// top, the passthrough, the eviction hold, the platform charge) is checked here
+// on the whole-bill charge.
 
-describe('POST /api/payments/:id/pay', () => {
+describe('POST /api/payments/pay-balance', () => {
   async function setupTenantForPay(f: Fixture, opts: { connectReady?: boolean } = {}) {
     await db.query(`UPDATE tenants SET stripe_customer_id='cus_t1' WHERE id=$1`, [f.tenant1Id])
     if (opts.connectReady) {
@@ -459,7 +1068,6 @@ describe('POST /api/payments/:id/pay', () => {
                           connect_details_submitted=TRUE WHERE id=$1`, [f.aUid])
     }
   }
-
   async function setFeePayer(propId: string, ach: 'tenant' | 'landlord', card: 'tenant' | 'landlord') {
     await db.query(
       `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer)
@@ -467,225 +1075,340 @@ describe('POST /api/payments/:id/pay', () => {
        ON CONFLICT (property_id) DO UPDATE SET ach_fee_payer=$2, card_fee_payer=$3`,
       [propId, ach, card])
   }
+  const bill = (f: Fixture, amount = 1000) =>
+    seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount, leaseId: f.lease1Id })
+  const pay = (f: Fixture, body: any, token = f.tokenTenant1) =>
+    request(buildApp()).post('/api/payments/pay-balance').set('Authorization', `Bearer ${token}`).send(body)
+  const sent = () => (stripeConnect.createRentPlatformCharge as any).mock.calls.map((c: any[]) => c[0].amount)
 
-  // S562: the processing fee (mock computePlatformCut → $5) must be ADDED to
-  // the charge when the tenant is the fee payer, so GAM doesn't eat Stripe's
-  // cost. When the landlord pays it, the charge stays pure rent and the
-  // landlord absorbs the fee via the settle-time allocation split.
-  it('S562: tenant pays ACH fee → charge = rent + processing fee', async () => {
+  // Fix pass (Step 8): one key per press of Pay, and a card its bank wants confirmed.
+  it('pay-balance passes the press key to Stripe, scoped to the tenant and the lease', async () => {
     const f = await seed()
     await setupTenantForPay(f, { connectReady: true })
     await setFeePayer(f.aPropId, 'tenant', 'tenant')
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
-    expect(res.status).toBe(200)
-    expect(stripeConnect.createRentPlatformCharge).toHaveBeenCalledTimes(1)
-    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBe(1005)
+    await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach', idempotencyKey: 'press_route_0001' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].idempotencyKey)
+      .toBe(`gam_balance_${f.tenant1Id}_${f.lease1Id}_press_route_0001`)
   })
 
-  it('S562: landlord pays ACH fee → charge = rent only (landlord absorbs at settle)', async () => {
+  it('pay-balance refuses a malformed press key and charges nothing', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach', idempotencyKey: 'bad key!' })
+    expect(res.status).toBe(400)
+    expect(sent()).toEqual([])
+  })
+
+  // decisions.md #48.4: renamed — only a payer who cannot see the bank's
+  // window (no confirmOnScreen: the tenant assistant) gets the charge canceled;
+  // the pay screen confirms it on the spot (below).
+  it('pay-balance without the pay screen answers 402 in plain words for a card its bank wants confirmed, points to the Payments page, and the bill stays open', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    await setFeePayer(f.aPropId, 'tenant', 'tenant')
+    const pid = await bill(f)
+    ;(stripeConnect.createRentPlatformCharge as any).mockImplementationOnce(async () => ({ id: 'pi_route_3ds', status: 'requires_action' }))
+    paymentIntentsCancelMock.mockClear()
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card' })
+    expect(res.status).toBe(402)
+    expect(res.body.error).toMatch(/Nothing was charged/)
+    expect(res.body.error).toMatch(/Payments page, where you can confirm it/)
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_route_3ds')
+    const { rows: [p] } = await db.query<any>(`SELECT status, stripe_payment_intent_id FROM payments WHERE id=$1`, [pid])
+    expect(p).toEqual({ status: 'pending', stripe_payment_intent_id: null })
+  })
+
+  // S562: the processing fee (mock computePlatformCut → $5) is ADDED to the
+  // charge when the tenant is the fee payer, so GAM never eats Stripe's cost.
+  it('S562: tenant pays ACH fee → charge = bill + processing fee', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    await setFeePayer(f.aPropId, 'tenant', 'tenant')
+    await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(sent()).toEqual([1005])
+  })
+
+  it('S562: landlord pays ACH fee → charge = the bill only (landlord absorbs at settle)', async () => {
     const f = await seed()
     await setupTenantForPay(f, { connectReady: true })
     await setFeePayer(f.aPropId, 'landlord', 'tenant')
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
     expect(res.status).toBe(200)
-    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBe(1000)
+    expect(sent()).toEqual([1000])
   })
 
-  it('S562: card is always tenant-borne → charge = rent + fee even when ACH is landlord', async () => {
+  it('S562: card is always tenant-borne → charge = bill + fee even when ACH is landlord', async () => {
     const f = await seed()
     await setupTenantForPay(f, { connectReady: true })
     await setFeePayer(f.aPropId, 'landlord', 'tenant')
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'card' })
+    await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card' })
     expect(res.status).toBe(200)
-    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBe(1005)
+    expect(sent()).toEqual([1005])
   })
 
   it('S562: tenant-payer platform-fee passthrough is added to the charge', async () => {
     const f = await seed()
     await setupTenantForPay(f, { connectReady: true })
-    // Landlord pays the ACH processing fee → isolates the passthrough on top.
     await setFeePayer(f.aPropId, 'landlord', 'tenant')
     await db.query(
       `INSERT INTO platform_fee_accruals
          (landlord_id, property_id, accrual_month, rate_per_unit, min_per_connect_account, total_amount, payer)
        VALUES ($1, $2, CURRENT_DATE, 2, 10, 20, 'tenant')`,
       [f.aLid, f.aPropId])
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
     expect(res.status).toBe(200)
-    // 1000 rent + 0 processing (landlord pays) + 20 passthrough = 1020
-    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBe(1020)
+    expect(sent()).toEqual([1020])                       // 1000 + 0 processing + 20 passthrough
+  })
+
+  // Review fix pass 2: the charge adds an unpaid tenant-payer platform fee on
+  // top; the quote read back (the pay screen, the assistant) used to leave it
+  // out, so the tenant was charged more than they were told.
+  it('a tenant-payer platform fee is in the quote, and the quote total equals the charge', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    await setFeePayer(f.aPropId, 'tenant', 'tenant')
+    await db.query(
+      `INSERT INTO platform_fee_accruals
+         (landlord_id, property_id, accrual_month, rate_per_unit, min_per_connect_account, total_amount, payer)
+       VALUES ($1, $2, CURRENT_DATE, 2, 10, 20, 'tenant')`,
+      [f.aLid, f.aPropId])
+    await bill(f)
+    const quote = (body: any) => request(buildApp()).post('/api/payments/quote')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`).send(body)
+
+    const q = await quote({ method: 'ach' })
+    expect(q.status, JSON.stringify(q.body)).toBe(200)
+    expect(q.body.data).toMatchObject({ base: 1000, fee: 25, total: 1025 })   // mock $5 + $20
+    // Paying ahead moves the processing fee to the larger amount; the platform fee still rides on top.
+    const ahead = await quote({ method: 'ach', amount: 1200 })
+    expect(ahead.body.data).toMatchObject({ base: 1200, fee: 25, total: 1225 })
+
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(sent()).toEqual([q.body.data.total])
+    expect(res.body.data.chargeAmount).toBe(q.body.data.total)
+    // Charged once: the next quote no longer carries it.
+    const { rows: [acc] } = await db.query<any>(
+      `SELECT tenant_charge_id FROM platform_fee_accruals WHERE property_id = $1`, [f.aPropId])
+    expect(acc.tenant_charge_id).not.toBeNull()
+  })
+
+  it('a bill the credit pays whole is quoted with no fee of any kind, a waiting platform fee included', async () => {
+    const f = await seed()
+    await setFeePayer(f.aPropId, 'tenant', 'tenant')
+    await db.query(
+      `INSERT INTO platform_fee_accruals
+         (landlord_id, property_id, accrual_month, rate_per_unit, min_per_connect_account, total_amount, payer)
+       VALUES ($1, $2, CURRENT_DATE, 2, 10, 20, 'tenant')`,
+      [f.aLid, f.aPropId])
+    await bill(f, 300)
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,300,300,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+    const q = await request(buildApp()).post('/api/payments/quote')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`).send({ method: 'ach', useCredit: true })
+    expect(q.body.data).toMatchObject({ base: 0, fee: 0, total: 0, payWithCreditNothingCharged: true })
+    const res = await pay(f, { amount: 0, useCredit: true, expectedCredit: 300 })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data.chargeAmount).toBe(0)
   })
 
   it('non-tenant → 403', async () => {
     const f = await seed()
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' }, f.tokenLandlordA)
     expect(res.status).toBe(403)
   })
 
-  it('cross-tenant payment id → 403 "Not your payment"', async () => {
-    const f = await seed()
-    const otherTenantId = await (async () => {
-      const c = await db.connect()
-      try {
-        await c.query('BEGIN')
-        const id = await seedTenant(c)
-        await c.query('COMMIT')
-        return id
-      } finally { c.release() }
-    })()
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: otherTenantId,
-                                     landlordId: f.aLid })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
-    expect(res.status).toBe(403)
-  })
-
-  it('unknown payment id → 404', async () => {
-    const f = await seed()
-    const res = await request(buildApp()).post(`/api/payments/${randomUUID()}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
-    expect(res.status).toBe(404)
-  })
-
-  it('payment already settled → 409', async () => {
+  it('S511 #8b: eviction mode (payment_block) blocks the landlord-bound payment → 409, nothing charged', async () => {
     const f = await seed()
     await setupTenantForPay(f, { connectReady: true })
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id,
-                                     landlordId: f.aLid, status: 'settled' })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
-    expect(res.status).toBe(409)
-  })
-
-  it('S511 #8b: eviction mode (payment_block) blocks the landlord-bound payment → 409', async () => {
-    const f = await seed()
-    await setupTenantForPay(f, { connectReady: true })
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
+    await bill(f)
     await db.query(`UPDATE units SET payment_block=TRUE WHERE id=$1`, [f.aUnitId])
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
     expect(res.status).toBe(409)
     expect(res.body.message || res.body.error).toMatch(/eviction/i)
-    // No charge attempted.
-    expect(stripeConnect.createRentDestinationCharge).not.toHaveBeenCalled()
     expect(stripeConnect.createRentPlatformCharge).not.toHaveBeenCalled()
-  })
-
-  it('payment already processing (with PI id) → 409', async () => {
-    const f = await seed()
-    await setupTenantForPay(f, { connectReady: true })
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id,
-                                     landlordId: f.aLid, status: 'processing' })
-    await db.query(`UPDATE payments SET stripe_payment_intent_id='pi_x' WHERE id=$1`, [pid])
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
-    expect(res.status).toBe(409)
   })
 
   it('tenant without stripe_customer_id → 409 "complete ACH setup first"', async () => {
     const f = await seed()
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
     expect(res.status).toBe(409)
   })
 
-  it('S560: even a Connect-ready landlord → PLATFORM charge + held (no destination charge)', async () => {
-    // Money-flow rebuild Phase 1: rent always lands on the platform balance and
-    // is batched out on the weekly run — no destination charge, ever.
+  it('S560: a PLATFORM charge, held, rows processing until the webhook settles them', async () => {
     const f = await seed()
-    await setupTenantForPay(f, { connectReady: true })
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    await setupTenantForPay(f, { connectReady: false })
+    const pid = await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card' })
     expect(res.status).toBe(200)
-    expect(stripeConnect.createRentPlatformCharge).toHaveBeenCalledTimes(1)
     expect(stripeConnect.createRentDestinationCharge).not.toHaveBeenCalled()
     expect(res.body.data.paymentIntentId).toBe('pi_plat_mock')
     const { rows: [p] } = await db.query<any>(
       `SELECT status, stripe_payment_intent_id, platform_held FROM payments WHERE id=$1`, [pid])
-    expect(p.status).toBe('processing')
-    expect(p.stripe_payment_intent_id).toBe('pi_plat_mock')
-    expect(p.platform_held).toBe(true)
+    expect(p).toEqual({ status: 'processing', stripe_payment_intent_id: 'pi_plat_mock', platform_held: true })
   })
 
-  it('S113-PhaseA: landlord NOT Connect-ready → platform charge + platform_held=TRUE', async () => {
+  // Fix pass 1: replaces the retired /:id/pay test 'S113-PhaseA: landlord NOT
+  // Connect-ready → platform charge + platform_held=TRUE' on the whole-bill path.
+  it('a landlord not Connect-ready still gets a platform charge: rows processing and platform_held, and one platform_held_rent_charge notice to GAM', async () => {
+    const notify = createAdminNotification as unknown as ReturnType<typeof vi.fn>
+    notify.mockClear()
     const f = await seed()
     await setupTenantForPay(f, { connectReady: false })
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
-    expect(res.status).toBe(200)
+    const rent = await bill(f, 600)
+    const res = await pay(f, { amount: 600, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
     expect(stripeConnect.createRentPlatformCharge).toHaveBeenCalledTimes(1)
     expect(stripeConnect.createRentDestinationCharge).not.toHaveBeenCalled()
-    expect(res.body.data.paymentIntentId).toBe('pi_plat_mock')
-    const { rows: [p] } = await db.query<any>(
-      `SELECT platform_held FROM payments WHERE id=$1`, [pid])
-    expect(p.platform_held).toBe(true)
+    const { rows } = await db.query<any>(
+      `SELECT status, platform_held, stripe_payment_intent_id FROM payments WHERE id = $1`, [rent])
+    expect(rows).toEqual([{ status: 'processing', platform_held: true, stripe_payment_intent_id: 'pi_plat_mock' }])
+    const held = notify.mock.calls.filter((c: any[]) => c[0]?.category === 'platform_held_rent_charge')
+    expect(held).toHaveLength(1)
+    expect(held[0][0].context).toMatchObject({ remittance_id: res.body.data.remittanceId, landlord_id: f.aLid })
   })
 
-  it('card payment: status→processing (webhook settles + allocates, like ACH) — S560', async () => {
-    // Pre-S560 this stamped 'settled' at charge time, which made the webhook's
-    // settle path (gated on status != 'settled') skip allocation, supersedence,
-    // Flex crediting, and PM/manager transfers for every card payment.
+  it('a Connect-ready landlord raises no platform_held_rent_charge notice', async () => {
+    const notify = createAdminNotification as unknown as ReturnType<typeof vi.fn>
+    notify.mockClear()
     const f = await seed()
     await setupTenantForPay(f, { connectReady: true })
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'card' })
-    expect(res.status).toBe(200)
-    const { rows: [p] } = await db.query<any>(
-      `SELECT status FROM payments WHERE id=$1`, [pid])
-    expect(p.status).toBe('processing')
+    await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(notify.mock.calls.filter((c: any[]) => c[0]?.category === 'platform_held_rent_charge')).toHaveLength(0)
   })
 
   it('invalid paymentMethodType enum → 400', async () => {
     const f = await seed()
-    await setupTenantForPay(f, { connectReady: true })
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
-      .set('Authorization', `Bearer ${f.tokenTenant1}`)
-      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'crypto' })
+    await setupTenantForPay(f)
+    await bill(f)
+    const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'crypto' })
     expect(res.status).toBe(400)
+  })
+
+  // S655 (Nic, 10/2): the screen's "Use all $X — pay $Y" / "Save it for later — pay $Z".
+  it('carries the credit choice: Use all charges the bill less the credit; a moved figure is a 409', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    await bill(f)
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,300,300,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+    const noChoice = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(noChoice.status).toBe(422)
+    expect(noChoice.body.error).toMatch(/Use all \$300\.00.*Save it for later/)
+    const moved = await pay(f, { amount: 700, paymentMethodId: 'pm_x', paymentMethodType: 'ach', useCredit: true, expectedCredit: 250 })
+    expect(moved.status).toBe(409)
+    expect(moved.body.error).toMatch(/it's now \$300\.00/)
+    expect(sent()).toEqual([])
+    const used = await pay(f, { amount: 700, paymentMethodId: 'pm_x', paymentMethodType: 'ach', useCredit: true, expectedCredit: 300 })
+    expect(used.status).toBe(200)
+    expect(sent()).toEqual([705])
+    expect(used.body.data.creditUsed).toBe(300)
+  })
+
+  // Fix round 1 (shelved 8): an answer without the figure it answered could
+  // spend whatever the credit is by then — refused, nothing charged.
+  it('useCredit without expectedCredit is refused and nothing is charged', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    await bill(f)
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,300,300,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+    for (const useCredit of [true, false]) {
+      const res = await pay(f, { amount: useCredit ? 700 : 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach', useCredit })
+      expect(res.status).toBe(422)
+      expect(res.body.error).toMatch(/expectedCredit/)
+    }
+    expect(sent()).toEqual([])
+    expect((await db.query(`SELECT 1 FROM tenant_remittances`)).rowCount).toBe(0)
+  })
+
+  // Fix pass 2: "Pay with credit — nothing charged" never reads a method, so a
+  // tenant with no bank or card on file (no Stripe customer at all) may still
+  // pay a bill their credit covers in full — no placeholder method needed.
+  it('a credit-only pay-balance with no method succeeds, and nothing is charged', async () => {
+    const f = await seed()
+    await bill(f, 300)
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,300,300,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+    const res = await pay(f, { amount: 0, useCredit: true, expectedCredit: 300 })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data).toMatchObject({ status: 'settled', paidWithCredit: true, chargeAmount: 0, creditUsed: 300 })
+    expect(sent()).toEqual([])
+    const { rows } = await db.query<any>(`SELECT status FROM payments WHERE lease_id = $1`, [f.lease1Id])
+    expect(rows.map((r: any) => r.status)).toEqual(['settled'])
+  })
+
+  it('a payment with money in it and no method is refused plainly, and nothing is charged', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    await bill(f, 1000)
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,300,300,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+    for (const body of [
+      { amount: 700, useCredit: true, expectedCredit: 300 },
+      { amount: 1000, useCredit: false, expectedCredit: 300 },
+      { amount: 0, useCredit: true, expectedCredit: 300 },          // the credit does not cover the bill
+      { amount: 700, paymentMethodType: 'ach', useCredit: true, expectedCredit: 300 },
+    ]) {
+      const res = await pay(f, body)
+      expect(res.status, JSON.stringify(body)).toBe(422)
+      expect(res.body.error).toBe('Choose a saved bank account or card to pay with.')
+    }
+    expect(sent()).toEqual([])
+    expect((await db.query(`SELECT 1 FROM tenant_remittances`)).rowCount).toBe(0)
+    const { rows } = await db.query<any>(`SELECT status, stripe_payment_intent_id FROM payments WHERE lease_id = $1`, [f.lease1Id])
+    expect(rows).toEqual([{ status: 'pending', stripe_payment_intent_id: null }])
+    expect((await db.query(`SELECT 1 FROM credit_uses`)).rowCount).toBe(0)
   })
 })
 
-// ─── POST /api/payments/:id/record-manual (S562) ──────────────
+describe('POST /api/payments/:id/pay', () => {
+  it('POST /:id/pay is gone: 410 pointing to pay-balance, and nothing is charged', async () => {
+    const f = await seed()
+    await db.query(`UPDATE tenants SET stripe_customer_id='cus_t1' WHERE id=$1`, [f.tenant1Id])
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status).toBe(410)
+    expect(res.body.error).toMatch(/pay-balance/)
+    expect(stripeConnect.createRentPlatformCharge).not.toHaveBeenCalled()
+    const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [pid])
+    expect(p.status).toBe('pending')
+  })
+})
+
 describe('POST /api/payments/:id/record-manual', () => {
   // S652 (Nic): the credit ledger only heard about Stripe settlements. A check
   // recorded at the desk three weeks late is a late payment too — same event,
   // same tier, landlord-attested with the check number as evidence.
   it('a check recorded late writes the same ledger event a card payment would', async () => {
     const f = await seed()
-    // due a month ago, paid today: well past any grace
+    // due a month ago, paid today: well past any grace. The bill was written
+    // on its due date — a bill written late counts lateness from the day it
+    // was written (S655 credit-history rules), which is not this case.
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 700, dueOffsetMonths: -1 })
+    await db.query(`UPDATE payments SET created_at = due_date::timestamptz WHERE id = $1`, [pid])
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'check', reference: 'CHK-77' })
+      .send({ method: 'check', reference: 'CHK-77', amountTendered: 700 })
     expect(res.status).toBe(200)
     const { rows } = await db.query<any>(
       `SELECT ce.event_type, ce.attestation_source, ce.attestation_evidence, ce.event_data
@@ -703,7 +1426,7 @@ describe('POST /api/payments/:id/record-manual', () => {
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'check', reference: 'CHK-1234' })
+      .send({ method: 'check', reference: 'CHK-1234', amountTendered: 1000 })
     expect(res.status).toBe(200)
     // S654 API contract: the fee machinery is gone, so are its response fields.
     for (const k of ['feeWaived', 'feeAmount', 'feeBilledTo', 'feePaymentId', 'firstPayment', 'coveredByLandlord']) {
@@ -732,7 +1455,7 @@ describe('POST /api/payments/:id/record-manual', () => {
       const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, dueOffsetMonths: i + 1 })
       const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
         .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-        .send({ method })
+        .send({ method, amountTendered: 1000 })
       expect(res.status, method).toBe(200)
       expect(res.body.data.amountSettled, method).toBe(1000)
       const ledger = await db.query<any>(
@@ -753,7 +1476,7 @@ describe('POST /api/payments/:id/record-manual', () => {
     const f = await seed()
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, type: 'utility', amount: 50 })
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash', amountTendered: 50 })
     expect(res.status).toBe(200)
     const { rows: [p] } = await db.query<any>(`SELECT status, manual_method FROM payments WHERE id = $1`, [pid])
     expect(p).toEqual({ status: 'settled', manual_method: 'cash' })
@@ -763,7 +1486,7 @@ describe('POST /api/payments/:id/record-manual', () => {
     const f = await seed()
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, status: 'settled' })
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash', amountTendered: 1000 })
     expect(res.status).toBe(409)
   })
 
@@ -771,7 +1494,7 @@ describe('POST /api/payments/:id/record-manual', () => {
     const f = await seed()
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordB}`).send({ method: 'cash' })
+      .set('Authorization', `Bearer ${f.tokenLandlordB}`).send({ method: 'cash', amountTendered: 1000 })
     expect(res.status).toBe(403)
   })
 
@@ -780,7 +1503,7 @@ describe('POST /api/payments/:id/record-manual', () => {
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
     await db.query(`UPDATE units SET payment_block=TRUE WHERE id=$1`, [f.aUnitId])
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash', amountTendered: 1000 })
     expect(res.status).toBe(409)
     expect(res.body.message || res.body.error).toMatch(/eviction/i)
   })
@@ -789,8 +1512,19 @@ describe('POST /api/payments/:id/record-manual', () => {
     const f = await seed()
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'venmo' })
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'venmo', amountTendered: 1000 })
     expect(res.status).toBe(400)
+  })
+
+  it('record-manual requires the amount handed over', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'check', reference: '1042' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/amountTendered/)
+    const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [pid])
+    expect(p.status).toBe('pending')
   })
 })
 
@@ -874,11 +1608,20 @@ describe('POST /api/payments/:id/record-prior-arrangement', () => {
 })
 
 describe('GET /payments/balance-context — per-method price breakdown', () => {
+  // These figures are checked against the real fee formula, not the file's $5
+  // stand-in, because the charge prices with the same one.
+  beforeEach(() => {
+    (stripeConnect.computePlatformCut as ReturnType<typeof vi.fn>).mockImplementation((o: any) => processingFeeFor(o))
+  })
+  afterEach(() => {
+    (stripeConnect.computePlatformCut as ReturnType<typeof vi.fn>).mockImplementation(() => 5.00)
+  })
+
   it('prices bank, card and cash for the outstanding balance', async () => {
     const f = await seed()
-    const prior = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+    const prior = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450, leaseId: f.lease1Id })
     await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [prior])
-    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450, leaseId: f.lease1Id })
 
     const res = await request(buildApp()).get('/api/payments/balance-context')
       .set('Authorization', `Bearer ${f.tokenTenant1}`)
@@ -898,7 +1641,7 @@ describe('GET /payments/balance-context — per-method price breakdown', () => {
 
   it('cash is free on a first payment too, and no fee-payer fields are sent', async () => {
     const f = await seed()
-    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450, leaseId: f.lease1Id })
 
     const res = await request(buildApp()).get('/api/payments/balance-context')
       .set('Authorization', `Bearer ${f.tokenTenant1}`)
@@ -909,6 +1652,49 @@ describe('GET /payments/balance-context — per-method price breakdown', () => {
     for (const k of ['manualFeePayer', 'manualFirstFree', 'manualFeeCoveredByLandlord', 'manualFeeFirstFree', 'manualFeeAbsorbed']) {
       expect(lease, k).not.toHaveProperty(k)
     }
+  })
+
+  // Review fix pass 2: each way to pay is priced as /pay-balance charges it.
+  it('a bank fee the landlord covers shows as none, and a waiting tenant-payer platform fee is on top of bank and card, never cash', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer)
+       VALUES ($1,'landlord','tenant')
+       ON CONFLICT (property_id) DO UPDATE SET ach_fee_payer='landlord', card_fee_payer='tenant'`, [f.aPropId])
+    await db.query(
+      `INSERT INTO platform_fee_accruals
+         (landlord_id, property_id, accrual_month, rate_per_unit, min_per_connect_account, total_amount, payer)
+       VALUES ($1, $2, CURRENT_DATE, 2, 10, 20, 'tenant')`,
+      [f.aLid, f.aPropId])
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450, leaseId: f.lease1Id })
+
+    const res = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(res.status).toBe(200)
+    const by = Object.fromEntries(res.body.data.leases[0].methodCosts.map((m: any) => [m.method, m]))
+    expect(by.ach).toMatchObject({ fee: 20, total: 470 })
+    const card = processingFeeFor({ amount: 450, paymentMethod: 'card' })
+    expect(by.card.fee).toBeCloseTo(card + 20, 2)
+    expect(by.card.total).toBeCloseTo(450 + card + 20, 2)
+    expect(by.manual).toMatchObject({ fee: 0, total: 450 })
+
+    // The bank figure shown is the bank figure the quote reads back.
+    const q = await request(buildApp()).post('/api/payments/quote')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`).send({ method: 'ach' })
+    expect(q.body.data.total).toBe(by.ach.total)
+  })
+
+  it('when the credit pays the whole bill, the used-credit prices carry no fee', async () => {
+    const f = await seed()
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 300, leaseId: f.lease1Id })
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,300,300,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+    const res = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    const lease = res.body.data.leases[0]
+    expect(lease.payIfUsed).toBe(0)
+    for (const m of lease.methodCostsIfUsed) expect(m, m.method).toMatchObject({ fee: 0, total: 0 })
   })
 })
 
@@ -932,21 +1718,21 @@ describe('fee settings are per-property and cannot single out a tenant', () => {
 
     // A SECOND tenant, in a second unit, at the SAME property.
     const c = await db.connect()
-    let tenant2Id = '', tenant2UserId = '', unit2Id = ''
+    let tenant2Id = '', tenant2UserId = '', unit2Id = '', lease2 = ''
     try {
       await c.query('BEGIN')
       unit2Id = await seedUnit(c, { propertyId: f.aPropId, landlordId: f.aLid })
       tenant2Id = await seedTenant(c)
       const r = await c.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [tenant2Id])
       tenant2UserId = r.rows[0].user_id
-      const lease2 = await seedLease(c, { unitId: unit2Id, landlordId: f.aLid })
+      lease2 = await seedLease(c, { unitId: unit2Id, landlordId: f.aLid })
       await seedLeaseTenant(c, { leaseId: lease2, tenantId: tenant2Id, role: 'primary' })
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
     const tokenTenant2 = sign({ userId: tenant2UserId, role: 'tenant', email: 't2@t.dev', profileId: tenant2Id })
 
-    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
-    await seedPayment({ unitId: unit2Id,   tenantId: tenant2Id,   landlordId: f.aLid, amount: 450 })
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450, leaseId: f.lease1Id })
+    await seedPayment({ unitId: unit2Id,   tenantId: tenant2Id,   landlordId: f.aLid, amount: 450, leaseId: lease2 })
 
     const one = await request(buildApp()).get('/api/payments/balance-context')
       .set('Authorization', `Bearer ${f.tokenTenant1}`)
@@ -1139,7 +1925,7 @@ describe('S637 record-manual settles the whole balance from any charge', () => {
     const res = await request(buildApp())
       .post(`/api/payments/${id}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'cash' })
+      .send({ method: 'cash', amountTendered: 524 })
     expect(res.status).toBe(200)
     const { rows: [r] } = await db.query<any>(`SELECT status FROM payments WHERE id = $1`, [rentId])
     expect(r.status).toBe('settled')
@@ -1160,7 +1946,7 @@ describe('S637 record-manual settles the whole balance from any charge', () => {
     const res = await request(buildApp())
       .post(`/api/payments/${rentId}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'cash' })
+      .send({ method: 'cash', amountTendered: 524 })
     expect(res.status).toBe(200)
     const { rows } = await db.query<any>(
       `SELECT type, status FROM payments WHERE lease_id=$1 AND type IN ('rent','utility')`,
@@ -1193,7 +1979,7 @@ describe('S636 a manual payment settles the whole balance', () => {
     const res = await request(buildApp())
       .post(`/api/payments/${b.rentPaymentId}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'cash' })
+      .send({ method: 'cash', amountTendered: 1165 })
     expect(res.status).toBe(200)
 
     const { rows } = await db.query<{ status: string; type: string }>(
@@ -1209,7 +1995,7 @@ describe('S636 a manual payment settles the whole balance', () => {
     await request(buildApp())
       .post(`/api/payments/${b.rentPaymentId}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'cash' }).expect(200)
+      .send({ method: 'cash', amountTendered: 1000 }).expect(200)
 
     const { rows } = await db.query<{ status: string }>(
       `SELECT status FROM payments
@@ -1267,7 +2053,7 @@ describe('S637 manual cash overpayment', () => {
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
       .send({ method: 'cash', amountTendered: 500 })      // no surplusHandling
     expect(res.status).toBe(422)
-    expect(res.body.error).toMatch(/handed back or kept as credit/i)
+    expect(res.body.error).toMatch(/Give \$40\.00 change.*Keep \$40\.00 as credit/i)
     const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [pid])
     expect(p.status).toBe('pending')
     expect(Number(await creditsFor(f.lease1Id))).toBe(0)
@@ -1331,12 +2117,19 @@ describe('S637 manual cash overpayment', () => {
   // S637 (Nic): "A check or money order, it is possible that they wrote it for
   // more than they owe, which is my exact situation right now — a $920 check
   // written on a $460 rent." Two months paid ahead, on paper.
-  it('a check written over the balance banks the remainder', async () => {
+  it('a check written over the balance banks the remainder, once the written amount is confirmed', async () => {
     const f = await seed()
     const pid = await openRent(f, 460)
-    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+    // 10/3 (Kim Harland's $0.55): the desk first confirms what is written on it.
+    const ask = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
       .send({ method: 'check', reference: '1042', amountTendered: 920, surplusHandling: 'credit' })
+    expect(ask.status).toBe(422)
+    expect(ask.body.error).toMatch(/You typed \$920\.00 against \$460\.00 owed — is the check really \$920\.00\?/)
+    expect(Number(await creditsFor(f.lease1Id))).toBe(0)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'check', reference: '1042', amountTendered: 920, surplusHandling: 'credit', confirmWrittenAmount: true })
     expect(res.status).toBe(200)
     expect(res.body.data.amountSettled).toBe(460)
     expect(res.body.data.surplus).toBe(460)          // exactly next month
@@ -1346,17 +2139,37 @@ describe('S637 manual cash overpayment', () => {
     expect(p.notes).toMatch(/1042/)
   })
 
-  // The bank-deposit match path never knows a tendered figure, and neither did
-  // any caller before this existed. Both must behave exactly as they did.
-  it('omitting the tendered amount changes nothing', async () => {
+  // S655: the paid-ahead money is the landlord's (they hold the check), dated
+  // the day it was taken, and tied to the desk receipt.
+  it('the credit kept from cash is landlord-held paid-ahead money linked to the receipt', async () => {
     const f = await seed()
     const pid = await openRent(f, 460)
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'check', reference: '1042' })
+      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'credit' })
     expect(res.status).toBe(200)
-    expect(res.body.data.surplus).toBe(0)
-    expect(Number(await creditsFor(f.lease1Id))).toBe(0)
+    const { rows: [c] } = await db.query<any>(
+      `SELECT funded_by, received_at IS NOT NULL AS dated, source_remittance_id FROM lease_prepaid_credits WHERE id=$1`,
+      [res.body.data.creditId])
+    expect(c).toEqual({ funded_by: 'landlord', dated: true, source_remittance_id: res.body.data.receiptId })
+    const { rows: [r] } = await db.query<any>(
+      `SELECT amount::float AS amount, applied_amount::float AS applied, unapplied_amount::float AS unapplied,
+              gross_amount, payment_method FROM tenant_remittances WHERE id=$1`, [res.body.data.receiptId])
+    expect(r).toEqual({ amount: 500, applied: 460, unapplied: 40, gross_amount: null, payment_method: 'cash' })
+  })
+
+  it('change handed back is not in the drawer: the receipt is what was kept', async () => {
+    const f = await seed()
+    const pid = await openRent(f, 460)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'change' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.changeGiven).toBe(40)
+    const { rows: [r] } = await db.query<any>(
+      `SELECT amount::float AS amount, notes FROM tenant_remittances WHERE id=$1`, [res.body.data.receiptId])
+    expect(r.amount).toBe(460)
+    expect(r.notes).toMatch(/Handed over \$500\.00; \$40\.00 given back as change/)
   })
 })
 
@@ -1463,9 +2276,16 @@ describe('S638 a credit reduces what the desk collects', () => {
       `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
        VALUES ($1,$2,$3,450,450,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
 
-    const res = await request(buildApp()).post(`/api/payments/${rent.id}/record-manual`)
+    // S655 (Nic, 10/2): the desk is ASKED — "credit available $450" — and
+    // must answer Use or Save; the credit is never netted by itself (bug 2).
+    const unasked = await request(buildApp()).post(`/api/payments/${rent.id}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
       .send({ method: 'cash', amountTendered: 450 })
+    expect(unasked.status).toBe(422)
+    expect(unasked.body.error).toMatch(/Use \$450\.00 or Save/)
+    const res = await request(buildApp()).post(`/api/payments/${rent.id}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 450, creditToUse: 450 })
     expect(res.status).toBe(200)
     expect(res.body.data.amountSettled).toBe(450)   // 900 less the 450 credit
     expect(res.body.data.creditUsed).toBe(450)
@@ -1491,7 +2311,7 @@ describe('S638 a credit reduces what the desk collects', () => {
 
     const res = await request(buildApp()).post(`/api/payments/${rent.id}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'cash', amountTendered: 400 })   // net owed is 450
+      .send({ method: 'cash', amountTendered: 400, creditToUse: 450 })   // net owed is 450
     expect(res.status).toBe(422)
     const { rows: [p] } = await db.query<{ status: string }>(
       `SELECT status FROM payments WHERE id=$1`, [rent.id])
@@ -1611,5 +2431,1490 @@ describe('S654 POST /post-payment — receivedAt keeps its calendar day', () => 
          FROM tenant_remittances WHERE id = $1`, [res.body.data.remittanceId])
     expect(r.phx).toBe('2026-09-09')
     expect(r.utc).toBe('2026-09-09 12:00')
+  })
+})
+
+// ─── S655 (money plan Step 8): the full balance, credit beside it ────────────
+describe('S655 the credit prompt on the tenant and desk screens', () => {
+  async function seedBill(f: Fixture) {
+    const rent = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 900, leaseId: f.lease1Id })
+    // GAM's own charge on the same bill (an ACH return fee) — paid online, never by credit.
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date, revenue_owner)
+       VALUES ($1,$2,$3,$4,'fee',15,'pending','RETURNFEE',CURRENT_DATE,'gam')`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    // $100 the landlord gave and $50 paid ahead at the desk.
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,100,100,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by, received_at)
+       VALUES ($1,$2,50,50,'landlord',NOW())`, [f.lease1Id, f.tenant1Id])
+    return rent
+  }
+
+  it('balance-context shows the full balance, usable credit including paid-ahead, and GAM charges separately', async () => {
+    const f = await seed()
+    await seedBill(f)
+    const res = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(res.status).toBe(200)
+    const lease = res.body.data.leases.find((l: any) => l.leaseId === f.lease1Id)
+    expect(lease.outstanding).toBe(915)                 // the whole bill, nothing netted
+    expect(lease.usableCredit).toBe(150)                // $100 given + $50 paid ahead
+    expect(lease.expectedCredit).toBe(150)
+    expect(lease.payIfSaved).toBe(915)
+    expect(lease.payIfUsed).toBe(765)
+    expect(lease.coversWholeBill).toBe(false)
+    expect(lease.gamCharges).toBe(15)
+    expect(lease.creditOnFile).toBe(150)
+  })
+
+  it('the tenant quote prices both answers and says what to send back', async () => {
+    const f = await seed()
+    await seedBill(f)
+    const save = await request(buildApp()).post('/api/payments/quote')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`).send({ method: 'ach' })
+    expect(save.status).toBe(200)
+    expect(save.body.data).toMatchObject({ outstanding: 915, usableCredit: 150, expectedCredit: 150, base: 915, useCredit: false })
+    const use = await request(buildApp()).post('/api/payments/quote')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`).send({ method: 'ach', useCredit: true })
+    expect(use.body.data).toMatchObject({ base: 765, creditUsed: 150, useCredit: true })
+    expect(use.body.data.total).toBe(770)               // the mock's $5 fee, on the money only
+  })
+
+  it('record-manual requires a credit choice when credit is usable', async () => {
+    const f = await seed()
+    const rent = await seedBill(f)
+    const res = await request(buildApp()).post(`/api/payments/${rent}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 900 })
+    expect(res.status).toBe(422)
+    expect(res.body.error).toMatch(/\$150\.00 of credit.*Use \$150\.00 or Save/)
+    const moved = await request(buildApp()).post(`/api/payments/${rent}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 800, creditToUse: 100 })
+    expect(moved.status).toBe(409)
+    expect(moved.body.error).toMatch(/now \$150\.00/)
+    const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [rent])
+    expect(p.status).toBe('pending')
+    const saved = await request(buildApp()).post(`/api/payments/${rent}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 900, creditToUse: 0 })
+    expect(saved.status).toBe(200)
+    expect(saved.body.data.creditUsed).toBe(0)
+  })
+
+  it('the desk window quote: the bill the desk takes, credit beside it, GAM charges as a Pay online line', async () => {
+    const f = await seed()
+    const rent = await seedBill(f)
+    const res = await request(buildApp()).get(`/api/payments/${rent}/record-manual/quote`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toMatchObject({
+      currentTotal: 900, creditAvailable: 150, owedIfUsed: 750, owedIfSaved: 900,
+      payOnlineTotal: 15, fullBalance: 915, oldBalanceTotal: 0,
+    })
+    expect(res.body.data.payOnline).toHaveLength(1)
+    expect(res.body.data.creditSetAsideElsewhere).toBe(0)
+    expect(res.body.data.surplusOptions.map((o: any) => o.value)).toEqual(['change', 'credit'])
+    const other = await request(buildApp()).get(`/api/payments/${rent}/record-manual/quote`)
+      .set('Authorization', `Bearer ${f.tokenLandlordB}`)
+    expect(other.status).toBe(403)
+  })
+
+  it('GET / shows the credit on file beside each charge, never netted', async () => {
+    const f = await seed()
+    const rent = await seedBill(f)
+    const res = await request(buildApp()).get('/api/payments?status=pending')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    const row = res.body.data.find((p: any) => p.id === rent)
+    expect(Number(row.amount)).toBe(900)
+    expect(Number(row.credit_on_file)).toBe(150)
+    expect(row).not.toHaveProperty('credit_pool')
+  })
+
+  // Fix round 2: paid-ahead money a dispute or return of its own Stripe
+  // funding still claims is not the tenant's — not on file on the landlord's
+  // list, not on the tenant's "paid ahead" figure (creditUse.usablePaidAheadSql).
+  it('GET / and the tenant\'s paid-ahead figure leave out paid-ahead money a dispute of its own funding claims', async () => {
+    const f = await seed()
+    const rent = await seedBill(f)                               // $100 given + $50 paid ahead at the desk
+    const { rows: [rem] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, gross_amount, applied_amount, unapplied_amount,
+                                       payment_method, stripe_payment_intent_id, status)
+       VALUES ($1,$2,$3,300,300,100,200,'card','pi_disputed_funding','settled') RETURNING id`,
+      [f.tenant1Id, f.lease1Id, f.aLid])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by, received_at, source_remittance_id)
+       VALUES ($1,$2,200,200,'gam',NOW(),$3)`, [f.lease1Id, f.tenant1Id, rem.id])
+    const onFile = async () => {
+      const res = await request(buildApp()).get('/api/payments?status=pending').set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      return Number(res.body.data.find((p: any) => p.id === rent).credit_on_file)
+    }
+    const paidAhead = async () => {
+      const res = await request(buildApp()).get('/api/payments/remittances').set('Authorization', `Bearer ${f.tokenTenant1}`)
+      expect(res.status).toBe(200)
+      return res.body.data.prepaidRemaining
+    }
+    expect([await onFile(), await paidAhead()]).toEqual([350, 250])
+    // The whole $300 card payment is disputed: none of the $200 it banked is theirs.
+    const { rows: [d] } = await db.query<{ id: string }>(
+      `INSERT INTO connect_disputes (stripe_dispute_id, stripe_charge_id, stripe_payment_intent_id, amount, status)
+       VALUES ('dp_fund','ch_fund','pi_disputed_funding',300,'needs_response') RETURNING id`)
+    expect([await onFile(), await paidAhead()]).toEqual([150, 50])
+    // $120 of it disputed: $80 is still theirs.
+    await db.query(`UPDATE connect_disputes SET amount = 120 WHERE id = $1`, [d.id])
+    expect([await onFile(), await paidAhead()]).toEqual([230, 130])
+    // A dispute GAM won takes nothing.
+    await db.query(`UPDATE connect_disputes SET status = 'won' WHERE id = $1`, [d.id])
+    expect([await onFile(), await paidAhead()]).toEqual([350, 250])
+  })
+
+  // Fix round 1: a bank pull that bounced paid nothing. A row it was on that
+  // account credit paid later is not "Paid by Bank (ACH)".
+  it('GET / never names a failed pull as what paid a row', async () => {
+    const f = await seed()
+    const byCredit = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id, status: 'settled' })
+    const byBank = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id, status: 'settled' })
+    await db.query(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       payment_method, stripe_payment_intent_id, status)
+       VALUES ($1,$2,$3,1000,1000,0,'ach','pi_bounced','failed'), ($1,$2,$3,1000,1000,0,'ach','pi_cleared','settled')`,
+      [f.tenant1Id, f.lease1Id, f.aLid])
+    await db.query(`UPDATE payments SET stripe_payment_intent_id = 'pi_bounced' WHERE id = $1`, [byCredit])
+    await db.query(`UPDATE payments SET stripe_payment_intent_id = 'pi_cleared' WHERE id = $1`, [byBank])
+    const res = await request(buildApp()).get('/api/payments?status=settled').set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    const paidBy = (id: string) => res.body.data.find((p: any) => p.id === id)?.paid_by
+    expect(paidBy(byCredit)).toBeNull()
+    expect(paidBy(byBank)).toBe('ach')
+  })
+})
+
+// ─── S655 (10/3): staff see and take money only at their own properties ──────
+describe('S655 GET /payments and the desk follow a staffer\'s property scope', () => {
+  async function secondProperty(f: Fixture) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const propId = await seedProperty(c, { landlordId: f.aLid, ownerUserId: f.aUid, managedByUserId: f.aUid })
+      const unitId = await seedUnit(c, { propertyId: propId, landlordId: f.aLid })
+      await c.query('COMMIT')
+      return { propId, unitId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+  const ids = (res: any) => (res.body.data as any[]).map(p => p.id).sort()
+
+  it('a one-property staffer sees only that property\'s rows; an all-properties staffer and the owner see all', async () => {
+    const f = await seed()
+    const other = await secondProperty(f)
+    const here = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
+    const there = await seedPayment({ unitId: other.unitId, tenantId: f.tenant1Id, landlordId: f.aLid })
+    const perms = { 'payments.view_all': true }
+    const oneProperty = await staffToken(f, 'onsite_manager', { propertyIds: [f.aPropId], perms })
+    const everyProperty = await staffToken(f, 'property_manager', { all: true, perms })
+    const noScope = sign({ userId: randomUUID(), role: 'onsite_manager', email: 'x@t.dev', profileId: null,
+                           landlordId: f.aLid, permissions: perms })
+
+    const one = await request(buildApp()).get('/api/payments').set('Authorization', `Bearer ${oneProperty}`)
+    expect(one.status).toBe(200)
+    expect(ids(one)).toEqual([here])
+    expect(one.body.total).toBe(1)
+    const all = await request(buildApp()).get('/api/payments').set('Authorization', `Bearer ${everyProperty}`)
+    expect(ids(all)).toEqual([here, there].sort())
+    const owner = await request(buildApp()).get('/api/payments').set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(ids(owner)).toEqual([here, there].sort())
+    // A staffer with no scope row is assigned nowhere: nothing comes back.
+    const none = await request(buildApp()).get('/api/payments').set('Authorization', `Bearer ${noScope}`)
+    expect(none.body.data).toEqual([])
+  })
+
+  it('a one-property staffer cannot open the desk window or record a payment on another property\'s charge', async () => {
+    const f = await seed()
+    const other = await secondProperty(f)
+    const there = await seedPayment({ unitId: other.unitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 500 })
+    const desk = await staffToken(f, 'onsite_manager', { propertyIds: [f.aPropId], perms: { take_payment: true } })
+    const quote = await request(buildApp()).get(`/api/payments/${there}/record-manual/quote`).set('Authorization', `Bearer ${desk}`)
+    expect(quote.status).toBe(403)
+    const rec = await request(buildApp()).post(`/api/payments/${there}/record-manual`)
+      .set('Authorization', `Bearer ${desk}`).send({ method: 'cash', amountTendered: 500 })
+    expect(rec.status).toBe(403)
+    expect(rec.body.error).toMatch(/not assigned/)
+    const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [there])
+    expect(p.status).toBe('pending')
+    // Their own property: recorded.
+    const here = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 500, leaseId: f.lease1Id })
+    const ok = await request(buildApp()).post(`/api/payments/${here}/record-manual`)
+      .set('Authorization', `Bearer ${desk}`).send({ method: 'cash', amountTendered: 1000 })
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200)
+  })
+})
+
+// ─── S655 (10/3): FlexPay never appears in the landlord portal ───────────────
+describe('S655 GET /payments never shows FlexPay to the landlord or their staff', () => {
+  async function flexpayMonth(f: Fixture) {
+    const { rows: [adv] } = await db.query<{ id: string }>(
+      `INSERT INTO flexpay_advances (cycle_month, tenant_id, landlord_id, unit_id, lease_id, rent_amount, tenant_fee_amount, pull_day)
+       VALUES (date_trunc('month', CURRENT_DATE)::date, $1, $2, $3, $4, 1000, 25, 10) RETURNING id`,
+      [f.tenant1Id, f.aLid, f.aUnitId, f.lease1Id])
+    // The bill line FlexPay covered: the landlord's rent, paid on time.
+    const { rows: [rent] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description,
+                             due_date, settled_at, platform_held, flexpay_advance_id, notes)
+       VALUES ($1,$2,$3,$4,'rent',1000,'settled','RENT',CURRENT_DATE,NOW(),TRUE,$5,'Paid on time') RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id, adv.id])
+    // GAM's pull from the tenant: GAM's own row.
+    const { rows: [pull] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description,
+                             due_date, revenue_owner, flexpay_advance_id)
+       VALUES ($1,$2,$3,$4,'fee',1025,'pending','FLEXPAY',CURRENT_DATE + 10,'gam',$5) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id, adv.id])
+    return { rent: rent.id, pull: pull.id }
+  }
+
+  it('the landlord and a staffer see the covered rent as paid, never the pull or the advance', async () => {
+    const f = await seed()
+    const m = await flexpayMonth(f)
+    const staff = await staffToken(f, 'property_manager', { all: true, perms: { 'payments.view_all': true } })
+    for (const token of [f.tokenLandlordA, staff]) {
+      const res = await request(buildApp()).get('/api/payments?limit=1000').set('Authorization', `Bearer ${token}`)
+      expect(res.status).toBe(200)
+      const rows = res.body.data as any[]
+      expect(rows.map(r => r.id)).toEqual([m.rent])
+      expect(res.body.total).toBe(1)
+      expect(rows[0]).not.toHaveProperty('flexpay_advance_id')
+      expect(JSON.stringify(rows)).not.toMatch(/flexpay/i)
+    }
+  })
+
+  it('the tenant and GAM still see the FlexPay pull', async () => {
+    const f = await seed()
+    const m = await flexpayMonth(f)
+    const tenant = await request(buildApp()).get('/api/payments?limit=1000').set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect((tenant.body.data as any[]).map(r => r.id).sort()).toEqual([m.rent, m.pull].sort())
+    const admin = await request(buildApp()).get('/api/payments?limit=1000').set('Authorization', `Bearer ${f.tokenAdmin}`)
+    const pull = (admin.body.data as any[]).find(r => r.id === m.pull)
+    expect(pull.flexpay_advance_id).toBeTruthy()
+  })
+})
+
+// ─── S655: prior arrangement takes the household lock and replaces a retry ──
+describe('S655 POST /:id/record-prior-arrangement', () => {
+  it('a bank retry scheduled on the charge is replaced: its held credit given back, its pull canceled', async () => {
+    const f = await seed()
+    await db.query(`UPDATE landlords SET reconciliation_until = NOW() + INTERVAL '10 days' WHERE id = $1`, [f.aLid])
+    const rent = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id, amount: 1000 })
+    const { rows: [credit] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,100,100,'goodwill') RETURNING id`, [f.aLid, f.tenant1Id, f.lease1Id])
+    const { rows: [rem] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       payment_method, stripe_payment_intent_id, status)
+       VALUES ($1,$2,$3,900,900,0,'ach','pi_prior_retry','processing') RETURNING id`, [f.tenant1Id, f.lease1Id, f.aLid])
+    await db.query(
+      `UPDATE payments SET status='failed', stripe_payment_intent_id='pi_prior_retry', next_retry_at = NOW() + INTERVAL '2 days'
+        WHERE id=$1`, [rent])
+    await db.query(
+      `INSERT INTO credit_uses (tenant_credit_id, payment_id, remittance_id, lease_id, amount, billing_month, source, status)
+       VALUES ($1,$2,$3,$4,100,date_trunc('month', CURRENT_DATE)::date,'portal','held')`, [credit.id, rent, rem.id, f.lease1Id])
+
+    const res = await request(buildApp()).post(`/api/payments/${rent}/record-prior-arrangement`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({})
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const { rows: [p] } = await db.query<any>(`SELECT status, next_retry_at FROM payments WHERE id=$1`, [rent])
+    expect(p).toEqual({ status: 'settled', next_retry_at: null })
+    const { rows: [u] } = await db.query<any>(`SELECT status, release_reason FROM credit_uses`)
+    expect(u).toEqual({ status: 'released', release_reason: 'superseded' })
+    const { rows: [c] } = await db.query<any>(`SELECT amount_remaining::float AS r FROM tenant_credits WHERE id=$1`, [credit.id])
+    expect(c.r).toBe(100)
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_prior_retry')
+  })
+
+  it('a charge with a payment already on its way is refused', async () => {
+    const f = await seed()
+    await db.query(`UPDATE landlords SET reconciliation_until = NOW() + INTERVAL '10 days' WHERE id = $1`, [f.aLid])
+    const rent = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, leaseId: f.lease1Id })
+    await db.query(`UPDATE payments SET stripe_payment_intent_id='pi_on_its_way' WHERE id=$1`, [rent])
+    const res = await request(buildApp()).post(`/api/payments/${rent}/record-prior-arrangement`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({})
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/on its way/)
+  })
+})
+
+// ─── 10/4: credit another bank payment holds, and "Pay all" with "Use all" ──
+// The renewal case: an $80 move-in special moved to the renewal while the old
+// lease's September bank payment still held $50 of it; that payment bounced
+// and its retry is scheduled, still holding the $50. October's $480 is open
+// on the renewal.
+describe('credit another bank payment holds, and Pay all (10/4)', () => {
+  const WAITING_50 = '$50.00 of your credit is set aside for an earlier bank payment that has not cleared yet. If that payment clears, the credit goes toward that earlier bill. If it does not, the credit comes back to your account.'
+
+  async function movedCreditHeldByOldRetry(f: Fixture) {
+    const { holdCredit } = await import('../services/creditUse')
+    const oldLeaseId = (await db.query<{ id: string }>(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date)
+       VALUES ($1,$2,460,'fixed_term','expired','2025-10-01','2026-09-30') RETURNING id`, [f.aUnitId, f.aLid])).rows[0].id
+    await db.query(`INSERT INTO lease_tenants (lease_id, tenant_id, role) VALUES ($1,$2,'primary')`, [oldLeaseId, f.tenant1Id])
+    await db.query(`UPDATE leases SET supersedes_lease_id = $2, rent_amount = 480 WHERE id = $1`, [f.lease1Id, oldLeaseId])
+    const special = (await db.query<{ id: string }>(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,80,80,'goodwill') RETURNING id`, [f.aLid, f.tenant1Id, oldLeaseId])).rows[0].id
+    const sept = (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, stripe_payment_intent_id)
+       VALUES ($1,$2,$3,$4,'rent',460,'processing','2026-09-01','RENT','pi_sept_retry') RETURNING id`,
+      [f.aUnitId, oldLeaseId, f.tenant1Id, f.aLid])).rows[0].id
+    const rem = (await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       status, payment_method, stripe_payment_intent_id, processing_fee_amount)
+       VALUES ($1,$2,$3,410,410,0,'processing','ach','pi_sept_retry',0) RETURNING id`,
+      [f.tenant1Id, oldLeaseId, f.aLid])).rows[0].id
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      await holdCredit(c, [{ creditKind: 'issued', creditId: special, paymentId: sept, leaseId: oldLeaseId, amount: 50, billingMonth: '2026-09-01' }],
+        { remittanceId: rem, source: 'portal' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    // The hand-off moves the credit to the renewal; the bank bounces September and a retry is scheduled.
+    await db.query(`UPDATE tenant_credits SET lease_id = $2 WHERE id = $1`, [special, f.lease1Id])
+    await db.query(`UPDATE payments SET status = 'failed', next_retry_at = now() + interval '3 days' WHERE id = $1`, [sept])
+    const oct = (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',480,'pending','2026-10-01','RENT') RETURNING id`,
+      [f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid])).rows[0].id
+    await db.query(`UPDATE tenants SET stripe_customer_id = 'cus_t1' WHERE id = $1`, [f.tenant1Id])
+    return { oldLeaseId, special, sept, oct }
+  }
+  const context = (f: Fixture) => request(buildApp()).get('/api/payments/balance-context').set('Authorization', `Bearer ${f.tokenTenant1}`)
+  const quote = (f: Fixture, body: any) => request(buildApp()).post('/api/payments/quote').set('Authorization', `Bearer ${f.tokenTenant1}`).send(body)
+
+  it('the pay screen says, in plain words, why only part of the credit on file can pay the renewal', async () => {
+    const f = await seed()
+    const { oldLeaseId } = await movedCreditHeldByOldRetry(f)
+    const res = await context(f)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const renewal = res.body.data.leases.find((l: any) => l.leaseId === f.lease1Id)
+    expect(renewal.creditOnFile).toBe(80)
+    expect(renewal.usableCredit).toBe(30)
+    expect(renewal.payIfUsed).toBe(450)
+    expect(renewal.creditWaiting).toBe(50)
+    expect(renewal.creditWaitingNote).toBe(WAITING_50)
+    expect(renewal.creditWaitingHeldBy).toEqual([oldLeaseId])
+    const old = res.body.data.leases.find((l: any) => l.leaseId === oldLeaseId)
+    expect(old.usableCredit).toBe(0)
+    expect(old.creditWaiting).toBe(0)
+    expect(old.creditWaitingNote).toBeNull()
+  })
+
+  it('the tenant quote carries the same waiting sentence for the agent and the pay screen', async () => {
+    const f = await seed()
+    await movedCreditHeldByOldRetry(f)
+    const q = await quote(f, { method: 'ach', leaseId: f.lease1Id, useCredit: true })
+    expect(q.status, JSON.stringify(q.body)).toBe(200)
+    expect(q.body.data).toMatchObject({ usableCredit: 30, base: 450, creditWaiting: 50, creditWaitingNote: WAITING_50 })
+  })
+
+  it('Pay all figures: the old lease first (its retry is replaced), then the renewal with the $80 the replaced retry frees', async () => {
+    const f = await seed()
+    const { oldLeaseId } = await movedCreditHeldByOldRetry(f)
+    const res = await context(f)
+    const renewal = res.body.data.leases.find((l: any) => l.leaseId === f.lease1Id)
+    const old = res.body.data.leases.find((l: any) => l.leaseId === oldLeaseId)
+    expect(old.payAll).toMatchObject({ order: [oldLeaseId, f.lease1Id], usableCredit: 0, payIfUsed: 460 })
+    expect(renewal.payAll).toMatchObject({ order: [oldLeaseId, f.lease1Id], usableCredit: 80, expectedCredit: 80, payIfUsed: 400, creditWaiting: 0, creditWaitingNote: null })
+    // The run's own first charge replaces the retry that held the $50, so the run has nothing waiting.
+    expect(old.payAll).toMatchObject({ runCreditWaiting: 0, runCreditWaitingNote: null })
+    expect(renewal.payAll).toMatchObject({ runCreditWaiting: 0, runCreditWaitingNote: null })
+    // The quote asked with the same order is the same figure.
+    const q = await quote(f, { method: 'ach', leaseId: f.lease1Id, useCredit: true, afterLeaseIds: [oldLeaseId] })
+    expect(q.body.data).toMatchObject({ usableCredit: 80, base: 400, creditWaiting: 0, creditWaitingNote: null })
+  })
+
+  it('Pay all with Use all charges the old lease and then the renewal in one go — no "Your credit changed"', async () => {
+    const f = await seed()
+    const { oldLeaseId, special, sept, oct } = await movedCreditHeldByOldRetry(f)
+    const ctx = (await context(f)).body.data.leases
+    const old = ctx.find((l: any) => l.leaseId === oldLeaseId)
+    const renewal = ctx.find((l: any) => l.leaseId === f.lease1Id)
+    ;(stripeConnect.createRentPlatformCharge as any)
+      .mockImplementationOnce(async () => ({ id: 'pi_payall_old', status: 'processing' }))
+      .mockImplementationOnce(async () => ({ id: 'pi_payall_renewal', status: 'processing' }))
+    const pay = (body: any) => request(buildApp()).post('/api/payments/pay-balance').set('Authorization', `Bearer ${f.tokenTenant1}`).send(body)
+    // What the pay screen sends (lib/payCredit planCharges with the payAll figures).
+    const first = await pay({ leaseId: oldLeaseId, amount: old.payAll.payIfUsed, paymentMethodId: 'pm_x', paymentMethodType: 'ach',
+      useCredit: false, expectedCredit: 0 })
+    expect(first.status, JSON.stringify(first.body)).toBe(200)
+    const second = await pay({ leaseId: f.lease1Id, amount: renewal.payAll.payIfUsed, paymentMethodId: 'pm_x', paymentMethodType: 'ach',
+      useCredit: true, expectedCredit: renewal.payAll.expectedCredit })
+    expect(second.status, JSON.stringify(second.body)).toBe(200)
+    expect(second.body.data.creditUsed).toBe(80)
+    const st = (await db.query<{ id: string; status: string }>(`SELECT id, status FROM payments WHERE id = ANY($1::uuid[])`, [[sept, oct]])).rows
+    expect(new Map(st.map(r => [r.id, r.status]))).toEqual(new Map([[sept, 'processing'], [oct, 'processing']]))
+    const held = (await db.query<{ payment_id: string; amount: string }>(
+      `SELECT payment_id, amount::text AS amount FROM credit_uses WHERE tenant_credit_id = $1 AND status = 'held'`, [special])).rows
+    expect(held).toEqual([{ payment_id: oct, amount: '80.00' }])
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls.map((c: any[]) => c[0].amount)).toEqual([465, 405])
+  })
+
+  // Fix pass 2: a paused lease's bank retry holds the whole $50 general
+  // credit. Pay all of the two other bills: each bill alone could use the
+  // same $50, so adding the bills' figures said "$100.00 set aside" with
+  // $50.00 on file. The run carries one figure, the same on every bill.
+  it('Pay all says the credit a paused lease\'s retry holds once for the run, never once per bill', async () => {
+    const f = await seed()
+    const { holdCredit } = await import('../services/creditUse')
+    const c = await db.connect()
+    let pausedLeaseId = '', otherLeaseId = ''
+    try {
+      await c.query('BEGIN')
+      const pausedUnit = await seedUnit(c, { propertyId: f.aPropId, landlordId: f.aLid })
+      pausedLeaseId = await seedLease(c, { unitId: pausedUnit, landlordId: f.aLid })
+      await seedLeaseTenant(c, { leaseId: pausedLeaseId, tenantId: f.tenant1Id, role: 'primary' })
+      const otherUnit = await seedUnit(c, { propertyId: f.aPropId, landlordId: f.aLid })
+      otherLeaseId = await seedLease(c, { unitId: otherUnit, landlordId: f.aLid })
+      await seedLeaseTenant(c, { leaseId: otherLeaseId, tenantId: f.tenant1Id, role: 'primary' })
+      const general = (await c.query<{ id: string }>(
+        `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+         VALUES ($1,$2,NULL,50,50,'goodwill') RETURNING id`, [f.aLid, f.tenant1Id])).rows[0].id
+      const aug = (await c.query<{ id: string }>(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, stripe_payment_intent_id)
+         VALUES ($1,$2,$3,$4,'rent',200,'processing','2026-08-01','RENT','pi_paused_retry') RETURNING id`,
+        [pausedUnit, pausedLeaseId, f.tenant1Id, f.aLid])).rows[0].id
+      const rem = (await c.query<{ id: string }>(
+        `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                         status, payment_method, stripe_payment_intent_id, processing_fee_amount)
+         VALUES ($1,$2,$3,150,150,0,'processing','ach','pi_paused_retry',0) RETURNING id`,
+        [f.tenant1Id, pausedLeaseId, f.aLid])).rows[0].id
+      await holdCredit(c, [{ creditKind: 'issued', creditId: general, paymentId: aug, leaseId: pausedLeaseId, amount: 50, billingMonth: '2026-08-01' }],
+        { remittanceId: rem, source: 'portal' })
+      await c.query(`UPDATE payments SET status = 'failed', next_retry_at = now() + interval '3 days' WHERE id = $1`, [aug])
+      await c.query(`UPDATE units SET payment_block = TRUE WHERE id = $1`, [pausedUnit])
+      // The run is charged in the list's order (lease ids sorted): the first
+      // bill of the run is the older one, so each bill at its turn is the
+      // oldest still open — the case where every bill reported the same $50.
+      const [firstId] = [f.lease1Id, otherLeaseId].sort()
+      const bills: [string, string][] = [[f.aUnitId, f.lease1Id], [otherUnit, otherLeaseId]]
+      for (const [unit, lease] of bills) {
+        const due = lease === firstId ? '2026-09-01' : '2026-10-01'
+        await c.query(
+          `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+           VALUES ($1,$2,$3,$4,'rent',200,'pending',$5,'RENT')`, [unit, lease, f.tenant1Id, f.aLid, due])
+      }
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const res = await context(f)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const leases = res.body.data.leases
+    const paused = leases.find((l: any) => l.leaseId === pausedLeaseId)
+    expect(paused.paymentBlocked).toBe(true)
+    expect(paused.payAll).toBeNull()
+    const run = [f.lease1Id, otherLeaseId].sort().map(id => leases.find((l: any) => l.leaseId === id))
+    expect(run[0].payAll.order).toEqual([f.lease1Id, otherLeaseId].sort())
+    // Alone, the older bill is the one the $50 would pay (oldest bill first).
+    expect(run.map(l => [l.usableCredit, l.creditWaiting])).toEqual([[0, 50], [0, 0]])
+    // In the run each bill, at its turn, could use those same $50: the bills'
+    // own figures add up to $100 — the double count the screen used to say.
+    expect(run.reduce((s: number, l: any) => s + l.payAll.creditWaiting, 0)).toBe(100)
+    for (const l of run) {
+      expect(l.creditOnFile).toBe(50)
+      // The run: one figure, the same on every bill, never more than is on file.
+      expect(l.payAll).toMatchObject({ runCreditWaiting: 50, runCreditWaitingNote: WAITING_50, usableCredit: 0 })
+    }
+    expect(run[0].payAll.order).toEqual(run[1].payAll.order)
+  })
+
+  // Fix pass 3: every dollar of the credit on file is explained on one bill.
+  it('one bill: the rest of the credit on file is said in plain words, on the pay screen and in the quote', async () => {
+    const f = await seed()
+    const { oldLeaseId } = await movedCreditHeldByOldRetry(f)
+    // $20 tied to the old lease: its only bill is the retrying one.
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,20,20,'goodwill')`, [f.aLid, f.tenant1Id, oldLeaseId])
+    const REST_20 = '$20.00 of your credit is kept for a bill on another lease.'
+    const renewal = (await context(f)).body.data.leases.find((l: any) => l.leaseId === f.lease1Id)
+    expect(renewal).toMatchObject({ creditOnFile: 100, usableCredit: 30, creditWaiting: 50, creditKeptElsewhere: 20, creditKeptForLater: 0, creditAlsoHeld: 0, creditRestNote: REST_20 })
+    const q = await quote(f, { method: 'ach', leaseId: f.lease1Id, useCredit: true })
+    expect(q.body.data).toMatchObject({ creditOnFile: 100, usableCredit: 30, creditWaiting: 50, creditRestNote: REST_20 })
+  })
+
+  it('a bill with nothing left over says no rest sentence', async () => {
+    const f = await seed()
+    await movedCreditHeldByOldRetry(f)
+    const renewal = (await context(f)).body.data.leases.find((l: any) => l.leaseId === f.lease1Id)
+    expect(renewal).toMatchObject({ creditOnFile: 80, usableCredit: 30, creditWaiting: 50, creditRestNote: null })
+  })
+
+  // Fix pass 3: bills the screen pays together that are not balance-context's
+  // run get the run's one held-credit figure from the server.
+  it('the quote answers the held-credit figure for any run of the tenant\'s bills, and nothing for leases that are not theirs', async () => {
+    const f = await seed()
+    const { oldLeaseId } = await movedCreditHeldByOldRetry(f)
+    const alone = await quote(f, { method: 'ach', runLeaseIds: [f.lease1Id] })
+    expect(alone.status, JSON.stringify(alone.body)).toBe(200)
+    expect(alone.body.data).toEqual({ runLeaseIds: [f.lease1Id], runCreditWaiting: 50, runCreditWaitingNote: WAITING_50 })
+    // The old lease first replaces its retry: nothing waits.
+    const both = await quote(f, { method: 'ach', runLeaseIds: [oldLeaseId, f.lease1Id] })
+    expect(both.body.data).toMatchObject({ runCreditWaiting: 0, runCreditWaitingNote: null })
+    const stranger = await quote(f, { method: 'ach', runLeaseIds: ['00000000-0000-4000-8000-000000000001'] })
+    expect(stranger.body.data).toMatchObject({ runCreditWaiting: 0, runCreditWaitingNote: null })
+  })
+
+  it('one bill alone gets no Pay all figures', async () => {
+    const f = await seed()
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 900, leaseId: f.lease1Id })
+    const res = await context(f)
+    expect(res.body.data.leases.find((l: any) => l.leaseId === f.lease1Id).payAll).toBeNull()
+  })
+})
+
+// ─── decisions.md #48.4: a card its bank wants confirmed (3-D Secure) ─────────
+// On the pay screen the tenant confirms on the spot; the bill is held for up to
+// CARD_CONFIRM_HOLD_MINUTES, then released.
+describe('3-D Secure on the pay screen', () => {
+  // What services/rentCharge stamps on a pay-screen card charge (the only
+  // kind #48.4 holds, releases and shows as waiting on the bank).
+  const ON_SCREEN = { gam_confirm_on_screen: 'true' }
+  async function ready(f: Fixture) {
+    await db.query(`UPDATE tenants SET stripe_customer_id='cus_t1' WHERE id=$1`, [f.tenant1Id])
+    await db.query(
+      `UPDATE users SET stripe_connect_account_id='acct_l1', connect_charges_enabled=TRUE, connect_details_submitted=TRUE WHERE id=$1`, [f.aUid])
+  }
+  const bill = (f: Fixture, amount = 1000) =>
+    seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount, leaseId: f.lease1Id })
+  const post = (f: Fixture, path: string, body: any, token = f.tokenTenant1) =>
+    request(buildApp()).post(`/api/payments${path}`).set('Authorization', `Bearer ${token}`).send(body)
+  const context = (f: Fixture) => request(buildApp()).get('/api/payments/balance-context').set('Authorization', `Bearer ${f.tokenTenant1}`)
+  const row = async (id: string) => (await db.query<any>(`SELECT status, stripe_payment_intent_id FROM payments WHERE id=$1`, [id])).rows[0]
+  const needsConfirm = () => (stripeConnect.createRentPlatformCharge as any)
+    .mockImplementationOnce(async () => ({ id: 'pi_screen', status: 'requires_action', client_secret: 'pi_screen_secret_1' }))
+  beforeEach(async () => {
+    paymentIntentsCancelMock.mockClear()
+    paymentIntentsRetrieveMock.mockReset()
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'processing' }))
+    // Every case reuses the id pi_screen: the sweep's memory of what it has
+    // seen (a real intent id is never reused) starts empty for each.
+    ;(await import('../jobs/paymentReconcile')).forgetSweptCardCharges()
+  })
+  const waitingOnBank = () => paymentIntentsRetrieveMock.mockImplementation(async (id: string) =>
+    ({ id, metadata: ON_SCREEN, status: 'requires_action', client_secret: `${id}_secret_1` }))
+
+  it('the pay screen keeps the charge: the bill is held for it and the screen gets what the bank\'s window needs', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    const before = Date.now()
+    const res = await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data).toMatchObject({ status: 'requires_action', paymentIntentId: 'pi_screen', clientSecret: 'pi_screen_secret_1' })
+    const by = new Date(res.body.data.confirmBy).getTime()
+    expect(by - before).toBeGreaterThanOrEqual(30 * 60_000 - 5_000)
+    expect(by - before).toBeLessThanOrEqual(30 * 60_000 + 5_000)
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+    expect(await row(pid)).toEqual({ status: 'processing', stripe_payment_intent_id: 'pi_screen' })
+  })
+
+  it('while it waits the bill is listed as waiting on the bank — never as clearing — and is not charged twice', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    const ctx = await context(f)
+    expect(ctx.status, JSON.stringify(ctx.body)).toBe(200)
+    const l = ctx.body.data.leases.find((x: any) => x.leaseId === f.lease1Id)
+    expect(l.clearing).toBe(0)
+    expect(l.awaitingConfirmation).toEqual([expect.objectContaining({ paymentIntentId: 'pi_screen', canConfirm: true })])
+    expect(l.awaitingConfirmation[0].amount).toBeGreaterThan(1000)
+    const again = await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(again.status).toBe(409)
+  })
+
+  it('release: the bank did not confirm — the charge is canceled at once and the bill opens again as it was (open, not Failed)', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'requires_payment_method' }))
+    const rel = await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen' })
+    expect(rel.status, JSON.stringify(rel.body)).toBe(200)
+    expect(rel.body.data).toEqual({ outcome: 'released', declined: false })
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_screen')
+    expect(await row(pid)).toEqual({ status: 'pending', stripe_payment_intent_id: null })
+    expect((await db.query<any>(`SELECT platform_held, payment_channel FROM payments WHERE id=$1`, [pid])).rows[0])
+      .toEqual({ platform_held: false, payment_channel: null })
+    const rem = (await db.query<any>(`SELECT status FROM tenant_remittances WHERE stripe_payment_intent_id='pi_screen'`)).rows[0]
+    expect(rem.status).toBe('failed')
+    const again = await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(again.status, JSON.stringify(again.body)).toBe(200)
+  })
+
+  it('release leaves a payment the bank confirmed alone', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'succeeded' }))
+    const rel = await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen' })
+    expect(rel.body.data).toEqual({ outcome: 'went_through', declined: false })
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+    expect((await row(pid)).status).toBe('processing')
+  })
+
+  it('release and resume refuse a payment that is not this tenant\'s', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    const c = await db.connect()
+    let otherToken: string
+    try {
+      const otherId = await seedTenant(c)
+      const uid = (await c.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [otherId])).rows[0].user_id
+      otherToken = sign({ userId: uid, role: 'tenant', email: 'o@t.dev', profileId: otherId })
+    } finally { c.release() }
+    waitingOnBank()
+    expect((await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen' }, otherToken)).status).toBe(404)
+    expect((await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' }, otherToken)).status).toBe(404)
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+  })
+
+  it('resume hands the bank\'s window back only while the payment can still be confirmed', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    const r1 = await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })
+    expect(r1.body.data).toMatchObject({ status: 'requires_action', clientSecret: 'pi_screen_secret_1' })
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'requires_payment_method', client_secret: 'x' }))
+    const r2 = await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })
+    expect(r2.body.data).toMatchObject({ status: 'requires_payment_method', clientSecret: null })
+  })
+
+  it('resume inside the 30 minutes on a payment that went through says so — never "can no longer be confirmed"', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    // The payer confirmed in another tab; Stripe says it went through, the webhook has not landed.
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'succeeded', client_secret: 'x' }))
+    const r1 = await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })
+    expect(r1.status, JSON.stringify(r1.body)).toBe(200)
+    expect(r1.body.data).toMatchObject({ status: 'succeeded', outcome: 'went_through', clientSecret: null })
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'processing', client_secret: 'x' }))
+    expect((await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })).body.data).toMatchObject({ outcome: 'went_through', clientSecret: null })
+    // The webhook settled the receipt: said from GAM's own record, Stripe not asked.
+    await db.query(`UPDATE tenant_remittances SET status = 'settled' WHERE stripe_payment_intent_id = 'pi_screen'`)
+    paymentIntentsRetrieveMock.mockClear()
+    expect((await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })).body.data).toMatchObject({ outcome: 'went_through', clientSecret: null })
+    expect(paymentIntentsRetrieveMock).not.toHaveBeenCalled()
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+    expect((await row(pid)).status).toBe('processing')
+  })
+
+  it('resume inside the 30 minutes on a payment already canceled (another tab, the sweep) says it was released', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    // Canceled in Stripe, the receipt not yet closed here.
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'canceled', client_secret: 'x' }))
+    const r1 = await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })
+    expect(r1.body.data).toMatchObject({ status: 'canceled', outcome: 'released', clientSecret: null })
+    // Released here too (the other tab's Cancel): the receipt says so.
+    await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen' })
+    paymentIntentsRetrieveMock.mockClear()
+    const r2 = await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })
+    expect(r2.body.data).toMatchObject({ status: 'canceled', outcome: 'released', expired: false, declined: false, clientSecret: null })
+    expect(paymentIntentsRetrieveMock).not.toHaveBeenCalled()
+  })
+
+  // Review (pay8 fix pass 2): "released" is said only once the bill is open.
+  it('resume on a payment canceled in Stripe whose bill side never ran opens the bill before saying it was released', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'canceled', client_secret: 'x' }))
+    const r = await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    expect(r.body.data).toMatchObject({ status: 'canceled', outcome: 'released', declined: false, expired: false, clientSecret: null })
+    expect(await row(pid)).toEqual({ status: 'pending', stripe_payment_intent_id: null })
+    expect((await db.query<any>(`SELECT status FROM tenant_remittances WHERE stripe_payment_intent_id='pi_screen'`)).rows[0].status).toBe('failed')
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+    // The bill is payable at once.
+    const again = await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(again.status, JSON.stringify(again.body)).toBe(200)
+  })
+
+  it('a payment still waiting on the bank is resumed with no outcome, only the bank\'s window', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    const r = await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })
+    expect(r.body.data.outcome).toBeUndefined()
+    expect(r.body.data.clientSecret).toBe('pi_screen_secret_1')
+  })
+
+  it('a co-tenant is sent no made-up name for a payer with no name on file (the screen words it)', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    await db.query(`UPDATE users SET first_name = '', last_name = '' WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [f.tenant1Id])
+    const c = await db.connect()
+    let coToken: string
+    try {
+      const coId = await seedTenant(c)
+      await seedLeaseTenant(c, { leaseId: f.lease1Id, tenantId: coId })
+      const uid = (await c.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [coId])).rows[0].user_id
+      coToken = sign({ userId: uid, role: 'tenant', email: 'co2@t.dev', profileId: coId })
+    } finally { c.release() }
+    waitingOnBank()
+    const ctx = await request(buildApp()).get('/api/payments/balance-context').set('Authorization', `Bearer ${coToken}`)
+    expect(ctx.status, JSON.stringify(ctx.body)).toBe(200)
+    expect(ctx.body.data.awaitingCardConfirmations).toEqual([expect.objectContaining({ mine: false, payerName: null })])
+  })
+
+  it('a payment nobody confirmed within 30 minutes is released before a new payment, so the tenant can pay', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    await db.query(`UPDATE tenant_remittances SET created_at = now() - interval '31 minutes' WHERE stripe_payment_intent_id='pi_screen'`)
+    waitingOnBank()
+    const res = await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_screen')
+    expect((await row(pid)).stripe_payment_intent_id).toBe('pi_plat_mock')
+  })
+
+  it('the pay screen\'s card charge is marked as confirmed on screen (so its bank\'s refusal is a release, not a decline); others are not', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    const md = () => (stripeConnect.createRentPlatformCharge as any).mock.calls.map((c: any[]) => c[0].metadata?.gam_confirm_on_screen ?? null)
+    ;(stripeConnect.createRentPlatformCharge as any).mockClear()
+    const r1 = await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    expect(r1.status, JSON.stringify(r1.body)).toBe(200)
+    expect(md()).toEqual(['true'])
+  })
+
+  it('a card charge without the pay screen (the assistant) is not marked', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    ;(stripeConnect.createRentPlatformCharge as any).mockClear()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card' })
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].metadata.gam_confirm_on_screen).toBeUndefined()
+  })
+
+  it('any look at the bill after 30 minutes opens it again — the tenant who closed the page is never left with a hidden bill', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    await db.query(`UPDATE tenant_remittances SET created_at = now() - interval '31 minutes' WHERE stripe_payment_intent_id='pi_screen'`)
+    waitingOnBank()
+    const ctx = await context(f)
+    expect(ctx.status, JSON.stringify(ctx.body)).toBe(200)
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_screen')
+    expect((await row(pid)).status).toBe('pending')
+    const l = ctx.body.data.leases.find((x: any) => x.leaseId === f.lease1Id)
+    expect(l.requiredNow).toBe(1000)
+    expect(l.awaitingConfirmation).toEqual([])
+    expect(ctx.body.data.awaitingCardConfirmations).toEqual([])
+  })
+
+  it('the page gets every held card payment in one list, so a bill held whole can still be confirmed or canceled', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    const ctx = await context(f)
+    const l = ctx.body.data.leases.find((x: any) => x.leaseId === f.lease1Id)
+    expect(l.requiredNow).toBe(0)
+    expect(ctx.body.data.awaitingCardConfirmations).toEqual([expect.objectContaining({
+      paymentIntentId: 'pi_screen', leaseId: f.lease1Id, serviceAgreementId: null, canConfirm: true, mine: true, payerName: null,
+    })])
+  })
+
+  it('resume after the time the screen showed: never offered again — released, and the bill opens', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    await db.query(`UPDATE tenant_remittances SET created_at = now() - interval '31 minutes' WHERE stripe_payment_intent_id='pi_screen'`)
+    waitingOnBank()
+    const r = await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    expect(r.body.data).toMatchObject({ outcome: 'released', clientSecret: null, status: 'canceled', expired: true, declined: false })
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_screen')
+    expect((await row(pid)).status).toBe('pending')
+  })
+
+  it('resume after the time ran out on a payment already canceled in Stripe says it was canceled, not that the time ran out', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    await db.query(`UPDATE tenant_remittances SET created_at = now() - interval '31 minutes' WHERE stripe_payment_intent_id='pi_screen'`)
+    // Canceled in the Stripe dashboard; the receipt here still holds the bill.
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'canceled', client_secret: 'x' }))
+    const r = await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    expect(r.body.data).toMatchObject({ outcome: 'released', status: 'canceled', expired: false, declined: false, clientSecret: null })
+    // The money handling is the same either way: the bill is open, nothing charged.
+    expect(await row(pid)).toEqual({ status: 'pending', stripe_payment_intent_id: null })
+  })
+
+  it('resume says why a payment is already released — declined by its bank, from the receipt — so the screen never guesses from the clock', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({
+      id, metadata: ON_SCREEN, status: 'requires_payment_method',
+      last_payment_error: { type: 'card_error', code: 'card_declined', decline_code: 'insufficient_funds' },
+    }))
+    expect((await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen' })).body.data).toMatchObject({ outcome: 'released', declined: true })
+    const r = await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' })
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    expect(r.body.data).toMatchObject({ outcome: 'released', declined: true, expired: false, clientSecret: null })
+  })
+
+  it('a co-tenant sees the held payment as waiting on the payer\'s card bank, by name — not clearing, and cannot confirm or cancel it', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    const c = await db.connect()
+    let coToken: string
+    try {
+      const coId = await seedTenant(c)
+      await seedLeaseTenant(c, { leaseId: f.lease1Id, tenantId: coId })
+      const uid = (await c.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [coId])).rows[0].user_id
+      coToken = sign({ userId: uid, role: 'tenant', email: 'co@t.dev', profileId: coId })
+    } finally { c.release() }
+    const payer = (await db.query<any>(
+      `SELECT u.first_name, u.last_name FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [f.tenant1Id])).rows[0]
+    waitingOnBank()
+    const ctx = await request(buildApp()).get('/api/payments/balance-context').set('Authorization', `Bearer ${coToken}`)
+    expect(ctx.status, JSON.stringify(ctx.body)).toBe(200)
+    const l = ctx.body.data.leases.find((x: any) => x.leaseId === f.lease1Id)
+    expect(l.clearing).toBe(0)
+    expect(l.awaitingConfirmation).toEqual([expect.objectContaining({
+      paymentIntentId: 'pi_screen', mine: false, canConfirm: false, payerName: `${payer.first_name} ${payer.last_name}`.trim(),
+    })])
+    expect((await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen' }, coToken)).status).toBe(404)
+    expect((await post(f, '/pay-balance/resume', { paymentIntentId: 'pi_screen' }, coToken)).status).toBe(404)
+  })
+
+  it('a payer with no lease (a service agreement) who leaves before confirming still gets the waiting block for that bill', async () => {
+    const f = await seed(); await ready(f)
+    const c = await db.connect()
+    let agreementId: string
+    try {
+      agreementId = (await c.query<{ id: string }>(
+        `INSERT INTO utility_service_agreements (landlord_id, unit_id, tenant_id, start_date)
+         VALUES ($1,$2,$3,'2026-01-01') RETURNING id`, [f.aLid, f.aUnitId, f.tenant1Id])).rows[0].id
+      const inv = (await c.query<{ id: string }>(
+        `INSERT INTO invoices (landlord_id, unit_id, service_agreement_id, invoice_number, due_date, total_amount, subtotal_utilities)
+         VALUES ($1,$2,$3,'SA-1',CURRENT_DATE,80,80) RETURNING id`, [f.aLid, f.aUnitId, agreementId])).rows[0].id
+      await c.query(
+        `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, invoice_id)
+         VALUES ($1,$2,$3,'utility',80,'pending',CURRENT_DATE,'UTILITY',$4)`, [f.aUnitId, f.tenant1Id, f.aLid, inv])
+    } finally { c.release() }
+    needsConfirm()
+    const res = await post(f, '/pay-balance', { amount: 80, serviceAgreementId: agreementId!, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data).toMatchObject({ status: 'requires_action', clientSecret: 'pi_screen_secret_1' })
+    waitingOnBank()
+    const ctx = await context(f)
+    expect(ctx.body.data.awaitingCardConfirmations).toEqual([expect.objectContaining({
+      paymentIntentId: 'pi_screen', leaseId: null, serviceAgreementId: agreementId!, canConfirm: true,
+    })])
+    // cleanupAllSchema deletes a service agreement's payment rows before their
+    // receipt lines (test helper, not this step's file): cleared here.
+    await db.query(`DELETE FROM remittance_applications WHERE payment_id IN
+                      (SELECT p.id FROM payments p JOIN invoices i ON i.id = p.invoice_id WHERE i.service_agreement_id = $1)`, [agreementId!])
+  })
+
+  it('a payment still inside its 30 minutes is not released by a new payment (the bill stays held)', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    const res = await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status).toBe(409)
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+  })
+
+  // Review (pay6 fix pass): staff screens never read a hold that ran out.
+  const heldOver = async (f: Fixture) => {
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    await db.query(`UPDATE tenant_remittances SET created_at = now() - interval '31 minutes' WHERE stripe_payment_intent_id='pi_screen'`)
+    waitingOnBank()
+    return pid
+  }
+  const deskQuoteOf = (f: Fixture, pid: string) =>
+    request(buildApp()).get(`/api/payments/${pid}/record-manual/quote`).set('Authorization', `Bearer ${f.tokenLandlordA}`)
+
+  it('the desk quote releases a card hold that ran out before reading the bill: staff see it owed, not clearing', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await heldOver(f)
+    const q = await deskQuoteOf(f, pid)
+    expect(q.status, JSON.stringify(q.body)).toBe(200)
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_screen')
+    expect(q.body.data).toMatchObject({ anchorOpen: true, currentTotal: 1000, clearing: 0, awaitingCard: [] })
+    expect((await row(pid)).status).toBe('pending')
+  })
+
+  it('the desk quote keeps a card hold inside its 30 minutes in what is clearing and names it as waiting on the payer\'s card bank, by name and with the time it opens on the park\'s clock — nothing canceled', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    const payer = (await db.query<any>(
+      `SELECT u.first_name, u.last_name FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [f.tenant1Id])).rows[0]
+    const madeAt = (await db.query<any>(`SELECT created_at FROM tenant_remittances WHERE stripe_payment_intent_id='pi_screen'`)).rows[0].created_at
+    const q = await deskQuoteOf(f, pid)
+    expect(q.status, JSON.stringify(q.body)).toBe(200)
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+    // The held amount stays on the desk window's screen ("Already on its way"),
+    // with awaitingCard saying which part of it waits on the card's bank.
+    expect(q.body.data).toMatchObject({ anchorOpen: false, currentTotal: 0, clearing: 1000 })
+    // The park's own time zone rides along so the desk says the hour on the
+    // park's clock, not the browser's (camelCase on the wire, always present).
+    const tz = (await db.query<{ timezone: string }>(
+      `SELECT pr.timezone FROM payments p JOIN units un ON un.id = p.unit_id JOIN properties pr ON pr.id = un.property_id
+        WHERE p.id = $1`, [pid])).rows[0].timezone
+    expect(q.body.data.awaitingCard).toEqual([{
+      amount: expect.any(Number), heldAmount: 1000,
+      confirmBy: new Date(new Date(madeAt).getTime() + 30 * 60_000).toISOString(),
+      payerName: `${payer.first_name} ${payer.last_name}`.trim(),
+      timezone: tz,
+    }])
+    expect(Object.keys(q.body.data.awaitingCard[0])).toContain('timezone')
+    expect(q.body.data.awaitingCard[0].amount).toBeGreaterThan(1000)
+    expect((await row(pid)).status).toBe('processing')
+  })
+
+  it('the desk quote gives a held card payment the time zone of the park its bill is on (a Chicago park says Chicago, never the server\'s or a default)', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    await db.query(
+      `UPDATE properties SET timezone = 'America/Chicago'
+        WHERE id = (SELECT un.property_id FROM payments p JOIN units un ON un.id = p.unit_id WHERE p.id = $1)`, [pid])
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    const q = await deskQuoteOf(f, pid)
+    expect(q.status, JSON.stringify(q.body)).toBe(200)
+    expect(q.body.data.awaitingCard).toEqual([expect.objectContaining({ heldAmount: 1000, timezone: 'America/Chicago' })])
+  })
+
+  it('the desk quote never lists another company\'s held card payment for the same person', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    // Company B bills the same person: its desk sees nothing of company A's card payment.
+    const bPid = await seedPayment({ unitId: f.bUnitId, tenantId: f.tenant1Id, landlordId: f.bLid, amount: 50 })
+    const q = await request(buildApp()).get(`/api/payments/${bPid}/record-manual/quote`).set('Authorization', `Bearer ${f.tokenLandlordB}`)
+    expect(q.status, JSON.stringify(q.body)).toBe(200)
+    expect(q.body.data.awaitingCard).toEqual([])
+    expect((await row(pid)).status).toBe('processing')
+  })
+
+  it('release: the card\'s bank confirmed the cardholder and then declined the payment — said as declined, the bill opens again, no decline fee', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({
+      id, metadata: ON_SCREEN, status: 'requires_payment_method',
+      last_payment_error: { type: 'card_error', code: 'card_declined', decline_code: 'insufficient_funds' },
+    }))
+    const rel = await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen' })
+    expect(rel.status, JSON.stringify(rel.body)).toBe(200)
+    expect(rel.body.data).toEqual({ outcome: 'released', declined: true })
+    expect((await row(pid)).status).toBe('pending')
+    expect((await db.query(`SELECT 1 FROM payments WHERE entry_description = 'DECLINEFEE'`)).rows).toEqual([])
+  })
+
+  it('release: a 3-D Secure confirmation that failed is not called a decline', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({
+      id, metadata: ON_SCREEN, status: 'requires_payment_method',
+      last_payment_error: { type: 'card_error', code: 'payment_intent_authentication_failure' },
+    }))
+    const rel = await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen' })
+    expect(rel.body.data).toEqual({ outcome: 'released', declined: false })
+  })
+
+  // Fix pass 3: why a card payment was released is recorded on its receipt when
+  // it is released (CARD_RELEASE_NOTE) — never inferred from whether a decline
+  // fee row exists. The tenant Payments page reads this answer, as the wire
+  // carries it, from one fixture.
+  it('payment history: a card payment canceled before anything was charged, and one declined by its bank, are each marked so from what was recorded; an ordinary failed card payment is neither', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen' })
+    // The bill is open again: a second card payment its bank declines after the cardholder confirmed it.
+    ;(stripeConnect.createRentPlatformCharge as any)
+      .mockImplementationOnce(async () => ({ id: 'pi_screen_2', status: 'requires_action', client_secret: 'pi_screen_2_secret_1' }))
+    const second = await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    expect(second.status, JSON.stringify(second.body)).toBe(200)
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({
+      id, metadata: ON_SCREEN, status: 'requires_payment_method',
+      last_payment_error: { type: 'card_error', code: 'card_declined', decline_code: 'insufficient_funds' },
+    }))
+    const rel = await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen_2' })
+    expect(rel.body.data).toEqual({ outcome: 'released', declined: true })
+    // A card payment the normal failure path closed (no on-screen confirmation, nothing recorded on it).
+    await db.query(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, payment_method, status, stripe_payment_intent_id, created_at)
+       VALUES ($1,$2,$3,25,25,'card','failed','pi_failed_plain', now() - interval '1 day')`,
+      [f.tenant1Id, f.lease1Id, f.aLid])
+    const res = await request(buildApp()).get('/api/payments/remittances').set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    // (Raw route columns here; the API's response transformer camelizes them on the wire.)
+    const byPi = async (pi: string) => {
+      const id = (await db.query<{ id: string }>(`SELECT id FROM tenant_remittances WHERE stripe_payment_intent_id = $1`, [pi])).rows[0].id
+      return res.body.data.remittances.find((r: any) => r.id === id)
+    }
+    expect(await byPi('pi_screen')).toMatchObject({ status: 'failed', payment_method: 'card', canceled_before_charge: true, declined_before_charge: false })
+    expect(await byPi('pi_screen_2')).toMatchObject({ status: 'failed', payment_method: 'card', canceled_before_charge: false, declined_before_charge: true })
+    expect(await byPi('pi_failed_plain')).toMatchObject({ status: 'failed', canceled_before_charge: false, declined_before_charge: false })
+    // The wire's answer (camelized) is the tenant Payments page's history fixture.
+    const ids = new Map<string, string>()
+    const stable = JSON.stringify(camelCaseKeys(res.body.data), null, 2)
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, (u) => {
+        if (!ids.has(u)) ids.set(u, `00000000-0000-4000-8000-${String(ids.size + 1).padStart(12, '0')}`)
+        return ids.get(u)!
+      })
+      .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z/g, '2026-10-04T18:30:00.000Z')
+      .replace(/"\d{4}-\d{2}-\d{2}"/g, '"2026-10-04"') + '\n'
+    const file = path.join(__dirname, '../../../tenant/src/pages/__fixtures__/remittances.cardReleased.real.json')
+    if (process.env.PAYMENTS_FIXTURE_UPDATE === '1' || !fs.existsSync(file)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.writeFileSync(file, stable)
+    }
+    expect(fs.readFileSync(file, 'utf8'), 'GET /remittances\'s answer for released card payments changed: run this test with PAYMENTS_FIXTURE_UPDATE=1, then the tenant PaymentsPage.awaiting test').toBe(stable)
+  })
+
+  it('release after the failure webhook already recorded a decline still says declined (Stripe has cleared the error by then)', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    // The webhook got there first, from the event's own copy of the charge.
+    const { releaseFailedOnScreenConfirmation } = await import('../jobs/paymentReconcile')
+    let now = 'requires_payment_method'
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: now }))
+    paymentIntentsCancelMock.mockImplementationOnce(async (id: string) => { now = 'canceled'; return { id, status: 'canceled' } })
+    const { getStripe } = await import('../lib/stripe')
+    expect(await releaseFailedOnScreenConfirmation(getStripe(), {
+      id: 'pi_screen', status: 'requires_payment_method', metadata: { gam_confirm_on_screen: 'true' },
+      last_payment_error: { type: 'card_error', code: 'card_declined' },
+    } as any)).toBe(true)
+    expect((await row(pid)).status).toBe('pending')
+    // The screen's release lands after: Stripe now shows no error, the receipt still says declined.
+    const rel = await post(f, '/pay-balance/release', { paymentIntentId: 'pi_screen' })
+    expect(rel.body.data).toEqual({ outcome: 'released', declined: true })
+  })
+
+  it('balance-context names the receipt of a held card payment, so the history can say it waits on the bank', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    const paid = await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    const ctx = await context(f)
+    expect(ctx.body.data.awaitingCardConfirmations).toEqual([expect.objectContaining({ remittanceId: paid.body.data.remittanceId })])
+  })
+
+  it('cash at the desk on a bill held by a card still inside its 30 minutes is refused in plain words, with when it opens', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 1000 })
+    expect(res.status).toBe(409)
+    const msg = JSON.stringify(res.body)
+    expect(msg).toContain('waiting on the resident\'s card payment to be confirmed by their card\'s bank')
+    expect(msg).toMatch(/opens here by itself at \d{1,2}:\d{2} [AP]M/)
+    // The next step for a resident standing at the desk who wants to pay another way now.
+    expect(msg).toContain('If they want to pay another way now, whoever made the card payment can tap \'Cancel it and pay another way\' on their Payments page, and the bill opens here.')
+    expect(msg).not.toMatch(/close this window|open it again/i)
+    expect(msg).not.toContain('status:')
+    expect(msg).not.toContain('processing')
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+  })
+
+  it('cash at the desk on a held charge with no space (so no park clock) says when it opens without guessing a clock time', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    waitingOnBank()
+    await db.query(`UPDATE payments SET unit_id = NULL WHERE id = $1`, [pid])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 1000 })
+    expect(res.status).toBe(409)
+    const msg = JSON.stringify(res.body)
+    expect(msg).toContain('It opens here by itself within 30 minutes of when they paid if they don\'t confirm it.')
+    expect(msg).not.toMatch(/\d{1,2}:\d{2} [AP]M/)
+  })
+
+  it('cash at the desk on a bill whose card went through but whose success has not landed says it was just paid — never "nothing has been charged"', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    // The cardholder confirmed; Stripe has the money, the webhook has not landed.
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'succeeded' }))
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 1000 })
+    expect(res.status).toBe(409)
+    const msg = JSON.stringify(res.body)
+    expect(msg).toContain('This charge was just paid or is on its way — the bill above was read again.')
+    expect(msg).not.toContain('nothing has been charged')
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+  })
+
+  it('cash at the desk when Stripe cannot be read says a card payment is in progress and to try again — never that nothing was charged', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    paymentIntentsRetrieveMock.mockImplementation(async () => { throw new Error('Stripe unreachable') })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 1000 })
+    expect(res.status).toBe(409)
+    const msg = JSON.stringify(res.body)
+    expect(msg).toContain('This charge has a card payment in progress that could not be checked just now — the bill above was read again. Try again in a minute.')
+    expect(msg).not.toContain('nothing has been charged')
+    expect((await row(pid)).status).toBe('processing')
+  })
+
+  // Review (pay8 fix pass 2): the desk asks Stripe about a held card however
+  // old it is — a hold whose release failed is still a hold, never "just paid".
+  const heldMinutesAgo = async (f: Fixture, minutes: number) => {
+    const pid = await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    await db.query(`UPDATE tenant_remittances SET created_at = now() - ($1 || ' minutes')::interval WHERE stripe_payment_intent_id='pi_screen'`, [String(minutes)])
+    return pid
+  }
+  const cashAtDesk = (f: Fixture, pid: string) => request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+    .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    .send({ method: 'cash', amountTendered: 1000 })
+
+  it('cash at the desk on a 35-minute-old card hold while Stripe is down says a card payment is in progress — never "just paid"', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await heldMinutesAgo(f, 35)
+    paymentIntentsRetrieveMock.mockImplementation(async () => { throw new Error('Stripe unreachable') })
+    const res = await cashAtDesk(f, pid)
+    expect(res.status).toBe(409)
+    const msg = JSON.stringify(res.body)
+    expect(msg).toContain('This charge has a card payment in progress that could not be checked just now — the bill above was read again. Try again in a minute.')
+    expect(msg).not.toContain('just paid')
+    expect((await row(pid)).status).toBe('processing')
+  })
+
+  it('cash at the desk on a 35-minute-old card hold the sweep could not cancel: the desk cancels it now and says the bill is open', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await heldMinutesAgo(f, 35)
+    waitingOnBank()
+    // The release before the desk reads the bill fails once (Stripe hiccup); the desk's own try works.
+    paymentIntentsCancelMock.mockImplementationOnce(async () => { throw new Error('Stripe hiccup') })
+    const res = await cashAtDesk(f, pid)
+    expect(res.status).toBe(409)
+    const msg = JSON.stringify(res.body)
+    expect(msg).toContain('The resident\'s card payment on this bill was canceled before anything was charged, so the bill is open again — the bill above was read again. Take the payment now.')
+    expect(msg).not.toContain('just paid')
+    expect(await row(pid)).toEqual({ status: 'pending', stripe_payment_intent_id: null })
+    const again = await cashAtDesk(f, pid)
+    expect(again.status, JSON.stringify(again.body)).toBe(200)
+  })
+
+  it('cash at the desk on a 35-minute-old card hold Stripe will not cancel says nothing was charged and it opens here in a few minutes', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await heldMinutesAgo(f, 35)
+    waitingOnBank()
+    paymentIntentsCancelMock.mockImplementationOnce(async () => { throw new Error('Stripe hiccup') })
+    paymentIntentsCancelMock.mockImplementationOnce(async () => { throw new Error('Stripe hiccup') })
+    const res = await cashAtDesk(f, pid)
+    expect(res.status).toBe(409)
+    const msg = JSON.stringify(res.body)
+    expect(msg).toContain('nothing has been charged and the bill is opening again. It opens here in a few minutes — try again then.')
+    expect(msg).not.toContain('just paid')
+    expect((await row(pid)).status).toBe('processing')
+  })
+
+  it('cash at the desk on a bill whose card was canceled in Stripe while its rows still wait: the bill opens now and the desk says nothing was charged', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await heldMinutesAgo(f, 5)
+    // Canceled in the Stripe dashboard; the canceled webhook has not landed.
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'canceled' }))
+    const res = await cashAtDesk(f, pid)
+    expect(res.status).toBe(409)
+    const msg = JSON.stringify(res.body)
+    expect(msg).toContain('canceled before anything was charged, so the bill is open again')
+    expect(msg).not.toContain('just paid')
+    expect(await row(pid)).toEqual({ status: 'pending', stripe_payment_intent_id: null })
+    expect((await db.query<any>(`SELECT status FROM tenant_remittances WHERE stripe_payment_intent_id='pi_screen'`)).rows[0].status).toBe('failed')
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+  })
+
+  it('the reader on a bill whose card was canceled in Stripe while its rows still wait opens the bill and says nothing was charged', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await heldMinutesAgo(f, 5)
+    paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({ id, metadata: ON_SCREEN, status: 'canceled' }))
+    const res = await request(buildApp()).get(`/api/payments/${pid}/reader/readers`).set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(409)
+    expect(JSON.stringify(res.body)).toContain('canceled before anything was charged, so the bill is open again')
+    expect((await row(pid)).status).toBe('pending')
+  })
+
+  // Review (pay7 money-3): only the pay screen's own card charge is held for
+  // its cardholder. A card charge made some other way that waits in Stripe —
+  // a move-out balance charge GAM saved but could not confirm yet
+  // (depositReturn attemptGapAutoCharge, gam_kind 'deposit_return_gap', left
+  // in requires_confirmation for finishPendingGapCharges) — is GAM's to finish.
+  describe('a card charge the pay screen did not make (a move-out balance charge GAM is finishing)', () => {
+    async function gapWaiting(f: Fixture, minutesOld: number) {
+      const pid = await bill(f)
+      needsConfirm()
+      await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+      await db.query(`UPDATE tenant_remittances SET created_at = now() - ($1 || ' minutes')::interval WHERE stripe_payment_intent_id='pi_screen'`, [String(minutesOld)])
+      paymentIntentsRetrieveMock.mockImplementation(async (id: string) => ({
+        id, status: 'requires_confirmation', metadata: { gam_kind: 'deposit_return_gap', gam_payment_id: pid },
+      }))
+      return pid
+    }
+    const noteOn = async () => (await db.query<any>(
+      `SELECT status, notes FROM tenant_remittances WHERE stripe_payment_intent_id='pi_screen'`)).rows[0]
+
+    it('left waiting 40 minutes, it is not canceled by any look at the bill and is never shown as waiting on the tenant\'s bank', async () => {
+      const f = await seed(); await ready(f)
+      const pid = await gapWaiting(f, 40)
+      const ctx = await context(f)
+      expect(ctx.status, JSON.stringify(ctx.body)).toBe(200)
+      expect(ctx.body.data.awaitingCardConfirmations).toEqual([])
+      expect(ctx.body.data.leases.find((l: any) => l.leaseId === f.lease1Id).awaitingConfirmation ?? []).toEqual([])
+      expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+      expect(await row(pid)).toEqual({ status: 'processing', stripe_payment_intent_id: 'pi_screen' })
+      expect(await noteOn()).toEqual({ status: 'processing', notes: null })
+    })
+
+    it('the tenant cannot cancel or confirm it from the Payments page: refused in plain words, nothing done', async () => {
+      const f = await seed(); await ready(f)
+      const pid = await gapWaiting(f, 40)
+      for (const path of ['/pay-balance/release', '/pay-balance/resume']) {
+        const r = await post(f, path, { paymentIntentId: 'pi_screen' })
+        expect(r.status, `${path} ${JSON.stringify(r.body)}`).toBe(409)
+        expect(JSON.stringify(r.body)).toContain('That card payment isn\'t waiting on your card\'s bank, so there is nothing to confirm or cancel here.')
+      }
+      expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+      expect((await row(pid)).status).toBe('processing')
+      expect(await noteOn()).toEqual({ status: 'processing', notes: null })
+    })
+
+    it('the desk quote leaves it alone and never names it as waiting on the resident\'s card bank', async () => {
+      const f = await seed(); await ready(f)
+      const pid = await gapWaiting(f, 40)
+      const q = await deskQuoteOf(f, pid)
+      expect(q.status, JSON.stringify(q.body)).toBe(200)
+      expect(q.body.data.awaitingCard).toEqual([])
+      expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+      expect((await row(pid)).status).toBe('processing')
+    })
+
+    it('cash at the desk on it inside 30 minutes is never told "nothing has been charged" by the resident\'s bank', async () => {
+      const f = await seed(); await ready(f)
+      const pid = await gapWaiting(f, 5)
+      const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+        .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+        .send({ method: 'cash', amountTendered: 1000 })
+      expect(res.status).toBe(409)
+      expect(JSON.stringify(res.body)).not.toContain('waiting on the resident')
+      expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+    })
+  })
+
+  it('cash at the desk on a charge already paid says so in plain words — never asks staff to close or reopen the window, which reads the bill again by itself', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await bill(f)
+    await db.query(`UPDATE payments SET status = 'settled' WHERE id = $1`, [pid])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 1000 })
+    expect(res.status).toBe(409)
+    expect(JSON.stringify(res.body)).toContain('This charge was just paid or is on its way — the bill above was read again.')
+    expect(JSON.stringify(res.body)).not.toContain('status:')
+    expect(JSON.stringify(res.body)).not.toMatch(/close this window|open it again/i)
+  })
+
+  it('another company\'s desk cannot release this household\'s expired card hold: refused first, nothing canceled', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await heldOver(f)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordB}`)
+      .send({ method: 'cash', amountTendered: 1000 })
+    expect(res.status).toBe(403)
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+    expect((await row(pid)).status).toBe('processing')
+  })
+
+  // Review (pay7 fix pass 2): the Payments page's held-payment test reads this
+  // route's real answer, as the wire carries it (camelized), from one fixture —
+  // never a hand-written shape each side assumes.
+  it('balance-context for a held card payment, as the payer and as a co-tenant, is the Payments page\'s fixture', async () => {
+    const f = await seed(); await ready(f)
+    await bill(f)
+    needsConfirm()
+    await post(f, '/pay-balance', { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card', confirmOnScreen: true })
+    await db.query(`UPDATE users SET first_name = 'Jane', last_name = 'Doe' WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [f.tenant1Id])
+    const c = await db.connect()
+    let coToken: string
+    try {
+      const coId = await seedTenant(c)
+      await seedLeaseTenant(c, { leaseId: f.lease1Id, tenantId: coId })
+      const uid = (await c.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [coId])).rows[0].user_id
+      coToken = sign({ userId: uid, role: 'tenant', email: 'cofix@t.dev', profileId: coId })
+    } finally { c.release() }
+    await db.query(`UPDATE properties SET name = 'Oak Park' WHERE id = $1`, [f.aPropId])
+    await db.query(`UPDATE units SET unit_number = 'MH 09' WHERE id = $1`, [f.aUnitId])
+    waitingOnBank()
+    const payer = await context(f)
+    const co = await request(buildApp()).get('/api/payments/balance-context').set('Authorization', `Bearer ${coToken!}`)
+    expect(payer.status, JSON.stringify(payer.body)).toBe(200)
+    expect(co.status, JSON.stringify(co.body)).toBe(200)
+    const ids = new Map<string, string>()
+    const stable = JSON.stringify(camelCaseKeys({ payer: payer.body.data, coTenant: co.body.data }), null, 2)
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, (u) => {
+        if (!ids.has(u)) ids.set(u, `00000000-0000-4000-8000-${String(ids.size + 1).padStart(12, '0')}`)
+        return ids.get(u)!
+      })
+      .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z/g, '2026-10-04T18:30:00.000Z')
+      .replace(/"\d{4}-\d{2}-\d{2}"/g, '"2026-10-04"') + '\n'
+    const file = path.join(__dirname, '../../../tenant/src/pages/__fixtures__/balanceContext.awaiting.real.json')
+    if (process.env.PAYMENTS_FIXTURE_UPDATE === '1' || !fs.existsSync(file)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.writeFileSync(file, stable)
+    }
+    expect(fs.readFileSync(file, 'utf8'), 'balance-context\'s answer for a held card payment changed: run this test with PAYMENTS_FIXTURE_UPDATE=1, then the tenant PaymentsPage.awaiting test').toBe(stable)
+  })
+
+  it('a check posted by another company for the same person never releases this company\'s card hold', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await heldOver(f)
+    await request(buildApp()).post('/api/payments/post-payment')
+      .set('Authorization', `Bearer ${f.tokenLandlordB}`)
+      .send({ tenantId: f.tenant1Id, method: 'check', amount: 1000 })
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
+    expect((await row(pid)).status).toBe('processing')
+  })
+
+  it('cash at the desk on a bill whose card hold ran out is taken: the hold is released first, then the bill settled', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await heldOver(f)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 1000 })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_screen')
+    expect((await row(pid)).status).toBe('settled')
+    expect((await db.query<any>(`SELECT status FROM tenant_remittances WHERE stripe_payment_intent_id='pi_screen'`)).rows[0].status).toBe('failed')
+  })
+
+  it('a check posted for the household releases a card hold that ran out first, so it pays that bill', async () => {
+    const f = await seed(); await ready(f)
+    const pid = await heldOver(f)
+    const res = await request(buildApp()).post('/api/payments/post-payment')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ tenantId: f.tenant1Id, method: 'check', amount: 1000 })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_screen')
+    expect((await row(pid)).status).toBe('settled')
+    expect(res.body.data.paidAhead ?? 0).toBe(0)
+  })
+})
+
+// autopaycredit2 review problem 3: "Pay all" explained only the credit the
+// bills use. The run now carries the credit on file and where the rest goes.
+describe('Pay all: every dollar of the credit on file is explained', () => {
+  const context = (f: Fixture) => request(buildApp()).get('/api/payments/balance-context').set('Authorization', `Bearer ${f.tokenTenant1}`)
+  async function secondLease(f: Fixture): Promise<{ leaseId: string; unitId: string }> {
+    const c = await db.connect()
+    try {
+      const unitId = await seedUnit(c, { propertyId: f.aPropId, landlordId: f.aLid })
+      const leaseId = await seedLease(c, { unitId, landlordId: f.aLid })
+      await seedLeaseTenant(c, { leaseId, tenantId: f.tenant1Id, role: 'primary' })
+      return { leaseId, unitId }
+    } finally { c.release() }
+  }
+  const credit = async (f: Fixture, amount: number, leaseId: string | null) => db.query(
+    `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+     VALUES ($1,$2,$3,$4,$4,'other')`, [f.aLid, f.tenant1Id, leaseId, amount.toFixed(2)])
+
+  it('two bills of $300 and $400 with $1,000 of credit: $700 pays them, $300 stays for a later bill', async () => {
+    const f = await seed()
+    const two = await secondLease(f)
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 300, leaseId: f.lease1Id })
+    await seedPayment({ unitId: two.unitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 400, leaseId: two.leaseId })
+    await credit(f, 1000, null)
+    const res = await context(f)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const run = res.body.data.leases.map((l: any) => l.payAll)
+    expect(run.reduce((s: number, p: any) => s + p.usableCredit, 0)).toBe(700)
+    for (const p of run) {
+      expect(p).toMatchObject({
+        runCreditOnFile: 1000, runCreditKeptForLater: 300, runCreditKeptElsewhere: 0, runCreditAlsoHeld: 0,
+        runCreditRestNote: '$300.00 of your credit stays on your account for a later bill.',
+      })
+    }
+  })
+
+  it('credit tied to a lease outside the run is said to be kept for that lease, and the parts add up to the credit on file', async () => {
+    const f = await seed()
+    const two = await secondLease(f)
+    const three = await secondLease(f)
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1300, leaseId: f.lease1Id })
+    await seedPayment({ unitId: two.unitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1400, leaseId: two.leaseId })
+    await credit(f, 1000, null)
+    await credit(f, 270, three.leaseId)
+    const res = await context(f)
+    const p = res.body.data.leases.find((l: any) => l.leaseId === f.lease1Id).payAll
+    const usable = res.body.data.leases.reduce((s: number, l: any) => s + (l.payAll?.usableCredit ?? 0), 0)
+    expect(p.runCreditOnFile).toBe(1270)
+    expect(usable).toBe(1000)
+    expect(p.runCreditKeptElsewhere).toBe(270)
+    expect(Math.round((usable + p.runCreditKeptElsewhere + p.runCreditKeptForLater + p.runCreditAlsoHeld) * 100) / 100).toBe(1270)
+    expect(p.runCreditRestNote).toBe('$270.00 of your credit is kept for a bill on another lease.')
   })
 })

@@ -1324,7 +1324,19 @@ INPUT.addEventListener('keydown', (e) => {
   if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
 });
 
-addMsg('bot', "Hi! I'm Skye, your stay assistant. I can help with your booking details, check-in, the property, and requests like a late checkout. What can I do for you?");
+// 10/4 (Nic): every AI assistant is off until it is retrained. Until the
+// platform switch is on, the page says so plainly and the box stays locked.
+fetch(API + '/api/sales/assistant').then(r => r.json()).then(j => {
+  if (j && j.data && j.data.visible === true) {
+    addMsg('bot', "Hi! I'm Skye, your stay assistant. I can help with your booking details, check-in, the property, and requests like a late checkout. What can I do for you?");
+  } else {
+    addMsg('bot', 'Our stay assistant is turned off for now. For anything about your stay, please call or email the park directly.');
+    lock('The stay assistant is off for now.');
+  }
+}).catch(() => {
+  addMsg('bot', 'Our stay assistant is turned off for now. For anything about your stay, please call or email the park directly.');
+  lock('The stay assistant is off for now.');
+});
 INPUT.focus();
 </script>
 </body>

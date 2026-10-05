@@ -17,12 +17,15 @@
  * `invoices.sent_at` already existed and had never been set on a single row —
  * it is exactly the "the tenant has been told" stamp, so no migration.
  */
-import { allocateCredits } from '@gam/shared'
-import { query, queryOne } from '../db'
+import {
+  UTILITY_TYPE_LABEL, LEASE_COLUMN_LABEL, PAYMENT_ENTRY_DESCRIPTION_LABELS, humanize, type UtilityType,
+} from '@gam/shared'
+import { query } from '../db'
 import { logger } from '../lib/logger'
 import { emailInvoiceReady } from './email'
 import { portalLink } from '../lib/portalUrls'
 import { signEmailFactorToken } from '../routes/emailOtp'
+import { creditBeside, openBalanceSql, openAmountSql } from './openBalances'
 
 // S654 (Nic): the Pay now link signs the resident in with just their password.
 // Opening it proves the inbox, which is what the emailed code was for — so no
@@ -79,14 +82,208 @@ interface PendingInvoice {
   landlord_name: string | null
 }
 
-/** The same plain-English labeling the landlord's balance reminder uses. */
-export function labelFor(row: { type: string; notes: string | null }): string {
-  const note = String(row.notes ?? '').split(' — ')[0].trim()
-  if (row.type === 'rent') return 'Rent'
-  if (row.type === 'utility') return note || 'Utilities'
-  if (row.type === 'deposit') return note || 'Security deposit'
-  if (row.type === 'late_fee') return 'Late fee'
-  return note || row.type.replace(/_/g, ' ')
+// ─── What a charge line is called (decisions #17) ────────────────────────────
+//
+// Nic (10/3): "Bill and email lines name the utility: 'Water', 'Electric',
+// 'Trash', 'Sewer' — never a generic 'Utilities' line." Kim Harland's October
+// email read "Utilities $10.45" (her water) and "Utilities $25" (her trash).
+// And a line was named after whatever its note said first, so a utility the
+// desk had recorded read "Recorded as manual money_order payment (ref …)".
+//
+// One labeler, used by every place a charge is written out to a person: the
+// bill email, the balance reminder, the receipt, the Outstanding breakdown, the
+// agents (and the portal, through the API that carries `label`). The NAME
+// comes from what the charge is — the utility bill it pays
+// (utility_bills.payment_id → utility_type), its lease fee, its entry code, its
+// type; the note only supplies the DETAIL (the meter read, the period), and a
+// payment tag in a note ("Recorded as …", "covered by …", "Work trade — …") is
+// never either.
+
+export interface ChargeLabelRow {
+  type: string
+  notes?: string | null
+  entry_description?: string | null
+  /** utility_bills.utility_type of the bill this charge pays (chargeLabelColumnsSql). */
+  utility_type?: string | null
+  /** lease_fees.fee_type behind the charge (chargeLabelColumnsSql). */
+  fee_type?: string | null
+  /** lease_fees.description: the landlord's own name for the fee, when they gave one. */
+  fee_description?: string | null
+  /**
+   * A reopened charge only: the note of the charge first billed, the one a
+   * dispute or bank return reopened it from (chargeLabelColumnsSql). Its own
+   * note is only the reopen tag, so its name and detail come from this one.
+   */
+  origin_notes?: string | null
+}
+
+const SQL_ALIAS = /^[a-z_][a-z0-9_]*$/i
+
+/**
+ * The charges a line takes its name from, as a recursive WITH named `a` (id,
+ * lease_fee_id, notes, reversal_id, depth): the charge itself (depth 0), then,
+ * when a dispute or bank return reopened it (payments.reversal_id), the charge
+ * it was reopened from, and so on back to the charge first billed (a reopened
+ * line that was paid and disputed again). paymentReversal writes the reopened
+ * row with no utility bill, no lease fee and only its reopen note, so a
+ * disputed Water line read "Utility" everywhere it was owed again.
+ */
+function labelSourcesSql(p: string, a: string): string {
+  return `WITH RECURSIVE ${a}(id, lease_fee_id, notes, reversal_id, depth) AS (
+            SELECT ${p}.id, ${p}.lease_fee_id, ${p}.notes, ${p}.reversal_id, 0
+            UNION ALL
+            SELECT ${a}_o.id, ${a}_o.lease_fee_id, ${a}_o.notes, ${a}_o.reversal_id, ${a}_s.depth + 1
+              FROM ${a} ${a}_s
+              JOIN payment_reversals ${a}_rv ON ${a}_rv.id = ${a}_s.reversal_id
+              JOIN payments ${a}_o ON ${a}_o.id = ${a}_rv.payment_id
+             WHERE ${a}_s.depth < 8)`
+}
+
+/**
+ * The columns chargeLabel/chargeDetail read beyond the payments row itself
+ * (`p` is the payments alias, or a CTE over payments.*): utility_type,
+ * fee_type, fee_description and origin_notes. A charge a dispute or bank
+ * return reopened is named by the charge it was reopened from (decisions #17:
+ * a disputed Water line is still "Water" — on Outstanding, the ledger, the bill
+ * email, the balance reminder and the receipt), its own utility bill or lease
+ * fee first when it has one.
+ */
+export function chargeLabelColumnsSql(p = 'p'): string {
+  if (!SQL_ALIAS.test(p)) throw new Error(`chargeLabelColumnsSql: "${p}" is not a table alias`)
+  const feeId = `CASE WHEN ${p}.reversal_id IS NULL THEN ${p}.lease_fee_id
+                      ELSE (${labelSourcesSql(p, 'ls_f')}
+                            SELECT ls_f.lease_fee_id FROM ls_f
+                             WHERE ls_f.lease_fee_id IS NOT NULL ORDER BY ls_f.depth LIMIT 1) END`
+  return `CASE WHEN ${p}.reversal_id IS NULL
+               THEN (SELECT ub_l.utility_type FROM utility_bills ub_l
+                      WHERE ub_l.payment_id = ${p}.id ORDER BY ub_l.created_at, ub_l.id LIMIT 1)
+               ELSE (${labelSourcesSql(p, 'ls_u')}
+                     SELECT ub_l.utility_type FROM ls_u JOIN utility_bills ub_l ON ub_l.payment_id = ls_u.id
+                      ORDER BY ls_u.depth, ub_l.created_at, ub_l.id LIMIT 1) END AS utility_type,
+          (SELECT lf_l.fee_type FROM lease_fees lf_l WHERE lf_l.id = ${feeId}) AS fee_type,
+          (SELECT NULLIF(btrim(lf_l.description), '') FROM lease_fees lf_l WHERE lf_l.id = ${feeId}) AS fee_description,
+          CASE WHEN ${p}.reversal_id IS NOT NULL
+               THEN (${labelSourcesSql(p, 'ls_n')}
+                     SELECT ls_n.notes FROM ls_n WHERE ls_n.depth > 0 ORDER BY ls_n.depth DESC LIMIT 1) END AS origin_notes`
+}
+
+const UTILITY_WORDS: Array<[RegExp, UtilityType]> = [
+  [/\belectric(ity)?\b/i, 'electric'],
+  [/\bwater\b/i, 'water'],
+  [/\bsewer\b/i, 'sewer'],
+  [/\b(natural )?gas\b/i, 'gas'],
+  [/\btrash\b/i, 'trash'],
+  [/\bpropane\b/i, 'propane'],
+]
+/** A note segment that is about the PAYMENT, never the charge. */
+const TAG = /^(recorded as|covered by|paid (with|on time|off-platform|in full)|work trade|suspended|waived|reopened|corrected|correction|settled|refunded|s\d{3,}:)/i
+/** A note segment that only names the space ("RV 44"): the bill already says where. */
+const SPACE_ONLY = /^(rv|mh|apt|apartment|unit|lot|site|space|spot|house|cabin|storage)\s*#?\s*[\w-]{1,6}$/i
+
+function noteSegments(notes: string | null | undefined): string[] {
+  return String(notes ?? '').split(' — ').map(x => x.trim()).filter(Boolean)
+}
+/** The note's segments that describe the charge: no payment tags, no bare space name. */
+function describingSegments(notes: string | null | undefined): string[] {
+  return noteSegments(notes).filter(x => !TAG.test(x) && !SPACE_ONLY.test(x))
+}
+
+/**
+ * The segments that describe this charge: its own note's, or — a reopened
+ * charge — the note of the charge it was reopened from (origin_notes).
+ * paymentReversal writes a reopened row's note as the FIRST segment of the
+ * note it reopened plus the reopen tag ("Final electric — reopened after a
+ * payment reversal"), so that copied head is the original cut short: a final
+ * meter bill "Final electric — meter 100 → 200" would lose its read on every
+ * bill, receipt and reminder that shows the line owed again. When the row's
+ * own note is only that copy (or only the tag), the original's segments are
+ * read whole, with anything the row's note adds after them. A reopened row
+ * whose note was written to say something else keeps its own words.
+ */
+function chargeSegments(row: ChargeLabelRow): string[] {
+  const own = describingSegments(row.notes)
+  const origin = describingSegments(row.origin_notes)
+  if (!origin.length) return own
+  const originHead = (noteSegments(row.origin_notes)[0] ?? '').toLowerCase()
+  const copiedHead = !!originHead && (noteSegments(row.notes)[0] ?? '').toLowerCase() === originHead
+  if (own.length && !copiedHead) return own
+  const seen = new Set(origin.map(s => s.toLowerCase()))
+  return [...origin, ...own.filter(s => !seen.has(s.toLowerCase()))]
+}
+
+/** The utility a charge is for: its bill's type, then PROPANE, then the note's own words. */
+export function utilityOf(row: ChargeLabelRow): UtilityType | null {
+  const t = String(row.utility_type ?? '').toLowerCase()
+  if (t && t in UTILITY_TYPE_LABEL) return t as UtilityType
+  if (String(row.entry_description ?? '').toUpperCase() === 'PROPANE') return 'propane'
+  for (const seg of chargeSegments(row)) {
+    for (const [re, type] of UTILITY_WORDS) if (re.test(seg)) return type
+  }
+  return null
+}
+
+/** A lease fee's name on a bill: "Pet rent", "Trash" — the lease column label without its "(monthly)". */
+function feeName(feeType: string): string {
+  if (feeType === 'trash_fee') return UTILITY_TYPE_LABEL.trash
+  const label = (LEASE_COLUMN_LABEL as Record<string, string | undefined>)[feeType]
+  return label ? label.replace(/\s*\([^)]*\)\s*$/, '') : humanize(feeType)
+}
+
+/** What a charge line is called, in plain words. Never "Utilities". */
+export function chargeLabel(row: ChargeLabelRow): string {
+  const entry = String(row.entry_description ?? '').toUpperCase()
+  const firstNote = chargeSegments(row)[0] ?? ''
+  switch (row.type) {
+    case 'rent': return 'Rent'
+    case 'utility': {
+      const u = utilityOf(row)
+      return u ? UTILITY_TYPE_LABEL[u] : 'Utility'
+    }
+    case 'late_fee': return 'Late fee'
+    case 'home_payment': return 'Home payment'
+    case 'carried_balance': return 'Earlier balance'
+    case 'deposit':
+      return row.fee_description || (row.fee_type ? feeName(row.fee_type) : 'Security deposit')
+  }
+  if (row.fee_type) return row.fee_description || feeName(row.fee_type)
+  if (entry === 'PROPANE') return UTILITY_TYPE_LABEL.propane
+  if (entry === 'DEPOSIT') return 'Security deposit'
+  const coded = (PAYMENT_ENTRY_DESCRIPTION_LABELS as Record<string, string | undefined>)[entry]
+  if (coded) return coded
+  if (firstNote) return firstNote.length > 60 ? `${firstNote.slice(0, 57)}…` : firstNote
+  return row.type === 'fee' ? 'Fee' : humanize(row.type)
+}
+
+/**
+ * The detail behind a line, when its note carries one: the meter read, the
+ * period, the installment — never a payment tag, never the line's own name
+ * again. null when there is nothing to add.
+ */
+export function chargeDetail(row: ChargeLabelRow): string | null {
+  const label = chargeLabel(row).toLowerCase()
+  const out: string[] = []
+  for (const seg of chargeSegments(row)) {
+    const lower = seg.toLowerCase()
+    if (lower === label) continue
+    // "Electric meter 44999 → 45219 …" under "Electric": the read, not the word again.
+    const rest = lower.startsWith(label + ' ') ? seg.slice(label.length).trim() : seg
+    if (rest && rest.toLowerCase() !== label) out.push(rest)
+  }
+  // The note is the label itself when the charge has no other name ("Fee" from a note).
+  const detail = out.join(' — ')
+  return detail && detail.toLowerCase() !== label ? detail : null
+}
+
+/** @deprecated name kept for existing callers: chargeLabel. */
+export const labelFor = (row: ChargeLabelRow): string => chargeLabel(row)
+
+/** Why a line on the bill is not owed: a tag beside it, never its name. */
+function coveredHow(l: { status: string; amount: string; credit_applied: string; open: boolean }): string {
+  if (l.status === 'processing' || (l.status === 'pending' && !l.open)) return 'payment clearing'
+  if (l.status === 'paid_via_deposit') return 'taken from the deposit'
+  const amt = Math.round(Number(l.amount) * 100)
+  if (amt > 0 && Math.round(Number(l.credit_applied) * 100) >= amt) return 'paid with your account credit'
+  return 'already paid'
 }
 
 /**
@@ -141,12 +338,26 @@ export async function sendPendingInvoiceNotices(
     try {
       // Charge lines come from the payment rows this invoice created. Work-trade
       // suspended rows are excluded from the list and shown as one credit line:
-      // they are real charges that nobody owes.
-      const lines = await query<{ type: string; notes: string | null; amount: string; status: string; lease_id: string | null }>(
-        `SELECT type, notes, amount::text, status, lease_id
-           FROM payments
-          WHERE invoice_id = $1 AND work_trade_suspended_at IS NULL
-          ORDER BY CASE type WHEN 'rent' THEN 0 WHEN 'deposit' THEN 1 ELSE 2 END, created_at`,
+      // they are real charges that nobody owes. GAM's FlexPay pull is never part
+      // of a tenant's bill.
+      const lines = await query<{
+        id: string; type: string; notes: string | null; entry_description: string | null
+        amount: string; status: string; lease_id: string | null
+        utility_type: string | null; fee_type: string | null; fee_description: string | null
+        open: boolean; open_amount: string; credit_applied: string
+      }>(
+        `SELECT p.id, p.type, p.notes, p.entry_description, p.amount::text, p.status, p.lease_id,
+                ${chargeLabelColumnsSql('p')},
+                ${openBalanceSql('p')} AS open,
+                ${openAmountSql('p')}::text AS open_amount,
+                COALESCE((SELECT SUM(u.amount) FROM credit_uses u
+                           WHERE u.payment_id = p.id AND u.status = 'applied'), 0)::text AS credit_applied
+           FROM payments p
+          WHERE p.invoice_id = $1 AND p.work_trade_suspended_at IS NULL
+            AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
+            -- a disputed original: its reopened row is the line that is owed
+            AND p.status <> 'returned'
+          ORDER BY CASE p.type WHEN 'rent' THEN 0 WHEN 'deposit' THEN 1 ELSE 2 END, p.created_at`,
         [inv.id])
       // S654 (Nic): "Work trade people are on work trade. There's no bills going
       // out to those people." A month the trade covers in full has nothing to
@@ -159,59 +370,24 @@ export async function sendPendingInvoiceNotices(
         result.skippedCovered++
         continue
       }
-      // S653 (Nic): "most people are going to see that email, think they owe
-      // $900 or whatever... they just saw the headline." The headline is what
-      // they will actually be asked for: what is still OPEN on this bill, less
-      // the paid-ahead money this month may use, less any credit on account.
-      // A line already settled — covered by paid-ahead credit when the bill
-      // was made, or a check that beat the email — is shown as covered, not due.
-      const paidAlready = Math.round(lines
-        .filter(l => l.status === 'settled' || l.status === 'processing')
-        .reduce((s, l) => s + Number(l.amount), 0) * 100) / 100
 
-      // S648 (Nic): "every dollar should only be counted once." Every invoice
-      // email used to claim the person's WHOLE credit, so two bills in one run
-      // each showed it coming off. Spent once across their open bills with this
-      // landlord, oldest first, lease-tied credits only on their own lease.
-      const pool = await query<{ lease_id: string | null; amount: string }>(
-        `SELECT lease_id, amount_remaining::text AS amount
-           FROM tenant_credits
-          WHERE tenant_id = $1 AND landlord_id = $2
-            AND status = 'active' AND amount_remaining > 0`,
-        [inv.tenant_id, inv.landlord_id])
-      const openBills = pool.length ? await query<{ id: string; lease_id: string | null; open: string; due: string }>(
-        `SELECT i.id, i.lease_id, to_char(i.due_date, 'YYYY-MM-DD') AS due,
-                -- S654: a suspended work-trade line is already outside
-                -- total_amount (the S634 shape, every writer); netting it again
-                -- here drove these balances negative.
-                (i.total_amount - COALESCE((SELECT SUM(p.amount) FROM payments p
-                   WHERE p.invoice_id = i.id
-                     AND p.status IN ('settled','processing')), 0))::text AS open
-           FROM invoices i
-          WHERE i.tenant_id = $1 AND i.landlord_id = $2
-            AND (i.status IN ('pending','partial') OR i.id = $3)`,
-        [inv.tenant_id, inv.landlord_id, inv.id]) : []
+      // S655 (Nic, 10/2): THE FULL BILL. The headline is what this bill still
+      // owes — every line that is open, at what it still owes — with nothing
+      // taken off for credit: "credit auto-applies only when it covers the
+      // WHOLE bill; otherwise the tenant is asked" when they pay. A line that
+      // was already paid (a check that beat the email, a bill the account
+      // credit paid in full) is listed as covered, not due.
+      const total = Math.round(lines.reduce((s, l) => s + (l.open ? Math.round(Number(l.open_amount) * 100) : 0), 0)) / 100
 
-      const invoiceTotal = Number(inv.total_amount)
-      const openNow = Math.round(Math.max(0, invoiceTotal - paidAlready) * 100) / 100
-      // S653: the paid-ahead money this bill's month may still use (capped by
-      // the resident's monthly draw, if they set one). It is netted when they
-      // pay, so the headline nets it now.
+      // The credit Pay Now will offer them for this bill: the household plan's
+      // share for this lease (oldest bill first, eligible lines only, within a
+      // monthly draw cap). Said beside the bill, never netted off it.
       const leaseId = lines.find(l => l.lease_id)?.lease_id ?? null
-      let prepaidApplied = 0
-      if (leaseId && openNow > 0) {
-        const { prepaidDrawAvailable } = await import('./prepaidRelease')
-        const { db } = await import('../db')
-        const month = inv.due_date.slice(0, 7) + '-01'
-        prepaidApplied = Math.min(openNow, (await prepaidDrawAvailable(db as any, leaseId, month)).available)
+      let creditAvailable = 0
+      if (leaseId && inv.tenant_id && total > 0) {
+        const c = await creditBeside({ tenantId: inv.tenant_id, landlordIds: [inv.landlord_id], leaseIds: [leaseId] })
+        creditAvailable = c.usableByLease.get(leaseId) ?? 0
       }
-      const creditApplied = pool.length
-        ? Math.min(Math.max(0, openNow - prepaidApplied), allocateCredits(
-            pool.map(c => ({ leaseId: c.lease_id, amount: Number(c.amount) })),
-            openBills.map(b => ({ key: b.id, leaseId: b.lease_id, total: Number(b.open), earliestDue: b.due })),
-          ).applied[inv.id] ?? 0)
-        : 0
-      const total = Math.round((openNow - prepaidApplied - creditApplied) * 100) / 100
 
       await emailInvoiceReady(inv.tenant_email, {
         tenantName: inv.tenant_first_name || 'there',
@@ -221,13 +397,14 @@ export async function sendPendingInvoiceNotices(
         dueDateLabel: inv.due_label,
         total,
         lines: lines.map(l => ({
-          label: labelFor(l), amount: Number(l.amount),
-          covered: l.status === 'settled' || l.status === 'processing',
-          coveredHow: (l.notes ?? '').includes('prepaid credit') ? 'paid-ahead credit' : 'already paid',
+          label: chargeLabel(l),
+          detail: chargeDetail(l),
+          amount: Number(l.amount),
+          covered: !l.open,
+          coveredHow: coveredHow(l),
         })),
         workTradeCredit: Number(inv.work_trade_credit_amount) || 0,
-        prepaidApplied,
-        creditApplied,
+        creditAvailable,
         portalUrl: payNowLink(inv),
         landlordName: inv.landlord_name || undefined,
         updated: !!opts.updated,

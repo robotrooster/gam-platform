@@ -236,4 +236,30 @@ describe('PATCH /api/background/:id/decision — approval drafts the packet', ()
     expect(res.body.data.lease).toBeNull()
     expect(await liveDrafts(fx.unitId)).toHaveLength(0)
   })
+  // 10/4 (Nic): approved a walk-up, closed the window at "Which space?", and the
+  // reopened screen offered Approve again — which answered "Cannot decide a
+  // check with status 'approved'". Stuck. Approving again now lands on the step.
+  it('approving a check that is already approved answers with the next step, and changes nothing', async () => {
+    const fx = await seedFixture({ withUnit: false, term: 6, status: 'complete' })
+    const tok = llToken(fx.landlordUserId, fx.landlordId)
+    await request(buildApp()).patch(`/api/background/${fx.checkId}/decision`).set('Authorization', `Bearer ${tok}`).send({ decision: 'approved' })
+    const before = (await db.query<any>('SELECT decided_at, expires_at FROM background_checks WHERE id=$1', [fx.checkId])).rows[0]
+    const again = await request(buildApp()).patch(`/api/background/${fx.checkId}/decision`).set('Authorization', `Bearer ${tok}`).send({ decision: 'approved' })
+    expect(again.status).toBe(200)
+    expect(again.body.data).toMatchObject({ alreadyApproved: true, needsUnit: true, lease: null })
+    const after = (await db.query<any>('SELECT status, decided_at, expires_at FROM background_checks WHERE id=$1', [fx.checkId])).rows[0]
+    expect(after.status).toBe('approved')
+    expect(after.decided_at).toEqual(before.decided_at)
+    expect(after.expires_at).toEqual(before.expires_at)
+  })
+
+  it('denying a check that is already approved is refused in plain words', async () => {
+    const fx = await seedFixture({ withUnit: false, term: 6, status: 'complete' })
+    const tok = llToken(fx.landlordUserId, fx.landlordId)
+    await request(buildApp()).patch(`/api/background/${fx.checkId}/decision`).set('Authorization', `Bearer ${tok}`).send({ decision: 'approved' })
+    const res = await request(buildApp()).patch(`/api/background/${fx.checkId}/decision`).set('Authorization', `Bearer ${tok}`).send({ decision: 'denied' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/already approved/i)
+    expect(res.body.error).not.toMatch(/status '/)
+  })
 })

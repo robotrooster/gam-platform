@@ -47,6 +47,7 @@ import {
   ensureConnectAccount, createOnboardingSession, fetchAccountStatus,
 } from '../services/stripeConnect'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 import { landlordScopeIds, ownsLandlord } from '../lib/landlordScope'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 
@@ -1269,7 +1270,10 @@ pmRouter.get('/companies/:id/owners/:landlordId/statement', async (req: any, res
     const { ownerStatement } = await import('../services/ownerStatement')
     const month = typeof req.query.month === 'string'
       ? req.query.month
-      : new Date().toISOString().slice(0, 7)
+      // S655: this month by GAM's home calendar (Phoenix), not the UTC date,
+      // which turns over at 5 pm here (on the last day it showed next month).
+      : todayIn(null).slice(0, 7)
+    if (!/^\d{4}-(0[1-9]|1[0-2])(-\d{2})?$/.test(month)) throw new AppError(400, 'month must be YYYY-MM')
     const statement = await ownerStatement({
       landlordId: req.params.landlordId,
       periodMonth: month,
@@ -1307,7 +1311,10 @@ pmRouter.get('/my-statements', async (req: any, res, next) => {
 
     const month = typeof req.query.month === 'string'
       ? req.query.month
-      : new Date().toISOString().slice(0, 7)
+      // S655: this month by GAM's home calendar (Phoenix), not the UTC date,
+      // which turns over at 5 pm here (on the last day it showed next month).
+      : todayIn(null).slice(0, 7)
+    if (!/^\d{4}-(0[1-9]|1[0-2])(-\d{2})?$/.test(month)) throw new AppError(400, 'month must be YYYY-MM')
 
     // S645 — EVERY manager, not only the ones who opened a portal.
     //

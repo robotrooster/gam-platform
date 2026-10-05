@@ -1,11 +1,13 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { z } from 'zod'
-import { db, queryOne } from '../db'
-import { requireAuth, requireLandlord, requireBooksRead, requireBooksWrite } from '../middleware/auth'
+import { db, query, queryOne } from '../db'
+import { requireAuth, requireLandlord, requireBooksRead, requireBooksWrite, getScopedPropertyIds } from '../middleware/auth'
+import { refuseScopedStaff } from './reports'
+import { landlordScopeIds, ownsLandlord } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { isDisposableEmail } from '../lib/email'
 import { todayIn, monthStartOf } from '../lib/timezone'
-import { landlordIncomeSql, landlordDepositSql } from '../services/landlordPL'
+import { parseIncomeBasis, basisMeta, incomeEvents, incomeTotals, summarize, lineList } from '../services/incomeBasis'
 
 export const booksRouter = Router()
 booksRouter.use(requireAuth)
@@ -16,10 +18,56 @@ booksRouter.use(requireAuth)
 // and 403 if the claimed client isn't an assigned scope, so by the time
 // we reach this helper, activeClientId is either a validated landlord_id
 // or the caller is not a bookkeeper.
-function landlordScope(user: any) {
+//
+// S655 SECURITY FIX — A LANDLORD'S SESSION NAMES NO COMPANY (S633).
+// This used to end `return user.landlordId || user.profileId`. Since S633 a
+// landlord owner's pass carries profileId = null and landlordId = null (the
+// account is not an entity; its companies ride in landlordIds), so that line
+// returned null for EVERY landlord owner — and null is the admin "see all"
+// value every `(landlord_id = $1 OR $1 IS NULL)` query below honors. A landlord
+// opening Books saw every other landlord's rent roll and owner statement.
+//
+// The rule now: null is returned for an admin and nobody else. A landlord gets
+// the company it chose (X-Client-Id, ownership-checked by the middleware
+// below), or its only company; an account with several that chose none is
+// ASKED (400), never defaulted — S654: "None is the default". A team role
+// (a property manager with books.view) gets its one company. Anyone else is
+// refused rather than handed a scope.
+function landlordScope(user: any): string | null {
   if (user.role === 'admin' || user.role === 'super_admin') return null
-  if (user.role === 'bookkeeper') return user.activeClientId
-  return user.landlordId || user.profileId
+  if (user.role === 'bookkeeper') {
+    if (!user.activeClientId) throw new AppError(400, 'X-Client-Id header required for bookkeeper requests')
+    return user.activeClientId
+  }
+  if (user.role === 'landlord') {
+    if (user.activeClientId) return user.activeClientId
+    const owned = landlordScopeIds(user)
+    if (owned.length === 1) return owned[0]
+    if (owned.length === 0) throw new AppError(400, 'No landlord scope on this user')
+    throw new AppError(400, BOOKS_CHOOSE_COMPANY)
+  }
+  const teamIds = landlordScopeIds(user)
+  if (teamIds.length === 1) return teamIds[0]
+  throw new AppError(403, 'There are no company books on this account.')
+}
+
+/** The 400 an account with several companies gets until it picks one (Books shows its picker on it). */
+export const BOOKS_CHOOSE_COMPANY = "You own more than one company. Choose which company's books to open."
+
+/**
+ * Does this landlord account own (or co-own) `landlordId`? The token first,
+ * then the database — a company created after sign-in is still the account's
+ * (S629), and a founding company predating landlord_members has no member row.
+ */
+async function accountOwnsCompany(user: any, landlordId: string): Promise<boolean> {
+  if (ownsLandlord(user, landlordId)) return true
+  if (!/^[0-9a-f-]{36}$/i.test(landlordId)) return false
+  const rows = await query<{ one: number }>(
+    `SELECT 1 AS one FROM landlord_members WHERE user_id = $1 AND landlord_id = $2::uuid
+     UNION ALL
+     SELECT 1 FROM landlords WHERE id = $2::uuid AND user_id = $1
+     LIMIT 1`, [user.userId, landlordId])
+  return rows.length > 0
 }
 
 // S459 — owner generalization. GAM Books is reused by BOTH landlords and
@@ -71,6 +119,24 @@ function blockBusinessOwner(req: Request, _res: Response, next: NextFunction) {
 // own authz check.
 booksRouter.use(async (req: Request, _res: Response, next: NextFunction) => {
   try {
+    // S655: a landlord account with more than one company names the one whose
+    // books it is reading with the same header a bookkeeper uses. It must be
+    // the account's own company; with no header, landlordScope takes the
+    // account's only company or asks which.
+    if (req.user?.role === 'landlord') {
+      // The company list is how Books learns which companies there are, so a
+      // remembered choice that is no longer the account's never blocks it.
+      if (req.path === '/companies') return next()
+      const headerVal = req.headers['x-client-id']
+      const clientId = Array.isArray(headerVal) ? headerVal[0] : headerVal
+      if (clientId) {
+        if (!(await accountOwnsCompany(req.user, clientId))) {
+          throw new AppError(403, 'That company is not yours. Choose one of your own companies in Books.')
+        }
+        ;(req.user as any).activeClientId = clientId
+      }
+      return next()
+    }
     if (req.user?.role !== 'bookkeeper') return next()
     // Discovery + invite routes don't need a scoped client — they ARE
     // how a bookkeeper finds out which clients they're assigned to.
@@ -804,6 +870,27 @@ booksRouter.post('/payroll/runs/:id/void', requireBooksWrite, async (req, res, n
 // should migrate; we expose access_level under both keys for
 // backward-compat reads.
 
+// GET /api/books/companies — S655: the companies a landlord account owns, so
+// Books can ask which company's books to open when there is more than one
+// (landlordScope never picks one). Read fresh, not from the pass, so a
+// company made after sign-in is listed (S629). Anyone else gets an empty list:
+// a bookkeeper picks from /bookkeeper/clients, a team member has one company.
+booksRouter.get('/companies', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'landlord') return res.json({ success: true, data: [] })
+    const rows = await query<any>(
+      `SELECT l.id AS landlord_id, l.business_name,
+              (SELECT string_agg(p.name, ', ' ORDER BY p.name) FROM properties p WHERE p.landlord_id = l.id) AS property_names
+         FROM landlords l
+        WHERE l.id = ANY($2::uuid[])
+           OR l.id IN (SELECT landlord_id FROM landlord_members WHERE user_id = $1)
+           OR l.user_id = $1
+        ORDER BY l.business_name NULLS LAST, l.created_at`,
+      [req.user.userId, landlordScopeIds(req.user)])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
 // GET /api/books/bookkeeper/clients — list all clients for logged-in bookkeeper
 // S131 bug fix: was gated by requireLandlord (admin/super_admin/landlord
 // only), which blocked the bookkeeper-self-fetch path the inner role
@@ -882,7 +969,10 @@ booksRouter.post('/bookkeeper/assign', requireLandlord, async (req, res, next) =
     // S385 fix: landlord callers can only assign bookkeepers to their own
     // books. Pre-fix this was unguarded — any landlord could create a
     // bookkeeper_scopes row pointing at any other landlord.
-    if (req.user.role === 'landlord' && landlordId !== req.user.profileId) {
+    // S655: profileId names no company since S633 (null for every landlord),
+    // so this compared against null and refused every landlord. The account's
+    // own companies are the test.
+    if (req.user.role === 'landlord' && !(await accountOwnsCompany(req.user, String(landlordId)))) {
       throw new AppError(403, 'Landlords can only assign bookkeepers to their own books')
     }
     // S592 ([[gam-foreign-ref-write-scope]]): the target MUST already be a
@@ -920,7 +1010,7 @@ booksRouter.delete('/bookkeeper/revoke', requireLandlord, async (req, res, next)
     // own books. Pre-fix any landlord could DELETE any other landlord's
     // bookkeeper scope row — denial-of-service against another landlord's
     // books access.
-    if (req.user.role === 'landlord' && landlordId !== req.user.profileId) {
+    if (req.user.role === 'landlord' && !(await accountOwnsCompany(req.user, String(landlordId)))) {
       throw new AppError(403, 'Landlords can only revoke bookkeepers from their own books')
     }
     await db.query(
@@ -1192,6 +1282,15 @@ booksRouter.delete('/transactions/:id', requireBooksWrite, async (req, res, next
 
 booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
   try {
+    // S655: the GAM income in this P&L follows the "Money received" /
+    // "Money billed" switch (default Money received), the landlord reports' own.
+    const basis = parseIncomeBasis(req.query.basis)
+    // S655 (gam-audience-data-isolation): the Books P&L is the whole company's
+    // (its ledger accounts and every property's income), so a team member
+    // assigned to some properties is refused it in plain words — as the
+    // Reports owner statement and tax summary are. Reports' own P&L shows
+    // them their properties.
+    await refuseScopedStaff(req.user, 'Books profit and loss')
     const { col, id: lid } = ownerScope(req.user)
     const { startDate, endDate } = req.query
     // S654: the default range runs to TODAY in GAM's home zone (Phoenix, the
@@ -1251,20 +1350,12 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
       { const s = new Date(String(start) + 'T00:00:00'); const e = new Date(String(end) + 'T00:00:00')
         for (let d = new Date(s.getFullYear(), s.getMonth(), 1); d <= e; d.setMonth(d.getMonth() + 1))
           monthKeys.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`) }
-      gamPL = await computeLandlordPL(lid, String(start), String(end), monthKeys)
+      gamPL = await computeLandlordPL(lid, String(start), String(end), monthKeys, basis)
       rentIncome = [{ total: gamPL.gross.total }]
-    } else {
-      // S654: the shared income definition and the shared P&L's window (settled
-      // in the range, the whole last day), not every settled row by due date,
-      // which counted deposits, GAM's fees and held paid-ahead money as rent.
-      const r = await db.query(
-        `SELECT COALESCE(SUM(p.amount), 0) AS total FROM payments p
-          WHERE (p.landlord_id=$1 OR $1 IS NULL) AND p.status='settled'
-            AND ${landlordIncomeSql('p')}
-            AND p.settled_at >= $2::date AND p.settled_at < ($3::date + 1)`,
-        [lid, start, end]
-      ).catch(() => ({ rows: [{ total: 0 }] }))
-      rentIncome = r.rows
+    } else if (col === 'landlord_id') {
+      // Admin (every landlord): the same income facts, platform-wide.
+      const t = await incomeTotals({ landlordIds: null, start: String(start), end: String(end), basis })
+      rentIncome = [{ total: t.total }]
     }
 
     // S459: for a business owner, pull REAL collected revenue the platform
@@ -1305,6 +1396,7 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
         // S568 detangle: the SAME shared P&L the landlord reports use (categorized
         // income, deposits-out, all expenses). Null for admin/business callers.
         gamPL,
+        meta: { basis: basisMeta(basis) },
         // Auto-pulled real sales (POS + collected invoices). Surfaced
         // separately so totalIncome/netIncome stay journal-only (no landlord
         // behavior change); business P&L UI folds this into its net.
@@ -1484,6 +1576,10 @@ booksRouter.post('/bills/:id/pay', requireBooksWrite, async (req, res, next) => 
 
 booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) => {
   try {
+    // S655 (gam-audience-data-isolation): the company's cash — every
+    // property's money in, payroll, bills, payouts — so a team member assigned
+    // to some properties is refused it in plain words.
+    await refuseScopedStaff(req.user, 'Books cash flow')
     const { col, id: lid } = ownerScope(req.user)
     const { startDate, endDate } = req.query
     // S654: year-to-date ends today in Phoenix, not on the UTC date.
@@ -1491,16 +1587,18 @@ booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) =
     const start = (startDate as string) || `${today.slice(0, 4)}-01-01`
     const end   = (endDate   as string) || today
 
-    const [rentRows, incomeRows, expenseRows, payrollRows, billRows, disbRows] = await Promise.all([
-      // S654: rent collected is the landlord's income by the shared definition;
-      // deposits are held, not income, and are reported apart (depositsHeld).
-      db.query(
-        `SELECT COALESCE(SUM(p.amount) FILTER (WHERE ${landlordIncomeSql('p')}),0) AS total,
-                COALESCE(SUM(p.amount) FILTER (WHERE ${landlordDepositSql('p')}),0) AS deposits
-         FROM payments p JOIN units u ON u.id=p.unit_id JOIN landlords l ON l.id=u.landlord_id
-         WHERE (l.id=$1::uuid OR $1 IS NULL) AND p.status='settled' AND p.due_date BETWEEN $2 AND $3`,
-        [lid, start, end]
-      ).catch(() => ({ rows: [{ total: 0, deposits: 0 }] })),
+    // S655: money IN through GAM, by the day it ARRIVED (Money received): each
+    // bill's own money on its settle day, paid-ahead money on its own line on
+    // the day it arrived (Todd's two-month check: $460 rent + $460 paid ahead,
+    // both in September), register sales and stays. A credit the landlord gave
+    // never appears: no money moved. Deposits are held, not income, and are
+    // reported apart. Bank-filed other income is not repeated here (the Books
+    // ledger's own income transactions are).
+    const gamEvents = col === 'landlord_id'
+      ? await incomeEvents({ landlordIds: lid ? [lid] : null, start, end, basis: 'received' })
+      : null
+    const gamIn = gamEvents ? summarize(gamEvents, 'received') : null
+    const [incomeRows, expenseRows, payrollRows, billRows, disbRows] = await Promise.all([
       db.query(
         `SELECT COALESCE(SUM(amount),0) AS total FROM books_transactions
          WHERE (${col}=$1 OR $1 IS NULL) AND type='income' AND date BETWEEN $2 AND $3`,
@@ -1531,31 +1629,94 @@ booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) =
       ).catch(() => ({ rows: [{ total: 0 }] })),
     ])
 
-    const rentCollected = +rentRows.rows[0]?.total || 0
-    const depositsHeld  = +rentRows.rows[0]?.deposits || 0
+    const r2 = (n: number) => Math.round(n * 100) / 100
+    const L = gamIn?.lines
+    const paidAhead     = L ? L.paidAhead : 0
+    const registerAndStays = L ? L.registerAndStays : 0
+    // Only money that ARRIVED: each bill's own money (rent, fees, utilities,
+    // late fees, home payments, balances collected) and a deposit shortfall the
+    // tenant paid, less returns and disputes.
+    const ARRIVAL_LINES = ['rent', 'fees', 'utilities', 'lateFees', 'homeSale', 'balances', 'depositShortfall', 'returned'] as const
+    const rentCollected = L ? r2(ARRIVAL_LINES.reduce((s, k) => s + L[k], 0)) : 0
+    // The move-out lines of the P&L (kept from deposits, deposit deductions,
+    // paid-ahead money that went into the settlement) are not money arriving
+    // when the deposit was the landlord's to hold: it arrived when it was paid
+    // (deposits held) and is only kept now. Two parts of a move-out ARE cash:
+    //   - a deposit GAM held in escrow: GAM pays the landlord's share out at
+    //     finalize (depositReturn's settlement transfer), so it arrives then;
+    //   - paid-ahead money handed back: it counted when it arrived, so what
+    //     goes back out at move-out is money leaving (a move-out's lines
+    //     adding up below $0 means more paid-ahead money went back than the
+    //     deductions kept).
+    //
+    // A move-out's facts are added up per MOVE-OUT (the deposit return), never
+    // per lease: depositReturn sweeps the whole renewal chain, so a swept bill
+    // can sit on the previous lease while the deposit and its deductions sit on
+    // the new one. Grouped by lease, the swept bills read as money kept and the
+    // move-out's own lines as money going out — cash that never moved. Who held
+    // the deposit is read off the move-out's own lease, where depositReturn
+    // reads it.
+    const MOVE_OUT_LINES = new Set(['keptFromDeposits', 'depositDeductions', 'paidAheadRefunded'])
+    const byMoveOut = new Map<string, number>()
+    for (const e of gamEvents ?? []) {
+      if (!e.inTotal || !MOVE_OUT_LINES.has(e.line)) continue
+      const k = e.moveOutId ?? ''
+      byMoveOut.set(k, (byMoveOut.get(k) ?? 0) + e.amount)
+    }
+    const escrowMoveOuts = new Set(byMoveOut.size
+      ? (await db.query<{ id: string }>(
+          `SELECT dr.id FROM deposit_returns dr
+            WHERE dr.id = ANY($1::uuid[])
+              AND EXISTS (SELECT 1 FROM security_deposits sd
+                           WHERE sd.lease_id = dr.lease_id AND sd.held_by = 'gam_escrow')`,
+          [[...byMoveOut.keys()].filter(Boolean)])).rows.map(r => r.id)
+      : [])
+    let moveOutCash = 0, keptAtMoveOut = 0
+    for (const [moveOutId, amt] of byMoveOut) {
+      if (escrowMoveOuts.has(moveOutId)) moveOutCash += amt
+      else { moveOutCash += Math.min(0, amt); keptAtMoveOut += Math.max(0, amt) }
+    }
+    moveOutCash = r2(moveOutCash)
+    keptAtMoveOut = r2(keptAtMoveOut)
+    const depositsHeld  = gamIn ? gamIn.beside.depositsHeld : 0
+    // A chargeback's fees (Stripe's dispute fee, the buyer's card fee) are
+    // netted from the landlord's payout: money going out.
+    const chargebackFees = gamIn ? gamIn.beside.chargebackFees : 0
+    // 10/4 (#38 Q4): the card fee a guest got back with an early check-out
+    // refund is netted from the payout too.
+    const refundCardFees = gamIn ? gamIn.beside.refundCardFees : 0
     const otherIncome   = +incomeRows.rows[0]?.total || 0
     const expenses      = +expenseRows.rows[0]?.total || 0
     const payroll       = +payrollRows.rows[0]?.total || 0
     const bills         = +billRows.rows[0]?.total || 0
     const disbursements = +disbRows.rows[0]?.total || 0
-    const totalInflows  = rentCollected + otherIncome
-    const totalOutflows = expenses + payroll + bills
-    const opNet         = totalInflows - totalOutflows
+    const totalInflows  = r2(rentCollected + paidAhead + registerAndStays + moveOutCash + otherIncome)
+    const totalOutflows = r2(expenses + payroll + bills + chargebackFees + refundCardFees)
+    const opNet         = r2(totalInflows - totalOutflows)
 
     res.json({
       success: true,
       data: {
         period: { start, end },
         operating: {
-          inflows:  { rentCollected, otherIncome, total: totalInflows },
-          outflows: { expenses, payroll, bills, total: totalOutflows },
+          inflows:  { rentCollected, paidAhead, registerAndStays, moveOut: moveOutCash, otherIncome, total: totalInflows },
+          outflows: { expenses, payroll, bills, chargebackFees, refundCardFees, total: totalOutflows },
           net: opNet,
         },
+        // S655: kept from deposits the landlord already held — counted when
+        // the deposit was paid, so not money arriving now (outside every total).
+        nonCash: { keptAtMoveOut },
         financing: { disbursements, total: disbursements },
-        netCashFlow: opNet - disbursements,
+        netCashFlow: r2(opNet - disbursements),
         // S654: deposits collected in the range — held for tenants, not income,
         // so outside every total above.
         depositsHeld,
+        // S655: still clearing at the bank — not arrived yet, so not counted.
+        stillClearing: gamIn ? gamIn.beside.clearing : 0,
+        meta: {
+          basis: basisMeta('received'),
+          note: 'Money in, by the day it arrived. Money paid ahead is its own line on the day it arrived. A credit you give never appears. A deposit you already held and keep at move-out is not new money.',
+        },
       }
     })
   } catch (e) { next(e) }
@@ -1567,6 +1728,10 @@ booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) =
 
 booksRouter.get('/reports/owner-statements', requireBooksRead, blockBusinessOwner, async (req, res, next) => {
   try {
+    const basis = parseIncomeBasis(req.query.basis)
+    // S655 (gam-audience-data-isolation): a company document, refused to a
+    // team member assigned to some properties — as the Reports owner statement is.
+    await refuseScopedStaff(req.user, 'owner statement')
     const lid = landlordScope(req.user)
     const { startDate, endDate } = req.query
     // S654: month-to-date in Phoenix. The UTC date flips at 5 pm here, and on
@@ -1588,29 +1753,23 @@ booksRouter.get('/reports/owner-statements', requireBooksRead, blockBusinessOwne
         `SELECT p.id, p.name,
                 COUNT(u.id) AS unit_count,
                 COUNT(u.id) FILTER (WHERE u.status='active') AS occupied,
-                COALESCE(SUM(u.rent_amount) FILTER (WHERE u.status='active'), 0) AS expected_rent,
-                -- S654: collected = the shared income definition; deposits
-                -- are held, not collected income, and are listed apart.
-                COALESCE(
-                  (SELECT SUM(py.amount) FROM payments py
-                   JOIN units u2 ON u2.id = py.unit_id
-                   WHERE u2.property_id = p.id
-                     AND py.status='settled' AND ${landlordIncomeSql('py')}
-                     AND py.due_date BETWEEN $2 AND $3), 0
-                ) AS collected,
-                COALESCE(
-                  (SELECT SUM(py.amount) FROM payments py
-                   JOIN units u2 ON u2.id = py.unit_id
-                   WHERE u2.property_id = p.id
-                     AND py.status='settled' AND ${landlordDepositSql('py')}
-                     AND py.due_date BETWEEN $2 AND $3), 0
-                ) AS deposits_held
+                COALESCE(SUM(u.rent_amount) FILTER (WHERE u.status='active'), 0) AS expected_rent
          FROM properties p
          LEFT JOIN units u ON u.property_id = p.id
          WHERE p.landlord_id = $1
          GROUP BY p.id ORDER BY p.name`,
-        [landlord.id, start, end]
+        [landlord.id]
       )
+      // S655: collected = the property's income under the basis (the landlord
+      // reports' own facts); deposits are held, not collected income, and are
+      // listed apart.
+      const events = await incomeEvents({ landlordIds: [landlord.id], start, end, basis })
+      for (const p of properties as any[]) {
+        const t = summarize(events.filter(e => e.propertyId === p.id), basis)
+        p.collected = t.total
+        p.deposits_held = t.beside.depositsHeld
+        p.lines = lineList(t.lines)
+      }
       const { rows: disbRows } = await db.query(
         `SELECT COALESCE(SUM(amount),0) AS total FROM disbursements
          WHERE landlord_id=$1 AND status='settled' AND target_date BETWEEN $2 AND $3`,
@@ -1625,7 +1784,7 @@ booksRouter.get('/reports/owner-statements', requireBooksRead, blockBusinessOwne
       return { landlord, properties, totalExpected, totalCollected, totalDepositsHeld, totalDisbursed, variance: totalCollected - totalExpected }
     }))
 
-    res.json({ success: true, data: statements })
+    res.json({ success: true, data: statements, meta: { basis: basisMeta(basis) } })
   } catch (e) { next(e) }
 })
 
@@ -1683,7 +1842,8 @@ booksRouter.get('/tax/summary', requireBooksRead, blockBusinessOwner, async (req
     // hardcoded per CLAUDE.md S177 carve-out — see
     // services/taxForms.ts and migrations/*_state_tax_forms.sql.
     const { getApplicableTaxForms } = await import('../services/taxForms')
-    const filingDeadlines = await getApplicableTaxForms(lid, +year)
+    // An admin (lid null, every landlord) gets the forms every landlord files, as before.
+    const filingDeadlines = await getApplicableTaxForms(lid as string, +year)
 
     res.json({
       success: true,
@@ -1701,7 +1861,12 @@ booksRouter.get('/tax/summary', requireBooksRead, blockBusinessOwner, async (req
 // Rent roll — sync from GAM
 booksRouter.get('/rent-roll', requireBooksRead, blockBusinessOwner, async (req, res, next) => {
   try {
+    const basis = parseIncomeBasis(req.query.basis)
     const lid = landlordScope(req.user)
+    // S655 (gam-audience-data-isolation): a team member assigned to some
+    // properties sees those properties' units, tenants and money only (null =
+    // every property; an empty list sees nothing).
+    const scopedIds = await getScopedPropertyIds(req.user)
 
     // S387 fix: pre-fix had an extra `AND ($2::boolean OR l.user_id =
     // $3::uuid)` clause that filtered by the caller's user_id. Admin
@@ -1718,10 +1883,7 @@ booksRouter.get('/rent-roll', requireBooksRead, blockBusinessOwner, async (req, 
           vuo.primary_first_name AS tenant_first, vuo.primary_last_name AS tenant_last,
           vuo.primary_email AS tenant_email,
           ten.ach_verified, ten.on_time_pay_enrolled,
-          -- S654: the shared income definition (no deposits, GAM fees or held money).
-          (SELECT SUM(py.amount) FROM payments py
-           WHERE py.unit_id=u.id AND py.status='settled' AND ${landlordIncomeSql('py')}
-           AND py.due_date >= date_trunc('month', CURRENT_DATE)) AS collected_mtd,
+          u.id AS unit_id,
           (SELECT COUNT(*) FROM payments
            WHERE unit_id=u.id AND status='pending') AS pending_count
         FROM units u
@@ -1730,8 +1892,9 @@ booksRouter.get('/rent-roll', requireBooksRead, blockBusinessOwner, async (req, 
         LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
         LEFT JOIN tenants ten ON ten.id = vuo.primary_tenant_id
         WHERE ($1::uuid IS NULL OR l.id = $1::uuid)
+          AND ($2::uuid[] IS NULL OR p.id = ANY($2::uuid[]))
         ORDER BY p.name, u.unit_number`,
-      [lid]
+      [lid, scopedIds]
     )
 
     // S604: an owner_use unit is occupied but collects no rent, so it belongs
@@ -1744,8 +1907,28 @@ booksRouter.get('/rent-roll', requireBooksRead, blockBusinessOwner, async (req, 
     // but not by anyone paying this landlord rent.
     const earnsRent = (r: any) =>
       r.status !== 'vacant' && r.status !== 'owner_use' && r.status !== 'utility_service'
+    // S655: THIS month's bills only — a month paid ahead is not this month's
+    // rent. Money received: what arrived this month toward bills due this
+    // month or earlier. Money billed: what has been collected so far of the
+    // bills due this month. Either way, from the landlord reports' own facts.
+    const today = todayIn(null)
+    const monthFirst = monthStartOf(today)
+    const [yy, mm] = monthFirst.split('-').map(Number)
+    const monthLast = new Date(Date.UTC(yy, mm, 0)).toISOString().slice(0, 10)
+    const events = await incomeEvents({
+      landlordIds: lid ? [lid] : null, start: monthFirst, end: monthLast, basis, propertyIds: scopedIds,
+    })
+    const byUnit = new Map<string, number>()
+    const COLLECTED = new Set(['paid', 'coveredByPaidAhead', 'coveredByDepositInterest', 'keptFromDeposit'])
+    for (const e of events) {
+      if (!e.inTotal || !e.paymentId || !e.unitId || !e.dueDate) continue
+      if (e.dueDate > monthLast) continue
+      if (basis === 'billed' && !(e.part && COLLECTED.has(e.part))) continue
+      byUnit.set(e.unitId, Math.round(((byUnit.get(e.unitId) ?? 0) + e.amount) * 100) / 100)
+    }
+    for (const r of rows as any[]) r.collected_mtd = byUnit.get(r.unit_id) ?? 0
     const totalExpected = rows.reduce((s: number, r: any) => s + (earnsRent(r) ? +r.rent_amount : 0), 0)
-    const totalCollected = rows.reduce((s: number, r: any) => s + (+r.collected_mtd || 0), 0)
+    const totalCollected = Math.round(rows.reduce((s: number, r: any) => s + (+r.collected_mtd || 0), 0) * 100) / 100
 
     res.json({
       success: true,
@@ -1755,6 +1938,8 @@ booksRouter.get('/rent-roll', requireBooksRead, blockBusinessOwner, async (req, 
         totalCollected,
         variance: totalCollected - totalExpected,
         occupancyRate: rows.length > 0 ? rows.filter((r: any) => r.status !== 'vacant').length / rows.length : 0,
+        period: { start: monthFirst, end: monthLast },
+        meta: { basis: basisMeta(basis) },
       }
     })
   } catch (e) { next(e) }

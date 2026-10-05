@@ -3,9 +3,10 @@ import { z } from 'zod'
 import path from 'path'
 import fs from 'fs'
 import { query, queryOne, getClient } from '../db'
+import type { PoolClient } from 'pg'
 import { LEASE_TYPES, AUTO_RENEW_MODES, LEASE_STATUSES, MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES,
          RENT_COMPONENT_KINDS } from '@gam/shared'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth, requirePerm, userHasPerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
@@ -289,6 +290,8 @@ leasesRouter.get('/', async (req, res, next) => {
       // the same helper.
       const scope = landlordScopeIds(req.user!)
       const { followsLeaseEndedEarlyUnsigned } = await import('../services/renewalSuccessor')
+      const { usablePaidAheadSql, disputeClaimJoinSql } = await import('../services/creditUse')
+      const { keptThroughNeverMovedInSql, moveInInvoiceIdSql } = await import('../lib/unwindIssuedLease')
       rows = scope.length === 0 ? [] : await query<any>(`
         SELECT l.*,
           (SELECT amount FROM lease_fees lf
@@ -302,6 +305,29 @@ leasesRouter.get('/', async (req, res, next) => {
           -- canceled. The Leases page says so, instead of "it takes over on its
           -- start date whether or not they have signed".
           (l.supersedes_lease_id IS NOT NULL AND ${followsLeaseEndedEarlyUnsigned('l')}) AS new_lease_wont_start,
+          -- Fix pass 2: the one "who signed" test Discard uses (leaseSignedBySql),
+          -- so the page offers Discard, "They never moved in — end the lease"
+          -- or "Void on the GoldSign page" exactly as the server will treat it.
+          ${leaseSignedBySql('l', 'tenant')} AS tenant_signed_any,
+          ${leaseSignedBySql('l', 'anyone')} AS anyone_signed,
+          -- Step 9 final fix (fix pass 1): a lease that ended (canceled with its
+          -- reservation before the close ran there, or a hold that lapsed)
+          -- with a bill still owed that nothing was ever paid on, no move-out
+          -- and no new lease after it — the page offers "They never moved in —
+          -- zero the bill" (the close decides, fresh, whether it applies).
+          (l.status IN ('terminated', 'expired')
+            AND NOT EXISTS (SELECT 1 FROM deposit_returns edr WHERE edr.lease_id = l.id AND edr.finalized_at IS NOT NULL)
+            AND NOT EXISTS (SELECT 1 FROM leases enx WHERE enx.supersedes_lease_id = l.id)
+            AND NOT EXISTS (SELECT 1 FROM payments esp
+                             WHERE esp.lease_id = l.id AND esp.amount > 0 AND esp.revenue_owner IS DISTINCT FROM 'gam'
+                               AND esp.status IN ('settled', 'paid_via_deposit', 'processing', 'returned'))
+            -- Final fix (fix pass 1, decisions #53): the close zeroes ONLY the
+            -- move-in bill, so the offer stands only while THAT bill is open
+            -- (a later bill stays owed and is never offered as zeroable).
+            AND EXISTS (SELECT 1 FROM payments eop
+                         WHERE eop.status IN ('pending', 'failed') AND eop.amount > 0
+                           AND eop.invoice_id = ${moveInInvoiceIdSql('l')}
+                           AND ${keptThroughNeverMovedInSql('eop')} IS NULL)) AS ended_bill_open,
           -- S609 autopay VISIBILITY (Nic, DIRECTIVE). The landlord sees THAT a
           -- payment is scheduled and on which day, so a quiet lease does not
           -- read as a tenant who stopped paying. They can never CHANGE it — a
@@ -311,7 +337,15 @@ leasesRouter.get('/', async (req, res, next) => {
           ap.enabled AS autopay_enabled,
           ap.pull_day AS autopay_pull_day,
           -- S653: money the resident paid ahead, for the monthly-draw control.
-          COALESCE((SELECT SUM(c.amount_remaining) FROM lease_prepaid_credits c WHERE c.lease_id = l.id AND c.amount_remaining > 0), 0) AS prepaid_credit_remaining
+          -- S655: a withdrawn credit (voidPaidAhead, an undone bank-deposit
+          -- settle, a stay shortened back) keeps its amount_remaining as
+          -- history; it is out of every balance, so never shown as paid ahead.
+          -- Nor is money a dispute or bank return of the credit's own funding
+          -- still claims (creditUse.usablePaidAheadSql, the one rule): the
+          -- control shows the same "paid ahead" the tenant page shows.
+          COALESCE((SELECT SUM(${usablePaidAheadSql('c', 'dc')}) FROM lease_prepaid_credits c
+                      ${disputeClaimJoinSql('c', 'dc')}
+                     WHERE c.lease_id = l.id AND c.amount_remaining > 0 AND c.voided_at IS NULL), 0) AS prepaid_credit_remaining
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -634,9 +668,29 @@ leasesRouter.patch('/:id/fees/:feeId', requirePerm('leases.edit'), async (req, r
 //
 // Status transitions to 'expired' or 'terminated' will cascade:
 //   - all active lease_tenants rows → status='removed', removed_reason='lease_ended'
+//     (an unsigned 'pending_add' spot → 'void'; it never joined the lease)
 //   - units.status → 'vacant' (units.tenant_id no longer exists; occupancy
-//     derives from v_unit_occupancy)
+//     derives from v_unit_occupancy) — unless another lease is in force or
+//     waiting on the space (the lease that replaced it)
+// A lease that has ALREADY ended is not ended again: switching it between
+// 'expired' and 'terminated' is refused, and the same status again is no change.
+// Nor is it brought back to 'active' / 'pending' — the household gets a new lease.
 // ─────────────────────────────────────────────────────────────
+/**
+ * What ending a lease does to the household and the space — one copy, inside
+ * the caller's transaction, after the lease's own status is written: the
+ * people on it are taken off it, the space empties (when no other lease is in
+ * force or waiting on it) and the end is stamped. Used by every door that ends
+ * a lease here (PATCH status, "They never moved in — end the lease", Discard).
+ */
+// Step 9 final fix (fix pass 1): the cascade lives in lib/unwindIssuedLease
+// (cascadeLeaseEnd) — one copy for every door that ends a lease, the
+// Schedule's Cancel reservation included.
+async function cascadeLeaseEnd(c: PoolClient, leaseId: string, unitId: string): Promise<void> {
+  const { cascadeLeaseEnd: cascade } = await import('../lib/unwindIssuedLease')
+  await cascade(c, leaseId, unitId)
+}
+
 leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) => {
   try {
     const body = z.object({
@@ -678,6 +732,46 @@ leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) =>
     // enforces landlord scope (PM must be scoped to this landlord).
     if (!canManageLandlordResource(req.user, lease.landlord_id, ['property_manager'])) {
       throw new AppError(403, 'Forbidden')
+    }
+
+    // S655: ending a lease here ('terminated' / 'expired' — the cascade below
+    // removes the household and empties the space) while the household's new
+    // lease waits is the same contradiction every other early-end door refuses
+    // (the tenant's "End lease early", the landlord's fee waiver, the front
+    // desk's leaving date): leaving, and staying on a new lease, cannot both be
+    // true. Nor can a waiting new lease itself be ended before it starts — the
+    // household still lives there on the lease before it. Refused first, before
+    // anything is written, in the waiver's own words
+    // (renewalSuccessor.newLeaseBlocksEarlyEnd).
+    //
+    // Final sweep (10/3): only a lease that is still running. A lease that has
+    // ALREADY ended is not ended again — switching it between 'terminated' and
+    // 'expired' is refused in plain words. Asked of a lease whose new lease was
+    // held, the check below sent the landlord to cancel that new lease first, a
+    // Cancel then refused because money was paid on it — a dead end — and the
+    // relabel itself would change what the jobs read: a new lease after a lease
+    // that went from 'terminated' to 'expired' is no longer "after an early end"
+    // (renewalSuccessor.followsLeaseEndedEarlyUnsigned), so it would start.
+    //
+    // Nor is an ended lease brought back ('active' / 'pending'). Its household
+    // was taken off it and its space emptied when it ended, and nothing here puts
+    // them back — it read 'active' with nobody on it. And a held new lease after
+    // it (money paid on a new lease nobody in the household signed) would no
+    // longer be "after an early end", so it would start on its date for a
+    // household that left. A household that is staying gets a new lease.
+    const endsIt = body.status === 'terminated' || body.status === 'expired'
+    const alreadyEnded = lease.status === 'terminated' || lease.status === 'expired'
+    if (alreadyEnded && body.status !== undefined && body.status !== lease.status) {
+      throw new AppError(409, endsIt
+        ? 'This lease has already ended, so it can\'t be ended again. Nothing else to do.'
+        : 'This lease has already ended, so it can\'t be made active again. If the household is staying, ' +
+          'give them a new lease: Tenants → Invite Tenant.')
+    }
+    if (endsIt && !alreadyEnded) {
+      const { newLeaseBlocksEarlyEnd } = await import('../services/renewalSuccessor')
+      const blocked = await newLeaseBlocksEarlyEnd(
+        async (sql, params) => ({ rows: await query<any>(sql, params) }), lease.id, 'landlord')
+      if (blocked) throw new AppError(409, blocked)
     }
 
     // Validate lease_type + end_date + auto_renew combinations against final values
@@ -899,7 +993,45 @@ leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) =>
       i++
     }
 
-    if (setParts.length > 0) {
+    // Cascade for terminal statuses — only when this PATCH is what ends the lease
+    // (an already-ended lease's household and space were settled when it ended;
+    // running it again emptied a space the lease that replaced it now holds).
+    //
+    // Step 9 review (fix pass 2): ending a lease is ONE transaction — the
+    // never-moved-in close (below), the status change and the cascade. Before
+    // this the status was written on its own first; when the close then failed
+    // (a lock timeout), the landlord saw an error but the lease stayed ended
+    // with its bill open, and every later PATCH read it as already ended, so
+    // the close never ran again.
+    let closedMoveInBill: { invoiceId: string | null; amount: number } | null = null
+    if (endsIt && !alreadyEnded) {
+      const { closeNeverMovedInBill } = await import('../lib/unwindIssuedLease')
+      const { cancelSupersededIntents } = await import('../services/creditUse')
+      const c = await getClient()
+      let stop: string[] = []
+      try {
+        await c.query('BEGIN')
+        // 10/4 (decisions #46.4, Nic, FINAL): a signed lease whose tenant never
+        // paid the move-in bill and never moved in — ending it zeroes that bill
+        // (lib/unwindIssuedLease.closeNeverMovedInBill decides when it applies:
+        // a lease that never came into force, GAM issued, not a renewal, one
+        // bill, nothing ever paid). Any other lease end leaves what is owed
+        // owed. First — it reads the status the lease had, and the household
+        // before it is taken off the lease, so its lock finds them.
+        const r = await closeNeverMovedInBill(c, lease.id)
+        stop = r.cancelAfterCommit
+        if (r.closed) closedMoveInBill = { invoiceId: r.invoiceId, amount: r.closedAmount }
+        if (setParts.length > 0) {
+          await c.query('UPDATE leases SET ' + setParts.join(', ') + ' WHERE id=$' + i, [...values, req.params.id])
+        }
+        await cascadeLeaseEnd(c, lease.id, lease.unit_id)
+        await c.query('COMMIT')
+      } catch (e) {
+        await c.query('ROLLBACK').catch(() => {})
+        throw e
+      } finally { c.release() }
+      await cancelSupersededIntents(stop)
+    } else if (setParts.length > 0) {
       values.push(req.params.id)
       await query('UPDATE leases SET ' + setParts.join(', ') + ' WHERE id=$' + i, values)
     }
@@ -967,26 +1099,6 @@ leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) =>
       }
     }
 
-    // Cascade for terminal statuses
-    if (body.status === 'expired' || body.status === 'terminated') {
-      await query(
-        `UPDATE lease_tenants
-         SET status='removed',
-             removed_at=NOW(),
-             removed_reason='lease_ended'
-         WHERE lease_id=$1 AND status IN ('active','pending_add','pending_remove')`,
-        [lease.id]
-      )
-      await query(
-        `UPDATE units SET status='vacant', updated_at=NOW() WHERE id=$1`,
-        [lease.unit_id]
-      )
-      await query(
-        'UPDATE leases SET terminated_at=NOW() WHERE id=$1 AND terminated_at IS NULL',
-        [lease.id]
-      )
-    }
-
     // S196: include security_deposit from lease_fees in the response
     // shape so the frontend's existingLease.securityDeposit field
     // continues to render after the column drop.
@@ -1031,7 +1143,9 @@ leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) =>
     // would be silently dropped on the client.
     res.json({
       success: true,
-      data: { ...updated, state_law_warnings: stateLawWarnings },
+      // closed_move_in_bill (decisions #46.4): the move-in bill this end zeroed
+      // because the tenant never paid it or moved in (null when none was).
+      data: { ...updated, state_law_warnings: stateLawWarnings, closed_move_in_bill: closedMoveInBill },
     })
   } catch (e) { next(e) }
 })
@@ -1055,13 +1169,158 @@ const damageLineSchema = z.object({
     'Each damage deduction needs at least one photo or receipt attached'),
 })
 
+type DepositReturnCalc = NonNullable<Awaited<ReturnType<
+  typeof import('../services/depositReturn').calculateDepositReturn>>>
+
+// Step 9 (final fix): the money figures the deposit-return page shows, exactly
+// as the one move-out calculation worked them out. The page never adds them up
+// itself — refund_amount / gap_amount are what finalize pays, and the approval
+// threshold is judged on refund_amount.
+//   interest_accrued          deposit interest still owed (not yet credited —
+//                             unpaidDepositInterest; a month the annual payout
+//                             already credited is never counted again)
+//   deposit_interest_credited interest the annual payout credited and the
+//                             tenant never spent (refunded with the deposit)
+//   prepaid_credit_used       the part of the tenant's paid-ahead money the
+//                             deductions take (which part is the move-out
+//                             calculation's rule, never the page's)
+//   prepaid_credit_left       paid-ahead money left over — stays the tenant's
+//                             paid-ahead money on the lease, not refunded here;
+//                             it waits for the landlord's choice on the
+//                             landlord page /leases/:id/paid-ahead-choice
+//   refund_from_gam           (decisions #46.3) the part of the refund GAM
+//   refund_from_landlord      sends, and the part the landlord hands back
+//                             themselves — whoever holds each deposit
+//   closed_at_move_out_lines  (decisions #46.4) unpaid deposits and up-front
+//                             rent paid ahead finalize closes as no longer
+//                             owed (never deducted)
+function depositReturnFigures(calc: DepositReturnCalc) {
+  return {
+    total_deposit:             calc.total_deposit,
+    interest_accrued:          calc.interest_accrued,
+    deposit_interest_credited: calc.deposit_interest_credited,
+    prepaid_credit_used:       calc.prepaid_credit_used,
+    prepaid_credit_left:       calc.prepaid_credit_left,
+    cleaning_fee_amount:       calc.cleaning_fee_amount,
+    final_utility_lines:       calc.final_utility_lines,
+    final_utility_total:       calc.final_utility_total,
+    damage_lines_total:        calc.damage_lines_total,
+    other_deductions_total:    calc.other_deductions_total,
+    unpaid_balance_lines:      calc.unpaid_balance_lines,
+    unpaid_balance_amount:     calc.unpaid_balance_total,
+    total_deductions:          calc.total_deductions,
+    refund_amount:             calc.refund_amount,
+    gap_amount:                calc.gap_amount,
+    refund_from_gam:           calc.refund_from_gam,
+    refund_from_landlord:      calc.refund_from_landlord,
+    closed_at_move_out_lines:  calc.closed_at_move_out_lines,
+    closed_at_move_out_total:  calc.closed_at_move_out_total,
+  }
+}
+
+/** The household and the space a deposit return is for, by name. */
+async function depositReturnHousehold(leaseId: string): Promise<{
+  tenant_names: string[]; unit_number: string | null; property_name: string | null
+}> {
+  const space = await queryOne<{ unit_number: string | null; property_name: string | null }>(
+    `SELECT u.unit_number, p.name AS property_name
+       FROM leases l JOIN units u ON u.id = l.unit_id JOIN properties p ON p.id = u.property_id
+      WHERE l.id = $1`, [leaseId])
+  const people = await query<{ name: string }>(
+    `SELECT btrim(COALESCE(tu.first_name, '') || ' ' || COALESCE(tu.last_name, '')) AS name
+       FROM lease_tenants lt
+       JOIN tenants t ON t.id = lt.tenant_id
+       JOIN users tu ON tu.id = t.user_id
+      WHERE lt.lease_id = $1
+        AND (lt.status IN ('active', 'pending_remove')
+             OR (lt.status = 'removed' AND lt.removed_reason = 'lease_ended'))
+      ORDER BY CASE lt.role WHEN 'primary' THEN 0 ELSE 1 END, lt.added_at ASC NULLS LAST, lt.created_at ASC`,
+    [leaseId])
+  return {
+    tenant_names: people.map((x) => x.name).filter((n) => n.length > 0),
+    unit_number: space?.unit_number ?? null,
+    property_name: space?.property_name ?? null,
+  }
+}
+
+/** The plain-words refusal for a team member locked to other properties. */
+export const DEPOSIT_RETURN_SCOPE_WORDS = 'You are not assigned to this property, so you can\'t work on its move-outs. ' +
+  'Ask the landlord to add this property to your access.'
+
+/**
+ * Step 9 review (fix pass 3): the lease a deposit-return route works on, with
+ * the caller's right to it — the landlord account (read or manage) AND, for a
+ * team member locked to some properties (onsite manager, property manager,
+ * maintenance), that this lease's property is one of theirs. Before this a
+ * property-locked staffer with "Deposit return / move-out" could open, begin,
+ * edit and finalize a move-out refund at any property on the account. A read
+ * uses the read-side scope (getScopedPropertyIds — a role with no property
+ * scope reads as before); a write uses the write guard (assertPropertyInScope),
+ * as the paid-ahead choice page does.
+ */
+async function depositReturnLease(req: any, mode: 'read' | 'write'): Promise<{
+  id: string; landlord_id: string; property_id: string; unit_type: string | null
+}> {
+  const lease = await queryOne<{ id: string; landlord_id: string; property_id: string; unit_type: string | null }>(
+    `SELECT l.id, l.landlord_id, u.property_id, u.unit_type
+       FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id = $1`, [req.params.id])
+  if (!lease) throw new AppError(404, 'Lease not found')
+  const allowed = mode === 'read'
+    ? canAccessLandlordResource(req.user, lease.landlord_id)
+    : canManageLandlordResource(req.user, lease.landlord_id)
+  if (!allowed) throw new AppError(403, 'Forbidden')
+  const { getScopedPropertyIds, assertPropertyInScope } = await import('../middleware/auth')
+  if (mode === 'read') {
+    const scoped = await getScopedPropertyIds(req.user)
+    if (scoped !== null && !scoped.includes(lease.property_id)) throw new AppError(403, DEPOSIT_RETURN_SCOPE_WORDS)
+  } else {
+    try { await assertPropertyInScope(req.user, lease.property_id) }
+    catch (e) {
+      if (e instanceof AppError && e.statusCode === 403) throw new AppError(403, DEPOSIT_RETURN_SCOPE_WORDS)
+      throw e
+    }
+  }
+  return lease
+}
+
+/** Whether this viewer may run this move-out: "Deposit return / move-out" and the property in their write scope. */
+async function canRunMoveOutHere(req: any, propertyId: string): Promise<boolean> {
+  if (!userHasPerm(req.user, 'leases.deposit_return')) return false
+  const { assertPropertyInScope } = await import('../middleware/auth')
+  try { await assertPropertyInScope(req.user, propertyId); return true } catch { return false }
+}
+
+/** The latest paid-ahead choice on this lease (services/paidAheadChoice writes them), by name — or null. */
+async function latestPaidAheadChoice(leaseId: string): Promise<null | {
+  refund_choice: string; refund_total: number; rest_choice: string | null; rest_amount: number
+  decided_at: string; decided_by_name: string | null
+}> {
+  const c = await queryOne<any>(
+    `SELECT pc.refund_choice, pc.refund_total::float AS refund_total, pc.rest_choice, pc.rest_amount::float AS rest_amount,
+            to_char(pc.decided_at AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'), 'YYYY-MM-DD') AS decided_at,
+            NULLIF(btrim(CONCAT(u.first_name, ' ', u.last_name)), '') AS decided_by_name
+       FROM paid_ahead_choices pc
+       JOIN leases l ON l.id = pc.lease_id
+       LEFT JOIN units un ON un.id = l.unit_id
+       LEFT JOIN properties pr ON pr.id = un.property_id
+       LEFT JOIN users u ON u.id = pc.decided_by
+      WHERE pc.lease_id = $1
+      ORDER BY pc.decided_at DESC, pc.id DESC LIMIT 1`, [leaseId])
+  return c ?? null
+}
+
+/** Whether this viewer passes the paid-ahead choice page's own gate ("Issue refunds" and the property in scope). */
+async function canDecidePaidAheadHere(req: any, propertyId: string): Promise<boolean> {
+  if (!userHasPerm(req.user, 'pos.refund')) return false
+  const { assertPropertyInScope } = await import('../middleware/auth')
+  try { await assertPropertyInScope(req.user, propertyId); return true } catch { return false }
+}
+
 leasesRouter.get('/:id/deposit-return', async (req, res, next) => {
   try {
-    const lease = await queryOne<any>('SELECT id, landlord_id FROM leases WHERE id=$1', [req.params.id])
-    if (!lease) throw new AppError(404, 'Lease not found')
-    if (!canAccessLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    const lease = await depositReturnLease(req, 'read')
 
-    const { calculateDepositReturn, fetchUnpaidBalanceLines } = await import('../services/depositReturn')
+    const { calculateDepositReturn } = await import('../services/depositReturn')
     // S548: the page needs the approval context — the landlord's threshold
     // and whether the viewer is owner-level — to render the staff finalize
     // button correctly (send-for-approval vs. locked "landlord reviewing").
@@ -1082,36 +1341,170 @@ leasesRouter.get('/:id/deposit-return', async (req, res, next) => {
         WHERE i.lease_id = $1 AND i.inspection_type = 'move_out' AND i.status <> 'cancelled'
         ORDER BY (i.status = 'finalized') DESC, i.created_at DESC LIMIT 1`,
       [req.params.id]) : null
+    const existing = await queryOne<any>('SELECT * FROM deposit_returns WHERE lease_id=$1', [req.params.id])
+    // Fix pass 1 (final fix): each damage line's photo or receipt by its name
+    // (the page showed "Evidence 1" after a reload), only this landlord's.
+    const evidenceIds = [...new Set(((existing?.damage_lines ?? []) as Array<{ evidenceDocumentIds?: unknown }>)
+      .flatMap((l) => Array.isArray(l.evidenceDocumentIds) ? l.evidenceDocumentIds.map(String) : []))]
+    const damageEvidence = evidenceIds.length === 0 ? [] : await query<{ id: string; name: string }>(
+      `SELECT id, COALESCE(NULLIF(btrim(name), ''), 'Evidence') AS name FROM documents
+        WHERE id = ANY($1::uuid[]) AND landlord_id = $2`, [evidenceIds, lease.landlord_id])
     const approvalMeta = {
+      damage_evidence: damageEvidence,
       approval_threshold: Number((await queryOne<{ t: string }>(
         `SELECT deposit_return_approval_threshold::text AS t FROM landlords WHERE id=$1`,
         [lease.landlord_id]))?.t ?? 500),
       viewer_is_owner: ['landlord', 'admin', 'super_admin'].includes(req.user!.role),
+      // Fix pass 3: whose payout and who hands the landlord's part back, in
+      // the page's words — "your" only to the landlord themselves; GAM staff
+      // (admin) and team members read "the landlord's". viewer_is_owner stays
+      // the approval rule.
+      viewer_is_landlord: req.user!.role === 'landlord',
       move_out_inspection_required: moveOutRequired,
       move_out_inspection: moveOutInspection,
+      // Fix pass 2 (decisions #47c, Nic): who holds the deposit is never shown
+      // to tenants or landlords — the page says how each part of a refund
+      // comes back instead (refund_from_gam / refund_from_landlord), so the
+      // holder is no longer sent.
+      // Deposit-page review: who this is, by name — the household and the
+      // space — so whoever finalizes a refund can tell it is the right one
+      // (the page named the lease only by an id fragment). The people still on
+      // the lease, or the ones its end took off it.
+      household: await depositReturnHousehold(req.params.id),
+      // Whether this viewer may make the landlord's paid-ahead choice — the
+      // choice page's own gate: "Issue refunds" (pos.refund) AND this property
+      // in their scope (fix pass 3) — so the page offers the button only to
+      // someone it lets through.
+      viewer_can_decide_paid_ahead: await canDecidePaidAheadHere(req, lease.property_id),
+      // Fix pass 1 (final fix): whether this viewer may run this move-out at
+      // all (Begin, save, finalize) — "Deposit return / move-out" AND the
+      // property in their write scope, the gate those routes use — so the page
+      // offers those buttons only to someone they let through.
+      viewer_can_run_move_out: await canRunMoveOutHere(req, lease.property_id),
+      // Fix pass 1 (final fix): the landlord's paid-ahead choice once it is
+      // made (decisions #46.1 / #46.1a) — who decided, when and what — so the
+      // page says "Left as their credit on <date> by <name>" instead of asking
+      // again. null before any choice.
+      paid_ahead_choice: await latestPaidAheadChoice(req.params.id),
+      // Step 9 final fix (fix pass 1 — decisions #48.6): a payment on the
+      // tenancy still clearing holds up finalize; the page says so, with the
+      // day it should clear, before anyone presses Finalize (finalize checks
+      // again, fresh, under its locks). null once finalized or when nothing
+      // is clearing.
+      //
+      // Fix pass 2 (review): a payment stuck past a week never clears or
+      // fails on its own — the page says GAM has been told, and this read
+      // tells GAM (once per payment attempt; the page no longer presses
+      // Finalize while anything is clearing, so finalize alone never did).
+      payments_clearing: existing?.finalized_at ? null : await (async () => {
+        const dr = await import('../services/depositReturn')
+        const clearing = await dr.tenancyPaymentsClearing(
+          async (t, v) => ({ rows: await query<any>(t, v) }), req.params.id)
+        if (clearing && clearing.stuck.length > 0) {
+          await dr.noteStuckTenancyPayments(existing?.id ?? null, req.params.id, clearing.stuck)
+        }
+        return clearing?.words ?? null
+      })(),
     }
-    const existing = await queryOne<any>('SELECT * FROM deposit_returns WHERE lease_id=$1', [req.params.id])
+
+    if (existing && (existing.status === 'draft' || existing.status === 'awaiting_approval')) {
+      // Step 9 (final fix): a draft not yet finalized shows the figures
+      // finalize will pay, worked out NOW by the one move-out calculation
+      // (depositReturn.calculateDepositReturn → moveOutMath) with the draft's
+      // saved damage lines — never the page's own sum. Paid-ahead money left
+      // over is not refunded; the interest is only what is still owed. Before
+      // this the page worked out deposit + interest − deductions itself, so
+      // the landlord could confirm one refund while finalize paid another. The
+      // saved row's own refund/gap are a snapshot of the last save; these
+      // replace them in the answer.
+      const calc = await calculateDepositReturn(
+        req.params.id, existing.damage_lines ?? [], existing.other_deductions ?? [])
+      if (!calc) throw new AppError(404, 'Lease not found')
+      return res.json({ success: true, data: { ...existing, ...depositReturnFigures(calc), ...approvalMeta } })
+    }
     if (existing) {
-      // S182 / A1 frontend: attach a live re-pull of the auto-sweep
-      // lines so the page can render them line-by-line. The row only
-      // stores the dollar total; line statuses can drift between
-      // draft create and finalize.
-      const unpaid_balance_lines = await fetchUnpaidBalanceLines(req.params.id)
-      // S188: pull live interest_accrued from security_deposits so the
-      // page can show the statutory interest line. The deposit_returns
-      // row doesn't snapshot interest (the monthly cron may have
-      // advanced it since the draft was created).
-      const sd = await queryOne<{ interest_accrued: string }>(
-        `SELECT interest_accrued FROM security_deposits WHERE lease_id = $1 LIMIT 1`,
-        [req.params.id],
-      )
-      const interest_accrued = Number(sd?.interest_accrued ?? 0)
-      return res.json({ success: true, data: { ...existing, unpaid_balance_lines, interest_accrued, ...approvalMeta } })
+      // A finalized return: the figures it paid, as recorded — the refund and
+      // shortfall on the row, the paid-ahead money and credited interest it
+      // spent (its 'move_out' credit uses), and the interest not yet credited
+      // it paid (its deposit_interest_paid event). The swept lines were settled
+      // from the deposit, so none is listed as unpaid; unpaid_balance_amount is
+      // the total it settled.
+      const spent = await queryOne<{ paid_ahead: string; interest_credited: string }>(
+        `SELECT COALESCE(SUM(u.amount) FILTER (WHERE u.prepaid_credit_id IS NOT NULL), 0)::text AS paid_ahead,
+                COALESCE(SUM(u.amount) FILTER (WHERE u.tenant_credit_id IS NOT NULL), 0)::text AS interest_credited
+           FROM credit_uses u
+          WHERE u.deposit_return_id = $1 AND u.source = 'move_out' AND u.status = 'applied'`,
+        [existing.id])
+      const interestPaid = await queryOne<{ amount: string | null }>(
+        `SELECT (e.event_data->>'interest_accrued_total') AS amount
+           FROM credit_events e
+          WHERE e.event_type = 'deposit_interest_paid'
+            AND e.event_data->>'deposit_return_id' = $1
+            AND e.superseded_by IS NULL
+          ORDER BY e.recorded_at DESC LIMIT 1`,
+        [existing.id])
+      // Paid-ahead money still on this lease after the move-out (the part the
+      // deductions did not take stays the tenant's — it is never refunded with
+      // the deposit), through the credit ledger's one rule (usablePaidAheadSql).
+      const { usablePaidAheadSql, disputeClaimJoinSql } = await import('../services/creditUse')
+      const left = await queryOne<{ left: string }>(
+        `SELECT COALESCE(SUM(${usablePaidAheadSql('c', 'dc')}), 0)::text AS left
+           FROM lease_prepaid_credits c
+           ${disputeClaimJoinSql('c', 'dc')}
+          WHERE c.lease_id = $1 AND c.amount_remaining > 0 AND c.voided_at IS NULL
+            -- Fix pass 1 (final fix): money a choice already left as the
+            -- tenant's credit is decided (decisions #46.1a) — never offered
+            -- again (the rule services/paidAheadChoice reads by).
+            AND c.left_by_choice_id IS NULL`,
+        [req.params.id])
+      // 10/4 (decisions #47a): how the refund is going back — each part GAM
+      // sends (back the way the deposit was paid, or to give back in cash at
+      // the office when that payment cannot take it) and the landlord's own
+      // part with its "Mark handed back" day. Read fresh: a part left sending
+      // after a crash is sent again, and the share of one whose payment was
+      // disputed since is stopped, before it is shown — only when the viewer
+      // may run this move-out (fix pass 2: opening the page read-only never
+      // moves money; the refund row alone is brought up to date).
+      const refundSend = await import('../services/depositRefundSend')
+      await refundSend.resumeDepositRefund(existing.id, { act: await canRunMoveOutHere(req, lease.property_id) })
+      const refundProgress = existing.status === 'sent_refund' ? await refundSend.depositRefundView(existing.id) : null
+      const closedRecorded = ((existing.closed_at_move_out_lines ?? []) as Array<Record<string, unknown>>).map((l) => ({
+        payment_id: String(l.payment_id), kind: l.kind === 'prepaid' ? 'prepaid' as const : 'deposit' as const,
+        label: String(l.label ?? ''), amount: Number(l.amount) || 0,
+      }))
+      return res.json({ success: true, data: {
+        ...existing,
+        total_deposit:             Number(existing.total_deposit),
+        total_deductions:          Number(existing.total_deductions),
+        refund_amount:             Number(existing.refund_amount),
+        gap_amount:                Number(existing.gap_amount),
+        // decisions #46.3: who paid which part, as finalize recorded it (null
+        // on a return finalized before it was recorded).
+        refund_from_gam:           existing.refund_from_gam == null ? null : Number(existing.refund_from_gam),
+        refund_from_landlord:      existing.refund_from_landlord == null ? null : Number(existing.refund_from_landlord),
+        // decisions #46.4 (fix pass 3): the lines finalize closed as no longer
+        // owed, as it recorded them (none recorded on an older return).
+        closed_at_move_out_lines:  closedRecorded,
+        closed_at_move_out_total:  Math.round(closedRecorded.reduce((t, l) => t + Math.round(l.amount * 100), 0)) / 100,
+        unpaid_balance_amount:     Number(existing.unpaid_balance_amount ?? 0),
+        unpaid_balance_lines:      [],
+        damage_lines_total:        Math.round(((existing.damage_lines ?? []) as Array<{ amount: unknown }>)
+                                     .reduce((t, l) => t + (Number(l.amount) || 0), 0) * 100) / 100,
+        other_deductions_total:    Math.round(((existing.other_deductions ?? []) as Array<{ amount: unknown }>)
+                                     .reduce((t, l) => t + (Number(l.amount) || 0), 0) * 100) / 100,
+        final_utility_lines:       [],
+        interest_accrued:          Number(interestPaid?.amount ?? 0),
+        deposit_interest_credited: Number(spent?.interest_credited ?? 0),
+        prepaid_credit_used:       Number(spent?.paid_ahead ?? 0),
+        prepaid_credit_left:       Number(left?.left ?? 0),
+        refund_progress:           refundProgress,
+        ...approvalMeta,
+      } })
     }
     // No row yet — return calculation preview
     const calc = await calculateDepositReturn(req.params.id)
     if (!calc) throw new AppError(404, 'Lease not found')
-    res.json({ success: true, data: { preview: true, ...calc, ...approvalMeta } })
+    res.json({ success: true, data: { preview: true, ...calc, ...depositReturnFigures(calc), ...approvalMeta } })
   } catch (e) { next(e) }
 })
 
@@ -1616,11 +2009,7 @@ leasesRouter.post('/:id/charge', requirePerm('leases.bill_fee'), async (req, res
 
 leasesRouter.post('/:id/deposit-return', requirePerm('leases.deposit_return'), async (req, res, next) => {
   try {
-    const lease = await queryOne<any>(
-      `SELECT l.id, l.landlord_id, u.unit_type
-         FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id=$1`, [req.params.id])
-    if (!lease) throw new AppError(404, 'Lease not found')
-    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    const lease = await depositReturnLease(req, 'write')
 
     // S548 (Nic): dwellings and storage require a FINALIZED in-person
     // move-out walkthrough before the deposit return can begin — the
@@ -1650,13 +2039,25 @@ const patchSchema = z.object({
 
 leasesRouter.patch('/:id/deposit-return', requirePerm('leases.deposit_return'), async (req, res, next) => {
   try {
-    const lease = await queryOne<any>('SELECT id, landlord_id FROM leases WHERE id=$1', [req.params.id])
-    if (!lease) throw new AppError(404, 'Lease not found')
-    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    const lease = await depositReturnLease(req, 'write')
 
     const body = patchSchema.parse(req.body)
-    const draft = await queryOne<any>('SELECT id FROM deposit_returns WHERE lease_id=$1', [req.params.id])
+    const draft = await queryOne<any>('SELECT id, status FROM deposit_returns WHERE lease_id=$1', [req.params.id])
     if (!draft) throw new AppError(404, 'No draft. POST first to create.')
+    // Step 9 (final fix): only a draft is edited (applyDeductionsToDraft
+    // refuses anything else with a bare error, which reached the page as a
+    // server failure). Said in plain words, with what to do.
+    if (draft.status === 'awaiting_approval') {
+      // Fix pass 1 (final fix): said to the person reading it, with their next step.
+      throw new AppError(409, ['landlord', 'admin', 'super_admin'].includes(req.user!.role)
+        ? 'This deposit return is waiting for your approval, so its deductions can\'t be changed as it is. ' +
+          'You can approve it as it is, or press Send back to draft to change it.'
+        : 'This deposit return is waiting for the landlord\'s approval, so its deductions can\'t be changed now. ' +
+          'The landlord can approve it as it is, or send it back to draft to change it.')
+    }
+    if (draft.status !== 'draft') {
+      throw new AppError(409, 'This deposit return is already finalized, so it can\'t be changed. The page now shows what it paid.')
+    }
 
     // Evidence documents must exist and belong to this landlord.
     if (body.damageLines?.length) {
@@ -1677,16 +2078,53 @@ leasesRouter.patch('/:id/deposit-return', requirePerm('leases.deposit_return'), 
   } catch (e) { next(e) }
 })
 
+// POST /api/leases/:id/deposit-return/send-back — fix pass 1 (final fix): a
+// return a team member sent for approval goes back to a draft, so the owner
+// can change it (a damage line they disagree with) instead of only approving
+// it as it is. Owner-level only — the approval is theirs. Nothing is paid and
+// nothing else changes; staff can then save and send it again.
+leasesRouter.post('/:id/deposit-return/send-back', requirePerm('leases.deposit_return'), async (req, res, next) => {
+  try {
+    await depositReturnLease(req, 'write')
+    if (!['landlord', 'admin', 'super_admin'].includes(req.user!.role)) {
+      throw new AppError(403, 'Only the landlord can send a deposit return waiting for approval back to draft.')
+    }
+    const sent = await queryOne<any>(
+      `UPDATE deposit_returns SET status = 'draft', updated_at = NOW()
+        WHERE lease_id = $1 AND status = 'awaiting_approval' RETURNING *`, [req.params.id])
+    if (!sent) {
+      const cur = await queryOne<{ status: string }>(`SELECT status FROM deposit_returns WHERE lease_id = $1`, [req.params.id])
+      throw new AppError(409, !cur ? 'There is no deposit return on this lease yet.'
+        : cur.status === 'draft' ? 'This deposit return is already a draft. The page now shows it.'
+        : 'This deposit return is already finalized, so it can\'t be sent back. The page now shows what it paid.')
+    }
+    res.json({ success: true, data: sent })
+  } catch (e) { next(e) }
+})
+
+// The figures the page's confirm showed (each optional — one not sent is not
+// checked). Fix pass 3: who refunds which part and the paid-ahead money used
+// are checked too — they can move while the refund and shortfall stay put.
+const finalizeSchema = z.object({
+  expectedRefund:             z.number().nonnegative().optional(),
+  expectedGap:                z.number().nonnegative().optional(),
+  expectedRefundFromGam:      z.number().nonnegative().optional(),
+  expectedRefundFromLandlord: z.number().nonnegative().optional(),
+  expectedPaidAheadUsed:      z.number().nonnegative().optional(),
+})
+
 leasesRouter.post('/:id/deposit-return/finalize', requirePerm('leases.deposit_return'), async (req, res, next) => {
   try {
-    const lease = await queryOne<any>('SELECT id, landlord_id FROM leases WHERE id=$1', [req.params.id])
-    if (!lease) throw new AppError(404, 'Lease not found')
-    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    const lease = await depositReturnLease(req, 'write')
 
     const draft = await queryOne<any>(
       'SELECT id, status, damage_lines, other_deductions FROM deposit_returns WHERE lease_id=$1', [req.params.id])
     if (!draft) throw new AppError(404, 'No draft. POST first to create.')
-    if (!['draft', 'awaiting_approval'].includes(draft.status)) throw new AppError(409, `Already finalized: ${draft.status}`)
+    // Step 9 (final fix): in plain words — the page refetches on a 409 and
+    // shows what the finished return paid.
+    if (!['draft', 'awaiting_approval'].includes(draft.status)) {
+      throw new AppError(409, 'This deposit return is already finalized. The page now shows what it paid.')
+    }
 
     // S548 (Nic): staff can run deposit returns without wasting the
     // landlord's time — up to the landlord's threshold. A refund above it
@@ -1694,42 +2132,123 @@ leasesRouter.post('/:id/deposit-return/finalize', requirePerm('leases.deposit_re
     // there. Gap-only or zero returns move no money out, so staff always
     // may finalize those.
     const isOwnerLevel = ['landlord', 'admin', 'super_admin'].includes(req.user!.role)
-    if (!isOwnerLevel) {
-      const threshold = Number((await queryOne<{ t: string }>(
-        `SELECT deposit_return_approval_threshold::text AS t FROM landlords WHERE id=$1`,
-        [lease.landlord_id]))?.t ?? 500)
-      const { calculateDepositReturn } = await import('../services/depositReturn')
-      const calc = await calculateDepositReturn(
-        req.params.id, draft.damage_lines ?? [], draft.other_deductions ?? [])
-      const refund = calc?.refund_amount ?? 0
-      if (refund > threshold) {
-        if (draft.status === 'draft') {
-          await query(`UPDATE deposit_returns SET status='awaiting_approval', updated_at=NOW() WHERE id=$1`, [draft.id])
-          const owner = await queryOne<{ user_id: string }>(
-            `SELECT user_id FROM landlords WHERE id=$1`, [lease.landlord_id])
-          if (owner) {
-            const { createNotification } = await import('../services/notifications')
-            await createNotification({
-              userId: owner.user_id,
-              landlordId: lease.landlord_id,
-              type: 'deposit_return_approval',
-              title: 'Deposit return needs your approval',
-              body: `A team member prepared a deposit return with a $${refund.toFixed(2)} refund — above your $${threshold.toFixed(2)} approval threshold. Review and finalize it.`,
-              data: { leaseId: lease.id, depositReturnId: draft.id, refund, threshold },
-              actionUrl: `/leases/${lease.id}/deposit-return`,
-            }).catch(() => {})
-          }
-        }
-        return res.status(202).json({
-          success: true,
-          data: { status: 'awaiting_approval', refund_amount: refund, threshold },
-        })
+    const body = finalizeSchema.parse(req.body ?? {})
+    const checkFigures = Object.values(body).some((v) => v !== undefined)
+    const { calculateDepositReturn, FIGURES_CHANGED_MESSAGE } = await import('../services/depositReturn')
+    const calc = checkFigures
+      ? await calculateDepositReturn(req.params.id, draft.damage_lines ?? [], draft.other_deductions ?? [])
+      : null
+    // Step 9 (fix pass 2): fresh figures at the moment of action. The page
+    // sends the refund and shortfall its confirm showed; if a swept payment
+    // settled or failed, or a final meter bill landed, since then, nothing is
+    // paid and the page reads the new figures in place. This is the early
+    // answer; finalizeDepositReturn checks them again under its locks (a
+    // change between this read and the locks rolls everything back the same way).
+    if (checkFigures) {
+      const cents = (n: number | undefined) => Math.round((n ?? 0) * 100)
+      const refundNow = calc?.refund_amount ?? 0
+      const gapNow = calc?.gap_amount ?? 0
+      const differs = (sent: number | undefined, now: number | undefined) => sent !== undefined && cents(sent) !== cents(now)
+      if (differs(body.expectedRefund, refundNow) || differs(body.expectedGap, gapNow)
+        || differs(body.expectedRefundFromGam, calc?.refund_from_gam)
+        || differs(body.expectedRefundFromLandlord, calc?.refund_from_landlord)
+        || differs(body.expectedPaidAheadUsed, calc?.prepaid_credit_used)) {
+        throw new AppError(409, FIGURES_CHANGED_MESSAGE)
       }
     }
-
+    // S548 + fix pass 1 (final fix): a team member's refund above the
+    // landlord's approval limit is parked for the landlord — judged by
+    // finalize itself, under its locks, on the refund it would pay now
+    // (before this it was judged here, on figures read before the locks, so a
+    // caller sending no figures could be paid more than the limit allows).
+    const threshold = isOwnerLevel ? undefined : Number((await queryOne<{ t: string }>(
+      `SELECT deposit_return_approval_threshold::text AS t FROM landlords WHERE id=$1`,
+      [lease.landlord_id]))?.t ?? 500)
     const { finalizeDepositReturn } = await import('../services/depositReturn')
-    const finalized = await finalizeDepositReturn(draft.id, req.user!.userId)
+    const finalized = await finalizeDepositReturn(draft.id, req.user!.userId, body, { approvalThreshold: threshold })
+    if (finalized.parked) {
+      const refund = Number(finalized.refund_amount)
+      if (finalized.parked === 'now') {
+        const owner = await queryOne<{ user_id: string }>(
+          `SELECT user_id FROM landlords WHERE id=$1`, [lease.landlord_id])
+        if (owner) {
+          const { createNotification } = await import('../services/notifications')
+          await createNotification({
+            userId: owner.user_id,
+            landlordId: lease.landlord_id,
+            type: 'deposit_return_approval',
+            title: 'Deposit return needs your approval',
+            body: `A team member prepared a deposit return with a $${refund.toFixed(2)} refund — above your $${threshold!.toFixed(2)} approval threshold. Review and finalize it.`,
+            data: { leaseId: lease.id, depositReturnId: draft.id, refund, threshold },
+            actionUrl: `/leases/${lease.id}/deposit-return`,
+          }).catch(() => {})
+        }
+      }
+      return res.status(202).json({
+        success: true,
+        data: { status: 'awaiting_approval', refund_amount: refund, threshold },
+      })
+    }
     res.json({ success: true, data: finalized })
+  } catch (e) { next(e) }
+})
+
+// ── The finalized refund going back — 10/4 (decisions #47a, Nic, FINAL) ──
+//
+// The part GAM holds goes back by itself at finalize (services/depositRefundSend).
+// A part the original payment could not take is on the move-out page and the
+// owner's to-do list with the way out: Try again (when trying again can work),
+// or "Give it back in cash instead" (the office hands it over; GAM pays the
+// landlord what it held for it). The landlord's own part gets "Mark handed
+// back" with the day. Each answers in plain words; a 409 means the page reads
+// the move-out again in place.
+const refundPartParams = z.object({ partId: z.string().uuid() })
+const cashPartSchema = z.object({ expectedAmount: z.number().finite().optional() }).strict()
+const handedBackSchema = z.object({
+  handedBackOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Pick the day it was handed back.'),
+  expectedAmount: z.number().finite().optional(),
+}).strict()
+
+leasesRouter.post('/:id/deposit-return/refund-parts/:partId/try-again', requirePerm('leases.deposit_return'), async (req, res, next) => {
+  try {
+    const lease = await depositReturnLease(req, 'write')
+    const { partId } = refundPartParams.parse({ partId: req.params.partId })
+    const { retryDepositRefundPart } = await import('../services/depositRefundSend')
+    res.json({ success: true, data: await retryDepositRefundPart(lease.id, partId) })
+  } catch (e) { next(e) }
+})
+
+leasesRouter.post('/:id/deposit-return/refund-parts/:partId/cash', requirePerm('leases.deposit_return'), async (req, res, next) => {
+  try {
+    const lease = await depositReturnLease(req, 'write')
+    const { partId } = refundPartParams.parse({ partId: req.params.partId })
+    const body = cashPartSchema.parse(req.body ?? {})
+    const { giveDepositPartBackInCash } = await import('../services/depositRefundSend')
+    res.json({ success: true, data: await giveDepositPartBackInCash(lease.id, partId, req.user!.userId, {
+      expectedAmount: body.expectedAmount,
+      // Fix pass 3: "your next payout" only to the landlord themselves — GAM
+      // staff (admin) and team members are told "the landlord's next payout".
+      viewerIsOwner: req.user!.role === 'landlord',
+    }) })
+  } catch (e) { next(e) }
+})
+
+leasesRouter.post('/:id/deposit-return/landlord-part/handed-back', requirePerm('leases.deposit_return'), async (req, res, next) => {
+  try {
+    const lease = await depositReturnLease(req, 'write')
+    const body = handedBackSchema.parse(req.body ?? {})
+    const { markLandlordPartHandedBack } = await import('../services/depositRefundSend')
+    res.json({ success: true, data: await markLandlordPartHandedBack(lease.id, {
+      handedBackOn: body.handedBackOn, expectedAmount: body.expectedAmount, actorUserId: req.user!.userId,
+    }) })
+  } catch (e) { next(e) }
+})
+
+leasesRouter.post('/:id/deposit-return/landlord-part/undo', requirePerm('leases.deposit_return'), async (req, res, next) => {
+  try {
+    const lease = await depositReturnLease(req, 'write')
+    const { undoLandlordPartHandedBack } = await import('../services/depositRefundSend')
+    res.json({ success: true, data: await undoLandlordPartHandedBack(lease.id) })
   } catch (e) { next(e) }
 })
 
@@ -1766,6 +2285,205 @@ leasesRouter.get('/:id/termination-quote', async (req, res, next) => {
 
 // POST /api/leases/:id/terminate-early — tenant initiates
 const reasonSchema = z.object({ reason: z.string().max(2000).optional() })
+// ── "They never moved in — end the lease" — 10/4 (decisions #46.4, Nic, FINAL) ──
+//
+//   "If they never pay the deposit or never move in, you would just zero it out
+//    and end the lease."
+//
+// Step 9 (final fix, fix pass 1): before this the never-moved-in close ran
+// only inside PATCH /leases/:id when a status change ended the lease, and no
+// screen sends that; the button staff had — Discard — refused a lease the
+// tenant had signed ("void the document instead"), and the void refused it too
+// ("Cannot void after a tenant has signed"): two errors in a row, no next
+// step, and the bill stayed owed. And a lease the scheduler had already made
+// active on its start date was never closed at all — the usual case (the day
+// came and the tenant never showed).
+//
+// Now staff say it in so many words: GET reads, fresh, exactly what would be
+// zeroed (the confirm lists it); POST does the ONE close — the unpaid MOVE-IN
+// bill zeroed with a plain note and voided (decisions #53: only that bill — a
+// later month's bill stays owed, and the confirm lists it as "stays owed"),
+// the lease ended, the household
+// taken off it, the space emptied — in one transaction, checking the total the
+// confirm showed under the locks (a change since answers 409 in plain words and
+// the window reads it again in place). Staff saying "they never moved in" is
+// what lets it close a lease that already went active on its start date
+// (lib/unwindIssuedLease.assessNeverMovedIn, attested). When it does not
+// apply — money was paid, a payment is on its way, GAM's records say they
+// moved in, a renewal, an imported tenancy — it refuses in plain words that
+// name the real next step, and nothing changes.
+
+/** The plain-words 409 when what the lease owes changed since the confirm opened (lib/unwindIssuedLease, one copy). */
+export { NEVER_MOVED_IN_CHANGED_WORDS } from '../lib/unwindIssuedLease'
+
+const neverMovedInSchema = z.object({ expectedTotal: z.number().finite().optional() }).strict()
+
+/**
+ * Fix pass 2: SQL — whether anyone signed a document of lease `a`: the
+ * tenant side (anyone but the landlord or a witness — a primary, a tenant, a
+ * co-tenant), or anyone at all. ONE test for the Leases page (which button a
+ * waiting lease shows) and for Discard (what it does), so the page never
+ * offers "discard the unsigned draft" on a lease the server reads as signed.
+ * (leases.signed_by_tenant is set only once EVERYONE has signed.)
+ */
+export function leaseSignedBySql(a: string, who: 'tenant' | 'anyone'): string {
+  if (!/^[a-z_][a-z0-9_]*$/i.test(a)) throw new Error(`leaseSignedBySql: "${a}" is not a table alias`)
+  return `EXISTS (SELECT 1 FROM lease_document_signers lss
+                   JOIN lease_documents lsd ON lsd.id = lss.document_id
+                  WHERE lsd.lease_id = ${a}.id AND lss.signed_at IS NOT NULL
+                    ${who === 'tenant' ? `AND lss.role NOT IN ('landlord', 'witness')` : ''})`
+}
+
+/** The plain-words 409 when Discard is pressed on a lease a tenant signed without the confirm that lists what is zeroed. */
+export const DISCARD_TENANT_SIGNED_WORDS = 'A tenant signed this lease, so it isn’t an unsigned draft. ' +
+  'Use “They never moved in — end the lease” — it shows exactly what would be zeroed first.'
+
+/** Who is reading a never-moved-in refusal, so its next step is one they can take. */
+function neverMovedInReader(req: any): { canMarkLeaving: boolean; canMoveOut: boolean } {
+  return {
+    canMarkLeaving: userHasPerm(req.user, 'leases.edit', 'front_desk.mark_leaving'),
+    canMoveOut: userHasPerm(req.user, 'leases.deposit_return'),
+  }
+}
+
+/** The lease, with the caller's right to end it (the landlord account AND the property in their scope). */
+async function neverMovedInLease(req: any, mode: 'read' | 'write'): Promise<{
+  id: string; landlord_id: string; unit_id: string; property_id: string
+}> {
+  const lease = await queryOne<{ id: string; landlord_id: string; unit_id: string; property_id: string }>(
+    `SELECT l.id, l.landlord_id, l.unit_id, u.property_id
+       FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id = $1`, [req.params.id])
+  if (!lease) throw new AppError(404, 'This lease is no longer on the account.')
+  const allowed = mode === 'read'
+    ? canAccessLandlordResource(req.user, lease.landlord_id)
+    : canManageLandlordResource(req.user, lease.landlord_id)
+  if (!allowed) throw new AppError(403, 'This lease isn’t on your account.')
+  const { getScopedPropertyIds, assertPropertyInScope } = await import('../middleware/auth')
+  const WORDS = 'You are not assigned to this property, so you can’t end its leases. Ask the landlord to add this property to your access.'
+  if (mode === 'read') {
+    const scoped = await getScopedPropertyIds(req.user)
+    if (scoped !== null && !scoped.includes(lease.property_id)) throw new AppError(403, WORDS)
+  } else {
+    try { await assertPropertyInScope(req.user, lease.property_id) }
+    catch (e) {
+      if (e instanceof AppError && e.statusCode === 403) throw new AppError(403, WORDS)
+      throw e
+    }
+  }
+  return lease
+}
+
+/**
+ * The one close for a lease the tenant never moved into (decisions #46.4):
+ * zero the unpaid move-in bill and void it (decisions #53 — later bills stay
+ * owed), end the lease and take the household
+ * off it, cancel the stay it was drafted from — one transaction
+ * (lib/unwindIssuedLease.endLeaseNeverMovedIn, the copy the Schedule's Cancel
+ * reservation runs too). Refuses (409, nothing changed) in the assessment's
+ * plain words when it does not apply, and when `expectedTotal` (what the
+ * confirm showed) is not what it would zero now.
+ */
+async function endLeaseNeverMovedIn(
+  lease: { id: string; unit_id: string }, userId: string, expectedTotal: number | undefined,
+  reader: { canMarkLeaving: boolean; canMoveOut: boolean },
+): Promise<{
+  lines: Array<{ payment_id: string; label: string; amount: number }>; total: number; reservationCanceled: boolean
+  kept: Array<{ payment_id: string; label: string; amount: number; why: string; due_date: string | null }>; keptTotal: number; keptWords: string | null
+}> {
+  const { endLeaseNeverMovedIn: endIt } = await import('../lib/unwindIssuedLease')
+  const { cancelSupersededIntents } = await import('../services/creditUse')
+  // A household's new lease waiting after this one is refused inside the
+  // assessment (fix pass 2), so the confirm shows the same refusal.
+  const c = await getClient()
+  let closed: Awaited<ReturnType<typeof endIt>>
+  try {
+    await c.query('BEGIN')
+    closed = await endIt(c, lease, { reader, expectedTotal, actorUserId: userId })
+    await c.query('COMMIT')
+  } catch (e) {
+    await c.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally { c.release() }
+  await cancelSupersededIntents(closed.cancelAfterCommit)
+  // The canceled reservation frees its dates: the next waitlister is offered
+  // them, as the Schedule's Cancel reservation does (best-effort).
+  if (closed.canceledBooking) {
+    const { promoteNextWaitlister } = await import('../services/propertyBooking')
+    promoteNextWaitlister(closed.canceledBooking.unitId).catch((err) =>
+      logger.error({ err, bookingId: closed.canceledBooking?.bookingId }, '[lease] waitlist promote after never-moved-in cancel failed'))
+  }
+  logger.info({ leaseId: lease.id, by: userId, zeroed: closed.closedAmount, lines: closed.closedPaymentIds.length,
+    voidedDocuments: closed.voidedDocumentIds.length, canceledBooking: closed.canceledBooking?.bookingId ?? null },
+    '[lease] ended — the tenant never moved in')
+  return {
+    lines: closed.assessment.lines.map((l) => ({ payment_id: l.paymentId, label: l.label, amount: l.amount })),
+    total: closed.closedAmount,
+    reservationCanceled: closed.canceledBooking != null,
+    // Fix pass 3 (review): what stays owed, as the close read it under its
+    // locks — the page's toast is built from this, never from the preview
+    // the window opened with (a GAM fee added in between is named too).
+    kept: closed.assessment.kept.map((k) => ({ payment_id: k.paymentId, label: k.label, amount: k.amount, why: k.why, due_date: k.dueDate })),
+    keptTotal: closed.assessment.keptTotal,
+    keptWords: closed.assessment.keptWords,
+  }
+}
+
+// GET /api/leases/:id/never-moved-in — what "They never moved in — end the
+// lease" would zero, read fresh (the confirm lists it), or why it does not apply.
+leasesRouter.get('/:id/never-moved-in', requirePerm('leases.terminate'), async (req, res, next) => {
+  try {
+    const lease = await neverMovedInLease(req, 'read')
+    const { assessNeverMovedIn, reservationCanceledWords, leaseHouseholdNames } = await import('../lib/unwindIssuedLease')
+    const a = await assessNeverMovedIn(
+      async (sql, params) => ({ rows: await query<any>(sql, params) }), lease.id,
+      { attested: true, lock: false, reader: neverMovedInReader(req) })
+    res.json({ success: true, data: {
+      applies: a.applies,
+      words: a.words,
+      status: a.status,
+      start_date: a.startDate,
+      lines: a.lines.map((l) => ({ payment_id: l.paymentId, label: l.label, amount: l.amount, due_date: l.dueDate, utility: l.utility })),
+      total: a.total,
+      // Step 9 final fix (fix pass 1): what stays owed (GAM's own fees,
+      // charges billed on purpose), in plain words; the reservation canceled
+      // with the lease; and whether the lease had already ended.
+      // Fix pass 2 (review): a later month's rent says the days it covers.
+      kept: a.kept.map((k) => ({ payment_id: k.paymentId, label: k.label, amount: k.amount, why: k.why, due_date: k.dueDate,
+                                 period_start: k.periodStart ?? null, period_end: k.periodEnd ?? null })),
+      kept_total: a.keptTotal,
+      kept_words: a.keptWords,
+      reservation_words: a.applies && a.reservation ? reservationCanceledWords(a.reservation) : null,
+      already_ended: a.alreadyEnded,
+      // Fix pass 3 (review): the people by the SAME helper the Schedule's
+      // Cancel reservation confirm uses (lib/unwindIssuedLease
+      // leaseHouseholdNames — an unsigned add-a-roommate included), so the
+      // two confirms that are one close name the same people.
+      household: await (async () => {
+        const h = await leaseHouseholdNames(async (sql, params) => ({ rows: await query<any>(sql, params) }), lease.id)
+        return { tenant_names: h.tenantNames, unit_number: h.unitNumber, property_name: h.propertyName }
+      })(),
+    } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/leases/:id/never-moved-in — the close (body: the total the confirm showed).
+leasesRouter.post('/:id/never-moved-in', requirePerm('leases.terminate'), async (req, res, next) => {
+  try {
+    const body = neverMovedInSchema.parse(req.body ?? {})
+    if (body.expectedTotal === undefined) {
+      throw new AppError(400, 'Open “They never moved in — end the lease” again: it shows what would be zeroed before you confirm.')
+    }
+    const lease = await neverMovedInLease(req, 'write')
+    const r = await endLeaseNeverMovedIn(lease, req.user!.userId, body.expectedTotal, neverMovedInReader(req))
+    const now = await queryOne<{ status: string }>(`SELECT status FROM leases WHERE id = $1`, [lease.id])
+    res.json({ success: true, data: {
+      id: lease.id, status: now?.status ?? 'terminated', zeroed_lines: r.lines, zeroed_total: r.total,
+      reservation_canceled: r.reservationCanceled,
+      kept: r.kept, kept_total: r.keptTotal, kept_words: r.keptWords,
+    } })
+  } catch (e) { next(e) }
+})
+
 // ── POST /api/leases/:id/discard — S640 (Nic) ───────────────────────────────
 //
 //   "The one lease in review, that's the one that was supposed to delete when I
@@ -1780,39 +2498,150 @@ const reasonSchema = z.object({ reason: z.string().max(2000).optional() })
 // button on it opens a PDF that does not exist.
 //
 // So: a way to discard one. It is a SOFT close, not a delete (GAM keeps
-// everything) — the row stays, marked terminated, with who did it and when. And
-// it is strictly limited to paperwork nobody has signed: a lease that reached
-// 'active' is an agreement between two people, and no button on a list page
-// ends a tenancy.
+// everything) — the row stays, marked terminated, with who did it and when.
+// A lease that reached 'active' is an agreement between two people, and no
+// Discard ends a tenancy (one whose tenant never came ends through "They never
+// moved in — end the lease").
+//
+// Step 9 (final fix, fix pass 1 — decisions #46.4): a pending lease the TENANT
+// signed is no longer refused. Nobody can void it (a tenant signed), so Discard
+// runs the same single close as "They never moved in — end the lease": the
+// unpaid move-in bill zeroed, the lease ended — or a refusal in plain words
+// naming the real next step when money was paid. A lease only the landlord
+// signed is voided on the GoldSign page (that takes its bill back and tells the
+// tenant).
+//
+// Fix pass 2: "a tenant signed" is ONE test (leaseSignedBySql — any signer but
+// the landlord or a witness), shared with the Leases list, so the page offers
+// Discard only where the server treats the lease as an unsigned draft. On a
+// tenant-signed lease the confirm's total (expectedTotal) is required: without
+// it Discard answers 409 'tenant_signed' and changes nothing, and the page
+// opens "They never moved in — end the lease", which shows what is zeroed.
+// The close also voids the lease's paperwork still waiting for signatures
+// (lib/unwindIssuedLease.closeNeverMovedInBill), so a later signature can't
+// issue a lease that already ended.
+//
+// Fix pass 3: every Discard path checks the property scope first (a team
+// member locked to other properties is refused in plain words, nothing
+// changes) — before only the tenant-signed path did. A lease only the
+// landlord signed answers 409 'landlord_signed' (the page reads the list
+// again, so the row shows "Void on the GoldSign page"). And discarding an
+// unsigned draft cancels its own paperwork still out for signature, in the
+// same transaction, under a lock that checks again that nobody has signed —
+// a signing link already sent no longer works (before, a tenant could sign
+// after the Discard and a later landlord signature issued an ended lease).
 leasesRouter.post('/:id/discard', requirePerm('leases.terminate'), async (req, res, next) => {
   try {
+    const body = neverMovedInSchema.parse(req.body ?? {})
+    // The account AND the property in this person's scope, in plain words.
+    await neverMovedInLease(req, 'write')
     const lease = await queryOne<any>(
-      `SELECT id, landlord_id, status, lease_source FROM leases WHERE id = $1`, [req.params.id])
-    if (!lease) throw new AppError(404, 'Lease not found')
-    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+      `SELECT id, landlord_id, status, lease_source, unit_id FROM leases WHERE id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'This lease is no longer on the account.')
     if (!['pending', 'draft'].includes(lease.status)) {
-      throw new AppError(400, 'Only an unsigned draft can be discarded')
+      throw new AppError(400, lease.status === 'active'
+        ? 'This lease is in force, so it can’t be discarded. If the tenant never moved in, use Change → “They never moved in — end the lease”. ' +
+          'If they live there and are leaving, use Change → “They’re leaving on…”.'
+        // Step 9 final fix (fix pass 1): never "Nothing else to do" — an ended
+        // lease may still carry a bill (its Change menu offers "They never
+        // moved in — zero the bill" when it does).
+        : 'This lease has already ended, so there is nothing to discard.')
     }
-    // A draft with signatures on it is mid-signing, not abandoned — that is
-    // what Void is for on the e-sign document, which notifies the signers.
-    const signed = await queryOne<{ n: string }>(
-      `SELECT COUNT(*)::text AS n
-         FROM lease_document_signers s
-         JOIN lease_documents d ON d.id = s.document_id
-        WHERE d.lease_id = $1 AND s.signed_at IS NOT NULL`, [req.params.id])
-    if (Number(signed?.n ?? 0) > 0) {
-      throw new AppError(400, 'Someone has already signed this — void the document instead')
+    const signed = await queryOne<{ tenant: boolean; anyone: boolean }>(
+      `SELECT ${leaseSignedBySql('l', 'tenant')} AS tenant, ${leaseSignedBySql('l', 'anyone')} AS anyone
+         FROM leases l WHERE l.id = $1`, [req.params.id])
+    if (signed?.tenant === true) {
+      // Fix pass 2: the confirm that lists what is zeroed is required. A
+      // Discard pressed from a stale list ("the unsigned draft … nothing is
+      // sent") must never zero a bill nobody was shown: 409, and the Leases
+      // page opens "They never moved in — end the lease" in its place.
+      if (body.expectedTotal === undefined) {
+        return res.status(409).json({ success: false, error: DISCARD_TENANT_SIGNED_WORDS, code: 'tenant_signed' })
+      }
+      const r = await endLeaseNeverMovedIn(lease, req.user!.userId, body.expectedTotal, neverMovedInReader(req))
+      return res.json({ success: true, data: {
+        id: req.params.id, status: 'terminated', zeroed_lines: r.lines, zeroed_total: r.total, reservation_canceled: r.reservationCanceled,
+        kept: r.kept, kept_total: r.keptTotal, kept_words: r.keptWords,
+      } })
+    }
+    // Only the landlord signed: the void takes the lease and its bill back and
+    // tells the tenant (lib/unwindIssuedLease.unwindIssuedLease). 409 with a
+    // code: the list read before the landlord signed is stale, and the page
+    // reads it again so the row shows "Void on the GoldSign page".
+    if (signed?.anyone === true) {
+      return res.status(409).json({ success: false, error: DISCARD_LANDLORD_SIGNED_WORDS, code: 'landlord_signed' })
     }
 
-    await query(
-      `UPDATE leases
-          SET status = 'terminated', needs_review = FALSE, updated_at = NOW()
-        WHERE id = $1`, [req.params.id])
-    logger.info({ leaseId: req.params.id, by: req.user!.userId, source: lease.lease_source },
+    const voided = await discardUnsignedDraft(req.params.id)
+    if (voided.refused) {
+      return res.status(409).json({ success: false, error: voided.refused.words, code: voided.refused.code })
+    }
+    logger.info({ leaseId: req.params.id, by: req.user!.userId, source: lease.lease_source, voidedDocuments: voided.documentIds.length },
       '[lease] unsigned draft discarded')
     res.json({ success: true, data: { id: req.params.id, status: 'terminated' } })
   } catch (e) { next(e) }
 })
+
+/** The plain-words 409 when Discard is pressed on a lease only the landlord signed. */
+export const DISCARD_LANDLORD_SIGNED_WORDS = 'You signed this lease and the tenant hasn’t yet. Void its document on the GoldSign page instead — ' +
+  'that takes the lease and its bill back and tells the tenant.'
+
+/** The void reason on an unsigned draft's paperwork canceled by Discard. */
+export const DISCARD_VOID_REASON = 'The lease ended: the unsigned draft was discarded'
+
+/**
+ * Fix pass 3: discard an unsigned draft — ONE transaction. The lease and its
+ * own paperwork are locked, the "nobody signed" test runs again under the
+ * locks (a signature since the page read it is refused in plain words, nothing
+ * changed), its documents still out for signature are voided (they can't be
+ * signed afterwards; a home-sale document is not the lease's and is left
+ * alone), their scheduled money changes canceled (as every void does), and the
+ * lease ends. Soft: every row stays.
+ */
+async function discardUnsignedDraft(leaseId: string): Promise<{
+  documentIds: string[]; refused: { code: 'tenant_signed' | 'landlord_signed' | 'not_a_draft'; words: string } | null
+}> {
+  const c = await getClient()
+  try {
+    await c.query('BEGIN')
+    const l = (await c.query<{ status: string }>(`SELECT status FROM leases WHERE id = $1 FOR UPDATE`, [leaseId])).rows[0]
+    await c.query(`SELECT id FROM lease_documents WHERE lease_id = $1 ORDER BY id FOR UPDATE`, [leaseId])
+    const now = (await c.query<{ tenant: boolean; anyone: boolean }>(
+      `SELECT ${leaseSignedBySql('l', 'tenant')} AS tenant, ${leaseSignedBySql('l', 'anyone')} AS anyone
+         FROM leases l WHERE l.id = $1`, [leaseId])).rows[0]
+    const refused = !l || !['pending', 'draft'].includes(l.status)
+      ? { code: 'not_a_draft' as const, words: 'This lease is no longer a draft, so nothing was discarded. The list now shows it as it is.' }
+      : now?.tenant === true ? { code: 'tenant_signed' as const, words: DISCARD_TENANT_SIGNED_WORDS }
+      : now?.anyone === true ? { code: 'landlord_signed' as const, words: DISCARD_LANDLORD_SIGNED_WORDS }
+      : null
+    if (refused) {
+      await c.query('ROLLBACK')
+      return { documentIds: [], refused }
+    }
+    const documentIds = (await c.query<{ id: string }>(
+      `UPDATE lease_documents
+          SET status = 'voided', voided_at = NOW(), updated_at = NOW(), void_reason = $2
+        WHERE lease_id = $1
+          AND status IN ('pending', 'sent', 'in_progress')
+          AND document_type IN ('original_lease', 'addendum_add', 'addendum_remove', 'addendum_terms',
+                                'work_trade_addendum', 'sublease_agreement')
+        RETURNING id`, [leaseId, DISCARD_VOID_REASON])).rows.map((r) => r.id)
+    if (documentIds.length > 0) {
+      await c.query(
+        `UPDATE scheduled_lease_changes SET status = 'cancelled', updated_at = NOW()
+          WHERE source_document_id = ANY($1::uuid[]) AND status IN ('draft', 'scheduled')`, [documentIds])
+    }
+    await c.query(
+      `UPDATE leases
+          SET status = 'terminated', needs_review = FALSE, updated_at = NOW()
+        WHERE id = $1`, [leaseId])
+    await c.query('COMMIT')
+    return { documentIds, refused: null }
+  } catch (e) {
+    await c.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally { c.release() }
+}
 
 leasesRouter.post('/:id/terminate-early', async (req, res, next) => {
   try {
@@ -2048,30 +2877,73 @@ async function leaseInScope(req: any, leaseId: string) {
 //    little bit out of pocket each month... use only a dedicated amount of the
 //    credit each month."
 //
-// One number on the lease: the most credit a billing month may use. Null
-// clears it (the credit covers whole bills as it always has). Read by the
-// invoice run, the tenant's Pay Now and the desk alike (services/prepaidRelease).
+// One number on the lease: the most paid-ahead money a billing month may use.
+// Null clears it. Read by the bill run, the tenant's Pay Now and the desk alike
+// (creditUse.householdQuote caps the plan with it).
+//
+// S655 (Nic, 10/2): credit pays a bill by itself only when it covers the WHOLE
+// bill. Raising or clearing the cap can make the paid-ahead money cover this
+// month's whole bill, so the whole-bill check runs for the household right
+// after the change (its own transaction; it never undoes the change) — the same
+// check the bill run and the late-fee run make. The answer says what the credit
+// covers now, and whether it just paid the bill.
+//
+// Because the change can spend the tenant's money, a team member is held to
+// the parks they work at, as for the leaving mark beside it (leaseInScope): a
+// desk locked to one park cannot lift the monthly limit on a lease at another.
 leasesRouter.patch('/:id/prepaid-draw', requirePerm('leases.edit', 'take_payment', 'front_desk.mark_leaving'), async (req: any, res, next) => {
   try {
     const body = z.object({ monthlyDraw: z.number().positive().max(100000).nullable() }).parse(req.body)
-    const lease = await queryOne<{ id: string; landlord_id: string; status: string; timezone: string }>(
-      `SELECT l.id, l.landlord_id, l.status, p.timezone
+    await leaseInScope(req, req.params.id)
+    const lease = await queryOne<{ id: string; landlord_id: string; status: string; timezone: string; cap: string | null }>(
+      `SELECT l.id, l.landlord_id, l.status, p.timezone, l.prepaid_monthly_draw::text AS cap
          FROM leases l
          JOIN units u ON u.id = l.unit_id
          JOIN properties p ON p.id = u.property_id
         WHERE l.id = $1`, [req.params.id])
     if (!lease) throw new AppError(404, 'Lease not found')
-    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
     await query(`UPDATE leases SET prepaid_monthly_draw = $2, updated_at = NOW() WHERE id = $1`,
       [lease.id, body.monthlyDraw == null ? null : body.monthlyDraw.toFixed(2)])
+
+    // The household: everyone on the lease now (their bills share its paid-ahead money).
+    const members = (await query<{ tenant_id: string }>(
+      `SELECT DISTINCT tenant_id FROM lease_tenants
+        WHERE lease_id = $1 AND status IN ('active','pending_add','pending_remove')
+        ORDER BY tenant_id`, [lease.id])).map(m => m.tenant_id)
+
+    // More room than before (raised or cleared): the money may now cover the
+    // whole bill. A lower cap never makes a bill payable from credit.
+    const before = lease.cap == null ? null : Number(lease.cap)
+    const raised = body.monthlyDraw == null ? before != null : (before != null && body.monthlyDraw > before)
+    let paidByCredit: string[] = []
+    if (raised) {
+      const { runWholeBillCheckAfterCommit } = await import('../services/creditUse')
+      for (const tenantId of members) {
+        const r = await runWholeBillCheckAfterCommit({ tenantId, landlordId: lease.landlord_id, onlyLeaseIds: [lease.id] })
+        paidByCredit = paidByCredit.concat(r?.settledIds ?? [])
+      }
+    }
+
     const { prepaidDrawAvailable } = await import('../services/prepaidRelease')
     const { db } = await import('../db')
     // S654: the billing month is the park's month — on the last evening of a
     // month UTC has already turned the page.
     const month = monthStartOf(todayIn(lease.timezone))
     const draw = await prepaidDrawAvailable(db as any, lease.id, month).catch(() => null)
-    logger.info({ leaseId: lease.id, monthlyDraw: body.monthlyDraw, by: req.user!.userId }, '[lease] prepaid monthly draw set')
-    res.json({ success: true, data: { leaseId: lease.id, monthlyDraw: body.monthlyDraw, credit: draw } })
+    // What credit (of any kind) would pay of this lease's open bill right now —
+    // the "credit available" the desk and the tenant see (openBalances.creditBeside).
+    const { creditBeside } = await import('../services/openBalances')
+    const creditAvailable = members.length
+      ? (await creditBeside({ tenantId: members[0], landlordIds: [lease.landlord_id], leaseIds: [lease.id] }))
+          .usableByLease.get(lease.id) ?? 0
+      : 0
+    logger.info({ leaseId: lease.id, monthlyDraw: body.monthlyDraw, paidByCredit: paidByCredit.length, by: req.user!.userId }, '[lease] prepaid monthly draw set')
+    res.json({ success: true, data: {
+      leaseId: lease.id, monthlyDraw: body.monthlyDraw, credit: draw,
+      creditAvailable,
+      // The charges the credit paid just now because the new limit lets it cover the whole bill.
+      paidByCredit: paidByCredit.length,
+    } })
   } catch (e) { next(e) }
 })
 

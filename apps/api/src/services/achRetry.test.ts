@@ -44,8 +44,11 @@ const retrieveFn = vi.fn(async (id: string): Promise<any> => ({
   payment_method_types: ['us_bank_account'],
   last_payment_error: { code: 'insufficient_funds', payment_method: { id: 'pm_tenant_bank', type: 'us_bank_account' } },
 }))
+// S655: a pull that will not be fired is canceled; a FlexPay retry re-prices its intent.
+const cancelFn = vi.fn(async (id: string) => ({ id, status: 'canceled' }))
+const updateFn = vi.fn(async (id: string, _p?: any) => ({ id }))
 vi.mock('../lib/stripe', () => ({
-  getStripe: () => ({ paymentIntents: { confirm: confirmFn, retrieve: retrieveFn } }),
+  getStripe: () => ({ paymentIntents: { confirm: confirmFn, retrieve: retrieveFn, cancel: cancelFn, update: updateFn } }),
 }))
 // S654: the retry cron can now tell a tenant their retry was not fired.
 const { sendNotificationEmailMock, repriceMock } = vi.hoisted(() => ({
@@ -61,7 +64,7 @@ vi.mock('./flexpay', async (importOriginal) => {
   return { ...actual, repriceFlexPayRetryPayment: repriceMock }
 })
 
-import { processAchRetries, extractReturnCode, decideRetry, retryConfirmParams } from './achRetry'
+import { processAchRetries, extractReturnCode, decideRetry, retryConfirmParams, bankRefusedDebit } from './achRetry'
 import { fetchOutstandingRows } from './rentCharge'
 
 beforeEach(async () => {
@@ -69,6 +72,8 @@ beforeEach(async () => {
   confirmFn.mockReset()
   confirmFn.mockResolvedValue({ id: 'pi_mock' } as any)
   retrieveFn.mockClear()
+  cancelFn.mockClear()
+  updateFn.mockClear()
   sendNotificationEmailMock.mockClear()
   repriceMock.mockReset()
   repriceMock.mockResolvedValue(undefined)
@@ -419,6 +424,33 @@ describe('extractReturnCode — reads the bank\'s reason by name as well as by c
   })
 })
 
+// Step 10 fix round (decisions #37.D, FlexPay terms §4.3): whose a failed bank
+// debit is. The bank's refusal is the bank's whether or not its reason maps to
+// an R-code; only Stripe refusing GAM's own request, or a cancel, is GAM's.
+describe('bankRefusedDebit — a failed bank debit is the bank\'s answer, readable reason or not', () => {
+  it.each(['bank_account_restricted', 'account_frozen', 'bank_ownership_changed', 'insufficient_funds', 'debit_not_authorized'])(
+    'a bank debit failing with %s is the tenant\'s bank', (code) => {
+      expect(bankRefusedDebit(failedPi({ type: 'card_error', code, payment_method: bank }))).toBe(true)
+    })
+
+  it('an unmapped bank reason has no R-code and is never retried, but is still the bank\'s', () => {
+    const pi = failedPi({ type: 'card_error', code: 'account_frozen', payment_method: bank })
+    expect(extractReturnCode(pi)).toBeNull()
+    expect(decideRetry(extractReturnCode(pi))).toBe('permanent')
+    expect(bankRefusedDebit(pi)).toBe(true)
+  })
+
+  it('Stripe refusing GAM\'s own request (an invalid request, an API error) is never the bank\'s', () => {
+    expect(bankRefusedDebit(failedPi({ type: 'invalid_request_error', code: 'payment_intent_mandate_invalid', payment_method: bank }))).toBe(false)
+    expect(bankRefusedDebit(failedPi({ type: 'api_error', payment_method: bank }))).toBe(false)
+  })
+
+  it('a canceled intent or a card is never the tenant\'s bank', () => {
+    expect(bankRefusedDebit(failedPi(null, { status: 'canceled', payment_method_types: ['us_bank_account'] }))).toBe(false)
+    expect(bankRefusedDebit(failedPi({ type: 'card_error', code: 'card_declined', payment_method: { type: 'card' } }))).toBe(false)
+  })
+})
+
 // S654: after a bounce Stripe sends the intent back to "needs a payment method"
 // and the account rides on last_payment_error. A bare confirm(id) has nothing to
 // pull from, so the retry names the account the tenant paid from.
@@ -595,5 +627,210 @@ describe('the retry names a debit authorization only for a bank account', () => 
       payment_method_types: ['card', 'us_bank_account'], last_payment_error: null,
     } as any)
     expect(params).toEqual({ payment_method: 'pm_card' })
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S655 (money plan Step 10): the retry and the credit a pull set aside.
+// ═══════════════════════════════════════════════════════════════════════════
+
+import { createPaidAhead, holdCredit, supersedeScheduledRetry } from './creditUse'
+import { seedLeaseTenant } from '../test/dbHelpers'
+
+/**
+ * A bounced bank pull due for its retry, the way the portal made it: rent and
+ * water, $100 of paid-ahead credit set aside on the rent, the receipt carrying
+ * the intent.
+ */
+async function seedHeldRetry(pi: string) {
+  const c = await getClient()
+  try {
+    const { userId: ownerUserId, landlordId } = await seedLandlord(c)
+    const tenantId = await seedTenant(c)
+    const propertyId = await seedProperty(c, { landlordId, ownerUserId, managedByUserId: ownerUserId })
+    const unitId = await seedUnit(c, { propertyId, landlordId, rentAmount: 1000 })
+    const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: 1000 })
+    await seedLeaseTenant(c, { leaseId, tenantId })
+    const mk = async (type: string, amount: number) => (await c.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,'2026-10-01') RETURNING id`,
+      [unitId, leaseId, tenantId, landlordId, type, amount, type === 'rent' ? 'RENT' : 'UTILITY'])).rows[0].id
+    const rentId = await mk('rent', 1000)
+    const waterId = await mk('utility', 40)
+    const creditId = await createPaidAhead(c, { leaseId, tenantId, amount: 100, fundedBy: 'landlord', receivedAt: new Date() })
+    const remId = (await c.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, payment_method,
+                                       gross_amount, processing_fee_amount)
+       VALUES ($1,$2,$3,940,940,'ach',946,6) RETURNING id`, [tenantId, leaseId, landlordId])).rows[0].id
+    await c.query('BEGIN')
+    await holdCredit(c, [{ creditKind: 'paid_ahead', creditId, paymentId: rentId, leaseId, amount: 100, billingMonth: '2026-10-01' }],
+      { remittanceId: remId, source: 'portal' })
+    await c.query('COMMIT')
+    await c.query(
+      `UPDATE payments SET status = 'failed', stripe_payment_intent_id = $2, return_code = 'R01', retry_count = 0,
+                           next_retry_at = NOW() - INTERVAL '1 minute'
+        WHERE id = ANY($1::uuid[])`, [[rentId, waterId], pi])
+    await c.query(`UPDATE tenant_remittances SET stripe_payment_intent_id = $2 WHERE id = $1`, [remId, pi])
+    return { tenantId, landlordId, leaseId, rentId, waterId, creditId, remId }
+  } finally { c.release() }
+}
+
+const useOf = async (remId: string) =>
+  (await db.query<any>(`SELECT status, release_reason FROM credit_uses WHERE remittance_id = $1`, [remId])).rows[0]
+const creditLeft = async (creditId: string) =>
+  (await db.query<any>(`SELECT amount_remaining::float AS r FROM lease_prepaid_credits WHERE id = $1`, [creditId])).rows[0].r
+
+describe('S655 Step 10 — the retry and its credit', () => {
+  it('the retry marks rows processing and confirms once per intent, its credit still set aside', async () => {
+    const f = await seedHeldRetry('pi_held_retry')
+    const res = await processAchRetries()
+    expect(res).toMatchObject({ scanned: 1, fired: 1, succeeded: 1 })
+    expect(confirmFn).toHaveBeenCalledTimes(1)
+    const rows = await db.query<any>(`SELECT status, retry_count FROM payments WHERE id = ANY($1::uuid[])`, [[f.rentId, f.waterId]])
+    expect(rows.rows).toEqual([{ status: 'processing', retry_count: 1 }, { status: 'processing', retry_count: 1 }])
+    expect(await useOf(f.remId)).toEqual({ status: 'held', release_reason: null })
+    expect(cancelFn).not.toHaveBeenCalled()
+  })
+
+  it('a tenant payment that claimed the rows first stops the retry and releases its credit', async () => {
+    const f = await seedHeldRetry('pi_paid_first')
+    // The tenant pays now: their payment supersedes the scheduled retry (what
+    // the portal, autopay and the desk do before they claim the rows).
+    const c = await getClient()
+    let cancel: string[]
+    try {
+      await c.query('BEGIN')
+      cancel = (await supersedeScheduledRetry(c, [f.rentId, f.waterId])).cancelAfterCommit
+      await c.query('COMMIT')
+    } finally { c.release() }
+    expect(cancel!).toEqual(['pi_paid_first'])
+    const res = await processAchRetries()
+    expect(res.scanned).toBe(0)
+    expect(confirmFn).not.toHaveBeenCalled()
+    expect(await useOf(f.remId)).toEqual({ status: 'released', release_reason: 'superseded' })
+    expect(await creditLeft(f.creditId)).toBe(100)
+  })
+
+  it('a stray skip releases held credit and cancels the intent', async () => {
+    const f = await seedHeldRetry('pi_stray_held')
+    // The water was paid at the desk meanwhile.
+    await db.query(`UPDATE payments SET status = 'settled', settled_at = NOW(), manual_method = 'cash' WHERE id = $1`, [f.waterId])
+    const res = await processAchRetries()
+    expect(res).toMatchObject({ scanned: 1, fired: 0, skipped: 1 })
+    expect(confirmFn).not.toHaveBeenCalled()
+    expect((await db.query<any>(`SELECT status, next_retry_at FROM payments WHERE id = $1`, [f.rentId])).rows[0])
+      .toEqual({ status: 'failed', next_retry_at: null })
+    expect(await useOf(f.remId)).toEqual({ status: 'released', release_reason: 'superseded' })
+    expect(await creditLeft(f.creditId)).toBe(100)
+    expect((await db.query<any>(`SELECT status FROM tenant_remittances WHERE id = $1`, [f.remId])).rows[0].status).toBe('failed')
+    expect(cancelFn).toHaveBeenCalledWith('pi_stray_held')
+  })
+
+  it('a confirm error leaves the rows payable and releases held credit', async () => {
+    const f = await seedHeldRetry('pi_confirm_err')
+    confirmFn.mockRejectedValueOnce(new Error('No such payment_method'))
+    const res = await processAchRetries()
+    expect(res.failed).toBe(1)
+    const rows = await db.query<any>(`SELECT status, next_retry_at FROM payments WHERE id = ANY($1::uuid[])`, [[f.rentId, f.waterId]])
+    expect(rows.rows).toEqual([{ status: 'failed', next_retry_at: null }, { status: 'failed', next_retry_at: null }])
+    expect(await useOf(f.remId)).toEqual({ status: 'released', release_reason: 'payment_canceled' })
+    expect(await creditLeft(f.creditId)).toBe(100)
+    expect(cancelFn).toHaveBeenCalledWith('pi_confirm_err')
+  })
+
+  it('a confirm error after the bank\'s answer already arrived leaves that answer alone: the credit stays set aside and the intent is not canceled', async () => {
+    const f = await seedHeldRetry('pi_confirm_raced')
+    // The confirm reached the bank after all and bounced: the failure webhook
+    // got there first, scheduling the next retry with the credit kept aside.
+    confirmFn.mockImplementationOnce(async () => {
+      await db.query(
+        `UPDATE payments SET status = 'failed', next_retry_at = NOW() + INTERVAL '3 days'
+          WHERE stripe_payment_intent_id = 'pi_confirm_raced' AND status = 'processing'`)
+      throw new Error('socket hang up')
+    })
+    const res = await processAchRetries()
+    expect(res.failed).toBe(1)
+    const rows = await db.query<any>(`SELECT status, next_retry_at FROM payments WHERE id = ANY($1::uuid[])`, [[f.rentId, f.waterId]])
+    expect(rows.rows.every((r: any) => r.status === 'failed' && r.next_retry_at !== null)).toBe(true)
+    expect(await useOf(f.remId)).toEqual({ status: 'held', release_reason: null })
+    expect((await db.query<any>(`SELECT status FROM tenant_remittances WHERE id = $1`, [f.remId])).rows[0].status).not.toBe('failed')
+    expect(cancelFn).not.toHaveBeenCalled()
+    const alert = await db.query<any>(`SELECT body FROM admin_notifications WHERE category = 'ach_retry_confirm_failure'`)
+    expect(alert.rows[0].body).toMatch(/already arrived and was handled/)
+  })
+
+  it('a confirm whose pull started anyway keeps its credit set aside', async () => {
+    const f = await seedHeldRetry('pi_confirm_lost')
+    confirmFn.mockRejectedValueOnce(new Error('socket hang up'))
+    retrieveFn
+      .mockImplementationOnce(async (id: string) => ({ id, status: 'requires_payment_method', payment_method: null, payment_method_types: ['us_bank_account'],
+        last_payment_error: { code: 'insufficient_funds', payment_method: { id: 'pm_tenant_bank', type: 'us_bank_account' } } }))
+      .mockImplementationOnce(async (id: string) => ({ id, status: 'processing' }))
+    await processAchRetries()
+    expect((await db.query<any>(`SELECT status FROM payments WHERE id = $1`, [f.rentId])).rows[0].status).toBe('processing')
+    expect(await useOf(f.remId)).toEqual({ status: 'held', release_reason: null })
+    expect(cancelFn).not.toHaveBeenCalled()
+  })
+
+  it('the FlexPay reprice case confirms the repriced amount', async () => {
+    const actual = await vi.importActual<typeof import('./flexpay')>('./flexpay')
+    repriceMock.mockImplementationOnce(actual.repriceFlexPayRetryPayment as (id: string) => Promise<undefined>)
+    const { rentId, tenantId, leaseId } = await seedLeasedRetry('pi_flex_reprice')
+    const pay = (await db.query<any>(`SELECT unit_id, landlord_id FROM payments WHERE id = $1`, [rentId])).rows[0]
+    const adv = (await db.query<{ id: string }>(
+      `INSERT INTO flexpay_advances (cycle_month, tenant_id, landlord_id, unit_id, lease_id, rent_amount, tenant_fee_amount,
+                                     pull_day, status, fronted_at, pulled_at, pull_date)
+       VALUES ('2026-10-01', $1, $2, $3, $4, 495, 25, 10, 'pulled', NOW(), NOW(), '2026-10-10') RETURNING id`,
+      [tenantId, pay.landlord_id, pay.unit_id, leaseId])).rows[0].id
+    await db.query(
+      `UPDATE payments SET type = 'fee', entry_description = 'FLEXPAY', revenue_owner = 'gam', amount = 520, flexpay_advance_id = $2
+        WHERE id = $1`, [rentId, adv])
+    await db.query(`UPDATE flexpay_advances SET rent_payment_id = $2 WHERE id = $1`, [adv, rentId])
+    await processAchRetries()
+    // One bounce so far: the $495 FlexPay paid + the flat $25 + one $4 returned-pull fee.
+    expect(updateFn).toHaveBeenCalledWith('pi_flex_reprice', expect.objectContaining({ amount: 52400 }))
+    expect(confirmFn).toHaveBeenCalledTimes(1)
+    expect(updateFn.mock.invocationCallOrder[0]).toBeLessThan(confirmFn.mock.invocationCallOrder[0])
+    expect((await db.query<any>(`SELECT amount::float AS a FROM payments WHERE id = $1`, [rentId])).rows[0].a).toBe(524)
+  })
+})
+
+describe('S655 Step 10 — a FlexPay retry that is not fired is GAM\'s', () => {
+  it('a FlexPay retry whose reprice fails is GAM\'s: FlexPay stays on, no wait, and the collection is made again — once', async () => {
+    repriceMock.mockRejectedValueOnce(new Error('reprice broke'))
+    const { rentId, tenantId, leaseId } = await seedLeasedRetry('pi_flex_reprice_fail')
+    const pay = (await db.query<any>(`SELECT unit_id, landlord_id FROM payments WHERE id = $1`, [rentId])).rows[0]
+    await db.query(`UPDATE tenants SET flexpay_enrolled = TRUE, flexpay_pull_day = 10, flexpay_monthly_fee = 25, ach_verified = TRUE WHERE id = $1`, [tenantId])
+    const adv = (await db.query<{ id: string }>(
+      `INSERT INTO flexpay_advances (cycle_month, tenant_id, landlord_id, unit_id, lease_id, rent_amount, tenant_fee_amount,
+                                     pull_day, status, fronted_at, pulled_at, pull_date)
+       VALUES ('2026-10-01', $1, $2, $3, $4, 495, 25, 10, 'pulled', NOW(), NOW(), '2026-10-10') RETURNING id`,
+      [tenantId, pay.landlord_id, pay.unit_id, leaseId])).rows[0].id
+    await db.query(
+      `UPDATE payments SET type = 'fee', entry_description = 'FLEXPAY', revenue_owner = 'gam', amount = 520, flexpay_advance_id = $2
+        WHERE id = $1`, [rentId, adv])
+    await db.query(`UPDATE flexpay_advances SET rent_payment_id = $2 WHERE id = $1`, [adv, rentId])
+
+    const res = await processAchRetries()
+    expect(res.failed).toBe(1)
+    expect(confirmFn).not.toHaveBeenCalled()
+    expect(cancelFn).toHaveBeenCalledWith('pi_flex_reprice_fail')
+    // Made again: the advance waits on its pull, the row is set to be pulled
+    // afresh. It is the same collection: its one bank return stays counted on
+    // the row (the bank sees it at most three times in all), and the try
+    // collects that return's $4 fee on the amount pulled — never folded into
+    // the advance, which a write-off would add again from the count.
+    const a = (await db.query<any>(`SELECT status, default_reason, tenant_fee_amount::float AS fee FROM flexpay_advances WHERE id = $1`, [adv])).rows[0]
+    expect(a).toEqual({ status: 'fronted', default_reason: null, fee: 25 })
+    const row = (await db.query<any>(`SELECT status, stripe_payment_intent_id, retry_count, amount::float AS amount FROM payments WHERE id = $1`, [rentId])).rows[0]
+    expect(row).toEqual({ status: 'pending', stripe_payment_intent_id: null, retry_count: 1, amount: 495 + 25 + 4 })
+    // Never the tenant's: FlexPay stays on, no wait.
+    const t = (await db.query<any>(`SELECT flexpay_enrolled, flexpay_disqualified_until FROM tenants WHERE id = $1`, [tenantId])).rows[0]
+    expect(t).toEqual({ flexpay_enrolled: true, flexpay_disqualified_until: null })
+    expect((await db.query(`SELECT 1 FROM admin_notifications WHERE category = 'flexpay_pull_gam_side'`)).rowCount).toBe(1)
+    // A second run changes nothing more.
+    await processAchRetries()
+    expect((await db.query(`SELECT 1 FROM admin_notifications WHERE category = 'flexpay_pull_gam_side'`)).rowCount).toBe(1)
+    expect((await db.query<any>(`SELECT status FROM flexpay_advances WHERE id = $1`, [adv])).rows[0].status).toBe('fronted')
   })
 })

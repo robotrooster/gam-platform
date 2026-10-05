@@ -13,8 +13,9 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiPut, apiDel } from '../lib/api'
 import { humanize, processingFeeFor, rvSiteFactsLabel, SUPPORTED_CARD_READER, READER_ORDER_STATUS_LABEL } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
-import { toast, appConfirm, appPrompt } from '../components/dialogs'
+import { appConfirm, appPrompt } from '../components/dialogs'
 import { SendPayLinkModal, PayLinksTab } from './POSPayLinks'
+import { POSCustomerPicker, toastOnce, errorMessage, type PickedPerson, type NewCustomerDraft } from '../components/POSCustomerPicker'
 
 // S243: Active reader for the terminal flow. Two paths:
 //   - 'smart'     — server-driven (S700, WisePOS E, etc.) registered
@@ -33,41 +34,147 @@ const STATUS_MAP: Record<string,string> = { completed:'badge-green', voided:'bad
 // The API says HOW a card arrived (tender); payment_method alone says only 'card'.
 const METHOD_MAP: Record<string,string> = { cash:'badge-green', card:'badge-blue', card_reader:'badge-blue', pay_link:'badge-gold', pay_link_in_person_cash:'badge-gold', pay_link_in_person_card:'badge-gold', card_on_file:'badge-blue', charge:'badge-amber' }
 // S654 (Nic): online and in person are different facts about the same card.
-// S654 (Nic): "another way to add a customer name after the sale is completed …
-// I don't want to change it to a whole dropdown of a list. I want to just edit
-// the field as their first and last name and email and phone number." Typed in
-// for the sale; the server keeps one record per person (same email or phone =
-// the same customer).
-function SaleCustomerForm({ txId, initial, onSaved, onCancel }: {
-  txId: string
-  initial: { firstName?: string | null; lastName?: string | null; email?: string | null; phone?: string | null } | null
-  onSaved: (c: any) => void
-  onCancel?: () => void
+
+/** The person a recorded sale names, as the picker shows them — or nobody (a card with no name yet). */
+function personOfSale(t: any): PickedPerson | null {
+  if (t?.tenantId) return { kind: 'resident', tenantId: t.tenantId, customerId: t.posCustomerId ?? null, name: t.tenantName || 'Resident', hint: 'resident' }
+  const name = String(t?.customerName ?? '').trim()
+  if (t?.posCustomerId && name && name !== 'Card Customer') return { kind: 'customer', tenantId: null, customerId: t.posCustomerId, name }
+  return null
+}
+
+/**
+ * 10/2 (Nic): the person a ticket or pay link names, as the chip shows them —
+ * by the name on the ticket itself, whether or not they would turn up in a
+ * search. A reservation with nobody named is nobody.
+ */
+function personOfTicket(t: any): PickedPerson | null {
+  const name = String(t?.customerName ?? '').trim()
+  if (t?.tenantId) return { kind: 'resident', tenantId: t.tenantId, customerId: null, name: name || 'Resident', hint: 'resident' }
+  if (t?.posCustomerId) return { kind: 'customer', tenantId: null, customerId: t.posCustomerId, name: name && name !== 'Card Customer' ? name : 'Unnamed customer' }
+  return null
+}
+
+/** A ticket's lines as the cart holds them. A line with no register item (a pay link's own) is an open line. */
+function cartFromTicket(t: any): CartItem[] {
+  // 10/2 (decisions #9): a reservation ticket's stay comes priced by the server
+  // at what the reservation owes, marked as the reservation — shown as it is.
+  // 10/3 (decisions #9, #23): a pay link's reservation comes the same way, with
+  // its nights — the reservation's own, changed only on the schedule.
+  return (t?.items || []).map((i: any, n: number) => ({
+    id: i.id || `open-${t.id}-${n}`, name: i.name || 'Item', price: Number(i.price) || 0, qty: Number(i.qty) || 1,
+    tax: Number(i.tax) || 0, cat: i.cat || '', icon: '📦', chargeEligible: true, stayUnit: null,
+    reservation: !!i.reservation,
+    ...(i.reservation && Number(i.nights) > 0 ? { nights: Number(i.nights) } : {}),
+  }))
+}
+
+/**
+ * 10/2 (review): a pay link's discount for the cart now in the register — all
+ * of it while the cart keeps every line the link was sent with, else the share
+ * of the link (by value) the cart still keeps. The same arithmetic as the
+ * server's linkDiscountFor (routes/pos.ts): a line is the link's by (item,
+ * price), or by (name, price) for a line with no register item; at most as
+ * many of each as the link carries.
+ */
+function linkDiscountShare(discount: number, linkLines: any[], cart: CartItem[]): number {
+  const key = (id: string | null, name: string, price: number) =>
+    id ? `i:${id.trim().toLowerCase()}:${price.toFixed(2)}` : `t:${name}|${price.toFixed(2)}`
+  const sent = new Map<string, { qty: number; price: number }>()
+  for (const l of linkLines) {
+    const price = Number(l?.price) || 0
+    const k = key(l?.id || null, String(l?.name ?? ''), price)
+    const e = sent.get(k) ?? { qty: 0, price }
+    e.qty += Number(l?.qty) || 0
+    sent.set(k, e)
+  }
+  const kept = new Map<string, number>()
+  for (const i of cart) {
+    const k = key(i.id.startsWith('open-') ? null : i.id, i.name, Number(i.price) || 0)
+    kept.set(k, (kept.get(k) ?? 0) + Math.max(0, Number(i.qty) || 0))
+  }
+  let whole = 0, keptValue = 0
+  sent.forEach((e, k) => { whole += e.qty * e.price; keptValue += Math.min(e.qty, kept.get(k) ?? 0) * e.price })
+  const share = whole > 0 ? Math.min(1, keptValue / whole) : 1
+  return Math.round((Number(discount) || 0) * share * 100) / 100
+}
+
+/** What a ticket holds, to tell whether the cart still matches it. */
+type TicketSnapshot = { id: string; lines: string; tenantId: string | null; posCustomerId: string | null; name: string | null }
+const linesKey = (items: { id: string | null; qty: number; price: number }[]) =>
+  items.map(i => `${i.id ?? ''}:${Number(i.qty)}:${Number(i.price).toFixed(2)}`).sort().join('|')
+
+// 10/2 (review): what the last link of each sale said, and its Undo. Kept
+// outside the row: a History row is drawn afresh once the sale names someone
+// new, and the message and its Undo must still be there.
+const linkNotes = new Map<string, { said: string | null; undo: string | null }>()
+
+// 10/2 (Nic): "on the history, same thing... start typing in their name; if
+// they're an existing customer I can click them and link them to that
+// transaction. And then have it retroactively fill to any matching cards."
+// Linking moves THIS sale to the person picked — it never renames whoever the
+// sale named before — and the server carries every other sale on the same card
+// that nobody had confirmed, then says so in one line, with an Undo.
+function SaleCustomerLink({ saleId, propertyId, current, startOpen, onLinked }: {
+  saleId: string
+  propertyId: string
+  current: PickedPerson | null
+  startOpen?: boolean
+  onLinked: (r: any, picked: PickedPerson | null) => void
 }) {
-  const placeholder = initial?.firstName === 'Card' && initial?.lastName === 'Customer'
-  const [form, setForm] = useState({
-    firstName: placeholder ? '' : (initial?.firstName || ''), lastName: placeholder ? '' : (initial?.lastName || ''),
-    email: initial?.email || '', phone: initial?.phone || '' })
-  const save = useMutation(
-    () => apiPut(`/pos/transactions/${txId}/customer-info`, { firstName: form.firstName.trim(), lastName: form.lastName.trim() || null,
-      email: form.email.trim() || null, phone: form.phone.trim() || null }),
-    { onSuccess: (row: any) => { toast('Customer saved'); onSaved(row) },
-      onError: (e: any) => toast.error(e?.response?.data?.error || 'The customer could not be saved') })
-  const emailOk = !form.email.trim() || /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(form.email.trim())
-  return (
+  const [editing, setEditing] = useState(!!startOpen && !current)
+  const [note, setNote] = useState<{ said: string | null; undo: string | null }>(() => linkNotes.get(saleId) ?? { said: null, undo: null })
+  const remember = (n: { said: string | null; undo: string | null }) => { linkNotes.set(saleId, n); setNote(n) }
+  const linkMut = useMutation(
+    (v: { body: any; picked: PickedPerson | null }) => apiPatch<any>(`/pos/transactions/${saleId}/customer`, v.body),
+    { onSuccess: (r: any, v) => { setEditing(false); remember({ said: r?.message ?? null, undo: r?.undo ?? null }); toastOnce(r?.message || 'Customer linked'); onLinked(r, v.picked) },
+      onError: (e: any) => toastOnce(errorMessage(e, 'The customer could not be linked — check the connection and pick them again.'), { error: true }) })
+  // 10/2 (review): a wrong pick is put back with one button — the sale, and
+  // every other sale and card the link carried with it.
+  const undoMut = useMutation(
+    (undo: string) => apiPost<any>(`/pos/transactions/${saleId}/customer/undo`, { undo }).then((r: any) => r?.data),
+    { onSuccess: (r: any) => {
+        remember({ said: r?.message ?? null, undo: null }); toastOnce(r?.message || 'Put back')
+        const name = String(r?.customerName ?? '').trim()
+        onLinked(r, r?.posCustomerId && name ? { kind: r?.tenantId ? 'resident' : 'customer', tenantId: r?.tenantId ?? null, customerId: r.posCustomerId, name } : null)
+      },
+      onError: (e: any) => { remember({ said: note.said, undo: null }); toastOnce(errorMessage(e, 'That could not be undone — check the connection, then open the sale in History and pick the right person.'), { error: true }) } })
+  const pick = (p: PickedPerson | null) => {
+    if (!p) return
+    // Someone from outside this company: their record here is made with the link.
+    linkMut.mutate({ body: p.pick ? { match: { pick: p.pick } } : p.kind === 'resident' ? { tenantId: p.tenantId } : { posCustomerId: p.customerId }, picked: p })
+  }
+  const addNew = (d: NewCustomerDraft) => linkMut.mutate({
+    body: { addNew: { firstName: d.firstName, lastName: d.lastName || null, email: d.email || null, phone: d.phone || null } },
+    picked: null })
+  if (editing) return (
     <div style={{display:'grid',gap:6,width:'100%'}}>
-      <div style={{display:'flex',gap:6}}>
-        <input className="form-input" placeholder="First name" value={form.firstName} onChange={e=>setForm(f=>({ ...f, firstName:e.target.value }))} />
-        <input className="form-input" placeholder="Last name" value={form.lastName} onChange={e=>setForm(f=>({ ...f, lastName:e.target.value }))} />
+      <POSCustomerPicker propertyId={propertyId} value={null} onChange={pick} onAddNew={addNew} sealedPicks busy={linkMut.isLoading}
+        autoFocus={!startOpen} placeholder="Type their name to link this sale" />
+      {current && <button type="button" className="btn btn-ghost btn-sm" style={{justifySelf:'start'}} onClick={()=>setEditing(false)}>Cancel</button>}
+    </div>
+  )
+  return (
+    <div style={{display:'grid',gap:4,width:'100%'}}>
+      <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+        <span style={{color:'var(--text-3)',fontSize:'.75rem'}}>Customer:</span>
+        {/* 10/2: whoever the sale names shows by name, with × to take them off it. */}
+        {current ? (
+          <span style={{display:'inline-flex',alignItems:'center',gap:6,padding:'2px 4px 2px 10px',border:'1px solid var(--gold)',borderRadius:'var(--r-md)',background:'var(--gold-bg)'}}>
+            <strong style={{fontSize:'.8rem'}}>{current.name}</strong>
+            {current.hint && <span style={{color:'var(--text-3)',fontSize:'.72rem'}}>{current.hint}</span>}
+            <button type="button" aria-label="Remove the customer from this sale" title="Remove the customer from this sale" disabled={linkMut.isLoading || undoMut.isLoading}
+              onClick={()=>linkMut.mutate({ body: { posCustomerId: null }, picked: null })}
+              style={{background:'none',border:'none',cursor:'pointer',color:'var(--text-2)',fontSize:'1rem',lineHeight:1,padding:'0 4px'}}>×</button>
+          </span>
+        ) : <strong style={{fontSize:'.8rem'}}>none yet</strong>}
+        <button type="button" className="btn btn-primary btn-sm" disabled={undoMut.isLoading} onClick={()=>{ remember({ said: null, undo: null }); setEditing(true) }}>{current ? 'Change customer' : 'Add customer'}</button>
       </div>
-      <div style={{display:'flex',gap:6}}>
-        <input className="form-input" type="email" placeholder="Email" value={form.email} onChange={e=>setForm(f=>({ ...f, email:e.target.value }))} />
-        <input className="form-input" placeholder="Phone" value={form.phone} onChange={e=>setForm(f=>({ ...f, phone:e.target.value }))} />
-      </div>
-      <div style={{display:'flex',gap:6}}>
-        <button type="button" className="btn btn-primary btn-sm" disabled={!form.firstName.trim()||!emailOk||save.isLoading} onClick={()=>save.mutate()}>{save.isLoading?'Saving…':'Save customer'}</button>
-        {onCancel && <button type="button" className="btn btn-ghost btn-sm" onClick={onCancel}>Cancel</button>}
-      </div>
+      {note.said && <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',fontSize:'.72rem',color:'var(--text-2)'}}>
+        <span>{note.said}</span>
+        {note.undo && <button type="button" className="btn btn-primary btn-sm" disabled={undoMut.isLoading} onClick={()=>undoMut.mutate(note.undo!)}>
+          {undoMut.isLoading ? 'Putting back…' : 'Undo'}</button>}
+      </div>}
     </div>
   )
 }
@@ -81,13 +188,13 @@ function CustomerEditor({ c, all, onHistory, onChanged }: { c: any; all: any[]; 
   const [form, setForm] = useState({ firstName: c.firstName || '', lastName: c.lastName || '', email: c.email || '', phone: c.phone || '' })
   const [mergeInto, setMergeInto] = useState('')
   const [confirmMerge, setConfirmMerge] = useState(false)
-  const refresh = () => { qc.invalidateQueries('pos-customer-base'); qc.invalidateQueries('pos-people'); qc.invalidateQueries('pos-transactions') }
+  const refresh = () => { qc.invalidateQueries('pos-customer-base'); qc.invalidateQueries('pos-transactions') }
   const saveMut = useMutation(
     () => apiPatch(`/pos/customers/${c.id}`, { firstName: form.firstName.trim() || undefined, lastName: form.lastName.trim(), email: form.email.trim() || null, phone: form.phone.trim() || null }),
-    { onSuccess: () => { refresh(); toast('Saved') }, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save') })
+    { onSuccess: () => { refresh(); toastOnce('Saved') }, onError: (e: any) => toastOnce(errorMessage(e, 'Could not save — check the connection and press Save again.'), { error: true }) })
   const mergeMut = useMutation(
     () => apiPost(`/pos/customers/${c.id}/merge`, { into: mergeInto }),
-    { onSuccess: () => { refresh(); setConfirmMerge(false); toast('Merged'); onChanged() }, onError: (e: any) => { setConfirmMerge(false); toast.error(e?.response?.data?.error || 'Could not merge') } })
+    { onSuccess: () => { refresh(); setConfirmMerge(false); toastOnce('Merged'); onChanged() }, onError: (e: any) => { setConfirmMerge(false); toastOnce(errorMessage(e, 'Could not merge — check the connection and press Merge again.'), { error: true }) } })
   const dupeIds: string[] = c.duplicateIds || []
   const others = all.filter(o => o.id !== c.id)
   const ordered = [...others.filter(o => dupeIds.includes(o.id)), ...others.filter(o => !dupeIds.includes(o.id))]
@@ -95,14 +202,18 @@ function CustomerEditor({ c, all, onHistory, onChanged }: { c: any; all: any[]; 
   const label = (o: any) => `${o.firstName} ${o.lastName}`.trim() + (o.email ? ` — ${o.email}` : o.phone ? ` — ${o.phone}` : '')
   return (
     <div style={{display:'grid',gap:10}}>
+      {/* 10/2: a resident's name, email and phone are on their own account. */}
+      {c.isResident ? (
+        <div style={{fontSize:'.78rem',color:'var(--text-2)'}}>Resident — their name, email and phone come from their own account and are changed there.</div>
+      ) : (
       <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}}>
         <input className="form-input" placeholder="First name" value={form.firstName} onChange={e=>setForm(f=>({ ...f, firstName:e.target.value }))} />
         <input className="form-input" placeholder="Last name" value={form.lastName} onChange={e=>setForm(f=>({ ...f, lastName:e.target.value }))} />
         <input className="form-input" type="email" placeholder="Email" value={form.email} onChange={e=>setForm(f=>({ ...f, email:e.target.value }))} />
         <input className="form-input" placeholder="Phone" value={form.phone} onChange={e=>setForm(f=>({ ...f, phone:e.target.value }))} />
-      </div>
+      </div>)}
       <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
-        <button className="btn btn-primary btn-sm" disabled={!form.firstName.trim()||saveMut.isLoading} onClick={()=>saveMut.mutate()}>{saveMut.isLoading?'Saving…':'Save'}</button>
+        {!c.isResident && <button className="btn btn-primary btn-sm" disabled={!form.firstName.trim()||saveMut.isLoading} onClick={()=>saveMut.mutate()}>{saveMut.isLoading?'Saving…':'Save'}</button>}
         <button className="btn btn-ghost btn-sm" onClick={onHistory}>Purchase history</button>
         <span style={{flex:1}} />
         <span style={{fontSize:'.75rem',color:'var(--text-3)'}}>Fold into</span>
@@ -142,7 +253,47 @@ const LAUNCH_HIDE_CHARGE = true
 // S651: stayUnit is set only on a STAY item (a night, a week or a month per
 // unit of quantity). Its presence is what makes the register ask for a site and
 // an arrival date before it will take the money — see StayDetailsModal.
-interface CartItem { id:string; name:string; price:number; qty:number; tax:number; cat:string; icon:string; chargeEligible:boolean; stayUnit?:'night'|'week'|'month'|null }
+// 10/2 (decisions #9): `reservation` marks a reservation ticket's stay line —
+// the reservation itself, at what it still owes (its price was quoted on the
+// schedule, tax included). It is not re-priced or re-counted at the register.
+// 10/3 (decisions #23): `nights` — a pay link's stay, as the reservation has
+// it. Its nights, site and price change only on the schedule, never here.
+// 10/3 (decisions #9, #21): `stayUnitId` / `stayCheckIn` / `stayTotal` /
+// `stayTax` — a stay rung here once its site and arrival are picked: what its
+// nights cost by the schedule's own pricing (the same figure a pay link and the
+// schedule charge), with the lodging tax inside it. Changing its nights clears
+// them — the site is picked again for the new length.
+interface CartItem { id:string; name:string; price:number; qty:number; tax:number; cat:string; icon:string; chargeEligible:boolean; stayUnit?:'night'|'week'|'month'|null; reservation?:boolean; nights?:number
+  stayUnitId?:string; stayCheckIn?:string; stayTotal?:number; stayTax?:number }
+
+/** 10/3 (decisions #9): a stay whose site and arrival are picked shows what its nights cost; anything else, price × quantity. */
+const stayPriced = (i: CartItem) => !!i.stayUnit && !i.reservation && typeof i.stayTotal === 'number'
+/** A line's amount before tax — a priced stay at its price less the lodging tax inside it. */
+const lineAmount = (i: CartItem) => stayPriced(i) ? Math.round(((i.stayTotal ?? 0) - (i.stayTax ?? 0)) * 100) / 100 : i.price * i.qty
+/** A line's tax — a priced stay's lodging tax; a reservation's is in its price. */
+const lineTax = (i: CartItem) => stayPriced(i) ? (i.stayTax ?? 0) : i.price * i.qty * i.tax
+/** A stay's nights changed: its site and price are picked again for the new length. */
+const unpriceStay = <T extends CartItem>(i: T): T => {
+  const { stayUnitId: _u, stayCheckIn: _c, stayTotal: _t, stayTax: _x, ...rest } = i
+  return rest as T
+}
+
+/**
+ * A cart line as the server's pricing calls take it (the quote, the card
+ * reader's charge and breakdown). A reservation's line names its ticket, so the
+ * server prices it as the reservation — the same way the sale does.
+ */
+function wireLine(i: CartItem, ticketId: string | null, linkId: string | null = null) {
+  return { id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax,
+           ...(i.reservation && ticketId ? { openTicketId: ticketId } : {}),
+           // 10/3: a pay link's reservation names its link (and its nights), so
+           // the server prices it as the reservation — the quote, the reader, the sale.
+           ...(i.reservation && linkId ? { payLinkId: linkId, reservation: true, ...(i.nights ? { nights: i.nights } : {}) } : {}),
+           // 10/3 (decisions #9): a stay carries its site, arrival and the figure
+           // the register shows, so every pricing call prices the same nights the
+           // same way — and refuses a figure that is not what they cost now.
+           ...(stayPriced(i) && i.stayUnitId ? { stayUnitId: i.stayUnitId, stayCheckIn: i.stayCheckIn, stayTotal: i.stayTotal } : {}) }
+}
 
 
 // POS money/quantity fields are never negative. Spread {...nonNeg} into every
@@ -172,6 +323,9 @@ export function POSPage() {
   // dates, and the server refuses it too.
   const stayLine = cart.find(i => !!i.stayUnit) || null
   const stayInCart = !!stayLine
+  // 10/3 (decisions #9): ready to charge once its site and arrival are picked
+  // for the nights in the cart (changing the nights asks for the site again).
+  const stayReady = !!stay && !!stayLine && (stayLine.reservation || stayPriced(stayLine))
   // S536: browser-neutral — no native alert(); transient in-app notice.
   const [stockNotice, setStockNotice] = useState<string | null>(null)
   const showStockNotice = (msg: string) => {
@@ -191,17 +345,26 @@ export function POSPage() {
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([])
   const [tabsExpanded, setTabsExpanded] = useState(false)
   const [method, setMethod] = useState<'cash'|'card'|'card_on_file'|'charge'>('cash')
-  const [tenantId, setTenantId] = useState('')
   // S254/S538: FlexCharge account holder can come from either backing
   // list (resident account or POS customer account). The register shows
   // ONE neutral "customer" picker; the ids stay mutually exclusive.
-  const [posCustomerId, setPosCustomerId] = useState('')
+  // 10/2 (Nic): "One flow" — the person is typed and picked (a chip), never
+  // picked from a list AND added beside it. A resident is sent by their tenant
+  // id, a register customer by theirs; the server stamps both on a resident's sale.
+  const [person, setPerson] = useState<PickedPerson | null>(null)
+  const tenantId = person?.kind === 'resident' ? (person.tenantId ?? '') : ''
+  const posCustomerId = person?.kind === 'customer' ? (person.customerId ?? '') : ''
   // S652 (Nic): propane is pumped in the office — that is where the meter is,
   // and it has to be zeroed before the next tank — and paid for at the door.
   // A ticket is the cart in between. Carries no total: the price is decided
   // when it is rung, by the same server path as every other sale.
   const [ticketsOpen, setTicketsOpen] = useState(false)
   const [openTicketId, setOpenTicketId] = useState<string | null>(null)
+  // 10/2 (the Scott Duffy ticket): what the reopened ticket held when it was
+  // opened, read fresh from the server — so Clear can put the ORIGINAL back,
+  // unchanged or updated in place, and never write a second ticket.
+  const [ticketSnapshot, setTicketSnapshot] = useState<TicketSnapshot | null>(null)
+  const [reopening, setReopening] = useState<string | null>(null)
   // S652 (Nic): an emailed pay link being settled here, in person. The link
   // is the bill; the server charges its lines and marks it paid.
   const [payLinkId, setPayLinkId] = useState<string | null>(null)
@@ -216,15 +379,16 @@ export function POSPage() {
   const [receiptEmail, setReceiptEmail] = useState('')
   const [receiptSent, setReceiptSent] = useState<string | null>(null)
   const [historyCustomer, setHistoryCustomer] = useState<{ id: string; name: string } | null>(null)
-  // S654: fixing a sale's customer / resending its receipt from History; the Customers tab.
-  const [txEdit, setTxEdit] = useState<{ id: string; mode: 'customer' | 'receipt'; value: string } | null>(null)
+  // S654: resending a sale's receipt from History; the Customers tab.
+  const [txEdit, setTxEdit] = useState<{ id: string; mode: 'receipt'; value: string } | null>(null)
   const [custSearch, setCustSearch] = useState('')
   const [openCust, setOpenCust] = useState<string | null>(null)
-  const [newCustomer, setNewCustomer] = useState<{ open: boolean; firstName: string; lastName: string; email: string; phone: string }>({ open: false, firstName: '', lastName: '', email: '', phone: '' })
   const [appliedDiscount, setAppliedDiscount] = useState<any>(null)
   const [discountCode, setDiscountCode] = useState('')
   const [openTx,setOpenTx]=useState<string|null>(null)   // S653: history row expanded to its lines
   const [refundModal, setRefundModal] = useState<{show:boolean; tx:any}>({show:false,tx:null})
+  // 10/3 (review): Void asks first, in the app — never a browser pop-up.
+  const [voidAsk, setVoidAsk] = useState<any | null>(null)
   const [refundAmt, setRefundAmt] = useState('')
   const [refundReason, setRefundReason] = useState('')
   // S339: refund_method enforcement. Cashier picks cash or check for
@@ -318,19 +482,37 @@ export function POSPage() {
   const properties = isScoped
     ? (allProperties as any[]).filter((p: any) => user!.propertyIds!.includes(p.id))
     : allProperties
-  // S654 (Nic): "I need to be able to choose a customer from the drop-down menu
-  // to link to that transaction." The register's people for EVERY sale: this
-  // property's residents and the company's register customers — never another
-  // company's. Keys carry which kind ('t:' resident, 'c:' customer).
-  const { data: people = [] } = useQuery<any[]>(['pos-people', registerProperty],
-    () => apiGet(`/pos/people?propertyId=${registerProperty}`), { enabled: !!registerProperty })
   // S652: whose card, and which one. The counter is about to take money with
   // nobody handing anything over, so the screen says it out loud first.
+  // 10/2 (Nic, front desk foolproof): the list of what is still out is read
+  // fresh every time it is shown — never a cached copy from before another
+  // register settled something.
   const tickets = useQuery<any[]>(
     ['pos-tickets', registerProperty],
     () => apiGet(`/pos/tickets?propertyId=${registerProperty}`),
-    { enabled: !!registerProperty, retry: false },
+    { enabled: !!registerProperty && tab === 'register', retry: false, staleTime: 0, refetchOnMount: 'always', refetchOnWindowFocus: true },
   )
+  useEffect(() => {
+    if (ticketsOpen && registerProperty) void tickets.refetch()
+  }, [ticketsOpen, registerProperty])   // eslint-disable-line react-hooks/exhaustive-deps
+
+  /**
+   * Back to an empty register, with nothing left behind: the live cart session
+   * is closed (so it never comes back as an "open cart"), the reader's waiting
+   * charge is let go, and the person, discount, stay, ticket and pay link are
+   * all cleared. Every way out of a sale that is not a sale ends here.
+   */
+  const resetRegister = (sessionReason: string) => {
+    if (clientSessionId) {
+      setDismissedSessions(d => new Set(d).add(clientSessionId))
+      void enqueueSync({ op: 'VOID_SESSION', clientSessionId, payload: { reason: sessionReason } })
+      qc.invalidateQueries(['pos-sessions-open', registerProperty])
+    }
+    setClientSessionId(null); abandonPendingIntent()
+    setCart([]); setPerson(null); setAppliedDiscount(null); setStay(null); setCashGiven('')
+    setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null)
+  }
+
   const writeTicketMut = useMutation(
     () => apiPost('/pos/tickets', {
       propertyId: registerProperty,
@@ -341,12 +523,160 @@ export function POSPage() {
     {
       onSuccess: () => {
         qc.invalidateQueries('pos-tickets')
-        abandonPendingIntent(); setCart([]); setTenantId(''); setPosCustomerId(''); setOpenTicketId(null); setPayLinkId(null)
-        toast('Held for delivery')
+        resetRegister('held_for_delivery')
+        toastOnce('Held for delivery — it is on the open tickets list.')
       },
-      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not hold that for delivery'),
+      onError: (e: any) => toastOnce(errorMessage(e, 'Could not hold it for delivery — check the connection and press Hold for delivery again.'), { error: true }),
     },
   )
+
+  // 10/2: Clear on a reopened ticket puts THAT ticket back — never a second one.
+  // The cart still matching it: nothing to send. Changed: updated in place.
+  /**
+   * What putting the reopened ticket back sends: null when the cart still
+   * matches it — or is empty (an emptied cart never empties a ticket; it goes
+   * back as it was). With nobody in the cart the ticket keeps its own person:
+   * a ticket is always for someone.
+   */
+  const ticketChanges = (): any | null => {
+    if (!openTicketId) return null
+    const snap = ticketSnapshot
+    const lines = cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
+    const personChanged = !!person && (
+      (tenantId || null) !== (snap?.tenantId ?? null) || (posCustomerId || null) !== (snap?.posCustomerId ?? null))
+    const unchanged = !lines.length || (!!snap && snap.id === openTicketId && snap.lines === linesKey(lines) && !personChanged)
+    return unchanged ? null : {
+      propertyId: registerProperty,
+      items: lines.filter(l => !!l.id),
+      ...(personChanged ? { tenantId: tenantId || null, posCustomerId: posCustomerId || null } : {}),
+    }
+  }
+  /** What the cashier is told once a ticket is back — and, if they took the person off, that it is still that person's. */
+  const putBackWords = (sent: boolean): string => {
+    const still = !person && ticketSnapshot?.name
+      ? ` It is still under ${ticketSnapshot.name} — a ticket is always for someone. To change who it is for, open it, pick the new person, then press Clear.`
+      : ''
+    return (sent ? 'Ticket updated and put back on the open list.' : 'Ticket put back on the open list.') + still
+  }
+  /** A ticket settled or voided at another register (404/409) — anything else wrong keeps the cart. */
+  const ticketIsGone = (e: any) => e?.response?.status === 404 || e?.response?.status === 409
+  const putTicketBackMut = useMutation(
+    (v: { id: string; body: any | null; words: string }) => v.body ? apiPut(`/pos/tickets/${v.id}`, v.body) : Promise.resolve(null),
+    {
+      onSuccess: (_r: any, v) => {
+        qc.invalidateQueries('pos-tickets')
+        resetRegister('ticket_put_back')
+        toastOnce(v.words)
+      },
+      onError: (e: any) => {
+        if (ticketIsGone(e)) {
+          // Settled or voided at another register: nothing to put back, and
+          // nothing in this cart is owed any more.
+          qc.invalidateQueries('pos-tickets')
+          resetRegister('ticket_gone')
+          toastOnce('That ticket was already settled or voided at another register, so there was nothing to put back. The cart is clear.')
+          return
+        }
+        // 10/2 (review): anything else — the person picked cannot go on it, the
+        // connection dropped — leaves the cart exactly as it is, with the
+        // server's own words for what to do.
+        toastOnce(errorMessage(e, 'The ticket could not be put back — check the connection and press Clear again.'), { error: true })
+      },
+    },
+  )
+  const putTicketBack = () => {
+    if (!openTicketId) return
+    const body = ticketChanges()
+    putTicketBackMut.mutate({ id: openTicketId, body, words: putBackWords(!!body) })
+  }
+
+  /**
+   * 10/2 (review): switching property with a reopened ticket in the cart puts
+   * it back first — changed lines are saved, never thrown away. If it cannot be
+   * saved the register stays where it is, cart and all.
+   */
+  const switchProperty = async (next: string) => {
+    if (openTicketId) {
+      const body = ticketChanges()
+      if (body) {
+        try {
+          await apiPut(`/pos/tickets/${openTicketId}`, body)
+          qc.invalidateQueries('pos-tickets')
+          toastOnce(putBackWords(true))
+        } catch (e: any) {
+          if (!ticketIsGone(e)) {
+            toastOnce(errorMessage(e, 'The ticket could not be put back — check the connection, then pick the property again.'), { error: true })
+            return
+          }
+          toastOnce('That ticket was already settled or voided at another register, so there was nothing to put back.')
+        }
+      } else if (!person && ticketSnapshot?.name) {
+        toastOnce(putBackWords(false))
+      }
+      resetRegister('property_switched')
+    } else if (payLinkId) {
+      // A pay link opened here stays on this property's list, as it was.
+      resetRegister('property_switched')
+    }
+    setRegisterProperty(next); setPerson(null)
+  }
+
+  /** The register's Clear: a reopened ticket goes back, a pay link stays out, a named cart is held, anything else is emptied. */
+  const clearRegister = () => {
+    if (openTicketId) { putTicketBack(); return }
+    if (payLinkId) { resetRegister('pay_link_put_back'); toastOnce('Pay link put back on the open list.'); return }
+    // S652 (Nic): "just clearing the cart should clear it, and if they have a
+    // name associated with it save it as a ticket."
+    if (tenantId || posCustomerId) { writeTicketMut.mutate(); return }
+    resetRegister('cleared_by_cashier')
+  }
+
+  // 10/2 (Nic, front desk foolproof): a ticket or pay link is opened from the
+  // server at the moment it is opened — never from a list that may be a
+  // minute old — and the person on it comes back as the chip, by name.
+  const reopenTicket = async (t: any) => {
+    setReopening(t.id)
+    try {
+      // A reopened ticket already in the cart goes back to the list first —
+      // changes saved; one settled elsewhere meanwhile has nothing to save.
+      if (openTicketId && openTicketId !== t.id) {
+        const body = ticketChanges()
+        if (body) await apiPut(`/pos/tickets/${openTicketId}`, body).catch((e: any) => { if (!ticketIsGone(e)) throw e })
+      }
+      const kind = t.kind === 'pay_link' ? 'pay_link' : 'ticket'
+      const fresh: any = await apiGet(`/pos/tickets/${t.id}?propertyId=${registerProperty}&kind=${kind}`)
+      resetRegister('reopened_another')
+      const lines = cartFromTicket(fresh)
+      setCart(lines)
+      setPerson(personOfTicket(fresh))
+      if (kind === 'pay_link') {
+        setPayLinkId(fresh.id)
+        // 10/2 (review): the link's own discount comes with it. A link sent
+        // at $20 less $5 is $15 at the counter too — it was being settled for $20.
+        const linkDiscount = Number(fresh.discountAmount) || 0
+        // 10/2 (review): it was given for the whole order — with only some of
+        // the link's lines left in the cart, only that share of it applies
+        // (linkDiscountShare, the server's own arithmetic), so taking a line
+        // out never leaves the whole discount on what is left.
+        if (linkDiscount > 0) setAppliedDiscount({ type: 'fixed', value: linkDiscount, name: 'Pay link discount', linkLines: fresh.items || [] })
+      } else {
+        setOpenTicketId(fresh.id)
+        setTicketSnapshot({ id: fresh.id, tenantId: fresh.tenantId ?? null, posCustomerId: fresh.posCustomerId ?? null,
+          name: personOfTicket(fresh)?.name ?? null,
+          lines: linesKey(lines.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, qty: i.qty, price: i.price }))) })
+      }
+      setTicketsOpen(false)
+      // 10/3: a ticket whose reservation is over opens with what is left on it, and says why.
+      if (fresh.notice) toastOnce(String(fresh.notice))
+    } catch (e: any) {
+      if (ticketIsGone(e)) {
+        void tickets.refetch()
+        toastOnce(errorMessage(e, 'That one was already settled or closed — the list below is up to date now.'))
+      } else {
+        toastOnce(errorMessage(e, 'Could not open that ticket — check the connection and press Settle again.'), { error: true })
+      }
+    } finally { setReopening(null) }
+  }
   const cardOnFile = useQuery<any>(
     ['pos-card-on-file', tenantId, posCustomerId],
     () => apiGet(`/pos/card-on-file?propertyId=${registerProperty}&${tenantId?`tenantId=${tenantId}`:`posCustomerId=${posCustomerId}`}`),
@@ -523,8 +853,14 @@ export function POSPage() {
       setCart(restored)
       setClientSessionId(id)
       setOpenTabs([])
+      // 10/2: a person on the cart comes back with it, shown by name with ×.
+      const sess = res?.session
+      setPerson(sess?.tenantId ? { kind: 'resident', tenantId: sess.tenantId, customerId: null, name: String(sess.customerName ?? '').trim() || 'Resident', hint: 'resident' }
+        : sess?.posCustomerId ? { kind: 'customer', tenantId: null, customerId: sess.posCustomerId, name: String(sess.customerName ?? '').trim() || 'Customer' }
+        : null)
     } catch (e) {
       console.error('[pos-session] resume failed', e)
+      toastOnce('That open cart could not be opened — check the connection and press Resume again.', { error: true })
     }
   }
 
@@ -539,10 +875,17 @@ export function POSPage() {
       setOpenTabs(prev => prev.filter(t => !ids.includes(t.id)))
     } catch (e) {
       console.error('[pos-session] discard failed', e)
+      toastOnce('That open cart could not be discarded — check the connection and press Discard again.', { error: true })
     }
   }
 
   const addToCart = async (item: any) => {
+    // 10/2 (decisions #9): a reservation in the cart is its own price — another
+    // tap of its stay button never adds nights to it.
+    if (cart.some(x => x.id === item.id && x.reservation)) {
+      showStockNotice('That reservation is already in the cart — its nights and price are set on the schedule.')
+      return
+    }
     // S536 (Nic): the cart can never hold more quantity than inventory
     // shows — the tile says "N left", so N is the ceiling.
     const inCartQty = cart.find(x => x.id === item.id)?.qty ?? 0
@@ -576,7 +919,7 @@ export function POSPage() {
       // clamp INSIDE the updater too — rapid clicks batch renders, so the
       // pre-check above can read a stale cart; the updater always sees
       // the latest state and is the hard guarantee.
-      if (ex) return c.map(x => x.id===item.id ? {...x,qty:Math.min(x.qty+1, Math.max(1, Number(item.stockQty))), _sessionItemId: (x as any)._sessionItemId ?? clientItemId} as any : x)
+      if (ex) return c.map(x => x.id===item.id ? {...unpriceStay(x),qty:Math.min(x.qty+1, Math.max(1, Number(item.stockQty))), _sessionItemId: (x as any)._sessionItemId ?? clientItemId} as any : x)
       // S652 (Nic): a stay's price is the SITE's, not the catalog's, and no
       // site has been picked yet. Starts at zero and fills in when one is,
       // so nothing on screen ever shows a number the guest will not be charged.
@@ -597,6 +940,8 @@ export function POSPage() {
   const setQty = async (id:string, target:number) => {
     const line = cart.find(x => x.id === id)
     if (!line) return
+    // 10/2 (decisions #9): the reservation's line is not counted at the register.
+    if (line.reservation) return
     const cap = stockCapFor(id)
     if (Number.isFinite(cap) && target > cap) showStockNotice(`Only ${cap} in stock`)
     // S652 (Nic): "will not let you put in decimal points." Propane is sold by
@@ -621,21 +966,31 @@ export function POSPage() {
         })
       }
     }
-    setCart(c => c.map(x => x.id===id ? {...x,qty:newQty} : x).filter(x=>x.qty>0))
+    // 10/3 (decisions #9): a stay's new length is priced when its site is picked again.
+    setCart(c => c.map(x => x.id===id ? {...(x.stayUnit ? unpriceStay(x) : x),qty:newQty} : x).filter(x=>x.qty>0))
   }
   const updateQty = (id:string, delta:number) => {
     const line = cart.find(x => x.id === id)
     if (line) void setQty(id, line.qty + delta)
   }
-
-  const subtotal = cart.reduce((s,i) => s+i.price*i.qty, 0)
-  const discountAmt = appliedDiscount ? (appliedDiscount.type==='percent' ? subtotal*(appliedDiscount.value/100) : Math.min(appliedDiscount.value, subtotal)) : 0
+  const subtotal = cart.reduce((s,i) => s+lineAmount(i), 0)
+  // 10/3 (review, decisions #9): a stay is charged at the schedule's price —
+  // a sale with a stay (or a reservation) in it takes no discount, and the
+  // server refuses one. The box says so instead of offering it.
+  const noDiscountForStay = cart.some(i => !!i.stayUnit || !!i.reservation)
+  useEffect(() => { if (noDiscountForStay && appliedDiscount) setAppliedDiscount(null) }, [noDiscountForStay, appliedDiscount])
+  const fixedDiscount = appliedDiscount?.linkLines ? linkDiscountShare(appliedDiscount.value, appliedDiscount.linkLines, cart) : appliedDiscount?.value
+  const discountAmt = appliedDiscount && !noDiscountForStay ? (appliedDiscount.type==='percent' ? subtotal*(appliedDiscount.value/100) : Math.min(fixedDiscount, subtotal)) : 0
   const discountedSubtotal = subtotal - discountAmt
-  const taxAmount = cart.reduce((s,i) => s+i.price*i.qty*i.tax, 0)
+  const taxAmount = cart.reduce((s,i) => s+lineTax(i), 0)
   // S650: the cart's tax by name ("Lodging tax"), from each item's taxes.
   const cartTaxLines = (() => {
     const by = new Map<string, number>()
     for (const c of cart as any[]) {
+      // 10/2 (decisions #9): a reservation's tax is in its quoted price.
+      if (c.reservation) continue
+      // 10/3 (decisions #21): a priced stay's tax is the property's lodging tax.
+      if (stayPriced(c)) { if (c.stayTax > 0) by.set('Lodging tax', (by.get('Lodging tax') || 0) + Number(c.stayTax)); continue }
       const it = (items as any[]).find((x:any) => x.id === c.id)
       for (const t of (it?.taxes || [])) {
         const name = t.name === 'Item tax rate' ? 'Tax' : t.name
@@ -653,7 +1008,16 @@ export function POSPage() {
     : (method==='card'||method==='card_on_file') && !absorbsCardFee ? processingFeeFor({ amount: discountedSubtotal + taxAmount, paymentMethod: 'card' })
     : 0
   const total = discountedSubtotal + taxAmount + surcharge
-  const changeDue = method==='cash' ? Math.max(0, Number(cashGiven)-total) : 0
+  // 10/3 (decisions #16): "Cash given" left blank is exact cash — received is
+  // the total and no change is due. Cash given below the total is short: the
+  // register says by how much, and Charge waits until it covers the total.
+  // Worked in cents, so $20.00 against $20.00 is never a penny short.
+  const cashBlank = String(cashGiven).trim() === ''
+  const cashCents = Math.round((Number(cashGiven) || 0) * 100)
+  const totalCents = Math.round(total * 100)
+  const cashShortBy = method==='cash' && !cashBlank ? Math.max(0, totalCents - cashCents) / 100 : 0
+  const changeDue = method==='cash' && !cashBlank ? Math.max(0, cashCents - totalCents) / 100 : 0
+  const cashReceived = method==='cash' ? (cashBlank ? total : cashCents / 100) : null
   const chargeBlocked = method==='charge' && cart.some(i => !i.chargeEligible)
 
   // S654 (Nic): "it goes away. It needs to be there the whole time … link it to
@@ -668,9 +1032,13 @@ export function POSPage() {
   const shownOnReader = useRef<{ readerId: string; propertyId: string } | null>(null)
   const liveCartCall = useRef<Promise<unknown> | null>(null)
   const liveReaderId = method==='card' && activeReader?.type==='smart' ? activeReader.stripeReaderId : null
-  const liveCartLines = cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
-  const liveCartSig = liveReaderId && registerProperty && cart.length
-    ? JSON.stringify([liveReaderId, registerProperty, liveCartLines, discountAmt, tenantId, posCustomerId, readerCartNonce]) : ''
+  const liveCartLines = cart.map(i => wireLine(i, openTicketId, payLinkId))
+  // 10/3 (review): a stay with no site and dates yet has no price — the
+  // customer's screen leaves it off (and out of its total) until it is priced,
+  // rather than show the item's rate × nights and a tax Charge never takes.
+  const readerCartLines = cart.filter(i => !(i.stayUnit && !i.reservation && !stayPriced(i))).map(i => wireLine(i, openTicketId, payLinkId))
+  const liveCartSig = liveReaderId && registerProperty && readerCartLines.length
+    ? JSON.stringify([liveReaderId, registerProperty, readerCartLines, discountAmt, tenantId, posCustomerId, readerCartNonce]) : ''
   // Every call to the reader goes in one line, in order: a take-down can never
   // land before a display that was already on its way, and it reads what is up
   // only after that display has landed.
@@ -700,7 +1068,7 @@ export function POSPage() {
     const timer = setTimeout(() => {
       queueReader(async () => {
         if (cancelled) return null   // the cart moved on before this one was sent
-        const r = await showCartLive({ stripeReaderId: target.readerId, propertyId: target.propertyId, items: liveCartLines,
+        const r = await showCartLive({ stripeReaderId: target.readerId, propertyId: target.propertyId, items: readerCartLines,
           discountAmount: discountAmt, tenantId: tenantId || null, posCustomerId: posCustomerId || null })
         if (r.shown) shownOnReader.current = target
         return r
@@ -717,8 +1085,8 @@ export function POSPage() {
   const breakdownIsUp = !!readerCart?.shown && readerCart.sig === liveCartSig
   // The latest cart, read when the tap window ends — the cashier may still have
   // changed it while the customer was reading the breakdown.
-  const latest = useRef({ cart, discountAmt, tenantId, posCustomerId })
-  latest.current = { cart, discountAmt, tenantId, posCustomerId }
+  const latest = useRef({ cart, discountAmt, tenantId, posCustomerId, openTicketId, payLinkId })
+  latest.current = { cart, discountAmt, tenantId, posCustomerId, openTicketId, payLinkId }
 
   // S654 (Nic): "leave it going for like thirty to forty-five seconds. They tap
   // and then it processes." After Charge the breakdown stays up for the tap.
@@ -765,7 +1133,7 @@ export function POSPage() {
   // null and skip validation.
   const checkoutMut = useMutation(
     (stripePaymentIntentId?: string) => apiPost('/pos/transactions', {
-      items: cart.map(i => ({ id:i.id.startsWith('open-')?null:i.id, name:i.name, qty:i.qty, price:i.price, tax:i.tax, cat:i.cat })),
+      items: cart.map(i => ({ ...wireLine(i, openTicketId, payLinkId), cat:i.cat })),
       // S654: a card the reader took is a card sale, whatever the tender buttons say now.
       paymentMethod: stripePaymentIntentId ? 'card' : method,
       // S254: charge mode posts customer + property scoping for FlexCharge
@@ -789,11 +1157,22 @@ export function POSPage() {
       payLinkId,
       // S651: present only when a stay is in the cart. The server derives the
       // dates from the item and its quantity; this is the part only the
-      // cashier knows.
-      stay: stay || null,
+      // cashier knows. (A stay taken back out leaves nothing behind.)
+      stay: stayInCart ? (stay || null) : null,
     }),
     { onSuccess: async (res:any) => {
-      setReceipt({ ...res.data, cartItems:cart, subtotal, discountAmt, taxAmount, surcharge, total, changeDue, method })
+      // 10/3 (Nic, decisions #16): the change stays on screen until the cashier
+      // closes the receipt — with what was handed over and the total beside it.
+      // 10/3 (decisions #21): a reservation's lodging tax is in its price; the
+      // sale records it as tax, and the receipt shows the sale's own figures.
+      // 10/3 (review): its lines too — the reservation (or stay) at its price
+      // before its lodging tax — so the lines and the tax add up to the total.
+      const hasReservation = cart.some(i => i.reservation || stayPriced(i))
+      const saleLines: any[] | null = Array.isArray(res.data?.items) && res.data.items.length ? res.data.items : null
+      setReceipt({ ...res.data, cartItems: hasReservation && saleLines ? saleLines : cart,
+                   subtotal: hasReservation && res.data?.subtotal != null ? Number(res.data.subtotal) : subtotal,
+                   taxAmount: hasReservation && res.data?.taxAmount != null ? Number(res.data.taxAmount) : taxAmount,
+                   discountAmt, surcharge, total, changeDue, method, cashReceived })
       setReceiptSent(null); setReceiptEmail(res.data?.customer?.email || '')
       setSaveCard(res.data?.customer?.prompting ? 'asking' : null)
       // S263/S264: link the live session to this transaction via the
@@ -810,21 +1189,28 @@ export function POSPage() {
         })
       }
       setClientSessionId(null)
-      abandonPendingIntent(); setCart([]); setCashGiven(''); setTenantId(''); setPosCustomerId(''); setAppliedDiscount(null); setStay(null)
-      setOpenTicketId(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets')
+      abandonPendingIntent(); setCart([]); setCashGiven(''); setPerson(null); setAppliedDiscount(null); setStay(null)
+      setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets')
       qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
+      // 10/3 (review): a stay sold here took its site — the next picker reads what is free again.
+      qc.invalidateQueries('stay-availability')
       qc.invalidateQueries(['pos-sessions-open', registerProperty])
     },
     // S652 (Nic): a propane sale failed on the server and the register said
     // nothing — the cart just sat there as an open tab. A failed sale says
     // why, and keeps the cart so the cashier can charge it again.
-    onError: (e: any) => toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || e?.message || 'The sale did not go through — nothing was charged. Try again.'),
+    onError: (e: any) => {
+      // A ticket or pay link settled elsewhere a moment ago: the open list is
+      // read again — and so is what is free (a site taken a moment ago).
+      if (e?.response?.status === 409) { qc.invalidateQueries('pos-tickets'); qc.invalidateQueries('stay-availability') }
+      toastOnce(errorMessage(e, 'The sale did not go through — nothing was charged. Check the connection and press Charge again.'), { error: true })
+    },
     }
   )
 
   const toggleChargeMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { chargeEligible:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
   const toggleActiveMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { isActive:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
-  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: registerProperty, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) }, onError: (e:any) => toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not add item — set name, sell price, category, and property') })
+  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: registerProperty, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) }, onError: (e:any) => toastOnce(errorMessage(e, 'Could not add the item — fill in the name, sell price and category, then press Add again.'), { error: true }) })
 
   // POS #1 auto-pricing helpers. Margin is gross % of sell price:
   // sell = cost / (1 - margin/100); margin = (sell - cost) / sell * 100.
@@ -899,7 +1285,7 @@ export function POSPage() {
     ? apiPatch(`/pos/tax-rates/${taxDraft.id}`, taxBody(taxDraft))
     : apiPost('/pos/tax-rates', { ...taxBody(taxDraft), propertyId: registerProperty || null }),
     { onSuccess: () => { qc.invalidateQueries('pos-tax-rates'); qc.invalidateQueries('pos-items'); setTaxDraft(blankTax) },
-      onError: (e:any) => toast.error(e?.response?.data?.error || 'Could not save the tax') })
+      onError: (e:any) => toastOnce(errorMessage(e, 'Could not save the tax — check the connection and press Save again.'), { error: true }) })
   const deleteTaxMut = useMutation((id:string) => apiDel(`/pos/tax-rates/${id}`), { onSuccess: () => { qc.invalidateQueries('pos-tax-rates'); qc.invalidateQueries('pos-items') } })
   // Turn one tax on or off for one item (the item editor's checkboxes).
   const setItemTaxMut = useMutation((v: { tax: any; itemId: string; on: boolean }) => {
@@ -920,8 +1306,31 @@ export function POSPage() {
   }
   const createDiscountMut = useMutation(() => apiPost('/pos/discounts', { ...newDiscount, value:Number(newDiscount.value), propertyId: registerProperty }), { onSuccess: () => { qc.invalidateQueries('pos-discounts'); setNewDiscount({ name:'', type:'percent', value:'', code:'' }) } })
   const deleteDiscountMut = useMutation((id:string) => apiDel(`/pos/discounts/${id}`), { onSuccess: () => qc.invalidateQueries('pos-discounts') })
-  const refundMut = useMutation(() => apiPost(`/pos/transactions/${refundModal.tx?.id}/refund`, { amount:Number(refundAmt)||refundModal.tx?.total, reason:refundReason, refundMethod }), { onSuccess: () => { qc.invalidateQueries('pos-transactions'); setRefundModal({show:false,tx:null}); setRefundAmt(''); setRefundReason(''); setRefundMethod('cash') } })
-  const voidMut = useMutation((id:string) => apiPost(`/pos/transactions/${id}/void`, { reason:'Voided by cashier' }), { onSuccess: () => qc.invalidateQueries('pos-transactions') })
+  const refundMut = useMutation(() => apiPost(`/pos/transactions/${refundModal.tx?.id}/refund`, { amount:Number(refundAmt)||refundModal.tx?.total, reason:refundReason, refundMethod }), { onSuccess: (r: any) => {
+      qc.invalidateQueries('pos-transactions'); setRefundModal({show:false,tx:null}); setRefundAmt(''); setRefundReason(''); setRefundMethod('cash')
+      // 10/3 (review): say what to do next — what to hand back, and that the
+      // reservation (if any) is still on the schedule (decisions #23).
+      const d = r?.data ?? {}
+      const amt = `$${Number(d.refundAmount ?? 0).toFixed(2)}`
+      const how = d.refundMethod === 'cash' ? `Refunded ${amt} — hand back ${amt} in cash.`
+        : d.refundMethod === 'check' ? `Refunded ${amt} — write them a check for ${amt}.`
+        : d.refundMethod === 'charge' ? `Refunded ${amt} to their charge account.`
+        : (d.refundMethod === 'card' || d.refundMethod === 'card_on_file') ? `Refunded ${amt} to their card — it shows on their statement in a few days.`
+        : `Refunded ${amt}.`
+      toastOnce(d.reservationStillOnSchedule ? `${how} Their reservation is still on the schedule — cancel it there if they are not staying.` : how)
+    },
+    onError: (e: any) => { qc.invalidateQueries('pos-transactions'); toastOnce(errorMessage(e, 'The refund did not go through — check the connection, then press Process Refund again.'), { error: true }) } })
+  // 10/3 (review): a void puts what the sale took back on the shelf — the item
+  // grid, the low-stock list and the stock log read their counts again, as
+  // after a sale or a stock change (also on a refusal: another desk may have
+  // voided it first).
+  const afterVoid = () => {
+    qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
+    qc.invalidateQueries('pos-low-stock'); qc.invalidateQueries('pos-inventory-log')
+  }
+  const voidMut = useMutation((id:string) => apiPost(`/pos/transactions/${id}/void`, { reason:'Voided by cashier' }), {
+    onSuccess: () => { setVoidAsk(null); toastOnce('Sale voided — what it took is back on the shelf'); afterVoid() },
+    onError: (e: any) => { setVoidAsk(null); afterVoid(); toastOnce(errorMessage(e, 'The sale was not voided — check the connection, then press Void again.'), { error: true }) } })
 
   // S243: SDK Bluetooth-reader discovery + connect (handheld path).
   // Smart readers (S700, WisePOS E) appear in the modal too but via
@@ -980,14 +1389,14 @@ export function POSPage() {
           const l = latest.current
           const rid = activeReader.stripeReaderId
           const r = await queueReader(() => showCartLive({ stripeReaderId: rid, propertyId: registerProperty,
-            items: l.cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax })),
+            items: l.cart.map(i => wireLine(i, l.openTicketId, l.payLinkId)),
             discountAmount: l.discountAmt, tenantId: l.tenantId || null, posCustomerId: l.posCustomerId || null })).catch(() => null)
           breakdownUp = !!r?.shown
           if (breakdownUp) shownOnReader.current = { readerId: activeReader.stripeReaderId, propertyId: registerProperty }
         }
         if (breakdownUp) {
           tapSubject.current = JSON.stringify(['card', activeReader.stripeReaderId,
-            latest.current.cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax })),
+            latest.current.cart.map(i => wireLine(i, latest.current.openTicketId, latest.current.payLinkId)),
             latest.current.discountAmt, latest.current.tenantId, latest.current.posCustomerId])
           setTerminalStatus('awaiting_tap')
           const outcome = await waitForTap()
@@ -1005,7 +1414,7 @@ export function POSPage() {
       // S648: the server prices the reader charge from the cart itself, card
       // fee included — the register no longer sends an amount.
       const l = latest.current
-      const cartLines = l.cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
+      const cartLines = l.cart.map(i => wireLine(i, l.openTicketId, l.payLinkId))
       const who = { tenantId: l.tenantId || null, posCustomerId: l.posCustomerId || null, cartOnReader: breakdownUp }
       let intent: { id: string; clientSecret: string } | null = null
       // S654: a charge the reader timed out on is sent again as-is. The server
@@ -1021,7 +1430,10 @@ export function POSPage() {
         }
       }
       if (!intent) {
-        const fresh = await createTerminalIntent({ items: cartLines, discountAmount: l.discountAmt, propertyId: registerProperty, description: 'GAM POS sale' })
+        // 10/2 (decisions #9): a reservation ticket's charge is priced by the
+        // server as the reservation, from the ticket it settles.
+        const intentArgs = { items: cartLines, discountAmount: l.discountAmt, propertyId: registerProperty, description: 'GAM POS sale', openTicketId: l.openTicketId }
+        const fresh = await createTerminalIntent(intentArgs)
         intent = fresh
         if (activeReader.type === 'smart') {
           await processIntentOnReader({ paymentIntentId: fresh.id, stripeReaderId: activeReader.stripeReaderId, items: cartLines, discountAmount: l.discountAmt, ...who })
@@ -1043,6 +1455,9 @@ export function POSPage() {
     } catch (e: any) {
       const raw = e?.response?.data?.error
       const msg: string = (typeof raw === 'string' ? raw : raw?.message) || e?.message || 'Charge failed'
+      // 10/3 (review): a refusal because something changed (a site taken, a
+      // figure moved) reads what is free again for the next pick.
+      if (e?.response?.status === 409) qc.invalidateQueries('stay-availability')
       if (activeReader.type === 'bluetooth') {
         await cancelCurrentPayment().catch(() => {})
         if (piId) await cancelTerminalIntent(piId).catch(() => {})
@@ -1052,9 +1467,13 @@ export function POSPage() {
         await clearReaderPrompt(piId, activeReader.stripeReaderId).catch(() => {})
         setPendingIntent({ id: piId, readerId: activeReader.stripeReaderId })
         setReaderCartNonce(n => n + 1)   // the breakdown goes back up for the next try
+        // 10/2 (review): one instruction, never two — a server message that
+        // already says what to press is shown as it is.
         setTerminalError(/timed out/i.test(msg)
           ? 'No card was presented. The cart is still here — tap Charge again when they are ready.'
-          : `${msg} — the cart is still here; tap Charge to try again.`)
+          : /press (charge|clear)|tap charge|charge again|on the reader instead|another form of payment/i.test(msg)
+            ? msg
+            : `${msg} — the cart is still here; tap Charge to try again.`)
       } else {
         setTerminalError(msg)
       }
@@ -1139,7 +1558,6 @@ export function POSPage() {
             if (a.nameSet) {
               const parts = String(a.nameSet).split(' ')
               setReceipt((r: any) => r ? { ...r, customer: { ...r.customer, firstName: parts.length > 1 ? parts.slice(0, -1).join(' ') : parts[0], lastName: parts.length > 1 ? parts[parts.length - 1] : '' } } : r)
-              qc.invalidateQueries('pos-people')
             }
             return
           }
@@ -1151,25 +1569,37 @@ export function POSPage() {
     void tick()
     return () => { stop = true }
   }, [saveCard, receipt?.id])   // eslint-disable-line react-hooks/exhaustive-deps
+  // 10/2 (review): the card tapped was folded into the person picked, with its
+  // other sales — Undo puts the card and those sales back (the sale stays theirs).
+  const cardUndoMut = useMutation(
+    (v: { saleId: string; undo: string }) => apiPost<any>(`/pos/transactions/${v.saleId}/customer/undo`, { undo: v.undo }).then((r: any) => r?.data),
+    { onSuccess: (r: any) => {
+        setReceipt((x: any) => x ? { ...x, customer: { ...(x.customer || {}), cardNote: r?.message ?? null, cardUndo: null } } : x)
+        toastOnce(r?.message || 'Put back')
+        qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-customer-base')
+      },
+      onError: (e: any) => {
+        setReceipt((x: any) => x ? { ...x, customer: { ...(x.customer || {}), cardUndo: null } } : x)
+        toastOnce(errorMessage(e, 'That could not be undone — check the connection, then open the sale in History and pick the right person.'), { error: true })
+      } })
   const emailReceiptMut = useMutation(
     () => apiPost(`/pos/transactions/${receipt?.id}/email-receipt`, { email: receiptEmail.trim() }),
-    { onSuccess: (r: any) => { setReceiptSent(r.data.sentTo); qc.invalidateQueries('pos-people') },
-      onError: (e: any) => toast.error(e?.response?.data?.error || 'The receipt could not be sent') })
+    { onSuccess: (r: any) => { setReceiptSent(r.data.sentTo) },
+      onError: (e: any) => toastOnce(errorMessage(e, 'The receipt could not be sent — check the email and press Send again.'), { error: true }) })
   const { data: customersBase = [], isLoading: custLoading } = useQuery<any[]>(['pos-customer-base', registerProperty],
     () => apiGet(`/pos/customers?propertyId=${registerProperty}`), { enabled: tab==='customers' && !!registerProperty })
   const txReceiptMut = useMutation(
     (v: { id: string; email: string }) => apiPost(`/pos/transactions/${v.id}/email-receipt`, { email: v.email.trim() }),
-    { onSuccess: (r: any) => { setTxEdit(null); toast(`Receipt sent to ${r.data.sentTo}`); qc.invalidateQueries('pos-people'); qc.invalidateQueries('pos-customer-base') },
-      onError: (e: any) => toast.error(e?.response?.data?.error || 'The receipt could not be sent') })
-  // S654: a first name is enough; an email already on the list picks that customer.
-  const createCustomerMut = useMutation(
-    () => apiPost('/pos/customers', { firstName: newCustomer.firstName.trim(), lastName: newCustomer.lastName.trim() || null,
-      email: newCustomer.email.trim() || null, phone: newCustomer.phone.trim() || null, propertyId: registerProperty }),
-    { onSuccess: (r: any) => {
-        if (r.data?.existing) toast(`${`${r.data.firstName ?? ''} ${r.data.lastName ?? ''}`.trim()} is already on the list — picked them.`)
-        qc.invalidateQueries(['pos-people', registerProperty]); qc.invalidateQueries('pos-customer-base')
-        setPosCustomerId(r.data?.id || ''); setTenantId(''); setNewCustomer({ open: false, firstName: '', lastName: '', email: '', phone: '' }) },
-      onError: (e: any) => toast.error(e?.response?.data?.error || 'The customer could not be added') })
+    { onSuccess: (r: any) => { setTxEdit(null); toastOnce(`Receipt sent to ${r.data.sentTo}`); qc.invalidateQueries('pos-customer-base') },
+      onError: (e: any) => toastOnce(errorMessage(e, 'The receipt could not be sent — check the email and press Send receipt again.'), { error: true }) })
+  // The person the finished sale names, as the picker shows them. A card with
+  // no name yet is nobody: the panel opens ready to type.
+  const rc: any = receipt?.customer ?? null
+  const rcName = rc ? `${rc.firstName ?? ''} ${rc.lastName ?? ''}`.trim() : ''
+  const receiptPerson: PickedPerson | null = !rc?.id ? null
+    : rc.isResident ? { kind: 'resident', tenantId: rc.tenantId ?? null, customerId: rc.id, name: rcName || 'Resident', hint: 'resident' }
+    : (rc.firstName === 'Card' && rc.lastName === 'Customer') || !rcName ? null
+    : { kind: 'customer', tenantId: null, customerId: rc.id, name: rcName, hint: rc.email || null }
 
   if (receipt) return (
     <div>
@@ -1178,7 +1608,19 @@ export function POSPage() {
         <div className="card" style={{textAlign:'center',padding:32}}>
           <div style={{fontSize:'2rem',marginBottom:8}}>✅</div>
           <div style={{fontWeight:700,fontSize:'1.1rem',marginBottom:4}}>Sale Complete</div>
-          <div style={{color:'var(--text-3)',fontSize:'.82rem',marginBottom:24}}>Transaction recorded</div>
+          <div style={{color:'var(--text-3)',fontSize:'.82rem',marginBottom:receipt.method==='cash'?12:24}}>Transaction recorded</div>
+          {/* 10/3 (Nic, decisions #16): the change to hand back stays up until
+              the cashier closes this — never gone the moment the sale lands. */}
+          {receipt.method==='cash' && (
+            <div style={{border:'2px solid var(--gold)',borderRadius:10,padding:'14px 12px',marginBottom:20}}>
+              <div style={{fontSize:'1.7rem',fontWeight:800,color:'var(--gold)',lineHeight:1.2}}>
+                {receipt.changeDue>0 ? `Give ${fmt(receipt.changeDue)} change` : 'No change due'}
+              </div>
+              <div style={{fontSize:'.9rem',color:'var(--text-2)',marginTop:6}}>
+                Received {fmt(receipt.cashReceived ?? receipt.total)} / Total {fmt(receipt.total)}
+              </div>
+            </div>
+          )}
           <table className="data-table" style={{marginBottom:16}}>
             <tbody>{receipt.cartItems.map((i:any,idx:number) => (<tr key={idx}><td>{i.name}</td><td className="mono">x{i.qty}</td><td className="mono">{fmt(i.price*i.qty)}</td></tr>))}</tbody>
           </table>
@@ -1192,39 +1634,52 @@ export function POSPage() {
             <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'1rem',borderTop:'1px solid var(--border-1)',paddingTop:8,marginTop:4}}>
               <span>Total</span><span style={{color:'var(--gold)'}}>{fmt(receipt.total)}</span>
             </div>
-            {receipt.method==='cash'&&receipt.changeDue>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--green)',fontWeight:600}}><span>Change Due</span><span>{fmt(receipt.changeDue)}</span></div>}
+            {receipt.method==='cash'&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--text-2)'}}><span>Received</span><span>{fmt(receipt.cashReceived ?? receipt.total)}</span></div>}
+            {receipt.method==='cash'&&receipt.changeDue>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--gold)',fontWeight:700}}><span>Give change</span><span>{fmt(receipt.changeDue)}</span></div>}
           </div>
-          {!receipt.tenantId && (
-            <div style={{textAlign:'left',border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 12px',marginBottom:12,fontSize:'.82rem'}}>
-              <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:6}}>Customer information</div>
-              <SaleCustomerForm key={`${receipt.id}:${receipt.customer?.id ?? ''}`} txId={receipt.id} initial={receipt.customer ?? null}
-                onSaved={(c:any)=>{ setReceipt((r:any)=>({ ...r, customer: { ...(r.customer || {}), id: c.id, firstName: c.firstName, lastName: c.lastName, email: c.email, phone: c.phone } }))
-                  if (c.email && !receiptEmail.trim()) setReceiptEmail(c.email)
-                  qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-customer-base'); qc.invalidateQueries('pos-people') }} />
-            </div>
-          )}
-          {receipt.customer && (
-            <div style={{textAlign:'left',border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 12px',marginBottom:12,fontSize:'.82rem'}}>
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+          {/* 10/2 (Nic): who the sale was for — typed and picked, exactly as at
+              the register. A sale that names nobody (or only a card) opens ready
+              to type; linking it fills in every other sale on the same card. */}
+          <div style={{textAlign:'left',border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 12px',marginBottom:12,fontSize:'.82rem',display:'grid',gap:6}}>
+            <SaleCustomerLink key={receipt.id} saleId={receipt.id} propertyId={registerProperty} current={receiptPerson} startOpen
+              onLinked={(r:any, picked)=>{
+                const name = String(r?.customerName ?? picked?.name ?? '').trim()
+                const parts = name.split(' ')
+                setReceipt((x:any)=>({ ...x, tenantId: r?.tenantId ?? null, posCustomerId: r?.posCustomerId ?? null,
+                  customer: { ...(x.customer || {}), id: r?.posCustomerId ?? null,
+                    firstName: parts.length > 1 ? parts.slice(0, -1).join(' ') : parts[0], lastName: parts.length > 1 ? parts[parts.length - 1] : '',
+                    isResident: !!r?.tenantId, tenantId: r?.tenantId ?? null, email: picked?.email ?? null,
+                    isNew: false, priorPurchases: undefined, cardNote: null } }))
+                if (picked?.email && !receiptEmail.trim()) setReceiptEmail(picked.email)
+                qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-customer-base')
+              }} />
+            {receipt.customer?.id && receiptPerson && (
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,color:'var(--text-3)',fontSize:'.75rem'}}>
                 <span>
-                  <span style={{color:'var(--text-3)'}}>Customer </span>
-                  <strong>{receipt.customer.firstName} {receipt.customer.lastName}</strong>
-                  {receipt.customer.last4 && <span style={{color:'var(--text-3)'}}> · card ending {receipt.customer.last4}</span>}
-                  <span style={{color:'var(--text-3)'}}> · {receipt.customer.isNew ? 'new customer' : `${receipt.customer.priorPurchases} previous purchase${receipt.customer.priorPurchases===1?'':'s'}`}</span>
+                  {receipt.customer.last4 ? `Card ending ${receipt.customer.last4}` : 'Paid'}
+                  {receipt.customer.isNew ? ' · new customer'
+                    : typeof receipt.customer.priorPurchases === 'number' ? ` · ${receipt.customer.priorPurchases} previous purchase${receipt.customer.priorPurchases===1?'':'s'}` : ''}
                 </span>
-                <button className="btn btn-ghost btn-sm" onClick={()=>{ setHistoryCustomer({ id: receipt.customer.id, name: `${receipt.customer.firstName} ${receipt.customer.lastName}`.trim() }); setReceipt(null); setTab('history') }}>History</button>
+                <button className="btn btn-ghost btn-sm" onClick={()=>{ setHistoryCustomer({ id: receipt.customer.id, name: receiptPerson.name }); setReceipt(null); setTab('history') }}>History</button>
               </div>
-              {saveCard==='asking' && <div style={{color:'var(--text-2)',marginTop:6}}>
+            )}
+            {receipt.customer?.cardNote && <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',color:'var(--text-2)'}}>
+              <span>{receipt.customer.cardNote}</span>
+              {receipt.customer.cardUndo && <button type="button" className="btn btn-primary btn-sm" disabled={cardUndoMut.isLoading}
+                onClick={()=>cardUndoMut.mutate({ saleId: receipt.id, undo: receipt.customer.cardUndo })}>{cardUndoMut.isLoading ? 'Putting back…' : 'Undo'}</button>}
+            </div>}
+            {receipt.customer && (<>
+              {saveCard==='asking' && <div style={{color:'var(--text-2)'}}>
                 Asking on the reader{[receipt.customer.asks?.askSave&&'whether to keep the card', receipt.customer.asks?.askName&&'for a name', receipt.customer.asks?.askEmail&&'for a receipt email'].filter(Boolean).map((x,i,a)=>(i===0?' ':i===a.length-1?' and ':', ')+x).join('')}…
               </div>}
-              {saveCard==='saved' && <div style={{color:'var(--green)',marginTop:6}}>Card kept for next time — it shows under On file.</div>}
-              {saveCard==='declined' && receipt.customer.asks?.askSave && <div style={{color:'var(--text-3)',marginTop:6}}>Card not kept.</div>}
-              {saveCard==='declined' && !receipt.customer.asks?.askSave && <div style={{color:'var(--text-3)',marginTop:6}}>Done on the reader.</div>}
-              {saveCard==='timeout' && <div style={{color:'var(--text-3)',marginTop:6}}>No answer on the reader.</div>}
-              {receipt.customer.cardSaved && saveCard==null && <div style={{color:'var(--text-3)',marginTop:6}}>Card already on file.</div>}
-              {!receipt.customer.cardSaved && !receipt.customer.cardKeepable && receipt.customer.last4 && saveCard==null && <div style={{color:'var(--text-3)',marginTop:6}}>A phone-wallet tap can't be kept on file.</div>}
-            </div>
-          )}
+              {saveCard==='saved' && <div style={{color:'var(--green)'}}>Card kept for next time — it shows under On file.</div>}
+              {saveCard==='declined' && receipt.customer.asks?.askSave && <div style={{color:'var(--text-3)'}}>Card not kept.</div>}
+              {saveCard==='declined' && !receipt.customer.asks?.askSave && <div style={{color:'var(--text-3)'}}>Done on the reader.</div>}
+              {saveCard==='timeout' && <div style={{color:'var(--text-3)'}}>No answer on the reader.</div>}
+              {receipt.customer.cardSaved && saveCard==null && <div style={{color:'var(--text-3)'}}>Card already on file.</div>}
+              {!receipt.customer.cardSaved && !receipt.customer.cardKeepable && !receipt.customer.isResident && receipt.customer.last4 && saveCard==null && <div style={{color:'var(--text-3)'}}>A phone-wallet tap can't be kept on file.</div>}
+            </>)}
+          </div>
           <div style={{textAlign:'left',marginBottom:14}}>
             <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Email a copy of the receipt</div>
             {receiptSent ? (
@@ -1251,7 +1706,7 @@ export function POSPage() {
               every tab (register, history, items, taxes, …) reads and
               writes within this property. No cross-property mixing. */}
           {(properties as any[]).length > 1 && (
-            <select className="form-select" value={registerProperty} onChange={e=>{ setRegisterProperty(e.target.value); setTenantId(''); setPosCustomerId('') }} style={{width:'auto',minWidth:200}}>
+            <select className="form-select" value={registerProperty} onChange={e=>{ void switchProperty(e.target.value) }} style={{width:'auto',minWidth:200}}>
               <option value="" disabled>Select a property…</option>
               {(properties as any[]).map((p:any)=><option key={p.id} value={p.id}>{p.name||p.street1}</option>)}
             </select>
@@ -1349,49 +1804,52 @@ export function POSPage() {
               </div>
             )}
             <div className="card-header"><span className="card-title">Current Sale</span>
-              {cart.length>0&&<button disabled={readerHoldsCharge} onClick={() => {
-                // S652 (Nic): "just clearing the cart should clear it, and if
-                // they have a name associated with it save it as a ticket."
-                if (tenantId || posCustomerId) { writeTicketMut.mutate(); return }
-                // S263/S264: clearing the cart enqueues a void on the
-                // live session. Offline-tolerant — drains on reconnect. The
-                // void lands after the open-tab list refreshes, so the tab
-                // used to come straight back as "resume or discard": remember
-                // what was cleared and never show it again on this terminal.
-                if (clientSessionId) setDismissedSessions(d => new Set(d).add(clientSessionId))
-                if (clientSessionId) {
-                  void enqueueSync({
-                    op: 'VOID_SESSION',
-                    clientSessionId,
-                    payload: { reason: 'cleared_by_cashier' },
-                  })
-                  qc.invalidateQueries(['pos-sessions-open', registerProperty])
-                }
-                setClientSessionId(null); abandonPendingIntent(); setCart([]); setOpenTicketId(null); setPayLinkId(null)
-              }} style={{background:'none',border:'none',color:'var(--text-3)',cursor:'pointer',fontSize:'.75rem'}}>Clear</button>}
+              {/* S652 (Nic): "just clearing the cart should clear it, and if
+                  they have a name associated with it save it as a ticket."
+                  10/2: a reopened ticket goes BACK (never a second ticket), a
+                  pay link stays out, and the live cart session is closed so it
+                  never comes back as "resume or discard" (resetRegister). */}
+              {(cart.length>0||!!openTicketId||!!payLinkId)&&<button disabled={readerHoldsCharge || putTicketBackMut.isLoading || writeTicketMut.isLoading} onClick={clearRegister}
+                title={openTicketId ? 'Put this ticket back on the open list' : payLinkId ? 'Put this pay link back on the open list' : (tenantId||posCustomerId) ? 'Hold it for delivery under their name' : 'Empty the cart'}
+                style={{background:'none',border:'none',color:'var(--text-3)',cursor:'pointer',fontSize:'.75rem'}}>
+                {putTicketBackMut.isLoading ? 'Putting it back…' : 'Clear'}
+              </button>}
             </div>
             {cart.length===0?(<div style={{color:'var(--text-3)',fontSize:'.85rem',padding:'24px 0',textAlign:'center'}}>No items added</div>):(
               <div style={{marginBottom:12}}>
                 {cart.map(i=>(<div key={i.id} style={{display:'flex',alignItems:'center',gap:6,padding:'7px 0',borderBottom:'1px solid var(--border-1)'}}>
-                  <div style={{flex:1,minWidth:0}}><div style={{fontSize:'.8rem',fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{i.name}</div>
+                  <div style={{flex:1,minWidth:0}}><div style={{fontSize:'.8rem',fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:i.reservation?'normal':'nowrap'}}>{i.name}</div>
                     {!i.chargeEligible&&method==='charge'&&<div style={{fontSize:'.65rem',color:'var(--red)'}}>not charge eligible</div>}
                   </div>
+                  {/* 10/2 (decisions #9, #23): the reservation is charged at
+                      its own price — its nights, site and price change only on
+                      the schedule, never counted up or down here. */}
+                  {i.reservation ? (
+                    <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>
+                      {i.nights ? `${i.nights} night${i.nights===1?'':'s'} · ` : ''}reservation price · change it on the schedule
+                    </div>
+                  ) : (
                   <div style={{display:'flex',alignItems:'center',gap:4}}>
                     <button onClick={()=>updateQty(i.id,-1)} style={{background:'var(--bg-3)',border:'none',borderRadius:3,width:20,height:20,cursor:'pointer',fontWeight:700}}>-</button>
                     <input type="number" min={0} step="any" value={i.qty} onFocus={e=>e.currentTarget.select()} onChange={e=>{const v=parseFloat(e.target.value); if(!isNaN(v)) void setQty(i.id, v)}} style={{width:46,textAlign:'center',fontSize:'.82rem',fontWeight:600,background:'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:4,color:'var(--text-0)',padding:'2px 0'}} />
                     <button onClick={()=>updateQty(i.id,1)} style={{background:'var(--bg-3)',border:'none',borderRadius:3,width:20,height:20,cursor:'pointer',fontWeight:700}}>+</button>
                   </div>
-                  <div style={{fontSize:'.82rem',fontWeight:600,minWidth:44,textAlign:'right'}}>{fmt(i.price*i.qty)}</div>
+                  )}
+                  <div style={{fontSize:'.82rem',fontWeight:600,minWidth:44,textAlign:'right'}}>{fmt(lineAmount(i))}</div>
                 </div>))}
               </div>
             )}
             {/* S650: the discount box is for staff allowed to discount; the server refuses it otherwise. */}
-            {!(isOwner || (user?.permissions as any)?.['pos.discount'] === true || (user?.permissions as any)?.['pos.manage_inventory'] === true) ? null : appliedDiscount?(<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--gold-bg)',borderRadius:6,padding:'6px 10px',marginBottom:10,fontSize:'.8rem'}}>
+            {!(isOwner || (user?.permissions as any)?.['pos.discount'] === true || (user?.permissions as any)?.['pos.manage_inventory'] === true) ? null
+              : noDiscountForStay ? (<div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:10,lineHeight:1.45}}>
+                  No discount on a sale with a stay — the stay is charged at the schedule's price. To discount other items, ring them on a sale of their own.
+                </div>)
+              : appliedDiscount?(<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--gold-bg)',borderRadius:6,padding:'6px 10px',marginBottom:10,fontSize:'.8rem'}}>
               <span style={{color:'var(--gold)',fontWeight:600}}>discount: {appliedDiscount.name}</span>
               <button onClick={()=>setAppliedDiscount(null)} style={{background:'none',border:'none',cursor:'pointer',color:'var(--text-3)'}}>x</button>
             </div>):(<div style={{display:'flex',gap:6,marginBottom:10}}>
               <input className="form-input" placeholder="Discount code" value={discountCode} onChange={e=>setDiscountCode(e.target.value)} style={{flex:1,fontSize:'.78rem',padding:'4px 8px'}} />
-              <button className="btn btn-ghost btn-sm" onClick={applyDiscountCode}>Apply</button>
+              <button className="btn btn-primary btn-sm" onClick={applyDiscountCode}>Apply</button>
             </div>)}
             <div style={{fontSize:'.82rem',display:'grid',gap:3,marginBottom:12}}>
               <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Subtotal</span><span>{fmt(subtotal)}</span></div>
@@ -1427,38 +1885,23 @@ export function POSPage() {
             </div>
             {method==='cash'&&(<div style={{marginBottom:10}}>
               <input className="form-input" type="number" {...nonNeg} placeholder="Cash given" value={cashGiven} onChange={e=>setCashGiven(e.target.value)} style={{width:'100%'}} />
-              {cashGiven&&Number(cashGiven)>=total&&<div style={{fontSize:'.82rem',color:'var(--green)',fontWeight:600,marginTop:4}}>Change: {fmt(changeDue)}</div>}
+              {cashBlank
+                ? <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:4}}>Left blank, it is exact cash — no change due.</div>
+                : cashShortBy>0
+                  ? <div style={{fontSize:'.82rem',color:'var(--red)',fontWeight:600,marginTop:4}}>Cash given is short by {fmt(cashShortBy)} — take the rest, then press Charge.</div>
+                  : <div style={{fontSize:'.82rem',color:'var(--green)',fontWeight:600,marginTop:4}}>{changeDue>0 ? `Change: ${fmt(changeDue)}` : 'No change due'}</div>}
             </div>)}
-            {/* S654 (Nic): "I need to be able to choose a customer from the
-                drop-down menu to link to that transaction and it should show
-                their name on the pay screen as well." One picker for every
-                tender — required only where the tender needs a person (a charge
-                account, a card on file). The name leads the reader's breakdown. */}
+            {/* S654 (Nic): "it should show their name on the pay screen as
+                well." 10/2 (Nic): "type their name, not a scroll down list...
+                One flow. If they aren't in the system, I choose add new, from
+                that flow." One typed picker for every tender — required only
+                where the tender needs a person (a charge account, a card on
+                file). Picked, it is a chip; the name leads the reader's breakdown. */}
             <div style={{marginBottom:10,display:'grid',gap:6}}>
               <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Customer{(method==='charge'||method==='card_on_file')?'':' (optional)'}</div>
-              <select className="form-select" value={tenantId?`t:${tenantId}`:posCustomerId?`c:${posCustomerId}`:''} onChange={e=>{ const v=e.target.value; if(v.startsWith('t:')){ setTenantId(v.slice(2)); setPosCustomerId('') } else if(v.startsWith('c:')){ setPosCustomerId(v.slice(2)); setTenantId('') } else { setTenantId(''); setPosCustomerId('') } }} style={{width:'100%'}}>
-                <option value="">{(method==='charge'||method==='card_on_file') ? 'Pick who this is for…' : 'No customer'}</option>
-                {(people as any[]).map((p:any)=><option key={p.key} value={p.key}>{p.name}{p.detail?` — ${p.detail}`:''}</option>)}
-              </select>
-              {/* S654 (Nic): "for cash people we can add them as a customer." */}
-              {!newCustomer.open ? (
-                <button type="button" className="btn btn-ghost btn-sm" style={{justifySelf:'start'}} onClick={()=>setNewCustomer(n=>({ ...n, open:true }))}>+ New customer</button>
-              ) : (
-                <div style={{display:'grid',gap:6,padding:'8px 10px',border:'1px solid var(--border-1)',borderRadius:8}}>
-                  <div style={{display:'flex',gap:6}}>
-                    <input className="form-input" placeholder="First name" value={newCustomer.firstName} onChange={e=>setNewCustomer(n=>({ ...n, firstName:e.target.value }))} />
-                    <input className="form-input" placeholder="Last name" value={newCustomer.lastName} onChange={e=>setNewCustomer(n=>({ ...n, lastName:e.target.value }))} />
-                  </div>
-                  <div style={{display:'flex',gap:6}}>
-                    <input className="form-input" type="email" placeholder="Email (optional)" value={newCustomer.email} onChange={e=>setNewCustomer(n=>({ ...n, email:e.target.value }))} />
-                    <input className="form-input" placeholder="Phone (optional)" value={newCustomer.phone} onChange={e=>setNewCustomer(n=>({ ...n, phone:e.target.value }))} />
-                  </div>
-                  <div style={{display:'flex',gap:6}}>
-                    <button type="button" className="btn btn-primary btn-sm" disabled={!newCustomer.firstName.trim()||!registerProperty||createCustomerMut.isLoading} onClick={()=>createCustomerMut.mutate()}>{createCustomerMut.isLoading?'Adding…':'Add customer'}</button>
-                    <button type="button" className="btn btn-ghost btn-sm" onClick={()=>setNewCustomer({ open:false, firstName:'', lastName:'', email:'', phone:'' })}>Cancel</button>
-                  </div>
-                </div>
-              )}
+              <POSCustomerPicker propertyId={registerProperty} value={person} onChange={setPerson}
+                disabled={!registerProperty || readerHoldsCharge}
+                placeholder={(method==='charge'||method==='card_on_file') ? 'Type who this is for' : 'Type a name, email or phone'} />
             </div>
             {(method==='charge'||method==='card_on_file')&&(<div style={{marginBottom:10,display:'grid',gap:6}}>
               {method==='charge'&&chargeBlocked&&<div style={{fontSize:'.72rem',color:'var(--red)'}}>Cart has non-charge-eligible items</div>}
@@ -1501,7 +1944,13 @@ export function POSPage() {
                   </div>
                 </div>)}
               {activeReader?.type==='smart' && cart.length>0 && terminalStatus!=='awaiting_tap' && terminalStatus!=='collecting' && terminalStatus!=='capturing' && (
-                breakdownIsUp
+                // 10/3 (review): a stay with no site and dates has no price, so
+                // nothing is on the reader yet — say what puts it there.
+                readerCartLines.length===0
+                  ? <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.45}}>
+                      Pick the site and dates — the breakdown goes on the reader once the stay is priced.
+                    </div>
+                  : breakdownIsUp
                   ? <div style={{fontSize:'.75rem',color:'var(--gold)',fontWeight:600,lineHeight:1.45,padding:'6px 8px',border:'1px solid var(--gold)',borderRadius:'var(--r-md)',background:'var(--gold-bg)'}}>
                       The breakdown is on the reader. They can tap any time; Charge gives them {TAP_WINDOW_SECONDS} seconds.
                     </div>
@@ -1517,11 +1966,12 @@ export function POSPage() {
             {/* S651: a stay cannot be rung without a site and an arrival date,
                 so the button says what it needs instead of failing on submit.
                 Once set, the site and dates show above it. */}
-            {stayInCart && (stay
-              ? <button className="btn btn-ghost btn-sm" style={{width:'100%',marginBottom:6,textAlign:'left'}}
+            {stayInCart && (stayReady
+              ? <button className="btn btn-primary btn-sm" style={{width:'100%',marginBottom:6,textAlign:'left'}}
                         onClick={()=>setStayModal(true)}>
                   {stay.siteLabel} · {stay.checkIn} → {stay.checkOut} · {stay.guestName}
                 </button>
+              : stay ? <div style={{fontSize:'.72rem',color:'var(--amber)',marginBottom:6}}>The nights changed — pick the site again for the new dates.</div>
               : null)}
             <button className="btn btn-primary" style={{width:'100%'}} disabled={
               cart.length===0
@@ -1531,22 +1981,32 @@ export function POSPage() {
               || terminalStatus==='capturing'
               || (method==='charge' && (chargeBlocked || !registerProperty || (!tenantId && !posCustomerId)))
               || (method==='card' && !registerProperty)
+              // 10/3: cash given that does not cover the total is not a sale yet.
+              || (method==='cash' && cashShortBy > 0)
               // S652: no customer, no card — and a customer with no card saved
               // has to go on the reader, which saves it for next time.
               || (method==='card_on_file' && (!registerProperty || (!tenantId && !posCustomerId) || !cardOnFile.data))
             } onClick={()=>{
-              if (stayInCart && !stay) { setStayModal(true); return }
+              if (stayInCart && !stayReady) { setStayModal(true); return }
               method==='card'?chargeWithReader():checkoutMut.mutate(undefined)
             }}>
               {checkoutMut.isLoading?'Processing...':terminalStatus==='awaiting_tap'?'Waiting for the tap…':terminalStatus==='collecting'?'Awaiting card…':terminalStatus==='capturing'?'Capturing…'
-               :stayInCart&&!stay?'Pick a site and dates'
+               :stayInCart&&!stayReady?'Pick a site and dates'
                :'Charge '+fmt(total)}
             </button>
             {/* S648 (Nic): "generate an item, a charge and send it to a link so
                 they can pay by email." The same cart, paid later by card. */}
-            <button className="btn btn-ghost" style={{width:'100%',marginTop:8}}
-              disabled={cart.length===0 || !registerProperty || readerHoldsCharge}
-              onClick={()=>setPayLinkOpen(true)}>
+            {/* 10/2: a ticket or pay link opened here is already out — a link
+                for it too would be a second bill for the same thing. */}
+            <button className="btn btn-primary" style={{width:'100%',marginTop:8}}
+              disabled={cart.length===0 || !registerProperty || readerHoldsCharge || !!openTicketId || !!payLinkId}
+              title={openTicketId || payLinkId ? 'This is already out on the open list — charge it here, or press Clear to put it back.' : undefined}
+              onClick={()=>{
+                // 10/3 (decisions #9): a stay goes out on a link with its site and
+                // dates — held for them, at the same price Charge would take.
+                if (stayInCart && !stayReady) { setStayModal(true); return }
+                setPayLinkOpen(true)
+              }}>
               Email a pay link
             </button>
             {/* S652 (Nic): the propane is pumped here, where the meter is and
@@ -1554,25 +2014,37 @@ export function POSPage() {
                 the customer's door. Nic, on why this is not a pay link: "That's
                 product actually out and payment needs to be rendered right then
                 instead of chasing somebody down later." */}
-            <button className="btn btn-ghost" style={{width:'100%',marginTop:8}}
+            {/* 10/3 (review): a stay is never held for delivery — it needs a
+                site and dates and is paid now, or sent on a link that holds
+                the site. The button says so instead of failing on the server. */}
+            <button className="btn btn-primary" style={{width:'100%',marginTop:8}}
               disabled={cart.length===0 || !registerProperty || (!tenantId && !posCustomerId) || !!openTicketId || !!payLinkId
-                        || writeTicketMut.isLoading || readerHoldsCharge}
+                        || stayInCart || writeTicketMut.isLoading || readerHoldsCharge}
+              title={stayInCart ? 'A stay is charged now or sent on a pay link — it is not held for delivery.' : undefined}
               onClick={()=>writeTicketMut.mutate()}>
               {writeTicketMut.isLoading ? 'Writing it up…' : 'Hold for delivery'}
             </button>
-            {cart.length>0 && !openTicketId && !payLinkId && !tenantId && !posCustomerId &&
+            {cart.length>0 && !openTicketId && !payLinkId && stayInCart &&
+              <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:4}}>
+                A stay is not held for delivery — charge it now, or email a pay link (that holds the site).
+              </div>}
+            {cart.length>0 && !openTicketId && !payLinkId && !stayInCart && !tenantId && !posCustomerId &&
               <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:4}}>
                 Pick who it is for to hold it for delivery.
               </div>}
             {payLinkOpen && (
               <SendPayLinkModal
                 propertyId={registerProperty}
-                cart={cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax, cat: i.cat }))}
+                cart={cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax, cat: i.cat,
+                                       // 10/3 (review): the stay's figure as shown — the link never goes out at another.
+                                       ...(stayPriced(i) ? { stayTotal: i.stayTotal } : {}) }))}
+                stay={stayInCart && stayReady && stay ? { unitId: stay.unitId, checkIn: stay.checkIn, guestName: stay.guestName, guestPhone: stay.guestPhone || null } : null}
                 discountAmount={discountAmt}
                 total={discountedSubtotal + taxAmount}
                 customerPaysFee={!absorbsCardFee}
                 onClose={()=>setPayLinkOpen(false)}
-                onSent={()=>{ setPayLinkOpen(false); abandonPendingIntent(); setCart([]); setTenantId(''); setPosCustomerId(''); setAppliedDiscount(null); setOpenTicketId(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets') }}
+                person={person}
+                onSent={()=>{ setPayLinkOpen(false); resetRegister('sent_as_pay_link'); qc.invalidateQueries('pos-tickets'); qc.invalidateQueries('stay-availability') }}
               />
             )}
           </div>
@@ -1609,9 +2081,13 @@ export function POSPage() {
                       (pos.refund / pos.void) — a cashier with Sales history
                       sees the sales, not the buttons. The API refuses either
                       without the permission; the page simply doesn't offer them. */}
-                  <td>{t.status==='completed'&&(canRefund||canVoid)&&(<div style={{display:'flex',gap:6}}>
-                    {canRefund&&<button className="btn btn-ghost btn-sm" onClick={()=>setRefundModal({show:true,tx:t})}>Refund</button>}
-                    {canVoid&&<button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={()=>voidMut.mutate(t.id)}>Void</button>}
+                  {/* 10/3 (review): Void only where it goes through — never on
+                      a card sale (the card was charged: Refund) or a sale that
+                      paid a stay or a pay link (Refund; cancel the stay on the
+                      schedule). It asks first, in the app. */}
+                  <td>{t.status==='completed'&&(canRefund||(canVoid&&!t.voidBlocked))&&(<div style={{display:'flex',gap:6}}>
+                    {canRefund&&<button className="btn btn-ghost btn-sm" onClick={e=>{e.stopPropagation(); setRefundModal({show:true,tx:t})}}>Refund</button>}
+                    {canVoid&&!t.voidBlocked&&<button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={e=>{e.stopPropagation(); setVoidAsk(t)}}>Void</button>}
                   </div>)}
                   {t.status==='refunded'&&<span style={{fontSize:'.75rem',color:'var(--text-3)'}}>-{fmt(t.refundAmount)}</span>}
                   </td>
@@ -1629,22 +2105,21 @@ export function POSPage() {
                       <span>{TENDER_LABEL[t.tender||t.paymentMethod]||humanize(t.paymentMethod)}{t.tenantName?` · ${t.tenantName}`:t.customerName?` · ${t.customerName}`:''} · {new Date(t.createdAt).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</span>
                       <span className="mono" style={{fontWeight:700,color:'var(--text-0)'}}>{fmt(t.total)}</span>
                     </div>
-                    {/* S654 (Nic): fix who a sale belongs to; resend its receipt. */}
+                    {/* S654 (Nic): fix who a sale belongs to; resend its receipt.
+                        10/2: typed and picked — linking fills in the card's other sales. */}
                     <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',marginTop:8,paddingTop:8,borderTop:'1px solid var(--border-1)'}}>
                       {(() => { const te = txEdit && txEdit.id===t.id ? txEdit : null
-                      if (te && te.mode==='customer') return (
-                        <SaleCustomerForm txId={t.id}
-                          initial={{ firstName: t.customerFirstName, lastName: t.customerLastName, email: t.customerEmail, phone: t.customerPhone }}
-                          onSaved={()=>{ setTxEdit(null); qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-customer-base'); qc.invalidateQueries('pos-people') }}
-                          onCancel={()=>setTxEdit(null)} />)
                       if (te && te.mode==='receipt') { const cur = te; return (<>
                         <input className="form-input" type="email" placeholder="name@example.com" value={cur.value} onChange={e=>{ const v=e.target.value; setTxEdit(prev=>prev?{ ...prev, value:v }:prev) }} style={{minWidth:220}} />
                         <button className="btn btn-primary btn-sm" disabled={!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cur.value.trim())||txReceiptMut.isLoading} onClick={()=>txReceiptMut.mutate({ id:t.id, email:cur.value })}>{txReceiptMut.isLoading?'Sending…':'Send receipt'}</button>
                         <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit(null)}>Cancel</button>
                       </>) }
                       return (<>
-                        <span style={{color:'var(--text-3)',fontSize:'.75rem'}}>Customer: {t.tenantName||t.customerName||'—'}</span>
-                        {!t.tenantId && <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit({ id:t.id, mode:'customer', value:'' })}>{t.customerName ? 'Edit customer' : 'Add customer'}</button>}
+                        <div style={{flex:'1 1 320px',minWidth:0}}>
+                          <SaleCustomerLink key={`${t.id}:${t.posCustomerId ?? ''}:${t.tenantId ?? ''}`} saleId={t.id} propertyId={registerProperty}
+                            current={personOfSale(t)}
+                            onLinked={()=>{ qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-customer-base') }} />
+                        </div>
                         <button className="btn btn-ghost btn-sm" onClick={()=>setTxEdit({ id:t.id, mode:'receipt', value: t.customerEmail||'' })}>Email receipt</button>
                       </>) })()}
                     </div>
@@ -1928,7 +2403,7 @@ export function POSPage() {
             <input className="form-input" placeholder="Search name, email, phone, last four" value={custSearch} onChange={e=>setCustSearch(e.target.value)} style={{maxWidth:300}} />
           </div>
           {custLoading ? <div style={{padding:24,color:'var(--text-3)'}}>Loading…</div> : rows.length===0 ? (
-            <div style={{padding:32,textAlign:'center',color:'var(--text-3)'}}>No customers yet — a card tapped on the reader adds one; "+ New customer" on the register adds a cash customer.</div>
+            <div style={{padding:32,textAlign:'center',color:'var(--text-3)'}}>No customers yet — a card tapped on the reader adds one, and typing a name in the register's Customer box and choosing "Add new customer" adds anyone else.</div>
           ) : (
             <table className="data-table">
               <thead><tr><th>Customer</th><th>Email</th><th>Phone</th><th>Cards</th><th style={{textAlign:'right'}}>Purchases</th><th>Last</th><th style={{textAlign:'right'}}>Spent</th></tr></thead>
@@ -1936,7 +2411,8 @@ export function POSPage() {
                 <tr onClick={()=>setOpenCust(openCust===c.id?null:c.id)} style={{cursor:'pointer'}}>
                   <td style={{fontWeight:500}}>{c.firstName} {c.lastName}
                     {(c.duplicateIds||[]).length>0 && <span style={{marginLeft:8,fontSize:'.68rem',color:'var(--amber, #d0a02a)',fontWeight:600}}>possible duplicate</span>}
-                    {c.createdFrom==='card_reader' && <span style={{marginLeft:8,fontSize:'.68rem',color:'var(--text-3)'}}>from a card</span>}
+                    {c.isResident && <span style={{marginLeft:8,fontSize:'.68rem',color:'var(--gold)',fontWeight:600}}>resident</span>}
+                    {c.createdFrom==='card_reader' && !c.isResident && <span style={{marginLeft:8,fontSize:'.68rem',color:'var(--text-3)'}}>from a card</span>}
                   </td>
                   <td style={{fontSize:'.82rem'}}>{c.email||'—'}</td>
                   <td style={{fontSize:'.82rem'}}>{c.phone||'—'}</td>
@@ -2342,6 +2818,19 @@ export function POSPage() {
 
 
 
+      {voidAsk&&(<div className="modal-overlay" onClick={()=>{ if (!voidMut.isLoading) setVoidAsk(null) }}><div className="modal" style={{maxWidth:400}} onClick={e=>e.stopPropagation()}>
+        <div className="modal-header"><span className="modal-title">Void this sale?</span></div>
+        <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
+          <div style={{fontSize:'.85rem',lineHeight:1.5}}>
+            Void the {fmt(voidAsk.total)} sale from {new Date(voidAsk.createdAt).toLocaleDateString()}? A void says the sale never happened — use it for a sale rung by mistake, and hand back any cash taken for it. What it took goes back on the shelf.
+            To give money back for a real sale, press Keep it, then Refund.
+          </div>
+          <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+            <button className="btn btn-ghost" disabled={voidMut.isLoading} onClick={()=>setVoidAsk(null)}>Keep it</button>
+            <button className="btn btn-primary" disabled={voidMut.isLoading} onClick={()=>voidMut.mutate(voidAsk.id)}>{voidMut.isLoading ? 'Voiding…' : 'Void the sale'}</button>
+          </div>
+        </div>
+      </div></div>)}
       {refundModal.show&&(<div className="modal-overlay" onClick={()=>setRefundModal({show:false,tx:null})}><div className="modal" style={{maxWidth:380}} onClick={e=>e.stopPropagation()}>
         <div className="modal-header"><span className="modal-title">Refund Transaction</span><button className="btn btn-ghost btn-sm" onClick={()=>setRefundModal({show:false,tx:null})}>x</button></div>
         <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
@@ -2378,7 +2867,14 @@ export function POSPage() {
             <button className="btn btn-ghost btn-sm" onClick={()=>setTicketsOpen(false)}>✕</button>
           </div>
           <div style={{padding:'4px 24px 24px',display:'grid',gap:8}}>
-            {!tickets.data?.length && <div style={{fontSize:'.8rem',color:'var(--text-3)'}}>Nothing is out — no tickets, no unpaid pay links.</div>}
+            {/* 10/2: read fresh every time this opens; a fresh sale in the cart
+                is finished or cleared before another one is opened. */}
+            {tickets.isFetching && <div style={{fontSize:'.75rem',color:'var(--text-3)'}}>Checking what is still out…</div>}
+            {cart.length>0 && !openTicketId && !payLinkId && (
+              <div style={{fontSize:'.75rem',color:'var(--amber)',lineHeight:1.45}}>
+                Finish the sale on the register, or press Clear, before opening one of these.
+              </div>)}
+            {!tickets.isFetching && !tickets.data?.length && <div style={{fontSize:'.8rem',color:'var(--text-3)'}}>Nothing is out — no tickets, no unpaid pay links.</div>}
             {(tickets.data ?? []).map((t:any)=>(
               <div key={t.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,
                                       padding:'11px 14px',background:'var(--bg-2)',
@@ -2394,24 +2890,11 @@ export function POSPage() {
                   </div>
                   {t.note && <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:2}}>{t.note}</div>}
                 </div>
-                <button className="btn btn-primary btn-sm" onClick={()=>{
-                  // Load the ticket into the cart exactly as if it had been
-                  // rung here: same items, same customer, priced by the server
-                  // at the moment it is charged.
-                  setCart((t.items||[]).map((i:any)=>({
-                    id:i.id, name:i.name||'Item', price:Number(i.price)||0, qty:Number(i.qty)||1,
-                    tax:Number(i.tax)||0, cat:'', icon:'📦', chargeEligible:true, stayUnit:null,
-                  })) as any)
-                  // A walk-in reservation is neither a tenant nor a POS
-                  // customer; the booking carries their name.
-                  if (t.tenantId) { setTenantId(t.tenantId); setPosCustomerId('') }
-                  else if (t.posCustomerId) { setPosCustomerId(t.posCustomerId); setTenantId('') }
-                  else { setPosCustomerId(''); setTenantId('') }
-                  // S652: a pay link settles as a pay link, a ticket as a ticket.
-                  if (t.kind==='pay_link') { setPayLinkId(t.id); setOpenTicketId(null) }
-                  else { setOpenTicketId(t.id); setPayLinkId(null) }
-                  setTicketsOpen(false)
-                }}>Settle</button>
+                {(openTicketId===t.id||payLinkId===t.id)
+                  ? <span style={{fontSize:'.72rem',color:'var(--gold)',fontWeight:700,whiteSpace:'nowrap'}}>In the cart</span>
+                  : <button className="btn btn-primary btn-sm"
+                      disabled={!!reopening || putTicketBackMut.isLoading || readerHoldsCharge || (cart.length>0 && !openTicketId && !payLinkId)}
+                      onClick={()=>void reopenTicket(t)}>{reopening===t.id ? 'Opening…' : 'Settle'}</button>}
               </div>
             ))}
           </div>
@@ -2428,8 +2911,11 @@ export function POSPage() {
               setStay(d); setStayModal(false)
               // The site carries the rate. Writing it onto the cart line is what
               // makes the total, the tax, the card authorization and the booking
-              // all one number instead of four.
-              if (d.rate != null) setCart(c=>c.map(i=>i.id===stayLine.id?{...i,price:Number(d.rate)}:i))
+              // all one number instead of four. 10/3 (decisions #9, #21): what
+              // these nights cost on that site by the schedule's own pricing,
+              // the lodging tax inside it — the figure Charge and a link take.
+              setCart(c=>c.map(i=>i.id===stayLine.id ? { ...i, price: d.rate != null ? Number(d.rate) : i.price,
+                stayUnitId: d.unitId, stayCheckIn: d.checkIn, stayTotal: Number(d.lineTotal), stayTax: Number(d.lodgingTax) || 0 } : i))
             }}
           />
         </div>
@@ -2458,10 +2944,13 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
   const [guestName, setGuestName] = useState<string>(initial?.guestName || '')
   const [guestPhone, setGuestPhone] = useState<string>(initial?.guestPhone || '')
 
+  // 10/3 (review, front desk foolproof): what is free is read FRESH every time
+  // the picker opens (never a list from before the last sale or link took a
+  // site), and the site cannot be used while that read is still on its way.
   const { data, isFetching, error } = useQuery<any>(
     ['stay-availability', propertyId, checkIn, line.stayUnit, line.qty],
     () => apiGet(`/pos/stays/available?propertyId=${propertyId}&checkIn=${checkIn}&stayUnit=${line.stayUnit}&qty=${line.qty}`),
-    { enabled: !!propertyId && !!checkIn, retry: false, keepPreviousData: true },
+    { enabled: !!propertyId && !!checkIn, retry: false, keepPreviousData: true, staleTime: 0, refetchOnMount: 'always' },
   )
   const units: any[] = data?.units ?? []
   // A site chosen for one set of dates may not be free for another, so the
@@ -2475,7 +2964,8 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
     : `${line.qty} month${line.qty === 1 ? '' : 's'}`
 
   const picked = units.find((u: any) => u.id === unitId)
-  const ready = !!unitId && picked?.rate != null && !!checkIn && !!guestName.trim()
+  // 10/3 (decisions #9): a site is picked by what these nights cost on it (the schedule's price).
+  const ready = !!unitId && picked?.lineTotal != null && !!checkIn && !!guestName.trim() && !isFetching
 
   return (
     <>
@@ -2507,16 +2997,26 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
                         value={unitId} onChange={e=>setUnitId(e.target.value)}>
                   <option value="">Pick a site…</option>
                   {units.map((u:any)=>(
-                    <option key={u.id} value={u.id} disabled={u.rate == null}>
+                    <option key={u.id} value={u.id} disabled={u.lineTotal == null}>
                       {[u.unitNumber, rvSiteFactsLabel(u),
-                        u.rate == null ? 'no rate set' : fmt(u.lineTotal ?? u.rate)]
+                        u.lineTotal == null ? 'no rate set' : `${fmt(u.lineTotal)}${Number(u.lodgingTax) > 0 ? ' with lodging tax' : ''}`,
+                        u.heldByUnpaidHold ? `held, unpaid${u.heldFor ? ` — ${u.heldFor}` : ''}` : null]
                         .filter(Boolean).join(' · ')}
                     </option>
                   ))}
                 </select>
-                {units.some((u:any)=>u.rate == null) && (
+                {units.some((u:any)=>u.lineTotal == null) && (
                   <div style={{fontSize:'.72rem',color:'var(--amber)',marginBottom:12}}>
                     A site with no rate for this length cannot be sold until one is set on the site.
+                  </div>)}
+                {/* 10/3 (S652: an unpaid hold yields to anyone who pays) */}
+                {units.find((u:any)=>u.id===unitId)?.heldByUnpaidHold && (
+                  <div style={{fontSize:'.72rem',color:'var(--amber)',marginBottom:12}}>
+                    {(()=>{ const h:any = units.find((u:any)=>u.id===unitId); return h?.heldFor ? `${h.heldFor} is` : 'Someone is' })()} holding this
+                    site without paying. If that is the person in front of you, press Cancel and settle their link or ticket from the
+                    open list instead. Otherwise, charging for it here moves their hold to another free site and emails them the new
+                    site — or, if the park is full, cancels their hold and the owner gets a notice to call them. A pay link cannot take
+                    a held site.
                   </div>)}
               </>
             : <div style={{fontSize:'.78rem',color:'var(--amber)',marginBottom:12}}>
@@ -2531,12 +3031,14 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
 
       <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
         <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
-        <button className="btn btn-primary" disabled={!ready} onClick={()=>onDone({
+        <button className="btn btn-primary" disabled={!ready} title={isFetching ? 'Checking what is free…' : undefined} onClick={()=>onDone({
           unitId, checkIn, guestName: guestName.trim(), guestPhone: guestPhone.trim() || null,
           checkOut: data?.checkOut,
           siteLabel: units.find((u:any)=>u.id===unitId)?.unitNumber ?? 'Site',
           rate: units.find((u:any)=>u.id===unitId)?.rate ?? null,
-        })}>Use this site</button>
+          lineTotal: units.find((u:any)=>u.id===unitId)?.lineTotal ?? null,
+          lodgingTax: units.find((u:any)=>u.id===unitId)?.lodgingTax ?? 0,
+        })}>{isFetching && !!unitId ? 'Checking…' : 'Use this site'}</button>
       </div>
     </>
   )
@@ -2559,8 +3061,8 @@ function GetReaderCard({ propertyId, property }: { propertyId: string; property:
       name: form.name, company: form.company || null, line1: form.line1, line2: form.line2 || null,
       city: form.city, state: form.state.toUpperCase(), zip: form.zip, phone: form.phone || null, email: form.email || null,
     }, note: form.note || null }),
-    { onSuccess: () => { qc.invalidateQueries(['pos-reader-orders', propertyId]); setShowForm(false); toast('Request sent — we order it and ship it to you') },
-      onError: (e: any) => toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not send the request') })
+    { onSuccess: () => { qc.invalidateQueries(['pos-reader-orders', propertyId]); setShowForm(false); toastOnce('Request sent — we order it and ship it to you') },
+      onError: (e: any) => toastOnce(errorMessage(e, 'Could not send the request — check the connection and press Send again.'), { error: true }) })
   const cancel = useMutation((id: string) => apiPost(`/pos/reader-orders/${id}/cancel`, {}),
     { onSuccess: () => qc.invalidateQueries(['pos-reader-orders', propertyId]) })
   const pieces = SUPPORTED_CARD_READER.installments

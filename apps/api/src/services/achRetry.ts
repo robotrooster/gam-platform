@@ -32,12 +32,24 @@
  * row matched it: the bank was debited twice and GAM held money with no record.
  * A later payment_failed puts them back to 'failed'; payment_intent.succeeded
  * settles them.
+ *
+ * S655 (money plan Step 10): the claim takes the household lock first (§1.5),
+ * so a tenant paying the same bill at the same moment waits and the second
+ * finds the rows taken. Credit a pull set aside stays held while it retries
+ * (the webhook applies it on success). The three ways a due retry ends with
+ * nothing pulled — part of the pull paid another way, a FlexPay reprice that
+ * failed, a confirm Stripe says moved nothing — give that credit back, close
+ * the pull's receipt as failed, cancel its intent at Stripe (it can never be
+ * confirmed later), and leave the rows owed, so the tenant can pay now. A
+ * FlexPay pull that ends that way is GAM's failure, never the tenant's.
  */
 
 import type Stripe from 'stripe'
 import { ACH_RETURN_CONFIG, STRIPE_ACH_FAILURE_CODE_TO_RETURN_CODE } from '@gam/shared'
-import { query } from '../db'
+import type { PoolClient } from 'pg'
+import { query, getClient } from '../db'
 import { getStripe } from '../lib/stripe'
+import { lockHousehold } from './moneyPredicates'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
 
@@ -76,6 +88,34 @@ export function extractReturnCode(pi: Stripe.PaymentIntent): string | null {
     if (mapped) return mapped
   }
   return null
+}
+
+/**
+ * Stripe's error types that say GAM's OWN request was the problem (bad
+ * parameters, a mandate GAM sent wrong, GAM's keys, Stripe's own outage) —
+ * never the bank's answer to the debit.
+ */
+const REQUEST_SIDE_ERROR_TYPES: readonly string[] = [
+  'invalid_request_error', 'api_error', 'api_connection_error', 'authentication_error',
+  'idempotency_error', 'rate_limit_error',
+]
+
+/**
+ * Step 10 (decisions #37.D, FlexPay terms §4.3): did the tenant's BANK refuse
+ * or return this failed debit? A failed bank debit is the bank's answer —
+ * whether or not GAM can read its reason (Stripe names several bank refusals,
+ * such as a frozen or restricted account, that no R-code here maps) — unless
+ * Stripe's error type says GAM's own request was the problem
+ * (REQUEST_SIDE_ERROR_TYPES). A readable return code is always the bank's.
+ * False for a card, and for a canceled intent (GAM called it off; the caller
+ * reads the cancel). The one rule for "at the tenant's bank" on a failed pull.
+ */
+export function bankRefusedDebit(pi: Stripe.PaymentIntent): boolean {
+  if (pi.status === 'canceled') return false
+  if (extractReturnCode(pi)) return true
+  if (!isBankDebitFailure(pi)) return false
+  const type = String((pi.last_payment_error as any)?.type ?? '')
+  return !REQUEST_SIDE_ERROR_TYPES.includes(type)
 }
 
 /** Was this a US bank debit (not a card)? The failing method's type wins; the
@@ -244,35 +284,18 @@ export async function processAchRetries(): Promise<RetryResult> {
   for (const { stripe_payment_intent_id: piId } of due) {
     result.scanned++
 
-    // Optimistic claim: bump retry_count + clear next_retry_at + stamp
-    // last_retry_at on EVERY row of this pull BEFORE firing the Stripe call.
-    // Prevents two concurrent cron runs (rare but possible) from double-firing.
-    // S654: and mark them 'processing' — the money is being pulled, so nothing
-    // else may take it a second time (see the header).
-    const claimed = await query<{
-      id: string; entry_description: string | null; type: string; amount: string
-      retry_count: number; return_code: string | null
-    }>(
-      `UPDATE payments
-          SET retry_count = retry_count + 1,
-              last_retry_at = NOW(),
-              next_retry_at = NULL,
-              status = 'processing'
-        WHERE stripe_payment_intent_id = $1
-          AND status = 'failed'
-          AND retry_count < 2
-          AND next_retry_at <= NOW()
-        RETURNING id, entry_description, type, amount::text AS amount, retry_count, return_code`,
-      [piId]
-    )
-    if (claimed.length === 0) continue  // Lost the race; skip
-    claimed.sort((a, b) => a.id.localeCompare(b.id))
+    // Claim: bump retry_count + clear next_retry_at + stamp last_retry_at on
+    // EVERY row of this pull BEFORE firing the Stripe call, and mark them
+    // 'processing' — the money is being pulled, so nothing else may take it a
+    // second time (see the header). S655 (§1.5): under the household lock, so
+    // a tenant paying the same bill at this moment waits, and whichever goes
+    // second finds the rows taken (a payment first: the retry finds them no
+    // longer failed and is not fired).
+    const claim = await claimPull(piId)
+    if (!claim) continue  // Lost the race (or paid another way); skip
+    const { claimed, stray } = claim
     const claimedIds = claimed.map((r) => r.id)
     const anchorId = claimed[0].id
-    // Put the claimed rows back to owed — nothing is being pulled for them.
-    const releaseClaim = () => query(
-      `UPDATE payments SET status = 'failed' WHERE id = ANY($1::uuid[]) AND status = 'processing'`,
-      [claimedIds])
 
     // S654: the retry pulls the intent's WHOLE original amount. If any line it
     // covered has since been paid another way — cash recorded at the desk or
@@ -281,13 +304,9 @@ export async function processAchRetries(): Promise<RetryResult> {
     // was not claimed. Pulling anyway would take that line's money a second
     // time and leave it with no row to land on. So the bank is not retried:
     // the rest stays owed, the tenant is told with a Pay now button, and an
-    // admin is alerted.
-    const stray = await query<{ id: string; status: string }>(
-      `SELECT id, status FROM payments
-        WHERE stripe_payment_intent_id = $1 AND NOT (id = ANY($2::uuid[]))`,
-      [piId, claimedIds])
+    // admin is alerted. S655: the credit the pull set aside is given back and
+    // the intent is canceled, so it can never be confirmed later.
     if (stray.length > 0) {
-      await releaseClaim()
       result.skipped++
       const owed = Math.round(claimed.reduce((s, r) => s + Number(r.amount), 0) * 100) / 100
       logger.warn({ piId, stray: stray.map((r) => r.id) }, '[ach-retry] part of the pull was paid another way; not retried')
@@ -297,19 +316,23 @@ export async function processAchRetries(): Promise<RetryResult> {
         title:    `ACH retry not fired — part of the payment was paid another way (payment ${anchorId})`,
         body:     `Bank pull ${piId} was due a retry, but ${stray.length} of its lines were not part of it ` +
                   `(now ${stray.map((r) => r.status).join(', ')}). Re-pulling would take the full original ` +
-                  `amount, so it was not retried. The other ${claimed.length} line(s), $${owed.toFixed(2)}, ` +
+                  `amount, so it was not retried and the pull was canceled. The other ${claimed.length} line(s), $${owed.toFixed(2)}, ` +
                   `are owed again and the tenant has been asked to pay.`,
         context:  { payment_ids: claimedIds, other_payment_ids: stray.map((r) => r.id), stripe_payment_intent_id: piId },
       })
+      await cancelDeadPull(piId, 'part of the pull was paid another way')
+      await endFlexPayRetries(claimed, 'part of the pull was paid another way, so the retry was not sent')
       await notifyRetrySkipped(claimed, owed)
       continue
     }
     result.fired++
 
-    // FlexPay re-prices the cycle on retry (Consumer ToS § 4.1/4.2): the fee
-    // recalculates to the retry day and the bounced attempt's ACH-return fee
-    // passes through. This updates the PI amount BEFORE we confirm it. If the
-    // reprice fails, skip the confirm (don't pull a stale amount) and alert.
+    // FlexPay: the retry collects the amount the cover paid + the flat $25 +
+    // the returned-pull fee for every bounce so far (repriceFlexPayRetryPayment)
+    // — set on the intent BEFORE the confirm. If the reprice fails, the confirm
+    // is skipped (never pull a stale amount): nothing was pulled, so the lines
+    // are owed again, the pull's credit is given back, the intent is canceled,
+    // and FlexPay handles the collection as a failure on GAM's side.
     let repriceFailed = false
     for (const row of claimed.filter((r) => r.entry_description === 'FLEXPAY')) {
       try {
@@ -331,7 +354,12 @@ export async function processAchRetries(): Promise<RetryResult> {
     }
     if (repriceFailed) {
       result.failed++
-      await releaseClaim()  // S654: nothing was pulled — owed again
+      // S654: nothing was pulled — owed again (unless the failure webhook
+      // already decided this pull: then its decision stands).
+      if (await giveBackClaim(piId, claimedIds, 'payment_canceled')) {
+        await cancelDeadPull(piId, 'the FlexPay retry could not be re-priced')
+        await endFlexPayRetries(claimed, 'GAM could not re-price the retry')
+      }
       continue  // skip the confirm — don't re-pull the original (wrong) amount
     }
 
@@ -356,36 +384,201 @@ export async function processAchRetries(): Promise<RetryResult> {
       logger.error({ err: errMsg }, `[ach-retry] confirm failed for payment intent ${piId}`)
 
       // S654: did a pull start anyway (the reply was lost, not the request)?
-      // Only a pull Stripe says is under way keeps the rows 'processing'.
-      // Nothing sent, or Stripe says nothing is moving → owed again. If Stripe
-      // cannot be asked, the rows stay 'processing' — a stuck row is safer
-      // than a second pull of the same money — and the alert says so.
+      // Only a pull Stripe says is under way keeps the rows 'processing' (and
+      // its credit set aside). Nothing sent, or Stripe says nothing is moving →
+      // owed again, the credit given back and the dead intent canceled (S655).
+      // If Stripe cannot be asked, the rows stay 'processing' — a stuck row is
+      // safer than a second pull of the same money — and the alert says so.
       let liveStatus: string | null = null
       if (confirmSent) {
         try { liveStatus = (await stripe.paymentIntents.retrieve(piId)).status } catch { liveStatus = null }
       }
       const pulling = liveStatus === 'processing' || liveStatus === 'succeeded'
       const unknown = confirmSent && liveStatus === null
-      if (!pulling && !unknown) await releaseClaim()
+      // A failure webhook that already moved the rows (the confirm reached the
+      // bank and bounced) has decided this pull: nothing more here.
+      const gaveBack = !pulling && !unknown && await giveBackClaim(piId, claimedIds, 'payment_canceled')
+      if (gaveBack) {
+        await cancelDeadPull(piId, 'the retry could not be sent to the bank')
+        await endFlexPayRetries(claimed, 'GAM could not send the retry to the bank')
+      }
 
       // S132: surface to admin. Stripe API errors during retry are rare
       // and signal something operational (auth, rate-limit, bad PI id).
-      // The webhook will still land payment_intent.payment_failed if the
-      // confirm itself rejected at Stripe; this alert is for the case
-      // where the API call itself didn't reach Stripe successfully.
       await createAdminNotification({
         severity: 'warn',
         category: 'ach_retry_confirm_failure',
         title:    `ACH retry confirm failed for payment ${anchorId}`,
         body:     unknown
           ? `${errMsg} — Stripe could not be asked whether the pull started, so its lines are held as in progress. Check ${piId} in Stripe.`
-          : errMsg,
+          : pulling
+            ? `${errMsg} — but Stripe shows the pull under way (${liveStatus}), so its lines stay in progress and its own success or failure settles them.`
+            : gaveBack
+              ? `${errMsg} — nothing was pulled: the lines are owed again (the tenant can pay them now) and the pull was canceled.`
+              : `${errMsg} — the bank's answer for this pull had already arrived and was handled (a retry scheduled, or the lines owed again); nothing more was changed.`,
         context:  { payment_id: anchorId, payment_ids: claimedIds, stripe_payment_intent_id: piId, intent_status: liveStatus },
       })
     }
   }
 
   return result
+}
+
+type ClaimedRow = {
+  id: string; entry_description: string | null; type: string; amount: string
+  retry_count: number; return_code: string | null
+}
+
+/**
+ * The household a bank pull belongs to (its receipt's, else its rows'), for
+ * the lock every money writer takes first (moneyPredicates.lockHousehold).
+ */
+async function pullHousehold(client: PoolClient, piId: string): Promise<{ tenantId: string; landlordId: string } | null> {
+  const r = (await client.query<{ tenant_id: string; landlord_id: string }>(
+    `SELECT tenant_id, landlord_id FROM tenant_remittances
+      WHERE stripe_payment_intent_id = $1 ORDER BY created_at LIMIT 1`, [piId])).rows[0]
+    ?? (await client.query<{ tenant_id: string; landlord_id: string }>(
+      `SELECT p.tenant_id, COALESCE(l.landlord_id, p.landlord_id) AS landlord_id
+         FROM payments p LEFT JOIN leases l ON l.id = p.lease_id
+        WHERE p.stripe_payment_intent_id = $1 AND p.tenant_id IS NOT NULL
+        ORDER BY (p.type = 'rent') DESC, p.id LIMIT 1`, [piId])).rows[0]
+  return r ? { tenantId: r.tenant_id, landlordId: r.landlord_id } : null
+}
+
+/**
+ * Claim a due pull under the household lock. A pull partly paid another way
+ * (stray rows) is not fired: its claimed rows go straight back to owed and the
+ * credit it set aside is given back, in the same transaction. Null when there
+ * was nothing left to claim.
+ */
+async function claimPull(piId: string): Promise<{ claimed: ClaimedRow[]; stray: { id: string; status: string }[] } | null> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const who = await pullHousehold(client, piId)
+    if (who) await lockHousehold(client, who.tenantId, who.landlordId)
+    await client.query(
+      `SELECT id FROM payments WHERE stripe_payment_intent_id = $1 ORDER BY id FOR UPDATE`, [piId])
+    const claimed = (await client.query<ClaimedRow>(
+      `UPDATE payments
+          SET retry_count = retry_count + 1,
+              last_retry_at = NOW(),
+              next_retry_at = NULL,
+              status = 'processing'
+        WHERE stripe_payment_intent_id = $1
+          AND status = 'failed'
+          AND retry_count < 2
+          AND next_retry_at <= NOW()
+        RETURNING id, entry_description, type, amount::text AS amount, retry_count, return_code`,
+      [piId])).rows.sort((a, b) => a.id.localeCompare(b.id))
+    if (claimed.length === 0) { await client.query('COMMIT'); return null }
+    const stray = (await client.query<{ id: string; status: string }>(
+      `SELECT id, status FROM payments
+        WHERE stripe_payment_intent_id = $1 AND NOT (id = ANY($2::uuid[]))
+        ORDER BY id`,
+      [piId, claimed.map(r => r.id)])).rows
+    if (stray.length > 0) {
+      // Put the claimed rows back to owed — nothing is being pulled for them —
+      // and give back what the pull set aside.
+      await client.query(
+        `UPDATE payments SET status = 'failed' WHERE id = ANY($1::uuid[]) AND status = 'processing'`,
+        [claimed.map(r => r.id)])
+      await releasePullCredit(client, piId, 'superseded')
+    }
+    await client.query('COMMIT')
+    return { claimed, stray }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+/** Give back the credit a pull set aside and close its receipt as failed (the rows are owed again). */
+async function releasePullCredit(client: PoolClient, piId: string, reason: 'superseded' | 'payment_canceled'): Promise<void> {
+  const { releaseHeldForRemittance } = await import('./creditUse')
+  const rems = (await client.query<{ id: string }>(
+    `SELECT id FROM tenant_remittances WHERE stripe_payment_intent_id = $1 ORDER BY id FOR UPDATE`, [piId])).rows
+  for (const rem of rems) {
+    await releaseHeldForRemittance(client, rem.id, reason)
+    await client.query(
+      `UPDATE tenant_remittances SET status = 'failed', updated_at = NOW() WHERE id = $1 AND status = 'processing'`, [rem.id])
+  }
+}
+
+/**
+ * Nothing was pulled for a claimed retry (a reprice that failed, a confirm
+ * Stripe says moved nothing): the rows are owed again, with no retry pending,
+ * and the credit the pull set aside is given back — the tenant may pay now.
+ * Under the household lock.
+ *
+ * Only when THIS call moved the claimed rows: the failure webhook for the same
+ * intent may have got there first (the confirm reached the bank after all and
+ * bounced) and already decided — a retry scheduled with the credit kept set
+ * aside, or a final failure with it given back. Then nothing is touched here
+ * and false is returned: the caller leaves the intent and FlexPay to that
+ * decision (a canceled intent would break the retry the tenant was told of).
+ */
+async function giveBackClaim(piId: string, claimedIds: string[], reason: 'superseded' | 'payment_canceled'): Promise<boolean> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const who = await pullHousehold(client, piId)
+    if (who) await lockHousehold(client, who.tenantId, who.landlordId)
+    const moved = await client.query(
+      `UPDATE payments SET status = 'failed', next_retry_at = NULL
+        WHERE id = ANY($1::uuid[]) AND status = 'processing'`, [claimedIds])
+    const mine = (moved.rowCount ?? 0) > 0
+    if (mine) await releasePullCredit(client, piId, reason)
+    await client.query('COMMIT')
+    return mine
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+/**
+ * A pull that will not be fired: its intent is canceled at Stripe so it can
+ * never be confirmed later (the payment_intent.canceled webhook then changes
+ * nothing: its rows are no longer waiting on it). Never throws; a cancel
+ * Stripe refuses is told to an admin.
+ */
+async function cancelDeadPull(piId: string, why: string): Promise<void> {
+  try {
+    await getStripe().paymentIntents.cancel(piId)
+  } catch (e: any) {
+    logger.warn({ err: e?.message ?? String(e), piId }, '[ach-retry] a pull that will not be fired could not be canceled')
+    await createAdminNotification({
+      severity: 'warn',
+      category: 'ach_retry_cancel_failed',
+      title:    `A bank pull that will not be retried could not be canceled (${piId})`,
+      body:     `The retry of ${piId} was not fired (${why}); its lines are owed again and nothing will pull it. ` +
+                `Stripe refused the cancel (${e?.message ?? String(e)}): cancel it in Stripe so it does not sit open.`,
+      context:  { stripe_payment_intent_id: piId },
+    }).catch(() => {})
+  }
+}
+
+/**
+ * A FlexPay pull whose retry was not fired is GAM's failure, never the
+ * tenant's bank's (decisions #37.D): FlexPay handles it as a GAM-side
+ * collection problem (flexpay.handleFlexPayPaymentNsf with gamSide) — FlexPay
+ * stays on, no wait starts, and the collection is made again by the next pull
+ * run. Once per pull; never throws.
+ */
+async function endFlexPayRetries(claimed: ClaimedRow[], why: string): Promise<void> {
+  for (const row of claimed.filter((r) => r.entry_description === 'FLEXPAY')) {
+    try {
+      const { handleFlexPayPaymentNsf } = await import('./flexpay')
+      await handleFlexPayPaymentNsf(row.id, undefined, { gamSide: true, why })
+    } catch (e) {
+      logger.error({ err: e, payment_id: row.id }, '[ach-retry] FlexPay could not be told its retry was not fired')
+    }
+  }
 }
 
 /**

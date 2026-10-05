@@ -9,6 +9,7 @@
  *     preview (used by the accept-invite page)
  *
  * Slice 1 (S374): /me + landlord-banking + verify-ach + deposit-interest.
+ *   (S655: the mock POST /verify-ach was removed — banks verify through Stripe only.)
  * Slice 2 (S375): all Flex (FlexCharge/FlexPay/FlexDeposit/FlexSuite
  *   re-accept + DELETE flex*) + portability eligibility/authorize.
  * Slice 3 (S376): OTP-deprecated + credit-reporting + payments +

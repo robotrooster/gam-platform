@@ -771,3 +771,104 @@ describe('S637 — signing email deliverability', () => {
     expect(String(call.subject)).toMatch(/^Document fully signed/)
   })
 })
+
+// ═════════════════════════ S655 (money plan, Step 11): money and credit ═════════════════════════
+describe('S655 bill, reminder and receipt emails: money and credit kept apart', () => {
+  const args = () => (resendSendMock.mock.calls.at(-1) as any[])[0]
+
+  it('emailPaymentReceipt: the credit is its own line and the total is the money handed over', async () => {
+    await email.emailPaymentReceipt('kim@mailer-test.co', {
+      tenantName: 'Kim', unitLabel: 'Unit RV 22 — Oak Park', amount: 486, method: 'money order',
+      reference: '55187081609', paidAt: new Date('2026-09-09T17:00:00Z'),
+      lines: [{ label: 'Rent', detail: 'due Oct 1, 2026', amount: 900 }, { label: 'Water', amount: 10.45 }, { label: 'Trash', amount: 25 }],
+      creditApplied: 450, creditBanked: 0.55,
+    })
+    const call = args()
+    expect(call.subject).toBe('Receipt — $486.00 for Unit RV 22 — Oak Park')
+    expect(call.html).toContain('Account credit applied')
+    expect(call.html).toContain('-$450.00')
+    expect(call.html).toContain('+$0.55')
+    expect(call.html).toContain('Total paid')
+    expect(call.html).toContain('Paid by money order')
+    // The surplus note no longer promises it "comes off your next bill automatically".
+    expect(call.html).not.toMatch(/automatically/)
+    expect(call.html).toContain('only when it covers the whole bill')
+  })
+
+  it('emailPaymentReceipt: a bill paid entirely with credit says so and charges nothing', async () => {
+    await email.emailPaymentReceipt('todd@mailer-test.co', {
+      tenantName: 'Todd', unitLabel: 'Unit MH 14 — Oak Park', amount: 0, method: 'your account credit',
+      paidAt: new Date('2026-10-01T14:00:00Z'), lines: [{ label: 'Rent', amount: 460 }],
+      creditApplied: 460, billLabel: 'October bill',
+    })
+    const call = args()
+    expect(call.subject).toBe('Your October bill was paid with your account credit — Unit MH 14 — Oak Park')
+    expect(call.html).toContain('Paid With Your Account Credit')
+    expect(call.html).toContain('Nothing was charged to you')
+    expect(call.html).not.toContain('Paid by your account credit')
+    const log = await logRowFor('todd@mailer-test.co')
+    expect(log.metadata).toMatchObject({ amount: 0, credit_applied: 460, credit_only: true })
+  })
+
+  it('emailInvoiceReady: the full bill, the credit Pay Now will offer said beside it', async () => {
+    await email.emailInvoiceReady('t@mailer-test.co', {
+      tenantName: 'Pat', unitLabel: 'Acme Ranch — RV 12', invoiceNumber: 'INV-1', dueDateLabel: 'October 1, 2026',
+      total: 460, lines: [{ label: 'Rent', amount: 450 }, { label: 'Water', detail: 'meter 03470 → 03537 · 6,700 gal', amount: 10 }],
+      creditAvailable: 10,
+    })
+    const call = args()
+    expect(call.subject).toContain('$460.00 due')
+    expect(call.html).toContain('You have <strong style="color:#eef1f8">$10.00</strong> credit available — you can use it when you pay.')
+    expect(call.html).toContain('meter 03470 → 03537 · 6,700 gal')
+    expect(call.html).not.toContain('-$10.00')
+  })
+
+  it('emailInvoiceReady: a statement with nothing due never mentions credit to use', async () => {
+    await email.emailInvoiceReady('t2@mailer-test.co', {
+      tenantName: 'Pat', unitLabel: 'Acme Ranch — RV 12', invoiceNumber: 'INV-2', dueDateLabel: 'October 1, 2026',
+      total: 0, lines: [], creditAvailable: 25,
+    })
+    expect(args().html).not.toContain('credit available')
+  })
+
+  it('emailBalanceDue: the full balance with credit available beside it, each line by name', async () => {
+    await email.emailBalanceDue('b@mailer-test.co', {
+      tenantName: 'Pat', unitLabel: 'Acme Ranch — RV 12', total: 482.47, creditAvailable: 50,
+      lines: [{ label: 'Rent', amount: 460, dueDate: 'Oct 1, 2026' }, { label: 'Electric', detail: '107 kWh', amount: 22.47 }],
+    })
+    const call = args()
+    expect(call.subject).toBe('Balance due — $482.47 for Acme Ranch — RV 12')
+    expect(call.html).toContain('$50.00</strong> credit available — you can use it when you pay.')
+    expect(call.html).toContain('Electric')
+    expect(call.html).not.toContain('Credit on your account')
+  })
+})
+
+describe('S655 the FlexPay enrollment email carries the terms the code keeps', () => {
+  it('every FLEXPAY_TERMS section is in the email, word for word', async () => {
+    await email.emailFlexsuiteEnrollment({
+      to: 'fx@mailer-test.co', tenantName: 'Alice Jones', product: 'flexpay',
+      acceptedAt: new Date('2026-06-01T12:00:00Z'), templateVersion: '2.0.0',
+      acceptanceId: '00000000-0000-0000-0000-000000000abd', pdfBuffer: Buffer.from('%PDF-1.4 fake'),
+    })
+    const html: string = (resendSendMock.mock.calls.at(-1) as any[])[0].html
+    const { FLEXPAY_TERMS } = await import('@gam/shared')
+    const esc = (x: string) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+    expect(FLEXPAY_TERMS.length).toBeGreaterThan(0)
+    for (const t of FLEXPAY_TERMS) {
+      expect(html).toContain(esc(t.title))
+      expect(html).toContain(esc(t.body))
+    }
+    expect(html).toContain('How FlexPay works')
+  })
+
+  it('FlexDeposit gets no FlexPay terms', async () => {
+    await email.emailFlexsuiteEnrollment({
+      to: 'fd2@mailer-test.co', tenantName: 'Bob', product: 'flexdeposit',
+      acceptedAt: new Date('2026-06-01T12:00:00Z'), templateVersion: '1.0.0',
+      acceptanceId: '00000000-0000-0000-0000-000000000abe', pdfBuffer: Buffer.from('%PDF-1.4 fake'),
+    })
+    expect((resendSendMock.mock.calls.at(-1) as any[])[0].html).not.toContain('How FlexPay works')
+  })
+})

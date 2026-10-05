@@ -340,7 +340,7 @@ const LANDLORD_ENTRY: AgentProfile = {
     // somebody out early.
     'update_lease', 'set_rent_components', 'explain_fee_override', 'bill_one_off_charge_to_lease',
     'add_carried_balance', 'set_seasonal_tenancy', 'clear_seasonal_tenancy',
-    'start_deposit_return', 'add_deposit_deductions', 'finalize_deposit_return',
+    'start_deposit_return', 'add_deposit_deductions',
     'waive_early_termination_fee', 'request_background_check_for_lease',
     // S628: drawing up a lease, and the monthly utility cycle on a park.
     'draft_household_lease', 'draft_renewal_document', 'draft_terms_addendum',
@@ -351,7 +351,7 @@ const LANDLORD_ENTRY: AgentProfile = {
     'generate_utility_bills', 'finalize_utility_bill',
     // S628: the bank feed's deposit queue, amenities, finishing an inspection,
     // surveys, work trade, and entry notices.
-    'confirm_deposit_match', 'mark_deposit_not_rent', 'sync_bank_connection',
+    'mark_deposit_not_rent', 'sync_bank_connection',
     'set_books_start_date', 'disconnect_bank_connection', 'create_common_area',
     'update_common_area', 'hold_common_area', 'retire_common_area',
     'cancel_amenity_reservation', 'reschedule_inspection', 'finalize_inspection',
@@ -458,7 +458,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
     // somebody out early.
     'update_lease', 'set_rent_components', 'explain_fee_override', 'bill_one_off_charge_to_lease',
     'add_carried_balance', 'set_seasonal_tenancy', 'clear_seasonal_tenancy',
-    'start_deposit_return', 'add_deposit_deductions', 'finalize_deposit_return',
+    'start_deposit_return', 'add_deposit_deductions',
     'waive_early_termination_fee', 'request_background_check_for_lease',
     // S628: drawing up a lease, and the monthly utility cycle on a park.
     'draft_household_lease', 'draft_renewal_document', 'draft_terms_addendum',
@@ -469,7 +469,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'generate_utility_bills', 'finalize_utility_bill',
     // S628: the bank feed's deposit queue, amenities, finishing an inspection,
     // surveys, work trade, and entry notices.
-    'confirm_deposit_match', 'mark_deposit_not_rent', 'sync_bank_connection',
+    'mark_deposit_not_rent', 'sync_bank_connection',
     'set_books_start_date', 'disconnect_bank_connection', 'create_common_area',
     'update_common_area', 'hold_common_area', 'retire_common_area',
     'cancel_amenity_reservation', 'reschedule_inspection', 'finalize_inspection',

@@ -181,6 +181,323 @@ $$;
 
 
 --
+-- Name: credit_uses_apply(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.credit_uses_apply() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  -- current_setting(..., true) is NULL when the setting was never made in this
+  -- session, so the switch is read through COALESCE: NULL must mean "off".
+  switch_on      boolean := COALESCE(current_setting('gam.credit_backfill', true), '') = 'on';
+  backfill       boolean := switch_on AND NEW.source = 'backfill';
+  live_before    boolean := false;
+  applied_before boolean := false;
+  live_after     boolean;
+  delta          numeric(12,2) := 0;
+  pay            record;
+  cr             record;
+  lease_owner    uuid;
+  covered        numeric(12,2);
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    -- What a use IS never changes: its credit, its target, its amount, its
+    -- month, its source, who wrote it and when.
+    IF NEW.amount <> OLD.amount
+       OR NEW.deposit_return_id   IS DISTINCT FROM OLD.deposit_return_id
+       OR NEW.payment_reversal_id IS DISTINCT FROM OLD.payment_reversal_id
+       OR NEW.tenant_credit_id    IS DISTINCT FROM OLD.tenant_credit_id
+       OR NEW.prepaid_credit_id   IS DISTINCT FROM OLD.prepaid_credit_id
+       OR NEW.remittance_id       IS DISTINCT FROM OLD.remittance_id
+       OR NEW.source <> OLD.source
+       OR NEW.created_by IS DISTINCT FROM OLD.created_by
+       OR NEW.held_at <> OLD.held_at
+       OR NEW.lease_id <> OLD.lease_id OR NEW.billing_month <> OLD.billing_month THEN
+      RAISE EXCEPTION 'A credit use is a record: only its status moves' USING ERRCODE = '23514';
+    END IF;
+    -- The one other change: the FK's ON DELETE SET NULL on a released use (its
+    -- unpaid charge was deleted). Nothing else may move with it.
+    IF NEW.payment_id IS DISTINCT FROM OLD.payment_id THEN
+      IF OLD.status = 'released' AND NEW.status = 'released'
+         AND OLD.payment_id IS NOT NULL AND NEW.payment_id IS NULL
+         AND NEW.applied_at     IS NOT DISTINCT FROM OLD.applied_at
+         AND NEW.released_at    IS NOT DISTINCT FROM OLD.released_at
+         AND NEW.release_reason IS NOT DISTINCT FROM OLD.release_reason THEN
+        RETURN NEW;
+      END IF;
+      RAISE EXCEPTION 'A credit use is a record: only its status moves' USING ERRCODE = '23514';
+    END IF;
+    -- The stamps are history: when it was used, and when and why it was given
+    -- back or undone. Deposit interest counts as income on the day it is used,
+    -- so moving applied_at would rewrite a report. Writing the same status again
+    -- changes nothing, and may not touch a stamp either.
+    IF NEW.status = OLD.status THEN
+      IF NEW.applied_at        IS DISTINCT FROM OLD.applied_at
+         OR NEW.released_at    IS DISTINCT FROM OLD.released_at
+         OR NEW.release_reason IS DISTINCT FROM OLD.release_reason THEN
+        RAISE EXCEPTION 'A credit use is a record: only its status moves' USING ERRCODE = '23514';
+      END IF;
+      RETURN NEW;
+    END IF;
+    IF NOT (   (OLD.status = 'held'    AND NEW.status IN ('applied','released'))
+            OR (OLD.status = 'applied' AND NEW.status = 'reversed')
+            OR (OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'stay_shortened')) THEN
+      RAISE EXCEPTION 'A credit use cannot go from % to %', OLD.status, NEW.status USING ERRCODE = '23514';
+    END IF;
+    -- Spent credit given back because a shortened stay no longer has the nights
+    -- it paid (decisions #30 / #35.3): only credit the landlord issued, on rent.
+    -- Deposit interest and paid-ahead money are the guest's money: what a
+    -- shortened stay no longer owes of them is banked as money paid ahead.
+    IF OLD.status = 'applied' AND NEW.status = 'released'
+       AND (NEW.tenant_credit_id IS NULL OR NEW.payment_id IS NULL
+            OR (SELECT tc.category FROM tenant_credits tc WHERE tc.id = NEW.tenant_credit_id) = 'deposit_interest'
+            OR (SELECT p.type FROM payments p WHERE p.id = NEW.payment_id) IS DISTINCT FROM 'rent') THEN
+      RAISE EXCEPTION 'Only credit the landlord issued, spent on rent, comes back when a stay is shortened'
+        USING ERRCODE = '23514';
+    END IF;
+    -- Undoing a spend keeps the day it was spent.
+    IF OLD.status = 'applied' AND NEW.applied_at IS DISTINCT FROM OLD.applied_at THEN
+      RAISE EXCEPTION 'A credit use keeps the day it was used' USING ERRCODE = '23514';
+    END IF;
+    -- Lock order, the same as an insert: the charge first, then the credit.
+    -- The issued-credit total below is then summed after every other writer of
+    -- this charge has committed. (Summed by a statement that started before
+    -- waiting on the charge, it would keep its old view of the uses and drop
+    -- one committed meanwhile.)
+    IF NEW.payment_id IS NOT NULL THEN
+      PERFORM 1 FROM payments WHERE id = NEW.payment_id FOR UPDATE;
+    END IF;
+    live_before    := OLD.status IN ('held','applied');
+    applied_before := OLD.status = 'applied';
+  ELSE
+    IF NEW.status NOT IN ('held','applied') THEN
+      RAISE EXCEPTION 'A credit use starts held or applied' USING ERRCODE = '23514';
+    END IF;
+    -- The backfill source exists only for the one deploy backfill, which turns
+    -- the switch on for its own transaction. Anything else using it is a bug.
+    IF NEW.source = 'backfill' AND NOT switch_on THEN
+      RAISE EXCEPTION 'Source backfill is only for the deploy backfill (gam.credit_backfill)'
+        USING ERRCODE = '23514';
+    END IF;
+    IF NEW.payment_id IS NOT NULL THEN
+      -- Lock the charge so two writers cannot both pass the coverage check.
+      SELECT p.lease_id, p.tenant_id, p.type, p.status, p.revenue_owner, p.entry_description,
+             p.lease_fee_id, p.work_trade_suspended_at, p.reversal_id, p.unit_id, p.amount,
+             p.stripe_payment_intent_id
+        INTO pay FROM payments p WHERE p.id = NEW.payment_id FOR UPDATE;
+      -- Credit pays only a charge still owed: pending with no Stripe intent, or
+      -- failed. A pending charge that already carries an intent may have money
+      -- on its way (the same rule as payableRowSql), so it takes no use. A
+      -- charge whose money is in flight (processing) takes only the HELD use its
+      -- own Stripe charge writes as it puts the charge in flight: the use's
+      -- remittance must carry the charge's own intent (so a path that stamps the
+      -- charge first stamps its remittance with the intent before holding
+      -- credit). Any other use would let the credit and that money both pay the
+      -- row. This is the backstop for payableRowSql and creditEligibleRowSql
+      -- (services/moneyPredicates.ts), which the app checks first.
+      IF NOT backfill
+         AND NOT ((pay.status = 'pending' AND pay.stripe_payment_intent_id IS NULL)
+                  OR pay.status = 'failed'
+                  OR (pay.status = 'processing' AND NEW.status = 'held'
+                      AND EXISTS (SELECT 1 FROM tenant_remittances r
+                                   WHERE r.id = NEW.remittance_id
+                                     AND r.stripe_payment_intent_id = pay.stripe_payment_intent_id))) THEN
+        RAISE EXCEPTION 'Charge % is already paid or being paid; credit cannot pay it again', NEW.payment_id
+          USING ERRCODE = '23514';
+      END IF;
+      -- Eligibility (shelved cases 2, 3, 4; reopened rows; move-out rows).
+      -- Mirrored by creditEligibleRowSql in apps/api/src/services/moneyPredicates.ts
+      -- (and, for a reopened row, creditEligibleRowForCreditSql): a row a
+      -- dispute reopened (reversal_id) takes only the paid-ahead credit that
+      -- same dispute gave back — the credit whose spend on the disputed
+      -- original it undid ('reversed') — decisions #48.7.
+      IF pay.revenue_owner IS DISTINCT FROM 'landlord'
+         OR pay.type NOT IN ('rent','utility','late_fee','fee')
+         OR pay.entry_description IN ('FLEXPAY','HOMEPMT')
+         OR (pay.entry_description = 'DEPOSIT' AND pay.lease_fee_id IS NULL)
+         OR pay.work_trade_suspended_at IS NOT NULL
+         OR (pay.reversal_id IS NOT NULL AND NOT (
+               NEW.prepaid_credit_id IS NOT NULL AND EXISTS (
+                 SELECT 1 FROM payment_reversals dg_r
+                   JOIN credit_uses dg_u ON dg_u.payment_id = dg_r.payment_id
+                  WHERE dg_r.id = pay.reversal_id AND dg_u.status = 'reversed'
+                    AND dg_u.prepaid_credit_id = NEW.prepaid_credit_id)))
+         OR pay.unit_id IS NULL
+         OR pay.lease_id IS DISTINCT FROM NEW.lease_id THEN
+        RAISE EXCEPTION 'Credit cannot pay charge % (not an eligible landlord charge on lease %)',
+          NEW.payment_id, NEW.lease_id USING ERRCODE = '23514';
+      END IF;
+      -- One payment at a time. Credit a card or bank payment set aside on this
+      -- charge stays that payment's until it is given back; a failed charge
+      -- whose retry is still scheduled keeps it. Any other use, held or spent,
+      -- would let the retry's money and this credit both pay the row. Paying
+      -- over a scheduled retry releases that credit first
+      -- (creditUse.supersedeScheduledRetry), so a correct path is never refused.
+      IF EXISTS (SELECT 1 FROM credit_uses u
+                  WHERE u.payment_id = NEW.payment_id AND u.id <> NEW.id
+                    AND u.status = 'held'
+                    AND u.remittance_id IS DISTINCT FROM NEW.remittance_id) THEN
+        RAISE EXCEPTION 'Charge % still has credit set aside by another payment; release the scheduled retry''s credit first',
+          NEW.payment_id USING ERRCODE = '23514';
+      END IF;
+      SELECT COALESCE(SUM(u.amount), 0) INTO covered FROM credit_uses u
+       WHERE u.payment_id = NEW.payment_id AND u.status IN ('held','applied');
+      IF covered > pay.amount THEN
+        RAISE EXCEPTION 'Charge % would be paid twice by credit', NEW.payment_id USING ERRCODE = '23514';
+      END IF;
+      -- decisions #48.7: the dispute's own credit pays its reopened row only up
+      -- to what the dispute gave back of it (the undone spend), never more.
+      IF pay.reversal_id IS NOT NULL
+         AND (SELECT COALESCE(SUM(u.amount), 0) FROM credit_uses u
+               WHERE u.payment_id = NEW.payment_id AND u.prepaid_credit_id = NEW.prepaid_credit_id
+                 AND u.status IN ('held','applied'))
+           > (SELECT COALESCE(SUM(dg_u.amount), 0) FROM payment_reversals dg_r
+                JOIN credit_uses dg_u ON dg_u.payment_id = dg_r.payment_id
+               WHERE dg_r.id = pay.reversal_id AND dg_u.status = 'reversed'
+                 AND dg_u.prepaid_credit_id = NEW.prepaid_credit_id) THEN
+        RAISE EXCEPTION 'Charge % was reopened by a dispute: its credit pays it only up to what the dispute gave back',
+          NEW.payment_id USING ERRCODE = '23514';
+      END IF;
+    END IF;
+    IF NEW.deposit_return_id IS NOT NULL
+       AND (SELECT dr.lease_id FROM deposit_returns dr WHERE dr.id = NEW.deposit_return_id)
+           IS DISTINCT FROM NEW.lease_id THEN
+      RAISE EXCEPTION 'Paid-ahead money joins only its own lease''s move-out' USING ERRCODE = '23514';
+    END IF;
+    IF NEW.prepaid_credit_id IS NOT NULL THEN
+      SELECT c.lease_id, c.voided_at INTO cr FROM lease_prepaid_credits c
+       WHERE c.id = NEW.prepaid_credit_id FOR UPDATE;
+      IF cr.lease_id IS DISTINCT FROM NEW.lease_id THEN
+        RAISE EXCEPTION 'Paid-ahead money pays only its own lease' USING ERRCODE = '23514';
+      END IF;
+      IF cr.voided_at IS NOT NULL THEN
+        RAISE EXCEPTION 'A withdrawn credit cannot be used' USING ERRCODE = '23514';
+      END IF;
+    ELSE
+      IF NEW.payment_id IS NULL AND NEW.deposit_return_id IS NULL THEN
+        RAISE EXCEPTION 'An issued credit pays only a charge' USING ERRCODE = '23514';
+      END IF;
+      SELECT tc.lease_id, tc.landlord_id, tc.tenant_id, tc.status, tc.category INTO cr
+        FROM tenant_credits tc WHERE tc.id = NEW.tenant_credit_id FOR UPDATE;
+      IF cr.status IS DISTINCT FROM 'active' THEN
+        RAISE EXCEPTION 'A voided credit cannot be used' USING ERRCODE = '23514';
+      END IF;
+      -- Step 9 review (fix pass 2): the one credit a move-out takes besides
+      -- paid-ahead money is deposit interest on that lease (owed back with the
+      -- deposit). Landlord-issued credit never joins a move-out.
+      IF NEW.deposit_return_id IS NOT NULL
+         AND (cr.category IS DISTINCT FROM 'deposit_interest' OR cr.lease_id IS DISTINCT FROM NEW.lease_id) THEN
+        RAISE EXCEPTION 'Only deposit interest on this lease joins its move-out' USING ERRCODE = '23514';
+      END IF;
+      SELECT l.landlord_id INTO lease_owner FROM leases l WHERE l.id = NEW.lease_id;
+      -- Every comparison below is NULL-safe: a missing tenant or landlord on
+      -- either side refuses the use, it never lets it through.
+      IF cr.lease_id IS NOT NULL THEN
+        IF cr.lease_id IS DISTINCT FROM NEW.lease_id THEN
+          RAISE EXCEPTION 'This credit belongs to another lease' USING ERRCODE = '23514';
+        END IF;
+        IF cr.landlord_id IS DISTINCT FROM lease_owner THEN
+          RAISE EXCEPTION 'This credit was given by another landlord, not the landlord on this lease'
+            USING ERRCODE = '23514';
+        END IF;
+      ELSIF cr.landlord_id IS DISTINCT FROM lease_owner
+         OR NOT (COALESCE(pay.tenant_id = cr.tenant_id, false) OR EXISTS (
+                   SELECT 1 FROM lease_tenants lt
+                    WHERE lt.lease_id = NEW.lease_id AND lt.tenant_id = cr.tenant_id)) THEN
+        RAISE EXCEPTION 'A general credit pays only its own tenant''s bills with the landlord who gave it'
+          USING ERRCODE = '23514';
+      END IF;
+    END IF;
+  END IF;
+
+  live_after := NEW.status IN ('held','applied');
+  -- The deploy backfill records spends that already lowered amount_remaining.
+  IF NOT backfill THEN
+    IF live_after AND NOT live_before THEN delta := -NEW.amount;
+    ELSIF live_before AND NOT live_after THEN delta := NEW.amount;
+    END IF;
+    IF delta <> 0 THEN
+      PERFORM set_config('gam.credit_ledger', 'on', true);
+      IF NEW.tenant_credit_id IS NOT NULL THEN
+        UPDATE tenant_credits SET amount_remaining = amount_remaining + delta, updated_at = now()
+         WHERE id = NEW.tenant_credit_id;
+      ELSE
+        UPDATE lease_prepaid_credits SET amount_remaining = amount_remaining + delta, updated_at = now()
+         WHERE id = NEW.prepaid_credit_id;
+      END IF;
+      PERFORM set_config('gam.credit_ledger', 'off', true);
+    END IF;
+  END IF;
+
+  -- The sum of the row's applied landlord-issued uses, recounted only when this
+  -- use enters or leaves 'applied' (held and released uses never count). The
+  -- charge is locked above on both paths, so this statement's view of the uses
+  -- includes every one committed before it.
+  IF NEW.tenant_credit_id IS NOT NULL AND NEW.payment_id IS NOT NULL
+     AND (NEW.status = 'applied') IS DISTINCT FROM applied_before THEN
+    UPDATE payments SET issued_credit_amount = (
+      SELECT COALESCE(SUM(u.amount), 0)
+        FROM credit_uses u JOIN tenant_credits tc ON tc.id = u.tenant_credit_id
+       WHERE u.payment_id = NEW.payment_id AND u.status = 'applied'
+         AND tc.category <> 'deposit_interest')
+     WHERE id = NEW.payment_id;
+  END IF;
+  -- Credit given back because a shortened stay no longer has the nights it
+  -- paid takes its rent row's amount down with it, in this statement: the row
+  -- then asks only what its own money (and any credit still on it) paid, so
+  -- that money (amount − issued_credit_amount) never moves, no report or
+  -- payout counts the given-back credit as money, and the credit is counted
+  -- once, as the guest's saved credit. The caller only notes the change on
+  -- the row and its invoice (services/bookingLeaseBilling).
+  IF TG_OP = 'UPDATE' AND OLD.status = 'applied' AND NEW.status = 'released' THEN
+    UPDATE payments SET amount = amount - NEW.amount WHERE id = NEW.payment_id;
+  END IF;
+  RETURN NEW;
+END $$;
+
+
+--
+-- Name: credit_uses_kept_forever(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.credit_uses_kept_forever() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  RAISE EXCEPTION 'Credit uses are kept forever' USING ERRCODE = '23514';
+END $$;
+
+
+--
+-- Name: credit_uses_choice_target_fixed(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.credit_uses_choice_target_fixed() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  -- Fires only when paid_ahead_choice_id moves (the trigger's WHEN): a use's
+  -- target is part of what the use IS (the same rule as refund_part_id).
+  RAISE EXCEPTION 'A credit use is a record: only its status moves' USING ERRCODE = '23514';
+END $$;
+
+
+--
+-- Name: credit_uses_refund_target_fixed(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.credit_uses_refund_target_fixed() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  -- Fires only when refund_part_id moves (the trigger's WHEN): a use's target
+  -- is part of what the use IS, like the other targets credit_uses_apply guards.
+  RAISE EXCEPTION 'A credit use is a record: only its status moves' USING ERRCODE = '23514';
+END $$;
+
+
+--
 -- Name: email_log_block_delete(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -694,6 +1011,123 @@ $$;
 
 
 --
+-- Name: paid_ahead_carry_left(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.paid_ahead_carry_left(p_lease uuid) RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  n integer;
+BEGIN
+  -- Money paid ahead the landlord left as the tenant's credit when an earlier
+  -- lease ended follows that person to this lease of the same landlord, once
+  -- this lease is in force and they are ON it with their own signature
+  -- (membership 'active' — never a pending addendum). It becomes this lease's
+  -- money paid ahead (the mark is cleared); who holds it (funded_by) never
+  -- changes, and where it arrived (received_lease_id) is kept.
+  UPDATE lease_prepaid_credits c
+     SET received_lease_id = COALESCE(c.received_lease_id, c.lease_id),
+         lease_id = p_lease, left_by_choice_id = NULL, updated_at = now()
+    FROM leases nl, leases ol
+   WHERE nl.id = p_lease AND nl.status = 'active'
+     AND c.left_by_choice_id IS NOT NULL AND c.voided_at IS NULL
+     AND ol.id = c.lease_id AND ol.id <> nl.id AND ol.landlord_id = nl.landlord_id
+     AND EXISTS (SELECT 1 FROM lease_tenants lt
+                  WHERE lt.lease_id = nl.id AND lt.tenant_id = c.tenant_id
+                    AND lt.status = 'active');
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
+
+
+--
+-- Name: FUNCTION paid_ahead_carry_left(p_lease uuid); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.paid_ahead_carry_left(p_lease uuid) IS '10/4 (decisions #46.1a): move money paid ahead left as a tenant''s credit (lease_prepaid_credits.left_by_choice_id) onto this lease of the same landlord when it is in force and they are an active (signed) member of it. Keeps where it arrived (received_lease_id). Returns how many credits moved.';
+
+
+--
+-- Name: paid_ahead_carry_left_on_lease(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.paid_ahead_carry_left_on_lease() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  PERFORM paid_ahead_carry_left(NEW.id);
+  RETURN NULL;
+END $$;
+
+
+--
+-- Name: paid_ahead_carry_left_on_member(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.paid_ahead_carry_left_on_member() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  PERFORM paid_ahead_carry_left(NEW.lease_id);
+  RETURN NULL;
+END $$;
+
+
+--
+-- Name: payments_keep_rows_with_live_credit(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.payments_keep_rows_with_live_credit() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM credit_uses WHERE payment_id = OLD.id AND status <> 'released') THEN
+    RAISE EXCEPTION 'Charge % has account credit on it and cannot be deleted', OLD.id
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN OLD;
+END $$;
+
+
+--
+-- Name: payments_voided_is_a_record(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.payments_voided_is_a_record() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF OLD.status = 'voided' THEN
+    IF NEW.status <> 'voided' OR NEW.amount <> OLD.amount
+       OR NEW.voided_at IS DISTINCT FROM OLD.voided_at
+       OR NEW.void_reason IS DISTINCT FROM OLD.void_reason THEN
+      RAISE EXCEPTION 'Charge % was voided: it is a record and does not change', OLD.id
+        USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF NEW.status = 'voided' THEN
+    -- Only a charge still owed is taken off: a paid, clearing, returned or
+    -- paid-from-deposit charge has money behind it and is refunded instead.
+    IF OLD.status NOT IN ('pending', 'failed') THEN
+      RAISE EXCEPTION 'Charge % is %, not owed: only a charge still owed can be voided', OLD.id, OLD.status
+        USING ERRCODE = '23514';
+    END IF;
+    -- Credit spent on it is given back first, so no spent credit is left on a
+    -- charge nobody owes. (Credit a bank retry set aside on it is that pull's
+    -- and is given back when the pull ends: a pull carrying a voided charge is
+    -- never sent again — services/achRetry treats it as paid another way.)
+    IF EXISTS (SELECT 1 FROM credit_uses u WHERE u.payment_id = OLD.id AND u.status = 'applied') THEN
+      RAISE EXCEPTION 'Charge % has account credit spent on it; give the credit back before voiding it', OLD.id
+        USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+
+--
 -- Name: prepaid_fee_follows_payment(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -703,13 +1137,33 @@ CREATE FUNCTION public.prepaid_fee_follows_payment() RETURNS trigger
 DECLARE
   kind text;
 BEGIN
+  -- 10/4 (decisions #46.4): a box closed at $0 (never paid, the lease ended)
+  -- has no money behind it — nothing to bank.
   IF NEW.status = 'settled' AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM 'settled')
-     AND NEW.lease_fee_id IS NOT NULL AND NEW.lease_id IS NOT NULL THEN
+     AND NEW.lease_fee_id IS NOT NULL AND NEW.lease_id IS NOT NULL AND NEW.amount > 0 THEN
     SELECT money_kind INTO kind FROM lease_fees WHERE id = NEW.lease_fee_id;
     IF kind = 'prepaid' THEN
-      INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, source_payment_id, note)
-      VALUES (NEW.lease_id, NEW.tenant_id, NEW.amount, NEW.amount, NEW.id, 'Rent paid ahead on the lease (move-in)')
-      ON CONFLICT (source_payment_id) WHERE source_payment_id IS NOT NULL DO NOTHING;
+      INSERT INTO lease_prepaid_credits
+        (lease_id, tenant_id, amount_original, amount_remaining, source_payment_id, note,
+         funded_by, received_at)
+      VALUES (NEW.lease_id, NEW.tenant_id, NEW.amount, NEW.amount, NEW.id,
+              'Rent paid ahead on the lease (move-in)',
+              CASE WHEN NEW.manual_method IS NULL
+                         AND (NEW.platform_held
+                              OR NEW.stripe_charge_id IS NOT NULL
+                              OR NEW.stripe_payment_intent_id IS NOT NULL
+                              OR NEW.flexpay_advance_id IS NOT NULL)
+                   THEN 'gam' ELSE 'landlord' END,
+              COALESCE(NEW.settled_at, now()))
+      ON CONFLICT (source_payment_id) WHERE source_payment_id IS NOT NULL DO UPDATE
+         SET funded_by   = EXCLUDED.funded_by,
+             received_at = EXCLUDED.received_at,
+             voided_at   = NULL,
+             void_reason = NULL,
+             updated_at  = now()
+       WHERE lease_prepaid_credits.voided_at IS NOT NULL
+         AND lease_prepaid_credits.amount_remaining = lease_prepaid_credits.amount_original
+         AND lease_prepaid_credits.amount_original = EXCLUDED.amount_original;
     END IF;
   END IF;
   RETURN NEW;
@@ -891,6 +1345,21 @@ $$;
 
 
 --
+-- Name: stay_refund_parts_replacement_parent(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stay_refund_parts_replacement_parent() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  SELECT rp.paid_ahead_choice_id, rp.deposit_return_id, rp.deposit_payment_id
+    INTO NEW.paid_ahead_choice_id, NEW.deposit_return_id, NEW.deposit_payment_id
+    FROM stay_refund_parts rp WHERE rp.id = NEW.replaces_part_id;
+  RETURN NEW;
+END $$;
+
+
+--
 -- Name: supersede_utility_service_agreement(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -931,9 +1400,11 @@ CREATE FUNCTION public.sync_unit_delinquency() RETURNS trigger
 DECLARE
   target_unit uuid := COALESCE(NEW.unit_id, OLD.unit_id);
   owed        numeric;
-  credit      numeric;
 BEGIN
   IF target_unit IS NULL THEN RETURN COALESCE(NEW, OLD); END IF;
+  -- S655 (Nic): saved credit does not stop a late bill. A credit that covers the
+  -- whole bill is applied to it (creditUse.settleWholeBillIfCovered), which
+  -- settles the rows and lands back here with nothing owed.
   SELECT COALESCE(SUM(p.amount), 0) INTO owed
     FROM payments p
     JOIN units u ON u.id = p.unit_id
@@ -941,16 +1412,11 @@ BEGIN
     LEFT JOIN leases l ON l.id = p.lease_id
    WHERE p.unit_id = target_unit
      AND p.type = 'rent'
-     AND p.status IN ('pending', 'failed')
+     AND p.status IN ('pending','failed')
      AND p.work_trade_suspended_at IS NULL
      AND (NOW() AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date
            > p.due_date + COALESCE(l.late_fee_grace_days, pr.late_fee_grace_days, 5);
-  SELECT COALESCE(SUM(c.amount_remaining), 0) INTO credit
-    FROM tenant_credits c
-    JOIN lease_tenants lt ON lt.tenant_id = c.tenant_id AND lt.status = 'active'
-    JOIN leases l ON l.id = lt.lease_id AND l.unit_id = target_unit AND l.status = 'active'
-   WHERE c.status = 'active' AND c.amount_remaining > 0;
-  IF owed - credit > 0 THEN
+  IF owed > 0 THEN
     UPDATE units SET status = 'delinquent', updated_at = NOW()
      WHERE id = target_unit AND status = 'active';
   ELSE
@@ -1721,6 +2187,8 @@ CREATE TABLE public.bank_deposit_allocations (
     amount numeric(12,2) NOT NULL,
     effective_paid_date date NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    reversed_at timestamp with time zone,
+    reversed_by uuid,
     CONSTRAINT bank_deposit_allocations_amount_positive CHECK ((amount > (0)::numeric))
 );
 
@@ -1730,6 +2198,74 @@ CREATE TABLE public.bank_deposit_allocations (
 --
 
 COMMENT ON TABLE public.bank_deposit_allocations IS 'S624: every charge a bank deposit settled. Also the basis for the on-site cash control — collected-but-not-banked is what has no allocation row.';
+
+
+--
+-- Name: COLUMN bank_deposit_allocations.reversed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bank_deposit_allocations.reversed_at IS 'S655: the match was undone. The charge is free to be matched to a different deposit; this row stays as the record.';
+
+
+--
+-- Name: bank_deposit_slip_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bank_deposit_slip_items (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    slip_id uuid NOT NULL,
+    remittance_id uuid,
+    pos_transaction_id uuid,
+    amount numeric(12,2) NOT NULL,
+    voided_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bank_deposit_slip_items_amount_positive CHECK ((amount > (0)::numeric)),
+    CONSTRAINT bank_deposit_slip_items_one_source CHECK ((num_nonnulls(remittance_id, pos_transaction_id) = 1))
+);
+
+
+--
+-- Name: TABLE bank_deposit_slip_items; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.bank_deposit_slip_items IS 'S655: one receipt (tenant_remittances) or register sale (pos_transactions) in a deposit slip, at the full amount handed over. Live in one slip at a time; removing it from a slip stamps voided_at.';
+
+
+--
+-- Name: bank_deposit_slips; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bank_deposit_slips (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid,
+    deposit_date date NOT NULL,
+    total numeric(12,2) NOT NULL,
+    other_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    other_note text,
+    source text DEFAULT 'staff'::text NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    bank_transaction_id uuid,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    matched_at timestamp with time zone,
+    voided_at timestamp with time zone,
+    CONSTRAINT bank_deposit_slips_matched_has_txn CHECK (((status <> 'matched'::text) OR ((bank_transaction_id IS NOT NULL) AND (matched_at IS NOT NULL)))),
+    CONSTRAINT bank_deposit_slips_other_needs_note CHECK (((other_amount = (0)::numeric) OR (btrim(COALESCE(other_note, ''::text)) <> ''::text))),
+    CONSTRAINT bank_deposit_slips_other_nonneg CHECK ((other_amount >= (0)::numeric)),
+    CONSTRAINT bank_deposit_slips_source_check CHECK ((source = ANY (ARRAY['staff'::text, 'inferred'::text]))),
+    CONSTRAINT bank_deposit_slips_staff_has_author CHECK (((source <> 'staff'::text) OR (created_by IS NOT NULL))),
+    CONSTRAINT bank_deposit_slips_status_check CHECK ((status = ANY (ARRAY['open'::text, 'matched'::text, 'void'::text]))),
+    CONSTRAINT bank_deposit_slips_total_positive CHECK ((total > (0)::numeric)),
+    CONSTRAINT bank_deposit_slips_void_stamped CHECK (((status <> 'void'::text) OR (voided_at IS NOT NULL)))
+);
+
+
+--
+-- Name: TABLE bank_deposit_slips; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.bank_deposit_slips IS 'S655 (Nic): "Make a bank deposit". What staff put in the bag: recorded receipts plus anything GAM never recorded (other_amount, with a note; the form asks "Is any of this rent? Record it first."). A bank row equal to the total within 5 business days matches it; the extra is filed as other income.';
 
 
 --
@@ -1778,6 +2314,11 @@ CREATE TABLE public.bank_transactions (
     ignored_reason text,
     duplicate_of_id uuid,
     bank_status text,
+    auto_settled_at timestamp with time zone,
+    auto_settle_undo jsonb,
+    auto_filed_rule_id uuid,
+    auto_filed_at timestamp with time zone,
+    CONSTRAINT bank_transactions_auto_filed_pair CHECK (((auto_filed_rule_id IS NULL) = (auto_filed_at IS NULL))),
     CONSTRAINT bank_transactions_bank_status_check CHECK (((bank_status IS NULL) OR (bank_status = ANY (ARRAY['pending'::text, 'posted'::text, 'void'::text])))),
     CONSTRAINT bank_transactions_duplicate_points_at_original CHECK (((ignored_reason IS DISTINCT FROM 'duplicate'::text) OR (duplicate_of_id IS NOT NULL))),
     CONSTRAINT bank_transactions_ignored_reason_check CHECK (((ignored_reason IS NULL) OR (ignored_reason = ANY (ARRAY['landlord'::text, 'before_books'::text, 'duplicate'::text, 'bank_void'::text])))),
@@ -1811,6 +2352,27 @@ COMMENT ON COLUMN public.bank_transactions.duplicate_of_id IS 'S655: for ignored
 --
 
 COMMENT ON COLUMN public.bank_transactions.bank_status IS 'S655: the bank''s own state (Stripe FC): pending / posted / void. NULL on rows imported before S655.';
+
+
+--
+-- Name: COLUMN bank_transactions.auto_settled_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bank_transactions.auto_settled_at IS 'S655: GAM applied this deposit by itself (it equaled exactly one tenant''s whole open bill to the cent). Both sides were told, and the landlord can Undo.';
+
+
+--
+-- Name: COLUMN bank_transactions.auto_settle_undo; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bank_transactions.auto_settle_undo IS 'S655: what an automatic deposit settle changed, so Undo restores it exactly: rows (prior status, next_retry_at), late fees zeroed (prior amount, status), late-fee refund credit created, excess paid-ahead credit created, receipt id, declaration, credit-ledger event ids.';
+
+
+--
+-- Name: COLUMN bank_transactions.auto_filed_rule_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bank_transactions.auto_filed_rule_id IS 'S655: the payer rule that filed this deposit by itself. Set with auto_filed_at; Undo clears both.';
 
 
 --
@@ -3475,6 +4037,67 @@ CREATE TABLE public.credit_subjects (
 
 
 --
+-- Name: credit_uses; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credit_uses (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_credit_id uuid,
+    prepaid_credit_id uuid,
+    payment_id uuid,
+    deposit_return_id uuid,
+    payment_reversal_id uuid,
+    remittance_id uuid,
+    lease_id uuid NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    billing_month date NOT NULL,
+    source text NOT NULL,
+    status text DEFAULT 'held'::text NOT NULL,
+    release_reason text,
+    held_at timestamp with time zone DEFAULT now() NOT NULL,
+    applied_at timestamp with time zone,
+    released_at timestamp with time zone,
+    created_by uuid,
+    refund_part_id uuid,
+    paid_ahead_choice_id uuid,
+    CONSTRAINT credit_uses_amount_positive CHECK ((amount > (0)::numeric)),
+    CONSTRAINT credit_uses_choice_is_paid_ahead CHECK (((paid_ahead_choice_id IS NULL) OR ((prepaid_credit_id IS NOT NULL) AND (source = 'paid_ahead_choice'::text) AND (status = 'applied'::text)))),
+    CONSTRAINT credit_uses_clawback_is_paid_ahead CHECK (((payment_reversal_id IS NULL) OR ((prepaid_credit_id IS NOT NULL) AND (source = 'reversal'::text)))),
+    CONSTRAINT credit_uses_held_rides_a_charge CHECK (((status <> 'held'::text) OR ((remittance_id IS NOT NULL) AND (payment_id IS NOT NULL) AND (source = ANY (ARRAY['portal'::text, 'autopay'::text, 'front_desk_reader'::text]))))),
+    CONSTRAINT credit_uses_month_is_first CHECK ((billing_month = (date_trunc('month'::text, (billing_month)::timestamp with time zone))::date)),
+    CONSTRAINT credit_uses_move_out_is_paid_ahead CHECK (((deposit_return_id IS NULL) OR ((source = 'move_out'::text) AND ((prepaid_credit_id IS NOT NULL) OR (tenant_credit_id IS NOT NULL))))),
+    CONSTRAINT credit_uses_one_credit CHECK ((num_nonnulls(tenant_credit_id, prepaid_credit_id) = 1)),
+    CONSTRAINT credit_uses_one_target CHECK (((num_nonnulls(payment_id, deposit_return_id, payment_reversal_id, refund_part_id, paid_ahead_choice_id) = 1) OR ((status = 'released'::text) AND (num_nonnulls(payment_id, deposit_return_id, payment_reversal_id, refund_part_id, paid_ahead_choice_id) = 0)))),
+    CONSTRAINT credit_uses_refund_is_paid_ahead CHECK (((refund_part_id IS NULL) OR ((prepaid_credit_id IS NOT NULL) AND (source = 'refund'::text)))),
+    CONSTRAINT credit_uses_reversed_is_paid_ahead CHECK (((status <> 'reversed'::text) OR ((prepaid_credit_id IS NOT NULL) AND (payment_id IS NOT NULL)))),
+    CONSTRAINT credit_uses_source_check CHECK ((source = ANY (ARRAY['portal'::text, 'autopay'::text, 'front_desk_reader'::text, 'desk'::text, 'landlord_agent'::text, 'whole_bill'::text, 'move_out'::text, 'reversal'::text, 'backfill'::text, 'refund'::text, 'paid_ahead_choice'::text]))),
+    CONSTRAINT credit_uses_status_check CHECK ((status = ANY (ARRAY['held'::text, 'applied'::text, 'released'::text, 'reversed'::text]))),
+    CONSTRAINT credit_uses_status_stamps CHECK ((((status = 'held'::text) AND (applied_at IS NULL) AND (released_at IS NULL) AND (release_reason IS NULL)) OR ((status = 'applied'::text) AND (applied_at IS NOT NULL) AND (released_at IS NULL) AND (release_reason IS NULL)) OR ((status = 'released'::text) AND (applied_at IS NULL) AND (released_at IS NOT NULL) AND (release_reason = ANY (ARRAY['payment_failed'::text, 'payment_canceled'::text, 'superseded'::text]))) OR ((status = 'released'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'stay_shortened'::text)) OR ((status = 'reversed'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'funding_reversed'::text))))
+);
+
+
+--
+-- Name: TABLE credit_uses; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.credit_uses IS 'S655: THE record of every spend of a credit. held = set aside by a Stripe charge still clearing; applied = spent; released = given back: unspent (charge failed, canceled or superseded), or stay_shortened (landlord-issued credit spent on rent for nights a shortened stay no longer has: back to the guest as saved credit, and the rent row''s amount comes down by the same amount, so the row''s own money never moves); reversed = a paid-ahead spend undone because the Stripe money that FUNDED the credit was disputed or returned (the target row reopens for this amount). amount_remaining on both credit tables and payments.issued_credit_amount move only through trg_credit_uses_apply.';
+
+
+--
+-- Name: COLUMN credit_uses.billing_month; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.credit_uses.billing_month IS 'S655: first of the month the spend belongs to. The monthly paid-ahead draw cap counts held and applied paid-ahead uses by this month.';
+
+
+--
+-- Name: COLUMN credit_uses.source; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.credit_uses.source IS 'S655: which path spent it. backfill = the one deploy backfill (P2), accepted only while gam.credit_backfill is on.';
+
+
+--
 -- Name: cross_property_service_links; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3636,6 +4259,14 @@ CREATE TABLE public.deposit_returns (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     unpaid_balance_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    refund_from_gam numeric(10,2),
+    refund_from_landlord numeric(10,2),
+    closed_at_move_out_lines jsonb,
+    landlord_part_handed_back_on date,
+    landlord_part_handed_back_by uuid,
+    landlord_part_handed_back_at timestamp with time zone,
+    CONSTRAINT deposit_returns_handed_back_shape CHECK (((landlord_part_handed_back_on IS NULL) = (landlord_part_handed_back_at IS NULL))),
+    CONSTRAINT deposit_returns_refund_holders_check CHECK ((((refund_from_gam IS NULL) OR (refund_from_gam >= (0)::numeric)) AND ((refund_from_landlord IS NULL) OR (refund_from_landlord >= (0)::numeric)))),
     CONSTRAINT deposit_returns_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'awaiting_approval'::text, 'sent_refund'::text, 'sent_gap'::text, 'sent_zero'::text, 'sent_carried_forward'::text, 'disputed'::text])))
 );
 
@@ -3645,6 +4276,34 @@ CREATE TABLE public.deposit_returns (
 --
 
 COMMENT ON COLUMN public.deposit_returns.unpaid_balance_amount IS 'Sum of the auto-swept unpaid payments (rent / utility / late_fee / fee with status pending or failed) that the deposit covers. Snapshotted at draft create + recomputed on applyDeductions + refreshed at finalize.';
+
+
+--
+-- Name: COLUMN deposit_returns.closed_at_move_out_lines; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.deposit_returns.closed_at_move_out_lines IS '10/4 (decisions #46.4): the unpaid deposits and up-front last month''s rent this move-out closed as no longer owed — [{payment_id, kind: deposit|prepaid, label, amount}]. Written at finalize; NULL on returns finalized before it was recorded.';
+
+
+--
+-- Name: COLUMN deposit_returns.landlord_part_handed_back_on; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.deposit_returns.landlord_part_handed_back_on IS '10/4 (decisions #47a): the day the landlord handed back their own part of the refund (refund_from_landlord), as they marked it on the move-out page ("Mark handed back"). NULL: not marked yet.';
+
+
+--
+-- Name: COLUMN deposit_returns.refund_from_gam; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.deposit_returns.refund_from_gam IS '10/4 (decisions #46.3): the part of the refund GAM sends — only money GAM holds (deposits paid through GAM, the deposit interest it credits). Written at finalize; NULL on returns finalized before it was recorded.';
+
+
+--
+-- Name: COLUMN deposit_returns.refund_from_landlord; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.deposit_returns.refund_from_landlord IS '10/4 (decisions #46.3): the part of the refund the landlord hands back themselves — deposits paid to them in person or into their own bank. GAM never sends or nets this part. Written at finalize; NULL on returns finalized before it was recorded.';
 
 
 --
@@ -4466,10 +5125,36 @@ CREATE TABLE public.flexpay_advances (
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT flexpay_advances_amount_positive CHECK (((rent_amount > (0)::numeric) AND (tenant_fee_amount > (0)::numeric))),
+    invoice_id uuid,
+    pull_date date,
+    pull_attempts integer DEFAULT 0 NOT NULL,
+    pull_last_error text,
+    CONSTRAINT flexpay_advances_amounts_check CHECK (((rent_amount >= (0)::numeric) AND (tenant_fee_amount > (0)::numeric))),
+    CONSTRAINT flexpay_advances_pull_attempts_nonneg CHECK ((pull_attempts >= 0)),
     CONSTRAINT flexpay_advances_pull_day_check CHECK (((pull_day >= 1) AND (pull_day <= 28))),
     CONSTRAINT flexpay_advances_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'fronted'::text, 'pulled'::text, 'reconciled'::text, 'nsf'::text, 'defaulted'::text])))
 );
+
+
+--
+-- Name: COLUMN flexpay_advances.invoice_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.flexpay_advances.invoice_id IS 'S655: the cycle invoice whose open landlord lines the cover paid (the whole monthly bill).';
+
+
+--
+-- Name: COLUMN flexpay_advances.pull_date; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.flexpay_advances.pull_date IS 'S655: the day GAM takes the covered amount plus the $25 back from the tenant''s bank. Never the 1st-5th (FLEXPAY_FORBIDDEN_PULL_DAYS).';
+
+
+--
+-- Name: COLUMN flexpay_advances.pull_attempts; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.flexpay_advances.pull_attempts IS 'S655: runs that tried to create the pull intent. The pull row is written first; a row with no intent is "create pending". After 3 failed creates the advance is defaulted and an admin is alerted.';
 
 
 --
@@ -4611,7 +5296,7 @@ CREATE TABLE public.held_payout_items (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT held_payout_items_amount_check CHECK ((amount <> (0)::numeric)),
     CONSTRAINT held_payout_items_one_payee CHECK (((landlord_id IS NULL) <> (business_id IS NULL))),
-    CONSTRAINT held_payout_items_source_type_check CHECK ((source_type = ANY (ARRAY['pos_sale'::text, 'booking_deposit'::text, 'business_invoice_payment'::text, 'business_pos_sale'::text, 'refund'::text, 'dispute'::text, 'platform_fee'::text, 'prepaid_draw'::text])))
+    CONSTRAINT held_payout_items_source_type_check CHECK ((source_type = ANY (ARRAY['pos_sale'::text, 'booking_deposit'::text, 'business_invoice_payment'::text, 'business_pos_sale'::text, 'refund'::text, 'dispute'::text, 'platform_fee'::text, 'prepaid_draw'::text, 'deposit_settlement'::text])))
 );
 
 
@@ -5159,6 +5844,9 @@ CREATE TABLE public.landlord_merchant_rules (
     last_used_at timestamp with time zone DEFAULT now() NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_direction text,
+    auto_file_income boolean DEFAULT true NOT NULL,
+    CONSTRAINT landlord_merchant_rules_last_direction_check CHECK (((last_direction IS NULL) OR (last_direction = ANY (ARRAY['in'::text, 'out'::text])))),
     CONSTRAINT landlord_merchant_rules_scope_kind_check CHECK ((scope_kind = ANY (ARRAY['unit'::text, 'property_common'::text, 'property_allocate'::text])))
 );
 
@@ -5168,6 +5856,20 @@ CREATE TABLE public.landlord_merchant_rules (
 --
 
 COMMENT ON TABLE public.landlord_merchant_rules IS 'S570: per-landlord memory of how a merchant was last categorized (category + scope). Pre-fills the bank-feed suggestion; never auto-books — landlord confirms.';
+
+
+--
+-- Name: COLUMN landlord_merchant_rules.last_direction; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_merchant_rules.last_direction IS 'S655: whether the landlord last filed money IN or OUT from this payer. Auto-filing needs in.';
+
+
+--
+-- Name: COLUMN landlord_merchant_rules.auto_file_income; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_merchant_rules.auto_file_income IS 'S655 (Nic): after the landlord files money IN from this payer once (last_direction = in), later deposits from the same payer file themselves as the same income, labeled, with one-click undo. Never for money out, a rent-channel payer (RENT_CHANNEL_PAYERS), a payer ever matched to a tenant bill, or a deposit that equals any open bill. Undo can switch this off for the payer.';
 
 
 --
@@ -5747,13 +6449,62 @@ CREATE TABLE public.lease_prepaid_credits (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     source_payment_id uuid,
     note text,
+    funded_by text,
+    received_at timestamp with time zone,
+    voided_at timestamp with time zone,
+    void_reason text,
+    left_by_choice_id uuid,
+    received_lease_id uuid,
     CONSTRAINT lease_prepaid_credits_amount_original_check CHECK ((amount_original > (0)::numeric)),
-    CONSTRAINT lease_prepaid_credits_amount_remaining_check CHECK ((amount_remaining >= (0)::numeric))
+    CONSTRAINT lease_prepaid_credits_amount_remaining_check CHECK ((amount_remaining >= (0)::numeric)),
+    CONSTRAINT lease_prepaid_credits_funded_by_check CHECK (((funded_by IS NULL) OR (funded_by = ANY (ARRAY['landlord'::text, 'gam'::text, 'reclassified'::text])))),
+    CONSTRAINT lease_prepaid_credits_void_has_reason CHECK (((voided_at IS NULL) = (void_reason IS NULL)))
 );
 
 
 --
--- Name: lease_renewal_requests; Type: TABLE; Schema: public; Owner: -
+-- Name: COLUMN lease_prepaid_credits.funded_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_prepaid_credits.funded_by IS 'S655: who holds this money. landlord = the landlord took it (cash, check, money order, a bank deposit, a typed-in carry-forward); gam = it reached GAM through Stripe (or a platform-held prepaid fee) and is released to the landlord as it is used; reclassified = rent already paid and already counted, moved to credit when a stay was shortened (source_payment_id = the row it reclassifies). NULL only before the P2 backfill; NOT NULL in C1.';
+
+
+--
+-- Name: COLUMN lease_prepaid_credits.received_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_prepaid_credits.received_at IS 'S655: when the money actually arrived (Russ Fuller: 2026-08-12). Under "Money received" paid-ahead money counts on this day, in full, and $0 when it later pays a bill.';
+
+
+--
+-- Name: COLUMN lease_prepaid_credits.voided_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_prepaid_credits.voided_at IS 'S655: withdrawn (an undone bank-deposit settle''s excess). amount_remaining is left as it was; a voided credit can never be used and is out of every balance.';
+
+
+--
+-- Name: COLUMN lease_prepaid_credits.void_reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_prepaid_credits.void_reason IS 'S655: why the credit was withdrawn, in plain words. Set exactly when voided_at is.';
+
+
+--
+-- Name: COLUMN lease_prepaid_credits.left_by_choice_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_prepaid_credits.left_by_choice_id IS '10/4 (decisions #46.1a): the paid-ahead choice that left this money as the tenant''s ("Leave it as their credit") on an ended lease. It stays their money paid ahead (GAM-held money is released to the landlord only when it pays a bill) and moves to their next lease with this landlord (paid_ahead_carry_left), which clears the mark. NULL: an ordinary credit.';
+
+
+--
+-- Name: COLUMN lease_prepaid_credits.received_lease_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_prepaid_credits.received_lease_id IS '10/4 (decisions #46.1a): the lease this money paid ahead ARRIVED on, set once when paid_ahead_carry_left moves money left as the tenant''s credit to their next lease with the landlord. NULL: it never moved (lease_id is where it arrived). Readers of where money arrived (Money received''s paid-ahead line, the owner statement) read COALESCE(received_lease_id, lease_id), so a carry never rewrites a past month or another property''s report.';
+
+
+---- Name: lease_renewal_requests; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.lease_renewal_requests (
@@ -6534,7 +7285,48 @@ CREATE TABLE public.otp_advances (
 
 
 --
--- Name: parts_inventory; Type: TABLE; Schema: public; Owner: -
+-- Name: paid_ahead_choices; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.paid_ahead_choices (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    lease_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    left_amount numeric(12,2) NOT NULL,
+    refund_choice text NOT NULL,
+    refund_total numeric(12,2) DEFAULT 0 NOT NULL,
+    rest_choice text,
+    rest_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    released_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    tenant_credit_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    idempotency_key text NOT NULL,
+    decided_by uuid NOT NULL,
+    decided_at timestamp with time zone DEFAULT now() NOT NULL,
+    left_gam_held numeric(12,2) DEFAULT 0 NOT NULL,
+    CONSTRAINT paid_ahead_choices_left_shape CHECK (((left_gam_held >= (0)::numeric) AND (left_gam_held <= rest_amount) AND ((rest_choice = 'credit'::text) OR (left_gam_held = (0)::numeric)))),
+    CONSTRAINT paid_ahead_choices_money_check CHECK (((left_amount > (0)::numeric) AND (refund_total >= (0)::numeric) AND (rest_amount >= (0)::numeric) AND (released_amount >= (0)::numeric) AND ((refund_total + rest_amount) = left_amount) AND (released_amount <= rest_amount))),
+    CONSTRAINT paid_ahead_choices_no_refund_shape CHECK (((refund_choice <> 'no_refund'::text) OR (refund_total = (0)::numeric))),
+    CONSTRAINT paid_ahead_choices_refund_choice_check CHECK ((refund_choice = ANY (ARRAY['no_refund'::text, 'refund_all'::text, 'refund_other'::text]))),
+    CONSTRAINT paid_ahead_choices_rest_choice_check CHECK (((rest_choice IS NULL) OR (rest_choice = ANY (ARRAY['keep'::text, 'credit'::text])))),
+    CONSTRAINT paid_ahead_choices_rest_shape CHECK (((rest_amount > (0)::numeric) = (rest_choice IS NOT NULL)))
+);
+
+
+--
+-- Name: TABLE paid_ahead_choices; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.paid_ahead_choices IS '10/4 (decisions #46.1, #46.1a): the landlord''s choice for paid-ahead money left on an ended lease — No refund / Refund all of it / Refund a different amount, and for the rest Keep it (released to the landlord when GAM held it: released_amount, prepaid_draw held items) or Leave it as their credit (nothing spent: the credits stay the tenant''s money paid ahead, marked lease_prepaid_credits.left_by_choice_id, and follow them to their next lease with this landlord; left_gam_held = what GAM keeps holding). tenant_credit_ids is only on choices made before #46.1a. Written by services/paidAheadChoice.ts only.';
+
+
+--
+-- Name: COLUMN paid_ahead_choices.left_gam_held; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.paid_ahead_choices.left_gam_held IS '10/4 (decisions #46.1a): of rest_amount left as the tenant''s credit, what GAM holds (it stays GAM-held until it pays one of their bills). 0 for Keep it.';
+
+
+---- Name: parts_inventory; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.parts_inventory (
@@ -6644,15 +7436,43 @@ CREATE TABLE public.payments (
     revenue_owner text DEFAULT 'landlord'::text NOT NULL,
     work_trade_suspended_at timestamp with time zone,
     payment_channel text,
+    issued_credit_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    flexpay_advance_id uuid,
+    voided_at timestamp with time zone,
+    void_reason text,
+    released_by_deposit_return_id uuid,
     CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text, 'HOMEPMT'::text, 'FCPAYDOWN'::text, 'DECLINEFEE'::text, 'BALANCE'::text, 'OTHERFEE'::text]))),
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
+    CONSTRAINT payments_issued_credit_amount_nonneg CHECK ((issued_credit_amount >= (0)::numeric)),
     CONSTRAINT payments_manual_method_check CHECK (((manual_method IS NULL) OR (manual_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'prior_arrangement'::text])))),
     CONSTRAINT payments_payment_channel_check CHECK (((payment_channel IS NULL) OR (payment_channel = ANY (ARRAY['online'::text, 'in_person'::text])))),
     CONSTRAINT payments_retry_count_check CHECK (((retry_count >= 0) AND (retry_count <= 2))),
     CONSTRAINT payments_revenue_owner_check CHECK ((revenue_owner = ANY (ARRAY['landlord'::text, 'gam'::text, 'held'::text]))),
-    CONSTRAINT payments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text, 'returned'::text, 'paid_via_deposit'::text]))),
-    CONSTRAINT payments_type_check CHECK ((type = ANY (ARRAY['rent'::text, 'fee'::text, 'deposit'::text, 'utility'::text, 'float_fee'::text, 'late_fee'::text, 'platform_fee'::text, 'home_payment'::text, 'carried_balance'::text])))
+    CONSTRAINT payments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text, 'returned'::text, 'paid_via_deposit'::text, 'voided'::text]))),
+    CONSTRAINT payments_type_check CHECK ((type = ANY (ARRAY['rent'::text, 'fee'::text, 'deposit'::text, 'utility'::text, 'float_fee'::text, 'late_fee'::text, 'platform_fee'::text, 'home_payment'::text, 'carried_balance'::text]))),
+    CONSTRAINT payments_voided_is_stamped CHECK ((((status = 'voided'::text) = (voided_at IS NOT NULL)) AND ((voided_at IS NULL) = (void_reason IS NULL))))
 );
+
+
+--
+-- Name: COLUMN payments.voided_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.voided_at IS 'decisions #48.5: when a charge nobody owes, that a payment had already touched, was taken off (status voided). NOT NULL exactly when status = voided. The row is kept forever and left out of every balance.';
+
+
+--
+-- Name: COLUMN payments.void_reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.void_reason IS 'decisions #48.5: the plain reason a voided charge is no longer owed (e.g. the reservation it was for was canceled). Set with voided_at.';
+
+
+--
+-- Name: COLUMN payments.released_by_deposit_return_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.released_by_deposit_return_id IS '10/4 (decisions #46.3): the finalized move-out (deposit_returns.id) that released this GAM-collected deposit payment — it cleared platform_held because the money now rides a held payout item or the refund GAM owes. Set only on payments GAM collected, so leaseFeesSync.depositCollectedBySql reads such a payment as collected by GAM before and after the move-out. NULL: never released by a move-out.';
 
 
 --
@@ -6716,6 +7536,20 @@ COMMENT ON COLUMN public.payments.work_trade_suspended_at IS 'S634: set while a 
 --
 
 COMMENT ON COLUMN public.payments.payment_channel IS 'S654: online (portal / autopay / emailed link) or in_person (card on the counter reader); NULL for cash, check, money order.';
+
+
+--
+-- Name: COLUMN payments.issued_credit_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.issued_credit_amount IS 'S655: dollars of this charge paid by a credit the LANDLORD issued (move-in special, goodwill, refunded fee, overcharge). No money moved for this part: never landlord income, never part of a payout. Deposit-interest credits are GAM-funded and are NOT included; paid-ahead money is NOT included (it is the tenant''s own money and counts on the day it arrived). Maintained only by trg_credit_uses_apply as the sum of the row''s applied landlord-issued uses.';
+
+
+--
+-- Name: COLUMN payments.flexpay_advance_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.flexpay_advance_id IS 'S655: on a bill line FlexPay covered (GAM float paid it on time) and on the one FLEXPAY pull row that repays it. Covered lines are GAM-held money for allocation.';
 
 
 --
@@ -7114,7 +7948,7 @@ CREATE TABLE public.platform_revenue_ledger (
     notes text,
     created_at timestamp with time zone DEFAULT now(),
     customer_fee_charged numeric(12,2),
-    CONSTRAINT platform_revenue_ledger_type_check CHECK ((type = ANY (ARRAY['banking_spread'::text, 'manual_withdrawal_fee'::text, 'placement_fee_share'::text, 'platform_fee_subscription'::text, 'screening_margin'::text, 'adjustment'::text])))
+    CONSTRAINT platform_revenue_ledger_type_check CHECK ((type = ANY (ARRAY['banking_spread'::text, 'manual_withdrawal_fee'::text, 'placement_fee_share'::text, 'platform_fee_subscription'::text, 'screening_margin'::text, 'adjustment'::text, 'flexpay_subscription'::text])))
 );
 
 
@@ -7165,6 +7999,7 @@ CREATE TABLE public.platform_transfer_intents (
     transferred_at timestamp with time zone,
     business_id uuid,
     disbursement_id uuid,
+    gam_fees_kept_amount numeric(12,2) GENERATED ALWAYS AS (((gross_owed - netted_amount) - amount)) STORED,
     CONSTRAINT platform_transfer_intents_one_payee CHECK (((landlord_id IS NULL) <> (business_id IS NULL))),
     CONSTRAINT platform_transfer_intents_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'transferred'::text, 'failed'::text])))
 );
@@ -7175,6 +8010,13 @@ CREATE TABLE public.platform_transfer_intents (
 --
 
 COMMENT ON COLUMN public.platform_transfer_intents.disbursement_id IS 'S655: the payout (disbursements row) that carried this transfer from the landlord''s Stripe balance to their bank. NULL until paid out.';
+
+
+--
+-- Name: COLUMN platform_transfer_intents.gam_fees_kept_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.platform_transfer_intents.gam_fees_kept_amount IS '10/3: the GAM charges (landlord_gam_charges: platform fee, bank-debit cost) netted from this payout: gross owed less reversals netted less the amount sent. GAM fees carried as negative payout lines (held_payout_items) are inside gross_owed and listed as their own lines, not here. Mountain View 2026-09-21: $82.';
 
 
 --
@@ -7538,6 +8380,42 @@ CREATE TABLE public.pos_eod_settlements (
 
 
 --
+-- Name: pos_held_payments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_held_payments (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid,
+    pay_link_id uuid,
+    booking_id uuid,
+    stripe_payment_intent_id text NOT NULL,
+    reason text NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    payer_name text,
+    note text,
+    status text DEFAULT 'held'::text NOT NULL,
+    stripe_refund_id text,
+    refunded_at timestamp with time zone,
+    refunded_by uuid,
+    stripe_fee_kept numeric(10,2),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_held_payments_amount_check CHECK ((amount > (0)::numeric)),
+    CONSTRAINT pos_held_payments_fee_kept_check CHECK (((stripe_fee_kept IS NULL) OR ((stripe_fee_kept >= (0)::numeric) AND (stripe_fee_kept <= amount)))),
+    CONSTRAINT pos_held_payments_reason_check CHECK ((reason = ANY (ARRAY['paid_twice'::text, 'wrong_amount'::text, 'over_owed'::text, 'deposit_part'::text]))),
+    CONSTRAINT pos_held_payments_refund_shape CHECK (((status = 'refunded'::text) = (refunded_at IS NOT NULL))),
+    CONSTRAINT pos_held_payments_status_check CHECK ((status = ANY (ARRAY['held'::text, 'refunded'::text])))
+);
+
+
+--
+-- Name: TABLE pos_held_payments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.pos_held_payments IS '10/3 (decisions #13): a pay-link card payment that did not fit (paid twice, an old amount, more than its reservation owed) — held by GAM, not a sale, in no payouts, refunded only when the account owner presses Refund this payment.';
+
+
+--
 -- Name: pos_inventory_log; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -7813,8 +8691,21 @@ CREATE TABLE public.pos_refunds (
     items jsonb,
     refund_method text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT pos_refunds_method_check CHECK ((refund_method = ANY (ARRAY['cash'::text, 'check'::text, 'charge'::text])))
+    stripe_refund_id text,
+    card_fee_refunded numeric(10,2) DEFAULT 0 NOT NULL,
+    stay_refund_part_id uuid,
+    reversed_at timestamp with time zone,
+    CONSTRAINT pos_refunds_card_shape CHECK ((((refund_method = 'card'::text) = (stripe_refund_id IS NOT NULL)) AND (card_fee_refunded >= (0)::numeric) AND (card_fee_refunded <= amount))),
+    CONSTRAINT pos_refunds_method_check CHECK ((refund_method = ANY (ARRAY['cash'::text, 'check'::text, 'charge'::text, 'card'::text]))),
+    CONSTRAINT pos_refunds_reversed_shape CHECK (((reversed_at IS NULL) OR ((refund_method = 'card'::text) AND (reversed_at >= created_at))))
 );
+
+
+--
+-- Name: COLUMN pos_refunds.reversed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_refunds.reversed_at IS '10/4 fix round 2: this card refund came back at this instant. It stays on its own day and is added back on this one; it no longer counts toward what the sale has refunded.';
 
 
 --
@@ -9880,6 +10771,167 @@ COMMENT ON TABLE public.state_tax_registrations IS 'Per-state sales-tax registra
 
 
 --
+-- Name: stay_checkout_decisions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.stay_checkout_decisions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    booking_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    lease_id uuid,
+    left_on date NOT NULL,
+    question text NOT NULL,
+    choice text,
+    status text DEFAULT 'pending'::text NOT NULL,
+    booked_price numeric(10,2) NOT NULL,
+    stayed_worth numeric(10,2) NOT NULL,
+    paid numeric(10,2) NOT NULL,
+    price_after numeric(10,2),
+    refund_total numeric(10,2) DEFAULT 0 NOT NULL,
+    stamped_paid boolean DEFAULT false NOT NULL,
+    idempotency_key text,
+    created_by uuid,
+    decided_by uuid,
+    decided_at timestamp with time zone,
+    undone_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT stay_checkout_decisions_choice_check CHECK (((choice IS NULL) OR (choice = ANY (ARRAY['keep_price'::text, 'nights_only'::text, 'no_refund'::text, 'refund_unused'::text, 'refund_other'::text])))),
+    CONSTRAINT stay_checkout_decisions_decided_shape CHECK ((((status = 'pending'::text) AND (choice IS NULL) AND (decided_at IS NULL)) OR ((status = 'decided'::text) AND (choice IS NOT NULL) AND (decided_at IS NOT NULL)) OR ((status = 'undone'::text) AND (undone_at IS NOT NULL)))),
+    CONSTRAINT stay_checkout_decisions_money_check CHECK (((booked_price >= (0)::numeric) AND (stayed_worth >= (0)::numeric) AND (paid >= (0)::numeric) AND (refund_total >= (0)::numeric) AND (refund_total <= paid))),
+    CONSTRAINT stay_checkout_decisions_question_check CHECK ((question = ANY (ARRAY['owes'::text, 'overpaid'::text]))),
+    CONSTRAINT stay_checkout_decisions_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'decided'::text, 'undone'::text])))
+);
+
+
+--
+-- Name: TABLE stay_checkout_decisions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.stay_checkout_decisions IS '10/4 (decisions #37.B, #38): the money question an early check-out asked (still owes / paid more than the nights stayed are worth), what was chosen and by whom. One live (pending or decided) per stay.';
+
+
+--
+-- Name: stay_payments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.stay_payments (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    booking_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    kind text NOT NULL,
+    pos_transaction_id uuid,
+    stripe_payment_intent_id text,
+    method text NOT NULL,
+    toward_stay numeric(10,2) NOT NULL,
+    card_fee numeric(10,2) DEFAULT 0 NOT NULL,
+    landlord_card_fee numeric(10,2) DEFAULT 0 NOT NULL,
+    paid_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT stay_payments_card_has_intent CHECK (((method <> ALL (ARRAY['card'::text, 'card_on_file'::text])) OR (stripe_payment_intent_id IS NOT NULL))),
+    CONSTRAINT stay_payments_fees_check CHECK (((card_fee >= (0)::numeric) AND (landlord_card_fee >= (0)::numeric))),
+    CONSTRAINT stay_payments_kind_check CHECK ((kind = ANY (ARRAY['site_deposit'::text, 'pos_sale'::text]))),
+    CONSTRAINT stay_payments_method_check CHECK ((method = ANY (ARRAY['card'::text, 'card_on_file'::text, 'cash'::text, 'check'::text, 'charge'::text]))),
+    CONSTRAINT stay_payments_source_shape CHECK ((((kind = 'pos_sale'::text) AND (pos_transaction_id IS NOT NULL)) OR ((kind = 'site_deposit'::text) AND (pos_transaction_id IS NULL) AND (stripe_payment_intent_id IS NOT NULL) AND (method = 'card'::text)))),
+    CONSTRAINT stay_payments_toward_check CHECK ((toward_stay > (0)::numeric))
+);
+
+
+--
+-- Name: TABLE stay_payments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.stay_payments IS '10/4 (decisions #37.B, #38): one row per payment toward a stay — how it was paid, how much of it was for the stay, and the card fee on that share. An early check-out reads what the guest paid only from here and refunds each payment back the way it came, most recent first.';
+
+
+--
+-- Name: stay_refund_parts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.stay_refund_parts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    decision_id uuid,
+    booking_id uuid,
+    landlord_id uuid NOT NULL,
+    seq integer NOT NULL,
+    kind text NOT NULL,
+    stay_payment_id uuid,
+    remittance_id uuid,
+    prepaid_credit_id uuid,
+    pos_transaction_id uuid,
+    stripe_payment_intent_id text,
+    toward_amount numeric(10,2) NOT NULL,
+    card_fee_back numeric(10,2) DEFAULT 0 NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    payout_drop numeric(10,2) DEFAULT 0 NOT NULL,
+    lodging_tax_share numeric(10,2) DEFAULT 0 NOT NULL,
+    label text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    stripe_refund_id text,
+    pos_refund_id uuid,
+    failure text,
+    refunded_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    reversed_at timestamp with time zone,
+    replaces_part_id uuid,
+    paid_ahead_choice_id uuid,
+    deposit_return_id uuid,
+    deposit_payment_id uuid,
+    CONSTRAINT stay_refund_parts_one_parent CHECK ((num_nonnulls(decision_id, paid_ahead_choice_id, deposit_return_id) = 1)),
+    CONSTRAINT stay_refund_parts_stay_part_has_booking CHECK (((decision_id IS NULL) OR (booking_id IS NOT NULL))),
+    CONSTRAINT stay_refund_parts_amount_check CHECK (((toward_amount > (0)::numeric) AND (card_fee_back >= (0)::numeric) AND (amount = (toward_amount + card_fee_back)) AND (payout_drop >= (0)::numeric) AND (lodging_tax_share >= (0)::numeric))),
+    CONSTRAINT stay_refund_parts_done_shape CHECK (((status = ANY (ARRAY['refunded'::text, 'handed_back'::text, 'credited'::text])) = (refunded_at IS NOT NULL))),
+    CONSTRAINT stay_refund_parts_kind_check CHECK ((kind = ANY (ARRAY['card'::text, 'bank'::text, 'cash'::text, 'check'::text, 'money_order'::text, 'charge'::text, 'credit'::text]))),
+    CONSTRAINT stay_refund_parts_reversed_shape CHECK (((reversed_at IS NULL) OR ((status = 'refunded'::text) AND (kind = ANY (ARRAY['card'::text, 'bank'::text])) AND (reversed_at >= refunded_at)))),
+    CONSTRAINT stay_refund_parts_source_check CHECK (((num_nonnulls(stay_payment_id, remittance_id, prepaid_credit_id, deposit_payment_id) >= 1) OR (deposit_return_id IS NOT NULL))),
+    CONSTRAINT stay_refund_parts_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'refunded'::text, 'handed_back'::text, 'credited'::text, 'failed'::text, 'replaced'::text]))),
+    CONSTRAINT stay_refund_parts_stripe_shape CHECK (((kind <> ALL (ARRAY['card'::text, 'bank'::text])) OR (stripe_payment_intent_id IS NOT NULL)))
+);
+
+
+--
+-- Name: TABLE stay_refund_parts; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.stay_refund_parts IS '10/4 (decisions #37.B, #38): each payment an early check-out refund went back to — the way it was paid, most recent first — with what the guest got back (card fee included, #38 Q4) and what the landlord''s payout dropped by.';
+
+
+--
+-- Name: COLUMN stay_refund_parts.deposit_payment_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stay_refund_parts.deposit_payment_id IS '10/4 (decisions #47a): the deposit payment (payments.id, type deposit) a move-out refund part goes back to. NULL on a cash part with no Stripe payment behind it (deposit interest, a record raised without one).';
+
+
+--
+-- Name: COLUMN stay_refund_parts.deposit_return_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stay_refund_parts.deposit_return_id IS '10/4 (decisions #47a): a refund part of a finalized move-out — the part of the deposit refund GAM holds, sent back the way the deposit was paid (or given back in cash at the office when that payment cannot take it). booking_id is NULL.';
+
+
+--
+-- Name: COLUMN stay_refund_parts.paid_ahead_choice_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stay_refund_parts.paid_ahead_choice_id IS '10/4 (decisions #46.1): a refund part of the landlord''s choice for paid-ahead money left on an ended lease (paid_ahead_choices) instead of an early check-out decision. booking_id is the lease''s stay when it came from one, else NULL.';
+
+
+--
+-- Name: COLUMN stay_refund_parts.reversed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stay_refund_parts.reversed_at IS '10/4 fix round 2: Stripe sent this refund back at this instant. The part keeps its own refund day; income adds it back on this day; its replacement part (replaces_part_id) carries what is still owed to the guest.';
+
+
+--
+-- Name: COLUMN stay_refund_parts.replaces_part_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stay_refund_parts.replaces_part_id IS '10/4 fix round 2: the part this one takes the place of — a card refund Stripe sent back (reversed_at), or a failed card part given back in cash instead (status replaced).';
+
+
+--
 -- Name: stripe_processing_costs; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -9894,6 +10946,7 @@ CREATE TABLE public.stripe_processing_costs (
     period_start date,
     period_end date,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    stripe_payment_intent_id text,
     CONSTRAINT stripe_processing_costs_amount_check CHECK ((amount >= (0)::numeric))
 );
 
@@ -9903,6 +10956,13 @@ CREATE TABLE public.stripe_processing_costs (
 --
 
 COMMENT ON TABLE public.stripe_processing_costs IS 'What Stripe charged GAM, as Stripe states it. Unbundled pricing attributes no cost to individual charges, so these are daily aggregates; margin is exact by day/month, never per payment.';
+
+
+--
+-- Name: COLUMN stripe_processing_costs.stripe_payment_intent_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.stripe_processing_costs.stripe_payment_intent_id IS '10/3: the PaymentIntent of the charge this fee came from (bank-payment and per-charge card fees only; NULL for daily card aggregates and monthly charges). Ties a bank payment to what Stripe took on it.';
 
 
 --
@@ -10133,6 +11193,7 @@ CREATE TABLE public.tenant_autopay (
     disarmed_at timestamp with time zone,
     disarmed_reason text,
     last_success_cycle date,
+    use_credit boolean DEFAULT false NOT NULL,
     CONSTRAINT tenant_autopay_pull_day_check CHECK (((pull_day IS NULL) OR ((pull_day >= 1) AND (pull_day <= 28))))
 );
 
@@ -10170,6 +11231,13 @@ COMMENT ON COLUMN public.tenant_autopay.consecutive_failures IS 'S609: failed pu
 --
 
 COMMENT ON COLUMN public.tenant_autopay.disarmed_reason IS 'S609: why autopay stopped, in the tenant''s words on their screen. Set only when the system disarmed it; a tenant switching it off themselves just sets enabled=FALSE.';
+
+
+--
+-- Name: COLUMN tenant_autopay.use_credit; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_autopay.use_credit IS 'S655 (Nic): "use my account credit first". Off by default: autopay charges the whole bill and the credit waits for the tenant. Tenant-only, like the rest of this table.';
 
 
 --
@@ -10244,10 +11312,12 @@ CREATE TABLE public.tenant_declared_deposits (
     resolution_note text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    recorded_remittance_id uuid,
     CONSTRAINT tenant_declared_deposits_amount_positive CHECK ((amount > (0)::numeric)),
     CONSTRAINT tenant_declared_deposits_confirmed_has_txn CHECK (((status <> 'confirmed'::text) OR (bank_transaction_id IS NOT NULL))),
     CONSTRAINT tenant_declared_deposits_method_check CHECK ((method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text]))),
-    CONSTRAINT tenant_declared_deposits_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'confirmed'::text, 'unconfirmed'::text, 'withdrawn'::text])))
+    CONSTRAINT tenant_declared_deposits_recorded_has_receipt CHECK (((status = 'recorded'::text) = (recorded_remittance_id IS NOT NULL))),
+    CONSTRAINT tenant_declared_deposits_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'confirmed'::text, 'unconfirmed'::text, 'withdrawn'::text, 'recorded'::text])))
 );
 
 
@@ -10256,6 +11326,13 @@ CREATE TABLE public.tenant_declared_deposits (
 --
 
 COMMENT ON TABLE public.tenant_declared_deposits IS 'S624: a tenant''s claim that they deposited rent at the bank. Changes nothing until a bank transaction confirms it — see the migration header for why that is the anti-fraud design.';
+
+
+--
+-- Name: COLUMN tenant_declared_deposits.recorded_remittance_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_declared_deposits.recorded_remittance_id IS 'S655 (decisions #11): status recorded — the landlord''s own receipt (cash, check or money order, dated on or after the reported day, for at least the reported amount) that covered this report. One receipt covers one report.';
 
 
 --
@@ -10549,6 +11626,8 @@ CREATE TABLE public.tenants (
     flexpay_permanently_banned boolean DEFAULT false NOT NULL,
     bank_verify_nudge_at timestamp with time zone,
     bank_verify_nudge_count integer DEFAULT 0 NOT NULL,
+    bank_pending_since timestamp with time zone,
+    ach_suspended_at timestamp with time zone,
     CONSTRAINT tenants_background_check_status_check CHECK ((background_check_status = ANY (ARRAY['not_started'::text, 'submitted'::text, 'approved'::text, 'denied'::text, 'cancelled'::text, 'expired'::text, 'waived'::text]))),
     CONSTRAINT tenants_flexpay_pull_day_check CHECK (((flexpay_pull_day IS NULL) OR ((flexpay_pull_day >= 1) AND (flexpay_pull_day <= 28)))),
     CONSTRAINT tenants_income_arrival_day_check CHECK (((income_arrival_day >= 1) AND (income_arrival_day <= 28))),
@@ -10583,6 +11662,20 @@ COMMENT ON COLUMN public.tenants.flexpay_permanently_banned IS 'S578: TRUE after
 --
 
 COMMENT ON COLUMN public.tenants.bank_verify_nudge_count IS 'S641: reminders sent for the CURRENT unfinished bank setup. Reset when a new setup starts or the bank verifies.';
+
+
+--
+-- Name: COLUMN tenants.bank_pending_since; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenants.bank_pending_since IS 'S655: a bank is waiting on microdeposit verification. The verified bank(s) already on file stay usable meanwhile.';
+
+
+--
+-- Name: COLUMN tenants.ach_suspended_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenants.ach_suspended_at IS 'S655: NACHA zero-tolerance block, written by handle-return. Split out of ach_verified, which now only means "has a verified bank". chargeLeaseBalance refuses ACH while set.';
 
 
 --
@@ -10628,7 +11721,7 @@ CREATE TABLE public.unit_booking_events (
     detail jsonb DEFAULT '{}'::jsonb NOT NULL,
     actor_user_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT unit_booking_events_type_check CHECK ((event_type = ANY (ARRAY['created'::text, 'moved'::text, 'dates_changed'::text, 'status_changed'::text, 'cancelled'::text])))
+    CONSTRAINT unit_booking_events_type_check CHECK ((event_type = ANY (ARRAY['created'::text, 'moved'::text, 'dates_changed'::text, 'status_changed'::text, 'cancelled'::text, 'money_settled'::text])))
 );
 
 
@@ -10702,6 +11795,7 @@ CREATE TABLE public.unit_bookings (
     displaced_from_unit uuid,
     cancelled_at timestamp with time zone,
     avoided_unit_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    booked_check_out date,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -10742,6 +11836,13 @@ COMMENT ON COLUMN public.unit_bookings.cancelled_at IS 'S652: when the cancellat
 --
 
 COMMENT ON COLUMN public.unit_bookings.avoided_unit_ids IS 'S653: sites this guest asked not to be put on. Every placement path skips them.';
+
+
+--
+-- Name: COLUMN unit_bookings.booked_check_out; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.booked_check_out IS '10/3 (decisions #33): the check-out the stay was sold for. Set on create and on every deliberate date change; an early check-out moves check_out only. Price, tax, deposit and revenue split read the later of this and check_out (empty = check_out): services/registerStay soldCheckOutSql.';
 
 
 --
@@ -11708,6 +12809,54 @@ COMMENT ON COLUMN public.utility_service_agreements.moveout_expected_on IS 'S616
 
 
 --
+-- Name: v_credit_uses; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_credit_uses AS
+ SELECT cu.id,
+    cu.tenant_credit_id,
+    cu.prepaid_credit_id,
+    cu.payment_id,
+    cu.deposit_return_id,
+    cu.payment_reversal_id,
+    cu.remittance_id,
+    cu.lease_id,
+    cu.amount,
+    cu.billing_month,
+    cu.source,
+    cu.status,
+    cu.release_reason,
+    cu.held_at,
+    cu.applied_at,
+    cu.released_at,
+    cu.created_by,
+        CASE
+            WHEN (cu.prepaid_credit_id IS NOT NULL) THEN 'paid_ahead'::text
+            WHEN (tc.category = 'deposit_interest'::text) THEN 'deposit_interest'::text
+            ELSE 'issued'::text
+        END AS kind,
+    pc.funded_by,
+        CASE
+            WHEN (cu.prepaid_credit_id IS NULL) THEN (tc.category = 'deposit_interest'::text)
+            ELSE COALESCE((pc.funded_by = 'gam'::text), ((EXISTS ( SELECT 1
+               FROM public.tenant_remittances r
+              WHERE ((r.id = pc.source_remittance_id) AND (r.payment_method = ANY (ARRAY['ach'::text, 'card'::text])) AND (r.stripe_payment_intent_id IS NOT NULL)))) OR (EXISTS ( SELECT 1
+               FROM public.payments sp
+              WHERE ((sp.id = pc.source_payment_id) AND sp.platform_held)))))
+        END AS gam_held
+   FROM ((public.credit_uses cu
+     LEFT JOIN public.tenant_credits tc ON ((tc.id = cu.tenant_credit_id)))
+     LEFT JOIN public.lease_prepaid_credits pc ON ((pc.id = cu.prepaid_credit_id)));
+
+
+--
+-- Name: VIEW v_credit_uses; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.v_credit_uses IS 'S655: every credit use with its kind (issued | deposit_interest | paid_ahead), the paid-ahead credit''s funded_by, and gam_held (GAM holds the money behind it).';
+
+
+--
 -- Name: v_installment_payments; Type: VIEW; Schema: public; Owner: -
 --
 
@@ -11790,6 +12939,43 @@ CREATE VIEW public.v_lease_active_tenants AS
      JOIN public.tenants t ON ((t.id = lt.tenant_id)))
      JOIN public.users us ON ((us.id = t.user_id)))
   WHERE (lt.status = 'active'::text);
+
+
+--
+-- Name: v_payment_money; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_payment_money AS
+ SELECT p.id AS payment_id,
+    p.amount,
+    p.issued_credit_amount,
+    COALESCE(c.landlord_held_credit, (0)::numeric) AS landlord_held_credit,
+    COALESCE(c.gam_funded_credit, (0)::numeric) AS gam_funded_credit,
+    COALESCE(c.paid_ahead_credit, (0)::numeric) AS paid_ahead_credit,
+    COALESCE(c.deposit_interest_credit, (0)::numeric) AS deposit_interest_credit,
+    (((p.amount - p.issued_credit_amount) - COALESCE(c.landlord_held_credit, (0)::numeric)) - COALESCE(c.gam_funded_credit, (0)::numeric)) AS money_part,
+        CASE
+            WHEN ((p.revenue_owner = 'landlord'::text) AND (p.type <> 'deposit'::text) AND (p.amount >= (0)::numeric)) THEN (COALESCE(c.gam_funded_credit, (0)::numeric) +
+            CASE
+                WHEN ((p.status = 'settled'::text) AND (p.manual_method IS NULL) AND ((p.stripe_charge_id IS NOT NULL) OR (p.flexpay_advance_id IS NOT NULL))) THEN (((p.amount - p.issued_credit_amount) - COALESCE(c.landlord_held_credit, (0)::numeric)) - COALESCE(c.gam_funded_credit, (0)::numeric))
+                ELSE (0)::numeric
+            END)
+            ELSE (0)::numeric
+        END AS gam_held_part
+   FROM (public.payments p
+     LEFT JOIN LATERAL ( SELECT sum(v.amount) FILTER (WHERE ((v.kind = 'paid_ahead'::text) AND (NOT v.gam_held))) AS landlord_held_credit,
+            sum(v.amount) FILTER (WHERE v.gam_held) AS gam_funded_credit,
+            sum(v.amount) FILTER (WHERE (v.kind = 'paid_ahead'::text)) AS paid_ahead_credit,
+            sum(v.amount) FILTER (WHERE (v.kind = 'deposit_interest'::text)) AS deposit_interest_credit
+           FROM public.v_credit_uses v
+          WHERE ((v.payment_id = p.id) AND (v.status = ANY (ARRAY['applied'::text, 'reversed'::text])))) c ON (true));
+
+
+--
+-- Name: VIEW v_payment_money; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.v_payment_money IS 'S655: each charge split by who paid it. gam_held_part is the ONLY figure a payout may carry, and is 0 on every row whose money is not paid to the landlord when it settles: GAM fees, the FlexPay pull, a held prepaid move-in box (its money is paid out on the row its paid-ahead credit pays), a deposit held in trust (type deposit; only the move-out settlement releases it) and a move-out refund row. A card-paid move-out shortfall keeps its figure. A 0 here never clears platform_held on a deposit (it stays TRUE while in trust). money_part is the row''s own money; paid_ahead_credit counted under "Money received" on the day it arrived, not again here.';
 
 
 --
@@ -12146,6 +13332,22 @@ ALTER TABLE ONLY public.bank_connections
 
 ALTER TABLE ONLY public.bank_deposit_allocations
     ADD CONSTRAINT bank_deposit_allocations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bank_deposit_slip_items bank_deposit_slip_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_slip_items
+    ADD CONSTRAINT bank_deposit_slip_items_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bank_deposit_slips bank_deposit_slips_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_slips
+    ADD CONSTRAINT bank_deposit_slips_pkey PRIMARY KEY (id);
 
 
 --
@@ -12762,6 +13964,14 @@ ALTER TABLE ONLY public.credit_subjects
 
 ALTER TABLE ONLY public.credit_subjects
     ADD CONSTRAINT credit_subjects_subject_type_subject_ref_id_key UNIQUE (subject_type, subject_ref_id);
+
+
+--
+-- Name: credit_uses credit_uses_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_pkey PRIMARY KEY (id);
 
 
 --
@@ -13805,6 +15015,14 @@ ALTER TABLE ONLY public.otp_advances
 
 
 --
+-- Name: paid_ahead_choices paid_ahead_choices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paid_ahead_choices
+    ADD CONSTRAINT paid_ahead_choices_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: parts_inventory parts_inventory_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -14170,6 +15388,14 @@ ALTER TABLE ONLY public.pos_eod_settlements
 
 ALTER TABLE ONLY public.pos_eod_settlements
     ADD CONSTRAINT pos_eod_settlements_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_held_payments pos_held_payments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_held_payments
+    ADD CONSTRAINT pos_held_payments_pkey PRIMARY KEY (id);
 
 
 --
@@ -14917,6 +16143,30 @@ ALTER TABLE ONLY public.state_tax_registrations
 
 
 --
+-- Name: stay_checkout_decisions stay_checkout_decisions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_checkout_decisions
+    ADD CONSTRAINT stay_checkout_decisions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: stay_payments stay_payments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_payments
+    ADD CONSTRAINT stay_payments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: stripe_processing_costs stripe_processing_costs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15644,6 +16894,20 @@ CREATE INDEX common_areas_property_idx ON public.common_areas USING btree (prope
 
 
 --
+-- Name: credit_uses_paid_ahead_choice_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX credit_uses_paid_ahead_choice_idx ON public.credit_uses USING btree (paid_ahead_choice_id) WHERE (paid_ahead_choice_id IS NOT NULL);
+
+
+--
+-- Name: credit_uses_refund_part_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX credit_uses_refund_part_idx ON public.credit_uses USING btree (refund_part_id) WHERE (refund_part_id IS NOT NULL);
+
+
+--
 -- Name: disclosure_library_fields_doc; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -15893,6 +17157,13 @@ CREATE INDEX idx_bank_deposit_allocations_landlord ON public.bank_deposit_alloca
 --
 
 CREATE INDEX idx_bank_deposit_allocations_txn ON public.bank_deposit_allocations USING btree (bank_transaction_id);
+
+
+--
+-- Name: idx_bank_deposit_slips_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bank_deposit_slips_open ON public.bank_deposit_slips USING btree (landlord_id, deposit_date) WHERE (status = 'open'::text);
 
 
 --
@@ -16663,6 +17934,55 @@ CREATE INDEX idx_credit_scores_subject ON public.credit_scores USING btree (subj
 --
 
 CREATE INDEX idx_credit_subjects_ref ON public.credit_subjects USING btree (subject_type, subject_ref_id);
+
+
+--
+-- Name: idx_credit_uses_deposit_return; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_uses_deposit_return ON public.credit_uses USING btree (deposit_return_id) WHERE (deposit_return_id IS NOT NULL);
+
+
+--
+-- Name: idx_credit_uses_paid_ahead_month; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_uses_paid_ahead_month ON public.credit_uses USING btree (lease_id, billing_month) WHERE ((prepaid_credit_id IS NOT NULL) AND (status = ANY (ARRAY['held'::text, 'applied'::text])));
+
+
+--
+-- Name: idx_credit_uses_payment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_uses_payment ON public.credit_uses USING btree (payment_id) WHERE (payment_id IS NOT NULL);
+
+
+--
+-- Name: idx_credit_uses_prepaid_credit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_uses_prepaid_credit ON public.credit_uses USING btree (prepaid_credit_id) WHERE (prepaid_credit_id IS NOT NULL);
+
+
+--
+-- Name: idx_credit_uses_remittance; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_uses_remittance ON public.credit_uses USING btree (remittance_id) WHERE (remittance_id IS NOT NULL);
+
+
+--
+-- Name: idx_credit_uses_remittance_held; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_uses_remittance_held ON public.credit_uses USING btree (remittance_id) WHERE (status = 'held'::text);
+
+
+--
+-- Name: idx_credit_uses_tenant_credit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_uses_tenant_credit ON public.credit_uses USING btree (tenant_credit_id) WHERE (tenant_credit_id IS NOT NULL);
 
 
 --
@@ -17520,7 +18840,13 @@ CREATE INDEX idx_lease_prepaid_credits_lease ON public.lease_prepaid_credits USI
 
 
 --
--- Name: idx_lease_renewal_requests_landlord; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_lease_prepaid_credits_left; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_prepaid_credits_left ON public.lease_prepaid_credits USING btree (tenant_id) WHERE (left_by_choice_id IS NOT NULL);
+
+
+---- Name: idx_lease_renewal_requests_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_lease_renewal_requests_landlord ON public.lease_renewal_requests USING btree (landlord_id);
@@ -17842,6 +19168,13 @@ CREATE INDEX idx_owner_use_absorption_landlord_cycle ON public.utility_owner_use
 
 
 --
+-- Name: idx_paid_ahead_choices_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_paid_ahead_choices_lease ON public.paid_ahead_choices USING btree (lease_id, decided_at DESC);
+
+
+--
 -- Name: idx_parts_inventory_landlord_name; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17898,6 +19231,13 @@ CREATE INDEX idx_payments_due_date ON public.payments USING btree (due_date);
 
 
 --
+-- Name: idx_payments_flexpay_advance; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_flexpay_advance ON public.payments USING btree (flexpay_advance_id) WHERE (flexpay_advance_id IS NOT NULL);
+
+
+--
 -- Name: idx_payments_import_source; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17951,6 +19291,13 @@ CREATE INDEX idx_payments_reversal_id ON public.payments USING btree (reversal_i
 --
 
 CREATE INDEX idx_payments_status ON public.payments USING btree (status);
+
+
+--
+-- Name: idx_payments_stripe_payment_intent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_stripe_payment_intent ON public.payments USING btree (stripe_payment_intent_id) WHERE (stripe_payment_intent_id IS NOT NULL);
 
 
 --
@@ -18808,6 +20155,13 @@ CREATE INDEX idx_shifts_landlord_open ON public.shifts USING btree (landlord_id,
 
 
 --
+-- Name: idx_slip_items_slip; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_slip_items_slip ON public.bank_deposit_slip_items USING btree (slip_id);
+
+
+--
 -- Name: idx_slp_lookup; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -18861,6 +20215,13 @@ CREATE INDEX idx_state_tax_forms_state_year ON public.state_tax_forms USING btre
 --
 
 CREATE INDEX idx_stripe_costs_category ON public.stripe_processing_costs USING btree (category, posted_at DESC);
+
+
+--
+-- Name: idx_stripe_costs_payment_intent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stripe_costs_payment_intent ON public.stripe_processing_costs USING btree (stripe_payment_intent_id) WHERE (stripe_payment_intent_id IS NOT NULL);
 
 
 --
@@ -20145,6 +21506,20 @@ CREATE UNIQUE INDEX pos_discounts_code_uniq ON public.pos_discounts USING btree 
 
 
 --
+-- Name: pos_held_payments_held_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_held_payments_held_idx ON public.pos_held_payments USING btree (landlord_id, created_at) WHERE (status = 'held'::text);
+
+
+--
+-- Name: pos_held_payments_intent_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pos_held_payments_intent_uniq ON public.pos_held_payments USING btree (stripe_payment_intent_id);
+
+
+--
 -- Name: pos_open_tickets_booking_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -20163,6 +21538,20 @@ CREATE INDEX pos_open_tickets_open_idx ON public.pos_open_tickets USING btree (p
 --
 
 CREATE INDEX pos_reader_orders_landlord_idx ON public.pos_reader_orders USING btree (landlord_id, status);
+
+
+--
+-- Name: pos_refunds_stay_part_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pos_refunds_stay_part_uniq ON public.pos_refunds USING btree (stay_refund_part_id) WHERE (stay_refund_part_id IS NOT NULL);
+
+
+--
+-- Name: pos_refunds_stripe_refund_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pos_refunds_stripe_refund_uniq ON public.pos_refunds USING btree (stripe_refund_id) WHERE (stripe_refund_id IS NOT NULL);
 
 
 --
@@ -20299,6 +21688,111 @@ CREATE UNIQUE INDEX sptp_unique ON public.state_property_tax_provisions USING bt
 
 
 --
+-- Name: stay_checkout_decisions_idem_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX stay_checkout_decisions_idem_uniq ON public.stay_checkout_decisions USING btree (idempotency_key) WHERE (idempotency_key IS NOT NULL);
+
+
+--
+-- Name: stay_checkout_decisions_live_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX stay_checkout_decisions_live_uniq ON public.stay_checkout_decisions USING btree (booking_id) WHERE (status = ANY (ARRAY['pending'::text, 'decided'::text]));
+
+
+--
+-- Name: stay_checkout_decisions_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX stay_checkout_decisions_pending_idx ON public.stay_checkout_decisions USING btree (landlord_id, created_at) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: stay_payments_booking_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX stay_payments_booking_idx ON public.stay_payments USING btree (booking_id, paid_at);
+
+
+--
+-- Name: stay_payments_sale_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX stay_payments_sale_uniq ON public.stay_payments USING btree (booking_id, pos_transaction_id) WHERE (pos_transaction_id IS NOT NULL);
+
+
+--
+-- Name: stay_payments_site_deposit_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX stay_payments_site_deposit_uniq ON public.stay_payments USING btree (booking_id) WHERE (kind = 'site_deposit'::text);
+
+
+--
+-- Name: idx_stay_refund_parts_deposit_payment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stay_refund_parts_deposit_payment ON public.stay_refund_parts USING btree (deposit_payment_id) WHERE (deposit_payment_id IS NOT NULL);
+
+
+--
+-- Name: idx_stay_refund_parts_deposit_return; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stay_refund_parts_deposit_return ON public.stay_refund_parts USING btree (deposit_return_id) WHERE (deposit_return_id IS NOT NULL);
+
+
+--
+-- Name: idx_stay_refund_parts_paid_ahead_choice; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stay_refund_parts_paid_ahead_choice ON public.stay_refund_parts USING btree (paid_ahead_choice_id) WHERE (paid_ahead_choice_id IS NOT NULL);
+
+
+--
+-- Name: ux_paid_ahead_choices_idem; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_paid_ahead_choices_idem ON public.paid_ahead_choices USING btree (idempotency_key);
+
+
+--
+-- Name: stay_refund_parts_decision_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX stay_refund_parts_decision_idx ON public.stay_refund_parts USING btree (decision_id, seq);
+
+
+--
+-- Name: stay_refund_parts_remittance_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX stay_refund_parts_remittance_idx ON public.stay_refund_parts USING btree (remittance_id) WHERE (remittance_id IS NOT NULL);
+
+
+--
+-- Name: stay_refund_parts_replaces_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX stay_refund_parts_replaces_uniq ON public.stay_refund_parts USING btree (replaces_part_id) WHERE (replaces_part_id IS NOT NULL);
+
+
+--
+-- Name: stay_refund_parts_stay_payment_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX stay_refund_parts_stay_payment_idx ON public.stay_refund_parts USING btree (stay_payment_id) WHERE (stay_payment_id IS NOT NULL);
+
+
+--
+-- Name: stay_refund_parts_stripe_refund_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX stay_refund_parts_stripe_refund_uniq ON public.stay_refund_parts USING btree (stripe_refund_id) WHERE (stripe_refund_id IS NOT NULL);
+
+
+--
 -- Name: suspended_utility_held_by_unit; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -20411,10 +21905,10 @@ CREATE UNIQUE INDEX utility_reading_runs_property_cycle_utility ON public.utilit
 
 
 --
--- Name: ux_bank_deposit_allocations_payment; Type: INDEX; Schema: public; Owner: -
+-- Name: ux_bank_deposit_allocations_payment_live; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX ux_bank_deposit_allocations_payment ON public.bank_deposit_allocations USING btree (payment_id);
+CREATE UNIQUE INDEX ux_bank_deposit_allocations_payment_live ON public.bank_deposit_allocations USING btree (payment_id) WHERE (reversed_at IS NULL);
 
 
 --
@@ -20422,6 +21916,13 @@ CREATE UNIQUE INDEX ux_bank_deposit_allocations_payment ON public.bank_deposit_a
 --
 
 CREATE UNIQUE INDEX ux_bank_deposit_allocations_txn_payment ON public.bank_deposit_allocations USING btree (bank_transaction_id, payment_id);
+
+
+--
+-- Name: ux_bank_deposit_slips_txn; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_bank_deposit_slips_txn ON public.bank_deposit_slips USING btree (bank_transaction_id) WHERE (status = 'matched'::text);
 
 
 --
@@ -20495,6 +21996,13 @@ CREATE UNIQUE INDEX ux_invoices_service_agreement_due_date ON public.invoices US
 
 
 --
+-- Name: ux_lease_prepaid_credits_source_remittance; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_lease_prepaid_credits_source_remittance ON public.lease_prepaid_credits USING btree (source_remittance_id) WHERE (source_remittance_id IS NOT NULL);
+
+
+--
 -- Name: ux_lease_unit_history_current; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -20523,6 +22031,20 @@ CREATE UNIQUE INDEX ux_owner_use_absorption_per_cycle ON public.utility_owner_us
 
 
 --
+-- Name: ux_payment_reversals_event_payment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_payment_reversals_event_payment ON public.payment_reversals USING btree (stripe_event_id, payment_id);
+
+
+--
+-- Name: INDEX ux_payment_reversals_event_payment; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON INDEX public.ux_payment_reversals_event_payment IS 'S655: a dispute or return reopens EVERY row its charge paid, one reversal record per row (reversed_amount = what that row lost). C0 drops the old one-per-event constraint.';
+
+
+--
 -- Name: ux_payments_fee_idempotent; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -20541,6 +22063,13 @@ CREATE UNIQUE INDEX ux_payments_home_sale_installment ON public.payments USING b
 --
 
 CREATE UNIQUE INDEX ux_payments_late_fee_idempotent ON public.payments USING btree (invoice_id, due_date) WHERE ((type = 'late_fee'::text) AND (status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text])));
+
+
+--
+-- Name: ux_payments_one_flexpay_pull_per_advance; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_payments_one_flexpay_pull_per_advance ON public.payments USING btree (flexpay_advance_id) WHERE (entry_description = 'FLEXPAY'::text);
 
 
 --
@@ -20600,10 +22129,38 @@ CREATE UNIQUE INDEX ux_properties_booking_slug ON public.properties USING btree 
 
 
 --
+-- Name: ux_slip_items_pos_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_slip_items_pos_live ON public.bank_deposit_slip_items USING btree (pos_transaction_id) WHERE ((pos_transaction_id IS NOT NULL) AND (voided_at IS NULL));
+
+
+--
+-- Name: ux_slip_items_remittance_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_slip_items_remittance_live ON public.bank_deposit_slip_items USING btree (remittance_id) WHERE ((remittance_id IS NOT NULL) AND (voided_at IS NULL));
+
+
+--
 -- Name: ux_tenant_declared_deposits_bank_txn; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX ux_tenant_declared_deposits_bank_txn ON public.tenant_declared_deposits USING btree (bank_transaction_id) WHERE (bank_transaction_id IS NOT NULL);
+
+
+--
+-- Name: ux_tenant_declared_deposits_recorded_remittance; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_tenant_declared_deposits_recorded_remittance ON public.tenant_declared_deposits USING btree (recorded_remittance_id) WHERE (recorded_remittance_id IS NOT NULL);
+
+
+--
+-- Name: ux_tenant_remittances_intent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_tenant_remittances_intent ON public.tenant_remittances USING btree (stripe_payment_intent_id) WHERE (stripe_payment_intent_id IS NOT NULL);
 
 
 --
@@ -20688,6 +22245,20 @@ CREATE TRIGGER audit_application_pool AFTER DELETE OR UPDATE ON public.applicati
 --
 
 CREATE TRIGGER audit_appointments AFTER DELETE OR UPDATE ON public.appointments FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: bank_deposit_slip_items audit_bank_deposit_slip_items; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_bank_deposit_slip_items AFTER DELETE OR UPDATE ON public.bank_deposit_slip_items FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: bank_deposit_slips audit_bank_deposit_slips; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_bank_deposit_slips AFTER DELETE OR UPDATE ON public.bank_deposit_slips FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -20828,6 +22399,13 @@ CREATE TRIGGER audit_common_areas AFTER DELETE OR UPDATE ON public.common_areas 
 --
 
 CREATE TRIGGER audit_contractors AFTER DELETE OR UPDATE ON public.contractors FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: credit_uses audit_credit_uses; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_credit_uses AFTER DELETE OR UPDATE ON public.credit_uses FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -21363,6 +22941,13 @@ CREATE TRIGGER audit_subleases AFTER DELETE OR UPDATE ON public.subleases FOR EA
 
 
 --
+-- Name: tenant_credits audit_tenant_credits; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_tenant_credits AFTER DELETE OR UPDATE ON public.tenant_credits FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
 -- Name: tenant_identifications audit_tenant_identifications; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -21636,6 +23221,34 @@ CREATE TRIGGER trg_cancel_unsigned_sale_on_void AFTER UPDATE OF status ON public
 
 
 --
+-- Name: credit_uses trg_credit_uses_apply; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_credit_uses_apply AFTER INSERT OR UPDATE ON public.credit_uses FOR EACH ROW EXECUTE FUNCTION public.credit_uses_apply();
+
+
+--
+-- Name: credit_uses trg_credit_uses_kept_forever; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_credit_uses_kept_forever BEFORE DELETE ON public.credit_uses FOR EACH ROW EXECUTE FUNCTION public.credit_uses_kept_forever();
+
+
+--
+-- Name: credit_uses trg_credit_uses_choice_target_fixed; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_credit_uses_choice_target_fixed BEFORE UPDATE ON public.credit_uses FOR EACH ROW WHEN ((new.paid_ahead_choice_id IS DISTINCT FROM old.paid_ahead_choice_id)) EXECUTE FUNCTION public.credit_uses_choice_target_fixed();
+
+
+--
+-- Name: credit_uses trg_credit_uses_refund_target_fixed; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_credit_uses_refund_target_fixed BEFORE UPDATE ON public.credit_uses FOR EACH ROW WHEN ((new.refund_part_id IS DISTINCT FROM old.refund_part_id)) EXECUTE FUNCTION public.credit_uses_refund_target_fixed();
+
+
+--
 -- Name: security_deposits trg_deposits_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -21825,6 +23438,20 @@ CREATE TRIGGER trg_one_meter_per_unit_utility BEFORE INSERT OR UPDATE ON public.
 
 
 --
+-- Name: leases trg_paid_ahead_carry_left_lease; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_paid_ahead_carry_left_lease AFTER INSERT OR UPDATE OF status ON public.leases FOR EACH ROW WHEN ((new.status = 'active'::text)) EXECUTE FUNCTION public.paid_ahead_carry_left_on_lease();
+
+
+--
+-- Name: lease_tenants trg_paid_ahead_carry_left_member; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_paid_ahead_carry_left_member AFTER INSERT OR UPDATE OF status ON public.lease_tenants FOR EACH ROW WHEN ((new.status = 'active'::text)) EXECUTE FUNCTION public.paid_ahead_carry_left_on_member();
+
+
+--
 -- Name: payments trg_payments_invoice_late_fee_subtotal_rollup; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -21836,6 +23463,20 @@ CREATE TRIGGER trg_payments_invoice_late_fee_subtotal_rollup AFTER INSERT OR DEL
 --
 
 CREATE TRIGGER trg_payments_invoice_status_rollup AFTER INSERT OR DELETE OR UPDATE OF status, invoice_id ON public.payments FOR EACH ROW EXECUTE FUNCTION public.fn_invoice_status_rollup();
+
+
+--
+-- Name: payments trg_payments_keep_rows_with_live_credit; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_payments_keep_rows_with_live_credit BEFORE DELETE ON public.payments FOR EACH ROW EXECUTE FUNCTION public.payments_keep_rows_with_live_credit();
+
+
+--
+-- Name: payments trg_payments_voided_is_a_record; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_payments_voided_is_a_record BEFORE UPDATE OF status, amount, voided_at, void_reason ON public.payments FOR EACH ROW EXECUTE FUNCTION public.payments_voided_is_a_record();
 
 
 --
@@ -21941,6 +23582,13 @@ CREATE TRIGGER trg_seasonal_tenancies_updated_at BEFORE UPDATE ON public.seasona
 --
 
 CREATE TRIGGER trg_stamp_tenant_invite_sent BEFORE INSERT OR UPDATE OF tenant_invite_token ON public.users FOR EACH ROW EXECUTE FUNCTION public.stamp_tenant_invite_sent();
+
+
+--
+-- Name: stay_refund_parts trg_stay_refund_parts_replacement_parent; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_stay_refund_parts_replacement_parent BEFORE INSERT ON public.stay_refund_parts FOR EACH ROW WHEN (((new.replaces_part_id IS NOT NULL) AND (new.decision_id IS NULL) AND (new.paid_ahead_choice_id IS NULL) AND (new.deposit_return_id IS NULL))) EXECUTE FUNCTION public.stay_refund_parts_replacement_parent();
 
 
 --
@@ -22358,6 +24006,70 @@ ALTER TABLE ONLY public.bank_deposit_allocations
 
 
 --
+-- Name: bank_deposit_allocations bank_deposit_allocations_reversed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_allocations
+    ADD CONSTRAINT bank_deposit_allocations_reversed_by_fkey FOREIGN KEY (reversed_by) REFERENCES public.users(id);
+
+
+--
+-- Name: bank_deposit_slip_items bank_deposit_slip_items_pos_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_slip_items
+    ADD CONSTRAINT bank_deposit_slip_items_pos_transaction_id_fkey FOREIGN KEY (pos_transaction_id) REFERENCES public.pos_transactions(id);
+
+
+--
+-- Name: bank_deposit_slip_items bank_deposit_slip_items_remittance_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_slip_items
+    ADD CONSTRAINT bank_deposit_slip_items_remittance_id_fkey FOREIGN KEY (remittance_id) REFERENCES public.tenant_remittances(id);
+
+
+--
+-- Name: bank_deposit_slip_items bank_deposit_slip_items_slip_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_slip_items
+    ADD CONSTRAINT bank_deposit_slip_items_slip_id_fkey FOREIGN KEY (slip_id) REFERENCES public.bank_deposit_slips(id);
+
+
+--
+-- Name: bank_deposit_slips bank_deposit_slips_bank_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_slips
+    ADD CONSTRAINT bank_deposit_slips_bank_transaction_id_fkey FOREIGN KEY (bank_transaction_id) REFERENCES public.bank_transactions(id);
+
+
+--
+-- Name: bank_deposit_slips bank_deposit_slips_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_slips
+    ADD CONSTRAINT bank_deposit_slips_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id);
+
+
+--
+-- Name: bank_deposit_slips bank_deposit_slips_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_slips
+    ADD CONSTRAINT bank_deposit_slips_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: bank_deposit_slips bank_deposit_slips_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_slips
+    ADD CONSTRAINT bank_deposit_slips_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id);
+
+
+--
 -- Name: bank_reconciliations bank_reconciliations_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -22379,6 +24091,14 @@ ALTER TABLE ONLY public.bank_reconciliations
 
 ALTER TABLE ONLY public.bank_reconciliations
     ADD CONSTRAINT bank_reconciliations_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: bank_transactions bank_transactions_auto_filed_rule_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_transactions
+    ADD CONSTRAINT bank_transactions_auto_filed_rule_id_fkey FOREIGN KEY (auto_filed_rule_id) REFERENCES public.landlord_merchant_rules(id);
 
 
 --
@@ -23414,6 +25134,86 @@ ALTER TABLE ONLY public.credit_stats
 
 
 --
+-- Name: credit_uses credit_uses_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id);
+
+
+--
+-- Name: credit_uses credit_uses_deposit_return_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_deposit_return_id_fkey FOREIGN KEY (deposit_return_id) REFERENCES public.deposit_returns(id);
+
+
+--
+-- Name: credit_uses credit_uses_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: credit_uses credit_uses_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id) ON DELETE SET NULL;
+
+
+--
+-- Name: credit_uses credit_uses_payment_reversal_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_payment_reversal_id_fkey FOREIGN KEY (payment_reversal_id) REFERENCES public.payment_reversals(id);
+
+
+--
+-- Name: credit_uses credit_uses_prepaid_credit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_prepaid_credit_id_fkey FOREIGN KEY (prepaid_credit_id) REFERENCES public.lease_prepaid_credits(id);
+
+
+--
+-- Name: credit_uses credit_uses_paid_ahead_choice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_paid_ahead_choice_id_fkey FOREIGN KEY (paid_ahead_choice_id) REFERENCES public.paid_ahead_choices(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: credit_uses credit_uses_refund_part_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_refund_part_id_fkey FOREIGN KEY (refund_part_id) REFERENCES public.stay_refund_parts(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: credit_uses credit_uses_remittance_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_remittance_id_fkey FOREIGN KEY (remittance_id) REFERENCES public.tenant_remittances(id);
+
+
+--
+-- Name: credit_uses credit_uses_tenant_credit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_uses
+    ADD CONSTRAINT credit_uses_tenant_credit_id_fkey FOREIGN KEY (tenant_credit_id) REFERENCES public.tenant_credits(id);
+
+
+--
 -- Name: cross_property_service_links cross_property_service_links_declined_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23531,6 +25331,14 @@ ALTER TABLE ONLY public.deposit_returns
 
 ALTER TABLE ONLY public.deposit_returns
     ADD CONSTRAINT deposit_returns_gap_payment_id_fkey FOREIGN KEY (gap_payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: deposit_returns deposit_returns_landlord_part_handed_back_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_landlord_part_handed_back_by_fkey FOREIGN KEY (landlord_part_handed_back_by) REFERENCES public.users(id);
 
 
 --
@@ -24027,6 +25835,14 @@ ALTER TABLE ONLY public.flexcredit_inquiries
 
 ALTER TABLE ONLY public.flexpay_advances
     ADD CONSTRAINT flexpay_advances_fee_payment_id_fkey FOREIGN KEY (fee_payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: flexpay_advances flexpay_advances_invoice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_advances
+    ADD CONSTRAINT flexpay_advances_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES public.invoices(id);
 
 
 --
@@ -24862,6 +26678,22 @@ ALTER TABLE ONLY public.lease_prepaid_credits
 
 
 --
+-- Name: lease_prepaid_credits lease_prepaid_credits_left_by_choice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credits
+    ADD CONSTRAINT lease_prepaid_credits_left_by_choice_id_fkey FOREIGN KEY (left_by_choice_id) REFERENCES public.paid_ahead_choices(id);
+
+
+--
+-- Name: lease_prepaid_credits lease_prepaid_credits_received_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credits
+    ADD CONSTRAINT lease_prepaid_credits_received_lease_id_fkey FOREIGN KEY (received_lease_id) REFERENCES public.leases(id);
+
+
+--
 -- Name: lease_prepaid_credits lease_prepaid_credits_source_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25494,6 +27326,30 @@ ALTER TABLE ONLY public.otp_advances
 
 
 --
+-- Name: paid_ahead_choices paid_ahead_choices_decided_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paid_ahead_choices
+    ADD CONSTRAINT paid_ahead_choices_decided_by_fkey FOREIGN KEY (decided_by) REFERENCES public.users(id);
+
+
+--
+-- Name: paid_ahead_choices paid_ahead_choices_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paid_ahead_choices
+    ADD CONSTRAINT paid_ahead_choices_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: paid_ahead_choices paid_ahead_choices_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paid_ahead_choices
+    ADD CONSTRAINT paid_ahead_choices_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
 -- Name: parts_inventory parts_inventory_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25523,6 +27379,14 @@ ALTER TABLE ONLY public.payment_reversals
 
 ALTER TABLE ONLY public.payment_reversals
     ADD CONSTRAINT payment_reversals_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: payments payments_flexpay_advance_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payments
+    ADD CONSTRAINT payments_flexpay_advance_id_fkey FOREIGN KEY (flexpay_advance_id) REFERENCES public.flexpay_advances(id);
 
 
 --
@@ -26190,6 +28054,46 @@ ALTER TABLE ONLY public.pos_eod_settlements
 
 
 --
+-- Name: pos_held_payments pos_held_payments_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_held_payments
+    ADD CONSTRAINT pos_held_payments_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_held_payments pos_held_payments_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_held_payments
+    ADD CONSTRAINT pos_held_payments_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_held_payments pos_held_payments_pay_link_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_held_payments
+    ADD CONSTRAINT pos_held_payments_pay_link_id_fkey FOREIGN KEY (pay_link_id) REFERENCES public.pos_pay_links(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_held_payments pos_held_payments_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_held_payments
+    ADD CONSTRAINT pos_held_payments_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_held_payments pos_held_payments_refunded_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_held_payments
+    ADD CONSTRAINT pos_held_payments_refunded_by_fkey FOREIGN KEY (refunded_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
 -- Name: pos_inventory_log pos_inventory_log_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26451,6 +28355,14 @@ ALTER TABLE ONLY public.pos_reader_orders
 
 ALTER TABLE ONLY public.pos_refunds
     ADD CONSTRAINT pos_refunds_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_refunds pos_refunds_stay_refund_part_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_refunds
+    ADD CONSTRAINT pos_refunds_stay_refund_part_id_fkey FOREIGN KEY (stay_refund_part_id) REFERENCES public.stay_refund_parts(id) ON DELETE SET NULL;
 
 
 --
@@ -27406,6 +29318,158 @@ ALTER TABLE ONLY public.state_law_provisions
 
 
 --
+-- Name: stay_checkout_decisions stay_checkout_decisions_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_checkout_decisions
+    ADD CONSTRAINT stay_checkout_decisions_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: stay_checkout_decisions stay_checkout_decisions_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_checkout_decisions
+    ADD CONSTRAINT stay_checkout_decisions_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: stay_checkout_decisions stay_checkout_decisions_decided_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_checkout_decisions
+    ADD CONSTRAINT stay_checkout_decisions_decided_by_fkey FOREIGN KEY (decided_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: stay_checkout_decisions stay_checkout_decisions_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_checkout_decisions
+    ADD CONSTRAINT stay_checkout_decisions_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: stay_checkout_decisions stay_checkout_decisions_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_checkout_decisions
+    ADD CONSTRAINT stay_checkout_decisions_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
+
+
+--
+-- Name: stay_payments stay_payments_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_payments
+    ADD CONSTRAINT stay_payments_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: stay_payments stay_payments_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_payments
+    ADD CONSTRAINT stay_payments_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: stay_payments stay_payments_pos_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_payments
+    ADD CONSTRAINT stay_payments_pos_transaction_id_fkey FOREIGN KEY (pos_transaction_id) REFERENCES public.pos_transactions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_deposit_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_deposit_payment_id_fkey FOREIGN KEY (deposit_payment_id) REFERENCES public.payments(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_deposit_return_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_deposit_return_id_fkey FOREIGN KEY (deposit_return_id) REFERENCES public.deposit_returns(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_decision_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_decision_id_fkey FOREIGN KEY (decision_id) REFERENCES public.stay_checkout_decisions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_paid_ahead_choice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_paid_ahead_choice_id_fkey FOREIGN KEY (paid_ahead_choice_id) REFERENCES public.paid_ahead_choices(id);
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_pos_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_pos_transaction_id_fkey FOREIGN KEY (pos_transaction_id) REFERENCES public.pos_transactions(id) ON DELETE SET NULL;
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_prepaid_credit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_prepaid_credit_id_fkey FOREIGN KEY (prepaid_credit_id) REFERENCES public.lease_prepaid_credits(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_remittance_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_remittance_id_fkey FOREIGN KEY (remittance_id) REFERENCES public.tenant_remittances(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_replaces_part_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_replaces_part_id_fkey FOREIGN KEY (replaces_part_id) REFERENCES public.stay_refund_parts(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: stay_refund_parts stay_refund_parts_stay_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stay_refund_parts
+    ADD CONSTRAINT stay_refund_parts_stay_payment_id_fkey FOREIGN KEY (stay_payment_id) REFERENCES public.stay_payments(id) ON DELETE CASCADE;
+
+
+--
 -- Name: subleases subleases_invitation_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27715,6 +29779,14 @@ ALTER TABLE ONLY public.tenant_declared_deposits
 
 ALTER TABLE ONLY public.tenant_declared_deposits
     ADD CONSTRAINT tenant_declared_deposits_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_declared_deposits tenant_declared_deposits_recorded_remittance_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_declared_deposits
+    ADD CONSTRAINT tenant_declared_deposits_recorded_remittance_id_fkey FOREIGN KEY (recorded_remittance_id) REFERENCES public.tenant_remittances(id) ON DELETE RESTRICT;
 
 
 --

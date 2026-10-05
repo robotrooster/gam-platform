@@ -22,7 +22,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync, readdirSync, statSync } from 'fs'
 import { join } from 'path'
-import { PROCESSING_FEES, CARD_DECLINE_FEE } from '@gam/shared'
+import { PROCESSING_FEES, CARD_DECLINE_FEE, INCOME_BASIS_LABEL } from '@gam/shared'
 
 const ROOT = join(__dirname, 'knowledge-content')
 
@@ -180,5 +180,79 @@ describe('a reported bank deposit is promised only what GAM can do', () => {
       expect(s.text, s.path).toMatch(/isn't connected, your landlord checks their own bank and marks your bill paid/)
       expect(s.text, s.path).toMatch(/keep your deposit slip/)
     }
+  })
+})
+
+/**
+ * S655 (money plan, Step 11) — credit, balances and the two report bases, as
+ * Nic decided them on 10/2. The articles said a prepaid credit "is applied
+ * automatically to your next invoice" and a waiver credit "lands on their open
+ * balance straight away"; the agents repeated both. Credit pays a bill by itself
+ * only when it covers the whole bill; otherwise the payer chooses.
+ */
+describe('S655 credit is described the way it works', () => {
+  const article = (path: string) => {
+    const a = ARTICLES.find((x) => x.path === path)
+    expect(a, path).toBeTruthy()
+    return a!.text
+  }
+
+  it('never promises credit comes off the next bill by itself', () => {
+    const BAD = /applied automatically to your next invoice|comes off your next bill automatically|released toward future rent as it comes due|lands on their open balance straight away/i
+    const offenders = ARTICLES.filter((a) => BAD.test(a.text)).map((a) => a.path)
+    expect(offenders).toEqual([])
+  })
+
+  it('states the whole-bill rule and the two choices where tenants and landlords read about credit', () => {
+    for (const path of ['tenant/how-payments-are-applied.md', 'tenant/paying-rent.md', 'landlord/waiving-a-charge.md']) {
+      expect(article(path), path).toMatch(/by itself only when it covers the whole bill/)
+      expect(article(path), path).toMatch(/Use all \$X/)
+      expect(article(path), path).toMatch(/Save it for later/)
+    }
+    // Autopay keeps the credit unless the tenant turned "use my credit first" on.
+    expect(article('tenant/how-payments-are-applied.md')).toMatch(/Use my account credit first", that is off unless you turn it on/)
+  })
+
+  it('saved credit is never said to stop a late fee', () => {
+    expect(article('landlord/waiving-a-charge.md')).toMatch(/Saved credit does not stop a late fee unless it covers the whole bill/)
+    expect(article('tenant/how-payments-are-applied.md')).toMatch(/Saved credit doesn't stop a late fee unless it covers the whole bill/)
+  })
+
+  it('the profit-and-loss article names both bases in the screens\' own words and never counts a credit as income', () => {
+    const text = article('landlord/expenses-and-your-profit-and-loss.md')
+    expect(text).toContain(`**${INCOME_BASIS_LABEL.received}**`)
+    expect(text).toContain(`**${INCOME_BASIS_LABEL.billed}**`)
+    expect(text).toMatch(/a credit you give is never income/i)
+    // Money received is the day the money arrived (owner correction, 10/2).
+    expect(text).toMatch(/counts money on the day it arrived/)
+  })
+
+  it('a bank-deposit match never spends credit, and adding a bank never removes the old one', () => {
+    expect(article('landlord/matching-cash-deposits-to-rent.md')).toMatch(/a match never spends the tenant's account credit/)
+    expect(article('tenant/updating-your-payment-method.md')).toMatch(/Adding a bank account never removes the one you already have/)
+  })
+
+  it('names both deposits GAM settles by itself — a confirmed report and an unreported whole bill — and the Undo', () => {
+    // bankFeed.decideDeposit: 'declared' (a report the bank confirms) and
+    // 'auto_settle' (bankDepositMatch.isAutoSettleable: exactly one tenant's
+    // whole bill, nothing rival). Both write bank_transactions.auto_settle_undo,
+    // and bankDepositConfirm.undoDepositMatch undoes either from the Bank feed.
+    const text = article('landlord/matching-cash-deposits-to-rent.md')
+    expect(text).not.toMatch(/There is one case GAM settles without asking/)
+    expect(text).toMatch(/There are two cases GAM settles without asking/)
+    expect(text).toMatch(/The tenant reported the deposit themselves, the bank confirms it/)
+    expect(text).toMatch(/A deposit equal to the cent to everything one tenant owes you/)
+    expect(text).toMatch(/no other deposit of the same amount came in within a few days/)
+    expect(text).toMatch(/A payout from a payment company that happens to match is never taken as rent/)
+    expect(text).toMatch(/The tenant and you are both told/)
+    expect(text).toMatch(/press \*\*Undo this match\*\* on the deposit under \*\*Bank → Bank feed\*\*/)
+  })
+
+  it('a bank a payment is still clearing from, or is set to be tried again from, is never said to be removable', () => {
+    // tenantBankMethods.pullBlockFor: kept even beside another verified bank (decisions #34(c)).
+    const text = article('tenant/updating-your-payment-method.md')
+    expect(text).toMatch(/A bank can't be removed while a payment from it is still clearing \(about 4 business days\) or is set to be tried again from it — even if another bank is verified/)
+    // onlyVerifiedBankBlock: FlexPay keeps the only verified bank too (decisions #34(a)(b)).
+    expect(text).toMatch(/only verified bank[^.]*\. The same goes while you're on FlexPay or a FlexPay payment is still owed/)
   })
 })

@@ -3,6 +3,10 @@
 // Single source of truth for all data models across all apps
 // ============================================================
 
+// S655: read at load time below (BANK_TXN_MATCH_KINDS), so it is imported first.
+// money.ts imports nothing from this file, so there is no cycle.
+import { BANK_MATCH_KINDS, BANK_MATCH_KIND_LABEL, type BankMatchKind } from './money'
+
 // ── ENUMS ──────────────────────────────────────────────────
 
 export const USER_ROLES = [
@@ -710,13 +714,12 @@ export const BANK_TXN_BANK_STATUSES = ['pending', 'posted', 'void'] as const
 export type BankTxnBankStatus = typeof BANK_TXN_BANK_STATUSES[number]
 
 // S655: what a matched money-in row was matched TO — the page said "GAM payout"
-// for every matched row, including a tenant's own cash deposit.
-export const BANK_TXN_MATCH_KINDS = ['gam_payout', 'tenant_deposit'] as const
-export type BankTxnMatchKind = typeof BANK_TXN_MATCH_KINDS[number]
-export const BANK_TXN_MATCH_KIND_LABEL: Record<BankTxnMatchKind, string> = {
-  gam_payout: 'GAM payout',
-  tenant_deposit: 'Tenant’s bank deposit',
-}
+// for every matched row, including a tenant's own cash deposit. The money plan
+// adds a deposit slip and a deposit that filed itself; the one list lives in
+// money.ts (BANK_MATCH_KINDS) and these names are the same objects.
+export const BANK_TXN_MATCH_KINDS = BANK_MATCH_KINDS
+export type BankTxnMatchKind = BankMatchKind
+export const BANK_TXN_MATCH_KIND_LABEL: Record<BankTxnMatchKind, string> = BANK_MATCH_KIND_LABEL
 
 // How a categorized bank charge maps onto the expense model: to one unit, to the
 // property as a common cost, or to the property split across its units.
@@ -730,7 +733,13 @@ export type MerchantRuleScope = typeof MERCHANT_RULE_SCOPES[number]
 // S609: a failed AUTOPAY pull belongs here for the same reason. The tenant
 // believes their rent is handled and has no reason to check — silence is the
 // worst possible outcome, and it ends in a late fee they never saw coming.
-export const CRITICAL_NOTIFICATION_TYPES = ['payment_failed', 'autopay_failed'] as const
+// S655 (decisions #35.7(c)): FlexPay's money notices always send too — FlexPay
+// ended (the next bill is the tenant's own), FlexPay paid the bill (and what is
+// still due on it), and a FlexPay collection being tried again (have the money
+// in the account by that day).
+export const CRITICAL_NOTIFICATION_TYPES = [
+  'payment_failed', 'autopay_failed', 'flexpay_ended', 'flexpay_bill_covered', 'flexpay_pull_retry',
+] as const
 export type CriticalNotificationType = typeof CRITICAL_NOTIFICATION_TYPES[number]
 export const isCriticalNotificationType = (t: string): boolean =>
   (CRITICAL_NOTIFICATION_TYPES as readonly string[]).includes(t)
@@ -1768,8 +1777,17 @@ export const SUB_PERMISSION_LABEL: Record<AnySubPermission, string> = {
 export interface PermissionItem {
   key: string
   label: string
-  /** Optional one-liner shown under the toggle on the permissions page. */
-  hint?: string
+  /** What the person can (and cannot) do with this permission, in plain
+   *  words — shown in small gray text under the toggle on the permissions
+   *  page. Required: an owner deciding whether to switch something on should
+   *  never have to guess (10/3, Nic: "card readers… I don't know if I need to
+   *  toggle that so that she can use the card reader to ring people up or if
+   *  that's for setting up a card reader"). Written for staff added from Team
+   *  (the on-site role every invite creates) and checked against the routes
+   *  that gate each key. Change the hint in the same pass as the gate. Another
+   *  permission is named by its exact label in double quotes; the catalog test
+   *  holds every such name to a real label. */
+  hint: string
   /** Renders a "sensitive" badge on the permissions page. Still grantable —
    *  the owner decides — but visually flagged (financials, PII, money movement,
    *  third-party control). */
@@ -1788,101 +1806,153 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     category: 'pos', label: 'Point of Sale',
     sections: [
       { label: 'Tabs', items: [
-        { key: 'pos.tab.register',   label: 'Register' },
-        { key: 'pos.tab.history',    label: 'Sales history' },
-        { key: 'pos.tab.items',      label: 'Items' },
-        { key: 'pos.tab.categories', label: 'Categories' },
-        { key: 'pos.tab.taxes',      label: 'Tax rates' },
-        { key: 'pos.tab.discounts',  label: 'Discounts' },
-        { key: 'pos.tab.vendors',    label: 'Vendors' },
-        { key: 'pos.tab.orders',     label: 'Purchase orders' },
-        { key: 'pos.tab.inventory',  label: 'Inventory log' },
-        { key: 'pos.tab.readers',    label: 'Card readers' },
+        { key: 'pos.tab.register',   label: 'Register',
+          hint: 'Opens the Register and Pay Links screens. They also need "Ring sales" to actually charge anyone.' },
+        { key: 'pos.tab.history',    label: 'Sales history',
+          hint: 'Opens past sales and the Customers list (these load with "Ring sales" or "End-of-day close"). Refunds and voids need their own permissions.' },
+        { key: 'pos.tab.items',      label: 'Items',
+          hint: 'Opens the list of what you sell and the prices. It loads with "Ring sales" or "Create / edit items, tax, vendors"; only the second lets them add or change items.' },
+        { key: 'pos.tab.categories', label: 'Categories',
+          hint: 'Opens your item categories. They load with "Ring sales" or "Create / edit items, tax, vendors"; only the second lets them add or change one.' },
+        { key: 'pos.tab.taxes',      label: 'Tax rates',
+          hint: 'Opens your sales tax rates. They load with "Ring sales" or "Create / edit items, tax, vendors"; only the second lets them add or change a rate.' },
+        { key: 'pos.tab.discounts',  label: 'Discounts',
+          hint: 'Opens your saved discounts (they load with "Apply discounts"). Creating or changing one needs "Create / edit items, tax, vendors".' },
+        { key: 'pos.tab.vendors',    label: 'Vendors',
+          hint: 'Opens your supplier list. It stays empty unless they also have "Create / edit items, tax, vendors".' },
+        { key: 'pos.tab.orders',     label: 'Purchase orders',
+          hint: 'Opens purchase orders for restocking. It stays empty unless they also have "Create / edit items, tax, vendors".' },
+        { key: 'pos.tab.inventory',  label: 'Inventory log',
+          hint: 'Opens the stock history and the low-stock list. It stays empty unless they also have "Create / edit items, tax, vendors".' },
+        { key: 'pos.tab.readers',    label: 'Card readers',
+          hint: 'Opens card reader setup: order, pair, or remove a reader (also needs "Create / edit items, tax, vendors"). Not needed to charge a card: "Register" plus "Ring sales" covers that, and "Record a cash / check payment" covers rent.' },
       ]},
       { label: 'Actions', items: [
-        { key: 'pos.ring_sale',        label: 'Ring sales' },
-        { key: 'pos.refund',           label: 'Issue refunds' },
-        { key: 'pos.void',             label: 'Void transactions' },
-        { key: 'pos.discount',         label: 'Apply discounts' },
-        { key: 'pos.end_of_day',       label: 'End-of-day close' },
-        { key: 'pos.manage_inventory', label: 'Create / edit items, tax, vendors' },
+        { key: 'pos.ring_sale',        label: 'Ring sales',
+          hint: 'Ring up sales and take cash, card, or the card reader; send pay links; look up and save customers. Prices stay as listed unless they also have "Apply discounts".' },
+        { key: 'pos.refund',           label: 'Issue refunds',
+          hint: 'Give money back on a finished sale, all of it or part.' },
+        { key: 'pos.void',             label: 'Void transactions',
+          hint: 'Cancel a sale as if it never happened and put its stock back. Card sales, stays, and pay links cannot be voided; those need a refund.' },
+        { key: 'pos.discount',         label: 'Apply discounts',
+          hint: 'Take money off a sale or change an item\'s price at the register. Without it, they ring everything at the listed price.' },
+        { key: 'pos.end_of_day',       label: 'End-of-day close',
+          hint: 'Look through past sales and customers even without "Ring sales". Each day closes on its own overnight, so there is no button to press.' },
+        { key: 'pos.manage_inventory', label: 'Create / edit items, tax, vendors',
+          hint: 'Set up the store: items, prices, categories, tax rates, discounts, vendors, purchase orders, stock counts, and card readers (ordering a reader bills you). Also lets them change prices at the register.' },
       ]},
     ],
   },
   {
     category: 'dashboard', label: 'Dashboard',
     sections: [{ label: 'Access', items: [
-      { key: 'dashboard.view', label: 'View dashboard', sensitive: true, hint: 'portfolio-wide financials' },
+      { key: 'dashboard.view', label: 'View dashboard', sensitive: true,
+        hint: 'Adds Dashboard to their menu, but its money totals and to-do list are owner-only, so staff see it mostly empty.' },
     ]}],
   },
   {
     category: 'properties', label: 'Properties',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'properties.view',           label: 'View properties' },
-      { key: 'properties.create',         label: 'Add property' },
-      { key: 'properties.edit',           label: 'Edit property' },
-      { key: 'properties.bulk_import',    label: 'Bulk import (CSV)' },
-      { key: 'properties.add_unit',       label: 'Add unit' },
-      { key: 'properties.assign_manager', label: 'Assign property manager' },
+      { key: 'properties.view',           label: 'View properties',
+        hint: 'Shows the Properties page so they can look up each property. Changes need the permissions below.' },
+      { key: 'properties.create',         label: 'Add property',
+        hint: 'Add a new property to your account.' },
+      { key: 'properties.edit',           label: 'Edit property',
+        hint: 'Change property setup (fees, site types, rent due day, meters, utility rates, propane), approve meter reads and send utility bills, and add one-time charges. Name, address, and late fees stay owner-only.' },
+      { key: 'properties.bulk_import',    label: 'Bulk import (CSV)',
+        hint: 'Upload a spreadsheet to add many properties and units at once.' },
+      { key: 'properties.add_unit',       label: 'Add unit',
+        hint: 'Add a new unit or site to a property.' },
+      { key: 'properties.assign_manager', label: 'Assign property manager',
+        hint: 'Has no effect for staff: choosing who manages a property is owner-only.' },
     ]}],
   },
   {
     category: 'units', label: 'Units',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'units.view',             label: 'View units' },
-      { key: 'units.set_status',       label: 'Change unit status' },
-      { key: 'units.manage_lifecycle', label: 'Unit lifecycle (available / vacant / activate)' },
-      { key: 'units.edit_listing',     label: 'Edit listing fields' },
-      { key: 'units.eviction_mode',    label: 'Eviction mode', sensitive: true, hint: 'blocks tenant ACH; legal' },
+      { key: 'units.view',             label: 'View units',
+        hint: 'Shows the Unit Overview page: every unit, its status, and who lives there. Look only.' },
+      { key: 'units.set_status',       label: 'Change unit status',
+        hint: 'Change a unit\'s status from the Unit Overview list, like vacant or owner-occupied. Eviction mode is separate.' },
+      { key: 'units.manage_lifecycle', label: 'Unit lifecycle (available / vacant / activate)',
+        hint: 'Mark a unit available to rent, or vacant. Turning a unit on for billing stays owner-only.' },
+      { key: 'units.edit_listing',     label: 'Edit listing fields',
+        hint: 'Change a unit\'s rental listing: its photos and description.' },
+      { key: 'units.eviction_mode',    label: 'Eviction mode', sensitive: true,
+        hint: 'Has no effect for staff: only the owner can turn eviction mode on or off (it stops the resident from paying by bank).' },
     ]}],
   },
   {
     category: 'schedule', label: 'Master Schedule',
     sections: [
       { label: 'Tabs', items: [
-        { key: 'schedule.tab.timeline', label: 'Timeline' },
-        { key: 'schedule.tab.list',     label: 'List' },
-        { key: 'schedule.tab.units',    label: 'Units' },
-        { key: 'schedule.tab.history',  label: 'History' },
+        { key: 'schedule.tab.timeline', label: 'Timeline',
+          hint: 'The calendar grid of sites and stays on Master Schedule. Look only; booking and changes need the permissions below.' },
+        { key: 'schedule.tab.list',     label: 'List',
+          hint: 'The list of stays on Master Schedule. Look only.' },
+        { key: 'schedule.tab.units',    label: 'Units',
+          hint: 'The site-by-site view on Master Schedule. Look only.' },
+        { key: 'schedule.tab.history',  label: 'History',
+          hint: 'The Master Schedule change log: who booked, moved, or canceled which stay, and when.' },
       ]},
       { label: 'Actions', items: [
-        { key: 'schedule.create_reservation', label: 'Create reservations' },
-        { key: 'schedule.edit_reservation',   label: 'Edit / move / cancel reservations' },
-        { key: 'schedule.configure_unit',     label: 'Configure unit (rates, type, amenities)' },
-        { key: 'guest_access',                label: 'Guest stay links', hint: 'shared with Reservations' },
+        { key: 'schedule.create_reservation', label: 'Create reservations',
+          hint: 'Book a site for a guest from the schedule, and email the guest a deposit link to hold it.' },
+        { key: 'schedule.edit_reservation',   label: 'Edit / move / cancel reservations',
+          hint: 'Change a booked stay: move it, change its dates, lock it to its site, or cancel it. Checking a guest in is not part of this.' },
+        { key: 'guests.check_in',             label: 'Check guests in',
+          hint: 'Mark a guest as arrived on the schedule. Taking a closing meter read on the site first may also be needed.' },
+        { key: 'guests.check_out',            label: 'Check guests out',
+          hint: 'Mark a guest as gone, including leaving early, or correct the day they left. Refunding anything also needs "Issue refunds".' },
+        { key: 'schedule.configure_unit',     label: 'Configure unit (rates, type, amenities)',
+          hint: 'Set up a site: type, size, hookups, rent and nightly, weekly, and monthly rates, deposit, and whether guests can book it. Marking a site out of order stays owner-only.' },
+        { key: 'guest_access',                label: 'Guest stay links',
+          hint: 'Create, copy, or turn off a guest\'s private link to their stay.' },
       ]},
     ],
   },
   {
     category: 'bookings', label: 'Reservations',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'bookings.view',                   label: 'View reservations' },
-      { key: 'bookings.change_requests',        label: 'View guest change requests' },
-      { key: 'bookings.acknowledge',            label: 'Acknowledge property rules' },
-      { key: 'bookings.resolve_change_request', label: 'Approve / decline change requests' },
+      { key: 'bookings.view',                   label: 'View reservations',
+        hint: 'The Reservations tab on Master Schedule: every booked stay with the guest and dates. They also get told when a guest asks to change a stay.' },
+      { key: 'bookings.change_requests',        label: 'View guest change requests',
+        hint: 'The Requests tab: guests asking to change their stay. Answering needs "Approve / decline change requests".' },
+      { key: 'bookings.acknowledge',            label: 'Acknowledge property rules',
+        hint: 'Mark that a guest has signed the property rules for their stay.' },
+      { key: 'bookings.resolve_change_request', label: 'Approve / decline change requests',
+        hint: 'Say yes or no to a guest\'s request to change their stay.' },
     ]}],
   },
   {
     category: 'booking_sites', label: 'Booking Sites',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'booking_sites.view', label: 'View booking-site config' },
-      { key: 'booking_sites.edit', label: 'Edit & publish booking site', sensitive: true, hint: 'publishes a public site' },
+      { key: 'booking_sites.view', label: 'View booking-site config',
+        hint: 'Has no effect for staff: the booking site settings are owner-only.' },
+      { key: 'booking_sites.edit', label: 'Edit & publish booking site', sensitive: true,
+        hint: 'Has no effect for staff: changing or publishing your public booking site is owner-only.' },
     ]}],
   },
   {
     category: 'tenants', label: 'Tenants',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'tenants.view',          label: 'View tenants' },
-      { key: 'tenants.invite',        label: 'Invite tenant' },
-      { key: 'tenants.onboard',       label: 'Onboard existing tenant' },
-      { key: 'tenants.transfer_unit', label: 'Transfer tenant unit' },
+      { key: 'tenants.view',          label: 'View tenants',
+        hint: 'Shows the Tenants page: each resident, their unit, rent, and how reliably they pay. Look only.' },
+      { key: 'tenants.invite',        label: 'Invite tenant',
+        hint: 'Email a new resident an invite to sign up, and skip the background check for someone who already lives there.' },
+      { key: 'tenants.onboard',       label: 'Onboard existing tenant',
+        hint: 'Add residents who already live there, with their current lease, or a new resident on a new lease.' },
+      { key: 'tenants.transfer_unit', label: 'Transfer tenant unit',
+        hint: 'Has no effect: moving a resident to another space is done on their lease, with "Edit / confirm leases".' },
     ]}],
   },
   {
     category: 'tenant_onboarding', label: 'Tenant Onboarding',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'tenant_onboarding.view',           label: 'Onboarding & import flows' },
-      { key: 'tenant_onboarding.pending_manage', label: 'Manage pending pool (builds leases)' },
+      { key: 'tenant_onboarding.view',           label: 'Onboarding & import flows',
+        hint: 'Adds Tenant Onboarding to their menu, but its lists are owner-only, so staff see it mostly empty. "Front desk to-do list" shows staff the same people.' },
+      { key: 'tenant_onboarding.pending_manage', label: 'Manage pending pool (builds leases)',
+        hint: 'For residents still joining: upload their existing lease PDF, confirm what it says, or cancel their invite.' },
     ]}],
   },
   {
@@ -1897,49 +1967,67 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     // the bigger your talent pool is."
     category: 'front_desk', label: 'Front Desk',
     sections: [{ label: 'Access', items: [
-      { key: 'front_desk.view', label: 'Front desk to-do list', hint: 'read-only: who to call, what phase, what they owe — plus re-send an invite' },
+      { key: 'front_desk.view', label: 'Front desk to-do list',
+        hint: 'The call list: who still needs a call, what step they are on, and how to reach them. They can resend an invite (not change its name or email) and fix a resident\'s emergency contact. Amounts owed need "View who owes + contact".' },
       // S653 (Nic): the desk writes down the day a resident says they are leaving.
-      { key: 'front_desk.mark_leaving', label: 'Mark a resident as leaving', hint: 'sets the day they said; the final meter read and move-out follow from it' },
+      { key: 'front_desk.mark_leaving', label: 'Mark a resident as leaving',
+        hint: 'Write down the day a resident says they are leaving, or call it off; the final meter read and move-out follow from it. Also sets how much paid-ahead money each bill uses.' },
     ]}],
   },
   {
     category: 'leases', label: 'Leases',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'leases.view',           label: 'View leases' },
-      { key: 'leases.edit',           label: 'Edit / confirm leases' },
-      { key: 'leases.view_pdf',       label: 'View lease PDF' },
-      { key: 'leases.bill_fee',       label: 'Bill a fee' },
-      { key: 'leases.deposit_return', label: 'Deposit return / move-out', sensitive: true, hint: 'moves deposit money' },
+      { key: 'leases.view',           label: 'View leases',
+        hint: 'Shows the Leases page: each lease\'s unit, resident, dates, rent, and status. Look only.' },
+      { key: 'leases.edit',           label: 'Edit / confirm leases',
+        hint: 'On an active lease: set the leaving date, move them to another space, list the parts of the rent, set how much paid-ahead money each bill uses, pause billing, change fees, and email a renewal offer or non-renewal notice. Confirming is owner-only.' },
+      { key: 'leases.view_pdf',       label: 'View lease PDF',
+        hint: 'Open the lease and its signed papers as a PDF on the Leases page.' },
+      { key: 'leases.bill_fee',       label: 'Bill a fee',
+        hint: 'Add a charge to a resident\'s bill: a fee from their lease, a one-time charge, or a balance they owed before you joined GAM.' },
+      { key: 'leases.deposit_return', label: 'Deposit return / move-out', sensitive: true,
+        hint: 'Do the move-out: list deductions and send the deposit refund. Refunds over your approval limit in Settings wait for your OK.' },
     ]}],
   },
   {
     category: 'subleases', label: 'Subleases',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'subleases.view',      label: 'View subleases' },
-      { key: 'subleases.decide',    label: 'Approve / deny subleases' },
-      { key: 'subleases.terminate', label: 'Terminate sublease' },
+      { key: 'subleases.view',      label: 'View subleases',
+        hint: 'Has no effect: subleasing is turned off.' },
+      { key: 'subleases.decide',    label: 'Approve / deny subleases',
+        hint: 'Has no effect: subleasing is turned off, and approving one is owner-only.' },
+      { key: 'subleases.terminate', label: 'Terminate sublease',
+        hint: 'Has no effect: subleasing is turned off, and ending one is owner-only.' },
     ]}],
   },
   {
     category: 'esign', label: 'GoldSign',
     sections: [
       { label: 'Tabs', items: [
-        { key: 'esign.tab.documents', label: 'Documents' },
-        { key: 'esign.tab.templates', label: 'Templates' },
+        { key: 'esign.tab.documents', label: 'Documents',
+          hint: 'Has no effect for staff: the GoldSign document list is owner-only.' },
+        { key: 'esign.tab.templates', label: 'Templates',
+          hint: 'Has no effect for staff: GoldSign templates, packages, and government forms are owner-only.' },
       ]},
       { label: 'Actions', items: [
-        { key: 'esign.send',            label: 'Send documents' },
-        { key: 'esign.void',            label: 'Void documents' },
-        { key: 'esign.download',        label: 'Download signed PDFs' },
-        { key: 'esign.template_manage', label: 'Create / edit templates' },
+        { key: 'esign.send',            label: 'Send documents',
+          hint: 'Has no effect for staff: sending needs the GoldSign document list, which is owner-only.' },
+        { key: 'esign.void',            label: 'Void documents',
+          hint: 'Has no effect for staff: voiding needs the GoldSign document list, which is owner-only.' },
+        { key: 'esign.download',        label: 'Download signed PDFs',
+          hint: 'Has no effect for staff: downloading needs the GoldSign document list, which is owner-only.' },
+        { key: 'esign.template_manage', label: 'Create / edit templates',
+          hint: 'Has no effect for staff: GoldSign templates are owner-only.' },
       ]},
     ],
   },
   {
     category: 'disbursements', label: 'Disbursements',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'disbursements.view',           label: 'View disbursements' },
-      { key: 'disbursements.pm_impact_view',  label: 'View PM impact', sensitive: true, hint: 'PM fee economics' },
+      { key: 'disbursements.view',           label: 'View disbursements',
+        hint: 'Shows the Disbursements page with only payouts made to them personally. Your payouts are not shown.' },
+      { key: 'disbursements.pm_impact_view',  label: 'View PM impact', sensitive: true,
+        hint: 'Has no effect for staff: the manager-fee breakdown is owner-only.' },
       // "withdraw now" is self-service (withdraws the caller's OWN balance) — not
       // a landlord-staff action, so not a catalog key.
     ]}],
@@ -1951,13 +2039,15 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     // NOT catalog keys. Only page visibility is grantable.
     category: 'banking', label: 'Banking',
     sections: [{ label: 'Access', items: [
-      { key: 'banking.view', label: 'View banking' },
+      { key: 'banking.view', label: 'View banking',
+        hint: 'Shows the Disbursement Account page for their own bank account, where any payouts to them land. It never shows or changes yours.' },
     ]}],
   },
   {
     category: 'payments', label: 'Payments',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'payments.view',           label: 'View payments' },
+      { key: 'payments.view',           label: 'View payments',
+        hint: 'Shows the Payments page with only unpaid bills: no paid history and no work-trade lines. They can email a resident a reminder of what they owe. Taking money needs "Record a cash / check payment".' },
       // ── S640 (Nic): THE FRONT DESK TAKES CASH ────────────────────────────
       //
       //   "She needs to be able to record payments for people that come in to
@@ -1972,31 +2062,40 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
       //
       // Issuing credit needs no key of its own — that route admits owners and
       // property managers only, and an onsite manager is neither.
-      { key: 'take_payment',            label: 'Record a cash / check payment', hint: 'marks a charge paid — GAM moves no money' },
-      { key: 'payments.import_history', label: 'Import payment history', sensitive: true },
+      { key: 'take_payment',            label: 'Record a cash / check payment',
+        hint: 'Take a payment at the counter: cash, check, money order, or a card on the reader. Also sets how much paid-ahead money each bill uses and, while you are moving onto GAM, marks a first rent as paid in your old system. No credit or refunds.' },
+      { key: 'payments.import_history', label: 'Import payment history', sensitive: true,
+        hint: 'Upload a spreadsheet of residents\' past payments from your old system.' },
     ]}],
   },
   {
     category: 'balances', label: 'Outstanding Balances',
     sections: [{ label: 'Access', items: [
-      { key: 'balances.view', label: 'View who owes + contact', hint: 'read-only: name, unit, amount owed, phone/email' },
+      { key: 'balances.view', label: 'View who owes + contact',
+        hint: 'Shows Outstanding Balances: who owes, their unit, how much, and their phone and email. Look only.' },
     ]}],
   },
   {
     category: 'reports', label: 'Reports',
     sections: [
       { label: 'Reports', items: [
-        { key: 'reports.tab.overview',  label: 'Overview' },
-        { key: 'reports.tab.property',  label: 'By property' },
-        { key: 'reports.tab.annual',    label: 'Annual & tax', sensitive: true, hint: 'tenant 1099 PII' },
-        { key: 'reports.tab.statement', label: 'Owner statement' },
+        { key: 'reports.tab.overview',  label: 'Overview',
+          hint: 'Has no effect for staff: report numbers are owner-only.' },
+        { key: 'reports.tab.property',  label: 'By property',
+          hint: 'Has no effect for staff: report numbers are owner-only.' },
+        { key: 'reports.tab.annual',    label: 'Annual & tax', sensitive: true,
+          hint: 'Has no effect for staff: tax reports are owner-only.' },
+        { key: 'reports.tab.statement', label: 'Owner statement',
+          hint: 'Has no effect for staff: owner statements are owner-only.' },
         // S603: the flexible report builder + T-12. Financial like the rest of
         // this category — a scoped staffer granted it still only ever sees their
         // assigned properties (the engine applies property scope server-side).
-        { key: 'reports.tab.custom',    label: 'Custom & T-12' },
+        { key: 'reports.tab.custom',    label: 'Custom & T-12',
+          hint: 'Has no effect for staff: custom reports are owner-only.' },
       ]},
       { label: 'Actions', items: [
-        { key: 'reports.export', label: 'Export / print' },
+        { key: 'reports.export', label: 'Export / print',
+          hint: 'Has no effect for staff: reports are owner-only, so there is nothing for them to export.' },
       ]},
     ],
   },
@@ -2004,34 +2103,49 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     category: 'maintenance', label: 'Maintenance',
     sections: [
       { label: 'Tabs', items: [
-        { key: 'maintenance.tab.outages', label: 'Outages' },
+        { key: 'maintenance.tab.outages', label: 'Outages',
+          hint: 'The Outages tab: post a water, power, or other outage notice for residents and mark it fixed. They also get told when one is posted.' },
       ]},
       { label: 'Access & actions', items: [
-        { key: 'maintenance.view',       label: 'View work orders' },
-        { key: 'maintenance.create',     label: 'Log request' },
-        { key: 'maintenance.approve',    label: 'Approve / reject' },
-        { key: 'maintenance.assign',     label: 'Assign worker' },
-        { key: 'maintenance.update',     label: 'Update work order' },
-        { key: 'maintenance.comment',    label: 'Add notes' },
-        { key: 'maintenance.view_costs', label: 'View cost breakdown', sensitive: true, hint: 'financial roll-up' },
+        { key: 'maintenance.view',       label: 'View work orders',
+          hint: 'Shows the Maintenance page and its repair jobs. Changes need the permissions below.' },
+        { key: 'maintenance.create',     label: 'Log request',
+          hint: 'Log a new repair request for a unit.' },
+        { key: 'maintenance.approve',    label: 'Approve / reject',
+          hint: 'Has no effect for staff: approving a job over your spending limit is owner-only.' },
+        { key: 'maintenance.assign',     label: 'Assign worker',
+          hint: 'Choose who a job goes to: a maintenance worker or a work-trade resident. Saving the choice also needs "Update work order".' },
+        { key: 'maintenance.update',     label: 'Update work order',
+          hint: 'Change a job\'s status, schedule, cost, and notes, and add receipts.' },
+        { key: 'maintenance.comment',    label: 'Add notes',
+          hint: 'Add notes to a repair job.' },
+        { key: 'maintenance.view_costs', label: 'View cost breakdown', sensitive: true,
+          hint: 'Has no effect for staff: the job counts and cost totals on Maintenance are owner-only.' },
       ]},
     ],
   },
   {
     category: 'inspections', label: 'Inspections',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'inspections.view',   label: 'View inspections' },
-      { key: 'inspections.create', label: 'Create inspection' },
-      { key: 'inspections.manage', label: 'Manage / finalize inspections' },
+      { key: 'inspections.view',   label: 'View inspections',
+        hint: 'Shows the Inspections page with each unit\'s inspection reports.' },
+      { key: 'inspections.create', label: 'Create inspection',
+        hint: 'Start a new inspection for a unit.' },
+      { key: 'inspections.manage', label: 'Manage / finalize inspections',
+        hint: 'Finish and lock an inspection report, or flag one that looks wrong.' },
     ]}],
   },
   {
     category: 'amenities', label: 'Amenities',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'amenities.view',                label: 'View common areas' },
-      { key: 'amenities.manage_areas',        label: 'Manage areas' },
-      { key: 'amenities.hold',                label: 'Place holds' },
-      { key: 'amenities.review_reservations', label: 'Review reservations' },
+      { key: 'amenities.view',                label: 'View common areas',
+        hint: 'Has no effect: the Amenities tab sits inside each property, so anyone with "View properties" already sees it.' },
+      { key: 'amenities.manage_areas',        label: 'Manage areas',
+        hint: 'Add, change, or remove common areas like a pool or clubhouse.' },
+      { key: 'amenities.hold',                label: 'Place holds',
+        hint: 'Close a common area for a while (for repairs or an event) so residents cannot book it.' },
+      { key: 'amenities.review_reservations', label: 'Review reservations',
+        hint: 'Approve or decline residents\' requests to book a common area.' },
     ]}],
   },
   {
@@ -2040,59 +2154,74 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     // the catalog, so no landlord could grant it from the permissions page.
     category: 'utilities', label: 'Meter readings',
     sections: [{ label: 'Access', items: [
-      { key: 'utility.read_meters', label: 'Enter meter readings', hint: 'the monthly walk, a one-off read, and the meter photo' },
+      { key: 'utility.read_meters', label: 'Enter meter readings',
+        hint: 'Walk the meters and enter each reading with a photo; they get the notice when reads are due. They read blind: they do not see past readings, prices or master bills. No meter setup or approvals.' },
     ]}],
   },
   {
     category: 'documents', label: 'Documents',
     sections: [{ label: 'Access', items: [
-      { key: 'documents.view', label: 'View documents' },
-      { key: 'documents.upload', label: 'Upload documents' },
+      { key: 'documents.view', label: 'View documents',
+        hint: 'Shows the Documents page: files saved for your properties and residents. Look only.' },
+      { key: 'documents.upload', label: 'Upload documents',
+        hint: 'Upload files to Documents and choose which properties they belong to.' },
       // S652 (Nic): "maintenance people need to be able to add a picture…
       // a picture of said notice to that tenant's profile." A photo from the
       // phone straight onto the resident's record — nothing else in Documents.
-      { key: 'documents.post_photo', label: 'Add photos & posted notices to a resident', hint: 'camera upload onto the resident\'s record' },
+      { key: 'documents.post_photo', label: 'Add photos & posted notices to a resident',
+        hint: 'Take a photo on their phone (like a posted notice) and add it to a resident\'s record.' },
     ]}],
   },
   {
     category: 'inventory', label: 'Inventory',
     sections: [{ label: 'Access', items: [
-      { key: 'inventory.view', label: 'View inventory' },
+      { key: 'inventory.view', label: 'View inventory',
+        hint: 'Has no effect for staff: the parts inventory is owner-only.' },
     ]}],
   },
   {
     category: 'entry_requests', label: 'Entry Requests',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'entry_requests.view',   label: 'View entry requests' },
-      { key: 'entry_requests.create', label: 'Create entry request' },
-      { key: 'entry_requests.manage', label: 'Grant / deny / record entry' },
+      { key: 'entry_requests.view',   label: 'View entry requests',
+        hint: 'The Entry Requests tab in Maintenance: times you asked residents to let someone in. They need a Maintenance permission to reach that page.' },
+      { key: 'entry_requests.create', label: 'Create entry request',
+        hint: 'Ask a resident for a time to enter their home for a repair job or an inspection.' },
+      { key: 'entry_requests.manage', label: 'Grant / deny / record entry',
+        hint: 'Record that the entry happened, or cancel a request. The resident is the one who says yes or no.' },
     ]}],
   },
   {
     category: 'applicant_pool', label: 'Applicant Pool',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'applicant_pool.view',      label: 'View applicant pool' },
-      { key: 'applicant_pool.reach_out', label: 'Reach out to candidates' },
+      { key: 'applicant_pool.view',      label: 'View applicant pool',
+        hint: 'Has no effect for staff: the applicant list is owner-only.' },
+      { key: 'applicant_pool.reach_out', label: 'Reach out to candidates',
+        hint: 'Has no effect for staff: reaching out needs the applicant list, which is owner-only.' },
     ]}],
   },
   {
     category: 'background_checks', label: 'Background Checks',
     sections: [{ label: 'Access', items: [
-      { key: 'background_checks.view', label: 'View background checks', sensitive: true, hint: 'applicant risk PII' },
+      { key: 'background_checks.view', label: 'View background checks', sensitive: true,
+        hint: 'Has no effect for staff: background check results are owner-only.' },
     ]}],
   },
   {
     category: 'screening', label: 'Rental History',
     sections: [{ label: 'Access', items: [
-      { key: 'screening.view', label: 'View rental history', sensitive: true, hint: 'cross-landlord behavioral PII' },
+      { key: 'screening.view', label: 'View rental history', sensitive: true,
+        hint: 'Shows Rental History: a resident\'s payment record on GAM, including what other GAM landlords share.' },
     ]}],
   },
   {
     category: 'pm_invitations', label: 'PM Invitations',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'pm_invitations.view',    label: 'View PM invitations' },
-      { key: 'pm_invitations.send',    label: 'Send PM invitation', sensitive: true, hint: 'grants 3rd-party control + fee cut' },
-      { key: 'pm_invitations.respond', label: 'Accept / reject PM invitation', sensitive: true, hint: 'grants 3rd-party control + fee cut' },
+      { key: 'pm_invitations.view',    label: 'View PM invitations',
+        hint: 'Has no effect: PM Invitations is turned off.' },
+      { key: 'pm_invitations.send',    label: 'Send PM invitation', sensitive: true,
+        hint: 'Has no effect: PM Invitations is turned off. When on, it hands an outside management company control of a property and a cut of fees.' },
+      { key: 'pm_invitations.respond', label: 'Accept / reject PM invitation', sensitive: true,
+        hint: 'Has no effect: PM Invitations is turned off. When on, it accepts or turns down a management company\'s offer to run a property.' },
     ]}],
   },
   {
@@ -2100,17 +2229,23 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     // settings.security (the owner's own login 2FA) is intentionally excluded —
     // it can't meaningfully apply to another user.
     sections: [{ label: 'Sections', items: [
-      { key: 'settings.account_view',         label: 'Account info' },
-      { key: 'settings.billing_view',         label: 'Billing info', sensitive: true },
-      { key: 'settings.maintenance_approval', label: 'Maintenance approval threshold', sensitive: true, hint: 'controls spend that bypasses approval' },
-      { key: 'settings.default_pm_company',   label: 'Default PM company', sensitive: true },
+      { key: 'settings.account_view',         label: 'Account info',
+        hint: 'See the company name, whether the tax ID is on file, and the owner\'s name and email. Look only.' },
+      { key: 'settings.billing_view',         label: 'Billing info', sensitive: true,
+        hint: 'See what GAM charges you and whether your bank is set up, plus each property\'s billing start month and meter-photo and repair-request settings. Look only.' },
+      { key: 'settings.maintenance_approval', label: 'Maintenance approval threshold', sensitive: true,
+        hint: 'Set the dollar limits above which repairs and deposit refunds wait for your OK, and whether utility bills wait for review. Careful: it also lets them raise their own limits, rename the company, and change its tax ID and default early move-out fee.' },
+      { key: 'settings.default_pm_company',   label: 'Default PM company', sensitive: true,
+        hint: 'Has no effect: outside management companies are turned off.' },
     ]}],
   },
   {
     category: 'notification_prefs', label: 'Notification Prefs',
     sections: [{ label: 'Access & actions', items: [
-      { key: 'notification_prefs.view',           label: 'Notification preferences' },
-      { key: 'notification_prefs.email_failures', label: 'Email delivery issues', sensitive: true, hint: 'exposes recipient emails' },
+      { key: 'notification_prefs.view',           label: 'Notification preferences',
+        hint: 'Has no effect: anyone who can open Settings already picks which GAM emails they get there.' },
+      { key: 'notification_prefs.email_failures', label: 'Email delivery issues', sensitive: true,
+        hint: 'Has no effect for staff: the list of emails that did not get delivered is owner-only.' },
     ]}],
   },
 ]
@@ -2567,15 +2702,28 @@ export const UNIT_TYPE_HAS_BEDROOMS: Record<UnitType, boolean> = {
 // ---------- Landlord-issued tenant account credits (S577 — Nic) ----------
 // A landlord issues a credit to a tenant for any reason; it's applied to the
 // tenant's next rent invoice (funded by the landlord = less rent received).
-// Single source of truth for the tenant_credits.category CHECK.
+//
+// S655 (money plan drift fix): TWO lists, on purpose.
+//   TENANT_CREDIT_CATEGORIES      what a LANDLORD may issue by hand (the credit
+//                                 form's choices and the issue route's check).
+//   TENANT_CREDIT_ALL_CATEGORIES  the tenant_credits.category CHECK: the above
+//                                 plus 'deposit_interest', which only GAM writes
+//                                 (statutory interest on a GAM-escrow deposit).
+// Deposit interest is GAM-FUNDED: the ledger treats it as money GAM holds and
+// pays its share out to the landlord when it is used. A landlord who could pick
+// "deposit interest" on the credit form would be paid real money for a credit
+// they issued themselves, so it is never on the issuable list.
 export const TENANT_CREDIT_CATEGORIES = ['screening_cap', 'late_fee_refund', 'overcharge', 'goodwill', 'other'] as const
 export type TenantCreditCategory = typeof TENANT_CREDIT_CATEGORIES[number]
-export const TENANT_CREDIT_CATEGORY_LABEL: Record<TenantCreditCategory, string> = {
-  screening_cap:   'Screening fee (state cap)',
-  late_fee_refund: 'Late fee refund',
-  overcharge:      'Overcharge correction',
-  goodwill:        'Goodwill',
-  other:           'Other',
+export const TENANT_CREDIT_ALL_CATEGORIES = [...TENANT_CREDIT_CATEGORIES, 'deposit_interest'] as const
+export type TenantCreditAnyCategory = typeof TENANT_CREDIT_ALL_CATEGORIES[number]
+export const TENANT_CREDIT_CATEGORY_LABEL: Record<TenantCreditAnyCategory, string> = {
+  screening_cap:    'Screening fee (state cap)',
+  late_fee_refund:  'Late fee refund',
+  overcharge:       'Overcharge correction',
+  goodwill:         'Goodwill',
+  other:            'Other',
+  deposit_interest: 'Deposit interest',
 }
 
 // ---------- Property-scoped tenant surveys (S577 — Nic) ----------
@@ -3873,8 +4021,104 @@ export const UNIT_BOOKING_WAITLIST_STATUSES = ['waiting', 'notified', 'claimed',
 export type UnitBookingWaitlistStatus = typeof UNIT_BOOKING_WAITLIST_STATUSES[number]
 
 // Master Schedule change-history (Walkthrough #10).
-export const UNIT_BOOKING_EVENT_TYPES = ['created', 'moved', 'dates_changed', 'status_changed', 'cancelled'] as const
+// 'money_settled' (decisions #38): what an early check-out did with the money —
+// "Left early — $90.00 back to Visa ••4242, $190.00 cash handed back".
+export const UNIT_BOOKING_EVENT_TYPES = ['created', 'moved', 'dates_changed', 'status_changed', 'cancelled', 'money_settled'] as const
 export type UnitBookingEventType = typeof UNIT_BOOKING_EVENT_TYPES[number]
+
+// ── Early check-out: what happens to the money (decisions #37.B, #38) ──
+//
+// When a guest leaves before the booked day, whoever checks them out answers
+// one question (services/earlyCheckOut.ts quoteEarlyCheckOut decides which):
+//   - they still owe for the stay → 'keep_price' ("Keep the price as booked")
+//     or 'nights_only' ("Charge only the nights stayed" — never more than the
+//     booked price, #38 Q7);
+//   - they paid more than the nights stayed are worth → 'no_refund' ("No refund
+//     (keep the price as booked)"), 'refund_unused' ("Refund the unused nights")
+//     or 'refund_other' ("Refund a different amount", up to what they paid —
+//     also how a full refund is done).
+// A refund re-prices nothing (#38 Q2). Single source for the
+// stay_checkout_decisions_choice_check CHECK.
+export const EARLY_CHECKOUT_CHOICES = ['keep_price', 'nights_only', 'no_refund', 'refund_unused', 'refund_other'] as const
+export type EarlyCheckoutChoice = typeof EARLY_CHECKOUT_CHOICES[number]
+/** The choices that send money back (need "Issue refunds", pos.refund). */
+export const EARLY_CHECKOUT_REFUND_CHOICES: readonly EarlyCheckoutChoice[] = ['no_refund', 'refund_unused', 'refund_other']
+export const EARLY_CHECKOUT_CHOICE_LABEL: Record<EarlyCheckoutChoice, string> = {
+  keep_price: 'Keep the price as booked',
+  nights_only: 'Charge only the nights stayed',
+  no_refund: 'No refund (keep the price as booked)',
+  refund_unused: 'Refund the unused nights',
+  refund_other: 'Refund a different amount',
+}
+/** A money question waiting on a stay (stay_checkout_decisions.status). 'undone': the check-out was put back. */
+export const STAY_CHECKOUT_DECISION_STATUSES = ['pending', 'decided', 'undone'] as const
+export type StayCheckoutDecisionStatus = typeof STAY_CHECKOUT_DECISION_STATUSES[number]
+/**
+ * How one part of a refund goes back — the way that money was paid (#37.B,
+ * #38 Q10): a card → refunded to that same card; a bank (ACH) payment → back
+ * to the bank; cash, a check or a money order → handed back at the desk; a
+ * charge account → back onto the account; paid-ahead credit → back to credit.
+ */
+export const STAY_REFUND_PART_KINDS = ['card', 'bank', 'cash', 'check', 'money_order', 'charge', 'credit'] as const
+export type StayRefundPartKind = typeof STAY_REFUND_PART_KINDS[number]
+/**
+ * A refund part's status (stay_refund_parts_status_check). 'replaced': a card
+ * or bank part that did not go out and was given back in cash instead — the
+ * cash part that took its place carries the money (migration 20261004410600).
+ */
+export const STAY_REFUND_PART_STATUSES = ['pending', 'refunded', 'handed_back', 'credited', 'failed', 'replaced'] as const
+export type StayRefundPartStatus = typeof STAY_REFUND_PART_STATUSES[number]
+/** Where a payment toward a stay came from (stay_payments.kind). */
+export const STAY_PAYMENT_KINDS = ['site_deposit', 'pos_sale'] as const
+export type StayPaymentKind = typeof STAY_PAYMENT_KINDS[number]
+/** How a payment toward a stay was paid (stay_payments_method_check) — a register sale's payment_method. */
+export const STAY_PAYMENT_METHODS = ['card', 'card_on_file', 'cash', 'check', 'charge'] as const
+export type StayPaymentMethod = typeof STAY_PAYMENT_METHODS[number]
+/** How a register refund was paid back (pos_refunds_method_check). 'card': back to the card through Stripe (#37.B). */
+export const POS_REFUND_METHODS = ['cash', 'check', 'charge', 'card'] as const
+export type PosRefundMethod = typeof POS_REFUND_METHODS[number]
+
+// ── Paid-ahead money left on an ended lease: the landlord's choice (decisions #46.1) ──
+//
+// Nic (10/4, FINAL): paid-ahead money left when ANY lease ends gets the
+// landlord's refund choices — and after "No refund" (or a refund of part of it)
+// the LANDLORD chooses what happens to the rest. GAM never decides it.
+// services/paidAheadChoice.ts is the one place this is done; a refund goes back
+// the way the money was paid (services/earlyCheckOut planRefund). Single source
+// for paid_ahead_choices_refund_choice_check / _rest_choice_check.
+export const PAID_AHEAD_REFUND_CHOICES = ['no_refund', 'refund_all', 'refund_other'] as const
+export type PaidAheadRefundChoice = typeof PAID_AHEAD_REFUND_CHOICES[number]
+export const PAID_AHEAD_REFUND_CHOICE_LABEL: Record<PaidAheadRefundChoice, string> = {
+  no_refund: 'No refund',
+  // Nic's own words for this choice (decisions #46.1: "No refund / Refund the
+  // unused days / Refund a different amount") — review fix pass 3.
+  refund_all: 'Refund the unused days',
+  refund_other: 'Refund a different amount',
+}
+/** "Refund the unused days" when only part of the money can go back (the rest has no payment to go back to): what it is named, before and after. */
+export const PAID_AHEAD_REFUND_ALL_PARTIAL_LABEL = 'Refund all that can go back'
+/** What happens to what is not refunded: the landlord's money, or still the tenant's as account credit (never a cash-out). */
+export const PAID_AHEAD_REST_CHOICES = ['keep', 'credit'] as const
+export type PaidAheadRestChoice = typeof PAID_AHEAD_REST_CHOICES[number]
+export const PAID_AHEAD_REST_CHOICE_LABEL: Record<PaidAheadRestChoice, string> = {
+  keep: 'Keep it',
+  credit: 'Leave it as their credit',
+}
+
+// S655: a reservation's status. Single source for the unit_bookings_status_check
+// CHECK, and the words the schedule shows for each (the booking PATCH refuses
+// anything else in these words, and the schedule prints them).
+export const BOOKING_STATUSES = ['tentative', 'confirmed', 'checked_in', 'checked_out', 'cancelled', 'no_show'] as const
+export type BookingStatus = typeof BOOKING_STATUSES[number]
+export const BOOKING_STATUS_LABEL: Record<BookingStatus, string> = {
+  tentative: 'Tentative',
+  confirmed: 'Confirmed',
+  checked_in: 'Checked in',
+  checked_out: 'Checked out',
+  // American spelling on screen; the stored value stays 'cancelled'.
+  cancelled: 'Canceled',
+  no_show: 'No-show',
+}
 
 // Master Schedule stay pricing (Nic 2026-06-27). The rate tier is implied by
 // the length of stay and prorated for odd lengths; short-term stays add a
@@ -5221,6 +5465,8 @@ export * from './camelize'
 export * from './versionWatch'
 export * from './autoPlaceEstimate'
 export * from './screeningFee'
+// === S655 money plan: credits, report bases, property breakdown, bank, FlexPay ===
+export * from './money'
 
 // ============================================================
 // S26a: Invoice types
@@ -5235,8 +5481,22 @@ export type InvoiceStatus = typeof INVOICE_STATUSES[number]
 
 // S180: 'paid_via_deposit' added for the move-out deposit sweep.
 // Distinct from 'settled' (real money in) and 'failed' (still owed).
-export const PAYMENT_STATUSES = ['pending', 'processing', 'settled', 'failed', 'returned', 'paid_via_deposit'] as const
+// 10/4 (decisions #48.5, migration 20261004530000_payments_voided_status):
+// 'voided' — a charge nobody owes that a payment had already touched (e.g. the
+// fee of a canceled reservation). Kept forever as a record (voided_at +
+// void_reason), owed by nobody, paid by nothing, left out of every balance.
+export const PAYMENT_STATUSES = ['pending', 'processing', 'settled', 'failed', 'returned', 'paid_via_deposit', 'voided'] as const
 export type PaymentStatus = typeof PAYMENT_STATUSES[number]
+/** S655: a charge's status in plain words, for any screen that shows one (never the raw value). */
+export const PAYMENT_STATUS_LABEL: Record<PaymentStatus, string> = {
+  pending: 'Not paid yet',
+  processing: 'Clearing',
+  settled: 'Paid',
+  failed: 'Failed',
+  returned: 'Returned',
+  paid_via_deposit: 'Paid from deposit',
+  voided: 'Voided',
+}
 
 // S568: 'home_payment' = amortized financed-home-sale installment (routes to the
 // landlord/seller like rent; billed as its own line, auto-stops at term). Kept
@@ -6973,8 +7233,19 @@ export function connectRequirementLabels(keys: string[]): string[] {
 // it is 'landlord'. If they owe it because they used a GAM service — a returned
 // bank payment, a declined card, an opt-in product — it is 'gam'. When in doubt
 // it is the landlord's; GAM's list is short, closed, and above.
-export const REVENUE_OWNERS = ['landlord', 'gam'] as const
+//
+// S655 (money plan drift fix): 'held' joins the list to match the
+// payments_revenue_owner_check CHECK (S653). A 'held' row is a prepaid move-in
+// box: money held for the tenant, neither the landlord's at settlement nor
+// GAM's revenue. When it settles it becomes paid-ahead money (the payments
+// trigger prepaid_fee_follows_payment), funded by whoever took it.
+export const REVENUE_OWNERS = ['landlord', 'gam', 'held'] as const
 export type RevenueOwner = typeof REVENUE_OWNERS[number]
+export const REVENUE_OWNER_LABEL: Record<RevenueOwner, string> = {
+  landlord: 'Landlord',
+  gam:      'GAM',
+  held:     'Held for the tenant (paid ahead)',
+}
 
 // The complete list of what GAM keeps (Nic). Everything not here is the
 // landlord's. Kept as codes so a reader can check a payments row against it.

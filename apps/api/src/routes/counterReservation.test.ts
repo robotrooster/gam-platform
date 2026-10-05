@@ -246,22 +246,43 @@ describe('a reservation paid at the till', () => {
     const bookingId = made.body.data.id
     const ticketId = made.body.data.registerTicketId
 
-    const sale = await request(posApp()).post('/api/pos/transactions')
+    // 10/2 (decisions #9): the register opens the ticket from the server, and
+    // the stay comes priced as the reservation — never the $0 it was written with.
+    const opened = await request(posApp()).get(`/api/pos/tickets/${ticketId}?propertyId=${f.propertyId}&kind=ticket`)
+      .set('Authorization', `Bearer ${f.token}`)
+    expect(opened.status, JSON.stringify(opened.body)).toBe(200)
+    expect(opened.body.data.items).toHaveLength(1)
+    expect(opened.body.data.items[0]).toMatchObject({ id: itemId, qty: 1, price: 280, tax: 0, stay: true, reservation: true })
+    expect(opened.body.data.items[0].name).toMatch(/7 nights at site RV 01 \(Mar 6 → Mar 13\)/)
+
+    // A register still showing the old $0 line is refused — nothing is charged.
+    const stale = await request(posApp()).post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.token}`)
       .send({
         items: [{ id: itemId, name: 'RV site — nightly', qty: 7, price: 0, tax: 0 }],
         paymentMethod: 'cash', propertyId: f.propertyId, openTicketId: ticketId,
       })
+    expect(stale.status).toBe(409)
+    expect(stale.body.error).toMatch(/comes to \$280\.00 .* nothing was charged\. Press Clear, open the ticket again, then press Charge\./)
+    expect(await query('SELECT 1 FROM pos_transactions')).toHaveLength(0)
+
+    const sale = await request(posApp()).post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({
+        items: opened.body.data.items,
+        paymentMethod: 'cash', propertyId: f.propertyId, openTicketId: ticketId,
+      })
     expect(sale.status, JSON.stringify(sale.body)).toBe(201)
 
-    const bookings = await query<any>(`SELECT id, status, deposit_paid_at, pos_transaction_id FROM unit_bookings`)
+    const bookings = await query<any>(`SELECT id, status, deposit_paid_at, pos_transaction_id, total_amount::float AS total FROM unit_bookings`)
     expect(bookings).toHaveLength(1)
     expect(bookings[0].id).toBe(bookingId)
     expect(bookings[0].status).toBe('confirmed')
     expect(bookings[0].deposit_paid_at).toBeTruthy()
     expect(bookings[0].pos_transaction_id).toBe(sale.body.data.id)
-    // Priced from the site, not from the zero the ticket carried.
-    expect(Number(sale.body.data.total)).toBe(280)   // 7 × $40
+    // The reservation's own price, and the booking's price untouched.
+    expect(Number(sale.body.data.total)).toBe(280)   // 7 × $40, as quoted
+    expect(bookings[0].total).toBe(280)
   })
 
   it('refuses to settle a reservation that was cancelled while it waited', async () => {

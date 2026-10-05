@@ -11,7 +11,25 @@
  * never be charged. The row now carries the grace so the screen can tell the
  * difference between "late" and "later than the 1st".
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+// S655: pinning a method reads the tenant's saved methods from Stripe.
+const { pmRetrieve, pmList, siList, customersRetrieve } = vi.hoisted(() => ({
+  pmRetrieve: vi.fn(async (id: string): Promise<any> => ({ id, customer: 'cus_autopay', type: 'us_bank_account' })),
+  pmList: vi.fn(async (o: any): Promise<any> => ({ data: o.type === 'us_bank_account'
+    ? [{ id: 'pm_bank_ok', customer: 'cus_autopay', type: 'us_bank_account', us_bank_account: { bank_name: 'First', last4: '6789' } }]
+    : [] })),
+  siList: vi.fn(async (): Promise<any> => ({ data: [] })),
+  customersRetrieve: vi.fn(async (): Promise<any> => ({ id: 'cus_autopay', invoice_settings: { default_payment_method: 'pm_bank_ok' } })),
+}))
+vi.mock('../lib/stripe', () => ({
+  getStripe: () => ({
+    paymentMethods: { retrieve: pmRetrieve, list: pmList },
+    setupIntents: { list: siList },
+    customers: { retrieve: customersRetrieve },
+  }),
+}))
+
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
@@ -125,5 +143,73 @@ describe('GET /api/autopay carries the grace period (S616)', () => {
     // The card's rule: inside dueDay..lastFreeDay is free.
     const lastFreeDay = row.rentDueDay + row.lateFeeGraceDays - 1
     expect(row.pullDay).toBeLessThanOrEqual(lastFreeDay)
+  })
+})
+
+// ── S655 (Nic, 10/2): "use my account credit first", and what may be pinned ──
+describe('PUT /api/autopay — the credit setting and the method it charges', () => {
+  beforeEach(() => {
+    pmRetrieve.mockClear(); siList.mockClear()
+    siList.mockResolvedValue({ data: [] })
+    pmRetrieve.mockImplementation(async (id: string) => ({ id, customer: 'cus_autopay', type: 'us_bank_account' }))
+  })
+  const put = (f: any, body: any) => request(buildApp()).put('/api/autopay').set('Authorization', `Bearer ${f.token}`)
+    .send({ leaseId: f.leaseId, ...body })
+  const setting = async (f: any) => (await request(buildApp()).get('/api/autopay')
+    .set('Authorization', `Bearer ${f.token}`)).body.data[0].useCredit
+
+  it('use my credit first is off by default, saved when the tenant turns it on, and kept when not sent', async () => {
+    const f = await seed()
+    expect((await put(f, { enabled: true })).status).toBe(200)
+    expect(await setting(f)).toBe(false)
+    const on = await put(f, { enabled: true, useCredit: true })
+    expect(on.status).toBe(200)
+    expect(on.body.data.useCredit).toBe(true)
+    expect(await setting(f)).toBe(true)
+    // Changing the day says nothing about credit: the setting stays as it was.
+    expect((await put(f, { enabled: true, pullDay: 3 })).status).toBe(200)
+    expect(await setting(f)).toBe(true)
+    expect((await put(f, { enabled: true, useCredit: false })).status).toBe(200)
+    expect(await setting(f)).toBe(false)
+  })
+
+  it('a bank still waiting on its microdeposits cannot be pinned for autopay', async () => {
+    const f = await seed()
+    await db.query(`UPDATE tenants SET stripe_customer_id = 'cus_autopay' WHERE id = $1`, [f.tenantId])
+    // Not attached yet (S637): Stripe has it only on a SetupIntent that waits on the tenant.
+    pmRetrieve.mockImplementation(async (id: string) => ({ id, customer: null, type: 'us_bank_account' }))
+    siList.mockResolvedValue({ data: [{
+      id: 'seti_new', status: 'requires_action', created: 1, next_action: { type: 'verify_with_microdeposits', verify_with_microdeposits: {} },
+      payment_method: { id: 'pm_bank_new', type: 'us_bank_account', us_bank_account: { bank_name: 'Second', last4: '1111' } },
+    }] })
+    const res = await put(f, { enabled: true, paymentMethodId: 'pm_bank_new' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/still being verified/)
+    const { rows } = await db.query(`SELECT 1 FROM tenant_autopay WHERE lease_id = $1`, [f.leaseId])
+    expect(rows).toHaveLength(0)
+  })
+
+  it('a verified bank on the account can be pinned', async () => {
+    const f = await seed()
+    await db.query(`UPDATE tenants SET stripe_customer_id = 'cus_autopay' WHERE id = $1`, [f.tenantId])
+    const res = await put(f, { enabled: true, paymentMethodId: 'pm_bank_ok' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data.paymentMethodId).toBe('pm_bank_ok')
+  })
+
+  it('a bank cannot be pinned while bank payments are paused after a return', async () => {
+    const f = await seed()
+    await db.query(`UPDATE tenants SET stripe_customer_id = 'cus_autopay', ach_suspended_at = NOW() WHERE id = $1`, [f.tenantId])
+    const res = await put(f, { enabled: true, paymentMethodId: 'pm_bank_ok' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/paused/)
+  })
+
+  it('a method that is not on the tenant\'s account is refused', async () => {
+    const f = await seed()
+    await db.query(`UPDATE tenants SET stripe_customer_id = 'cus_autopay' WHERE id = $1`, [f.tenantId])
+    pmRetrieve.mockImplementation(async (id: string) => ({ id, customer: 'cus_someone_else', type: 'us_bank_account' }))
+    const res = await put(f, { enabled: true, paymentMethodId: 'pm_stranger' })
+    expect(res.status).toBe(403)
   })
 })

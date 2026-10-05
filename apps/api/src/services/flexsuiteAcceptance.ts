@@ -16,7 +16,11 @@ import { todayIn } from '../lib/timezone'
 // audit artifact for the SLA-not-loan / subscription structural
 // defense. See migrations/20260518140000_flexsuite_enrollment_acceptances.sql.
 
-export const FLEXPAY_TEMPLATE_VERSION     = '1.0.0'
+// 10/3 (Nic): 2.1.0 — matches legal/FLEXPAY_SUBSCRIPTION_TERMS.md "Template
+// Version: 2.1" (the code had drifted at 1.0.0 behind the doc's 2.0). 2.1 takes
+// home payments off the Covered Lines: a payment toward owning a home is a
+// real-property interest GAM will not hold a claim in.
+export const FLEXPAY_TEMPLATE_VERSION     = '2.1.0'
 // S514: bumped 1.0.0 → 2.0.0 with the custody-model rewrite. The new
 // template (FLEXDEPOSIT_CUSTODY_AGREEMENT.md) replaces the advance/SLA
 // model with the deposit-custody model of Consumer ToS § 9.1. Tenants on

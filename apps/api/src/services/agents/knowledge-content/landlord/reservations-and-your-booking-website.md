@@ -18,6 +18,10 @@ Short stays (under 30 nights) pay a **percentage of the stay total** as a deposi
 
 The Master Schedule's timeline shows every unit's bookings and leases on one grid. You can drag a reservation to another unit or date, drag its edges to change check-in/check-out, and work from the list, reservations, and history tabs. Guest-submitted change requests appear for your approve/decline.
 
+## Checking a guest out
+
+Checking a guest out — on the day, or early — is done on the Master Schedule: open the stay and press **Check out**. When a guest leaves before the booked day, that window asks one question about the money (keep the price as booked or charge only the nights stayed; or, if they paid more than the nights stayed are worth, no refund, refund the unused nights, or a different amount) and sends any refund back the way it was paid. A long stay's lease ends on the day they leave. The assistant cannot check a guest out or decide anything about the money — point the person to the schedule's Check out button.
+
 ## Long stays become leases
 
 Anyone staying **30 or more nights** (7+, if the property runs weekly leases) gets a **draft lease created automatically**. You're notified with the guest's GAM history — prior stays, any approved background check, and whether they've had continuous tenancy since — and you decide: screen first, or send the lease directly if you know them. The system never auto-sends a background check.

@@ -11,6 +11,10 @@ export interface AllocatablePayment {
   type?: string
   /** S609: propane marker, since a fill is billed as type 'utility'. */
   entry_description?: string | null
+  /** S655: creation time, the tie-break after due date and charge type. Pass
+   *  it (payments.created_at): a row without it sorts after every row that has
+   *  it, like NULLS LAST in the SQL twin. */
+  created_at?: string | Date | null
 }
 
 /**
@@ -28,8 +32,9 @@ export interface AllocatablePayment {
  * short. Rent short means a late fee and an eviction clock — over a propane
  * bill.
  *
- * Late fees are computed on RENT alone (jobs/lateFees), so protecting rent from
- * being crowded out is what actually keeps the clock from starting.
+ * A late fee fires on any unpaid line that is not itself a late fee
+ * (jobs/lateFees), so protecting the current bill from being crowded out is
+ * what actually keeps the clock from starting.
  *
  * Within each group the ordinary oldest-first rule still applies; this only says
  * which group gets paid first.
@@ -66,6 +71,59 @@ export const isCarriedBalance = (p: AllocatablePayment): boolean =>
 const priority = (p: AllocatablePayment): number =>
   isCarriedBalance(p) ? 2 : isPropane(p) ? 1 : 0
 
+/**
+ * S655 (money plan §1.4): on the same due date, the order charges are paid in.
+ * Kim Harland's rent, water and trash were all due the same day and created in
+ * the same second; her $450 move-in special belongs on the rent, and only a
+ * fixed type order puts it there every time.
+ */
+export const ALLOCATION_TYPE_ORDER = ['rent', 'utility', 'late_fee', 'fee', 'home_payment'] as const
+const typeRank = (p: AllocatablePayment): number => {
+  const i = (ALLOCATION_TYPE_ORDER as readonly string[]).indexOf(p.type ?? '')
+  return i === -1 ? ALLOCATION_TYPE_ORDER.length : i
+}
+const createdMs = (p: AllocatablePayment): number | null => {
+  if (p.created_at == null) return null
+  const ms = p.created_at instanceof Date ? p.created_at.getTime() : Date.parse(p.created_at)
+  return Number.isFinite(ms) ? ms : null
+}
+
+/**
+ * THE ONE ALLOCATION ORDER (S655, money plan §1.4). Every path that decides
+ * which charge money or credit pays first uses this comparator, and the SQL
+ * twin in apps/api/src/services/moneyPredicates.ts (allocationOrderSql):
+ *
+ *   1. bucket: ordinary charges, then propane, then carried balance (S609/S622)
+ *   2. due date, oldest first
+ *   3. type: rent, utility, late fee, fee, home payment, anything else
+ *   4. creation time, oldest first; a row with no creation time after every
+ *      row that has one (the SQL's NULLS LAST)
+ *   5. id
+ *
+ * A total order: every pair of distinct rows compares the same way whatever
+ * order they arrive in, so a sort never depends on how a query returned them.
+ */
+export function compareForAllocation(a: AllocatablePayment, b: AllocatablePayment): number {
+  const pa = priority(a), pb = priority(b)
+  if (pa !== pb) return pa - pb
+  const byDue = a.due_date.localeCompare(b.due_date)
+  if (byDue !== 0) return byDue
+  const ta = typeRank(a), tb = typeRank(b)
+  if (ta !== tb) return ta - tb
+  const ca = createdMs(a), cb = createdMs(b)
+  if (ca !== cb) {
+    if (ca === null) return 1
+    if (cb === null) return -1
+    return ca - cb
+  }
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+}
+
+/** A sorted copy, in the one allocation order. */
+export function sortForAllocation<T extends AllocatablePayment>(rows: readonly T[]): T[] {
+  return [...rows].sort(compareForAllocation)
+}
+
 export interface AllocationLine {
   payment_id: string
   amount_applied: number
@@ -85,13 +143,9 @@ export function allocateOldestFirst(
   outstanding: AllocatablePayment[],
   incomingAmount: number
 ): AllocationResult {
-  const sorted = [...outstanding].sort((a, b) => {
-    // Propane, then carried arrears, sink below everything regardless of age;
-    // within a bucket the long-standing oldest-first order still applies.
-    const pa = priority(a), pb = priority(b)
-    if (pa !== pb) return pa - pb
-    return a.due_date.localeCompare(b.due_date)
-  })
+  // Propane, then carried arrears, sink below everything regardless of age;
+  // within a bucket oldest-first, then the S655 type and creation tie-breaks.
+  const sorted = sortForAllocation(outstanding)
   let remainingCents = Math.round(incomingAmount * 100)
   const lines: AllocationLine[] = []
 

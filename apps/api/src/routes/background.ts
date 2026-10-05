@@ -1071,8 +1071,20 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
       [req.params.id, landlordScopeIds(req.user!)]
     )
     if (!check) throw new AppError(404, 'Not found')
+    // 10/4 (Nic): an approval whose next step was left open — the window closed
+    // on "Which space?" — dead-ended: the stale screen offered Approve again and
+    // this refused it. Approving an approved check is now a no-op that answers
+    // with the next step; anything else on a decided check is refused in plain
+    // words.
+    if (check.status === 'approved' && decision === 'approved') {
+      return res.json({ success: true, data: { decision, alreadyApproved: true, lease: null, draftError: null, needsUnit: !check.unit_id } })
+    }
     if (!['complete', 'submitted', 'processing'].includes(check.status)) {
-      throw new AppError(400, `Cannot decide a check with status '${check.status}'`)
+      throw new AppError(409, check.status === 'approved'
+        ? 'This applicant is already approved. Pick their space and draft the lease, or mark them not moving in for now.'
+        : check.status === 'denied'
+          ? 'This applicant was already denied.'
+          : 'This check is not ready to decide yet — the report is not back.')
     }
 
     const expiresClause = decision === 'approved'

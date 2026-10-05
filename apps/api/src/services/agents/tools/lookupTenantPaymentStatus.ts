@@ -10,6 +10,9 @@
  */
 
 import { query } from '../../../db'
+import { LEASE_TENANT_ROLE_LABEL, type LeaseTenantRole } from '@gam/shared'
+import { openBalanceSql, openAmountSql, inFlightMoneySql, householdRowSql, creditBeside } from '../../openBalances'
+import { HOUSEHOLD_MEMBER_STATUSES } from '../../creditUse'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface TenantMatch {
@@ -30,8 +33,21 @@ interface TenantMatch {
 // with a figure that included money Chen had already sent and which was
 // clearing the bank. Same bug, quieter path, and this is the tool the landlord
 // uses when they ask about one person by name.
-const OUTSTANDING_STATUSES = ['pending', 'failed', 'returned']
-/** Already paid, still clearing. Owed by nobody — reported separately. */
+//
+// S655 (money plan, Step 11): what is owed is the one rule the Outstanding page
+// reads (services/openBalances.openBalanceSql), so this answer and that page
+// cannot disagree. A bounce is owed once, on the row the reversal reopened
+// (reversal_id), never on the 'returned' original as well; a failed attempt is
+// owed on the row itself. Both are "they tried and it came back"
+// (ofWhichReturned). Money in flight is its own figure.
+/** An open charge they tried to pay and that came back: a failed attempt, or a reopened row (reversal_id). */
+const TRIED_STATUSES = ['failed', 'returned']
+/**
+ * Already paid, still clearing (and a pending row with a payment already
+ * started). Owed by nobody. The same rule as the Outstanding page's "Payment
+ * clearing" (openBalances.inFlightRowSql), counting only the money part
+ * (inFlightMoneySql: credit a clearing payment set aside is not money).
+ */
 const IN_FLIGHT_STATUSES = ['processing']
 
 /**
@@ -91,7 +107,8 @@ export const lookupTenantPaymentStatus: AgentTool = {
     '(\u201cthey tried an ACH and it was returned\u201d), because that is a different problem from never ' +
     'having paid. inFlight is already paid and still clearing: it is NOT owed, it is NOT overdue, and ' +
     'the tenant is not behind on it \u2014 mention it whenever it is above zero so the landlord is not ' +
-    'told someone is short when the money is already on its way.',
+    'told someone is short when the money is already on its way. creditAvailable is credit the tenant can ' +
+    'choose to use when they pay; it is NOT taken off outstandingBalance \u2014 say both figures.',
 
   parameters: {
     type: 'object',
@@ -167,10 +184,14 @@ export const lookupTenantPaymentStatus: AgentTool = {
            -- S617: compared as NUMBERS, not text. "spot 1" normalizes to "1"
            -- and the unit "RV 01" to "01"; as strings those differ, so asking
            -- about spot 1 returned "no tenant matches" while the spot existed.
-           OR ($3 ~ '[0-9]'
-               AND regexp_replace(un.unit_number, '[^0-9]', '', 'g') <> ''
-               AND regexp_replace(un.unit_number, '[^0-9]', '', 'g')::bigint
-                   = regexp_replace($3, '[^0-9]', '', 'g')::bigint))
+           -- S655: as numeric, never bigint — an email with a long run of
+           -- digits (tenant-<uuid>@…) overflowed bigint and the lookup threw.
+           -- NULLIF keeps a unit with no digits from ever being cast, however
+           -- the planner orders these tests. An email names a person, never a
+           -- unit: "bob2@…" is not a question about every unit numbered 2.
+           OR ($3 ~ '[0-9]' AND position('@' in $3) = 0
+               AND NULLIF(regexp_replace(un.unit_number, '[^0-9]', '', 'g'), '')::numeric
+                   = NULLIF(regexp_replace($3, '[^0-9]', '', 'g'), '')::numeric))
           AND ($4::text[] IS NULL OR un.unit_type = ANY($4))`,
       [actorLandlordIds(actor), `%${needle}%`, needle, typeFilter]
     )
@@ -240,29 +261,85 @@ export const lookupTenantPaymentStatus: AgentTool = {
     const full = `${m.first_name ?? ''} ${m.last_name ?? ''}`.trim().toLowerCase()
     const exact = needle.toLowerCase() === full || needle.toLowerCase() === (m.email ?? '').toLowerCase()
     const matchedOn = exact ? 'exact' : 'partial'
-    // Payments are scoped to BOTH the tenant AND this landlord.
+    const landlordIds = actorLandlordIds(actor)
+    // Payments are scoped to BOTH the tenant's household AND this landlord.
+    //
+    // S652 (one household balance): lease charges carry the PRIMARY resident's
+    // tenant_id, so a co-tenant read by payments.tenant_id alone came back
+    // "owes $0" while their household owed the lease's bill — beside a credit
+    // figure (creditBeside, household-based) measured against bills it said
+    // they did not owe. The household is the one the tenant's own agent and
+    // Pay Now read (openBalances.householdRowSql): their own charges plus every
+    // charge on a lease they are on now. Someone who has left the lease is
+    // no longer on its bills.
     const owed = await query<{ outstanding: string | null; count: string; returned: string | null; returned_count: string }>(
-      `SELECT COALESCE(SUM(amount), 0) AS outstanding, COUNT(*) AS count,
-              COALESCE(SUM(amount) FILTER (WHERE status IN ('failed','returned')), 0) AS returned,
-              COUNT(*) FILTER (WHERE status IN ('failed','returned')) AS returned_count
-         FROM payments
-        WHERE tenant_id = $1 AND landlord_id = ANY($2::uuid[]) AND status = ANY($3)`,
-      [m.tenant_id, actorLandlordIds(actor), OUTSTANDING_STATUSES]
+      `SELECT COALESCE(SUM(${openAmountSql('p')}), 0) AS outstanding, COUNT(*) AS count,
+              COALESCE(SUM(${openAmountSql('p')}) FILTER (WHERE p.status = ANY($3) OR p.reversal_id IS NOT NULL), 0) AS returned,
+              COUNT(*) FILTER (WHERE p.status = ANY($3) OR p.reversal_id IS NOT NULL) AS returned_count
+         FROM payments p
+        WHERE ${householdRowSql('p', '$1')} AND p.landlord_id = ANY($2::uuid[])
+          AND ${openBalanceSql('p')} AND ${openAmountSql('p')} > 0`,
+      [m.tenant_id, landlordIds, TRIED_STATUSES]
     )
+    // Already paid, still clearing: a card or bank payment on its way (the
+    // Outstanding page's "Payment clearing" — IN_FLIGHT_STATUSES above).
     const flight = await query<{ in_flight: string | null }>(
-      `SELECT COALESCE(SUM(amount), 0) AS in_flight
-         FROM payments
-        WHERE tenant_id = $1 AND landlord_id = ANY($2::uuid[]) AND status = ANY($3)`,
-      [m.tenant_id, actorLandlordIds(actor), IN_FLIGHT_STATUSES]
+      `SELECT COALESCE(SUM(${inFlightMoneySql('p')}), 0) AS in_flight
+         FROM payments p
+        WHERE ${householdRowSql('p', '$1')} AND p.landlord_id = ANY($2::uuid[])
+          AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
+          AND (p.status = ANY($3) OR (p.status = 'pending' AND p.stripe_payment_intent_id IS NOT NULL))`,
+      [m.tenant_id, landlordIds, IN_FLIGHT_STATUSES]
     )
+    const credit = await creditBeside({ tenantId: m.tenant_id, landlordIds })
+    // GAM's FlexPay pull is the tenant's arrangement with GAM and never reaches
+    // a landlord (CLAUDE.md: FlexPay must never surface in the landlord portal).
     const recent = await query<{ type: string; amount: string; status: string; due_date: string | null }>(
-      `SELECT type, amount, status, due_date
-         FROM payments
-        WHERE tenant_id = $1 AND landlord_id = ANY($2::uuid[])
-        ORDER BY COALESCE(due_date, created_at) DESC
+      `SELECT p.type, p.amount, p.status, p.due_date
+         FROM payments p
+        WHERE ${householdRowSql('p', '$1')} AND p.landlord_id = ANY($2::uuid[])
+          AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
+        ORDER BY COALESCE(p.due_date, p.created_at) DESC, p.created_at DESC, p.id
         LIMIT 5`,
-      [m.tenant_id, actorLandlordIds(actor)]
+      [m.tenant_id, landlordIds]
     )
+    // Whom the household's bill is in the name of, and who else lives on it.
+    // The Outstanding page lists a shared lease's bill on the row of the person
+    // it is billed to (the primary resident); a landlord asking about both
+    // residents must hear it is ONE bill, or the two answers get added up.
+    const billedTo = await query<{ name: string }>(
+      `SELECT DISTINCT TRIM(CONCAT_WS(' ', us.first_name, us.last_name)) AS name
+         FROM payments p
+         JOIN tenants t ON t.id = p.tenant_id
+         JOIN users us ON us.id = t.user_id
+        WHERE ${householdRowSql('p', '$1')} AND p.landlord_id = ANY($2::uuid[])
+          AND p.tenant_id <> $1
+          AND ${openBalanceSql('p')} AND ${openAmountSql('p')} > 0
+        ORDER BY 1`,
+      [m.tenant_id, landlordIds]
+    )
+    const sharedWith = await query<{ name: string; role: LeaseTenantRole; unit_number: string | null }>(
+      `SELECT DISTINCT TRIM(CONCAT_WS(' ', us.first_name, us.last_name)) AS name, o.role, un.unit_number
+         FROM lease_tenants me
+         JOIN leases l ON l.id = me.lease_id AND l.landlord_id = ANY($2::uuid[])
+         JOIN lease_tenants o ON o.lease_id = me.lease_id AND o.tenant_id <> me.tenant_id
+                             AND o.status = ANY($3::text[])
+         JOIN tenants t ON t.id = o.tenant_id
+         JOIN users us ON us.id = t.user_id
+         LEFT JOIN units un ON un.id = l.unit_id
+        WHERE me.tenant_id = $1 AND me.status = ANY($3::text[])
+        ORDER BY 1`,
+      [m.tenant_id, landlordIds, HOUSEHOLD_MEMBER_STATUSES]
+    )
+    const household = sharedWith.length === 0 && billedTo.length === 0 ? undefined : {
+      sharedWith: sharedWith.map((r) => ({ name: r.name, role: LEASE_TENANT_ROLE_LABEL[r.role] ?? r.role, unit: r.unit_number })),
+      billedInNameOf: billedTo.map((r) => r.name),
+      note:
+        'outstandingBalance is the HOUSEHOLD’s balance: every charge on the lease this person shares' +
+        (billedTo.length > 0 ? `, billed in the name of ${billedTo.map((r) => r.name).join(' and ')}` : '') +
+        '. Say whose name the bill is in and who shares it. It is ONE bill — if the landlord also asks ' +
+        'about the other residents it is the same money, never a second amount; never add them together.',
+    }
 
     return {
       ok: true,
@@ -284,6 +361,10 @@ export const lookupTenantPaymentStatus: AgentTool = {
       returnedItemCount: Number(owed[0]?.returned_count ?? 0),
       // Already paid, still clearing. NOT part of the balance above.
       inFlight: Number(flight[0]?.in_flight ?? 0),
+      // S655: credit they can choose to use when they pay — beside the balance, never taken off it.
+      creditAvailable: credit.usable,
+      // S652: whose name the household's bill is in, and who shares it (absent when they live alone).
+      household,
       recentPayments: recent.map((r) => ({ type: r.type, amount: Number(r.amount), status: r.status, dueDate: r.due_date })),
       // S630 (Nic): "in June, he tried to pay a $750 ACH, and it failed. Current
       // attempt would need to be the full amount." A failed attempt is a

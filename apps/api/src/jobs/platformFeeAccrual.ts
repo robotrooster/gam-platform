@@ -57,6 +57,7 @@ import { getClient, query } from '../db'
 import { chargeLandlord } from '../services/landlordGamAccount'
 import { activateBillingForOccupancy } from '../services/billingActivation'
 import { billableUnitsForProperty } from '../services/billableUnits'
+import { stayRevenueInMonthSql } from '../services/platformFee'
 import { NIGHTS_AGGREGATION_UNIT_TYPES, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
 import type { PoolClient } from 'pg'
 import { addDaysTo, dateIn, monthStartOf } from '../lib/timezone'
@@ -484,16 +485,12 @@ async function accrueOneProperty(
     // bill a percentage of revenue instead of nights/30. Revenue
     // attributes to the month pro-rata by nights:
     // total_amount × in-month / full-stay.
+    // 10/3 (decisions #33): "full-stay" is the length SOLD, and an early
+    // check-out's unstayed nights count in the month the guest left
+    // (services/platformFee stayRevenueInMonthSql — one formula for the bill
+    // and the landlord's fee estimate).
     const strRes = await client.query<{ revenue: string | null }>(`
-      SELECT COALESCE(SUM(
-          COALESCE(b.total_amount, 0)
-            * GREATEST(
-                LEAST(b.check_out, $2::date + INTERVAL '1 month')::date
-                  - GREATEST(b.check_in, $2::date)::date,
-                0
-              )::numeric
-            / GREATEST((b.check_out - b.check_in), 1)::numeric
-        ), 0) AS revenue
+      SELECT COALESCE(SUM(${stayRevenueInMonthSql('b', '$2::date')}), 0) AS revenue
         FROM unit_bookings b
         JOIN units u ON u.id = b.unit_id
        WHERE u.property_id = $1

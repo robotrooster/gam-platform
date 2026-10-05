@@ -45,6 +45,9 @@ vi.mock('./payShared', () => ({
   SavedMethodsCard: () => null,
   VerifyMicrodepositsCard: () => null,
   useTenantPaymentMethods: () => ({ data: [], isLoading: false }),
+  readBalanceContext: async () => server.balance,
+  // decisions.md #48.4: drawn by the page for held card payments (PaymentsPage.awaiting.test.tsx).
+  AwaitingCardPayments: () => null,
 }))
 vi.mock('./AutopayCard', () => ({ AutopaySection: () => null }))
 

@@ -33,7 +33,7 @@ const CASES: [string, string][] = [
   ['I closed on the fourplex on roosevelt',             'add_property'],
   ['danny is going to $25 an hour',                     'update_employee'],
   ['clock me in',                                       'clock_in'],
-  ['that $1,300 deposit on the 4th was spot 12',        'confirm_deposit_match'],
+  ['that $1,300 deposit on the 4th was not rent',       'mark_deposit_not_rent'],
   ['get their lease ready',                             'draft_household_lease'],
   ['lot 14 water reads 89,120',                         'record_reading_in_run'],
   ['spot 14 is actually 14A',                           'renumber_unit'],

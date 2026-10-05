@@ -233,6 +233,26 @@ interface CreateRentPlatformChargeOpts {
   paymentMethodTypes: ('us_bank_account' | 'card')[]
   entryDescription: string
   metadata?: Record<string, string>
+  /**
+   * S655 (money plan Step 4): Stripe's idempotency key for this create. A
+   * retry of the SAME request with the same key (a lost reply, a dropped
+   * connection) returns the intent Stripe already made instead of pulling the
+   * bank a second time. The FlexPay pull passes `flexpay_pull_<paymentId>`;
+   * the caller must send identical parameters on every retry with one key.
+   */
+  idempotencyKey?: string
+  /**
+   * S655 (decisions.md #48.4): the cardholder is not here — an autopay card
+   * pull. Sent to Stripe as `off_session: true`, which tells the card's bank
+   * the customer is away and lets it accept the payment on the saved card's
+   * standing authorization instead of asking for a confirmation nobody can
+   * give (3-D Secure). If the bank still insists, Stripe refuses the charge
+   * (authentication_required) and the pull fails through the normal failure
+   * path. The card was saved for later use when the tenant set it up, so
+   * setup_future_usage is left out. Cards only: a bank account debit runs on
+   * its mandate, so this is ignored for one.
+   */
+  offSession?: boolean
 }
 
 /**
@@ -242,13 +262,16 @@ interface CreateRentPlatformChargeOpts {
  */
 export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpts) {
   const stripe = getStripe()
-  const intent = await stripe.paymentIntents.create({
+  const isCard = opts.paymentMethodTypes.includes('card')
+  const offSession = opts.offSession === true && isCard
+  const params: Stripe.PaymentIntentCreateParams = {
     amount: Math.round(opts.amount * 100),
     currency: 'usd',
     customer: opts.stripeCustomerId,
     payment_method: opts.paymentMethodId,
     payment_method_types: opts.paymentMethodTypes,
     confirm: true,
+    ...(offSession ? { off_session: true } : {}),
     // S603 (Nic): save the card on THIS authorization instead of spending a
     // separate one on a SetupIntent. Stripe bills $0.26 per authorization — per
     // BANK ASK, not per successful payment — so the old "add a card, then pay
@@ -261,7 +284,10 @@ export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpt
     //
     // Harmless when the card is ALREADY saved — Stripe reaffirms the existing
     // payment method rather than duplicating it.
-    ...(opts.paymentMethodTypes.includes('card')
+    //
+    // Not on an off-session pull (autopay): the card was saved for later use
+    // when the tenant set it up; there is nobody here to save it again.
+    ...(isCard && !offSession
       ? { setup_future_usage: 'off_session' as const }
       : {}),
     description: `${opts.entryDescription} - Gold Asset Management`,
@@ -281,7 +307,11 @@ export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpt
           },
         }
       : {}),
-  })
+  }
+  // Only a caller that names a key sends one; every other call is unchanged.
+  const intent = opts.idempotencyKey
+    ? await stripe.paymentIntents.create(params, { idempotencyKey: opts.idempotencyKey })
+    : await stripe.paymentIntents.create(params)
   return intent
 }
 

@@ -7,6 +7,18 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest'
 
 vi.mock('../../../db', () => ({ query: vi.fn(), queryOne: vi.fn() }))
+// The credit beside a balance is the household quote's own business (Step 2's
+// suites cover it); these tests check who a tool reads for. Stubbed here so a
+// tool that shows "credit available" never opens a pooled client on the mocked db.
+const { mockCreditBeside } = vi.hoisted(() => ({
+  mockCreditBeside: vi.fn(async () => ({
+    usable: 0, usableByLease: new Map<string, number>(), onFile: 0, paidAhead: 0, fromLandlord: 0, depositInterest: 0,
+  })),
+}))
+vi.mock('../../openBalances', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../openBalances')>()),
+  creditBeside: mockCreditBeside,
+}))
 vi.mock('../../../db/propertiesDb', () => ({ queryProperties: vi.fn() }))
 vi.mock('../../maintenanceRequests', () => ({ createMaintenanceRequest: vi.fn() }))
 vi.mock('../../notifications', () => ({ createNotification: vi.fn(), notifyMaintenanceUpdated: vi.fn() }))
@@ -457,13 +469,25 @@ describe('read tools scope to the actor', () => {
       ;(query as any)
         .mockResolvedValueOnce([{ tenant_id: 'tX', first_name: 'Jane', last_name: 'Doe', email: 'jane@x.dev' }])
         .mockResolvedValueOnce([{ outstanding: '1200.00', count: '1' }])
+        .mockResolvedValueOnce([{ in_flight: '0' }])
         .mockResolvedValueOnce([{ type: 'rent', amount: '1200.00', status: 'failed', due_date: 'd' }])
+      mockCreditBeside.mockResolvedValueOnce({
+        usable: 25, usableByLease: new Map([['lease-1', 25]]), onFile: 25, paidAhead: 25, fromLandlord: 0, depositInterest: 0,
+      })
       const res: any = await lookupTenantPaymentStatus.execute({ tenant: 'Jane' }, LANDLORD_ACTOR)
       // match query scoped to landlord id
       expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
-      // payment query scoped to BOTH tenant AND landlord
+      // open-balance query scoped to BOTH tenant AND landlord
       expect((query as any).mock.calls[1][1]).toEqual(['tX', ['L1'], expect.any(Array)])
+      // still-clearing query scoped the same way
+      expect((query as any).mock.calls[2][1]).toEqual(['tX', ['L1'], expect.any(Array)])
+      // recent payments scoped the same way
+      expect((query as any).mock.calls[3][1]).toEqual(['tX', ['L1']])
+      // the credit beside the balance is read for this tenant with THIS landlord only
+      expect(mockCreditBeside).toHaveBeenCalledWith({ tenantId: 'tX', landlordIds: ['L1'] })
       expect(res.outstandingBalance).toBe(1200)
+      expect(res.creditAvailable).toBe(25)
+      expect(res.recentPayments).toHaveLength(1)
       expect(res.tenant).toMatchObject({ name: 'Jane Doe' })
     })
 
@@ -562,12 +586,15 @@ describe('read tools scope to the actor', () => {
 
     it('get_my_deposit binds to the tenant id and omits Flex/interest fields', async () => {
       ;(query as any)
-        .mockResolvedValueOnce([{ total_amount: '1500.00', collected_amount: '1500.00', status: 'held', damage_claimed: false, disbursed_to_landlord: false, held_by: 'gam' }])
+        .mockResolvedValueOnce([{ total_amount: '1500.00', collected_amount: '1500.00', status: 'held', damage_claimed: false, held_by: 'gam' }])
         .mockResolvedValueOnce([])
       const res: any = await getMyDeposit.execute({}, TENANT_ACTOR)
       expect((query as any).mock.calls[0][1]).toEqual(['t1'])
       expect((query as any).mock.calls[0][0]).not.toMatch(/flex_deposit|gam_advance|interest_accrued/)
       expect(res.deposit).toMatchObject({ totalAmount: 1500, status: 'held' })
+      // S655: never a column nothing writes (it read '0.00' for everyone).
+      expect((query as any).mock.calls[0][0]).not.toMatch(/disbursed_to_landlord/)
+      expect(res.deposit).not.toHaveProperty('disbursedToLandlord')
     })
 
     it('get_my_invoices binds to the tenant id', async () => {
@@ -1536,5 +1563,54 @@ describe('get_portfolio_stats never tells a landlord who is on SSI/SSDI', () => 
     expect(out.tenants).not.toHaveProperty('onFixedIncomePct')
     expect(out.tenants.sourceOfIncome).toMatch(/private/i)
     expect(JSON.stringify(out)).not.toMatch(/fixed.?income/i)
+  })
+})
+
+// S655 (money plan, Step 3): the agent's P&L is the reports page's P&L under
+// the same "Money received" / "Money billed" switch. The figures themselves are
+// held equal to the report and the dashboard card against a real database in
+// routes/reportsPropertyBreakdown.test.ts; here, that the switch reaches the
+// shared computation and the answer says which way it counted.
+describe('get_profit_and_loss follows the basis switch', () => {
+  beforeEach(() => { mockQuery.mockReset(); mockQueryOne.mockReset() })
+
+  async function run(args: Record<string, unknown>) {
+    const pl = await import('../../landlordPL')
+    const { getProfitAndLoss } = await import('./getProfitAndLoss')
+    mockQuery.mockResolvedValue([{ id: 'L1', business_name: 'Oak Park' }])
+    const spy = vi.spyOn(pl, 'computeLandlordPL').mockImplementation(async (_l, _s, _e, _m, basis = 'received') => ({
+      gross: { rent: 460, fees: 0, utilities: 0, homeSale: 0, balances: 0, otherIncome: 0, other: 0, total: 460 },
+      lines: {} as any,
+      lineItems: [{ line: 'rent', label: 'Rent', amount: 460 }],
+      beside: { clearing: 0, creditsYouGave: 0, workTrade: 0, depositsHeld: 0, collectedSoFar: 0, stillOwed: 0, paidAheadUnused: 0 },
+      besideItems: [],
+      depositsHeld: 0,
+      expenses: { platformFee: 10, maintenance: 0, lotRent: 0, enteredExpenses: 5, total: 15 },
+      net: 445,
+      basis: { basis, label: basis === 'billed' ? 'Money billed' : 'Money received', note: 'n' },
+    }) as any)
+    try {
+      const out: any = await getProfitAndLoss.execute(args, LANDLORD_ACTOR)
+      return { out, call: spy.mock.calls[0] }
+    } finally { spy.mockRestore() }
+  }
+
+  it('passes Money billed to the shared P&L and says so in the answer', async () => {
+    const { out, call } = await run({ year: 2026, month: 9, basis: 'billed' })
+    expect(call[4]).toBe('billed')
+    expect(out.basis).toBe('Money billed')
+    expect(out.income.lines).toEqual([{ line: 'rent', label: 'Rent', amount: 460 }])
+  })
+
+  it('defaults to Money received, and an unknown basis falls back to it', async () => {
+    expect((await run({ year: 2026, month: 9 })).call[4]).toBe('received')
+    expect((await run({ year: 2026, month: 9, basis: 'accrual' })).call[4]).toBe('received')
+  })
+
+  it('offers the basis as a one-sentence parameter', async () => {
+    const { getProfitAndLoss } = await import('./getProfitAndLoss')
+    const p: any = (getProfitAndLoss.parameters as any).properties.basis
+    expect(p.enum).toEqual(['received', 'billed'])
+    expect(p.description.split('. ').length).toBeLessThanOrEqual(2)
   })
 })

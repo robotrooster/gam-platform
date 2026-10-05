@@ -58,6 +58,14 @@ describe('S639 a long stay is screened automatically', () => {
     // Nobody had to decide. That is the point.
     expect(screeningMock).toHaveBeenCalledTimes(1)
     expect(String(screeningMock.mock.calls[0][0])).toBe(email)
+    // 10/4: the link names this landlord, park and site — without them the
+    // guest lands in the renter-pool check instead of this landlord's.
+    const link = new URL(String(screeningMock.mock.calls[0][3]))
+    const b = (await db.query<any>(`SELECT b.landlord_id, b.unit_id, u.property_id FROM unit_bookings b JOIN units u ON u.id = b.unit_id WHERE b.id = $1`, [bookingId])).rows[0]
+    expect(link.pathname).toBe('/background-check')
+    expect(link.searchParams.get('landlordId')).toBe(b.landlord_id)
+    expect(link.searchParams.get('propertyId')).toBe(b.property_id)
+    expect(link.searchParams.get('unitId')).toBe(b.unit_id)
   })
 
   it('does not screen a short stay — no lease, no email', async () => {

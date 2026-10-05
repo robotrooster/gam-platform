@@ -140,6 +140,41 @@ describe('GET /api/landlords/:id/dashboard', () => {
     expect(typeof res.body.data.otp_units).toBe('number')
   })
 
+  // S655: the income card follows the switch and carries both pairs:
+  // Money received (what arrived, paid ahead inside, clearing beside) and
+  // Money billed (the bill, collected so far, clearing, still owed).
+  it('S655: the income card follows the switch; money still clearing sits beside what arrived', async () => {
+    const f = await seedLFixture()
+    const token = jwt.sign(
+      { userId: f.landlordUserId, role: 'landlord', email: 'll@test.dev', profileId: null,
+        landlordIds: [f.landlordId], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const propertyId = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      const u = await seedUnit(client, { propertyId, landlordId: f.landlordId })
+      const d = (await client.query(`SELECT (now() AT TIME ZONE 'America/Phoenix')::date::text AS d`)).rows[0].d
+      await client.query(
+        `INSERT INTO payments (unit_id, landlord_id, type, amount, status, entry_description, due_date, settled_at)
+         VALUES ($1,$2,'rent',800,'settled','RENT',$3::date,now()),
+                ($1,$2,'utility',60,'processing','UTILITY',$3::date,NULL)`,
+        [u, f.landlordId, d])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const rx = (await request(buildApp()).get('/api/landlords/me/dashboard')
+      .set('Authorization', `Bearer ${token}`)).body.data
+    expect(rx.basis).toMatchObject({ basis: 'received', label: 'Money received' })
+    expect(rx.income_card.received).toEqual({ amount: 800, paidAhead: 0, clearing: 60 })
+    expect(rx.collected_mtd).toBe(800)
+    const bx = (await request(buildApp()).get('/api/landlords/me/dashboard?basis=billed')
+      .set('Authorization', `Bearer ${token}`)).body.data
+    expect(bx.basis.label).toBe('Money billed')
+    expect(bx.income_card.billed).toEqual({ amount: 860, collected: 800, clearing: 60, stillOwed: 0 })
+  })
+
   it('PM (team role) → 403 (canViewLandlordFinances rejects team roles)', async () => {
     const f = await seedLFixture()
     const pmToken = await seedPmTokenFor(f)

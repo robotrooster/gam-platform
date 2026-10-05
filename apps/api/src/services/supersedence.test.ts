@@ -33,8 +33,12 @@ beforeEach(async () => {
   // Pre-clean: cleanupAllSchema doesn't know about flexpay_advances /
   // flex_charge_statements / flex_deposit_installments / custody
   // charges. Drop them explicitly so cleanupAllSchema's lease/landlord
-  // delete doesn't FK-fail.
+  // delete doesn't FK-fail. A bill line FlexPay paid points at its advance
+  // (payments.flexpay_advance_id), so that link is cleared first — whatever
+  // suite ran before this one.
+  await db.query(`UPDATE payments SET flexpay_advance_id = NULL WHERE flexpay_advance_id IS NOT NULL`)
   await db.query(`DELETE FROM flexpay_advances`)
+  await db.query(`DELETE FROM platform_revenue_ledger`)
   await db.query(`DELETE FROM flex_deposit_custody_charges`)
   await db.query(`DELETE FROM flex_charge_statements`)
   await db.query(`DELETE FROM flex_charge_accounts`)
@@ -393,5 +397,84 @@ describe('applyTenantSupersedence', () => {
     expect(pay.gam_supersedence_breakdown[1]).toMatchObject({
       ref_id: 'over_collected', amount: 30, residual: true,
     })
+  })
+})
+
+// ─── S655 money plan Step 4: a FlexPay pull written off ───────
+//
+// A FlexPay pull that fails for good writes the advance off; the only way it
+// is recovered is GAM-first routing on the tenant's next payment (S542). Every
+// returned-pull fee Stripe charged GAM for it ($4 a bounce: the first try and
+// each retry) is written off with it, so the recovery takes those back too and
+// GAM keeps no fee. Two payments can both have been quoted with it in their
+// boost (computed when each was created); only the first may take it, and the
+// failed pull itself is never pulled again or owed as a tenant charge.
+describe('a defaulted FlexPay pull', () => {
+  it('a defaulted pull is recovered once: the bounce fees come back with it and the $25 is booked once', async () => {
+    const ctx = await seedCtx()
+    const { handleFlexPayPaymentNsf } = await import('./flexpay')
+    const { payableRowSql } = await import('./moneyPredicates')
+    // The cycle's advance and its pull, which failed on its last try.
+    const { rows: [adv] } = await db.query<{ id: string }>(
+      `INSERT INTO flexpay_advances
+         (cycle_month, tenant_id, landlord_id, unit_id, lease_id,
+          rent_amount, tenant_fee_amount, pull_day, status, pull_date)
+       VALUES ('2026-10-01', $1, $2, $3, $4, 1060, 25, 20, 'pulled', '2026-10-20') RETURNING id`,
+      [ctx.tenantId, ctx.landlordId, ctx.unitId, ctx.leaseId])
+    const { rows: [pull] } = await db.query<{ id: string }>(
+      `INSERT INTO payments
+         (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, revenue_owner,
+          due_date, stripe_payment_intent_id, retry_count, flexpay_advance_id)
+       VALUES ($1, $2, $3, $4, 'fee', 1085, 'failed', 'FLEXPAY', 'gam', '2026-10-20', 'pi_fp_dead', 2, $5)
+       RETURNING id`,
+      [ctx.unitId, ctx.leaseId, ctx.tenantId, ctx.landlordId, adv.id])
+    await db.query(`UPDATE flexpay_advances SET rent_payment_id = $2 WHERE id = $1`, [adv.id, pull.id])
+    await handleFlexPayPaymentNsf(pull.id)
+
+    // The covered bill $1,060 + the $25 + three bounces (the first try and two
+    // retries, retry_count 2) at $4 each.
+    const owed = await computeTenantGamOutstanding(ctx.tenantId)
+    expect(owed).toEqual([expect.objectContaining({ source: 'flexpay_advance', ref_id: adv.id, amount: 1097 })])
+
+    // Two later payments were each quoted with the $1,097 in their boost.
+    const first = await seedPayment(ctx, { boostAmount: 1097 })
+    const { rows: [{ id: second }] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status,
+                             entry_description, due_date, gam_supersedence_amount)
+       VALUES ($1, $2, $3, 'utility', 60, 'pending', 'UTILITY', CURRENT_DATE, 1097) RETURNING id`,
+      [ctx.unitId, ctx.tenantId, ctx.landlordId])
+    const apply = async (paymentId: string) => {
+      const client = await db.connect()
+      try {
+        await client.query('BEGIN')
+        const res = await applyTenantSupersedence(client, paymentId)
+        await client.query('COMMIT')
+        return res
+      } finally { client.release() }
+    }
+    const r1 = await apply(first)
+    expect(r1).toMatchObject({ applied: true, amount_distributed: 1097, amount_residual: 0 })
+    const r2 = await apply(second)
+    // Nothing left to recover: the second boost is recorded as over-collected,
+    // never applied to the same advance twice.
+    expect(r2).toMatchObject({ applied: true, amount_distributed: 0, amount_residual: 1097 })
+
+    const { rows: [a] } = await db.query<any>(
+      `SELECT status, rent_payment_id FROM flexpay_advances WHERE id = $1`, [adv.id])
+    expect(a.status).toBe('reconciled')
+    expect(a.rent_payment_id).toBe(pull.id)       // the link to its own pull is kept
+    expect(await computeTenantGamOutstanding(ctx.tenantId)).toEqual([])
+
+    // The recovery booked the month's $25 as GAM earnings — once, though two
+    // payments carried the boost; the $12 of bounce fees is Stripe's cost
+    // passed on, never earnings.
+    const { rows: fee } = await db.query<{ amount: string; reference_id: string }>(
+      `SELECT amount::text AS amount, reference_id FROM platform_revenue_ledger WHERE type = 'flexpay_subscription'`)
+    expect(fee).toEqual([{ amount: '25.00', reference_id: adv.id }])
+
+    // The dead pull stays failed and is no tenant charge anyone can pay.
+    const { rows: [p] } = await db.query<any>(
+      `SELECT status, (${payableRowSql('p')}) AS payable FROM payments p WHERE id = $1`, [pull.id])
+    expect(p).toEqual({ status: 'failed', payable: false })
   })
 })

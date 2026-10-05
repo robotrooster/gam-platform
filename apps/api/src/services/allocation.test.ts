@@ -37,6 +37,21 @@ beforeAll(async () => {
   // first this beforeAll would otherwise blow up on duplicate insert.
   const client = await db.connect()
   try {
+    // Every expectation below is worked out on these two rates, so a rate
+    // another suite left active (bookingLeaseBilling seeds a flat $6 ACH row
+    // the same way) is retired first. Without this the file passed or failed
+    // depending on which suite the run happened to start with.
+    await client.query(
+      `UPDATE platform_processing_rates SET effective_until = now()
+        WHERE effective_until IS NULL AND effective_from < now()
+          AND NOT (
+            (payment_method = 'ach' AND customer_facing_flat = 0 AND customer_facing_percent = 1.0
+              AND stripe_cost_flat = 0 AND stripe_cost_percent = 0.5)
+            OR (payment_method = 'card' AND customer_facing_flat = 0.30 AND customer_facing_percent = 3.25
+              AND stripe_cost_flat = 0.30 AND stripe_cost_percent = 2.9))
+              OR (effective_until IS NULL AND effective_from < now()
+                  AND (customer_facing_cap IS NOT NULL OR stripe_cost_cap IS NOT NULL))`
+    )
     await client.query(
       `INSERT INTO platform_processing_rates
          (payment_method, customer_facing_flat, customer_facing_percent,
@@ -62,6 +77,21 @@ beforeAll(async () => {
   }
 })
 
+/**
+ * S655: a rent row the tenant paid by card or bank. Allocation pays out only
+ * money GAM holds (v_payment_money.gam_held_part), and a Stripe settle is what
+ * makes the row's own money GAM-held: the webhook stamps the charge id on it.
+ * A row with no Stripe charge (cash at the desk) books no owner share at all.
+ */
+async function seedPaidRent(
+  client: any,
+  params: Parameters<typeof seedRentPayment>[1],
+): Promise<string> {
+  const id = await seedRentPayment(client, params)
+  await client.query(`UPDATE payments SET stripe_charge_id = 'ch_' || id::text WHERE id = $1`, [id])
+  return id
+}
+
 // Pool lifecycle: don't end the singleton in afterAll. Multiple test
 // files share the same process under vitest singleFork — whichever
 // file ran first would otherwise close the pool out from under the
@@ -77,7 +107,7 @@ describe('executeRentAllocation — ACH', () => {
       })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
       await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -122,7 +152,7 @@ describe('executeRentAllocation — ACH', () => {
       })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
       await seedAllocationRule(client, { propertyId, achFeePayer: 'landlord' })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -158,7 +188,7 @@ describe('executeRentAllocation — ACH', () => {
         achFeePayer: 'landlord',
         rentPercent: 10,
       })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -200,7 +230,7 @@ describe('executeRentAllocation — ACH', () => {
         rentPercent: 8,
         rentPercentFloor: 75,
       })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 500,
       })
 
@@ -231,7 +261,7 @@ describe('executeRentAllocation — ACH', () => {
         rentPercent: 20,
         rentPercentCeiling: 300,
       })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 5000,
       })
 
@@ -261,7 +291,7 @@ describe('executeRentAllocation — ACH', () => {
         achFeePayer: 'tenant',
         rentPercent: 10,
       })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
         gamSupersedenceAmount: 200,
       })
@@ -296,7 +326,7 @@ describe('executeRentAllocation — ACH', () => {
       await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
       // A sublessee paid the sub_monthly_amount of 1200; master_share_amount is
       // 1000, so 200 markup is stamped on the payment (as the pay route does).
-      const paymentId = await seedRentPayment(client, { unitId, tenantId, landlordId, amount: 1200 })
+      const paymentId = await seedPaidRent(client, { unitId, tenantId, landlordId, amount: 1200 })
       await client.query(`UPDATE payments SET sublease_markup_amount = 200 WHERE id = $1`, [paymentId])
 
       await executeRentAllocation(client, paymentId, 'ach')
@@ -321,7 +351,7 @@ describe('executeRentAllocation — ACH', () => {
       })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
       await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -359,8 +389,8 @@ describe('executeRentAllocation — ACH', () => {
     const res = await client.query(
       `INSERT INTO payments
          (unit_id, tenant_id, landlord_id, type, amount, status,
-          entry_description, due_date, revenue_owner)
-       VALUES ($1, $2, $3, $4, 100, 'settled', $5, CURRENT_DATE, $6)
+          entry_description, due_date, revenue_owner, stripe_charge_id)
+       VALUES ($1, $2, $3, $4, 100, 'settled', $5, CURRENT_DATE, $6, 'ch_fee_' || gen_random_uuid())
        RETURNING id`,
       [unitId, tenantId, landlordId, opts.type, opts.desc, opts.owner ?? 'landlord'])
     return { paymentId: res.rows[0].id, ownerUserId }
@@ -417,7 +447,7 @@ describe('executeRentAllocation — ACH', () => {
       })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
       // NO allocation rule seeded
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
       await expect(executeRentAllocation(client, paymentId, 'ach'))
@@ -442,7 +472,7 @@ describe('executeRentAllocation — card', () => {
         achFeePayer: 'tenant',
         cardFeePayer: 'landlord',
       })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -495,7 +525,7 @@ describe('executeRentAllocation — PM company cut', () => {
       })
       await attachPmToProperty(client, { propertyId, pmCompanyId, pmFeePlanId })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -546,7 +576,7 @@ describe('executeRentAllocation — PM company cut', () => {
       await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
       await attachPmToProperty(client, { propertyId, pmCompanyId, pmFeePlanId })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -588,7 +618,7 @@ describe('executeRentAllocation — PM company cut', () => {
       await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
       await attachPmToProperty(client, { propertyId, pmCompanyId, pmFeePlanId })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -629,7 +659,7 @@ describe('executeRentAllocation — PM company cut', () => {
       await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
       await attachPmToProperty(client, { propertyId, pmCompanyId, pmFeePlanId })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -672,7 +702,7 @@ describe('executeRentAllocation — PM company cut', () => {
       await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
       await attachPmToProperty(client, { propertyId, pmCompanyId, pmFeePlanId })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -705,7 +735,7 @@ describe('executeRentAllocation — PM company cut', () => {
       await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
       await attachPmToProperty(client, { propertyId, pmCompanyId, pmFeePlanId })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-      const paymentId = await seedRentPayment(client, {
+      const paymentId = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 1000,
       })
 
@@ -745,8 +775,8 @@ describe('executeRentAllocation — one charge covering multiple rows (S603)', (
     const r = await client.query(
       `INSERT INTO payments
          (unit_id, tenant_id, landlord_id, type, amount, status,
-          entry_description, due_date, stripe_payment_intent_id)
-       VALUES ($1,$2,$3,'utility',500,'settled','UTILITY', CURRENT_DATE, $4)
+          entry_description, due_date, stripe_payment_intent_id, stripe_charge_id)
+       VALUES ($1,$2,$3,'utility',500,'settled','UTILITY', CURRENT_DATE, $4, 'ch_' || $4)
        RETURNING id`,
       [a.unitId, a.tenantId, a.landlordId, a.pi])
     return r.rows[0].id
@@ -777,7 +807,7 @@ describe('executeRentAllocation — one charge covering multiple rows (S603)', (
       // Pay-Now payment settling two obligations, which is how a charge really
       // ends up spanning multiple rows.
       const pi = 'pi_multi_row_s603'
-      const p1 = await seedRentPayment(client, {
+      const p1 = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 500, stripePaymentIntentId: pi })
       const p2 = await seedUtilityOnSameCharge(client, { unitId, tenantId, landlordId, pi })
 
@@ -808,7 +838,7 @@ describe('executeRentAllocation — one charge covering multiple rows (S603)', (
       await seedAllocationRule(client, { propertyId, achFeePayer: 'landlord' })
 
       const pi = 'pi_multi_row_landlord_s603'
-      const p1 = await seedRentPayment(client, {
+      const p1 = await seedPaidRent(client, {
         unitId, tenantId, landlordId, amount: 500, stripePaymentIntentId: pi })
       const p2 = await seedUtilityOnSameCharge(client, { unitId, tenantId, landlordId, pi })
 
@@ -823,6 +853,473 @@ describe('executeRentAllocation — one charge covering multiple rows (S603)', (
       // Pre-S603 they were charged $6 per row and received $988.00 — $6 of
       // their own money gone. THIS is the discrepancy that must never exist.
       expect(parseFloat(owner.rows[0].total)).toBeCloseTo(994.00, 2)
+    })
+  })
+})
+
+// ══════════════════════════════════════════════════════════════
+// S655 (money plan Step 2) — THE OWNER SHARE IS MONEY GAM HOLDS.
+//
+// A row can be paid partly by money (a card, a bank pull) and partly by credit:
+// credit the landlord issued, paid-ahead money the landlord already holds (a
+// check they deposited), or money GAM holds (paid ahead through Stripe, deposit
+// interest). Only what GAM holds may ever be paid out; the processing fee is on
+// money only; and a cut too big for what GAM holds is capped, never thrown.
+// ══════════════════════════════════════════════════════════════
+describe('executeRentAllocation — credit on the row (S655)', () => {
+  interface Fx { ownerUserId: string; landlordId: string; propertyId: string; unitId: string; tenantId: string; leaseId: string; managerUserId?: string }
+
+  async function fx(client: any, o: { managerPercent?: number; managerFloor?: number; feePayer?: 'tenant' | 'landlord' } = {}): Promise<Fx> {
+    const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+    const managerUserId = o.managerPercent != null ? await seedManager(client) : undefined
+    const tenantId = await seedTenant(client)
+    const propertyId = await seedProperty(client, { landlordId, ownerUserId, managedByUserId: managerUserId ?? ownerUserId })
+    await seedAllocationRule(client, {
+      propertyId, achFeePayer: o.feePayer ?? 'tenant', cardFeePayer: o.feePayer ?? 'tenant',
+      rentPercent: o.managerPercent, rentPercentFloor: o.managerFloor,
+    })
+    const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 460 })
+    const lease = await client.query(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date)
+       VALUES ($1, $2, 460, 'month_to_month', 'active', '2026-01-01') RETURNING id`, [unitId, landlordId])
+    const leaseId = lease.rows[0].id
+    await client.query(`INSERT INTO lease_tenants (lease_id, tenant_id, role) VALUES ($1, $2, 'primary')`, [leaseId, tenantId])
+    return { ownerUserId, landlordId, propertyId, unitId, tenantId, leaseId, managerUserId }
+  }
+
+  async function rentRow(client: any, f: Fx, amount = 460): Promise<string> {
+    const r = await client.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1, $2, $3, $4, 'rent', $5, 'pending', '2026-10-01', 'RENT') RETURNING id`,
+      [f.unitId, f.leaseId, f.tenantId, f.landlordId, amount])
+    return r.rows[0].id
+  }
+
+  async function paidAhead(client: any, f: Fx, amount: number, fundedBy: 'landlord' | 'gam') {
+    const r = await client.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by, received_at)
+       VALUES ($1, $2, $3, $3, $4, now()) RETURNING id`, [f.leaseId, f.tenantId, amount, fundedBy])
+    return r.rows[0].id as string
+  }
+
+  async function issuedCredit(client: any, f: Fx, amount: number, category = 'goodwill') {
+    const r = await client.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1, $2, $3, $4, $4, $5) RETURNING id`, [f.landlordId, f.tenantId, f.leaseId, amount, category])
+    return r.rows[0].id as string
+  }
+
+  async function use(client: any, f: Fx, paymentId: string, credit: { prepaid?: string; issued?: string }, amount: number) {
+    await client.query(
+      `INSERT INTO credit_uses (tenant_credit_id, prepaid_credit_id, payment_id, lease_id, amount, billing_month, source, status, applied_at)
+       VALUES ($1, $2, $3, $4, $5, '2026-10-01', 'portal', 'applied', now())`,
+      [credit.issued ?? null, credit.prepaid ?? null, paymentId, f.leaseId, amount])
+  }
+
+  /** The card or bank payment for the rest settles the row (the webhook's stamp). */
+  async function settleByStripe(client: any, paymentId: string, money: number, method: 'ach' | 'card' = 'ach') {
+    const pi = `pi_${paymentId.slice(0, 8)}`
+    await client.query(
+      `UPDATE payments SET status = 'settled', settled_at = now(), stripe_payment_intent_id = $2, stripe_charge_id = 'ch_' || $2 WHERE id = $1`,
+      [paymentId, pi])
+    await client.query(
+      `INSERT INTO tenant_remittances (tenant_id, landlord_id, amount, applied_amount, unapplied_amount, status, payment_method, stripe_payment_intent_id)
+       SELECT tenant_id, landlord_id, $2, $2, 0, 'settled', $3, $4 FROM payments WHERE id = $1`,
+      [paymentId, money, method, pi])
+  }
+
+  async function settleByCreditOnly(client: any, paymentId: string) {
+    await client.query(`UPDATE payments SET status = 'settled', settled_at = now() WHERE id = $1`, [paymentId])
+  }
+
+  const ledger = async (client: any, paymentId: string, type: string) => {
+    const r = await client.query(
+      `SELECT COALESCE(SUM(amount), 0)::float AS a, COUNT(*)::int AS n FROM user_balance_ledger WHERE reference_id = $1 AND type = $2`,
+      [paymentId, type])
+    return r.rows[0] as { a: number; n: number }
+  }
+  const spread = async (client: any, paymentId: string) => {
+    const r = await client.query(`SELECT amount::float AS a, customer_fee_charged::float AS fee FROM platform_revenue_ledger WHERE reference_id = $1`, [paymentId])
+    return r.rows[0] ?? null
+  }
+
+  it('shelved 5: a row paid partly from GAM-held and partly from check-funded paid-ahead pays the landlord only the GAM-held part', async () => {
+    await withRollback(async (client) => {
+      const f = await fx(client)
+      const pay = await rentRow(client, f)
+      const gam = await paidAhead(client, f, 300, 'gam')
+      const check = await paidAhead(client, f, 160, 'landlord')
+      await use(client, f, pay, { prepaid: gam }, 300)
+      await use(client, f, pay, { prepaid: check }, 160)
+      await settleByCreditOnly(client, pay)
+      await executeRentAllocation(client, pay, 'ach', { feeAlreadyCollected: true })
+      expect((await ledger(client, pay, 'allocation_owner_share')).a).toBe(300)
+      expect(await spread(client, pay)).toBeNull()
+    })
+  })
+
+  it('owner share is Stripe money plus GAM-funded credit, never landlord-held or issued credit', async () => {
+    await withRollback(async (client) => {
+      const f = await fx(client)
+      const pay = await rentRow(client, f)
+      await use(client, f, pay, { issued: await issuedCredit(client, f, 50) }, 50)          // a move-in special
+      await use(client, f, pay, { prepaid: await paidAhead(client, f, 10, 'landlord') }, 10) // a check the landlord has
+      await use(client, f, pay, { prepaid: await paidAhead(client, f, 100, 'gam') }, 100)    // paid ahead by card
+      await settleByStripe(client, pay, 300)                                                  // the card paid the rest
+      await executeRentAllocation(client, pay, 'ach')
+      // 300 money + 100 GAM-held credit. Never the 50 issued or the 10 the landlord holds.
+      const owner = await ledger(client, pay, 'allocation_owner_share')
+      expect(owner.a).toBe(400)
+      const vm = (await client.query(`SELECT money_part::float AS m, gam_held_part::float AS g, issued_credit_amount::float AS i FROM v_payment_money WHERE payment_id = $1`, [pay])).rows[0]
+      expect(vm).toEqual({ m: 300, g: 400, i: 50 })
+    })
+  })
+
+  it("rent paid with deposit-interest credit pays the landlord's share with no fee and counts as received", async () => {
+    await withRollback(async (client) => {
+      const f = await fx(client)
+      const pay = await rentRow(client, f, 40)
+      const interest = await issuedCredit(client, f, 40, 'deposit_interest')
+      await use(client, f, pay, { issued: interest }, 40)
+      await settleByCreditOnly(client, pay)
+      await executeRentAllocation(client, pay, 'ach', { feeAlreadyCollected: true })
+      expect((await ledger(client, pay, 'allocation_owner_share')).a).toBe(40)
+      expect(await spread(client, pay)).toBeNull()
+      // GAM funds interest: it is not "issued" (never income) — it is new money
+      // to the landlord on the day it pays the bill.
+      const vm = (await client.query(
+        `SELECT issued_credit_amount::float AS issued, deposit_interest_credit::float AS interest, gam_held_part::float AS held
+           FROM v_payment_money WHERE payment_id = $1`, [pay])).rows[0]
+      expect(vm).toEqual({ issued: 0, interest: 40, held: 40 })
+    })
+  })
+
+  it('the processing fee is computed on the money part only', async () => {
+    await withRollback(async (client) => {
+      const f = await fx(client, { feePayer: 'landlord' })
+      const pay = await rentRow(client, f, 1000)
+      await use(client, f, pay, { issued: await issuedCredit(client, f, 200) }, 200)
+      await settleByStripe(client, pay, 800)
+      await executeRentAllocation(client, pay, 'ach')
+      // ACH test rate is 1.0% customer / 0.5% cost, on the $800 of money.
+      const s = await spread(client, pay)
+      expect(s.fee).toBe(8)
+      expect(s.a).toBe(4)
+      // Landlord pays the fee: 800 − 8 out of what GAM holds.
+      expect((await ledger(client, pay, 'allocation_owner_share')).a).toBe(792)
+    })
+  })
+
+  it('a manager-fee floor above the GAM-held part clamps and alerts instead of throwing', async () => {
+    await withRollback(async (client) => {
+      const f = await fx(client, { managerPercent: 10, managerFloor: 75 })
+      const pay = await rentRow(client, f)
+      // $450 of the $460 the landlord collected at the desk earlier; $10 of GAM-held
+      // credit is all GAM holds for this row.
+      await use(client, f, pay, { prepaid: await paidAhead(client, f, 450, 'landlord') }, 450)
+      await use(client, f, pay, { prepaid: await paidAhead(client, f, 10, 'gam') }, 10)
+      await settleByCreditOnly(client, pay)
+      await expect(executeRentAllocation(client, pay, 'ach', { feeAlreadyCollected: true })).resolves.toBeUndefined()
+      // Manager earned $75 (floor) on $460 of income, but only $10 is GAM's to pay.
+      expect((await ledger(client, pay, 'allocation_manager_fee')).a).toBe(10)
+      const owner = await ledger(client, pay, 'allocation_owner_share')
+      expect(owner).toEqual({ a: 0, n: 1 })
+      const alert = await client.query(`SELECT body FROM admin_notifications WHERE category = 'allocation_fees_exceed_held'`)
+      expect(alert.rowCount).toBe(1)
+      expect(alert.rows[0].body).toMatch(/\$65\.00 was not covered/)
+      // Re-running is a no-op (the $0 owner share marks it allocated).
+      await executeRentAllocation(client, pay, 'ach', { feeAlreadyCollected: true })
+      expect((await ledger(client, pay, 'allocation_manager_fee')).n).toBe(1)
+    })
+  })
+
+  it('credit-only settle books GAM-held paid-ahead with no second fee and marks the row platform_held', async () => {
+    const { db } = await import('../db')
+    const { settleFromCredit } = await import('./creditUse')
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const f = await fx(c)
+      const pay = await rentRow(c, f)
+      await paidAhead(c, f, 460, 'gam')
+      const r = await settleFromCredit(c, { leaseId: f.leaseId, tenantId: f.tenantId, source: 'portal', receipt: false })
+      expect(r.settledIds).toEqual([pay])
+      expect((await ledger(c, pay, 'allocation_owner_share')).a).toBe(460)
+      expect(await spread(c, pay)).toBeNull()
+      const row = (await c.query(`SELECT platform_held, status FROM payments WHERE id = $1`, [pay])).rows[0]
+      expect(row).toEqual({ platform_held: true, status: 'settled' })
+    } finally {
+      await c.query('ROLLBACK').catch(() => {})
+      c.release()
+    }
+  })
+
+  it('a row with nothing GAM holds (cash, a check, credit the landlord gave) books nothing', async () => {
+    await withRollback(async (client) => {
+      const f = await fx(client)
+      const pay = await rentRow(client, f)
+      await use(client, f, pay, { issued: await issuedCredit(client, f, 460) }, 460)
+      await settleByCreditOnly(client, pay)
+      await executeRentAllocation(client, pay, 'ach')
+      expect((await ledger(client, pay, 'allocation_owner_share')).n).toBe(0)
+      expect(await spread(client, pay)).toBeNull()
+    })
+  })
+
+  // S655 review: "Use all $X" — GAM-held paid-ahead money covers rent and water
+  // in full, and the card or bank pays only GAM's $4 returned-payment fee. No
+  // landlord row on the charge carries money, so there is nothing to share the
+  // fee by; it used to be booked on EVERY row (a landlord-paid $6 taken twice:
+  // owner $488, not $494, and GAM's book counting one fee twice).
+  async function creditPaidChargeWithGamFee(client: any, f: Fx, method: 'ach' | 'card') {
+    const rent = await rentRow(client, f, 460)
+    const water = (await client.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1, $2, $3, $4, 'utility', 40, 'pending', '2026-10-01', 'UTILITY') RETURNING id`,
+      [f.unitId, f.leaseId, f.tenantId, f.landlordId])).rows[0].id as string
+    const gamFee = (await client.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, revenue_owner)
+       VALUES ($1, $2, $3, $4, 'fee', 4, 'pending', '2026-10-01', 'RETURNFEE', 'gam') RETURNING id`,
+      [f.unitId, f.leaseId, f.tenantId, f.landlordId])).rows[0].id as string
+    const credit = await paidAhead(client, f, 500, 'gam')
+    await use(client, f, rent, { prepaid: credit }, 460)
+    await use(client, f, water, { prepaid: credit }, 40)
+    const pi = `pi_all_credit_${method}`
+    await client.query(
+      `UPDATE payments SET status = 'settled', settled_at = now(), stripe_payment_intent_id = $2, stripe_charge_id = 'ch_' || $2
+        WHERE id = ANY($1::uuid[])`, [[rent, water, gamFee], pi])
+    await client.query(
+      `INSERT INTO tenant_remittances (tenant_id, landlord_id, lease_id, amount, applied_amount, unapplied_amount, status, payment_method, stripe_payment_intent_id)
+       VALUES ($1, $2, $3, 4, 4, 0, 'settled', $4, $5)`, [f.tenantId, f.landlordId, f.leaseId, method, pi])
+    await executeRentAllocation(client, rent, method)
+    await executeRentAllocation(client, water, method)
+    const owner = await client.query(
+      `SELECT COALESCE(SUM(amount), 0)::float AS a FROM user_balance_ledger
+        WHERE reference_id = ANY($1::uuid[]) AND type = 'allocation_owner_share'`, [[rent, water]])
+    const fees = await client.query(
+      `SELECT COUNT(*)::int AS n, COALESCE(SUM(customer_fee_charged), 0)::float AS fee FROM platform_revenue_ledger
+        WHERE reference_id = ANY($1::uuid[]) AND type = 'banking_spread'`, [[rent, water]])
+    return { owner: owner.rows[0].a as number, spreadRows: fees.rows[0].n as number, feeBooked: fees.rows[0].fee as number }
+  }
+
+  it('a charge whose landlord rows were all paid by credit books its fee once (bank, landlord pays the fee)', async () => {
+    await withRollback(async (client) => {
+      // The flat $6 ACH schedule, so a doubled fee is plain to see.
+      await client.query(`UPDATE platform_processing_rates SET effective_until = now() WHERE payment_method = 'ach' AND effective_until IS NULL`)
+      await client.query(
+        `INSERT INTO platform_processing_rates
+           (payment_method, customer_facing_flat, customer_facing_percent, customer_facing_cap,
+            stripe_cost_flat, stripe_cost_percent, stripe_cost_cap)
+         VALUES ('ach', 6.00, 0, 6.00, 0, 0.5, 3.00)`)
+      const f = await fx(client, { feePayer: 'landlord' })
+      const r = await creditPaidChargeWithGamFee(client, f, 'ach')
+      expect(r.owner).toBe(494)          // $500 GAM holds, less ONE $6 fee
+      expect(r.feeBooked).toBe(6)
+      expect(r.spreadRows).toBe(1)
+    })
+  })
+
+  it('a charge whose landlord rows were all paid by credit books its fee once (card)', async () => {
+    await withRollback(async (client) => {
+      await client.query(`UPDATE platform_processing_rates SET effective_until = now() WHERE payment_method = 'card' AND effective_until IS NULL`)
+      await client.query(
+        `INSERT INTO platform_processing_rates
+           (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
+         VALUES ('card', 0.30, 3.25, 0.30, 2.9)`)
+      const f = await fx(client, { feePayer: 'landlord' })
+      const r = await creditPaidChargeWithGamFee(client, f, 'card')
+      // Card test rate 3.25% + $0.30 on the $4 that moved: $0.43, once.
+      expect(r.feeBooked).toBe(0.43)
+      expect(r.owner).toBe(499.57)
+    })
+  })
+
+  // S655 review (round 2): the once-per-charge fee went to the LAST landlord row
+  // by id — even a row with nothing GAM holds on it, which books nothing. Rent
+  // paid whole by GAM-held paid-ahead money, water paid whole by paid-ahead
+  // money the landlord holds, and the bank paid only GAM's returned-payment
+  // fee: with water last, the landlord-paid $6 was booked zero times (GAM
+  // absorbing it).
+  it('a charge whose credit-paid rows are split GAM-held / landlord-held books its fee once on the GAM-held row', async () => {
+    await withRollback(async (client) => {
+      await client.query(`UPDATE platform_processing_rates SET effective_until = now() WHERE payment_method = 'ach' AND effective_until IS NULL`)
+      await client.query(
+        `INSERT INTO platform_processing_rates
+           (payment_method, customer_facing_flat, customer_facing_percent, customer_facing_cap,
+            stripe_cost_flat, stripe_cost_percent, stripe_cost_cap)
+         VALUES ('ach', 6.00, 0, 6.00, 0, 0.5, 3.00)`)
+      const f = await fx(client, { feePayer: 'landlord' })
+      // Ids chosen so the landlord-held row (water) sorts LAST.
+      const rent = `10000000-0000-4000-8000-${randomUUID().slice(-12)}`
+      const water = `f0000000-0000-4000-8000-${randomUUID().slice(-12)}`
+      await client.query(
+        `INSERT INTO payments (id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1, $3, $4, $5, $6, 'rent', 460, 'pending', '2026-10-01', 'RENT'),
+                ($2, $3, $4, $5, $6, 'utility', 40, 'pending', '2026-10-01', 'UTILITY')`,
+        [rent, water, f.unitId, f.leaseId, f.tenantId, f.landlordId])
+      const gamFee = (await client.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, revenue_owner)
+         VALUES ($1, $2, $3, $4, 'fee', 4, 'pending', '2026-10-01', 'RETURNFEE', 'gam') RETURNING id`,
+        [f.unitId, f.leaseId, f.tenantId, f.landlordId])).rows[0].id as string
+      await use(client, f, rent, { prepaid: await paidAhead(client, f, 460, 'gam') }, 460)
+      await use(client, f, water, { prepaid: await paidAhead(client, f, 40, 'landlord') }, 40)
+      const pi = 'pi_split_credit'
+      await client.query(
+        `UPDATE payments SET status = 'settled', settled_at = now(), stripe_payment_intent_id = $2, stripe_charge_id = 'ch_' || $2
+          WHERE id = ANY($1::uuid[])`, [[rent, water, gamFee], pi])
+      await client.query(
+        `INSERT INTO tenant_remittances (tenant_id, landlord_id, lease_id, amount, applied_amount, unapplied_amount, status, payment_method, stripe_payment_intent_id)
+         VALUES ($1, $2, $3, 4, 4, 0, 'settled', 'ach', $4)`, [f.tenantId, f.landlordId, f.leaseId, pi])
+      await executeRentAllocation(client, rent, 'ach')
+      await executeRentAllocation(client, water, 'ach')
+      // GAM holds $460 on rent: the landlord's share less ONE $6 fee. Water books nothing.
+      expect((await ledger(client, rent, 'allocation_owner_share')).a).toBe(454)
+      expect((await ledger(client, water, 'allocation_owner_share')).n).toBe(0)
+      const fees = await client.query(
+        `SELECT COUNT(*)::int AS n, COALESCE(SUM(customer_fee_charged), 0)::float AS fee FROM platform_revenue_ledger
+          WHERE reference_id = ANY($1::uuid[]) AND type = 'banking_spread'`, [[rent, water]])
+      expect(fees.rows[0]).toEqual({ n: 1, fee: 6 })
+    })
+  })
+
+  // The same rule when money did move: a row settled at the desk that still
+  // carries the charge's old (bounced) intent books nothing, so it takes no
+  // share of the fee and cannot swallow the rounding cent.
+  it("a desk-settled row still carrying the charge's old intent takes no share of its fee", async () => {
+    await withRollback(async (client) => {
+      const f = await fx(client, { feePayer: 'landlord' })
+      const rent = `10000000-0000-4000-8000-${randomUUID().slice(-12)}`
+      const water = `f0000000-0000-4000-8000-${randomUUID().slice(-12)}`
+      const pi = 'pi_with_desk_row'
+      await client.query(
+        `INSERT INTO payments (id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description,
+                               stripe_payment_intent_id, settled_at, stripe_charge_id, manual_method)
+         VALUES ($1, $3, $4, $5, $6, 'rent', 1000, 'settled', '2026-10-01', 'RENT', $7, now(), 'ch_' || $7, NULL),
+                ($2, $3, $4, $5, $6, 'utility', 333.33, 'settled', '2026-10-01', 'UTILITY', $7, now(), NULL, 'cash')`,
+        [rent, water, f.unitId, f.leaseId, f.tenantId, f.landlordId, pi])
+      await client.query(
+        `INSERT INTO tenant_remittances (tenant_id, landlord_id, lease_id, amount, applied_amount, unapplied_amount, status, payment_method, stripe_payment_intent_id)
+         VALUES ($1, $2, $3, 1000, 1000, 0, 'settled', 'ach', $4)`, [f.tenantId, f.landlordId, f.leaseId, pi])
+      await executeRentAllocation(client, rent, 'ach')
+      await executeRentAllocation(client, water, 'ach')
+      // ACH test rate 1.0% on the $1,000 the bank moved: $10, all on rent.
+      const s = await spread(client, rent)
+      expect(s.fee).toBe(10)
+      expect((await ledger(client, rent, 'allocation_owner_share')).a).toBe(990)
+      expect((await ledger(client, water, 'allocation_owner_share')).n).toBe(0)
+      expect(await spread(client, water)).toBeNull()
+    })
+  })
+
+  // Wave A review: the same desk row, but GAM-held paid-ahead money paid part
+  // of it (gam_held_part > 0, so it books an owner share). It used to join the
+  // split by its $300 of CASH — money Stripe never processed — and take $2.31
+  // of the $10 fee: booked on the cash when the desk forgot to say "no fee",
+  // and booked nowhere (GAM absorbing it) when it did. Either way the fee
+  // belongs on the row the bank paid, once.
+  it.each([
+    ['the desk says no fee of its own', { feeAlreadyCollected: true }],
+    ['the desk forgets to say so', {}],
+  ])("a desk-settled row with GAM-held credit and the charge's old intent takes no share of its fee (%s)", async (_label, deskOpts) => {
+    await withRollback(async (client) => {
+      const f = await fx(client, { feePayer: 'landlord' })
+      const rent = `10000000-0000-4000-8000-${randomUUID().slice(-12)}`
+      const water = `f0000000-0000-4000-8000-${randomUUID().slice(-12)}`
+      const pi = 'pi_with_desk_credit_row'
+      await client.query(
+        `INSERT INTO payments (id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description,
+                               stripe_payment_intent_id, settled_at, stripe_charge_id)
+         VALUES ($1, $3, $4, $5, $6, 'rent', 1000, 'settled', '2026-10-01', 'RENT', $7, now(), 'ch_' || $7),
+                ($2, $3, $4, $5, $6, 'utility', 333.33, 'failed', '2026-10-01', 'UTILITY', $7, NULL, NULL)`,
+        [rent, water, f.unitId, f.leaseId, f.tenantId, f.landlordId, pi])
+      // At the desk: $33.33 from money paid ahead through GAM, $300 in cash.
+      await use(client, f, water, { prepaid: await paidAhead(client, f, 33.33, 'gam') }, 33.33)
+      await client.query(
+        `UPDATE payments SET status = 'settled', settled_at = now(), manual_method = 'cash', platform_held = TRUE WHERE id = $1`, [water])
+      await client.query(
+        `INSERT INTO tenant_remittances (tenant_id, landlord_id, lease_id, amount, applied_amount, unapplied_amount, status, payment_method, stripe_payment_intent_id)
+         VALUES ($1, $2, $3, 1000, 1000, 0, 'settled', 'ach', $4)`, [f.tenantId, f.landlordId, f.leaseId, pi])
+      const vm = (await client.query(
+        `SELECT money_part::float AS m, gam_held_part::float AS g FROM v_payment_money WHERE payment_id = $1`, [water])).rows[0]
+      expect(vm).toEqual({ m: 300, g: 33.33 })
+      await executeRentAllocation(client, rent, 'ach')
+      await executeRentAllocation(client, water, 'ach', deskOpts)
+      // ACH test rate 1.0% on the $1,000 the bank moved: $10, booked once, all on rent.
+      const fees = await client.query(
+        `SELECT COUNT(*)::int AS n, COALESCE(SUM(customer_fee_charged), 0)::float AS fee FROM platform_revenue_ledger
+          WHERE reference_id = ANY($1::uuid[]) AND type = 'banking_spread'`, [[rent, water]])
+      expect(fees.rows[0]).toEqual({ n: 1, fee: 10 })
+      expect((await spread(client, rent)).fee).toBe(10)
+      expect((await ledger(client, rent, 'allocation_owner_share')).a).toBe(990)
+      // The water's GAM-held credit is paid out whole, with no fee; its cash never.
+      expect((await ledger(client, water, 'allocation_owner_share')).a).toBe(33.33)
+      expect(await spread(client, water)).toBeNull()
+    })
+  })
+
+  // Wave A cleanup: a row on the charge that is outside the split set (here a
+  // reopened row whose re-payment GAM keeps; the webhook skips its allocation)
+  // used to take a share of the fee by its money while the set's rows already
+  // carried all of it — part of the fee booked twice if anything ever
+  // allocated it. It takes nothing.
+  it('a row on the intent that is not in the split set books no fee', async () => {
+    await withRollback(async (client) => {
+      const f = await fx(client, { feePayer: 'landlord' })
+      const rent = `10000000-0000-4000-8000-${randomUUID().slice(-12)}`
+      const reopened = `f0000000-0000-4000-8000-${randomUUID().slice(-12)}`
+      const pi = 'pi_with_reopened_row'
+      // October's rent was disputed: the original is returned, the landlord has
+      // not been clawed back yet, and a reopened row asks the $500 again.
+      const orig = (await client.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description,
+                               stripe_payment_intent_id, settled_at)
+         VALUES ($1, $2, $3, $4, 'rent', 500, 'returned', '2026-09-01', 'RENT', 'pi_disputed', now()) RETURNING id`,
+        [f.unitId, f.leaseId, f.tenantId, f.landlordId])).rows[0].id as string
+      const rev = (await client.query(
+        `INSERT INTO payment_reversals (payment_id, landlord_id, tenant_id, lease_id, reversal_type, reversed_amount,
+                                        stripe_event_id, raw_event, recovery_status)
+         VALUES ($1, $2, $3, $4, 'card_dispute', 500, $5, '{}'::jsonb, 'pending') RETURNING id`,
+        [orig, f.landlordId, f.tenantId, f.leaseId, `evt_${randomUUID()}`])).rows[0].id as string
+      // One bank payment settles this month's rent and the reopened row.
+      await client.query(
+        `INSERT INTO payments (id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description,
+                               stripe_payment_intent_id, settled_at, stripe_charge_id, reversal_id)
+         VALUES ($1, $3, $4, $5, $6, 'rent', 1000, 'settled', '2026-10-01', 'RENT', $7, now(), 'ch_' || $7, NULL),
+                ($2, $3, $4, $5, $6, 'rent', 500, 'settled', '2026-09-01', 'RENT', $7, now(), 'ch_' || $7, $8)`,
+        [rent, reopened, f.unitId, f.leaseId, f.tenantId, f.landlordId, pi, rev])
+      await client.query(
+        `INSERT INTO tenant_remittances (tenant_id, landlord_id, lease_id, amount, applied_amount, unapplied_amount, status, payment_method, stripe_payment_intent_id)
+         VALUES ($1, $2, $3, 1500, 1500, 0, 'settled', 'ach', $4)`, [f.tenantId, f.landlordId, f.leaseId, pi])
+      await executeRentAllocation(client, rent, 'ach')
+      // Nothing allocates the reopened row today; if anything ever does, it
+      // books no share of the fee the rent row already carries in full.
+      await executeRentAllocation(client, reopened, 'ach')
+      // ACH test rate 1.0% on the $1,500 the bank moved: $15, booked once, all on rent.
+      const fees = await client.query(
+        `SELECT COUNT(*)::int AS n, COALESCE(SUM(customer_fee_charged), 0)::float AS fee FROM platform_revenue_ledger
+          WHERE reference_id = ANY($1::uuid[]) AND type = 'banking_spread'`, [[rent, reopened]])
+      expect(fees.rows[0]).toEqual({ n: 1, fee: 15 })
+      expect((await spread(client, rent)).fee).toBe(15)
+      expect(await spread(client, reopened)).toBeNull()
+      expect((await ledger(client, reopened, 'allocation_owner_share')).a).toBe(500)
+    })
+  })
+
+  it('a row no money paid carries no processing fee, even when the caller forgets to say so', async () => {
+    await withRollback(async (client) => {
+      await client.query(`UPDATE platform_processing_rates SET effective_until = now() WHERE payment_method = 'ach' AND effective_until IS NULL`)
+      await client.query(
+        `INSERT INTO platform_processing_rates
+           (payment_method, customer_facing_flat, customer_facing_percent, customer_facing_cap,
+            stripe_cost_flat, stripe_cost_percent, stripe_cost_cap)
+         VALUES ('ach', 6.00, 0, 6.00, 0, 0.5, 3.00)`)
+      const f = await fx(client, { feePayer: 'landlord' })
+      const pay = await rentRow(client, f)
+      await use(client, f, pay, { prepaid: await paidAhead(client, f, 460, 'gam') }, 460)
+      await settleByCreditOnly(client, pay)
+      await executeRentAllocation(client, pay, 'ach')        // no feeAlreadyCollected
+      expect((await ledger(client, pay, 'allocation_owner_share')).a).toBe(460)
+      expect(await spread(client, pay)).toBeNull()
     })
   })
 })

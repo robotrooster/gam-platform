@@ -377,3 +377,37 @@ describe('the tenant’s list of reports', () => {
     expect((await get()).body.data[0].bank_feed_linked).toBe(true)
   })
 })
+
+// S655 (Step 12): a match the landlord undoes gives the tenant their report back.
+describe('a report whose deposit match is undone', () => {
+  it('is waiting again, and the tenant may withdraw it', async () => {
+    const f = await fixture()
+    const { autoSettleDeclaredDeposits } = await import('../services/bankFeed')
+    const { undoDepositMatch } = await import('../services/bankDepositConfirm')
+    const rent = (await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',250,'pending',$5::date,'RENT') RETURNING id`,
+      [f.unitId, f.leaseId, f.tenantId, f.landlordId, today()])).rows[0].id
+    const made = await request(buildApp()).post('/api/declared-deposits')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash' })
+    expect(made.status, JSON.stringify(made.body)).toBe(200)
+    const conn = (await db.query(
+      `INSERT INTO bank_connections (landlord_id, provider, status) VALUES ($1,'stripe_fc','active') RETURNING id`, [f.landlordId])).rows[0].id
+    const txn = (await db.query(
+      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status)
+       VALUES ($1,$2,'d1',$3::date,250,'ATM CASH DEPOSIT','needs_review') RETURNING id`, [conn, f.landlordId, today()])).rows[0].id
+    expect(await autoSettleDeclaredDeposits(f.landlordId)).toBe(1)
+    expect((await db.query(`SELECT status FROM tenant_declared_deposits WHERE id=$1`, [made.body.data.id])).rows[0].status).toBe('confirmed')
+
+    await undoDepositMatch({ bankTransactionId: txn, landlordId: f.landlordId, undoneBy: f.landlordUserId })
+    expect((await db.query(`SELECT status FROM tenant_declared_deposits WHERE id=$1`, [made.body.data.id])).rows[0].status).toBe('pending')
+    expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [rent])).rows[0].status).toBe('pending')
+    // The feed never settles it again by itself — the landlord said no.
+    expect(await autoSettleDeclaredDeposits(f.landlordId)).toBe(0)
+    const res = await request(buildApp())
+      .delete(`/api/declared-deposits/${made.body.data.id}`)
+      .set('Authorization', `Bearer ${f.token}`)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+  })
+})

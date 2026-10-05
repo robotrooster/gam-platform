@@ -61,9 +61,11 @@ import { dumpLocationsRouter } from './routes/dumpLocations'
 import { tenantsRouter }      from './routes/tenants'
 import { propertiesRouter, publicPropertiesRouter } from './routes/properties'
 import { unitsRouter }        from './routes/units'
+import { stayCheckOutRouter }  from './routes/stayCheckOut'
 import { propertyBookingAdminRouter } from './routes/propertyBookingAdmin'
 import { telemetryRouter } from './routes/telemetry'
 import { leasesRouter }       from './routes/leases'
+import { paidAheadChoiceRouter } from './routes/paidAheadChoice'
 import { homeSaleRouter }     from './routes/homeSale'
 import { homeOwnershipRouter } from './routes/homeOwnership'
 import { lotRentRouter }      from './routes/lotRent'
@@ -384,9 +386,13 @@ app.use('/api/dump-locations', dumpLocationsRouter)
 app.use('/api/tenants',       tenantsRouter)
 app.use('/api/properties',    propertiesRouter)
 app.use('/api/public/properties', publicPropertiesRouter)
+// 10/4 (decisions #38): checking a guest out and settling the money.
+app.use('/api/units',         stayCheckOutRouter)
 app.use('/api/units',         unitsRouter)
 app.use('/api',               propertyBookingAdminRouter)
 app.use('/api',               telemetryRouter)
+// 10/4 (decisions #46.1): the landlord's choice for paid-ahead money left on an ended lease.
+app.use('/api/leases',        paidAheadChoiceRouter)
 app.use('/api/leases',        leasesRouter)
 app.use('/api/home-sales',    homeSaleRouter)
 app.use('/api/home-ownerships', homeOwnershipRouter)

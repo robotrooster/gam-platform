@@ -16,12 +16,16 @@
  * custody, deposit portability, OTP deposits, interest accrual, and
  * deposit-return — but written nowhere in production (only tests). Now
  * every lease that gets a deposit amount also gets a `security_deposits`
- * row (status='pending', held_by from the property's deposit_handling_mode)
- * so the whole subsystem actually functions. See syncSecurityDepositRow.
+ * row (status='pending', held_by PLANNED from the lease's source and the S604
+ * custody gate) so the whole subsystem actually functions. See
+ * syncSecurityDepositRow. 10/4 (decisions #46.3): the planned holder is only a
+ * plan — when the deposit is paid, reconcileSettledDepositPayment sets it from
+ * HOW it was collected (through GAM → GAM; in person or into the landlord's
+ * bank → the landlord).
  */
 
 import type { PoolClient } from 'pg'
-import { query, queryOne } from '../db'
+import { db, query, queryOne } from '../db'
 
 /**
  * Upsert the security_deposit lease_fees row for a lease. When amount
@@ -84,11 +88,13 @@ export async function syncSecurityDepositLeaseFee(
  * the live deposit amount. This is the production creation path the table
  * never had (pre-S515 only tests inserted rows).
  *
- * held_by is derived from the property's deposit_handling_mode
- * ('landlord_held' → 'landlord', 'gam_escrow' → 'gam_escrow'). The row
- * starts status='pending'; the move-in / settle path bumps
- * collected_amount + status (see reconcileSettledDepositPayment) and
- * FlexDeposit enrollment overlays its own columns.
+ * held_by here is the PLAN (see the CASE below: lease source + the S604
+ * custody gate; a property's deposit_handling_mode 'gam_escrow' only means the
+ * landlord turned an imported tenancy's deposits over to GAM — FlexVault). The
+ * row starts status='pending'; every settle of a deposit payment bumps
+ * collected_amount + status AND sets held_by from how the money was actually
+ * collected (reconcileSettledDepositPayment, decisions #46.3), and FlexDeposit
+ * enrollment overlays its own columns.
  *
  * Idempotency landmine: this is an UPSERT, NOT delete-then-insert (unlike
  * the lease_fees side). Re-syncing a deposit amount must never wipe an
@@ -157,8 +163,16 @@ export async function syncSecurityDepositRow(
             -- resolves to 'landlord'. Silence means "nobody has checked", never
             -- "go ahead". Flipping a state to supported later automatically
             -- lets new deposits flow to GAM with no code change.
+            --
+            -- Fix pass 1 (final fix): ONE gate — the same predicate as
+            -- gamMayHoldDeposits below and depositCustody.canCustodyDeposits:
+            -- supported AND the state allows the vehicle GAM uses (Treasury
+            -- bills). Before this the plan read 'supported' alone, so a state
+            -- supported without allows_treasury_bills was planned (and, paid
+            -- through GAM, recorded) as GAM's where the gate says no.
             CASE
-              WHEN COALESCE(cr.custody_status, 'needs_research') <> 'supported'
+              WHEN NOT (COALESCE(cr.custody_status, 'needs_research') = 'supported'
+                        AND COALESCE(cr.allows_treasury_bills, FALSE))
                 THEN 'landlord'
               WHEN l.lease_source = 'imported'
                 THEN CASE WHEN p.deposit_handling_mode = 'gam_escrow'
@@ -200,17 +214,132 @@ export async function syncSecurityDepositRow(
 }
 
 /**
+ * 10/4 (decisions #46.3, Nic, FINAL): who holds a deposit is decided by HOW IT
+ * WAS COLLECTED, never by a property setting.
+ *   'gam'      — paid electronically through GAM: a card or bank payment that
+ *                settled on GAM's balance (platform_held — every card, bank,
+ *                reader and autopay charge GAM makes for a lease bill is made
+ *                that way, rentCharge) with no hand-payment method. GAM holds
+ *                it until move-out, where the S604 custody gate lets it
+ *                (otherwise the landlord, as before).
+ *   'landlord' — paid in person (cash, a check or a money order at the desk or
+ *                register, an agent-recorded cash payment, a posted receipt) or
+ *                matched from a deposit into the landlord's own bank: the
+ *                payment carries its hand-payment method. The landlord holds it,
+ *                whatever was planned at billing. Also a card or bank payment
+ *                whose money went straight to the landlord (a Stripe intent,
+ *                not on GAM's balance — the old destination charges), and a
+ *                deposit payment GAM released to them at move-out
+ *                (depositReturn clears platform_held on it).
+ *   null       — none of these facts is on the row (a hand-made test row): the
+ *                planned holder stands.
+ * ONE definition (SQL), for every reader that has to say who holds a deposit
+ * payment: the record's holder here (reconcileSettledDepositPayment), the
+ * move-out's refund split (depositReturn.settledDepositPayments) and the
+ * renewal unwind (unwindIssuedLease.returnDepositCountedOnce). Step 9 review
+ * (fix pass 2): before this the move-out read "GAM holds it" off platform_held
+ * and the record read it off the Stripe intent — a Stripe-paid deposit not on
+ * GAM's balance was recorded as GAM's (interest accrued, counted in trust)
+ * while the move-out named the landlord as the one who refunds it.
+ * `a` is the payments alias.
+ */
+export function depositCollectedBySql(a = 'p'): string {
+  if (!/^[a-z_][a-z0-9_]*$/i.test(a)) throw new Error(`depositCollectedBySql: "${a}" is not a table alias`)
+  // Fix pass 1 (final fix): a deposit payment GAM took that a finalized
+  // move-out has since used (finalize clears platform_held on it — its kept
+  // part was paid to the landlord, the rest is a refund GAM owes, counted on
+  // its own line in GAM's book) was still COLLECTED by GAM. Before this it
+  // read 'landlord' afterwards (platform_held FALSE plus a Stripe intent),
+  // though GAM took the money and may still owe part of it.
+  //
+  // Fix pass 2: told by a RECORDED fact, never by timing. Finalize clears
+  // platform_held only on the deposit payments of a record GAM held
+  // (security_deposits.held_by 'gam_escrow', set from the actual collection
+  // when the deposit was paid — reconcileSettledDepositPayment); a Stripe
+  // deposit passed straight to the landlord (a state where GAM may not hold
+  // deposits) is on a record the landlord holds and keeps reading 'landlord'
+  // before and after the move-out.
+  //
+  // Fix pass 3: told by the PAYMENT itself. Finalize stamps each GAM-held
+  // deposit payment it releases with released_by_deposit_return_id (the same
+  // UPDATE that clears platform_held) — the security deposit's GAM part AND a
+  // pet, key or cleaning deposit GAM held. Before this only the security
+  // deposit record's holder was read, so a pet deposit paid online through
+  // GAM on a lease whose security deposit the landlord holds read 'landlord'
+  // after finalize. The record test stays as the fallback for a return
+  // finalized before the stamp existed.
+  return `(CASE WHEN ${a}.manual_method IS NOT NULL THEN 'landlord'
+                WHEN ${a}.platform_held THEN 'gam'
+                WHEN ${a}.released_by_deposit_return_id IS NOT NULL THEN 'gam'
+                WHEN ${a}.stripe_payment_intent_id IS NOT NULL AND ${a}.type = 'deposit' AND ${a}.settled_at IS NOT NULL
+                     AND EXISTS (SELECT 1 FROM deposit_returns dcb_dr
+                                   JOIN security_deposits dcb_sd ON dcb_sd.id = dcb_dr.security_deposit_id
+                                  WHERE dcb_dr.lease_id = ${a}.lease_id
+                                    AND dcb_dr.finalized_at IS NOT NULL
+                                    AND dcb_sd.held_by = 'gam_escrow') THEN 'gam'
+                WHEN ${a}.stripe_payment_intent_id IS NOT NULL THEN 'landlord'
+                ELSE NULL END)`
+}
+
+/**
+ * The S604 custody gate for one lease: may GAM hold deposits in this
+ * property's state (state_deposit_custody_rules, fail-closed — a state nobody
+ * has researched reads as "no")? The same rule syncSecurityDepositRow plans
+ * with, and services/depositCustody.canCustodyDeposits reads.
+ */
+export async function gamMayHoldDeposits(runner: Pick<PoolClient, 'query'>, leaseId: string): Promise<boolean> {
+  const r = await runner.query<{ ok: boolean }>(
+    `SELECT (COALESCE(cr.custody_status, 'needs_research') = 'supported'
+             AND COALESCE(cr.allows_treasury_bills, FALSE)) AS ok
+       FROM leases l
+       JOIN units u ON u.id = l.unit_id
+       JOIN properties p ON p.id = u.property_id
+       LEFT JOIN state_deposit_custody_rules cr ON cr.state_code = p.state
+      WHERE l.id = $1`, [leaseId])
+  return r.rows[0]?.ok === true
+}
+
+/** What one settled security-deposit payment did to its deposit record. */
+export interface DepositRecordRaised {
+  depositId: string
+  /** Dollars the record's collected amount rose by (0: it was already funded). */
+  amount: number
+  /** Who the record said held it before, and after (decisions #46.3). */
+  priorHeldBy: string
+  heldBy: string
+  /** The record's status before (Undo puts it back). */
+  priorStatus: string
+}
+
+/**
  * S515: on a settled regular (non-FlexDeposit) deposit payment, advance
  * the security_deposits row: bump collected_amount and flip status to
  * 'funded' (or 'partial'). FlexDeposit deposits do their own collected
  * accounting via the installment / pay-ahead reconcilers, so this skips
  * any FlexDeposit-enrolled row. Idempotent at the webhook layer (the
  * settle transition fires reconcile hooks exactly once).
+ *
+ * 10/4 (decisions #46.3): EVERY path that settles a security deposit calls
+ * this — the Stripe webhook (portal, autopay, the counter card reader), and
+ * every settle outside Stripe through services/manualPaymentSettle (the desk,
+ * the landlord agent's cash payment, a posted receipt, the bank-deposit
+ * match). It records WHO HOLDS the deposit from the actual collection
+ * (depositCollectedBySql):
+ *   - through GAM: GAM holds it (gam_escrow) when the record was already
+ *     planned that way (the custody gate allowed it at billing) or the gate
+ *     allows it now; otherwise the landlord, as before.
+ *   - in person or into the landlord's bank: the landlord holds it — the
+ *     record becomes 'landlord' when nothing on it was held yet. When GAM
+ *     already holds part of it (paid through GAM earlier) the record stays
+ *     'gam_escrow' and the landlord's part is told apart at move-out by its
+ *     payment (depositReturn reads each payment's own collection).
+ * FlexDeposit is left alone (its own accounting), and so is a record already
+ * funded (the payment raised nothing). Returns what changed, or null.
  */
 export async function reconcileSettledDepositPayment(
   paymentId: string,
   client?: PoolClient,
-): Promise<void> {
+): Promise<DepositRecordRaised | null> {
   const exec = async (sql: string, params: any[]): Promise<void> => {
     if (client) { await client.query(sql, params) } else { await query(sql, params) }
   }
@@ -219,34 +348,86 @@ export async function reconcileSettledDepositPayment(
     return queryOne<T>(sql, params)
   }
 
-  const p = await one<{ lease_id: string | null; type: string; amount: string; lease_fee_id: string | null }>(
-    `SELECT lease_id, type, amount::text, lease_fee_id FROM payments WHERE id = $1`,
+  const p = await one<{
+    lease_id: string | null; type: string; amount: string; lease_fee_id: string | null
+    collected_by: 'gam' | 'landlord' | null; reversal_id: string | null
+  }>(
+    `SELECT p.lease_id, p.type, p.amount::text, p.lease_fee_id, ${depositCollectedBySql('p')} AS collected_by,
+            p.reversal_id
+       FROM payments p WHERE p.id = $1`,
     [paymentId],
   )
-  if (!p || p.type !== 'deposit' || !p.lease_id) return
+  if (!p || p.type !== 'deposit' || !p.lease_id) return null
   // S653: a pet / key / cleaning deposit is its own held deposit (it carries
   // its lease_fees row). It is returned by depositReturn alongside the security
   // deposit but it does not fund THIS pool, or a pet deposit settling first
-  // would read as the security deposit being paid.
-  if (p.lease_fee_id) return
+  // would read as the security deposit being paid. Who holds it is read off
+  // its own payment at move-out.
+  if (p.lease_fee_id) return null
 
-  const dep = await one<{ id: string; flex_deposit_enabled: boolean; status: string }>(
-    `SELECT id, flex_deposit_enabled, status
+  const dep = await one<{ id: string; flex_deposit_enabled: boolean; status: string; held_by: string; collected: string }>(
+    `SELECT id, flex_deposit_enabled, status, held_by, collected_amount::text AS collected
        FROM security_deposits
       WHERE lease_id = $1
       ORDER BY created_at DESC
-      LIMIT 1`,
+      LIMIT 1
+      ${client ? 'FOR UPDATE' : ''}`,
     [p.lease_id],
   )
-  if (!dep || dep.flex_deposit_enabled || dep.status === 'funded') return
+  if (!dep || dep.flex_deposit_enabled || dep.status === 'funded') return null
 
+  // Step 9 review (fix pass 2): a deposit payment a bank return or a dispute
+  // reopened (payments.reversal_id), paid again. The record still counts the
+  // payment the bank took back — a return never lowers it (paymentReversal);
+  // the move-out takes off a reopened line still unpaid instead
+  // (depositReturn.liveDepositPool) — so this payment is that same deposit
+  // paid at last, never more of it: raising the record again counted the one
+  // deposit twice. Who holds it is still read off how it was paid: the
+  // landlord's part is told apart at move-out by its payment. Only when the
+  // record holds nothing else (the returned payment was all of it) does the
+  // holder follow this payment.
+  if (p.reversal_id) {
+    const other = await one<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM payments o
+        WHERE o.lease_id = $1 AND o.type = 'deposit' AND o.lease_fee_id IS NULL
+          AND o.status = 'settled' AND o.amount > 0 AND o.id <> $2`,
+      [p.lease_id, paymentId])
+    const heldByNow = (other?.n ?? 0) > 0 || p.collected_by == null ? dep.held_by
+      : p.collected_by === 'landlord' ? 'landlord'
+      : (dep.held_by === 'gam_escrow' || await gamMayHoldDeposits(client ?? db, p.lease_id)) ? 'gam_escrow' : 'landlord'
+    if (heldByNow !== dep.held_by) {
+      await exec(`UPDATE security_deposits SET held_by = $2, updated_at = NOW() WHERE id = $1`, [dep.id, heldByNow])
+    }
+    return { depositId: dep.id, amount: 0, priorHeldBy: dep.held_by, heldBy: heldByNow, priorStatus: dep.status }
+  }
+
+  const nothingHeldYet = Number(dep.collected) <= 0
+  let heldBy = dep.held_by
+  if (p.collected_by === 'gam') {
+    const gamMay = dep.held_by === 'gam_escrow' || await gamMayHoldDeposits(client ?? db, p.lease_id)
+    heldBy = gamMay ? 'gam_escrow' : (nothingHeldYet ? 'landlord' : dep.held_by)
+  } else if (p.collected_by === 'landlord') {
+    heldBy = nothingHeldYet ? 'landlord' : dep.held_by
+  }
+
+  const before = Number(dep.collected)
   await exec(
     `UPDATE security_deposits
         SET collected_amount = LEAST(collected_amount + $2::numeric, total_amount),
             status = CASE WHEN collected_amount + $2::numeric >= total_amount
                           THEN 'funded' ELSE 'partial' END,
+            held_by = $3,
             updated_at = NOW()
       WHERE id = $1`,
-    [dep.id, Number(p.amount).toFixed(2)],
+    [dep.id, Number(p.amount).toFixed(2), heldBy],
   )
+  const after = await one<{ collected: string }>(
+    `SELECT collected_amount::text AS collected FROM security_deposits WHERE id = $1`, [dep.id])
+  return {
+    depositId: dep.id,
+    amount: Math.round((Number(after?.collected ?? before) - before) * 100) / 100,
+    priorHeldBy: dep.held_by,
+    heldBy,
+    priorStatus: dep.status,
+  }
 }

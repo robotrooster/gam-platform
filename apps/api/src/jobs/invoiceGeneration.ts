@@ -11,8 +11,8 @@ import {
   loadWorkTradeCreditContext, distributeWorkTradeCredit, round2,
 } from '../services/workTradeCredit'
 import { ensureBillsForUnit } from '../services/utilityBilling'
-import { applyCreditsToOpenCharges } from '../services/creditApplication'
-import { consumePrepaidCreditForInvoice } from '../services/prepaidRelease'
+import { settleWholeBillIfCovered, type WholeBillResult } from '../services/creditUse'
+import { lockHousehold } from '../services/moneyPredicates'
 import { createAdminNotification } from '../services/adminNotifications'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
@@ -76,6 +76,25 @@ interface MonthlyFee {
   fee_type: string
   amount: string
   description: string | null
+}
+
+/**
+ * Does the tenant on this lease owe the utility this meter measures? The bill
+ * engine's own rule (services/utilityBilling tenantOwesUtility, S629/S634): a
+ * utility row on the lease wins when the lease says something; when it is
+ * silent, the meter's setup decides — anything but "bill the landlord" is the
+ * tenant's. `leaseRef` is a placeholder, `m` the utility_meters alias.
+ *
+ * The three invoice holds below used to INNER JOIN the lease's utility rows,
+ * so a lease that names no utilities (78 of the 79 active leases in
+ * production, 10/3) never waited for an unread meter, a flagged reading or
+ * the landlord's review — its bill went out with last month's utility missing
+ * while the engine billed it anyway. The holds now ask the engine's question.
+ */
+function tenantOwesMeterSql(leaseRef: string, m: string): string {
+  return `COALESCE((SELECT lur.tenant_responsible FROM lease_utility_responsibilities lur
+                     WHERE lur.lease_id = ${leaseRef} AND lur.utility_type = ${m}.utility_type),
+                   ${m}.billing_method <> 'master_bill_to_landlord')`
 }
 
 interface InvoiceGenResult {
@@ -171,6 +190,10 @@ export async function generateFinalUtilityInvoice(
   let invoiceId: string
   try {
     await client.query('BEGIN')
+    // S655 money plan §1.5: this writes the household's charges, so it takes
+    // the household lock first, like the monthly run (before the invoice
+    // number, which another writer holding the household may also need).
+    if (lease.tenant_id) await lockHousehold(client, lease.tenant_id, lease.landlord_id)
     const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, Number(today.slice(0, 4)))
     const inv = await client.query<{ id: string }>(
       `INSERT INTO invoices (
@@ -547,17 +570,16 @@ async function runGeneration(
       // and on any needs_review flag on the master or a linked submeter.
       // (Supersedes the old "RUBS masters never block" posture.) Same
       // force-complete escape hatch releases it.
+      // S655 (10/3 sweep): "tenant-responsible" is the engine's rule
+      // (tenantOwesMeterSql), not "the lease has a utility row".
       const readHold = await queryOne<{ meter_id: string }>(
         `SELECT m.id AS meter_id
            FROM utility_reading_runs r
            JOIN utility_meters m ON m.property_id = r.property_id
                                 AND m.billing_method IN ('submeter','rubs')
            JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $2
-           JOIN lease_utility_responsibilities lur
-             ON lur.lease_id = $1
-            AND lur.utility_type = m.utility_type
-            AND lur.tenant_responsible
           WHERE r.status <> 'completed'
+            AND ${tenantOwesMeterSql('$1::uuid', 'm')}
             -- S652: BEFORE the invoice's own month. An invoice due in March
             -- carries February's round; March's round is read for April. With
             -- "<=" a round that opened on the 26th held every invoice due the
@@ -589,19 +611,25 @@ async function runGeneration(
           LIMIT 1`,
         [lease.id, lease.unit_id, dueDate]
       )
+      // A flag holds the bill only on a monthly-cycle read — the same reads the
+      // run counts (utilityReadingRuns.countFlaggedOnRun) and the landlord's
+      // "Readings to double-check" shows. A reference, turnover or
+      // billed-off-platform read is not what this month's bill is computed
+      // from, so a stale flag on one never holds a household's rent. (Country
+      // Acres MH 21/22/24's August water reads were re-marked
+      // 'billed_off_platform' still flagged; under the old join they never
+      // held a bill and they must not start to.)
       const flagHold = readHold ? null : await queryOne<{ meter_id: string }>(
         `SELECT m.id AS meter_id
            FROM utility_meters m
            JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $2
-           JOIN lease_utility_responsibilities lur
-             ON lur.lease_id = $1
-            AND lur.utility_type = m.utility_type
-            AND lur.tenant_responsible
           WHERE m.billing_method IN ('submeter','rubs')
+            AND ${tenantOwesMeterSql('$1::uuid', 'm')}
             AND (
               EXISTS (
                 SELECT 1 FROM utility_meter_readings rd
                  WHERE rd.meter_id = m.id AND rd.needs_review
+                   AND rd.reason = 'monthly_cycle'
                    AND rd.billing_cycle_month < date_trunc('month', $3::date)::date)
               -- a flagged reading on a submeter on one of the master's units
               OR (m.billing_method = 'rubs' AND EXISTS (
@@ -612,6 +640,7 @@ async function runGeneration(
                                         AND sm.utility_type = m.utility_type
                   JOIN utility_meter_readings rd ON rd.meter_id = sm.id
                  WHERE master_mu.meter_id = m.id AND rd.needs_review
+                   AND rd.reason = 'monthly_cycle'
                    AND rd.billing_cycle_month < date_trunc('month', $3::date)::date))
             )
           LIMIT 1`,
@@ -630,9 +659,8 @@ async function runGeneration(
                                 AND m.billing_method IN ('submeter','rubs')
                                 AND (r.utility_type IS NULL OR m.utility_type = r.utility_type)
            JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $2
-           JOIN lease_utility_responsibilities lur
-             ON lur.lease_id = $1 AND lur.utility_type = m.utility_type AND lur.tenant_responsible
           WHERE r.status <> 'completed' AND r.approved_at IS NULL
+            AND ${tenantOwesMeterSql('$1::uuid', 'm')}
             AND r.billing_cycle_month < date_trunc('month', $3::date)::date
           LIMIT 1`,
         [lease.id, lease.unit_id, dueDate])
@@ -865,8 +893,16 @@ async function runGeneration(
       }
 
       const client = await getClient()
+      // The "paid with your account credit" receipts, sent once COMMIT returns.
+      let creditReceipts: WholeBillResult['afterCommit'] | null = null
       try {
         await client.query('BEGIN')
+        // S655 money plan §1.5: the bill run writes this household's money
+        // (its rows, and a credit settle right after), so it takes the
+        // household lock first, like every other writer. A tenant paying, the
+        // desk, a webhook or a credit being issued for the same household waits
+        // for this bill, or this bill waits for them — never both at once.
+        if (effectiveTenantId) await lockHousehold(client, effectiveTenantId, lease.landlord_id)
 
         const year = DateTime.fromISO(dueDate).year
         const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, year)
@@ -1407,58 +1443,61 @@ async function runGeneration(
           homePaymentsInserted++
         }
 
-        // S537 (Nic): consume prepaid credit — money the tenant paid ahead —
-        // against this invoice's fresh charge rows, oldest credit first.
+        // ── S655 (Nic, 10/2): THE WHOLE-BILL RULE, ONCE PER HOUSEHOLD ────────
         //
-        // S609: the release now also HANDS THE LANDLORD their share of what the
-        // credit covered. Before, the tenant's bill was marked paid and the
-        // money stayed on GAM's books permanently; see services/prepaidRelease
-        // for the full note. Runs BEFORE landlord-issued credits so real money
-        // the tenant already paid is spent before a landlord's write-off is.
-        await consumePrepaidCreditForInvoice(client, { leaseId: lease.id, invoiceId })
-
-        // S577/S607: landlord-issued account credits (tenant_credits), applied to
-        // whatever pending rows remain after prepaid credits, oldest-first.
-        // Funded by the landlord (the tenant simply owes less → less rent
-        // received). INDEPENDENT of work-trade.
+        //   "Credit auto-applies only when it covers the WHOLE bill."
         //
-        // S607: the application logic now lives in services/creditApplication so
-        // this path and the issue-a-credit path behave identically. They had to
-        // agree anyway, and two copies of "how a credit lands" is how a tenant
-        // ends up with a different balance depending on which code touched them
-        // last. Scoped to this invoice's rows, as it always was — the landlord
-        // route uses lease scope to reach older open charges.
+        // This was two passes (S537 paid-ahead money, then S607 landlord
+        // credits), each settling whatever single charges a credit could cover:
+        // a $200 monthly draw paid a $60 water line by itself, and Kim
+        // Harland's $450 Move In Special was chopped into a water row, a trash
+        // row and five late fees. Now credit of every kind — paid ahead,
+        // landlord-issued, deposit interest — settles a lease's bill only when it
+        // covers every row the tenant owes on it (older open rows included), and
+        // otherwise settles nothing: MH 25's $10 waits for the tenant's
+        // "Use all $10" or "Save it for later". A bill carrying a GAM fee, a
+        // neighbor landlord's utility or a scheduled bank retry never settles
+        // itself (creditUse.settleWholeBillIfCovered). The check covers the
+        // whole household with this landlord, so a credit that already covers
+        // another of its leases' bills pays that one too.
         //
-        // S609: savepoint-guarded for the same reason the prepaid release is —
         // THE BILL ALWAYS GOES OUT. This runs inside the per-lease invoice
         // transaction, so anything thrown here would roll the invoice back and
-        // the tenant would get no bill at all. A credit that fails to apply
-        // leaves the tenant owing money they were going to be forgiven, which is
-        // fixable next cycle; a tenant who never receives a bill is not.
-        // (The landlord's own issue-a-credit route calls the same service
-        // WITHOUT a savepoint, and should — a person pressing a button needs to
-        // see the error.)
-        await client.query('SAVEPOINT lease_credits')
-        try {
-          await applyCreditsToOpenCharges(client, {
-            leaseId: lease.id, scope: 'invoice', invoiceId,
-          })
-          await client.query('RELEASE SAVEPOINT lease_credits')
-        } catch (e) {
-          await client.query('ROLLBACK TO SAVEPOINT lease_credits')
-          logger.error({ err: e, leaseId: lease.id, invoiceId },
-            '[InvoiceGen] account credits could not be applied — invoice still issued')
-          await createAdminNotification({
-            severity: 'warn',
-            category: 'invoice_credit_apply_failed',
-            title: `Account credit could not be applied to invoice ${invoiceId}`,
-            body: `The tenant's landlord-issued credit was not applied, so their bill is higher than intended. The invoice was issued rather than held. The credit is untouched and applies on the next cycle.`,
-            context: { lease_id: lease.id, invoice_id: invoiceId },
-          }).catch(() => {})
+        // the tenant would get no bill at all. Savepoint-guarded: a credit step
+        // that fails leaves the credit untouched and the bill open, GAM is told,
+        // and the next bill run (or the next credit) applies it.
+        if (effectiveTenantId) {
+          await client.query('SAVEPOINT whole_bill_credit')
+          try {
+            const wb = await settleWholeBillIfCovered(client, {
+              tenantId: effectiveTenantId, landlordId: lease.landlord_id, source: 'whole_bill',
+            })
+            await client.query('RELEASE SAVEPOINT whole_bill_credit')
+            creditReceipts = wb.afterCommit
+            if (wb.settledIds.length > 0) {
+              logger.info({ leaseId: lease.id, invoiceId, settled: wb.settledIds.length,
+                creditUsed: wb.leases.reduce((s, l) => s + l.creditUsed, 0) },
+                '[InvoiceGen] the whole bill was paid from account credit')
+            }
+          } catch (e) {
+            await client.query('ROLLBACK TO SAVEPOINT whole_bill_credit')
+            logger.error({ err: e, leaseId: lease.id, invoiceId },
+              '[InvoiceGen] account credit could not be checked against the bill — invoice still issued')
+            await createAdminNotification({
+              severity: 'warn',
+              category: 'invoice_credit_apply_failed',
+              title: `Account credit could not be checked against invoice ${invoiceId}`,
+              body: `The bill went out in full, and the tenant's account credit was not touched: checking whether it covers the whole bill failed (${e instanceof Error ? e.message : String(e)}). ` +
+                `If the credit covers the bill, the next bill run or the next credit applies it once the cause is fixed; the tenant can also use it when they pay.`,
+              context: { lease_id: lease.id, invoice_id: invoiceId, tenant_id: effectiveTenantId },
+            }).catch(() => {})
+          }
         }
 
         await client.query('COMMIT')
         invoicesInserted++
+        // Never throws: a receipt that fails to send costs nobody their bill.
+        if (creditReceipts) await creditReceipts()
 
         // S654: the contract's billed/paid counters, after the commit so a
         // counter that fails to update never costs anyone their bill.

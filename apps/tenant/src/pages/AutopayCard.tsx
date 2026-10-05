@@ -10,15 +10,24 @@
  * NO FORECAST (Nic): "We don't need to make it all complicated and show somebody
  * what their bill will be exactly." The balance moves between choosing a day and
  * the charge landing, so any number promised here is one the system cannot keep.
- * The tenant is told the rule instead — the whole balance, on the day they pick,
- * and picking a day after rent is due costs late fees under their lease.
+ * The tenant is told the rule instead — the whole bill, on the day they pick,
+ * and picking a day after rent is due costs late fees under their lease. The
+ * whole BILL: autopay never takes an earlier balance carried onto the account
+ * (services/rentCharge — "Autopay is always exact"; S622), and the copy says so.
+ *
+ * S655 (Nic, 10/2): "use my account credit first" — the tenant's own setting,
+ * OFF by default. Off: autopay charges the whole bill and any credit waits for
+ * the tenant to use it. On: the credit pays its part and the rest is charged.
+ * Credit is applied by itself only when it covers a whole bill (the bill run
+ * does that, and skips a bill with a GAM charge, a neighbor's utility or a
+ * scheduled retry on it — so the copy never says "always").
  */
 
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import { autopayLateness } from '@gam/shared'
 import { apiGet, apiPut } from '../lib/api'
-import { useTenantPaymentMethods, type SavedPaymentMethod } from './payShared'
+import { useTenantPaymentMethods, isChargeable, methodLabel, type SavedPaymentMethod } from './payShared'
 
 interface AutopayRow {
   leaseId:         string
@@ -32,6 +41,8 @@ interface AutopayRow {
   enabled:         boolean | null
   pullDay:         number | null
   paymentMethodId: string | null
+  /** S655: "Use my account credit first". Off unless the tenant turned it on. */
+  useCredit?:      boolean | null
   lastSuccessCycle: string | null
   disarmedAt:      string | null
   disarmedReason:  string | null
@@ -62,6 +73,7 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
   // null = "on the day rent is due", the ordinary case.
   const [pullDay, setPullDay] = useState<number | null>(row.pullDay)
   const [methodId, setMethodId] = useState<string | null>(row.paymentMethodId)
+  const [useCredit, setUseCredit] = useState<boolean>(row.useCredit === true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -73,6 +85,7 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
         enabled,
         pullDay,
         paymentMethodId: methodId,
+        useCredit,
       })
       qc.invalidateQueries('autopay')
       setEditing(false)
@@ -104,14 +117,9 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
   const prettyPayDate = new Date(`${lateness.payDate}T00:00:00Z`)
     .toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: 'UTC' })
   const afterDue = chargeDay > dueDay
-  // A bank still verifying cannot be charged, so it must not be offered as the
-  // method a monthly schedule depends on.
-  const usable = methods.filter((m: SavedPaymentMethod) => !(m.type === 'ach' && m.verified === false))
-
-  const label = (m: SavedPaymentMethod) =>
-    m.type === 'ach'
-      ? `${m.bankName ?? 'Bank'} ····${m.last4 ?? ''}`
-      : `${(m.brand ?? 'Card').toUpperCase()} ····${m.last4 ?? ''}`
+  // A bank still verifying — or with bank payments paused — cannot be charged,
+  // so it must not be offered as the method a monthly schedule depends on.
+  const usable = methods.filter((m: SavedPaymentMethod) => isChargeable(m))
 
   return (
     <div className="card" style={{ padding: 16, marginTop: 16 }}>
@@ -127,8 +135,14 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
                 On — pays on the {ordinal(chargeDay)} of each month
               </div>
               <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4, lineHeight: 1.5 }}>
-                We charge your whole balance on that day, whatever it is then.
+                We charge your whole bill on that day, whatever it is then. An earlier balance carried
+                onto your account isn&apos;t included.
                 {afterDue && ' Because that’s after rent is due, late fees under your lease still apply.'}
+              </div>
+              <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4, lineHeight: 1.5 }}>
+                {row.useCredit
+                  ? 'Your account credit is used first; we charge the rest.'
+                  : 'Your account credit is kept for you — use it when you pay.'}
               </div>
             </>
           ) : !on ? (
@@ -225,15 +239,29 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
           >
             <option value="">Whichever method is my default at the time</option>
             {usable.map((m: SavedPaymentMethod) => (
-              <option key={m.id} value={m.id}>{label(m)}</option>
+              <option key={m.id} value={m.id}>{methodLabel(m)}</option>
             ))}
           </select>
 
+          {/* S655 (Nic, 10/2): off by default. */}
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 14, fontSize: '.82rem', color: 'var(--t1)', cursor: 'pointer' }}>
+            <input type="checkbox" checked={useCredit} onChange={(e) => setUseCredit(e.target.checked)} style={{ marginTop: 3 }} />
+            <span>
+              Use my account credit first
+              <span style={{ display: 'block', fontSize: '.72rem', color: 'var(--t3)', marginTop: 2, lineHeight: 1.5 }}>
+                {useCredit
+                  ? 'Any account credit pays its part of the bill and we charge the rest.'
+                  : 'Off: we charge the whole bill and your credit waits until you choose to use it. Credit is applied by itself only when it covers a whole bill.'}
+              </span>
+            </span>
+          </label>
+
           <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 10, lineHeight: 1.5 }}>
-            We charge your <strong>whole balance</strong> on that day — rent plus anything else on your
-            account at that moment. We don&apos;t show you the amount in advance because it can still change
-            between now and then. You&apos;ll get an email each time it runs, and if it ever doesn&apos;t go
-            through we&apos;ll tell you straight away.
+            We charge your <strong>whole bill</strong> on that day — rent plus anything else billed to your
+            account at that moment{useCredit ? ', less the account credit used' : ''}. An earlier balance carried
+            onto your account isn&apos;t included — pay it down yourself on the Payments page. We don&apos;t show
+            you the amount in advance because it can still change between now and then. You&apos;ll get an email
+            each time it runs, and if it ever doesn&apos;t go through we&apos;ll tell you straight away.
           </div>
 
           {error && (
@@ -245,7 +273,7 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
               {saving ? 'Saving…' : on ? 'Save changes' : 'Turn on autopay'}
             </button>
             <button className="btn btn-g" disabled={saving} onClick={() => {
-              setEditing(false); setPullDay(row.pullDay); setMethodId(row.paymentMethodId); setError(null)
+              setEditing(false); setPullDay(row.pullDay); setMethodId(row.paymentMethodId); setUseCredit(row.useCredit === true); setError(null)
             }}>
               Cancel
             </button>

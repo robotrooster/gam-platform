@@ -405,8 +405,9 @@ describe('an add-a-roommate addendum never attaches anyone on the landlord\'s si
 
   it('a roommate spot they never signed for, ended with its lease, still leaves them needing their own signature', async () => {
     // Ending a lease (the landlord's PATCH, a termination, the nightly
-    // lease-end job) marks every spot on it 'removed' — including an unsigned
-    // 'pending_add' one. That person never signed onto anything.
+    // lease-end job) makes an unsigned 'pending_add' spot 'void' (final sweep,
+    // 10/3; before that it became 'removed'). That person never signed onto
+    // anything.
     const a = await company()
     const b = await company()
     const holder = await resident()
@@ -418,7 +419,7 @@ describe('an add-a-roommate addendum never attaches anyone on the landlord\'s si
     const ended = await request(buildApp()).patch(`/api/leases/${home.leaseId}`)
       .set('Authorization', `Bearer ${b.token}`).send({ status: 'terminated' })
     expect(ended.status).toBe(200)
-    expect(await spotOf(home.leaseId, r)).toBe('removed')
+    expect(await spotOf(home.leaseId, r)).toBe('void')
 
     const documentId = await draftFor(b, r)
     expect((await tenantsNeedingOwnSignature(documentId)).map(x => x.userId)).toEqual([r.userId])
@@ -429,6 +430,23 @@ describe('an add-a-roommate addendum never attaches anyone on the landlord\'s si
       `SELECT lt.status FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id
         WHERE lt.tenant_id = $1 AND l.landlord_id = $2 AND lt.status = 'active'`,
       [r.tenantId, b.landlordId])).rows).toEqual([])
+  })
+
+  it("a never-signed roommate spot an older lease ending marked 'removed' (before 10/3) still does not count", async () => {
+    const a = await company()
+    const b = await company()
+    const holder = await resident()
+    const r = await resident()
+    await invitedAt(a, r)
+    const home = await householdAt(b, holder)
+    await addendumAdding(b, home, holder, r)
+    await db.query(
+      `UPDATE lease_tenants SET status = 'removed', removed_at = NOW(), removed_reason = 'lease_ended'
+        WHERE lease_id = $1 AND tenant_id = $2`, [home.leaseId, r.tenantId])
+    await db.query(`UPDATE leases SET status = 'terminated', terminated_at = NOW() WHERE id = $1`, [home.leaseId])
+
+    const documentId = await draftFor(b, r)
+    expect((await tenantsNeedingOwnSignature(documentId)).map(x => x.userId)).toEqual([r.userId])
   })
 
   it('a roommate spot they DID sign for, later ended, makes them this company\'s tenant already', async () => {

@@ -1330,3 +1330,40 @@ describe('GET /api/leases/:id/documents', () => {
     expect(res.status).toBe(403)
   })
 })
+
+// Final sweep (10/3): ending a lease here marked an add-a-roommate spot nobody
+// signed ('pending_add') 'removed' / lease_ended, as if that person had been on
+// the lease, and never stamped updated_at. The spot is void now (as voiding
+// its addendum leaves it); the people who were on the lease are removed.
+describe('PATCH /leases/:id ending a lease: an unsigned roommate spot becomes void', () => {
+  it.each(['terminated', 'expired'] as const)('status %s', async (status) => {
+    const f = await seedFixture({ leaseStatus: 'active' })
+    const roommate = await (async () => {
+      const c = await db.connect()
+      try { return await seedTenant(c, { email: `rm-${randomUUID()}@test.dev` }) } finally { c.release() }
+    })()
+    const addendum = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status)
+       VALUES ($1,$2,$3,'Add a roommate','addendum_add','in_progress') RETURNING id`,
+      [f.landlordId, f.unitId, f.leaseId])).rows[0].id
+    await db.query(
+      `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_reason, financial_responsibility, add_document_id)
+       VALUES ($1,$2,'co_tenant','pending_add','roommate_added','joint_several',$3)`,
+      [f.leaseId, roommate, addendum])
+    await db.query(`UPDATE lease_tenants SET updated_at = NOW() - INTERVAL '1 day' WHERE lease_id = $1`, [f.leaseId])
+
+    const res = await request(buildApp())
+      .patch(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ status, terminationReason: 'mutual agreement' })
+    expect(res.status).toBe(200)
+
+    const spots = await db.query<{ tenant_id: string; status: string; removed_reason: string | null; removed_at: string | null; fresh: boolean }>(
+      `SELECT tenant_id, status, removed_reason, removed_at, (updated_at > NOW() - INTERVAL '1 minute') AS fresh
+         FROM lease_tenants WHERE lease_id = $1`, [f.leaseId])
+    expect(spots.rows.find(r => r.tenant_id === f.tenantId))
+      .toMatchObject({ status: 'removed', removed_reason: 'lease_ended', fresh: true })
+    expect(spots.rows.find(r => r.tenant_id === roommate))
+      .toMatchObject({ status: 'void', removed_reason: null, removed_at: null, fresh: true })
+  })
+})

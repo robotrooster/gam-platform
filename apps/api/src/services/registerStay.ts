@@ -34,6 +34,7 @@
  */
 import type { PoolClient } from 'pg'
 import { DateTime } from 'luxon'
+import { computeStayPrice, computeMonthlyStaySchedule } from '@gam/shared'
 import { AppError } from '../middleware/errorHandler'
 
 export interface StayLine {
@@ -72,6 +73,15 @@ export function checkOutFor(checkIn: string, unit: 'night' | 'week' | 'month', q
   return co.toISODate()!
 }
 
+/**
+ * The booking's lease_type for what one of quantity buys — one of the values
+ * the unit_bookings CHECK allows (nightly, weekly, month_to_month, long_term,
+ * lease_hold). A month sold at the counter is a month-to-month stay.
+ */
+export function bookingLeaseTypeFor(stayUnit: 'night' | 'week' | 'month'): 'nightly' | 'weekly' | 'month_to_month' {
+  return stayUnit === 'night' ? 'nightly' : stayUnit === 'week' ? 'weekly' : 'month_to_month'
+}
+
 /** Nights the stay covers, for the booking row's own count. */
 export function nightsBetween(checkIn: string, checkOut: string): number {
   return Math.round(
@@ -80,11 +90,12 @@ export function nightsBetween(checkIn: string, checkOut: string): number {
 }
 
 /**
- * The column on `units` that holds the rate for one of these.
+ * The column on `units` that holds the rate for one of these — the rate the
+ * counter's site list shows beside each site (GET /pos/stays/available).
  *
- * One map, exported, so that every surface that prices a stay — the register,
- * the booking site, the counter's availability list — is reading the same
- * three columns rather than each deciding for itself which one applies.
+ * 10/3 (decisions #9): what a stay COSTS is never this rate × a quantity; it is
+ * the schedule's own pricing for its nights (priceStayBySchedule below), at
+ * the counter, on a link and on the schedule alike.
  */
 export const STAY_RATE_COLUMN = {
   night: 'nightly_rate',
@@ -93,76 +104,6 @@ export const STAY_RATE_COLUMN = {
 } as const
 
 export type StayUnit = keyof typeof STAY_RATE_COLUMN
-
-/** What one night/week/month on this site costs, or null when nobody set it. */
-export function rateForStay(
-  unit: { nightly_rate?: any; weekly_rate?: any; monthly_rate?: any } | null | undefined,
-  stayUnit: StayUnit,
-): number | null {
-  if (!unit) return null
-  const raw = (unit as any)[STAY_RATE_COLUMN[stayUnit]]
-  if (raw === null || raw === undefined || raw === '') return null
-  const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null
-}
-
-/** "a weekly rate" — for saying which one is missing, in words a person uses. */
-export function stayRateLabel(stayUnit: StayUnit): string {
-  return stayUnit === 'night' ? 'a nightly rate'
-       : stayUnit === 'week'  ? 'a weekly rate'
-       :                        'a monthly rate'
-}
-
-/**
- * Price a stay from the site it is on.
- *
- * THE SITE FIRST, THEN THE PROPERTY — the same order, and the same two places,
- * the booking site already quotes from (services/propertyBookingQuote: `rep
- * .nightly_rate ?? prop.nightly_rate`). A site may be worth more or less than
- * its neighbors and carries its own number; the property's rate is what the
- * rest of the sites cost. If the register consulted only the unit, a property
- * that prices at the property level would sell on the booking site and be
- * refused at the counter — the identical split this whole change exists to
- * close, rebuilt one layer down.
- *
- * Throws rather than falling back to the catalog price. No rate in either place
- * is a setup mistake somebody has to fix, and quietly charging a different
- * number instead is how the prices got out of step in the first place.
- */
-export async function priceStayFromUnit(
-  /** A rows-returning query — `db.query`, or a PoolClient wrapped to match. */
-  q: (sql: string, params: any[]) => Promise<any[]>,
-  unitId: string,
-  landlordId: string,
-  stayUnit: StayUnit,
-  qty: number,
-): Promise<{ rate: number; lineTotal: number; unitNumber: string; from: 'site' | 'property' }> {
-  const rows = await q(
-    `SELECT u.unit_number, u.nightly_rate, u.weekly_rate, u.monthly_rate,
-            p.nightly_rate AS p_nightly_rate, p.weekly_rate AS p_weekly_rate,
-            p.monthly_rate AS p_monthly_rate
-       FROM units u JOIN properties p ON p.id = u.property_id
-      WHERE u.id = $1 AND u.landlord_id = $2`,
-    [unitId, landlordId])
-  const u = rows[0]
-  if (!u) throw new AppError(404, 'That site is not one of yours')
-  const own = rateForStay(u, stayUnit)
-  const fallback = rateForStay({
-    nightly_rate: u.p_nightly_rate, weekly_rate: u.p_weekly_rate, monthly_rate: u.p_monthly_rate,
-  }, stayUnit)
-  const rate = own ?? fallback
-  if (rate === null) {
-    throw new AppError(409,
-      `Site ${u.unit_number} has no ${stayRateLabel(stayUnit).replace(/^a /, '')} set, and neither does the property. `
-      + 'Set it and it will be the price everywhere — the counter, the booking site, both.')
-  }
-  return {
-    rate,
-    lineTotal: Math.round(rate * qty * 100) / 100,
-    unitNumber: u.unit_number,
-    from: own !== null ? 'site' : 'property',
-  }
-}
 
 /**
  * Is this site free for these dates?
@@ -249,8 +190,14 @@ export async function createStayBooking(
 
   // The site has to be this property's, or a cashier could park somebody on
   // another park's spot from a dropdown that should never have offered it.
+  // 10/3 (review, fix round 3): the site's row is taken here, BEFORE the site's
+  // lock below. The booking written at the end needs it, and a pay link being
+  // sent for the site takes the row first and the site second (posPayLinks);
+  // taking the site first and the row last left the sale and the link each
+  // waiting on the other, and the database ended the sale.
   const unit = await client.query<{ id: string; property_id: string }>(
-    `SELECT id, property_id FROM units WHERE id = $1 AND property_id = $2 AND retired_at IS NULL`,
+    `SELECT id, property_id FROM units WHERE id = $1 AND property_id = $2 AND retired_at IS NULL
+        FOR KEY SHARE`,
     [details.unitId, opts.propertyId])
   if (!unit.rows.length) throw new AppError(400, 'That site is not at this property')
 
@@ -261,21 +208,364 @@ export async function createStayBooking(
   }
 
   const ins = await client.query<{ id: string }>(
+    // 10/3 (decisions #33): booked_check_out — the length the stay is sold for.
     `INSERT INTO unit_bookings
        (unit_id, landlord_id, guest_name, guest_email, guest_phone,
         check_in, check_out, nights, total_amount, status, lease_type,
-        source, pos_transaction_id, deposit_paid_at, notes)
+        source, pos_transaction_id, deposit_paid_at, notes, booked_check_out)
      VALUES ($1,$2,$3,$4,$5,$6::date,$7::date,$8,$9,$13,$10,
-             $14,$11, CASE WHEN $13 = 'confirmed' THEN NOW() ELSE NULL END, $12)
+             $14,$11, CASE WHEN $13 = 'confirmed' THEN NOW() ELSE NULL END, $12, $7::date)
      RETURNING id`,
     [details.unitId, opts.landlordId, details.guestName.trim(),
      details.guestEmail?.trim() || null, details.guestPhone?.trim() || null,
      checkIn, checkOut, nights, line.lineTotal,
      // The lease type the stay was SOLD as, so the schedule and the books agree
      // with the item that was rung rather than re-deriving a tier from nights.
-     line.stayUnit === 'night' ? 'nightly' : line.stayUnit === 'week' ? 'weekly' : 'monthly',
+     // 10/2 (review): a month is 'month_to_month' — the bookings CHECK knows no
+     // 'monthly', and every month stay rung at the register failed on it.
+     bookingLeaseTypeFor(line.stayUnit),
      opts.posTransactionId, details.notes?.trim() || null,
      opts.status ?? 'confirmed', opts.source ?? 'register'])
 
   return { bookingId: ins.rows[0].id, checkIn, checkOut, nights }
+}
+
+/**
+ * 10/2 (decisions #9) — WHAT A RESERVATION STILL OWES.
+ *
+ * "One price, and it is the site's" (Nic, S652): the reservation was quoted
+ * once, on the schedule or the booking site, and that quote — unit_bookings
+ * .total_amount, its tax already in it — is what it costs. The register never
+ * re-prices it per item (an item's rate × a quantity rounded to weeks charged
+ * a ten-night stay as one week). What is left to pay is that price less what
+ * was paid ahead of arrival:
+ *   - the balance stamped paid (balance_paid_at) — nothing is left;
+ *   - a deposit stamped paid — its amount (deposit_amount). A deposit stamped
+ *     paid with no amount on record is a stay that was paid whole (the counter
+ *     and a stay link write it that way), so nothing is left either.
+ *
+ * 10/3 (decisions #15) — A RESERVATION THAT BECOMES A LEASE IS NEVER CHARGED
+ * WHOLE AT THE REGISTER. A stay at or over the lease threshold (30 nights, or 7
+ * at a weekly-lease park — services/bookingLeaseDraft) drafts a lease, and the
+ * lease bills the stay: the arrival month on arrival day, monthly after that
+ * (services/bookingLeaseBilling). The register takes only what is due NOW — the
+ * deposit the booking site would have asked for the same stay
+ * (services/propertyBooking depositForStay), or the one already on the
+ * reservation — and the lease bills the rest. Taking the whole quote here as
+ * well billed the stay twice the moment the lease was signed. `owed` is then
+ * what the register may still take (the deposit, less what was paid toward it)
+ * and `leaseBillsRest` says so. Only a reservation a lease bills counts: one
+ * with a lease drafted from it, or one the schedule or the booking site made
+ * (they draft one at that length). A stay the register sold itself (source
+ * 'register') drafts no lease, so it is charged whole as before.
+ */
+export interface ReservationDue {
+  bookingId: string
+  status: string
+  unitId: string | null
+  unitNumber: string | null
+  checkIn: string
+  /** The stored check-out — the day the guest leaves (or left, after an early check-out). */
+  checkOut: string
+  /** Nights on the site: check-in to the stored check-out (occupancy). */
+  nights: number
+  /**
+   * 10/3 (decisions #33): the check-out the stay was SOLD for
+   * (soldCheckOutSql). An early check-out moves the stored check-out only;
+   * the price, its tax, the lease threshold and the deposit all go by this.
+   */
+  bookedCheckOut: string
+  /** Nights the stay was sold for: check-in to bookedCheckOut. Tax and the lease threshold read this, never `nights`. */
+  bookedNights: number
+  /** The reservation's own quoted price. */
+  total: number
+  /** Paid ahead of today. */
+  paid: number
+  /** What is left for the register to take (for a stay its lease bills: what is left of the deposit). */
+  owed: number
+  /** A price was quoted and nothing is left for the register to take. */
+  paidInFull: boolean
+  /** Cancelled, or a no-show: not something to take money for. */
+  closed: boolean
+  /**
+   * Its site went to a guest who paid first (holdDisplacement) — as opposed to
+   * cancelled on the schedule. 10/3 (review): only a hold that lost its site
+   * and was left with none (displaced_from_unit is still its own site); a hold
+   * that was MOVED and later cancelled on the schedule was cancelled there.
+   */
+  displaced: boolean
+  /** No price was ever quoted on it — it has to be set on the schedule. */
+  noPrice: boolean
+  /** The pay link this booking's arrival-day balance went out on, if any. */
+  balancePayLinkId: string | null
+  /** decisions #15: a long stay — its lease bills the stay; the register takes only the deposit. */
+  leaseBillsRest: boolean
+  /** decisions #15: the deposit due now on a long stay (null for any other). */
+  depositDue: number | null
+  /**
+   * 10/3 (decisions #21): the property's short-term lodging tax, as a percent
+   * (properties.short_term_tax_rate) — the rate the schedule prices a stay
+   * under 30 nights with (computeStayPrice). Its price has the tax in it; a
+   * sale that takes it records that part as tax (stayTaxRate, taxInside).
+   */
+  taxPct: number
+  /** The stay's own rates (the site's, else the property's) — for working out the tax rate inside its price (stayTaxRate). */
+  rates: { nightly: number | null; weekly: number | null; monthly: number | null }
+}
+
+/**
+ * 10/3 (decisions #33) — THE CHECK-OUT A STAY WAS SOLD FOR, as SQL, for a
+ * unit_bookings alias. The schedule keeps it in booked_check_out (set when the
+ * reservation is made and on every deliberate change of its dates); an early
+ * check-out moves only check_out, which can then be EARLIER than it. A path
+ * that lengthens a stay without setting the column (the guest agent's extra
+ * night) can only make check_out LATER — so the later of the two is the length
+ * sold, and an empty column reads as check_out. Price, tax, the lease
+ * threshold, the deposit and GAM's short-stay revenue split all read this.
+ */
+export const soldCheckOutSql = (b: string): string =>
+  `GREATEST(COALESCE(${b}.booked_check_out, ${b}.check_out), ${b}.check_out)`
+
+/** The lease threshold for a property: 30 nights, or 7 when it runs weekly leases (services/bookingLeaseDraft). */
+export const leaseThresholdNights = (weeklyLeaseMode: boolean | null | undefined): number => (weeklyLeaseMode ? 7 : 30)
+
+export async function reservationDue(
+  q: Pick<PoolClient, 'query'>, bookingId: string, opts: { lock?: boolean } = {},
+): Promise<ReservationDue | null> {
+  if (!/^[0-9a-f-]{36}$/i.test(String(bookingId ?? ''))) return null
+  const r = (await q.query<any>(
+    `SELECT b.id, b.status, b.unit_id, u.unit_number, b.source,
+            to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+            to_char(${soldCheckOutSql('b')}, 'YYYY-MM-DD') AS booked_check_out,
+            COALESCE(b.total_amount, 0)::float AS total, b.deposit_amount::float AS deposit_amount,
+            (b.deposit_paid_at IS NOT NULL) AS deposit_paid, (b.balance_paid_at IS NOT NULL) AS balance_paid,
+            (b.displaced_at IS NOT NULL AND b.displaced_from_unit IS NOT DISTINCT FROM b.unit_id) AS displaced,
+            b.balance_pay_link_id,
+            COALESCE(p.weekly_lease_mode, FALSE) AS weekly_lease_mode,
+            p.booking_deposit_pct, p.booking_monthly_deposit, p.short_term_tax_rate,
+            COALESCE(u.nightly_rate, p.nightly_rate)::float AS nightly_rate,
+            COALESCE(u.weekly_rate, p.weekly_rate)::float AS weekly_rate,
+            COALESCE(u.monthly_rate, p.monthly_rate)::float AS monthly_rate,
+            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id AND l.status <> 'cancelled') AS has_lease
+       FROM unit_bookings b
+       LEFT JOIN units u ON u.id = b.unit_id
+       LEFT JOIN properties p ON p.id = u.property_id
+      WHERE b.id = $1${opts.lock ? ' FOR UPDATE OF b' : ''}`, [bookingId])).rows[0]
+  if (!r) return null
+  const round = (n: number) => Math.round(n * 100) / 100
+  const total = round(Number(r.total) || 0)
+  const nights = nightsBetween(r.check_in, r.check_out)
+  // 10/3 (decisions #33): the length it was SOLD for. An early check-out moves
+  // the stored check-out only — it never turns a long stay into a short one
+  // here (the counter asking for the whole price of a stay its lease bills),
+  // nor an untaxed price into a taxed one (stayTaxRate on `bookedNights`).
+  const bookedNights = nightsBetween(r.check_in, r.booked_check_out)
+  // decisions #15: a stay its lease bills — one a lease was drafted from (the
+  // same test the arrival-day run uses to leave it alone, services/stayBalance),
+  // or one at or over the threshold that the schedule or the booking site made
+  // (they draft its lease as it is made).
+  const leaseBillsRest = total > 0 && (r.has_lease === true
+    || (bookedNights >= leaseThresholdNights(r.weekly_lease_mode) && (r.source ?? 'direct') !== 'register'))
+  let depositDue: number | null = null
+  if (leaseBillsRest) {
+    if (r.deposit_amount != null) {
+      depositDue = round(Number(r.deposit_amount) || 0)
+    } else {
+      // The deposit the booking site quotes for the same nights on the same site.
+      const { depositForStay } = await import('./propertyBooking')
+      const price = computeStayPrice(
+        { nightly: r.nightly_rate, weekly: r.weekly_rate, monthly: r.monthly_rate },
+        Number(r.short_term_tax_rate || 0), bookedNights)
+      depositDue = depositForStay(
+        { booking_deposit_pct: r.booking_deposit_pct ?? 0, booking_monthly_deposit: r.booking_monthly_deposit },
+        { tier: price.tier, total, monthlyRate: r.monthly_rate ?? null })
+    }
+    depositDue = Math.min(total, Math.max(0, depositDue))
+  }
+  const paid = r.balance_paid ? total
+    : r.deposit_paid ? Math.min(total, r.deposit_amount == null ? total : round(Number(r.deposit_amount) || 0))
+    : 0
+  const owed = leaseBillsRest
+    ? round(Math.max(0, (depositDue ?? 0) - paid))
+    : round(Math.max(0, total - paid))
+  return {
+    bookingId: r.id, status: r.status, unitId: r.unit_id ?? null, unitNumber: r.unit_number ?? null,
+    checkIn: r.check_in, checkOut: r.check_out, nights,
+    bookedCheckOut: r.booked_check_out, bookedNights,
+    total, paid: round(paid), owed,
+    paidInFull: total > 0 && owed < 0.005,
+    closed: r.status === 'cancelled' || r.status === 'no_show',
+    displaced: r.displaced === true,
+    noPrice: !(total > 0),
+    balancePayLinkId: r.balance_pay_link_id ?? null,
+    leaseBillsRest,
+    depositDue,
+    taxPct: Number(r.short_term_tax_rate || 0),
+    rates: { nightly: r.nightly_rate ?? null, weekly: r.weekly_rate ?? null, monthly: r.monthly_rate ?? null },
+  }
+}
+
+/**
+ * 10/3 (decisions #21) — THE TAX INSIDE A STAY'S PRICE.
+ *
+ * The schedule prices a stay with computeStayPrice: the site's rates (else the
+ * property's), tiered by length, plus the property's short-term lodging tax on
+ * a stay under 30 nights; a monthly-tier stay is priced on the calendar
+ * schedule (computeMonthlyStaySchedule), untaxed. So the rate a stay's price
+ * carries is the lodging tax for a nightly- or weekly-tier stay under 30
+ * nights, and nothing otherwise. Returned as a fraction (0.12 for 12%).
+ */
+export function stayTaxRate(rates: { nightly: number | null; weekly: number | null; monthly: number | null },
+                            taxPct: number, nights: number): number {
+  if (!(taxPct > 0) || !(nights > 0) || nights >= 30) return 0
+  const price = computeStayPrice({ nightly: rates.nightly, weekly: rates.weekly, monthly: rates.monthly }, taxPct, nights)
+  return price.tier === 'monthly' ? 0 : taxPct / 100
+}
+
+/** How much of an amount that has its tax in it (at `rate`, a fraction) is that tax — to the cent. */
+export function taxInside(amount: number, rate: number): number {
+  if (!(rate > 0) || !(amount > 0)) return 0
+  return Math.round(amount * rate / (1 + rate) * 100) / 100
+}
+
+/**
+ * 10/3 (decisions #21, review) — THE TAX INSIDE ONE PAYMENT TOWARD A STAY.
+ *
+ * A stay is often paid in parts — a deposit when it is booked, the balance on
+ * arrival — and each part is its own sale. Each records its share of the tax
+ * inside the stay's price: what the tax inside everything paid so far comes to
+ * now, less what it came to before this payment. So the parts always add up to
+ * the tax inside the whole, to the cent, whichever door took each one (the
+ * counter, a link paid online, the reservation's ticket). `rate` a fraction.
+ */
+export function taxInsidePayment(paidBefore: number, amount: number, rate: number): number {
+  if (!(rate > 0) || !(amount > 0)) return 0
+  const before = Math.max(0, Number(paidBefore) || 0)
+  return Math.max(0, Math.round((taxInside(before + amount, rate) - taxInside(before, rate)) * 100) / 100)
+}
+
+/**
+ * 10/3 (decisions #9, #21) — what a stay costs by the schedule's own pricing,
+ * from the rates it is priced from (the site's, else the property's) and the
+ * property's short-term lodging tax (a percent): computeStayPrice tiers by
+ * length (nightly, weekly, monthly) and adds the tax under 30 nights; a
+ * monthly-tier stay prices on the calendar-aligned schedule
+ * (computeMonthlyStaySchedule), untaxed. `total` is 0 when no rate prices it.
+ * One function, so the schedule, a pay link, the counter and the register's
+ * site list cannot price the same nights two ways.
+ */
+export function scheduleStayPrice(
+  rates: { nightly: number | string | null; weekly: number | string | null; monthly: number | string | null },
+  taxPct: number | string | null, checkIn: string, checkOut: string,
+): { total: number; base: number; tax: number; taxRate: number; nights: number; tier: 'nightly' | 'weekly' | 'monthly' } {
+  const num = (x: number | string | null) => (x == null || x === '' ? null : Number(x))
+  const nights = nightsBetween(checkIn, checkOut)
+  const monthlyRate = num(rates.monthly)
+  const pct = Number(taxPct || 0)
+  const price = computeStayPrice({ nightly: num(rates.nightly), weekly: num(rates.weekly), monthly: monthlyRate }, pct, nights)
+  const onSchedule = price.tier === 'monthly' && monthlyRate != null
+  const total = onSchedule ? computeMonthlyStaySchedule(checkIn, checkOut, monthlyRate!).total : price.total
+  // 10/3 (decisions #21): the tax in the price, exactly as the schedule added it.
+  const tax = onSchedule || !(total > 0) ? 0 : price.tax
+  const taxRate = tax > 0 ? pct / 100 : 0
+  return { total: total > 0 ? total : 0, base: Math.round(((total > 0 ? total : 0) - tax) * 100) / 100, tax, taxRate, nights, tier: price.tier }
+}
+
+/**
+ * 10/3 (decisions #9, #21) — what a NEW stay costs by the SAME pricing the
+ * schedule uses (routes/units PATCH bookings): the site's rates, else the
+ * property's; computeStayPrice tiers by length (nightly, weekly, monthly) and
+ * adds the property's short-term tax; a monthly-tier stay prices on the
+ * calendar-aligned schedule (computeMonthlyStaySchedule). Used when a link for
+ * a stay is sent and when a stay is rung straight at the counter — never an
+ * item's rate × nights. (decisions #23: a reservation already on the schedule
+ * is never repriced here — it is charged what it owes, reservationDue.)
+ * Refuses (in the clerk's words) a site with no rate to price it from.
+ */
+export async function priceStayBySchedule(
+  q: Pick<PoolClient, 'query'>, unitId: string, checkIn: string, checkOut: string,
+  /** What the clerk is told when the site has no rate (default: plain words with the next step). */
+  noRateWords?: (unitNumber: string) => string,
+): Promise<{ total: number; base: number; tax: number; taxRate: number; nights: number; tier: 'nightly' | 'weekly' | 'monthly'; unitNumber: string }> {
+  const u = (await q.query<any>(
+    `SELECT u.unit_number,
+            COALESCE(u.nightly_rate, p.nightly_rate) AS nightly_rate,
+            COALESCE(u.weekly_rate, p.weekly_rate) AS weekly_rate,
+            COALESCE(u.monthly_rate, p.monthly_rate) AS monthly_rate,
+            p.short_term_tax_rate
+       FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [unitId])).rows[0]
+  if (!u) throw new AppError(404, 'That site is not on this account any more — look the reservation up on the schedule.')
+  const priced = scheduleStayPrice({ nightly: u.nightly_rate, weekly: u.weekly_rate, monthly: u.monthly_rate },
+    u.short_term_tax_rate, checkIn, checkOut)
+  if (!(priced.total > 0)) {
+    throw new AppError(409, noRateWords ? noRateWords(u.unit_number)
+      : `Site ${u.unit_number} has no stay rate set, so this stay cannot be priced — nothing was changed. `
+        + 'Set the site\'s nightly rate (or the property\'s), then try again.')
+  }
+  return { ...priced, unitNumber: u.unit_number }
+}
+
+/**
+ * 10/3 (review) — A RESERVATION THAT IS OVER LEAVES THE REST OF ITS TICKET
+ * OWED.
+ *
+ * A reservation ticket can carry more than its stay: a tank of propane the
+ * clerk added and held with Clear. When the reservation is over — cancelled,
+ * marked a no-show, its site lost to a guest who paid first, or paid in full
+ * some other way — the stay comes off the ticket and the ticket stays OPEN
+ * with what is left on it, Void button and all: the $20 of propane is still
+ * owed, and voiding the whole ticket made it owed nowhere (not on the
+ * register, not on Outstanding Balances). A ticket whose stay was its only
+ * line has nothing left to take and is voided, with the reason. Kept, never
+ * deleted. The ticket keeps naming the booking (a ticket must name someone or
+ * something — the booking is who a walk-in's ticket is for); with no stay line
+ * left on it, it is an ordinary ticket from then on (ticketCarriesStay).
+ */
+export async function releaseReservationTickets(
+  q: Pick<PoolClient, 'query'>, bookingId: string, reason: string,
+  opts: { exceptTicketId?: string | null; onlyTicketId?: string | null } = {},
+): Promise<{ voided: string[]; kept: string[] }> {
+  const tickets = (await q.query<{ id: string; landlord_id: string; items: any }>(
+    `SELECT id, landlord_id, items FROM pos_open_tickets
+      WHERE booking_id = $1 AND status = 'open' AND id IS DISTINCT FROM $2
+        AND ($3::uuid IS NULL OR id = $3::uuid)
+      FOR UPDATE`, [bookingId, opts.exceptTicketId ?? null, opts.onlyTicketId ?? null])).rows
+  const out = { voided: [] as string[], kept: [] as string[] }
+  for (const t of tickets) {
+    const items = Array.isArray(t.items) ? t.items : []
+    const stays = await stayItemIdsIn(q, t.landlord_id, items)
+    const rest = items.filter((i: any) => !stays.has(lowerItemId(i?.id)))
+    if (!rest.length) {
+      await q.query(
+        `UPDATE pos_open_tickets SET status = 'voided', voided_at = NOW(), updated_at = NOW(), void_reason = $2
+          WHERE id = $1 AND status = 'open'`, [t.id, reason])
+      out.voided.push(t.id)
+    } else {
+      await q.query(
+        `UPDATE pos_open_tickets
+            SET items = $2::jsonb, updated_at = NOW(),
+                note = TRIM(BOTH ' ·' FROM COALESCE(note, '') || ' · ' || $3)
+          WHERE id = $1 AND status = 'open'`,
+        [t.id, JSON.stringify(rest), `${reason} — its stay was taken off this ticket; the rest is still owed`])
+      out.kept.push(t.id)
+    }
+  }
+  return out
+}
+
+/** A register item id as the database writes it (lowercase), or '' for none. */
+const lowerItemId = (x: unknown): string => (typeof x === 'string' ? x.trim().toLowerCase() : '')
+
+/** Which of these lines' register items are stays (pos_items.stay_unit), by id. */
+export async function stayItemIdsIn(q: Pick<PoolClient, 'query'>, landlordId: string, items: any[]): Promise<Set<string>> {
+  const ids = [...new Set((Array.isArray(items) ? items : []).map((i: any) => lowerItemId(i?.id)).filter((x) => /^[0-9a-f-]{36}$/.test(x)))]
+  if (!ids.length) return new Set()
+  const rows = (await q.query<{ id: string }>(
+    `SELECT id FROM pos_items WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND stay_unit IS NOT NULL`, [ids, landlordId])).rows
+  return new Set(rows.map((r) => r.id))
+}
+
+/** A ticket that still carries a stay line — a reservation ticket is one only while it does (releaseReservationTickets). */
+export async function ticketCarriesStay(q: Pick<PoolClient, 'query'>, t: { landlord_id: string; items: any }): Promise<boolean> {
+  return (await stayItemIdsIn(q, t.landlord_id, Array.isArray(t.items) ? t.items : [])).size > 0
 }

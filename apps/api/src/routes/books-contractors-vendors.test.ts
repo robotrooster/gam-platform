@@ -71,8 +71,8 @@ async function seedPortfolio(): Promise<PortfolioFixture> {
     const sign = (p: object) => jwt.sign(p, process.env.JWT_SECRET!, { expiresIn: '1h' })
     return {
       landlordAId: aId, landlordBId: bId,
-      landlordAToken: sign({ userId: aUid, role: 'landlord', email: 'la@t.dev', profileId: aId, permissions: {} }),
-      landlordBToken: sign({ userId: bUid, role: 'landlord', email: 'lb@t.dev', profileId: bId, permissions: {} }),
+      landlordAToken: sign({ userId: aUid, role: 'landlord', email: 'la@t.dev', profileId: null, landlordIds: [aId], permissions: {} }),
+      landlordBToken: sign({ userId: bUid, role: 'landlord', email: 'lb@t.dev', profileId: null, landlordIds: [bId], permissions: {} }),
       adminToken:     sign({ userId: admin.rows[0].id, role: 'admin', email: 'a@t.dev', profileId: null, permissions: {} }),
     }
   } catch (e) { await client.query('ROLLBACK'); throw e }

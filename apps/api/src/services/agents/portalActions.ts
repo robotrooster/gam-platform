@@ -19,6 +19,8 @@
  * another person, or cannot be undone.
  */
 import type { AgentAudience } from './types'
+import { query, queryOne } from '../../db'
+import { todayIn } from '../../lib/timezone'
 
 export interface PortalAction {
   id: string
@@ -35,6 +37,147 @@ export interface PortalAction {
   required?: string[]
   /** Read the details back and get an explicit yes before calling. */
   confirmFirst?: boolean
+  /**
+   * Something the PERSON may do through this endpoint but the assistant may
+   * not. The endpoint cannot tell the two apart (the assistant calls it with
+   * the person's own token), so the refusal is decided before anything is
+   * sent: plain words the assistant passes on, or null to let the call
+   * through. For the dispatcher to run once ids are resolved.
+   */
+  refuse?: (args: Record<string, unknown>) => Promise<string | null>
+}
+
+/** decisions #38 Q6: what the assistant is told when a call would check a guest out. */
+export const AGENT_CANNOT_CHECK_OUT =
+  'The assistant cannot check a guest out, end or shorten a stay that has started, change a ' +
+  'stay that is over, or decide anything about the money on a stay. Do that on the schedule.'
+
+/** decisions.md #48.3: a stay that has started stays on its site (the new site's price is a money decision). */
+export const AGENT_CANNOT_MOVE_STARTED_STAY =
+  'The assistant cannot move a stay that has started to another site: the new site\u2019s price is a ' +
+  'money decision. Move it on the schedule.'
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** A day the booking PATCH would read: its first ten characters as YYYY-MM-DD, else null. */
+function sentDay(v: unknown): string | null {
+  if (v == null) return null
+  const s = String(v).slice(0, 10)
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null
+}
+
+/**
+ * decisions #38 Q6 (Nic, 10/3, final): "the AI assistant must NOT check guests
+ * out or make any money decision." The booking PATCH takes a check-out from
+ * anyone holding "Check guests out", and repricing from anyone who may edit a
+ * reservation, so the tool's wording alone does not stop one. These are
+ * refused:
+ *   - the status Checked out, however it is spelled;
+ *   - on a stay that is over (Checked out): any status (undoing or redoing the
+ *     check-out), a new day they left, or a new arrival day. Each of those
+ *     reprices a finished stay or settles when the guest left. The notes, the
+ *     guest's details and the site needs still go through;
+ *   - on a stay that has started (Checked in, or Tentative or Confirmed with
+ *     the arrival day today or earlier in the property's time zone):
+ *       - an early departure: a check-out day before the one booked, or today
+ *         or earlier (the day they left). A guest who arrived but was never
+ *         marked Checked in is the same: shortening that stay reprices it and
+ *         ends its lease;
+ *       - Canceled or No-show, which end a stay in progress;
+ *       - a later arrival day, which takes nights off the stay and reprices
+ *         it (an earlier arrival only adds nights and goes through);
+ *       - a move to another site (decisions.md #48.3): the PATCH reprices the
+ *         stay at the new site's rates, which is a money decision. The same on
+ *         a stay that is over.
+ *   The unit named is read before the dispatcher turns a spoken name into an
+ *   id, so it is resolved here the way the dispatcher will resolve it, against
+ *   the company's own units (namedUnitIsBookings): a name that lands on
+ *   another unit is a move. A name that lands on nothing, or on more than one,
+ *   is left to the dispatcher, which asks which one is meant.
+ * A check-out day equal to the one stored is no change and is ignored (the
+ * edit form and the agent send it back with every save). Everything else goes
+ * through as before: a stay that has not started, a longer stay, a cancellation
+ * before arrival, the guest's details. A booking that cannot be found is left
+ * to the endpoint, which says so.
+ */
+export async function refuseAgentCheckOut(args: Record<string, unknown>): Promise<string | null> {
+  const status = String(args.status ?? '').toLowerCase().replace(/[\s_-]+/g, '')
+  if (status === 'checkedout') return AGENT_CANNOT_CHECK_OUT
+  const outDay = sentDay(args.checkOut)
+  const inDay = sentDay(args.checkIn)
+  const bookingId = String(args.bookingId ?? '')
+  const unitNamed = String(args.unitId ?? '').trim()
+  // Nothing that touches the stay's status, dates or site: the guest's details.
+  if (!status && !outDay && !inDay && !unitNamed) return null
+  if (!UUID_RE.test(bookingId)) return null
+  const b = await queryOne<{
+    status: string; check_in_day: string; check_out_day: string; timezone: string | null
+    unit_id: string; landlord_id: string
+  }>(
+    `SELECT b.status, b.landlord_id,
+            to_char(b.check_in,  'YYYY-MM-DD') AS check_in_day,
+            to_char(b.check_out, 'YYYY-MM-DD') AS check_out_day,
+            p.timezone, b.unit_id
+       FROM unit_bookings b
+       JOIN units u ON u.id = b.unit_id
+       JOIN properties p ON p.id = u.property_id
+      WHERE b.id = $1`, [bookingId])
+  if (!b) return null
+  const outChanged = outDay !== null && outDay !== b.check_out_day
+  const moved = unitNamed !== '' && !(await namedUnitIsBookings(unitNamed, b.unit_id, b.landlord_id))
+  if (b.status === 'checked_out') {
+    const inChanged = inDay !== null && inDay !== b.check_in_day
+    return status || outChanged || inChanged || moved ? AGENT_CANNOT_CHECK_OUT : null
+  }
+  const today = todayIn(b.timezone)
+  const started = b.status === 'checked_in'
+    || ((b.status === 'tentative' || b.status === 'confirmed') && b.check_in_day <= today)
+  if (!started) return null
+  if (moved) return AGENT_CANNOT_MOVE_STARTED_STAY
+  if (status === 'cancelled' || status === 'canceled' || status === 'noshow') return AGENT_CANNOT_CHECK_OUT
+  if (outChanged && (outDay! < b.check_out_day || outDay! <= today)) return AGENT_CANNOT_CHECK_OUT
+  // A later arrival takes nights off a stay that has started, and the PATCH
+  // reprices it on what is left. An earlier one only adds nights.
+  if (inDay !== null && inDay > b.check_in_day) return AGENT_CANNOT_CHECK_OUT
+  return null
+}
+
+/**
+ * Is the unit the agent named this booking's own site? Resolved the way the
+ * dispatcher resolves a spoken unit (portalDispatch.ts resolveHumanId), over
+ * the company's own units: an id; one unit whose number reads the same ("RV
+ * 07"); one unit whose number the words contain, or that contains them ("Site
+ * A" for "A", "Cabin Rose" for "Rose"); one unit with the same number ("spot
+ * 7" for "RV 07"). Landing on another unit is a move. Landing on none, or on
+ * more than one, is not decided here: the dispatcher refuses it and asks
+ * which one is meant, so nothing is sent either way.
+ */
+async function namedUnitIsBookings(named: string, unitId: string, landlordId: string): Promise<boolean> {
+  if (UUID_RE.test(named)) return named.toLowerCase() === unitId.toLowerCase()
+  const rows = await query<{ id: string; label: string | null }>(
+    `SELECT un.id, un.unit_number AS label
+       FROM units un JOIN properties p ON p.id = un.property_id
+      WHERE p.landlord_id = $1 AND un.retired_at IS NULL`, [landlordId])
+  const norm = (v: unknown) => String(v ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
+  const given = norm(named)
+  const landsOn = (hits: Array<{ id: string }>): boolean | null =>
+    hits.length === 1 ? hits[0].id === unitId : null
+  const exact = landsOn(rows.filter(r => norm(r.label) === given))
+  if (exact !== null) return exact
+  const wordyHits = rows.filter(r => norm(r.label) !== '' && (norm(r.label).includes(given) || given.includes(norm(r.label))))
+  const wordy = landsOn(wordyHits)
+  if (wordy !== null) return wordy
+  const digits = named.match(/\d+/)
+  if (digits) {
+    const n = parseInt(digits[0], 10)
+    const byNumber = rows.filter(r => {
+      const d = String(r.label ?? '').match(/\d+/)
+      return d != null && parseInt(d[0], 10) === n
+    })
+    if (byNumber.length >= 1) return byNumber.length === 1 ? byNumber[0].id === unitId : true
+  }
+  // Nothing, or more than one: the dispatcher asks which one is meant.
+  return true
 }
 
 export const PORTAL_ACTIONS: readonly PortalAction[] = [
@@ -440,11 +583,13 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'CONFIRM CLEARLY when switching it ON: money will leave their account without them doing ' +
       'anything, on the day chosen, for the full rent. Read back the day and that it is the whole ' +
       'balance, not part of it. Leave pullDay out to charge on the day rent is due, which is the ' +
-      'ordinary case; 1-28 otherwise, because a 29th does not exist every month.',
+      'ordinary case; 1-28 otherwise, because a 29th does not exist every month.\n' +
+      'useCredit is their "use my account credit first" setting — off unless they ask for it.',
     params: {
       leaseId: { type: 'string', description: 'Their lease id, from get_my_lease.' },
       enabled: { type: 'boolean', description: 'true to turn autopay on, false to turn it off.' },
       pullDay: { type: 'integer', description: '1-28. Omit to charge on the rent due date.' },
+      useCredit: { type: 'boolean', description: 'Use my account credit first — only when they asked. Omit to leave it as it is.' },
     },
     required: ['leaseId', 'enabled'],
     confirmFirst: true,
@@ -2116,18 +2261,23 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     id: 'get_payment_quote',
     audience: 'tenant', method: 'POST', path: '/api/payments/quote',
     description:
-      'Work out what a payment will ACTUALLY cost before charging anything — the rent plus the ' +
-      'processing fee, for the method they are about to use. Nothing is charged and no money moves.\n' +
+      'Work out what a payment will ACTUALLY cost before charging anything — the whole bill, the ' +
+      'account credit that could pay part of it, and the processing fee for the method they are about ' +
+      'to use. Nothing is charged and no money moves.\n' +
       'Call this BEFORE pay_my_balance, every time, and read the total back. The fee is not the same ' +
       'on both methods and it is not always the tenant\u2019s to pay — some properties cover the bank ' +
       'fee, none of them cover the card one. A tenant who is told "$1,200" and is charged $1,242.55 ' +
-      'has been misled by you, not by the property.',
+      'has been misled by you, not by the property.\n' +
+      'When usableCredit is above zero, ask whether to use all of it (pay payIfUsed) or save it for later (pay payIfSaved), then quote again with useCredit. ' +
+      'When creditWaitingNote or creditRestNote is set, read it to them as written: it is why only part of their credit can pay this bill.',
     params: {
-      amount: { type: 'number', description: 'The rent amount they are paying, before any fee.' },
+      amount: { type: 'number', description: 'Only when they want to pay MORE than the bill (paying ahead); otherwise leave it out and the bill is quoted.' },
       method: { type: 'string', description: 'ach for a bank transfer, card for a card.' },
-      leaseId: { type: 'string', description: 'Their lease id, from get_my_lease. Without it the fee is estimated as tenant-paid.' },
+      leaseId: { type: 'string', description: 'Their lease id, only when they hold more than one.' },
+      serviceAgreementId: { type: 'string', description: 'For a utility-only payer with no lease.' },
+      useCredit: { type: 'boolean', description: 'Their answer to the credit question: true to use all the credit, false to save it for later. Leave out until they have answered.' },
     },
-    required: ['amount', 'method'],
+    required: ['method'],
   },
   {
     id: 'pay_my_balance',
@@ -2148,15 +2298,18 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'out unless they hold more than one lease; each lease is paid as its own charge.\n' +
       'A bank transfer takes days to clear. It is paid the moment it goes through here — do NOT tell ' +
       'them it has landed with their landlord, and do NOT charge it a second time because it still ' +
-      'reads as processing.',
+      'reads as processing.\n' +
+      'When the quote showed usableCredit, pass their use-or-save answer as useCredit and that figure as expectedCredit; if it changed, nothing is charged — quote and ask again.',
     params: {
-      amount: { type: 'number', description: 'How much to charge, from their balance — the full amount owed.' },
-      paymentMethodId: { type: 'string', description: 'The id of the saved method to charge, from get_my_payment_methods. It must be one that is chargeable.' },
-      paymentMethodType: { type: 'string', description: 'ach or card — matching the method you chose.' },
+      amount: { type: 'number', description: 'How much to charge: payIfUsed or payIfSaved from the quote, matching their credit answer (0 when the credit covers the whole bill and they chose to use it).' },
+      paymentMethodId: { type: 'string', description: 'The id of the saved method to charge, from get_my_payment_methods. It must be one that is chargeable. Leave it out only when their credit pays the whole bill (amount 0): nothing is charged.' },
+      paymentMethodType: { type: 'string', description: 'ach or card — matching the method you chose. Left out with paymentMethodId.' },
       leaseId: { type: 'string', description: 'Which lease, only when they hold more than one.' },
       serviceAgreementId: { type: 'string', description: 'For a utility-only payer with no lease, settling their whole bill.' },
+      useCredit: { type: 'boolean', description: 'Their answer to "use your credit or save it": true uses all of it, false saves it. Required whenever the quote showed usable credit.' },
+      expectedCredit: { type: 'number', description: 'The usableCredit figure from the quote you read them. Required with useCredit.' },
     },
-    required: ['amount', 'paymentMethodId', 'paymentMethodType'],
+    required: ['amount'],
     confirmFirst: true,
   },
   // ── LANDLORD · the unit itself (S628) ────────────────────────────────
@@ -2504,7 +2657,9 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'landlord approves deductions looking at photographs, not on memory. If the system refuses for ' +
       'that reason, the answer is to do the walkthrough, not to try again. An RV spot is exempt, ' +
       'because the pull-out meter read IS its walkthrough.\n' +
-      'This opens a draft. Nothing is refunded and nothing is deducted until it is finalized.',
+      'This opens a draft. Nothing is refunded and nothing is deducted until it is finalized — and ' +
+      'the landlord finalizes it on the move-out page, never you: finalizing sends the refund, so it is a ' +
+      'money decision (decisions #38 Q6). Tell them that is the next step there.',
     params: { leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' } },
     required: ['leaseId'],
     confirmFirst: true,
@@ -2521,30 +2676,12 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'deduction defensible when the tenant disputes it. If they have not uploaded the evidence yet, ' +
       'say that is what is needed rather than sending it without.\n' +
       'The list REPLACES the deductions on the draft; send all of them, not just the new one. Nothing ' +
-      'is final until the return is finalized.',
+      'is final until the landlord finalizes the return on the move-out page; you never finalize it.',
     params: {
       leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       damageLines: { type: 'array', description: 'The deductions. Each needs a description, an amount, and the document ids of its photos or receipts.' },
       notes: { type: 'string', description: 'Notes on the return, in the landlord\u2019s words.' },
     },
-    required: ['leaseId'],
-    confirmFirst: true,
-  },
-  {
-    id: 'finalize_deposit_return',
-    audience: 'landlord', method: 'POST', path: '/api/leases/:leaseId/deposit-return/finalize',
-    pathParams: ['leaseId'],
-    description:
-      'Finalize the deposit return. This is the one that COUNTS: it settles what is deducted and what ' +
-      'goes back, and it is what the tenant sees.\n' +
-      'Read the whole thing back before you call it — the deposit held, every deduction with its ' +
-      'reason, and the figure being returned — and get an explicit yes to that total. A deposit ' +
-      'return is on a statutory clock in most states and is the single most disputed thing in ' +
-      'renting; there is no version of this that should be done quickly.\n' +
-      'A staff member may finalize up to the landlord\u2019s own approval threshold; above it, it parks ' +
-      'and waits for the landlord. If it comes back parked, that is not a failure — tell them it is ' +
-      'waiting on the owner.',
-    params: { leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' } },
     required: ['leaseId'],
     confirmFirst: true,
   },
@@ -2988,37 +3125,18 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
   // ── LANDLORD · the bank feed (S628) ──────────────────────────────────
   //
   // Categorizing and ignoring a transaction already worked. Matching a DEPOSIT
-  // to the charges it paid did not, and that is the one that matters: in a park
-  // where every lot pays the same rent, an amount identifies nobody.
-  {
-    id: 'confirm_deposit_match',
-    audience: 'landlord', method: 'POST', path: '/api/bank-feed/deposits/:depositId/confirm',
-    pathParams: ['depositId'],
-    description:
-      'Say which charges a bank deposit paid off. Use for "that $1,300 on the 4th was spot 12 and ' +
-      'spot 19".\n' +
-      'The LANDLORD confirms this, never you. In a park where every lot pays the same rent an amount ' +
-      'identifies nobody, and a confident wrong answer books one tenant\u2019s money onto another\u2019s ' +
-      'ledger — and from there onto their credit file. Read back the deposit, the date, and every ' +
-      'charge you are about to mark paid, by tenant and unit, and get a yes to that list.\n' +
-      'If the landlord is not sure who it was, mark_deposit_not_rent is the honest way out. Never ' +
-      'pick the most likely tenant to close the loop.',
-    params: {
-      depositId: { type: 'string', description: 'The bank deposit id, from the unmatched-deposit queue.' },
-      chargeIds: { type: 'array', description: 'The charge ids this deposit paid, 1 to 20. From the candidate shortlist on that deposit.' },
-      method: { type: 'string', description: 'cash, check or money_order — how it reached the bank.' },
-      declarationId: { type: 'string', description: 'The tenant\u2019s own declaration of this payment, when one lines up.' },
-    },
-    required: ['depositId', 'chargeIds', 'method'],
-    confirmFirst: true,
-  },
+  // to the charges it paid settles money, so it is the owner's press on the
+  // Bank feed, not an action (decisions #38 Q6 — confirm_deposit_match was
+  // removed 10/4; actionGap.ts DELIBERATE says why). In a park where every lot
+  // pays the same rent, an amount identifies nobody.
   {
     id: 'mark_deposit_not_rent',
     audience: 'landlord', method: 'POST', path: '/api/bank-feed/deposits/:depositId/not-rent',
     pathParams: ['depositId'],
     description:
       'Say a deposit was not a tenant payment at all — an owner contribution, an insurance check, a ' +
-      'refund. It goes back to the ordinary categorizing flow as other income.\n' +
+      'refund. It comes off the rent-matching list and stays on the Bank feed waiting to be filed; ' +
+      'no category is chosen for the owner, and they can put it back on the list from there.\n' +
       'Offer this whenever the landlord is unsure. Without it, somebody staring at a shortlist of ' +
       'tenants who did NOT pay this deposit has no honest way out except to pick one, and that is the ' +
       'outcome this exists to prevent.',
@@ -3980,18 +4098,22 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     audience: 'landlord', method: 'PATCH', path: '/api/units/:unitId/bookings/:bookingId',
     pathParams: ['unitId', 'bookingId'],
     description:
-      'Change a guest booking — its dates, its status, the guest\u2019s details, or move it to a ' +
-      'different spot. Use for "they are staying an extra two nights" or "move them to 9, the water ' +
-      'is off on 7".\n' +
-      'Moving the stay to a different unit is what unitId does here. Canceling it is a status ' +
-      'change, and the guest is NOT told automatically — offer to draft the message, because a guest ' +
-      'arriving at a spot that is no longer theirs is the outcome to avoid.',
+      'Change a guest booking — its dates, its status or the guest\u2019s details. Use for "they are ' +
+      'staying an extra two nights" or "her new phone number is …".\n' +
+      'You cannot move a stay to another spot: unitId only says which spot the booking is on now. ' +
+      'When they ask to move a guest, tell them to drag the stay to the new spot on the schedule. ' +
+      'Canceling it is a status change, and the guest is NOT told automatically — offer to draft the ' +
+      'message, because a guest arriving at a spot that is no longer theirs is the outcome to avoid.\n' +
+      'You cannot check a guest out, early or on the day, and you make no money decision about a ' +
+      'stay. When a guest has left or is leaving, tell them to check the guest out on the schedule. ' +
+      'Once a stay has started you may only make it longer or change the details; once it is over, ' +
+      'only the notes and the guest\u2019s details.',
     params: {
-      unitId: { type: 'string', description: 'The unit the booking is currently on, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit the booking is on now, from a lookup. Never a different unit: this does not move the stay.' },
       bookingId: { type: 'string', description: 'The booking id, from a lookup.' },
-      status: { type: 'string', description: 'The booking status — confirmed, cancelled, and so on.' },
-      checkIn: { type: 'string', description: 'New arrival date, YYYY-MM-DD.' },
-      checkOut: { type: 'string', description: 'New departure date, YYYY-MM-DD.' },
+      status: { type: 'string', description: 'The booking status — confirmed, cancelled, and so on. Never checked_out: a check-out is done on the schedule, not by you. Never cancelled or no_show once the stay has started.' },
+      checkIn: { type: 'string', description: 'New arrival date, YYYY-MM-DD. Once the stay has started, only an earlier day.' },
+      checkOut: { type: 'string', description: 'New departure date, YYYY-MM-DD. Never to record that a guest left early: that is a check-out, done on the schedule. For a guest already checked in, only a later day.' },
       guestName: { type: 'string', description: 'The guest\u2019s name.' },
       guestEmail: { type: 'string', description: 'Their email.' },
       guestPhone: { type: 'string', description: 'Their phone.' },
@@ -4002,6 +4124,8 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     },
     required: ['unitId', 'bookingId'],
     confirmFirst: true,
+    // decisions #38 Q6: refused before it is sent, whatever the wording above.
+    refuse: refuseAgentCheckOut,
   },
   {
     id: 'send_guest_access',

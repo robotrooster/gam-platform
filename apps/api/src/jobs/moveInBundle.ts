@@ -7,6 +7,7 @@ import { logger } from '../lib/logger'
 import { hourRateFor } from '../services/workTradeSettlement'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
+import { RESERVATION_PAID_SQL } from '../services/bookingLeaseDraft'
 
 // ============================================================
 // S26a: Move-in invoice generator (replaces S25 moveInBundle)
@@ -37,6 +38,15 @@ export interface MoveInBundleResult {
   rentAmount: number
   moveInFeesInserted: number
   depositInserted: boolean
+  /**
+   * 10/3 (decisions #15): money already paid toward the reservation this lease
+   * was drafted from (its deposit, taken at the register or on the booking
+   * site) that came off this bill's rent, and the part the rent did not use —
+   * kept on the lease as paid-ahead credit for the next bill. Both 0 for any
+   * other lease.
+   */
+  stayDepositCredited?: number
+  stayDepositLeftover?: number
 }
 
 /**
@@ -51,6 +61,12 @@ function entryDescriptionForFeeType(feeType: string): 'DEPOSIT' | 'RENT' | 'SUBS
   if (feeType === 'last_month_rent') return 'RENT'
   return 'SUBSCRIP'
 }
+
+/** Dollars as a bill prints them. */
+const money2 = (n: number) => `$${n.toFixed(2)}`
+
+/** 10/3 (decisions #15): the note on the credit a reservation deposit leaves on its lease — also how a re-issue finds it. */
+export const STAY_DEPOSIT_CREDIT_NOTE = "Reservation deposit paid before the lease — the part the first bill's rent did not use"
 
 /** Banker's rounding (half-even) to cents. */
 export function roundHalfEvenCents(value: number): number {
@@ -261,8 +277,10 @@ export async function generateMoveInInvoice(
     rent_due_day: number
     property_added_on: string | null
     lease_start_date: string; property_tz: string
+    source_booking_id: string | null
   }>(
     `SELECT l.lease_source, to_char(l.end_date, 'YYYY-MM-DD') AS end_date,
+            l.source_booking_id,
             COALESCE(l.is_existing_tenancy, false) AS is_existing_tenancy,
             to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
             COALESCE(p.onboarding_late_fee_waiver, false) AS onboarding_late_fee_waiver,
@@ -284,7 +302,7 @@ export async function generateMoveInInvoice(
   const bookingArrival = leaseMeta && isBookingScheduleLease(leaseMeta)
     ? bookingRentForDueDate(inputs.start_date, leaseMeta.end_date!, inputs.rent_amount, inputs.start_date)
     : null
-  const rentForMoveIn = renewal ? 0
+  const rentBeforeStayDeposit = renewal ? 0
     : bookingArrival != null
     ? roundHalfEvenCents(bookingArrival)
     // S648 (Nic): page 8 IS the move-in invoice. A new tenant is billed the
@@ -297,6 +315,40 @@ export async function generateMoveInInvoice(
       ? roundHalfEvenCents(Number(leaseMeta.move_in_first_month_rent) + Number(leaseMeta.move_in_proration))
       : moveInRentAmount(inputs.rent_amount, inputs.start_date, !!leaseMeta?.is_existing_tenancy,
           leaseMeta?.rent_due_day ?? 1)
+
+  // ── 10/3 (decisions #15): A RESERVATION'S DEPOSIT COMES OFF THE LEASE'S FIRST BILL ──
+  //
+  // "A reservation that becomes a lease is never charged its whole quoted price
+  // at the counter: the counter takes only what is due now (the deposit), and
+  // the lease bills the rest; never both." The register (and the booking site)
+  // take that deposit and stamp it on the reservation (unit_bookings
+  // .deposit_amount, deposit_paid_at). The lease drafted from the reservation
+  // (services/bookingLeaseDraft) then billed its arrival rent in full, so the
+  // deposit was paid once at the counter and billed again here.
+  //
+  // What was paid toward the stay comes off this bill's RENT — the line it was
+  // paid toward — and the rent line says so. A deposit bigger than the arrival
+  // rent (a late-month arrival) leaves the rest as paid-ahead credit on the
+  // lease for the next bill. That money is already the landlord's (a register
+  // sale or a booking deposit, paid out as such) and already counted in the
+  // reports as a stay, so it is the "already paid, already counted" kind of
+  // credit (funded_by 'reclassified'): it settles a bill but is never paid out
+  // a second time. A renewal or an onboarding resident has no reservation.
+  let stayPaid: { amount: number; paidAt: Date | null } | null = null
+  if (!renewal && !leaseMeta?.is_existing_tenancy && leaseMeta?.source_booking_id) {
+    const b = await client.query<{ paid: string | null; paid_at: Date | null }>(
+      // The same amount the landlord's notice named when the lease was drafted
+      // (services/bookingLeaseDraft RESERVATION_PAID_SQL — one definition).
+      `SELECT ${RESERVATION_PAID_SQL}::text AS paid,
+              COALESCE(b.deposit_paid_at, b.balance_paid_at) AS paid_at
+         FROM unit_bookings b WHERE b.id = $1`,
+      [leaseMeta.source_booking_id])
+    const paid = roundHalfEvenCents(Number(b.rows[0]?.paid ?? 0))
+    if (paid > 0) stayPaid = { amount: paid, paidAt: b.rows[0]?.paid_at ?? null }
+  }
+  const stayDepositCredited = stayPaid ? Math.min(stayPaid.amount, rentBeforeStayDeposit) : 0
+  const rentForMoveIn = roundHalfEvenCents(rentBeforeStayDeposit - stayDepositCredited)
+  const stayDepositLeftover = stayPaid ? roundHalfEvenCents(stayPaid.amount - stayDepositCredited) : 0
 
   // S631: an existing tenancy's first invoice is dated the 1st of its billing
   // cycle, not the signing date. That is what makes it a September invoice for
@@ -480,13 +532,19 @@ export async function generateMoveInInvoice(
     const lateFeeExempt = !!wtAgreement || renewalBackdated
       || (isFirstInvoice && onboardingWaived)
 
+    // 10/3 (decisions #15): the bill says what the reservation's deposit did.
+    const keepsLeftover = stayDepositLeftover > 0 && !!inputs.tenant_id
+    const stayDepositNote = !stayPaid ? null
+      : `The ${money2(stayPaid.amount)} already paid toward the reservation `
+        + (stayDepositCredited > 0 ? `covers ${money2(stayDepositCredited)} of this bill's rent` : 'was not used on this bill')
+        + (keepsLeftover ? `; the other ${money2(stayDepositLeftover)} is kept as credit toward the next bill.` : '.')
     const invoiceRes = await client.query(
       `INSERT INTO invoices (
          landlord_id, tenant_id, lease_id, unit_id,
          invoice_number, due_date,
          subtotal_rent, subtotal_fees, subtotal_deposits, total_amount,
-         work_trade_agreement_id, late_fee_exempt
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         work_trade_agreement_id, late_fee_exempt, notes
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (lease_id, due_date) DO NOTHING
        RETURNING id`,
       [
@@ -515,6 +573,7 @@ export async function generateMoveInInvoice(
         // S648 (Nic): and only where the landlord chose to waive it for this
         // property. Unanswered = the resident is billed late fees.
         lateFeeExempt,
+        stayDepositNote,
       ]
     )
 
@@ -553,9 +612,34 @@ export async function generateMoveInInvoice(
           rentForMoveIn.toFixed(2), invoiceDueDate,
           // S634: suspended while the hours are being worked — see totalAmount.
           rentSuspended ? new Date().toISOString() : null,
-          rentSuspended ? 'Work trade — suspended while the hours are worked; settled at month close' : null,
+          rentSuspended ? 'Work trade — suspended while the hours are worked; settled at month close'
+            : stayDepositCredited > 0
+            ? `Rent ${money2(rentBeforeStayDeposit)} less the ${money2(stayDepositCredited)} reservation deposit already paid`
+            : null,
         ]
       )
+    }
+
+    // 10/3 (decisions #15): what the arrival rent did not use is the tenant's,
+    // kept on the lease for the next bill — never billed again, never paid out
+    // again (it reached the landlord with the reservation). Once per lease: a
+    // re-issued lease (unwound and signed again) finds it already there.
+    if (keepsLeftover) {
+      const had = await client.query(
+        `SELECT 1 FROM lease_prepaid_credits
+          WHERE lease_id = $1 AND note = $2 AND voided_at IS NULL LIMIT 1`,
+        [inputs.lease_id, STAY_DEPOSIT_CREDIT_NOTE])
+      if (!had.rows.length) {
+        const { createPaidAhead } = await import('../services/creditUse')
+        await createPaidAhead(client, {
+          leaseId: inputs.lease_id, tenantId: inputs.tenant_id!, amount: stayDepositLeftover,
+          fundedBy: 'reclassified', receivedAt: stayPaid!.paidAt ?? new Date(),
+          note: STAY_DEPOSIT_CREDIT_NOTE,
+        })
+      }
+    } else if (stayDepositLeftover > 0) {
+      logger.warn({ leaseId: inputs.lease_id, leftover: stayDepositLeftover },
+        '[moveIn] reservation deposit larger than the arrival rent, but the lease has no tenant to keep the credit for')
     }
 
     let moveInFeesInserted = 0
@@ -800,6 +884,8 @@ export async function generateMoveInInvoice(
       rentAmount: rentForMoveIn,
       moveInFeesInserted,
       depositInserted,
+      stayDepositCredited,
+      stayDepositLeftover: keepsLeftover ? stayDepositLeftover : 0,
     }
   } catch (e) {
     if (ownsTx) await client.query('ROLLBACK')

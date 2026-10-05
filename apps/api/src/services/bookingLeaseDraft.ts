@@ -97,6 +97,20 @@ async function guestScreeningContext(
   return out
 }
 
+/**
+ * 10/3 (decisions #15): what has been paid toward a reservation, as SQL on a
+ * unit_bookings row aliased `b` — NULL when nothing has been. The stay paid
+ * whole (balance_paid_at) is its whole price; otherwise the deposit paid
+ * (deposit_paid_at), or the whole price when that payment carried no separate
+ * deposit amount. The ONE definition: the lease drafted from the reservation
+ * takes this off its first bill (jobs/moveInBundle) and the landlord's notice
+ * here names the same amount.
+ */
+export const RESERVATION_PAID_SQL =
+  `(CASE WHEN b.balance_paid_at IS NOT NULL THEN b.total_amount
+         WHEN b.deposit_paid_at IS NOT NULL THEN COALESCE(b.deposit_amount, b.total_amount)
+    END)`
+
 // S526 (Nic): "anyone staying 30 or more days needs to be drafted a lease
 // automatically" — guests often just keep staying. When a reservation is
 // created or its dates change and the stay meets the property's threshold
@@ -112,6 +126,9 @@ async function guestScreeningContext(
 export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ drafted: boolean; leaseId?: string }> {
   const booking = await queryOne<any>(
     `SELECT b.id, b.unit_id, b.landlord_id, b.status, b.check_in, b.check_out, b.guest_name, b.guest_email,
+            ${RESERVATION_PAID_SQL}::text AS paid_toward_stay,
+            -- the whole stay: paid in full, or a payment stamped with no separate deposit amount
+            (b.balance_paid_at IS NOT NULL OR (b.deposit_paid_at IS NOT NULL AND b.deposit_amount IS NULL)) AS paid_whole,
             u.rent_amount, u.monthly_rate, u.unit_number,
             p.weekly_lease_mode, p.timezone
        FROM unit_bookings b
@@ -185,12 +202,17 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
         if (booking.guest_email && !alreadyCleared) {
           try {
             const { emailBackgroundCheckScreeningRequest } = await import('./email')
-            const prop = await queryOne<{ name: string }>(
-              `SELECT p.name FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+            const prop = await queryOne<{ name: string; id: string }>(
+              `SELECT p.name, p.id FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
               [booking.unit_id])
+            // 10/4: the link names this landlord, park and site. Without them the
+            // tenant page has nobody in scope and runs the guest through the
+            // speculative renter-pool check — not this landlord's screening.
+            const qs = new URLSearchParams({ landlordId: booking.landlord_id, unitId: booking.unit_id })
+            if (prop?.id) qs.set('propertyId', prop.id)
             await emailBackgroundCheckScreeningRequest(
               booking.guest_email, booking.guest_name, prop?.name || 'the property',
-              `${(process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com').replace(/\/$/, '')}/background-check`,
+              `${(process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com').replace(/\/$/, '')}/background-check?${qs.toString()}`,
               { landlordId: booking.landlord_id })
             screeningEmailed = true
             logger.info({ bookingId, leaseId, nights },
@@ -208,6 +230,20 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
           : ctx.priorStays > 0
           ? ` They've stayed with you ${ctx.priorStays} time${ctx.priorStays === 1 ? '' : 's'} before; no background check with you is on file.`
           : ' No background check with you is on file for this guest.'
+        // 10/3 (decisions #15): what was paid toward the reservation (at the
+        // register or on the booking site) is part of the stay's price — the
+        // lease's first bill takes it off the rent (jobs/moveInBundle), so the
+        // landlord is told it will not be billed twice. Said as the code does
+        // it: the first bill is written when the lease is signed, from what has
+        // been paid by then (RESERVATION_PAID_SQL), and what that bill's rent
+        // does not use is kept as credit toward the next one.
+        const paidTowardStay = Number(booking.paid_toward_stay ?? 0)
+        const depositLine = paidTowardStay > 0
+          ? (booking.paid_whole
+              ? ` The $${paidTowardStay.toFixed(2)} already paid for the whole stay comes off the lease's first bill.`
+              : ` The $${paidTowardStay.toFixed(2)} deposit already paid on the reservation comes off the lease's first bill.`)
+            + ' Anything more than that bill\'s rent is kept as credit toward the next one.'
+          : ' A deposit paid on the reservation before the lease is signed comes off its first bill.'
         await createNotification({
           userId: owner.user_id,
           landlordId: booking.landlord_id,
@@ -218,7 +254,8 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
                 ? 'A background-check link has been emailed to them automatically, as it is for every stay over the threshold — nothing to do until it comes back.'
                 : alreadyCleared
                 ? 'No screening was sent: they already passed a background check and have rented from you continuously since.'
-                : 'No screening was sent because the reservation has no guest email on file.'),
+                : 'No screening was sent because the reservation has no guest email on file.')
+            + depositLine,
           data: {
             leaseId, bookingId,
             priorStays: ctx.priorStays,

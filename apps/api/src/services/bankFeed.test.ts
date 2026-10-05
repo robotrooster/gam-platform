@@ -3,7 +3,47 @@
 // Pure-DB paths (no Stripe): the Stripe boundary is only createLinkSession /
 // finalize / syncConnection's pull, which are exercised in the route/integration
 // layer; here we drive upsertTransactions directly with normalized rows.
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+// S655 (Step 12): a disconnect asks Stripe whether a link can be debited and
+// mints the debit method from the link that stays — mocked; nothing reaches
+// Stripe. No other test here touches Stripe.
+const stripeFake = vi.hoisted(() => ({
+  accounts: {} as Record<string, any>,
+  unreachable: false,
+  created: [] as string[],
+}))
+vi.mock('../lib/stripe', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return {
+    ...actual,
+    getStripe: () => ({
+      financialConnections: { accounts: { retrieve: async (id: string) => {
+        if (stripeFake.unreachable) throw Object.assign(new Error('connection error'), { type: 'StripeConnectionError' })
+        const a = stripeFake.accounts[id]
+        if (!a) throw Object.assign(new Error('No such account'), { code: 'resource_missing', statusCode: 404 })
+        return a
+      } } },
+      customers: { create: async () => ({ id: 'cus_fc_test' }) },
+      paymentMethods: {
+        create: async (p: any) => {
+          const fca = p.us_bank_account.financial_connections_account
+          stripeFake.created.push(fca)
+          return { id: `pm_from_${fca}`, us_bank_account: { last4: stripeFake.accounts[fca]?.last4 ?? null, bank_name: 'Test Bank' } }
+        },
+        attach: async () => ({}),
+        // Step 12 review: which FC account the landlord's fee debit is drawn from.
+        retrieve: async (id: string) => {
+          if (stripeFake.unreachable) throw Object.assign(new Error('connection error'), { type: 'StripeConnectionError' })
+          const m = /^pm_from_(.+)$/.exec(id)
+          if (!m) throw Object.assign(new Error('No such PaymentMethod'), { code: 'resource_missing', statusCode: 404 })
+          return { id, us_bank_account: { financial_connections_account: m[1] } }
+        },
+      },
+    }),
+  }
+})
+
 import { db, query } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedRentPayment, seedLease, seedLeaseTenant,
@@ -11,8 +51,11 @@ import {
 import {
   upsertTransactions, autoMatchLandlord, categorizeTransaction, ignoreTransaction,
   suggestForMerchant, normalizeMerchant, listTransactions, setBooksStartDate, autoSettleDeclaredDeposits,
+  undoAutoFile, disconnectConnection, reconcileDeposits, namesAPayer,
 } from './bankFeed'
 import { landlordExpensesTotal, unitAllocatedExpenses, createLandlordExpense } from './landlordExpenses'
+import { memoSaysTransfer, isTenantCheckMemo, NOT_CUSTOMER_MONEY_WORDS, BANK_BOILERPLATE_WORDS } from './bankDepositMatch'
+import { createSlip } from './depositSlips'
 
 beforeEach(async () => { await cleanupAllSchema() })
 
@@ -1037,5 +1080,418 @@ describe('setting the books start date inside a caller’s transaction', () => {
     } finally { c.release() }
     expect((await row('old_a')).status).toBe('needs_review')
     expect((await db.query(`SELECT books_start_date FROM landlords WHERE id = $1`, [f.landlordId])).rows[0].books_start_date).toBeNull()
+  })
+})
+
+// ── S655 money plan Step 12 (K-D, L's landlord guard) ────────────────────────
+
+describe('Step 12: one payer, one key', () => {
+  it('Square and DoorLoop references normalize to one payer', () => {
+    const square = [
+      'Square Inc       SQ261001   261001 T3H80F2ZQ67M',
+      'Square Inc       SQ260929   260929 T3QHTR8RAS82',
+      'Square Inc       SQ260910   260910 T3S9K91T5HR7',
+    ].map(normalizeMerchant)
+    expect(new Set(square)).toEqual(new Set(['SQUARE INC']))
+    const doorloop = [
+      'ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH',
+      'ST-X4O0K9S9Y9T4 DOORLOOP CORPORATE ACH',
+      'ST-U9L3Q8J9X7A9 DOORLOOP CORPORATE ACH',
+    ].map(normalizeMerchant)
+    expect(new Set(doorloop)).toEqual(new Set(['DOORLOOP CORPORATE']))
+    // Store numbers and dates still go; the name stays.
+    expect(normalizeMerchant('HOME DEPOT #1234 PHOENIX AZ 07/12')).toBe('HOME DEPOT PHOENIX AZ')
+  })
+
+  it('a branch, teller or store deposit names no payer; a real payer does (memos as the banks write them)', () => {
+    const anonymous = [
+      'EDEPOSIT IN BRANCH 09/15/26 02:31:45 PM 123 W CONTINENTAL RD GREEN VALLEY AZ',   // Wells Fargo, Mountain View
+      'EDEPOSIT IN BRANCH 09/04/26 10:02:11 AM 123 W CONTINENTAL RD GREEN VALLEY AZ',
+      'EDEPOSIT IN BRANCH/STORE',
+      'DEPOSIT *4021',                                                                     // PNC, Oak Park
+      'TELLER DEPOSIT',
+      'MOBILE DEPOSIT',
+      'MOBILE DEPOSIT REF NUMBER 812345678 RHOADES',                                         // payer key cut to four words
+      'DEPOSIT MADE IN A BRANCH/STORE CHECK',
+      'REMOTE DEPOSIT CAPTURE',
+      'INSTANT DEPOSIT REF NBR 4471',
+    ]
+    for (const m of anonymous) expect(namesAPayer(normalizeMerchant(m)), m).toBe(false)
+    const named = [
+      'Square Inc       SQ261001   261001 T3H80F2ZQ67M',
+      'ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH',
+      'INTEREST PAYMENT',
+      'CITY LAUNDRY SERVICES',
+    ]
+    for (const m of named) expect(namesAPayer(normalizeMerchant(m)), m).toBe(true)
+  })
+})
+
+describe('decisions #48.1: a transfer between accounts', () => {
+  const TRANSFER_MEMO = 'ONLINE TRANSFER FROM CHK 1234'
+  /** A cash payment taken at the desk on `day` (settled rent + its receipt). */
+  async function deskCash(f: any, amount: number, day: string) {
+    const c = await db.connect()
+    try {
+      const tenantId = await seedTenant(c)
+      const leaseId = await seedLease(c, { unitId: f.unitA, landlordId: f.landlordId, rentAmount: amount })
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      const at = `${day}T18:00:00Z`
+      const rentId = (await c.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date,
+                               entry_description, manual_method, settled_at)
+         VALUES ($1,$2,$3,$4,'rent',$5,'settled',$6::date,'RENT','cash',$7) RETURNING id`,
+        [f.unitA, leaseId, tenantId, f.landlordId, amount.toFixed(2), day, at])).rows[0].id
+      const id = (await c.query(
+        `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, status,
+                                         payment_method, settled_at, received_by)
+         VALUES ($1,$2,$3,$4,$4,'settled','cash',$5,$6) RETURNING id`,
+        [tenantId, leaseId, f.landlordId, amount.toFixed(2), at, f.llUser])).rows[0].id
+      await c.query(`INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied) VALUES ($1,$2,$3)`,
+        [id, rentId, amount.toFixed(2)])
+      return id as string
+    } finally { c.release() }
+  }
+  /** One tenant whose whole open bill is one $250 rent line, billed before today. */
+  async function openBill(f: any) {
+    const c = await db.connect()
+    try {
+      const tenantId = await seedTenant(c)
+      const leaseId = await seedLease(c, { unitId: f.unitB, landlordId: f.landlordId, rentAmount: 250 })
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      return (await c.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date,
+                               entry_description, created_at)
+         VALUES ($1,$2,$3,$4,'rent',250,'pending',CURRENT_DATE,'RENT',NOW() - interval '2 days') RETURNING id`,
+        [f.unitB, leaseId, tenantId, f.landlordId])).rows[0].id as string
+    } finally { c.release() }
+  }
+  const status = async (table: string, id: string) =>
+    (await db.query(`SELECT status FROM ${table} WHERE id = $1`, [id])).rows[0].status
+
+  it("a transfer from the landlord's own account is never the office's cash and never settles a bill on amount alone", async () => {
+    const today = (await db.query(`SELECT CURRENT_DATE::text AS d`)).rows[0].d as string
+    // The office's cash not yet banked equals the transfer: never taken as the bag.
+    const office = await seed()
+    await deskCash(office, 250, today)
+    await upsertTransactions(office.connectionId, office.landlordId, [
+      { externalId: 'xfer_cash', postedDate: today, amount: 250, description: TRANSFER_MEMO }])
+    expect(await reconcileDeposits(office.landlordId)).toMatchObject({ slips: 0, inferred: 0, autoSettled: 0, autoFiled: 0 })
+    expect((await row('xfer_cash')).status).toBe('needs_review')
+    expect((await db.query(`SELECT COUNT(*)::int AS n FROM bank_deposit_slips WHERE landlord_id = $1`, [office.landlordId])).rows[0].n).toBe(0)
+    // One tenant's whole bill equals the transfer: never paid on amount alone.
+    // (A second company, so the office's cash above is not in play.)
+    await db.query(`UPDATE bank_connections SET stripe_fc_account_id = 'fca_office' WHERE id = $1`, [office.connectionId])
+    const bill = await seed()
+    const rentId = await openBill(bill)
+    await upsertTransactions(bill.connectionId, bill.landlordId, [
+      { externalId: 'xfer_bill', postedDate: today, amount: 250, description: TRANSFER_MEMO }])
+    expect(await reconcileDeposits(bill.landlordId)).toMatchObject({ slips: 0, inferred: 0, declared: 0, autoSettled: 0, autoFiled: 0 })
+    expect((await row('xfer_bill')).status).toBe('needs_review')
+    expect(await status('payments', rentId)).toBe('pending')
+    // It still names nobody (never a payer to file income from), and it is no tenant's check.
+    expect(namesAPayer(normalizeMerchant(TRANSFER_MEMO))).toBe(false)
+    expect(memoSaysTransfer(TRANSFER_MEMO)).toBe(true)
+    expect(memoSaysTransfer('XFER FROM SAVINGS')).toBe(true)
+    expect(memoSaysTransfer('BRANCH DEPOSIT')).toBe(false)
+    expect(isTenantCheckMemo('ONLINE TRANSFER FROM CHK ROSA GARCIA', 'Rosa Garcia')).toBe(false)
+    expect(isTenantCheckMemo('REMOTE DEP CHK ROSA GARCIA', 'Rosa Garcia')).toBe(true)
+    expect([...NOT_CUSTOMER_MONEY_WORDS].every(w => BANK_BOILERPLATE_WORDS.has(w))).toBe(true)
+  })
+
+  it('a staff deposit slip of the same amount never takes a transfer: it waits for the landlord', async () => {
+    const f = await seed()
+    const today = (await db.query(`SELECT CURRENT_DATE::text AS d`)).rows[0].d as string
+    const receiptId = await deskCash(f, 180, today)
+    const slip = await createSlip({ landlordId: f.landlordId, depositDate: today, receiptIds: [receiptId], createdBy: f.llUser } as any)
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'xfer2', postedDate: today, amount: 180, description: 'XFER FROM CHK 9921' }])
+    expect((await reconcileDeposits(f.landlordId)).slips).toBe(0)
+    expect((await row('xfer2')).status).toBe('needs_review')
+    expect(await status('bank_deposit_slips', slip.id)).not.toBe('matched')
+  })
+})
+
+describe('Step 12: money GAM never handled files itself after the first', () => {
+  async function fileFirst(f: any, externalId: string, description: string, amount: number, postedDate = '2026-09-10') {
+    await upsertTransactions(f.connectionId, f.landlordId, [{ externalId, postedDate, amount, description }])
+    const r = await row(externalId)
+    return categorizeTransaction(f.landlordId, r.id, { category: 'other', scopeKind: 'property_common', propertyId: f.propertyId })
+  }
+  const ruleFor = async (f: any, merchant: string) => (await db.query(
+    `SELECT last_direction, auto_file_income FROM landlord_merchant_rules WHERE landlord_id=$1 AND normalized_merchant=$2`,
+    [f.landlordId, merchant])).rows[0]
+
+  it('the second deposit from a filed payer files itself, labeled', async () => {
+    const f = await seed()
+    await fileFirst(f, 'sq1', 'Square Inc       SQ260910   260910 T3S9K91T5HR7', 72.13)
+    expect(await ruleFor(f, 'SQUARE INC')).toEqual({ last_direction: 'in', auto_file_income: true })
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'sq2', postedDate: '2026-09-21', amount: 251.05, description: 'Square Inc       SQ260921   260921 T3RS4VZNYDHF' },
+    ])
+    const r = (await db.query(
+      `SELECT id, status, auto_filed_rule_id, auto_filed_at, landlord_other_income_id FROM bank_transactions WHERE external_id='sq2'`)).rows[0]
+    expect(r.status).toBe('categorized')
+    expect(r.auto_filed_rule_id).toBeTruthy()
+    expect(r.auto_filed_at).toBeTruthy()
+    const inc = (await db.query(`SELECT amount::float AS amount, category, property_id, income_date::text AS d FROM landlord_other_income WHERE id=$1`,
+      [r.landlord_other_income_id])).rows[0]
+    expect(inc).toEqual({ amount: 251.05, category: 'other', property_id: f.propertyId, d: '2026-09-21' })
+    const listed = (await listTransactions(f.landlordId)).find((t: any) => t.id === r.id)
+    expect(listed.match_kind).toBe('auto_filed')
+  })
+
+  it('DoorLoop is never auto-filed', async () => {
+    const f = await seed()
+    await fileFirst(f, 'dl1', 'ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH', 904.7)
+    expect((await ruleFor(f, 'DOORLOOP CORPORATE')).last_direction).toBeNull()
+    // Even a rule someone set to "in" by hand never files a rent channel.
+    await db.query(`UPDATE landlord_merchant_rules SET last_direction='in' WHERE landlord_id=$1`, [f.landlordId])
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'dl2', postedDate: '2026-09-15', amount: 590.91, description: 'ST-X4O0K9S9Y9T4 DOORLOOP CORPORATE ACH' },
+    ])
+    expect((await row('dl2')).status).toBe('needs_review')
+  })
+
+  it('a transfer from savings filed once as income never files itself again', async () => {
+    const f = await seed()
+    await fileFirst(f, 'xs1', 'XFER FROM SAVINGS 1234', 500)
+    const merchant = normalizeMerchant('XFER FROM SAVINGS 1234')
+    expect(namesAPayer(merchant)).toBe(true)
+    expect((await ruleFor(f, merchant)).last_direction).toBeNull()
+    // Even a rule someone set to "in" by hand never files a transfer.
+    await db.query(`UPDATE landlord_merchant_rules SET last_direction='in' WHERE landlord_id=$1`, [f.landlordId])
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'xs2', postedDate: '2026-09-15', amount: 750, description: 'XFER FROM SAVINGS 1234' },
+    ])
+    expect((await row('xs2')).status).toBe('needs_review')
+    expect((await db.query(`SELECT COUNT(*)::int AS n FROM landlord_other_income WHERE landlord_id=$1`, [f.landlordId])).rows[0].n).toBe(1)
+  })
+
+  it('a payer once matched to rent is never auto-filed', async () => {
+    const f = await seed()
+    await fileFirst(f, 'jd1', 'ZELLE FROM JOHN DOE', 120)
+    expect((await ruleFor(f, 'ZELLE FROM JOHN DOE')).last_direction).toBe('in')
+    // Later, a deposit from the same payer was matched to a tenant's rent.
+    const c = await db.connect()
+    let rentId: string
+    try {
+      const tenantId = await seedTenant(c)
+      rentId = await seedRentPayment(c, { unitId: f.unitA, tenantId, landlordId: f.landlordId, amount: 777 })
+    } finally { c.release() }
+    await db.query(
+      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description,
+                                      normalized_merchant, status, matched_payment_id)
+       VALUES ($1,$2,'jd_rent','2026-09-12',777,'ZELLE FROM JOHN DOE','ZELLE FROM JOHN DOE','matched',$3)`,
+      [f.connectionId, f.landlordId, rentId])
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'jd2', postedDate: '2026-09-20', amount: 130, description: 'ZELLE FROM JOHN DOE' },
+    ])
+    expect((await row('jd2')).status).toBe('needs_review')
+    // And filing it by hand now leaves the payer with no direction.
+    await categorizeTransaction(f.landlordId, (await row('jd2')).id, { category: 'other', scopeKind: 'property_common', propertyId: f.propertyId })
+    expect((await ruleFor(f, 'ZELLE FROM JOHN DOE')).last_direction).toBeNull()
+  })
+
+  it('money out is never auto-filed', async () => {
+    const f = await seed()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'hd_out', postedDate: '2026-09-10', amount: -50, description: 'HOME DEPOT #12 AZ' },
+    ])
+    await categorizeTransaction(f.landlordId, (await row('hd_out')).id, { category: 'maintenance', scopeKind: 'unit', unitId: f.unitA })
+    expect((await ruleFor(f, 'HOME DEPOT AZ')).last_direction).toBe('out')
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'hd_out2', postedDate: '2026-09-12', amount: -70, description: 'HOME DEPOT #13 AZ' },
+      { externalId: 'hd_refund', postedDate: '2026-09-13', amount: 25, description: 'HOME DEPOT #13 AZ' },
+    ])
+    expect((await row('hd_out2')).status).toBe('needs_review')
+    expect((await row('hd_refund')).status).toBe('needs_review')
+  })
+
+  it('a deposit equal to an open bill is never auto-filed', async () => {
+    const f = await seed()
+    await fileFirst(f, 'cm1', 'COINMACH LAUNDRY', 210)
+    const c = await db.connect()
+    try {
+      const tenantId = await seedTenant(c)
+      await seedRentPayment(c, { unitId: f.unitA, tenantId, landlordId: f.landlordId, amount: 250, status: 'pending' })
+    } finally { c.release() }
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'cm2', postedDate: '2026-09-20', amount: 250, description: 'COINMACH LAUNDRY' },
+      { externalId: 'cm3', postedDate: '2026-09-27', amount: 199.5, description: 'COINMACH LAUNDRY' },
+    ])
+    expect((await row('cm2')).status).toBe('needs_review')     // the same as an open bill: may be rent
+    expect((await row('cm3')).status).toBe('categorized')
+  })
+
+  it('a deposit whose memo names nobody never teaches GAM a payer', async () => {
+    const f = await seed()
+    await fileFirst(f, 'md1', 'MOBILE DEPOSIT', 60)
+    expect((await ruleFor(f, 'MOBILE DEPOSIT')).last_direction).toBeNull()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'md2', postedDate: '2026-09-20', amount: 65, description: 'MOBILE DEPOSIT' },
+    ])
+    expect((await row('md2')).status).toBe('needs_review')
+    // A Wells Fargo branch deposit filed as income (laundry, say) teaches nothing
+    // either: the next branch deposit may be the office's rent cash.
+    const wf = 'EDEPOSIT IN BRANCH 09/15/26 02:31:45 PM 123 W CONTINENTAL RD GREEN VALLEY AZ'
+    await fileFirst(f, 'wf1', wf, 41)
+    expect((await ruleFor(f, normalizeMerchant(wf))).last_direction).toBeNull()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'wf2', postedDate: '2026-09-22', amount: 43, description: wf.replace('09/15/26', '09/22/26') },
+    ])
+    expect((await row('wf2')).status).toBe('needs_review')
+  })
+
+  it('a mobile deposit’s REF NUMBER memo names no payer and never files itself as income', async () => {
+    // Step 12 fix round 2: "NUMBER" (like "REF") is the bank's word. Before,
+    // the payer key "MOBILE DEPOSIT REF NUMBER" read as a named payer, so one
+    // such deposit filed as income taught GAM to file the next one by itself —
+    // which could be the office's rent cash or a tenant's paid-ahead check.
+    const f = await seed()
+    const memo = (ref: string) => `MOBILE DEPOSIT REF NUMBER ${ref} RHOADES`
+    expect(normalizeMerchant(memo('812345678'))).toBe('MOBILE DEPOSIT REF NUMBER')
+    expect(namesAPayer(normalizeMerchant(memo('812345678')))).toBe(false)
+    await fileFirst(f, 'mr1', memo('812345678'), 60)
+    expect((await ruleFor(f, 'MOBILE DEPOSIT REF NUMBER')).last_direction).toBeNull()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'mr2', postedDate: '2026-09-20', amount: 65, description: memo('812349999') },
+    ])
+    expect((await row('mr2')).status).toBe('needs_review')
+    // Even a rule someone set to "in" by hand never files a memo that names nobody.
+    await db.query(`UPDATE landlord_merchant_rules SET last_direction='in' WHERE landlord_id=$1`, [f.landlordId])
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'mr3', postedDate: '2026-09-22', amount: 70, description: memo('812350000') },
+    ])
+    expect((await row('mr3')).status).toBe('needs_review')
+  })
+
+  it('undo can stop auto-filing a payer', async () => {
+    const f = await seed()
+    await fileFirst(f, 'sqa', 'Square Inc       SQ260910   260910 T3S9K91T5HR7', 72.13)
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'sqb', postedDate: '2026-09-21', amount: 251.05, description: 'Square Inc       SQ260921   260921 T3RS4VZNYDHF' },
+    ])
+    const b = (await db.query(`SELECT id, landlord_other_income_id FROM bank_transactions WHERE external_id='sqb'`)).rows[0]
+    // Undo alone: back to review, its income voided, and it never files itself again.
+    await undoAutoFile(f.landlordId, b.id, { undoneBy: f.llUser })
+    expect((await row('sqb')).status).toBe('needs_review')
+    expect((await db.query(`SELECT status FROM landlord_other_income WHERE id=$1`, [b.landlord_other_income_id])).rows[0].status).toBe('voided')
+    await reconcileDeposits(f.landlordId)
+    expect((await row('sqb')).status).toBe('needs_review')
+    // The next Square deposit still files itself.
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'sqc', postedDate: '2026-09-23', amount: 24.13, description: 'Square Inc       SQ260923   260923 T3BD7AW9SENW' },
+    ])
+    const c = (await db.query(`SELECT id, status FROM bank_transactions WHERE external_id='sqc'`)).rows[0]
+    expect(c.status).toBe('categorized')
+    // Undo and stop: Square stops filing itself.
+    const stopped = await undoAutoFile(f.landlordId, c.id, { stopAutoFiling: true, undoneBy: f.llUser })
+    expect(stopped.stoppedForPayer).toBe('SQUARE INC')
+    expect((await ruleFor(f, 'SQUARE INC')).auto_file_income).toBe(false)
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'sqd', postedDate: '2026-09-29', amount: 61.73, description: 'Square Inc       SQ260929   260929 T3QHTR8RAS82' },
+    ])
+    expect((await row('sqd')).status).toBe('needs_review')
+    // A row the landlord filed by hand is not "filed by itself".
+    await expect(undoAutoFile(f.landlordId, (await row('sqa')).id, { undoneBy: null })).rejects.toThrow(/was not filed by itself/)
+  })
+})
+
+describe('Step 12: the bank link GAM collects its fees from', () => {
+  beforeEach(() => { stripeFake.accounts = {}; stripeFake.unreachable = false; stripeFake.created = [] })
+
+  async function link(f: any, fca: string, debit: boolean, last4: string) {
+    stripeFake.accounts[fca] = { status: 'active', permissions: debit ? ['transactions', 'payment_method'] : ['transactions'], last4 }
+    return (await db.query(
+      `INSERT INTO bank_connections (landlord_id, provider, stripe_fc_account_id, institution_name, account_last4, display_name, status)
+       VALUES ($1,'stripe_fc',$2,'Test Bank',$3,$4,'active') RETURNING id`,
+      [f.landlordId, fca, last4, `Test Bank ••${last4}`])).rows[0].id as string
+  }
+  const statusOf = async (id: string) => (await db.query(`SELECT status FROM bank_connections WHERE id=$1`, [id])).rows[0].status
+
+  it('the last debit-capable link cannot be disconnected', async () => {
+    const f = await seed()
+    await db.query(`UPDATE bank_connections SET status = 'disconnected' WHERE id = $1`, [f.connectionId])
+    const debit = await link(f, 'fca_debit', true, '1111')
+    const readOnly = await link(f, 'fca_read', false, '2222')
+    await expect(disconnectConnection(f.landlordId, debit)).rejects.toThrow(
+      'This is the only linked bank GAM can collect its fees from, so it can’t be disconnected. Link your other bank first (Connect feed), then disconnect this one.')
+    expect(await statusOf(debit)).toBe('active')
+    // A link GAM cannot debit from goes freely.
+    expect(await disconnectConnection(f.landlordId, readOnly)).toEqual({ ok: true, debitMovedTo: null })
+    expect(await statusOf(readOnly)).toBe('disconnected')
+  })
+
+  it('disconnecting a debit-capable link moves the fee debit to the link that stays', async () => {
+    const f = await seed()
+    await db.query(`UPDATE bank_connections SET status = 'disconnected' WHERE id = $1`, [f.connectionId])
+    const old = await link(f, 'fca_old', true, '1111')
+    await link(f, 'fca_new', true, '3333')
+    // The fee debit is drawn from the link being disconnected.
+    await db.query(`UPDATE landlords SET gam_debit_payment_method_id = 'pm_from_fca_old', gam_debit_bank_last4 = '1111' WHERE id = $1`, [f.landlordId])
+    const r = await disconnectConnection(f.landlordId, old)
+    expect(r.debitMovedTo).toEqual({ name: 'Test Bank', last4: '3333' })
+    expect(stripeFake.created).toEqual(['fca_new'])
+    const ll = (await db.query(`SELECT gam_debit_payment_method_id, gam_debit_bank_last4 FROM landlords WHERE id=$1`, [f.landlordId])).rows[0]
+    expect(ll).toEqual({ gam_debit_payment_method_id: 'pm_from_fca_new', gam_debit_bank_last4: '3333' })
+    expect(await statusOf(old)).toBe('disconnected')
+  })
+
+  it('disconnecting a link the fee debit is not drawn from leaves the debit where it is', async () => {
+    const f = await seed()
+    await db.query(`UPDATE bank_connections SET status = 'disconnected' WHERE id = $1`, [f.connectionId])
+    await link(f, 'fca_a', true, '1111')
+    const unused = await link(f, 'fca_b', true, '2222')
+    await link(f, 'fca_c', true, '3333')
+    await db.query(`UPDATE landlords SET gam_debit_payment_method_id = 'pm_from_fca_a', gam_debit_bank_last4 = '1111' WHERE id = $1`, [f.landlordId])
+    expect(await disconnectConnection(f.landlordId, unused)).toEqual({ ok: true, debitMovedTo: null })
+    expect(stripeFake.created).toEqual([])
+    const ll = (await db.query(`SELECT gam_debit_payment_method_id, gam_debit_bank_last4 FROM landlords WHERE id=$1`, [f.landlordId])).rows[0]
+    expect(ll).toEqual({ gam_debit_payment_method_id: 'pm_from_fca_a', gam_debit_bank_last4: '1111' })
+    expect(await statusOf(unused)).toBe('disconnected')
+  })
+
+  it('with no fee debit set up yet, a disconnect sets none up', async () => {
+    const f = await seed()
+    await db.query(`UPDATE bank_connections SET status = 'disconnected' WHERE id = $1`, [f.connectionId])
+    const a = await link(f, 'fca_a', true, '1111')
+    await link(f, 'fca_b', true, '2222')
+    await db.query(`UPDATE landlords SET gam_debit_payment_method_id = NULL, gam_debit_revoked_at = now() WHERE id = $1`, [f.landlordId])
+    expect(await disconnectConnection(f.landlordId, a)).toEqual({ ok: true, debitMovedTo: null })
+    expect(stripeFake.created).toEqual([])
+    const ll = (await db.query(`SELECT gam_debit_payment_method_id, gam_debit_revoked_at IS NOT NULL AS revoked FROM landlords WHERE id=$1`, [f.landlordId])).rows[0]
+    expect(ll).toEqual({ gam_debit_payment_method_id: null, revoked: true })
+  })
+
+  it('when Stripe cannot be asked, nothing is disconnected', async () => {
+    const f = await seed()
+    const only = await link(f, 'fca_x', true, '4444')
+    stripeFake.unreachable = true
+    await expect(disconnectConnection(f.landlordId, only)).rejects.toThrow(/Stripe could not be reached/)
+    expect(await statusOf(only)).toBe('active')
+  })
+})
+
+describe('Step 12: a matched deposit the bank voids', () => {
+  it('is told to the landlord when the sync hears it', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    let rentId: string
+    try {
+      const tenantId = await seedTenant(c)
+      rentId = await seedRentPayment(c, { unitId: f.unitA, tenantId, landlordId: f.landlordId, amount: 400 })
+    } finally { c.release() }
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'dep_v', postedDate: '2026-09-07', amount: 400, description: 'DEPOSIT' },
+    ])
+    await db.query(`UPDATE bank_transactions SET status='matched', matched_payment_id=$2 WHERE external_id='dep_v' AND landlord_id=$1`,
+      [f.landlordId, rentId])
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'dep_v', postedDate: '2026-09-07', amount: 400, description: 'DEPOSIT', status: 'void' },
+    ])
+    const owner = (await db.query(`SELECT user_id FROM landlords WHERE id=$1`, [f.landlordId])).rows[0].user_id
+    const n = (await db.query(`SELECT title FROM notifications WHERE user_id=$1 AND type='bank_deposit_voided'`, [owner])).rows
+    expect(n).toEqual([{ title: 'Your bank voided a deposit that paid rent' }])
   })
 })

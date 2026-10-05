@@ -481,3 +481,37 @@ describe('cancelRequest', () => {
     expect(out).toBeNull()
   })
 })
+
+// Final sweep (10/3): an add-a-roommate spot nobody signed ('pending_add')
+// never joined the lease, so ending the lease does not mark it 'removed' /
+// lease_ended like the people who were on it: it is void, the way voiding its
+// addendum leaves it (lib/leaseDocCascade.ts).
+describe('early termination: an unsigned roommate spot becomes void, not removed', () => {
+  it('the household is removed (lease_ended); the never-signed roommate is void', async () => {
+    const f = await seedFixture()
+    const roommate = await (async () => {
+      const c = await db.connect()
+      try { return await seedTenant(c) } finally { c.release() }
+    })()
+    const addendum = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status)
+       VALUES ($1,$2,$3,'Add a roommate','addendum_add','in_progress') RETURNING id`,
+      [f.landlordId, f.unitId, f.leaseId])).rows[0].id
+    await db.query(
+      `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_reason, financial_responsibility, add_document_id)
+       VALUES ($1,$2,'co_tenant','pending_add','roommate_added','joint_several',$3)`,
+      [f.leaseId, roommate, addendum])
+
+    await requestEarlyTermination({
+      leaseId: f.leaseId, tenantId: f.tenantId, requestedByUserId: f.tenantUserId, reason: 'Moving',
+    })
+
+    const spots = await db.query<{ tenant_id: string; status: string; removed_reason: string | null; removed_at: string | null; updated_at: string | null }>(
+      `SELECT tenant_id, status, removed_reason, removed_at, updated_at FROM lease_tenants WHERE lease_id = $1`, [f.leaseId])
+    const holder = spots.rows.find(r => r.tenant_id === f.tenantId)!
+    const added = spots.rows.find(r => r.tenant_id === roommate)!
+    expect(holder).toMatchObject({ status: 'removed', removed_reason: 'lease_ended' })
+    expect(added).toMatchObject({ status: 'void', removed_reason: null, removed_at: null })
+    expect(added.updated_at).toBeTruthy()
+  })
+})

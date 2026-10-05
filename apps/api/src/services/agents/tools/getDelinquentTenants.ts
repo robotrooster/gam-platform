@@ -5,6 +5,7 @@
  */
 
 import { query } from '../../../db'
+import { openBalanceSql, openAmountSql, inFlightRowSql, inFlightMoneySql } from '../../openBalances'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row {
@@ -40,10 +41,18 @@ interface FlightRow { in_flight: string | null; payers: string }
  * paid_via_deposit), the late-fee engine's postmark rule, the tenant's own
  * balance, portfolio stats, and the portfolio query. This line was the outlier.
  *
- * 'returned' and 'failed' STAY. Those are payments that came back or never
- * went through — that money really is still owed.
+ * 'failed' STAYS, and so does a payment the bank sent back: that money really
+ * is still owed.
+ *
+ * S655 (money plan, Step 11): "unpaid" is the one rule the Outstanding page
+ * reads (services/openBalances.openBalanceSql), so this list and that page
+ * cannot disagree. A payment the bank sent back is owed ONCE, on the row the
+ * reversal reopened (reversal_id) — counting the 'returned' original as well
+ * doubled every bounce. A work-trade line and GAM's FlexPay pull are never
+ * owed. "Tried and it came back" = a failed attempt or a reopened row (a
+ * 'returned' original is never owed, so it never reaches this list).
  */
-const UNPAID = ['pending', 'failed', 'returned']
+const TRIED_SQL = `(p.status IN ('failed','returned') OR p.reversal_id IS NOT NULL)`
 
 export const getDelinquentTenants: AgentTool = {
   name: 'get_delinquent_tenants',
@@ -66,22 +75,26 @@ export const getDelinquentTenants: AgentTool = {
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 100) : 25
     const rows = await query<Row>(
       `SELECT us.first_name, us.last_name, us.email,
-              CASE WHEN p.status IN ('failed','returned') THEN 'returned' ELSE 'never_attempted' END AS kind,
-              SUM(p.amount) AS overdue, COUNT(*) AS items, MIN(p.due_date) AS oldest_due,
+              CASE WHEN ${TRIED_SQL} THEN 'returned' ELSE 'never_attempted' END AS kind,
+              SUM(${openAmountSql('p')}) AS overdue, COUNT(*) AS items, MIN(p.due_date) AS oldest_due,
               -- The bank's own words, where it gave any. A landlord chasing a
               -- returned payment needs to know whether it was insufficient
               -- funds or a closed account; those are different conversations.
-              NULLIF(STRING_AGG(DISTINCT COALESCE(p.return_reason, p.return_code), '; '), '') AS return_reasons,
-              MAX(COALESCE(p.processed_at, p.last_retry_at)) AS last_attempt
+              -- A reopened row carries no code of its own: its original does.
+              NULLIF(STRING_AGG(DISTINCT COALESCE(p.return_reason, p.return_code, orig.return_reason, orig.return_code), '; '), '') AS return_reasons,
+              MAX(COALESCE(p.processed_at, p.last_retry_at, orig.processed_at, orig.settled_at)) AS last_attempt
          FROM payments p
          JOIN tenants t ON t.id = p.tenant_id
          JOIN users us ON us.id = t.user_id
-        WHERE p.landlord_id = ANY($1::uuid[]) AND p.status = ANY($2) AND p.due_date < now()
+         LEFT JOIN payment_reversals rv ON rv.id = p.reversal_id
+         LEFT JOIN payments orig ON orig.id = rv.payment_id
+        WHERE p.landlord_id = ANY($1::uuid[]) AND ${openBalanceSql('p')} AND ${openAmountSql('p')} > 0
+          AND p.due_date < now()
         GROUP BY us.first_name, us.last_name, us.email,
-                 CASE WHEN p.status IN ('failed','returned') THEN 'returned' ELSE 'never_attempted' END
+                 CASE WHEN ${TRIED_SQL} THEN 'returned' ELSE 'never_attempted' END
         ORDER BY overdue DESC
-        LIMIT $3`,
-      [actorLandlordIds(actor), UNPAID, limit]
+        LIMIT $2`,
+      [actorLandlordIds(actor), limit]
     )
 
     // S626 (Nic): "The $8 ACH was not stuck. It was paid. Money was already out
@@ -95,9 +108,10 @@ export const getDelinquentTenants: AgentTool = {
     // second question. So the overdue figure now always arrives with the
     // in-flight figure beside it.
     const flight = await query<FlightRow>(
-      `SELECT SUM(p.amount) AS in_flight, COUNT(DISTINCT p.tenant_id) AS payers
+      `SELECT SUM(${inFlightMoneySql('p')}) AS in_flight, COUNT(DISTINCT p.tenant_id) AS payers
          FROM payments p
-        WHERE p.landlord_id = ANY($1::uuid[]) AND p.status = 'processing'`,
+        WHERE p.landlord_id = ANY($1::uuid[])
+          AND ${inFlightRowSql('p')}`,
       [actorLandlordIds(actor)]
     )
     const inFlight = Number(flight[0]?.in_flight ?? 0)

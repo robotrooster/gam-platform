@@ -264,3 +264,18 @@ describe('S640 next disbursement says what is coming', () => {
     expect(Number(res.body.data.next_payout_ready)).toBe(0)
   })
 })
+
+// S655: under either switch, a bill covered by work trade is never income —
+// not on the trend, not in the property-health card, not in the income card.
+describe('S655 work trade is in neither total', () => {
+  it('the billed trend counts the cash bill and never the traded one', async () => {
+    const f = await seed()
+    const billed = (await request(buildApp()).get('/api/landlords/me/dashboard?basis=billed')
+      .set('Authorization', `Bearer ${f.token}`)).body.data
+    const sum = billed.trend.reduce((s: number, t: any) => s + t.revenue, 0)
+    expect(sum).toBe(500)
+    const received = (await dashboard(f)).body.data
+    expect(received.trend.reduce((s: number, t: any) => s + t.revenue, 0)).toBe(0)
+    expect(received.income_card.received.amount).toBe(0)
+  })
+})

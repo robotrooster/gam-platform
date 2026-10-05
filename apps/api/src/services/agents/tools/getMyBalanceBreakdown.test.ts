@@ -18,7 +18,7 @@ vi.mock('../../reversalRecovery', () => ({ decideReversalRecovery: vi.fn(async (
 vi.mock('../../responsibleParty', () => ({ getPropertyResponsibleParty: vi.fn(async () => null) }))
 
 import { db, getClient } from '../../../db'
-import { getMyBalanceBreakdown } from './getMyBalanceBreakdown'
+import { getMyBalanceBreakdown, LISTED_CHARGES } from './getMyBalanceBreakdown'
 import { handlePaymentReversal } from '../../paymentReversal'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
@@ -74,12 +74,33 @@ describe('get_my_balance_breakdown — a bounced payment is owed once', () => {
       .toEqual([expect.objectContaining({ amount: 300, status: 'pending' })])
   })
 
-  it('S626: a return with no reopened row is still owed', async () => {
+  // S655 (money plan, Step 11): one rule for "owed" (openBalances.openBalanceSql).
+  // A bounce is owed on the row the reversal reopened (paymentReversal always
+  // writes one); a bare 'returned' original is never counted again.
+  it('a returned original is never counted; only the reopened row is owed', async () => {
     const s = await seed()
     await db.query(`UPDATE payments SET status = 'returned', return_code = 'R01' WHERE id = $1`, [s.septPaymentId])
     const out: any = await getMyBalanceBreakdown.execute({}, s.actor)
-    expect(out.totalOwed).toBe(760)
-    expect(out.openChargesOldestFirst.filter((c: any) => c.status === 'returned')).toHaveLength(1)
+    expect(out.totalOwed).toBe(460)
+    expect(out.openChargesOldestFirst.filter((c: any) => c.status === 'returned')).toHaveLength(0)
+  })
+})
+
+describe('get_my_balance_breakdown — the full balance, credit beside it (S655)', () => {
+  it('a payment still clearing is not owed; the credit is reported, not taken off', async () => {
+    const s = await seed()
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, stripe_payment_intent_id)
+       VALUES ($1,$2,$3,$4,'utility',40,'processing','2026-09-20','UTILITY','pi_clearing')`,
+      [s.unitId, s.leaseId, s.tenantId, s.landlordId])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, status)
+       VALUES ($1,$2,NULL,25,25,'goodwill','test','active')`, [s.landlordId, s.tenantId])
+    const out: any = await getMyBalanceBreakdown.execute({}, s.actor)
+    expect(out.totalOwed).toBe(460)
+    expect(out.creditAvailable).toBe(25)
+    expect(out.creditOnAccount).toBe(25)
+    expect(out.openChargesOldestFirst.map((c: any) => c.label)).toEqual(['Rent'])
   })
 })
 
@@ -92,5 +113,23 @@ describe('get_my_balance_breakdown — work trade is not owed (S637)', () => {
       [s.unitId, s.leaseId, s.tenantId, s.landlordId])
     const out: any = await getMyBalanceBreakdown.execute({}, s.actor)
     expect(out.totalOwed).toBe(460)
+  })
+})
+
+describe('get_my_balance_breakdown — the total is every open charge, however many are listed', () => {
+  it('totalOwed counts every open charge, not only the oldest ones it lists', async () => {
+    const s = await seed()
+    // October rent $460 is open already; add 45 small charges going back in time.
+    for (let i = 0; i < 45; i++) {
+      await db.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,'fee',10,'pending',DATE '2026-01-01' + $5::int,'OTHERFEE')`,
+        [s.unitId, s.leaseId, s.tenantId, s.landlordId, i])
+    }
+    const out: any = await getMyBalanceBreakdown.execute({}, s.actor)
+    expect(out.openChargesOldestFirst).toHaveLength(LISTED_CHARGES)
+    expect(out.totalOwed).toBe(910)
+    expect(out.openChargeCount).toBe(46)
+    expect(out.moreChargesNotListed).toBe(46 - LISTED_CHARGES)
   })
 })

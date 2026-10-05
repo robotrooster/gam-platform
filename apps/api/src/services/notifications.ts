@@ -8,7 +8,12 @@ import { portalLink } from '../lib/portalUrls'
 // receipts go by email or in-app only. Do not reintroduce an SMS
 // channel or provider.
 
-function emailTemplate(title: string, body: string, cta?: { label: string; url: string }) {
+/**
+ * The notification email shell. `title` and `body` go into the HTML as they
+ * are (callers pass markup), so a caller putting in anything a person typed —
+ * a name, a guest name from the public booking form — escapes it first.
+ */
+export function emailTemplate(title: string, body: string, cta?: { label: string; url: string }) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
     body{font-family:system-ui,sans-serif;background:#060809;color:#b8c4d8;margin:0;padding:20px}
     .c{max-width:560px;margin:0 auto;background:#0a0d10;border:1px solid #1e2530;border-radius:12px;overflow:hidden}

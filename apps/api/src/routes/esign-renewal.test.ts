@@ -49,6 +49,7 @@ import { invoiceEndedLeaseBills } from '../services/utilityBilling'
 import { voidDocument } from '../lib/voidDocument'
 import { getLandlordRenewalTendency } from '../services/landlordRenewalTendency'
 import { holdOverUntilNewLeaseStarts, closePredecessorOfStartedRenewals } from '../services/renewalSuccessor'
+import { householdQuote } from '../services/creditUse'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -777,7 +778,12 @@ describe('the hand-off: the old lease is in force through its last day, and its 
     expect((await db.query(`SELECT 1 FROM deposit_returns WHERE lease_id=$1`, [f.oldLeaseId])).rows).toHaveLength(0)
   })
 
-  it('the moved read lands on the renewal\'s first bill, and the $10 credit keeps reducing it', async () => {
+  // The moved read and a landlord credit that moved with it, on the renewal's
+  // first bill. THE WHOLE-BILL RULE (decisions.md, "Credits" line under "Decided
+  // from Nic's stated direction", and #35.3): credit pays a bill by itself
+  // only when it covers the WHOLE bill; otherwise it is saved and the tenant
+  // chooses at payment ("Use all $X" / "Save it for later").
+  async function movedReadAndCredit(creditAmount: number) {
     const today = await dbToday()
     const f = await fixture({ oldEnd: plusDays(today, -1) })
     const renewalId = await renewalOf(f, today)
@@ -790,7 +796,7 @@ describe('the hand-off: the old lease is in force through its last day, and its 
     } finally { c.release() }
     await db.query(
       `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
-       VALUES ($1,$2,$3,10,10,'goodwill')`, [f.landlordId, f.tenantId, f.oldLeaseId])
+       VALUES ($1,$2,$3,$4,$4,'goodwill')`, [f.landlordId, f.tenantId, f.oldLeaseId, creditAmount])
     await oldLeaseBilled(f)
     await processLeaseEnds()
     expect(await statusOf(renewalId)).toBe('active')
@@ -802,12 +808,38 @@ describe('the hand-off: the old lease is in force through its last day, and its 
       `SELECT p.type, p.amount::float AS amount, p.status FROM payments p
          JOIN invoices i ON i.id = p.invoice_id
         WHERE i.lease_id = $1 ORDER BY p.type`, [renewalId])
-    expect(lines.rows).toEqual([
+    const credit = await db.query<{ lease_id: string; r: number }>(
+      `SELECT lease_id, amount_remaining::float AS r FROM tenant_credits`)
+    return { f, renewalId, lines: lines.rows, credit: credit.rows }
+  }
+
+  it('the moved read lands on the renewal\'s first bill; a $10 credit that does not cover the whole bill is saved for the tenant to use at payment', async () => {
+    const { f, renewalId, lines, credit } = await movedReadAndCredit(10)
+    // $1,060 bill, $10 credit: nothing is paid from the credit on its own.
+    expect(lines).toEqual([
       { type: 'rent', amount: 1050, status: 'pending' },
+      { type: 'utility', amount: 10, status: 'pending' },
+    ])
+    // The credit moved to the renewal, untouched...
+    expect(credit).toEqual([{ lease_id: renewalId, r: 10 }])
+    // ...and is offered on the renewal's bill when the tenant pays.
+    const c = await db.connect()
+    try {
+      const q = await householdQuote(c, { tenantId: f.tenantId, landlordId: f.landlordId })
+      const lq = q.leases.find(l => l.leaseId === renewalId)!
+      expect(lq.requiredTotal).toBe(1060)
+      expect(lq.usableCredit).toBe(10)
+      expect(lq.coversWholeBill).toBe(false)
+    } finally { c.release() }
+  })
+
+  it('a moved credit that covers the renewal\'s whole first bill pays it, the moved read included', async () => {
+    const { lines, credit } = await movedReadAndCredit(1060)
+    expect(lines).toEqual([
+      { type: 'rent', amount: 1050, status: 'settled' },
       { type: 'utility', amount: 10, status: 'settled' },
     ])
-    const credit = await db.query<{ r: number }>(`SELECT amount_remaining::float AS r FROM tenant_credits`)
-    expect(credit.rows[0].r).toBe(0)
+    expect(credit.map(r => r.r)).toEqual([0])
   })
 
   it('a bill held on the old lease\'s last day: the hand-off waits, the old lease bills it, then hands off', async () => {

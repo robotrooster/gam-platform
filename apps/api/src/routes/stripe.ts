@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import type Stripe from 'stripe'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
@@ -12,6 +13,16 @@ import {
 } from '../services/stripeConnect'
 import { assertLiveLandlordMember } from '../services/landlordMembership'
 import { microdepositInstruction, type MicrodepositType } from '@gam/shared'
+import {
+  loadTenantPaymentMethods,
+  removeTenantPaymentMethod,
+  setTenantDefaultPaymentMethod,
+  recordVerifiedTenantBank,
+  recordWaitingTenantBank,
+  bankSetupState,
+  listWaitingBankSetups,
+  BANK_CHECK_RECEIVED,
+} from '../services/tenantBankMethods'
 import { logger } from '../lib/logger'
 
 export const stripeRouter = Router()
@@ -157,9 +168,10 @@ stripeRouter.get('/connect/status', async (req: any, res, next) => {
 
 // POST /api/stripe/tenant/setup — tenant starts payment-method setup.
 // Body: { method?: 'ach' | 'card' }. Default 'ach' (back-compat).
-//   - 'ach':  SetupIntent w/ Financial Connections (instant verification);
-//             frontend must POST /tenant/confirm-setup on success so we can
-//             stamp ach_verified + bank_last4 server-side.
+//   - 'ach':  SetupIntent with MICRODEPOSIT verification (S570/S605 — never
+//             Financial Connections instant); the frontend must POST
+//             /tenant/confirm-setup afterwards so the server records the bank
+//             (verifying, or verified) beside any bank already on file (S655).
 //   - 'card': SetupIntent w/ payment_method_types:['card']; Stripe attaches
 //             the resulting payment_method to the customer automatically
 //             on confirmSetup success — no /confirm-setup roundtrip
@@ -311,8 +323,7 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
     // 1–3 days until the deposits are confirmed, then setup_intent.succeeded
     // (webhooks.ts) flips ach_verified. Only mark verified here if it already
     // succeeded (e.g. a card, or an already-verified reuse).
-    const si = await stripe.setupIntents.retrieve(setupIntentId)
-    const verified = si.status === 'succeeded'
+    let si: Stripe.SetupIntent = await stripe.setupIntents.retrieve(setupIntentId)
 
     // S406 fix #2: pre-fix took paymentMethodId from request body without
     // verifying ownership. A tenant could supply another tenant's PM id
@@ -325,7 +336,7 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
     )
     if (!tenant) throw new AppError(404, 'Tenant not found')
     if (!tenant.stripe_customer_id) {
-      throw new AppError(409, 'Stripe customer not initialized — call /tenant/setup first')
+      throw new AppError(409, 'We could not find the account you were adding. Start again on the Payments page.')
     }
     // S605 (Nic hit this live — "payment method does not belong to this tenant"
     // on a perfectly good bank account): this USED to be
@@ -351,19 +362,88 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
     if (siCustomerId !== tenant.stripe_customer_id || siPmId !== paymentMethodId) {
       throw new AppError(403, 'Payment method does not belong to this tenant')
     }
+    // This step records a BANK ACCOUNT, and nothing else. A card is saved
+    // through /tenant/confirm-card; recording a card — or any other kind of
+    // payment method Stripe holds — here would mark the tenant as having a
+    // verified bank with no bank behind it (the same mistake S571 closed in the
+    // webhook). The service checks the same thing again under the lock.
+    if (pm.type !== 'us_bank_account') {
+      throw new AppError(400, pm.type === 'card'
+        ? 'This step is for bank accounts. A card is saved on its own when you add it.'
+        : 'This step is for bank accounts. Add your bank account on the Payments page.')
+    }
     const bank = pm.us_bank_account
 
-    // Stamp the bank metadata regardless (available on the PM once attached),
-    // but only flip ach_verified when the SetupIntent actually succeeded.
-    await query(
-      // S641: a fresh attempt resets the nudge counter, so somebody who
-      // abandons one setup and starts another is chased about the NEW one
-      // rather than being silently out of reminders.
-      `UPDATE tenants SET ach_verified = $1, bank_last4 = $2, bank_routing_last4 = $3,
-              bank_verify_nudge_count = 0, bank_verify_nudge_at = NULL
-        WHERE id = $4`,
-      [verified, bank?.last4 || null, bank?.routing_number?.slice(-4) || null, req.user!.profileId]
-    )
+    // ── S655 (Nic, item L): KEEP THE OLD BANK ─────────────────────────────
+    //
+    // "Adding never removes; new verified bank becomes default; old stays
+    // until the tenant deletes it." This used to detach every other bank and
+    // write ach_verified = FALSE while the new one waited 1–3 days on its
+    // deposits, so a tenant switching banks the week rent was due lost the
+    // only account that could pay it, and autopay had nothing to charge.
+    //
+    // Now nothing is detached here (the tenant removes a bank themselves:
+    // DELETE /tenant/payment-methods/:id). A bank waiting on microdeposits only
+    // sets bank_pending_since; ach_verified keeps meaning "has a verified
+    // bank", and bank_last4 keeps naming the verified bank on file — it takes
+    // the new one only when there is no verified bank yet. A bank verified
+    // already (or later, setup_intent.succeeded) goes through
+    // recordVerifiedTenantBank, which makes it the default.
+    //
+    // A succeeded SetupIntent leaves its bank ATTACHED to the customer. One
+    // that is not (pm.customer is empty) was removed by the tenant — replaying
+    // its old, succeeded SetupIntent must not mark them bank-verified with no
+    // bank on file (ach_verified gates FlexPay and FlexDeposit). The service
+    // checks the same thing again under the tenant's bank lock, which also
+    // covers a removal that lands between this read and the write.
+    //
+    // Only a setup Stripe is really waiting on is recorded as "a bank waiting
+    // on deposits" (services/tenantBankMethods.bankSetupState). A bank the
+    // tenant removed while it was still verifying has a CANCELED setup;
+    // replaying it here used to answer "We sent a small verification
+    // deposit…", restart the reminders and, with no verified bank, put the
+    // removed bank's last 4 on file. A setup whose bank failed
+    // (requires_payment_method) is not waiting on anything either.
+    const removed = new AppError(409,
+      'That bank was removed from your account, so it can no longer be used. ' +
+      'To use it again, add it as a new bank on the Payments page.')
+    const notSetUp = new AppError(409, 'That bank could not be set up. Add it again on the Payments page.')
+    const firstState = bankSetupState(si)
+    if (firstState === 'removed') throw removed
+    if (firstState === 'not_set_up') throw notSetUp
+    let state = firstState
+    if (state === 'waiting') {
+      // Read again and written under the tenant's bank lock (a removal takes it
+      // too and cancels the setup before it commits).
+      const waiting = await recordWaitingTenantBank({
+        tenantId: req.user!.profileId,
+        setupIntentId,
+        paymentMethodId,
+        bank,
+      })
+      if (waiting.state === 'removed') throw removed
+      if (waiting.state === 'not_set_up') throw notSetUp
+      if (waiting.setupIntent) si = waiting.setupIntent
+      // 'verified' when the deposits were confirmed in between.
+      state = waiting.state
+    }
+    const verified = state === 'verified'
+    if (verified) {
+      // The payment method read above is current only when the setup had
+      // already succeeded then; one verified in between was read unattached,
+      // so its owner is left to the service's own check under the lock.
+      const pmCustomer = typeof pm.customer === 'string' ? pm.customer : pm.customer?.id ?? null
+      if (firstState === 'verified' && pmCustomer !== tenant.stripe_customer_id) throw removed
+      const recorded = await recordVerifiedTenantBank({
+        tenantId: req.user!.profileId,
+        customerId: tenant.stripe_customer_id,
+        paymentMethodId,
+        bank,
+        makeDefault: 'always',
+        note: 'New bank account added — first-time sender tracking initiated',
+      })
+      if (recorded.refused) throw removed
+    }
 
     // ── S641: TELL THEM THE DEPOSIT IS COMING, NOW ──────────────────────────
     //
@@ -410,39 +490,32 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
 
     // S571: email 2FA is mandatory for every tenant from signup (enforced at
     // login), so no payment-method-triggered flip is needed here.
-
-    // S571: exactly ONE bank on file — a new bank supersedes the old one (swap
-    // within type; card is untouched). And ACH becomes the DEFAULT method (Nic:
-    // ACH defaults when set up; the tenant can later switch to card).
     //
-    // S654: the default is set here ONLY when the SetupIntent already
-    // succeeded. A microdeposit bank stays unattached until its code is
-    // confirmed, and Stripe refuses it as a default ("The customer does not
-    // have a payment method with the ID ..."), so every new bank logged an
-    // error here. The setup_intent.succeeded webhook promotes it once verified.
-    try {
-      const banks = await stripe.paymentMethods.list({ customer: tenant.stripe_customer_id!, type: 'us_bank_account', limit: 20 })
-      for (const opm of banks.data) {
-        if (opm.id !== paymentMethodId) await stripe.paymentMethods.detach(opm.id)
-      }
-      if (verified) {
-        await stripe.customers.update(tenant.stripe_customer_id!, {
-          invoice_settings: { default_payment_method: paymentMethodId },
-        })
-      }
-    } catch (e) {
-      logger.error({ err: e }, '[stripe] one-bank swap / default set failed')
+    // S654: a bank still waiting on its deposits is never made the default
+    // here — it stays unattached until its code is confirmed and Stripe
+    // refuses it ("The customer does not have a payment method with the ID
+    // ..."). The verified path above (recordVerifiedTenantBank) sets the
+    // default and logs the NACHA first-time sender once per bank.
+    if (verified) {
+      return res.json({ success: true, verified: true, message: 'Bank account verified. ACH collections active.' })
     }
 
-    if (verified) {
-      // Log first-sender detection for NACHA monitoring (only once verified;
-      // the microdeposit path logs this from the setup_intent.succeeded webhook).
-      await query(`
-        INSERT INTO ach_monitoring_log (event_type, tenant_id, bank_fingerprint, notes)
-        VALUES ('first_sender', $1, $2, 'New bank account added — first-time sender tracking initiated')`,
-        [req.user!.profileId, `${bank?.routing_number}_${bank?.last4}`]
-      )
-      return res.json({ success: true, verified: true, message: 'Bank account verified. ACH collections active.' })
+    // Stripe is checking deposits the tenant already entered (a confirm-setup
+    // replayed after they verified, or a reload): there is no deposit coming
+    // and no form to fill in — GET /tenant/microdeposits asks for nothing — so
+    // say it was received and is being checked, never "we sent a deposit".
+    if (si.status === 'processing') {
+      return res.json({
+        success: true,
+        verified: false,
+        status: si.status,
+        verificationStep: 'checking',
+        bankName: bank?.bank_name ?? null,
+        bankLast4: bank?.last4 ?? null,
+        microdepositType: null,
+        arrivalDate: null,
+        message: BANK_CHECK_RECEIVED,
+      })
     }
 
     const mdType = ((si.next_action as any)?.verify_with_microdeposits?.microdeposit_type
@@ -457,6 +530,7 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
       success: true,
       verified: false,
       status: si.status,
+      verificationStep: 'deposits',
       bankName: bank?.bank_name ?? null,
       bankLast4: bank?.last4 ?? null,
       // S605 (Nic): Stripe picks 'amounts' vs 'descriptor_code' per bank, so the
@@ -470,108 +544,50 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
   } catch (e) { next(e) }
 })
 
-// GET /api/stripe/tenant/payment-methods — list saved payment methods on
-// the calling tenant's Stripe customer. Used by the Pay Now picker on the
-// tenant /payments page (S169). Returns ACH (us_bank_account) entries
-// today; `card` slots are included for the follow-on card path so the
-// UI shape is stable.
+// GET /api/stripe/tenant/payment-methods — the calling tenant's saved
+// payment methods (S169), each with ITS OWN state (S655, item L):
+//   verified   Stripe confirmed the account (microdeposits done)
+//   verifying  waiting on that step — never pre-select or charge it
+//   verificationStep  'deposits' (Stripe waits on the tenant to confirm the
+//              microdeposits) or 'checking' (Stripe is checking what they
+//              entered — nothing left for them to do); null once verified
+//   chargeable verified, and bank payments are not suspended for this tenant
+//   isDefault, autopayPinned
+//   canRemove / removeBlockedReason — the same sentence the DELETE would refuse
+//     with, so the screen can say it before the tap.
+// Before S655 every bank's `verified` was the tenant-level flag, which was
+// fine for one bank per tenant and wrong the moment the old bank is kept.
+//
+// S637 still holds: a bank mid-verification is not attached to the customer in
+// the descriptor-code flow, so it is read off its waiting SetupIntent and
+// listed as verifying (services/tenantBankMethods.readStripeMethodFacts).
 stripeRouter.get('/tenant/payment-methods', async (req: any, res, next) => {
   try {
     if (req.user!.role !== 'tenant') {
       throw new AppError(403, 'Tenants only')
     }
-    const tenant = await queryOne<{ stripe_customer_id: string | null; ach_verified: boolean }>(
-      `SELECT stripe_customer_id, ach_verified FROM tenants WHERE id = $1`,
-      [req.user!.profileId]
-    )
-    if (!tenant) throw new AppError(404, 'Tenant not found')
-    if (!tenant.stripe_customer_id) {
-      return res.json({ success: true, data: [] })
-    }
-    const stripe = getStripe()
-    const [achList, cardList, customer, setupIntents] = await Promise.all([
-      stripe.paymentMethods.list({
-        customer: tenant.stripe_customer_id,
-        type: 'us_bank_account',
-        limit: 20,
-      }),
-      stripe.paymentMethods.list({
-        customer: tenant.stripe_customer_id,
-        type: 'card',
-        limit: 20,
-      }),
-      stripe.customers.retrieve(tenant.stripe_customer_id),
-      // ── S637: A BANK MID-VERIFICATION IS NOT ATTACHED YET ──────────────
-      //
-      // Randall Cox set up ACH, believed he had paid, and his saved-methods
-      // list showed only a card — no sign the bank existed. paymentMethods
-      // .list returns ATTACHED methods, and in the descriptor-code microdeposit
-      // flow Stripe does not attach the bank until the code is confirmed. So
-      // the bank was invisible here, `hasPendingBank` was always false, and the
-      // "Your bank is still verifying" banner — the one line that tells a
-      // tenant they have NOT paid yet — could never fire on the commonest ACH
-      // path. The comment below this call asserted the opposite ("attached but
-      // NOT yet verified"); that is true of the amounts flow, not this one.
-      stripe.setupIntents.list({
-        customer: tenant.stripe_customer_id,
-        limit: 20,
-        expand: ['data.payment_method'],
-      }),
-    ])
-    // S571: which method is the tenant's default (ACH by default; overridable).
-    const defaultPmId = (customer && !('deleted' in customer && customer.deleted))
-      ? ((customer as any).invoice_settings?.default_payment_method as string | null) ?? null
-      : null
-    // S570: `verified` gates whether a bank can actually be charged. With
-    // microdeposit verification a just-linked bank is attached but NOT yet
-    // verified — Stripe rejects a charge against it until the tenant confirms
-    // the two deposits (setup_intent.succeeded webhook flips ach_verified).
-    // Launch reality is one bank per tenant, so the tenant-level flag is the
-    // per-method signal; a multi-bank tenant is a post-launch refinement.
-    const ach = achList.data.map((pm) => ({
-      id:        pm.id,
-      type:      'ach' as const,
-      bankName:  pm.us_bank_account?.bank_name ?? null,
-      last4:     pm.us_bank_account?.last4 ?? null,
-      verified:  !!tenant.ach_verified,
-      isDefault: pm.id === defaultPmId,
-    }))
-    // The same bank, still waiting on its code. Emitted as an unverified ach
-    // method so every existing consumer treats it correctly without changing:
-    // payShared already refuses to pre-select or charge `verified === false`,
-    // and the banner keys off exactly that.
-    const attachedBankIds = new Set(achList.data.map((pm) => pm.id))
-    const pendingAch = setupIntents.data
-      .filter((si) =>
-        si.status === 'requires_action' &&
-        (si.next_action as any)?.type === 'verify_with_microdeposits' &&
-        si.payment_method && typeof si.payment_method !== 'string' &&
-        (si.payment_method as any).type === 'us_bank_account' &&
-        !attachedBankIds.has((si.payment_method as any).id))
-      .map((si) => {
-        const pm = si.payment_method as any
-        return {
-          id:        pm.id,
-          type:      'ach' as const,
-          bankName:  pm.us_bank_account?.bank_name ?? null,
-          last4:     pm.us_bank_account?.last4 ?? null,
-          verified:  false,
-          isDefault: false,
-        }
-      })
+    const state = await loadTenantPaymentMethods(req.user!.profileId)
+    if (!state) throw new AppError(404, 'Tenant not found')
+    res.json({ success: true, data: state.methods })
+  } catch (e) { next(e) }
+})
 
-    const card = cardList.data.map((pm) => ({
-      id:        pm.id,
-      type:      'card' as const,
-      brand:     pm.card?.brand ?? null,
-      last4:     pm.card?.last4 ?? null,
-      expMonth:  pm.card?.exp_month ?? null,
-      expYear:   pm.card?.exp_year ?? null,
-      country:   pm.card?.country ?? null,
-      verified:  true,   // cards are chargeable immediately
-      isDefault: pm.id === defaultPmId,
-    }))
-    res.json({ success: true, data: [...ach, ...pendingAch, ...card] })
+// DELETE /api/stripe/tenant/payment-methods/:id — the tenant removes one of
+// their own saved methods (S655, item L). Nic: "old stays until the tenant
+// deletes it; delete blocked while it is their only verified bank, EXCEPT when
+// nothing is owed and autopay is off (moved out); cards not affected."
+// A verified bank is also kept, even beside another verified one, while a
+// payment made from it is still clearing or set to be tried again — the retry
+// runs on that same bank (services/tenantBankMethods.pullBlockFor).
+// Refusals are 409 with the reason and the next step; the id is matched only
+// against the caller's own Stripe customer, so a guessed id is a 404 and never
+// reaches Stripe. Returns the saved methods as they are after the removal.
+stripeRouter.delete('/tenant/payment-methods/:id', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenants only')
+    const { id } = z.object({ id: z.string().trim().min(1).max(255) }).parse(req.params)
+    const result = await removeTenantPaymentMethod(req.user!.profileId, id)
+    res.json({ success: true, data: result })
   } catch (e) { next(e) }
 })
 
@@ -585,7 +601,9 @@ stripeRouter.post('/tenant/confirm-card', async (req: any, res, next) => {
     const { paymentMethodId } = z.object({ paymentMethodId: z.string() }).parse(req.body)
     const tenant = await queryOne<{ stripe_customer_id: string | null }>(
       `SELECT stripe_customer_id FROM tenants WHERE id = $1`, [req.user!.profileId])
-    if (!tenant?.stripe_customer_id) throw new AppError(409, 'Stripe customer not initialized')
+    if (!tenant?.stripe_customer_id) {
+      throw new AppError(409, 'We could not find the card you were adding. Add it again on the Payments page.')
+    }
 
     const stripe = getStripe()
     const pm = await stripe.paymentMethods.retrieve(paymentMethodId)
@@ -612,33 +630,19 @@ stripeRouter.post('/tenant/confirm-card', async (req: any, res, next) => {
 
 // PATCH /api/stripe/tenant/default-payment-method — tenant chooses which saved
 // method is the default (e.g. switch from ACH to card, accepting card fees).
+// S655: decided on each bank's own state, under the tenant's bank lock
+// (services/tenantBankMethods.setTenantDefaultPaymentMethod). The old check was
+// "attached to this customer", which let a bank still verifying become the
+// default whenever it was already attached, and autopay then charged a bank
+// that could not be charged yet. A card or a verified bank can be chosen; a
+// bank still verifying gets 409 with the next step; a method not on the
+// tenant's own customer is 403 and never reaches Stripe.
 stripeRouter.patch('/tenant/default-payment-method', async (req: any, res, next) => {
   try {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenants only')
-    const { paymentMethodId } = z.object({ paymentMethodId: z.string() }).parse(req.body)
-    const tenant = await queryOne<{ stripe_customer_id: string | null }>(
-      `SELECT stripe_customer_id FROM tenants WHERE id = $1`, [req.user!.profileId])
-    if (!tenant?.stripe_customer_id) throw new AppError(409, 'Stripe customer not initialized')
-
-    const stripe = getStripe()
-    const pm = await stripe.paymentMethods.retrieve(paymentMethodId)
-    // Unlike the confirm-setup check above, `pm.customer` is right here: a
-    // payment method can only be made the default once it is ATTACHED. But an
-    // unattached bank is the ordinary mid-microdeposit state, not a stranger's
-    // card, so say which one it is instead of implying the tenant is using
-    // someone else's account.
-    if (!pm.customer) {
-      throw new AppError(409,
-        'That bank account isn’t verified yet. Finish the verification Stripe sent you first, ' +
-        'then you can make it your default.')
-    }
-    if (pm.customer !== tenant.stripe_customer_id) {
-      throw new AppError(403, 'Payment method does not belong to this tenant')
-    }
-    await stripe.customers.update(tenant.stripe_customer_id, {
-      invoice_settings: { default_payment_method: paymentMethodId },
-    })
-    res.json({ success: true, data: { defaultPaymentMethodId: paymentMethodId } })
+    const { paymentMethodId } = z.object({ paymentMethodId: z.string().trim().min(1).max(255) }).parse(req.body)
+    const data = await setTenantDefaultPaymentMethod(req.user!.profileId, paymentMethodId)
+    res.json({ success: true, data })
   } catch (e) { next(e) }
 })
 
@@ -667,13 +671,16 @@ stripeRouter.patch('/tenant/default-payment-method', async (req: any, res, next)
 // Both are supported; the GET tells the UI which one to ask for.
 // ══════════════════════════════════════════════════════════════
 
-/** The tenant's most recent bank SetupIntent still awaiting microdeposits. */
+/**
+ * The tenant's most recent bank setup still waiting on THEM to confirm the
+ * microdeposits. Read from the same list the saved-methods screen, the agent
+ * and the nudge use (services/tenantBankMethods.listWaitingBankSetups), so the
+ * verify form shows exactly when the screen says a bank is waiting on its
+ * deposits. A bank whose deposits Stripe is already checking asks for nothing.
+ */
 async function pendingMicrodepositIntent(customerId: string) {
-  const stripe = getStripe()
-  const list = await stripe.setupIntents.list({ customer: customerId, limit: 10 })
-  return list.data.find(si =>
-    si.status === 'requires_action' &&
-    (si.next_action as any)?.type === 'verify_with_microdeposits') ?? null
+  const waiting = await listWaitingBankSetups(getStripe(), customerId)
+  return waiting.find((w) => w.awaitingTenant) ?? null
 }
 
 // GET /api/stripe/tenant/microdeposits — is a verification waiting, and what
@@ -688,12 +695,11 @@ stripeRouter.get('/tenant/microdeposits', async (req, res, next) => {
     const si = await pendingMicrodepositIntent(tenant.stripe_customer_id)
     if (!si) return res.json({ success: true, data: { pending: false } })
 
-    const na = (si.next_action as any)?.verify_with_microdeposits ?? {}
     res.json({
       success: true,
       data: {
         pending: true,
-        setupIntentId: si.id,
+        setupIntentId: si.setupIntentId,
         // 'amounts' | 'descriptor_code' — drives which field the UI shows.
         //
         // S605 (Nic): this used to fall back to 'amounts' when Stripe didn't say.
@@ -701,8 +707,8 @@ stripeRouter.get('/tenant/microdeposits', async (req, res, next) => {
         // would be shown two amount boxes for a deposit that has no amounts to
         // read, with no way to enter what they actually received. NULL means
         // "unknown", and the UI offers BOTH inputs rather than picking wrong.
-        microdepositType: na.microdeposit_type ?? null,
-        arrivalDate: na.arrival_date ?? null,
+        microdepositType: si.microdeposits?.type ?? null,
+        arrivalDate: si.microdeposits?.arrivalDate ?? null,
       },
     })
   } catch (e) { next(e) }
@@ -738,9 +744,10 @@ stripeRouter.post('/tenant/microdeposits/verify', async (req, res, next) => {
     if (!si) throw new AppError(409, 'No bank verification is waiting on your account')
 
     const stripe = getStripe()
+    let after: { status?: string } | null = null
     try {
-      await stripe.setupIntents.verifyMicrodeposits(
-        si.id,
+      after = await stripe.setupIntents.verifyMicrodeposits(
+        si.setupIntentId,
         body.amounts ? { amounts: body.amounts } : { descriptor_code: body.descriptorCode! },
       )
     } catch (err: any) {
@@ -755,6 +762,24 @@ stripeRouter.post('/tenant/microdeposits/verify', async (req, res, next) => {
     // Do NOT flip ach_verified here. setup_intent.succeeded is the single place
     // that happens (webhooks.ts), so the microdeposit path and every other path
     // agree, and a Stripe-side confirmation still lands correctly.
-    res.json({ success: true, data: { verified: true } })
+    //
+    // S655: say what Stripe says. Accepted entries can leave the setup
+    // 'processing' while Stripe checks them — that bank is not verified yet,
+    // and there is nothing more for the tenant to do (the saved-methods list
+    // calls it 'checking'). It used to answer verified: true either way.
+    const verified = after?.status === 'succeeded'
+    const checking = after?.status === 'processing'
+    res.json({
+      success: true,
+      data: {
+        verified,
+        verificationStep: checking ? 'checking' : null,
+        message: verified
+          ? 'Bank account verified.'
+          : checking
+            ? BANK_CHECK_RECEIVED
+            : 'We received what you entered. Your saved payment methods below show where this bank stands.',
+      },
+    })
   } catch (e) { next(e) }
 })

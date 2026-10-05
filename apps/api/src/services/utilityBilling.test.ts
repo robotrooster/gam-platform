@@ -2214,6 +2214,32 @@ describe('suspended utility charges for units mid-onboarding', () => {
     expect(bills.rows).toHaveLength(0)
   })
 
+  // 10/3 (final sweep, fifth pass): the expiry reads the same "is the window
+  // open" rule a share is held by — marking onboarding complete closes it too.
+  it('expires unclaimed holds when onboarding is marked complete, whatever the days left', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(await expireHeldChargesAfterOnboarding()).toEqual({ closed: 0, amount: 0 })
+
+    // Started minutes ago — days left in the window — but marked complete.
+    await db.query(`UPDATE properties SET onboarding_completed_at = now() WHERE id = $1`, [base.propertyId])
+    expect(await expireHeldChargesAfterOnboarding()).toEqual({ closed: 1, amount: 50 })
+    const held = await db.query<any>(
+      `SELECT cancelled_at, cancelled_reason FROM suspended_utility_charges WHERE unit_id=$1`, [invited.unitId])
+    expect(held.rows).toHaveLength(1)
+    expect(held.rows[0].cancelled_at).not.toBeNull()
+    expect(held.rows[0].cancelled_reason).toMatch(/settled off-platform/)
+    // Idempotent: a second night closes nothing more.
+    expect(await expireHeldChargesAfterOnboarding()).toEqual({ closed: 0, amount: 0 })
+  })
+
   it('releases the held share onto the lease when it is signed', async () => {
     const base = await seedBaseProperty()
     const meterId = await rubsMeter(base)

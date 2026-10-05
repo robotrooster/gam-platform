@@ -371,3 +371,135 @@ describe('S654: resolveIntent and existing accounts', () => {
     expect(emailTenantOnboardedMock.mock.calls[0]![0]).toBe(email)
   })
 })
+
+// Final sweep (10/3): a paper import for another company's resident said
+// "It's drafted… and waiting for your signature in Front Desk" even when
+// nothing had drafted. It now reads like POST /me/onboard-tenant's message for
+// the same person: the reason once, the step after it, and who was reached.
+describe("final sweep: another company's resident — what the landlord is told", () => {
+  beforeEach(async () => {
+    await cleanupAllSchema()
+    emailTenantOnboardedMock.mockClear()
+  })
+
+  async function company() {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId, withLateFeeDecision: true })
+      await c.query('COMMIT')
+      const unitNumber = (await db.query(`SELECT unit_number FROM units WHERE id=$1`, [unitId])).rows[0].unit_number
+      return { userId, landlordId, propertyId, unitId, propertyName: 'Test Property', unitNumber }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+  type Company = Awaited<ReturnType<typeof company>>
+
+  /** A resident with their own password, living at `home` (another company). */
+  async function residentAt(home: Company) {
+    const email = `resident-${randomUUID().slice(0, 6)}@test.dev`
+    const u = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ($1, '$2b$10$their.own.real.password.hash', 'tenant', 'Vic', 'Tim') RETURNING id`, [email])).rows[0]
+    const t = (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.id])).rows[0]
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const leaseId = await seedLease(c, { unitId: home.unitId, landlordId: home.landlordId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId, tenantId: t.id, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    return { userId: u.id, tenantId: t.id, email }
+  }
+
+  const intentFor = async (b: Company, tenantId: string, draftDocumentId: string | null = null) => (await db.query<{ id: string }>(
+    `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, draft_document_id)
+     VALUES ($1, $2, 'error', $3) RETURNING id`, [b.landlordId, tenantId, draftDocumentId])).rows[0].id
+
+  const overridesFor = (b: Company, email: string): any => ({
+    tenants: [{ firstName: { value: ' Vic ' }, lastName: { value: 'Tim' }, email: { value: email } }],
+    unit: { propertyName: { value: b.propertyName }, unitNumber: { value: b.unitNumber } },
+    lease: { leaseStart: { value: '2026-02-01' }, monthlyRent: { value: 900 } },
+  })
+
+  it('nothing drafted: says so, gives the reason once and the step after it, and who was reached', async () => {
+    const a = await company()
+    const b = await company()   // no default lease for this kind of unit
+    const r = await residentAt(a)
+
+    const res: any = await resolveIntent(await intentFor(b, r.tenantId), [b.landlordId], overridesFor(b, r.email))
+    expect(res.sentToSign).toBe(true)
+    expect(res.draftedDocumentIds).toEqual([])
+    expect(res.draftBlocked.length).toBeGreaterThan(0)
+    const msg: string = res.message
+    expect(msg).toMatch(/^Vic Tim already has a GAM account with another company/)
+    expect(msg).toMatch(/could not be drafted yet/)
+    expect(msg).not.toMatch(/waiting for your signature/)
+    expect(msg).toContain(res.draftBlocked[0])
+    expect(msg).not.toMatch(/\.\./)
+    expect(msg.match(/drafts on its own/g)).toHaveLength(1)
+    expect(msg.match(/Front Desk/g)).toHaveLength(1)
+    expect(msg).toMatch(/Once it is drafted, sign it in Front Desk\./)
+    // The usual invite went instead: a notice in the account they already use.
+    expect(res.fallbackSent).toBe(true)
+    expect(msg).toMatch(/sent a notice in their GAM account/)
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  it('drafted: waiting for the landlord\'s signature in Front Desk, from the unit\'s own setup', async () => {
+    const a = await company()
+    const b = await company()
+    await db.query(
+      `UPDATE property_unit_type_late_fees
+          SET no_late_fee = true, late_fee_grace_days = NULL, late_fee_initial_amount = NULL, late_fee_initial_type = NULL
+        WHERE property_id = $1`, [b.propertyId])
+    const tid = (await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, page_count, unit_type, deposit_months, default_term_months, is_unit_type_default)
+       VALUES ($1, 'Primary Apartment', 1, 'apartment', 1, 12, true) RETURNING id`, [b.landlordId])).rows[0].id
+    for (const col of ['rent_amount', 'security_deposit', 'start_date', 'end_date', 'lease_type']) {
+      await db.query(
+        `INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y, width, height)
+         VALUES ($1, 'text', 'landlord', $2, 1, 10, 10, 100, 20)`, [tid, col])
+    }
+    const r = await residentAt(a)
+
+    const res: any = await resolveIntent(await intentFor(b, r.tenantId), [b.landlordId], overridesFor(b, r.email))
+    expect(res.sentToSign).toBe(true)
+    expect(res.draftedDocumentIds).toHaveLength(1)
+    expect(res.fallbackSent).toBe(false)
+    expect(res.message).toMatch(/is waiting for your signature in Front Desk/)
+    expect(res.message).toMatch(/not the paper's terms/)
+    expect(res.message).not.toMatch(/could not be drafted/)
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  it('pressing Build again after the landlord signed says it waits on THEIR signature, not his', async () => {
+    const a = await company()
+    const b = await company()
+    const r = await residentAt(a)
+    const doc = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status)
+       VALUES ($1, $2, 'A lease', 'original_lease', 'in_progress') RETURNING id`, [b.landlordId, b.unitId])).rows[0].id
+    await db.query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
+       VALUES ($1, $2, 'landlord', 'L L', 'll@test.dev', 1, $3, 'signed'),
+              ($1, $4, 'primary', 'Vic Tim', $5, 2, $6, 'sent')`,
+      [doc, b.userId, randomUUID(), r.userId, r.email, randomUUID()])
+    await db.query(`UPDATE units SET rent_amount = 900 WHERE id = $1`, [b.unitId])
+
+    const res: any = await resolveIntent(await intentFor(b, r.tenantId, doc), [b.landlordId], overridesFor(b, r.email))
+    expect(res.sentToSign).toBe(true)
+    expect(res.draftedDocumentIds).toEqual([doc])
+    expect(res.fallbackSent).toBe(false)
+    expect(res.message).toMatch(/you have signed it; it is waiting on their signature/)
+    expect(res.message).not.toMatch(/waiting for your signature/)
+    // Final sweep (10/3): the sentence before is about a person, so "Its lease"
+    // had nothing to refer to. It names the lease plainly.
+    expect(res.message).toBe(
+      `Vic Tim already has a GAM account with another company, so they sign this lease themselves. ` +
+      `The lease for Unit ${b.unitNumber} is drafted and you have signed it; it is waiting on their signature, ` +
+      `and it starts when they sign. Nothing is billed before then.`)
+    expect(res.message).not.toMatch(/\bIts\b/)
+  })
+})

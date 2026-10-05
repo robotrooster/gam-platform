@@ -10,6 +10,14 @@ You can change how you pay rent in GAM at any time. The methods you can save and
 2. Add a new payment method — a bank account or a card.
 3. When you make your next payment, simply pick the new method — you choose which saved method to pay with each time.
 
+## Adding a new bank keeps the old one
+
+Adding a bank account never removes the one you already have. A new bank has to be verified first (a small deposit from us, and a code or two amounts you enter), and while it waits, your verified bank keeps working — so autopay and Pay now still go through. Once the new one is verified, it becomes your default.
+
+Your old bank stays until you remove it yourself. You can't remove your only verified bank while you owe money or have autopay on — you would have no way to pay. The same goes while you're on FlexPay or a FlexPay payment is still owed. Once none of that applies (for example, after you move out), you can remove it.
+
+A bank can't be removed while a payment from it is still clearing (about 4 business days) or is set to be tried again from it — even if another bank is verified. Once that payment has cleared, you can remove it. Cards are not affected by any of this.
+
 ## Choosing between bank account and card
 
 A processing fee may apply based on how you pay, and your payment screen shows it before you confirm:

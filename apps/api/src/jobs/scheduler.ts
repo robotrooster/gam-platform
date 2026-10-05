@@ -20,7 +20,7 @@ import { registerRefreshCron, refreshTimezoneCrons, summary as tzCronSummary } f
 import { expireStaleInvitations as expireStalePmPropertyInvitations } from '../services/pm'
 import { getPropertyResponsibleParty } from '../services/responsibleParty'
 import { logger } from '../lib/logger'
-import { reconcileStuckPayments } from './paymentReconcile'
+import { reconcileStuckPayments, releaseUnconfirmedCardCharges } from './paymentReconcile'
 import { getStripe } from '../lib/stripe'
 import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 
@@ -211,6 +211,14 @@ export async function activatePendingLeases() {
  * OPEN rows move — what is settled stays on the old lease as its history —
  * and they move, never get recreated, so a paid-ahead row keeps whose money
  * it is (S654: GAM-held vs landlord-recorded). One transaction: all or none.
+ *
+ * S655: under the household lock (every writer of the household's money takes
+ * it), and a credit moves when anything of it is still the household's to
+ * use: money left on it, OR money a payment still in flight has set aside. A
+ * credit fully held by a bank payment that is clearing reads $0 left, so it
+ * used to stay behind; when that payment then failed, the credit came back on
+ * the expired lease, where no bill would ever reach it. A withdrawn paid-ahead
+ * credit stays where it is (it can never be used).
  */
 export async function handOffOpenItemsToRenewal(
   oldLeaseId: string, newLeaseId: string,
@@ -218,6 +226,10 @@ export async function handOffOpenItemsToRenewal(
   const client = await getClient()
   try {
     await client.query('BEGIN')
+    const { billHouseholdTenant } = await import('../services/creditUse')
+    const { lockHousehold } = await import('../services/moneyPredicates')
+    const hh = await billHouseholdTenant(client, oldLeaseId)
+    if (hh) await lockHousehold(client, hh.tenantId, hh.landlordId)
     const moved = async (sql: string) =>
       (await client.query(sql, [oldLeaseId, newLeaseId])).rowCount ?? 0
     const counts = {
@@ -233,11 +245,17 @@ export async function handOffOpenItemsToRenewal(
             AND EXISTS (SELECT 1 FROM propane_fill_installments i
                          WHERE i.fill_id = f.id AND i.payment_id IS NULL)`),
       credits: await moved(
-        `UPDATE tenant_credits SET lease_id = $2, updated_at = NOW()
-          WHERE lease_id = $1 AND status = 'active' AND amount_remaining > 0`),
+        `UPDATE tenant_credits tc SET lease_id = $2, updated_at = NOW()
+          WHERE tc.lease_id = $1 AND tc.status = 'active'
+            AND (tc.amount_remaining > 0
+                 OR EXISTS (SELECT 1 FROM credit_uses u
+                             WHERE u.tenant_credit_id = tc.id AND u.status = 'held'))`),
       paidAhead: await moved(
-        `UPDATE lease_prepaid_credits SET lease_id = $2, updated_at = NOW()
-          WHERE lease_id = $1 AND amount_remaining > 0`),
+        `UPDATE lease_prepaid_credits c SET lease_id = $2, updated_at = NOW()
+          WHERE c.lease_id = $1 AND c.voided_at IS NULL
+            AND (c.amount_remaining > 0
+                 OR EXISTS (SELECT 1 FROM credit_uses u
+                             WHERE u.prepaid_credit_id = c.id AND u.status = 'held'))`),
       // Autopay is one row per lease, and the runner only pulls for a lease in
       // force. Left on the old lease it never ran again — every renewal bill
       // un-pulled, each one turning into a late fee. It goes with the household
@@ -380,10 +398,17 @@ export async function processLeaseEnds() {
         }
 
         await query(`UPDATE leases SET status='expired', terminated_at=NOW() WHERE id=$1`, [lease.id])
+        // Final sweep (10/3): an add-a-roommate spot nobody signed ('pending_add')
+        // never joined this lease, so it did not END with it: it is void, the
+        // way voiding its addendum leaves it (lib/leaseDocCascade.ts). Only the
+        // people who were on the lease are 'removed' / lease_ended.
+        await query(
+          `UPDATE lease_tenants SET status='void', updated_at=NOW() WHERE lease_id=$1 AND status='pending_add'`,
+          [lease.id])
         await query(`
           UPDATE lease_tenants
           SET status='removed', removed_at=NOW(), removed_reason='lease_ended', updated_at=NOW()
-          WHERE lease_id=$1 AND status IN ('active','pending_add','pending_remove')
+          WHERE lease_id=$1 AND status IN ('active','pending_remove')
         `, [lease.id])
         if (handOff) {
           logger.info(`[LeaseEnd] Expired lease ${lease.id}; unit ${lease.unit_id} hands off to successor lease ${successor.id} — no vacate, no deposit-return draft`)
@@ -1062,81 +1087,93 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
   // a deposit top-up the tenant paid early. That used to fail here on every
   // run, forever: an error in the log every 15 minutes, the deposit record left
   // on a lease that will never start (so the lease that ended had none to
-  // return), and nobody told. Now the landlord side and GAM hear ONCE, the
-  // deposit record goes back to the lease that ended, and the document is
-  // stamped (new_lease_cancel_held_at) so later runs leave it be. Nobody can
-  // sign it meanwhile (POST /esign/sign), so it still never starts. Once the
-  // payment has been returned or moved, the next run cancels it like any other.
+  // return), and nobody told. Now, once: the deposit record goes back to the
+  // lease that ended; what the new lease billed that was never owed comes off
+  // (renewalSuccessor.clearNeverOwedOnHeldNewLease — the household that left is
+  // not shown a deposit due on it, asked to pay it, or charged a late fee on
+  // it); the landlord side and GAM hear. Nobody can sign it meanwhile (GET and
+  // POST /esign/sign), so it still never starts. Once the payment has been
+  // returned or moved, the next run cancels it like any other.
+  //
+  // A PAYMENT TRIED ON ITS BILL holds it the same way (fix round 1): a bank or
+  // card payment that bounced or is to be retried, a reopened charge the bank
+  // sent back, a receipt or credit on a charge — lib/unwindIssuedLease refuses
+  // that void too (countTriedCharges), so sending it to the cancel failed
+  // every run, exactly as above. It is held instead: a bank retry that would
+  // pull money only for this bill is stopped first (a pull that also carries
+  // what the household owes elsewhere runs on), then what was never owed comes
+  // off. If nothing paid or tried is left after that, it is not held — the
+  // next run cancels it like any other, and the landlord hears "canceled",
+  // not "can't be canceled".
+  //
+  // The document is stamped (new_lease_cancel_held_at) so later runs leave it
+  // be — LAST, and only once every one of those has landed. The notice helpers
+  // never throw (a failed write is only logged), so "landed" is read back from
+  // the tables, not assumed (the in-app notice; for someone whose in-app notices
+  // are off, the email that went out, recorded on the document's audit trail so
+  // it is never sent twice): a notice that did not land leaves the document
+  // unstamped and the next run sends what is missing, to only who is missing
+  // it, instead of the lease sitting stopped with nobody told. GAM's notice
+  // carries what it said (`cleared`, `kept` in its context): when a later run
+  // has to leave charges for GAM to take off by hand that the notice did not
+  // name — its first clear-up failed, so it could only say "the next run tries
+  // again" — GAM gets one follow-up naming them before the document is stamped.
   try {
-    const { newLeasesAfterEarlyEnd, returnDepositToEndedLease, sayMoney } = await import('../services/renewalSuccessor')
+    const {
+      newLeasesAfterEarlyEnd, clearNeverOwedOnHeldNewLease, sayMoney, sayKeptCharges,
+    } = await import('../services/renewalSuccessor')
     const { voidDocument } = await import('../lib/voidDocument')
-    const endedEarly = await newLeasesAfterEarlyEnd(async (sql, params) => ({ rows: await query<any>(sql, params) }))
+    // S655: the deposit move that counts the new lease's own deposit payments
+    // once, and the household lock every writer of a household's money takes
+    // — resolved the void's own way (lockLeaseHousehold), so the cancel, the
+    // hold and the void inside the cancel all take the same key.
+    const {
+      returnDepositCountedOnce, countTriedCharges, stopRetriesForChargesTheVoidRemoves, lockLeaseHousehold,
+    } = await import('../lib/unwindIssuedLease')
+    const { cancelSupersededIntents } = await import('../services/creditUse')
+    const { moneyPaidOnLease } = await import('../services/renewalSuccessor')
+    const readQ = async (sql: string, params?: any[]) => ({ rows: await query<any>(sql, params) })
+    const endedEarly = await newLeasesAfterEarlyEnd(readQ)
     const words = (iso: string) => DateTime.fromISO(iso).toFormat('LLLL d, yyyy')
     type Notice = Map<string, { email: string; landlordId: string; items: any[] }>
     const canceled: Notice = new Map()
     const held: Notice = new Map()
-    /** Everyone on the landlord side of `d` — its landlord signers and the account owner — once each. */
-    const addLandlordSide = async (into: Notice, d: any) => {
-      const people = await query<{ user_id: string; email: string }>(`
+    /** Everyone on the landlord side of document $1 (landlord $2) — its landlord signers and the account owner. */
+    const LANDLORD_SIDE = `
         SELECT s.user_id, COALESCE(su.email, s.email) AS email
           FROM lease_document_signers s LEFT JOIN users su ON su.id = s.user_id
          WHERE s.document_id = $1 AND s.role = 'landlord' AND s.user_id IS NOT NULL
         UNION
-        SELECT lu.id, lu.email FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id = $2`,
-        [d.id, d.landlord_id])
-      for (const p of people) {
-        if (!into.has(p.user_id)) into.set(p.user_id, { email: p.email, landlordId: d.landlord_id, items: [] })
-        const items = into.get(p.user_id)!.items
-        if (!items.some((x: any) => x.id === d.id)) items.push(d)
-      }
+        SELECT lu.id, lu.email FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id = $2`
+    const addTo = (into: Notice, d: any, p: { user_id: string; email: string }) => {
+      if (!into.has(p.user_id)) into.set(p.user_id, { email: p.email, landlordId: d.landlord_id, items: [] })
+      const items = into.get(p.user_id)!.items
+      if (!items.some((x: any) => x.id === d.id)) items.push(d)
     }
+    /** Everyone on the landlord side of `d`, once each. */
+    const addLandlordSide = async (into: Notice, d: any) => {
+      for (const p of await query<{ user_id: string; email: string }>(LANDLORD_SIDE, [d.id, d.landlord_id])) addTo(into, d, p)
+    }
+    // Held: everything for it is done once it is stamped — it waits on the
+    // payment, quietly. The rest are held below, after the cancels.
+    const toHold: any[] = []
     for (const d of endedEarly) {
-      if (Number(d.paid_count) > 0) {
-        // Already told: it waits on the payment, quietly.
-        if (d.new_lease_cancel_held_at) continue
-        const vc = await getClient()
-        try {
-          await vc.query('BEGIN')
-          const live = (await vc.query(
-            `SELECT id FROM lease_documents
-              WHERE id = $1 AND status NOT IN ('completed','voided') AND new_lease_cancel_held_at IS NULL
-              FOR UPDATE`, [d.id])).rows[0]
-          if (!live) { await vc.query('ROLLBACK'); continue }
-          await returnDepositToEndedLease(vc.query.bind(vc) as any, d.new_lease_id, d.ended_lease_id)
-          await vc.query(
-            `UPDATE lease_documents SET new_lease_cancel_held_at = NOW(), updated_at = NOW() WHERE id = $1`, [d.id])
-          await vc.query('COMMIT')
-        } catch (e) {
-          await vc.query('ROLLBACK').catch(() => {})
-          logger.error({ err: e, document_id: d.id, lease_id: d.new_lease_id },
-            '[ESIGN-TIMEOUTS] could not hold a new lease with money paid on it — retried next run')
-          continue
-        } finally {
-          vc.release()
-        }
-        logger.warn({ document_id: d.id, lease_id: d.new_lease_id, ended_lease_id: d.ended_lease_id, paid_total: d.paid_total },
-          '[ESIGN-TIMEOUTS] new lease after an early end has money paid on it — held until it is returned; landlord side and GAM told')
-        try {
-          const { createAdminNotification } = await import('../services/adminNotifications')
-          await createAdminNotification({
-            severity: 'warn',
-            category: 'new_lease_cancel_held',
-            title: `New lease can't be canceled — money paid on it (${d.unit_label}, ${d.property_name})`,
-            body: `The lease it follows ended early on ${words(d.ended_on)} and nobody in the household signed the new lease ` +
-              `(it was to start ${words(d.new_start_date)}), so it will never start. But ${sayMoney(Number(d.paid_total))} was ` +
-              'already paid on it. Return or move that payment; the next run then cancels the new lease. The deposit record ' +
-              'is already back on the lease that ended. The landlord has been told.',
-            context: { document_id: d.id, new_lease_id: d.new_lease_id, ended_lease_id: d.ended_lease_id, paid_total: d.paid_total },
-          })
-        } catch (e) {
-          logger.error({ err: e, document_id: d.id }, '[ESIGN-TIMEOUTS] new-lease held admin notice failed')
-        }
-        await addLandlordSide(held, d)
+      // A payment tried on its bill holds it like money paid on it: the void
+      // would refuse it (lib/unwindIssuedLease, the same count).
+      d.tried_count = await countTriedCharges(readQ, d.new_lease_id)
+      if (Number(d.paid_count) > 0 || d.tried_count > 0) {
+        if (!d.new_lease_cancel_held_at) toHold.push(d)
         continue
       }
       const vc = await getClient()
       try {
         await vc.query('BEGIN')
+        // S655 lock order — household, then its leases, then rows: the
+        // household first, as the hold below takes it, never after the
+        // document (a cancel holding the document while it waited on the
+        // household could deadlock with a hold of the same document). The
+        // void's unwind takes the same key again, at no cost.
+        await lockLeaseHousehold(vc.query.bind(vc), d.new_lease_id)
         // Held for the void, and read again: a signature a moment ago keeps it
         // (voidDocument refuses a document a tenant has signed).
         const live = (await vc.query(
@@ -1186,36 +1223,320 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
         logger.error({ err: e, user_id: userId }, '[ESIGN-TIMEOUTS] new-lease canceled notice failed')
       }
     }
-    for (const [userId, t] of held) {
-      const one = t.items.length === 1
-      const first = t.items[0]
-      const line = (d: any) => `${d.unit_label} at ${d.property_name} (${sayMoney(Number(d.paid_total))} paid; its lease ` +
-        `ended early on ${words(d.ended_on)}; the new lease was to start ${words(d.new_start_date)})`
-      const title = one ? `New lease can't be canceled yet — ${first.unit_label}, ${first.property_name}`
-                        : `${t.items.length} new leases can't be canceled yet`
+    // ── Held: money paid on it ──────────────────────────────────────────────
+    // One run at a time through this step (a transaction-scoped advisory lock),
+    // so two overlapping runs never tell anyone twice.
+    if (toHold.length) {
+      const gate = await getClient()
       try {
-        await createNotification({
-          userId, landlordId: t.landlordId,
-          type: 'lease_renewal_status',
-          title,
-          body: (one
-            ? `The lease for ${first.unit_label} at ${first.property_name} ended early on ${words(first.ended_on)}, and nobody ` +
-              `in the household had signed the new lease that was to start ${words(first.new_start_date)}. It will never ` +
-              `start, but ${sayMoney(Number(first.paid_total))} was already paid on it, so it can't be canceled until that ` +
-              'money is returned or moved. The deposit record is back on the lease that ended. '
-            : 'These leases ended early, and nobody in the household had signed the new lease that was to follow. None of ' +
-              'those new leases will start, but money was already paid on each, so they can\'t be canceled until it is ' +
-              `returned or moved: ${t.items.map(line).join('; ')}. The deposit records are back on the leases that ended. `) +
-            'GAM has been told. To speed it up, email support@goldassetmanagement.com and name the ' +
-            (one ? 'space' : 'spaces') + '. Once it is sorted, ' + (one ? 'the new lease is' : 'each is') + ' canceled for you.',
-          data: { documentIds: t.items.map((d: any) => d.id), leaseIds: t.items.map((d: any) => d.new_lease_id) },
-          actionUrl: '/leases',
-          sendEmail: true,
-          emailTo: t.email,
-          emailSubject: title,
-        })
-      } catch (e) {
-        logger.error({ err: e, user_id: userId }, '[ESIGN-TIMEOUTS] new-lease held notice failed')
+        await gate.query('BEGIN')
+        const ours = (await gate.query(
+          `SELECT pg_try_advisory_xact_lock(hashtextextended('new_lease_cancel_held', 0)) AS ok`)).rows[0]?.ok === true
+        if (ours) {
+          // 1. The money side, per document, in its own transaction: the deposit
+          //    record back on the lease that ended, then what was never owed off
+          //    the new lease. A failure taking the charges off is kept apart
+          //    (savepoint) so the deposit move and the notices still go ahead;
+          //    the document then stays unstamped and the next run tries again.
+          //    `kept`: unpaid charge rows another record points at, which stay
+          //    for GAM to take off by hand (named in GAM's notice).
+          const ready: any[] = []
+          const cleared = new Set<string>()
+          type Kept = Awaited<ReturnType<typeof clearNeverOwedOnHeldNewLease>>['keptCharges']
+          const kept = new Map<string, Kept>()
+          for (const d of toHold) {
+            const vc = await getClient()
+            try {
+              await vc.query('BEGIN')
+              // S655: the household's lock first — this moves their deposit
+              // record and takes unpaid charges off the new lease.
+              await lockLeaseHousehold(vc.query.bind(vc), d.new_lease_id)
+              const live = (await vc.query(
+                `SELECT id FROM lease_documents
+                  WHERE id = $1 AND status NOT IN ('completed','voided') AND new_lease_cancel_held_at IS NULL
+                  FOR UPDATE`, [d.id])).rows[0]
+              if (!live) { await vc.query('ROLLBACK'); continue }
+              const vq = vc.query.bind(vc) as any
+              await returnDepositCountedOnce(vq, d.new_lease_id, d.ended_lease_id)
+              // Bank pulls stopped in this transaction, canceled at Stripe after
+              // its COMMIT — only if the savepoint that stopped them held.
+              let stopped: string[] = []
+              await vc.query('SAVEPOINT never_owed')
+              try {
+                // A bank retry still to come for this bill alone would pull
+                // money for a lease that never starts: stopped first, and the
+                // credit it set aside given back, so its charge can come off.
+                const stop = await stopRetriesForChargesTheVoidRemoves(vc, d.new_lease_id)
+                const off = await clearNeverOwedOnHeldNewLease(vq, d.new_lease_id, d.ended_lease_id)
+                await vc.query('RELEASE SAVEPOINT never_owed')
+                stopped = stop
+                cleared.add(d.id)
+                kept.set(d.id, off.keptCharges)
+                if (off.charges || off.bills || off.retotaled || off.utilityBills) {
+                  logger.info({ document_id: d.id, lease_id: d.new_lease_id, ...off },
+                    '[ESIGN-TIMEOUTS] held new lease — its unpaid charges and open bills taken off (never owed)')
+                }
+                if (off.kept) {
+                  logger.warn({ document_id: d.id, lease_id: d.new_lease_id, kept: off.kept,
+                                kept_payment_ids: off.keptCharges.map(k => k.paymentId) },
+                    '[ESIGN-TIMEOUTS] held new lease — unpaid charge rows other records point at were left for GAM')
+                }
+              } catch (e) {
+                await vc.query('ROLLBACK TO SAVEPOINT never_owed')
+                logger.error({ err: e, document_id: d.id, lease_id: d.new_lease_id },
+                  '[ESIGN-TIMEOUTS] could not take the unpaid charges off a held new lease — retried next run')
+              }
+              // Still held? Read again now the never-owed charges are off: with
+              // no money paid on it and no charge a payment was tried on left,
+              // nothing stops the cancel, and the next run makes it (the
+              // landlord hears "canceled", never "can't be canceled" first).
+              d.tried_count = await countTriedCharges(vq, d.new_lease_id)
+              const stillHeld = !!(await moneyPaidOnLease(vq, d.new_lease_id)) || d.tried_count > 0
+              await vc.query('COMMIT')
+              await cancelSupersededIntents(stopped)   // never throws
+              if (stillHeld) {
+                ready.push(d)
+              } else {
+                logger.info({ document_id: d.id, lease_id: d.new_lease_id },
+                  '[ESIGN-TIMEOUTS] new lease after an early end — what held it is cleared; canceled next run')
+              }
+            } catch (e) {
+              await vc.query('ROLLBACK').catch(() => {})
+              logger.error({ err: e, document_id: d.id, lease_id: d.new_lease_id },
+                '[ESIGN-TIMEOUTS] could not hold a new lease with money paid or a payment tried on it — retried next run')
+            } finally {
+              vc.release()
+            }
+          }
+
+          // Who on the landlord side has had the held notice naming `d` (read
+          // back, not assumed):
+          //   - the in-app notice is in their bell (a notifications row naming it);
+          //   - or, for someone whose in-app notices of this kind are off, the
+          //     email — their only copy — went out. There is no row of theirs to
+          //     read back, so once email_send_log shows it went, step 2 records it
+          //     on the document's own trail (audit_log, HELD_EMAILED), naming
+          //     them. Final sweep (10/3): they used to count as never told, so
+          //     every run that found the document still unstamped (its clear-up
+          //     failing, a notice to GAM or to someone else not landing) emailed
+          //     them the same notice again — every 15 minutes while it lasted;
+          //   - or both their in-app notices and their emails of this kind are
+          //     off: there is nothing to send them.
+          // A copy that did not land counts as not told: they are sent it again
+          // next run, and the document is not stamped until it lands.
+          const HELD_EMAILED = 'document.new_lease_cancel_held_emailed'
+          const landlordSide = (d: any) => query<{ user_id: string; email: string; told: boolean; in_app_off: boolean }>(`
+            SELECT x.user_id, x.email,
+                   (EXISTS (SELECT 1 FROM notifications n
+                             WHERE n.user_id = x.user_id AND n.type = 'lease_renewal_status'
+                               AND n.data->>'kind' = 'new_lease_cancel_held'
+                               AND (n.data->'documentIds') ? $3)
+                    OR EXISTS (SELECT 1 FROM audit_log a
+                                WHERE a.action = $4 AND a.entity_type = 'lease_document' AND a.entity_id = $1
+                                  AND a.new_value->>'userId' = x.user_id::text)
+                    OR EXISTS (SELECT 1 FROM notification_preferences np
+                                WHERE np.user_id = x.user_id AND np.type = 'lease_renewal_status'
+                                  AND np.in_app_enabled = FALSE AND np.email_enabled = FALSE)) AS told,
+                   EXISTS (SELECT 1 FROM notification_preferences np
+                            WHERE np.user_id = x.user_id AND np.type = 'lease_renewal_status'
+                              AND np.in_app_enabled = FALSE) AS in_app_off
+              FROM (${LANDLORD_SIDE}) x`, [d.id, d.landlord_id, String(d.id), HELD_EMAILED])
+          // GAM's latest notice about `d` (read back, not assumed) — its context
+          // says what that notice told GAM: whether the unpaid charges had come
+          // off (`cleared`) and how many were left to take off by hand (`kept`).
+          const gamLast = async (d: any) => (await queryOne<{ context: any }>(
+            `SELECT context FROM admin_notifications
+              WHERE category = 'new_lease_cancel_held' AND context->>'document_id' = $1::text
+              ORDER BY created_at DESC, id DESC LIMIT 1`, [d.id]))?.context ?? null
+          /**
+           * GAM's notices about `d` already say everything this run found: it was
+           * told at all, and — when charges were left for GAM to take off by hand —
+           * a notice said the charges came off and named at least that many. A
+           * notice from a run whose clear-up failed ("the next run tries again")
+           * says nothing about what a later run had to leave behind.
+           */
+          const gamUpToDate = (d: any, last: any): boolean => {
+            if (!last) return false
+            const k = kept.get(d.id)?.length ?? 0
+            return !(cleared.has(d.id) && k > 0) || (last.cleared === true && Number(last.kept ?? 0) >= k)
+          }
+          const keptSentence = (k: Kept) =>
+            `${k.length} unpaid charge${k.length === 1 ? '' : 's'} on it could not be taken off because other records ` +
+            `point at ${k.length === 1 ? 'it' : 'them'} (${sayKeptCharges(k)}) — take ${k.length === 1 ? 'it' : 'them'} ` +
+            'off by hand so the household is not asked to pay.'
+          const gamContext = (d: any, extra: Record<string, unknown> = {}) => ({
+            document_id: d.id, new_lease_id: d.new_lease_id, ended_lease_id: d.ended_lease_id, paid_total: d.paid_total,
+            tried_count: d.tried_count ?? 0, cleared: cleared.has(d.id), kept: kept.get(d.id)?.length ?? 0,
+            kept_payment_ids: (kept.get(d.id) ?? []).map(k => k.paymentId).filter(Boolean),
+            ...extra,
+          })
+
+          // 2. The landlord side: one notice per person for the lot, to
+          //    whoever has not had one naming that space yet.
+          /** People whose in-app notices of this kind are off: their copy is the email alone. */
+          const emailOnly = new Set<string>()
+          for (const d of ready) {
+            for (const p of await landlordSide(d)) {
+              if (p.told) continue
+              addTo(held, d, p)
+              if (p.in_app_off) emailOnly.add(p.user_id)
+            }
+          }
+          // "Nothing unpaid is billed" is said only where it is true this run.
+          const allOff = (items: any[]) => items.every((d: any) => cleared.has(d.id) && !kept.get(d.id)?.length)
+          // Money paid on it, or (no money moved) a payment tried on its bill
+          // that did not go through: what holds it, in words.
+          const paidOn = (d: any) => Number(d.paid_count) > 0
+          for (const [userId, t] of held) {
+            const one = t.items.length === 1
+            const first = t.items[0]
+            const everyPaid = t.items.every(paidOn)
+            const line = (d: any) => `${d.unit_label} at ${d.property_name} (` +
+              (paidOn(d) ? `${sayMoney(Number(d.paid_total))} paid` : 'a payment tried on its bill did not go through') +
+              `; its lease ended early on ${words(d.ended_on)}; the new lease was to start ${words(d.new_start_date)})`
+            const title = one ? `New lease can't be canceled yet — ${first.unit_label}, ${first.property_name}`
+                              : `${t.items.length} new leases can't be canceled yet`
+            // The database's own clock, so the read-back below finds only this send.
+            const sentFrom = emailOnly.has(userId)
+              ? (await queryOne<{ at: string }>(`SELECT clock_timestamp()::text AS at`))?.at ?? null
+              : null
+            await createNotification({
+              userId, landlordId: t.landlordId,
+              type: 'lease_renewal_status',
+              title,
+              body: (one
+                ? `The lease for ${first.unit_label} at ${first.property_name} ended early on ${words(first.ended_on)}, and nobody ` +
+                  `in the household had signed the new lease that was to start ${words(first.new_start_date)}. It will never ` +
+                  (paidOn(first)
+                    ? `start, but ${sayMoney(Number(first.paid_total))} was already paid on it, so it can't be canceled until that ` +
+                      'money is returned or moved. '
+                    : 'start, but a payment was tried on its bill and did not go through, so it can\'t be canceled until GAM ' +
+                      'takes that charge off. ') +
+                  'The deposit record is back on the lease that ended' +
+                  (allOff([first]) ? ', and nothing unpaid on the new lease is billed to the household. ' : '. ')
+                : 'These leases ended early, and nobody in the household had signed the new lease that was to follow. None of ' +
+                  (everyPaid
+                    ? 'those new leases will start, but money was already paid on each, so they can\'t be canceled until it is ' +
+                      'returned or moved: '
+                    : 'those new leases will start, but money was paid, or a payment was tried, on each, so they can\'t be ' +
+                      'canceled until that is sorted out: ') +
+                  `${t.items.map(line).join('; ')}. The deposit records are back on the leases that ended` +
+                  (allOff(t.items) ? ', and nothing unpaid on the new leases is billed to the households. ' : '. ')) +
+                'GAM has been told. To speed it up, email support@goldassetmanagement.com and name the ' +
+                (one ? 'space' : 'spaces') + '. Once it is sorted, ' + (one ? 'the new lease is' : 'each is') + ' canceled for you.',
+              // `kind` is what a later run reads back to know this person was told.
+              data: { kind: 'new_lease_cancel_held', documentIds: t.items.map((d: any) => d.id),
+                      leaseIds: t.items.map((d: any) => d.new_lease_id) },
+              actionUrl: '/leases',
+              sendEmail: true,
+              emailTo: t.email,
+              emailSubject: title,
+            })
+            // In-app notices off: no row of theirs to read back, so read back that
+            // the email went out (email_send_log — 'failed' means the provider
+            // refused it; an address the provider will not deliver to can never
+            // land, so trying again changes nothing) and record it on each
+            // document it named, for later runs (landlordSide).
+            if (sentFrom) {
+              try {
+                const sent = await queryOne<{ id: string }>(
+                  `SELECT id FROM email_send_log
+                    WHERE category = 'notif_lease_renewal_status' AND metadata->>'user_id' = $1
+                      AND subject = $2 AND created_at >= $3::timestamptz AND status <> 'failed'
+                    ORDER BY created_at DESC LIMIT 1`, [userId, title, sentFrom])
+                if (sent) {
+                  for (const d of t.items) {
+                    await query(
+                      `INSERT INTO audit_log (user_id, action, entity_type, entity_id, new_value)
+                       VALUES (NULL, $1, 'lease_document', $2, $3::jsonb)`,
+                      [HELD_EMAILED, d.id, JSON.stringify({ userId, sentTo: t.email, subject: title, emailLogId: sent.id })])
+                  }
+                } else {
+                  logger.warn({ user_id: userId, document_ids: t.items.map((d: any) => d.id) },
+                    '[ESIGN-TIMEOUTS] held new lease — the email to someone with in-app notices off did not go out; sent again next run')
+                }
+              } catch (e) {
+                logger.error({ err: e, user_id: userId },
+                  '[ESIGN-TIMEOUTS] held new lease — could not record the email to someone with in-app notices off; sent again next run')
+              }
+            }
+          }
+
+          // 3. GAM, once per new lease — and once more if a later run had to
+          //    leave charges for GAM to take off by hand that GAM's notice did not
+          //    name (the first run's clear-up failed, so its notice could only say
+          //    "the next run tries again"). Without it the document was stamped
+          //    with the charge still due and nobody told to take it off.
+          const { createAdminNotification } = await import('../services/adminNotifications')
+          for (const d of ready) {
+            const last = await gamLast(d)
+            if (last) {
+              if (gamUpToDate(d, last)) continue
+              const k = kept.get(d.id) ?? []
+              logger.warn({ document_id: d.id, lease_id: d.new_lease_id, kept: k.length },
+                '[ESIGN-TIMEOUTS] held new lease — charges left for GAM that its notice did not name; GAM told')
+              await createAdminNotification({
+                severity: 'warn',
+                category: 'new_lease_cancel_held',
+                title: `Unpaid charges to take off by hand — ${d.unit_label}, ${d.property_name}`,
+                body: `Follow-up on the new lease for ${d.unit_label} at ${d.property_name} that can't be canceled ` +
+                  (paidOn(d)
+                    ? `(${sayMoney(Number(d.paid_total))} was paid on it; it will never start). Its unpaid charges have now been ` +
+                      `taken off, except: ${keptSentence(k)} Return or move the payment as before; the next run then cancels ` +
+                      'the new lease.'
+                    : '(a payment was tried on its bill and did not go through; it will never start). Its unpaid charges have ' +
+                      `now been taken off, except: ${keptSentence(k)} Once they are off, the next run cancels the new lease.`),
+                context: gamContext(d, { follow_up: true }),
+              })
+              continue
+            }
+            logger.warn({ document_id: d.id, lease_id: d.new_lease_id, ended_lease_id: d.ended_lease_id, paid_total: d.paid_total,
+                          tried_count: d.tried_count },
+              paidOn(d)
+                ? '[ESIGN-TIMEOUTS] new lease after an early end has money paid on it — held until it is returned; landlord side and GAM told'
+                : '[ESIGN-TIMEOUTS] new lease after an early end has a payment tried on its bill — held until that charge is off; landlord side and GAM told')
+            await createAdminNotification({
+              severity: 'warn',
+              category: 'new_lease_cancel_held',
+              title: paidOn(d)
+                ? `New lease can't be canceled — money paid on it (${d.unit_label}, ${d.property_name})`
+                : `New lease can't be canceled — a payment was tried on its bill (${d.unit_label}, ${d.property_name})`,
+              body: `The lease it follows ended early on ${words(d.ended_on)} and nobody in the household signed the new lease ` +
+                `(it was to start ${words(d.new_start_date)}), so it will never start. ` +
+                (paidOn(d)
+                  ? `But ${sayMoney(Number(d.paid_total))} was already paid on it. Return or move that payment; the next run then ` +
+                    'cancels the new lease. '
+                  : 'But a payment was tried on its bill and did not go through, and the charge it was tried on is the record ' +
+                    'of that payment, so the void refuses it. Once no such charge is left on it, the next run cancels the new lease. ') +
+                'The deposit record is already back on the lease that ended' +
+                (!cleared.has(d.id) ? '. Its unpaid charges could not be taken off yet; the next run tries again. '
+                  : kept.get(d.id)?.length ? `. ${keptSentence(kept.get(d.id)!)} `
+                  : ', and nothing unpaid on the new lease is billed to the household. ') +
+                'The landlord is told too.',
+              context: gamContext(d),
+            })
+          }
+
+          // 4. The stamp, last: only for a document whose charges came off, whose
+          //    GAM notices say everything this run found (gamUpToDate — including
+          //    any charges left for GAM to take off by hand), and that everyone on
+          //    the landlord side was told about (landlordSide — by email alone for
+          //    someone whose in-app notices are off). Anything missing is sent
+          //    again next run.
+          for (const d of ready) {
+            if (!cleared.has(d.id) || !gamUpToDate(d, await gamLast(d))) continue
+            if ((await landlordSide(d)).some(p => !p.told)) {
+              logger.warn({ document_id: d.id }, '[ESIGN-TIMEOUTS] held new lease — a landlord-side notice did not land; sent again next run')
+              continue
+            }
+            await query(
+              `UPDATE lease_documents SET new_lease_cancel_held_at = NOW(), updated_at = NOW()
+                WHERE id = $1 AND new_lease_cancel_held_at IS NULL`, [d.id])
+          }
+        }
+      } finally {
+        await gate.query('ROLLBACK').catch(() => {})
+        gate.release()
       }
     }
   } catch (e) {
@@ -1508,15 +1829,27 @@ export async function revealTodaysSites() {
   } catch(e) { logger.error({ err: e }, '[SCHEDULER] site reveal') }
 }
 
-// W-44 (S531): tenant private events — hourly sweep, two passes.
+// W-44 (S531): tenant private events — hourly sweep, three passes.
 //   1. ANNOUNCE: deposit settled → mass property announcement (deferred
 //      from approval time; fireAmenityAlert skips deposit-events).
 //   2. AUTO-RELEASE: event start arrived with the deposit unpaid → the
 //      space becomes NOT private (cancel + void the unpaid deposit +
-//      tell the tenant), when the area's event_auto_release is on.
+//      tell the tenant), when the area's event_auto_release is on. A
+//      deposit that cannot be taken off holds the release (GAM is told once).
+//   3. WAITING FEES: a canceled reservation whose fee was still being paid
+//      at the cancel is decided once that payment clears or fails for good
+//      (decisions #52; services/commonAreas decideWaitingReservationFee).
 export async function processTenantEvents() {
   try {
-    // Pass 1 — announce paid events that haven't been announced.
+    // "Is this event's deposit paid?" has ONE definition (services/commonAreas
+    // reservationFeePaidSql): the deposit row itself, or — after a dispute or
+    // bank return took its money back — the row that dispute reopened, paid
+    // again. Testing pay.status alone read a re-paid disputed deposit as
+    // unpaid: the event was never announced and was released at its start
+    // with the tenant's money kept.
+    const { reservationFeePaidSql, reservationFeeMovingSql, reservationFeeUnpaidHowSql } = await import('../services/commonAreas')
+    // Pass 1 — announce paid events that haven't been announced. Only money
+    // that has ARRIVED announces an event (['settled']).
     const toAnnounce = await query<any>(`
       SELECT car.id, car.property_id, car.landlord_id, car.title, car.kind,
              car.starts_at, car.ends_at, car.reserved_by_tenant_id,
@@ -1524,14 +1857,13 @@ export async function processTenantEvents() {
         FROM common_area_reservations car
         JOIN common_areas ca ON ca.id = car.common_area_id
         JOIN properties p ON p.id = car.property_id
-        JOIN payments pay ON pay.id = car.fee_payment_id
        WHERE car.kind = 'event'
          AND car.reserved_by_tenant_id IS NOT NULL
          AND car.status = 'approved'
          AND car.notify_residents = TRUE
          AND car.residents_notified_at IS NULL
          AND car.fee_amount > 0
-         AND pay.status = 'settled'`)
+         AND ${reservationFeePaidSql('car.fee_payment_id', ['settled'])}`)
     for (const r of toAnnounce) {
       try {
         const { notifyAmenityUnavailable } = await import('../services/notifications')
@@ -1548,41 +1880,174 @@ export async function processTenantEvents() {
     // Pass 2 — release events whose start arrived with the deposit unpaid.
     const toRelease = await query<any>(`
       SELECT car.id, car.fee_payment_id, car.reserved_by_tenant_id,
-             car.landlord_id, car.starts_at, car.ends_at,
-             ca.name AS area_name, tu.id AS tenant_user_id, tu.email AS tenant_email
+             car.landlord_id, car.property_id, car.starts_at, car.ends_at,
+             ca.name AS area_name, p.name AS property_name,
+             tu.id AS tenant_user_id, tu.email AS tenant_email
         FROM common_area_reservations car
         JOIN common_areas ca ON ca.id = car.common_area_id
+        JOIN properties p ON p.id = car.property_id
         JOIN tenants t ON t.id = car.reserved_by_tenant_id
         JOIN users tu ON tu.id = t.user_id
-        LEFT JOIN payments pay ON pay.id = car.fee_payment_id
        WHERE car.kind = 'event'
          AND car.reserved_by_tenant_id IS NOT NULL
          AND car.status = 'approved'
          AND car.fee_amount > 0
          AND car.starts_at <= now()
          AND ca.event_auto_release = TRUE
-         AND (pay.id IS NULL OR pay.status NOT IN ('settled','processing'))`)
+         -- No deposit row, or a deposit not paid (paid, clearing or paid from
+         -- the deposit — on the row or on the row a dispute reopened).
+         AND NOT ${reservationFeePaidSql('car.fee_payment_id')}
+         -- Never while a payment carrying it is still in flight (decisions
+         -- #52): a card or bank payment that may still be going through, or a
+         -- bank retry still to come — alone or bundled with the household's
+         -- rent. A later run decides: the payment cleared (the event is kept)
+         -- or failed for good (the event is released, the deposit voided).
+         AND NOT ${reservationFeeMovingSql('car.fee_payment_id')}`)
+    const { lockHousehold } = await import('../services/moneyPredicates')
+    const { voidUnpaidReservationFee, alertEventReleaseHeld, eventReleasedNotice } = await import('../services/commonAreas')
+    const { cancelSupersededIntents } = await import('../services/creditUse')
     for (const r of toRelease) {
       try {
-        await query(
-          `UPDATE common_area_reservations
-              SET status='cancelled', decision_note='Auto-released: event deposit unpaid by start time', updated_at=now()
-            WHERE id = $1`, [r.id])
-        if (r.fee_payment_id) {
-          await query(`DELETE FROM payments WHERE id = $1 AND status IN ('pending','failed')`, [r.fee_payment_id])
-          await query(`UPDATE common_area_reservations SET fee_voided = true, fee_payment_id = NULL WHERE id = $1`, [r.id])
+        // S655: one transaction, under the household lock (the deposit is
+        // household money), with the reservation and its deposit read fresh: a
+        // deposit paid since the scan keeps the event, and the release and the
+        // deposit's fate land together. The deposit used to be deleted after
+        // the event was already marked released; a deposit a payment had been
+        // tried on refused the delete, and the event stayed released while the
+        // tenant was still billed for it.
+        let outcome: 'none' | 'voided' | 'kept' | 'paid' | 'still_paid' | 'held' = 'none'
+        let feePaymentId: string | null = null
+        let feeAmount = 0
+        // The event had been announced to the property (its deposit was paid,
+        // then a dispute took it back): the property is told it is open again.
+        let announced = false
+        // Why the deposit was unpaid (read before the void changes it), and
+        // when the event ends (read fresh): the tenant's notice says the true
+        // reason, and "open to everyone" only while the event's time is ahead.
+        let unpaidHow: 'taken_back' | 'did_not_go_through' | 'not_paid' = 'not_paid'
+        let endsAt: string | Date = r.ends_at
+        // A bank retry of the deposit alone that the release stopped: canceled after COMMIT.
+        const stopped: string[] = []
+        const client = await getClient()
+        try {
+          await client.query('BEGIN')
+          await lockHousehold(client, r.reserved_by_tenant_id, r.landlord_id)
+          // Read fresh under the household lock, every test the scan used
+          // checked again BEFORE anything changes: a deposit paid since the
+          // scan — on its own row or on the row a dispute reopened — keeps the
+          // event; a payment on it that started since — or a bank retry
+          // scheduled since — is still in flight (a later run decides, #52);
+          // and an event the landlord moved
+          // later, or an area whose auto-release was turned off, is not
+          // released.
+          const cur = (await client.query<any>(
+            `SELECT car.id, car.status, car.fee_payment_id, car.fee_amount::text AS fee_amount,
+                    car.reserved_by_tenant_id, car.landlord_id,
+                    (car.notify_residents AND car.residents_notified_at IS NOT NULL) AS announced,
+                    (car.starts_at <= now() AND ca.event_auto_release = TRUE) AS due,
+                    ${reservationFeePaidSql('car.fee_payment_id')} AS fee_paid,
+                    ${reservationFeeMovingSql('car.fee_payment_id')} AS fee_moving,
+                    CASE WHEN car.fee_payment_id IS NULL THEN 'not_paid'
+                         ELSE ${reservationFeeUnpaidHowSql('car.fee_payment_id')} END AS fee_unpaid_how,
+                    car.ends_at
+               FROM common_area_reservations car
+               JOIN common_areas ca ON ca.id = car.common_area_id
+              WHERE car.id = $1
+              FOR UPDATE OF car`, [r.id])).rows[0]
+          if (!cur || cur.status !== 'approved' || cur.due !== true || cur.fee_paid || cur.fee_moving) {
+            await client.query('ROLLBACK')
+            continue
+          }
+          feePaymentId = cur.fee_payment_id
+          feeAmount = Number(cur.fee_amount)
+          announced = cur.announced === true
+          unpaidHow = cur.fee_unpaid_how ?? 'not_paid'
+          endsAt = cur.ends_at ?? r.ends_at
+          // The deposit's fate first, under its own row lock: a payment that
+          // landed between the read above and this lock reads 'paid' here.
+          outcome = await voidUnpaidReservationFee(client, cur, stopped)
+          if (outcome === 'paid') {
+            // The tenant paid for the event: it stays theirs. Nothing the void
+            // pass touched is kept (it touches nothing on 'paid'; the rollback
+            // makes sure), and no retry it stopped is canceled.
+            await client.query('ROLLBACK')
+            stopped.length = 0
+            outcome = 'still_paid'
+          } else if (outcome === 'kept') {
+            // The deposit is owed by nobody once the event is released, but it
+            // cannot be taken off (account credit already spent on it, or a
+            // dispute reopened only part of it). Releasing anyway left the
+            // tenant billed — autopay or their next pay-in-full would collect
+            // it — for an event taken away. So nothing changes: the event
+            // stays theirs, the deposit stays owed, and GAM is told once to
+            // decide with the landlord (keep the event, or release it and give
+            // back the credit / refund the paid part — Nic's call, not GAM's).
+            await client.query('ROLLBACK')
+            stopped.length = 0
+            outcome = 'held'
+          } else {
+            await client.query(
+              `UPDATE common_area_reservations
+                  -- After the note the landlord typed when approving it, never over it.
+                  SET status='cancelled',
+                      decision_note = CASE WHEN COALESCE(btrim(decision_note), '') = '' THEN $2
+                                           ELSE rtrim(decision_note) || E'\n\n' || $2 END,
+                      updated_at=now()
+                WHERE id = $1`, [r.id, 'Auto-released: event deposit unpaid by start time'])
+            await client.query('COMMIT')
+          }
+        } catch (e) {
+          await client.query('ROLLBACK').catch(() => {})
+          throw e
+        } finally {
+          client.release()
         }
+        if (outcome === 'still_paid') continue
+        if (outcome === 'held') {
+          await alertEventReleaseHeld({
+            reservationId: r.id, paymentId: feePaymentId, landlordId: r.landlord_id,
+            tenantId: r.reserved_by_tenant_id, amount: feeAmount,
+          })   // never throws; once per reservation
+          continue
+        }
+        await cancelSupersededIntents(stopped)   // never throws
         const { createNotification } = await import('../services/notifications')
         await createNotification({
           userId: r.tenant_user_id, landlordId: r.landlord_id,
           type: 'amenity_unavailable',
           title: `Event released — ${r.area_name}`,
-          body: `Your private event at ${r.area_name} was released because the deposit wasn't paid by the start time. The space is open to everyone as usual.`,
+          body: eventReleasedNotice({ areaName: r.area_name, how: unpaidHow, endsAt }),
           data: { reservationId: r.id },
           sendEmail: true, emailTo: r.tenant_email,
         })
+        // An event the property had been told about (its deposit was paid, then
+        // a dispute or bank return took it back) is open again — the property
+        // is told, as when an announced event is canceled (routes/commonAreas).
+        // Not once the event's time is over: "open again" for a time already
+        // past tells nobody anything (a release can come days late, #52).
+        if (announced && new Date(endsAt).getTime() > Date.now()) {
+          try {
+            const { notifyAmenityEventReleased } = await import('../services/notifications')
+            await notifyAmenityEventReleased({
+              propertyId: r.property_id, landlordId: r.landlord_id, propertyName: r.property_name ?? '',
+              areaName: r.area_name, startsAt: r.starts_at, endsAt,
+            })
+          } catch (e) { logger.error({ err: e }, `[events] open-again notice ${r.id}`) }
+        }
         logger.info(`[events] auto-released unpaid event ${r.id} (${r.area_name})`)
       } catch (e) { logger.error({ err: e }, `[events] release ${r.id}`) }
+    }
+
+    // Pass 3 — a canceled reservation whose fee (or event deposit) was still
+    // being paid at the cancel: decided once that payment clears (refund due /
+    // the deposit stands) or fails for good (taken off, never collected, the
+    // landlord never told to refund money that did not arrive). Decisions #52.
+    // Every waiting fee, page by page (a fee still in flight is left as it
+    // is, so a first-page-only pass would recheck the same rows forever).
+    const { decideAllWaitingReservationFees } = await import('../services/commonAreas')
+    const decidedFees = await decideAllWaitingReservationFees()
+    for (const [id, out] of Object.entries(decidedFees)) {
+      logger.info(`[events] canceled reservation ${id}: waiting fee decided (${out})`)
     }
   } catch(e) { logger.error({ err: e }, '[SCHEDULER] tenant events') }
 }
@@ -1790,6 +2255,28 @@ export function schedulerInit() {
       logger.error({ err }, '[reconcile] payment reconciliation failed')
     }
   }, { timezone: 'America/Phoenix' })
+
+  // ── CARD PAYMENTS NOBODY CONFIRMED (decisions.md #48.4) ─────
+  // A card the tenant pay screen is confirming with its bank (3-D Secure)
+  // holds the bill for at most 30 minutes (CARD_CONFIRM_HOLD_MINUTES). Every
+  // five minutes, any such hold past its time is canceled in Stripe and its
+  // bill opened again — so the screen's "canceled by itself" time holds even
+  // when nobody looks at the bill again, and staff screens never show a hold
+  // that has run out. Stripe is built only when a hold is due (most runs find
+  // none). Offset to :02/:07/… so it never stacks on the other 5-minute jobs;
+  // a run still going when the next is due is not started twice.
+  let cardHoldSweepRunning = false
+  cron.schedule('2-59/5 * * * *', async () => {
+    if (cardHoldSweepRunning) return
+    cardHoldSweepRunning = true
+    try {
+      await releaseUnconfirmedCardCharges(getStripe)
+    } catch (err) {
+      logger.error({ err }, '[reconcile] unconfirmed card release failed')
+    } finally {
+      cardHoldSweepRunning = false
+    }
+  })
 
   // ── LEASE EXPIRATION NOTICES ────────────────────────────────
   // Daily at 8am — notify landlord when lease approaches end_date
@@ -2322,6 +2809,45 @@ export function schedulerInit() {
       if (r.billed || r.failed) logger.info(r, '[stay-balance]')
     } catch (e) {
       logger.error({ err: e }, '[stay-balance] fatal')
+    }
+  })
+
+  // Step 9 review (fix pass 2): a move-out balance charge saved on its row but
+  // never confirmed (Stripe could not be reached at finalize) is finished here —
+  // confirmed with its own key (never a second charge), left to the webhook
+  // when its money is moving, or let go so the balance is payable again.
+  // Hourly; safe to run again. Without it the row stayed 'processing' for good:
+  // the tenant could not pay it and the landlord could not record it.
+  cron.schedule('35 * * * *', async () => {
+    try {
+      const { finishPendingGapCharges } = await import('../services/depositReturn')
+      const r = await finishPendingGapCharges()
+      if (r.checked > 0 || r.errors.length > 0) logger.info(r, '[deposit-return-gap-finisher]')
+    } catch (e) {
+      logger.error({ err: e }, '[deposit-return-gap-finisher] fatal')
+    }
+  })
+
+  // Fix pass (rev8, decisions #47a: a deposit refund GAM holds goes back BY
+  // ITSELF when the move-out is finalized): a card or bank refund part left
+  // "sending" (a crash between finalize and Stripe, or Stripe's answer lost)
+  // is sent again here every 15 minutes — the same runner and key, so a
+  // refund Stripe already made is found and recorded, never sent twice —
+  // instead of waiting for someone to open the move-out page. Offset to
+  // :04/:19/:34/:49 so it never stacks on the quarter-hour jobs; a run still
+  // going when the next is due is not started twice. Never throws.
+  let staleDepositRefundsRunning = false
+  cron.schedule('4-59/15 * * * *', async () => {
+    if (staleDepositRefundsRunning) return
+    staleDepositRefundsRunning = true
+    try {
+      const { resumeStaleDepositRefunds } = await import('../services/depositRefundSend')
+      const n = await resumeStaleDepositRefunds()
+      if (n > 0) logger.info({ moveOuts: n }, '[deposit-refund-sweep] resumed refunds left sending')
+    } catch (e) {
+      logger.error({ err: e }, '[deposit-refund-sweep] fatal')
+    } finally {
+      staleDepositRefundsRunning = false
     }
   })
 
@@ -2894,26 +3420,47 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
-  // S245: FlexPay grace-period-end advance — daily at 3am Phoenix.
-  // Fronts rent to landlord on the day rent_due_day + grace_days
-  // matches today's day-of-month. Gated by
-  // system_features.flexpay_rollout_visible inside the service.
+  // S655 (Nic 10/2): FlexPay covers the whole monthly bill — daily at 3am
+  // Phoenix. For every FlexPay tenant whose cycle invoice reaches its LAST
+  // GRACE DAY today (invoice due + grace − 1, the property's calendar), the
+  // bill's open landlord lines are paid from GAM's float, before the late-fee
+  // engine's midnight run. A month already paid still makes an advance for the
+  // $25. A bill this run missed (the server was down that morning, or the run
+  // failed for that tenant — an admin is alerted the same day) is caught up by
+  // the next runs for FLEXPAY_COVER_CATCHUP_DAYS days, flagged to an admin as
+  // late. Gated by system_features.flexpay_rollout_visible inside the service.
   cron.schedule('0 3 * * *', async () => {
     try {
-      const { processGracePeriodAdvance } = await import('../services/flexpay')
-      const result = await processGracePeriodAdvance()
+      const { coverFlexPayCycle } = await import('../services/flexpay')
+      const result = await coverFlexPayCycle()
       if (result.candidates_scanned > 0) {
-        logger.info(result, '[flexpay-front]')
+        logger.info(result, '[flexpay-cover]')
       }
     } catch (e) {
-      logger.error({ err: e }, '[flexpay-front] fatal')
+      logger.error({ err: e }, '[flexpay-cover] fatal')
+      // The whole run failed: no FlexPay bill was paid today, and the late-fee
+      // run comes at midnight. Best effort — the database may be the cause.
+      try {
+        const { createAdminNotification } = await import('../services/adminNotifications')
+        await createAdminNotification({
+          severity: 'critical',
+          category: 'flexpay_cover_run_failed',
+          title:    'The FlexPay daily run failed — no bill was paid today',
+          body:     `The 3 am FlexPay run stopped before paying anything: ${e instanceof Error ? e.message : String(e)}. ` +
+                    'Bills whose last grace day is today get the landlord\'s late fee at midnight unless the cause is fixed and the run is made today. ' +
+                    'The next runs catch up missed bills for a few days.',
+          context:  {},
+        })
+      } catch (alertErr) {
+        logger.error({ err: alertErr }, '[flexpay-cover] could not alert an admin')
+      }
     }
   }, { timezone: 'America/Phoenix' })
 
-  // S245: FlexPay tenant pull — daily at 5am Phoenix. Initiates the
-  // tenant ACH pull (rent + fee) for every flexpay_advances row
-  // whose pull_day matches today and whose grace-end advance has
-  // already settled.
+  // S655: FlexPay pull — daily at 5am Phoenix. Collects every covered cycle
+  // whose pull_date has come (never the 1st-5th): the pull row is written
+  // first, Stripe is searched before any create, and a missed day is caught up
+  // the next run.
   cron.schedule('0 5 * * *', async () => {
     try {
       const { processFlexPayPullDay } = await import('../services/flexpay')

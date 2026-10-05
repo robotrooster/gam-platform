@@ -89,7 +89,9 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
   const { data: masterBills = [] } = useQuery<any[]>(
     ['master-bills', propertyId],
     () => apiGet(`/utility/master-bills?propertyId=${propertyId}`),
-    { enabled: !!propertyId && canRead }
+    // 10/3: owners only — past master readings and dollars are not for a
+    // staffer who reads meters blind.
+    { enabled: !!propertyId && canReview }
   )
   const { data: runs = [] } = useQuery<any[]>(
     ['reading-runs', propertyId],
@@ -142,7 +144,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
   // system, visible without downloading external reports."
   const [historyOpen, setHistoryOpen] = useState(false)
   const [reviewReading, setReviewReading] = useState<any | null>(null)
-  const [specialRead, setSpecialRead] = useState<{ meterId?: string; unitNumber?: string; reason?: string; label?: string } | null>(null)
+  const [specialRead, setSpecialRead] = useState<{ meterId?: string; unitNumber?: string; reason?: string; label?: string; leaseId?: string } | null>(null)
 
   const invalidate = () => {
     qc.invalidateQueries(['utility-meters', propertyId])
@@ -313,7 +315,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
                       {r.who ? `${r.who} — ` : ''}left {String(r.departedOn).slice(0,10)}
                     </span>
                     <button className="btn btn-primary btn-sm" style={{ marginLeft:'auto' }}
-                      onClick={()=>setSpecialRead({ meterId: r.meterId, unitNumber: r.unitNumber, reason: r.reason, label: r.meterLabel })}>
+                      onClick={()=>setSpecialRead({ meterId: r.meterId, unitNumber: r.unitNumber, reason: r.reason, label: r.meterLabel, leaseId: r.reason === 'move_out_final' ? r.leaseId : undefined })}>
                       Read meter
                     </button>
                   </div>
@@ -348,7 +350,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
 
           {/* S605: rates sit ABOVE meter setup — the price is the first thing
               you decide for a property, and every meter below bills at it. */}
-          <PropertyRatesCard propertyId={propertyId} />
+          {canReview && <PropertyRatesCard propertyId={propertyId} />}
           {canReview && <BrokenMeterPolicyCard property={(properties as any[]).find((p: any) => p.id === propertyId)} />}
 
           {/* ── METER SETUP (S558: masters, submeters, RUBS groups, flat-rate) ── */}
@@ -378,6 +380,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
               went back out to tenants. The per-tenant split lives on the
               tenant's own invoice and on the unit; restating it here was
               the same money listed twice in the landlord's setup screen. */}
+          {canReview && (<>
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12 }}>
             <div>
               <h2 style={{ fontSize:'.95rem', margin:0, display:'flex', alignItems:'center', gap:8 }}><Receipt size={16}/> Master bills</h2>
@@ -429,6 +432,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
               </table>
             )}
           </div>
+          </>)}
           {/* ── PROPANE (tank fills — gas for RVs) ─────────── */}
           <PropaneSection propertyId={propertyId} property={(properties as any[]).find((p:any)=>p.id===propertyId)} units={units as any[]} onChanged={invalidate} />
 
@@ -573,7 +577,7 @@ function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () =>
 // reads-due to-do), punch the number. NO prior value is ever shown.
 // move_out_final bills the departing tenant; every other reason is a
 // reference/baseline read that resets the baseline for the next stay.
-function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: string; unitNumber?: string; reason?: string; label?: string }; meters: any[]; onClose: () => void }) {
+function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: string; unitNumber?: string; reason?: string; label?: string; leaseId?: string }; meters: any[]; onClose: () => void }) {
   const presetReason = !!preset.reason && preset.reason !== 'monthly_cycle'
   const [meterId, setMeterId] = useState(preset.meterId || (meters.length === 1 ? meters[0].id : ''))
   const [reason, setReason] = useState<string>(presetReason ? preset.reason! : (METER_READ_MANUAL_REASONS[0] as string))
@@ -583,7 +587,11 @@ function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: str
   const digits = Number(meter?.digits) || METER_READING_DEFAULT_DIGITS
   const valueOk = new RegExp(`^\\d{1,${digits}}$`).test(value)
   const save = useMutation(
-    () => apiPost(`/utility/meters/${meterId}/reads`, { readingValue: Number(value), reason, reasonNote: note || undefined }),
+    // 10/3: a move-out read from the to-do names whose move-out it is, so the
+    // bill lands on that household — only while the meter is still the one the
+    // to-do picked.
+    () => apiPost(`/utility/meters/${meterId}/reads`, { readingValue: Number(value), reason, reasonNote: note || undefined,
+      ...(reason === 'move_out_final' && preset.leaseId && meterId === preset.meterId ? { leaseId: preset.leaseId } : {}) }),
     { onSuccess: (r:any) => { toast(r?.data?.billed ? 'Read recorded — final bill created' : 'Reading recorded'); onClose() },
       onError: (e:any) => toast.error(e?.response?.data?.error || 'Could not record the reading') }
   )

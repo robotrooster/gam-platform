@@ -11,6 +11,7 @@ import {
   MaintenanceJobCategory,
 } from '@gam/shared'
 import { appConfirm } from '../components/dialogs'
+import { PermissionToggleRow, PERMISSION_ROW_GRID } from '../components/PermissionCatalogEditor'
 
 // Dedicated per-user permissions page — THE one surface for configuring a
 // staff member (S526: the old Team-row expandable grid is retired). The
@@ -184,21 +185,15 @@ export function StaffPermissionsPage() {
                   <div style={{ fontSize: '.7rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 8 }}>
                     {section.label}
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 6 }}>
+                  <div style={PERMISSION_ROW_GRID}>
                     {section.items.map(item => (
-                      <label key={item.key} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.83rem', color: 'var(--text-1)', cursor: 'pointer', padding: '4px 0' }}>
-                        <input
-                          type="checkbox"
-                          checked={!!perms[item.key]}
-                          onChange={() => toggle(item.key)}
-                          disabled={save.isLoading}
-                        />
-                        <span>{item.label}</span>
-                        {item.sensitive && (
-                          <span style={{ fontSize: '.62rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.04em', color: 'var(--gold)', background: 'rgba(201,162,39,.12)', border: '1px solid rgba(201,162,39,.3)', borderRadius: 4, padding: '1px 5px' }}>sensitive</span>
-                        )}
-                        {item.hint && <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>— {item.hint}</span>}
-                      </label>
+                      <PermissionToggleRow
+                        key={item.key}
+                        item={item}
+                        checked={!!perms[item.key]}
+                        onToggle={() => toggle(item.key)}
+                        disabled={save.isLoading}
+                      />
                     ))}
                   </div>
                 </div>

@@ -807,9 +807,14 @@ export async function unitPendingReads(unitId: string) {
          AND (b.status = 'checked_out'
               OR (b.status IN ('confirmed','checked_in') AND b.check_out <= CURRENT_DATE))
     )
-    SELECT DISTINCT m.id AS meter_id, m.label AS meter_label, m.utility_type,
+    -- 10/3: one row per meter (two departures used to ask for the same meter
+    -- twice). A billing move-out wins over a turnover; its lease rides along
+    -- so the read bills that household.
+    SELECT DISTINCT ON (m.id) m.id AS meter_id, m.label AS meter_label, m.utility_type,
            CASE WHEN d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)
-                THEN 'move_out_final' ELSE 'stay_turnover' END AS reason
+                THEN 'move_out_final' ELSE 'stay_turnover' END AS reason,
+           CASE WHEN d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)
+                THEN d.lease_id END AS lease_id
       FROM departures d
       JOIN utility_meter_units mu ON mu.unit_id = $1
       JOIN utility_meters m ON m.id = mu.meter_id
@@ -818,6 +823,9 @@ export async function unitPendingReads(unitId: string) {
              ON lur.lease_id = d.lease_id AND lur.utility_type = m.utility_type
      WHERE NOT EXISTS (
         SELECT 1 FROM utility_meter_readings r
-         WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)`,
+         WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)
+     ORDER BY m.id,
+              (d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) DESC,
+              d.departed_on DESC`,
     [unitId])
 }

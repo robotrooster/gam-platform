@@ -44,6 +44,7 @@
  */
 
 import { query } from '../../../db'
+import { openBalanceSql, openAmountSql } from '../../openBalances'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 type Subject = 'tenants' | 'units' | 'properties'
@@ -117,16 +118,21 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
              WHERE p.landlord_id = ANY($1::uuid[]) AND p.type = 'rent' AND p.due_date <= CURRENT_DATE
              GROUP BY t.id, u.first_name, u.last_name`,
     },
+    // S655 (money plan, Step 11): the Outstanding page's own rule
+    // (services/openBalances.openBalanceSql) — never a payment still clearing,
+    // a work-trade line or the FlexPay pull — so "who owes the most" ranks the
+    // same figures that page shows. The full balance: credit is not taken off.
     balance_owed: {
-      means: 'what they currently owe',
+      means: 'what they currently owe (the full balance; credit they have is not taken off)',
       unit: 'dollars',
       sql: `SELECT u.first_name || ' ' || u.last_name AS label,
-                   COALESCE(SUM(p.amount), 0)::numeric AS value,
+                   COALESCE(SUM(${openAmountSql('p')}), 0)::numeric AS value,
                    COUNT(*)::text || ' unpaid charges' AS detail
               FROM payments p
-              JOIN tenants t ON t.id = p.tenant_id
+              LEFT JOIN invoices inv ON inv.id = p.invoice_id
+              JOIN tenants t ON t.id = COALESCE(p.tenant_id, inv.tenant_id)
               JOIN users u   ON u.id = t.user_id
-             WHERE p.landlord_id = ANY($1::uuid[]) AND p.status IN ('pending','failed')
+             WHERE p.landlord_id = ANY($1::uuid[]) AND ${openBalanceSql('p')} AND ${openAmountSql('p')} > 0
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     complaints_filed: {

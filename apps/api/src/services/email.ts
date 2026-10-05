@@ -1,5 +1,5 @@
 import { Resend } from 'resend'
-import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL } from '@gam/shared'
+import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL, FLEXPAY_TERMS } from '@gam/shared'
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { buildDemoBookingIcs } from './demoCalendar'
@@ -1812,6 +1812,18 @@ export async function sendPasswordResetEmail(
 }
 
 
+/** The FlexPay terms, section by section, exactly as packages/shared states them. */
+export function flexPayTermsBlock(): string {
+  return `<div style="margin:16px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+    <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">How FlexPay works</div>
+    ${FLEXPAY_TERMS.map(t =>
+      `<div style="margin-bottom:10px">
+         <div style="font-size:.84rem;font-weight:700;color:#eef1f8">${escapeHtml(t.title)}</div>
+         <div style="font-size:.82rem;color:#b8c4d8;line-height:1.55">${escapeHtml(t.body)}</div>
+       </div>`).join('')}
+  </div>`
+}
+
 // S322: FlexSuite enrollment confirmation with attached populated
 // terms PDF. The PDF is the load-bearing tenant-inbox-durability copy
 // of the click-accepted SLA / Subscription Terms; the canonical legal
@@ -1840,6 +1852,10 @@ export async function emailFlexsuiteEnrollment(args: {
     p(greeting) +
     p(`Thank you for enrolling. Your accepted copy of the ${productLabel} is attached as a PDF for your records.`) +
     p(`<strong style="color:#eef1f8">What's attached:</strong> the exact populated agreement you click-accepted on the platform on <strong style="color:#eef1f8">${args.acceptedAt.toLocaleString()}</strong>. Keep it with your other GAM records.`) +
+    // S655: how FlexPay works, in the same words as the app, the PDF and the
+    // admin screen (packages/shared FLEXPAY_TERMS) — one set of terms, so the
+    // email can never promise something the code does not do.
+    (args.product === 'flexpay' ? flexPayTermsBlock() : '') +
     `<div style="margin-top:20px;padding:12px 14px;background:#1a1f24;border-radius:7px;font-size:.74rem;color:#a0aec0;line-height:1.5">
       <div><strong style="color:#c9a227">Acceptance ID</strong> ${args.acceptanceId}</div>
       <div style="margin-top:4px"><strong style="color:#c9a227">Template version</strong> v${args.templateVersion}</div>
@@ -2636,15 +2652,21 @@ export async function emailPaymentReceipt(
   args: {
     tenantName: string
     unitLabel: string
+    /** S655: the MONEY received: the lines, less account credit used, plus anything kept on account. */
     amount: number
     method: string          // 'cash' | 'check' | 'money order' | 'card' | 'bank transfer'
     reference?: string | null
     paidAt: Date
-    lines: Array<{ label: string; amount: number }>
+    /** Each charge paid, by name ("Rent", "Water"), at its full amount. */
+    lines: Array<{ label: string; detail?: string | null; amount: number }>
     /** Set when the money has not settled yet — ACH in flight. */
     pending?: boolean
+    /** S655: account credit that paid part of these lines — its own line, never hidden in the total. */
+    creditApplied?: number
     /** S637: surplus kept on account rather than handed back. */
     creditBanked?: number
+    /** S655: "your October bill", for a bill paid entirely with account credit. */
+    billLabel?: string | null
     portalUrl?: string
   },
   ctx?: { landlordId?: string; tenantId?: string; paymentId?: string },
@@ -2653,36 +2675,50 @@ export async function emailPaymentReceipt(
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
   const when = args.paidAt.toLocaleDateString('en-US',
     { month: 'long', day: 'numeric', year: 'numeric' })
+  const credit = Math.max(0, Math.round((args.creditApplied ?? 0) * 100) / 100)
+  const banked = Math.max(0, Math.round((args.creditBanked ?? 0) * 100) / 100)
+  // S655: nothing was charged — the account credit paid the whole thing.
+  const creditOnly = args.amount <= 0 && credit > 0
+  const bill = args.billLabel || 'bill'
 
-  const rows = args.lines.map(l =>
-    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#b8c4d8;margin-bottom:5px">
-       <span>${l.label}</span><span>${money(l.amount)}</span>
-     </div>`).join('')
+  const line = (label: string, amount: string, color = '#b8c4d8', detail?: string | null) =>
+    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:${color};margin-bottom:5px">
+       <span>${escapeHtml(label)}${detail ? `<span style="display:block;font-size:.74rem;color:#7a8aaa">${escapeHtml(detail)}</span>` : ''}</span><span>${amount}</span>
+     </div>`
+  const rows = args.lines.map(l => line(l.label, money(l.amount), '#b8c4d8', l.detail)).join('') +
+    (credit > 0 ? line('Account credit applied', `-${money(credit)}`, '#5fbf7f') : '') +
+    (banked > 0 ? line('Kept on your account as credit', `+${money(banked)}`, '#5fbf7f') : '')
 
-  const subject = args.pending
-    ? `Payment received — ${money(args.amount)} for ${args.unitLabel}`
-    : `Receipt — ${money(args.amount)} for ${args.unitLabel}`
+  const subject = creditOnly
+    ? `Your ${bill} was paid with your account credit — ${args.unitLabel}`
+    : args.pending
+      ? `Payment received — ${money(args.amount)} for ${args.unitLabel}`
+      : `Receipt — ${money(args.amount)} for ${args.unitLabel}`
 
   return await send(to, subject,
     base(
-      h(args.pending ? 'Payment Received' : 'Payment Receipt') +
-      p(`Hi ${args.tenantName},`) +
-      p(args.pending
-        ? `We've received your payment of <strong style="color:#eef1f8">${money(args.amount)}</strong>. Bank transfers take about four business days to clear — nothing more is needed from you, and we'll only be in touch if there's a problem.`
-        : `Thank you — your payment of <strong style="color:#eef1f8">${money(args.amount)}</strong> was received on ${when}.`) +
+      h(creditOnly ? 'Paid With Your Account Credit' : args.pending ? 'Payment Received' : 'Payment Receipt') +
+      p(`Hi ${escapeHtml(args.tenantName)},`) +
+      p(creditOnly
+        ? `Your ${escapeHtml(bill)} was paid with your account credit on ${when}. Nothing was charged to you.`
+        : args.pending
+          ? `We've received your payment of <strong style="color:#eef1f8">${money(args.amount)}</strong>. Bank transfers take about four business days to clear — nothing more is needed from you, and we'll only be in touch if there's a problem.`
+          : `Thank you — your payment of <strong style="color:#eef1f8">${money(args.amount)}</strong> was received on ${when}.`) +
       `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
-         <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">${args.unitLabel}</div>
+         <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">${escapeHtml(args.unitLabel)}</div>
          ${rows}
          <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
                      border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
-           <span>${args.pending ? 'Total submitted' : 'Total paid'}</span><span>${money(args.amount)}</span>
+           <span>${creditOnly ? 'Charged to you' : args.pending ? 'Total submitted' : 'Total paid'}</span><span>${money(Math.max(0, args.amount))}</span>
          </div>
          <div style="font-size:.78rem;color:#7a8aaa;margin-top:9px">
-           Paid by ${args.method}${args.reference ? ` &middot; #${args.reference}` : ''} &middot; ${when}
+           ${creditOnly
+             ? `Paid with your account credit &middot; ${when}`
+             : `Paid by ${escapeHtml(args.method)}${args.reference ? ` &middot; #${escapeHtml(args.reference)}` : ''} &middot; ${when}`}
          </div>
        </div>` +
-      (args.creditBanked && args.creditBanked > 0
-        ? p(`You paid <strong style="color:#eef1f8">${money(args.creditBanked)}</strong> more than was owed. It's being held on your account and comes off your next bill automatically.`)
+      (banked > 0
+        ? p(`You paid <strong style="color:#eef1f8">${money(banked)}</strong> more than was owed. It is kept on your account as credit. It pays a bill by itself only when it covers the whole bill; otherwise you can choose to use it when you pay.`)
         : '') +
       (args.portalUrl ? btn('View your account', args.portalUrl) : '') +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Keep this receipt for your records.</div>`
@@ -2692,6 +2728,7 @@ export async function emailPaymentReceipt(
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.paymentId ? 'payment' : null,
       relatedEntityId: ctx?.paymentId ?? null,
+      metadata: { amount: Math.max(0, args.amount), credit_applied: credit, credit_banked: banked, credit_only: creditOnly },
     },
     // A receipt is something people reply to when a figure looks wrong.
     'support',
@@ -2720,10 +2757,11 @@ export async function emailBalanceDue(
   args: {
     tenantName: string
     unitLabel: string
+    /** S655: the FULL balance. Credit is never taken off it. */
     total: number
-    lines: Array<{ label: string; amount: number; dueDate?: string | null }>
-    /** Credit on account, already netted out of `total`. Shown so the figure adds up. */
-    creditApplied?: number
+    lines: Array<{ label: string; detail?: string | null; amount: number; dueDate?: string | null }>
+    /** S655: what their credit would pay now — said beside the balance, never netted. */
+    creditAvailable?: number
     portalUrl?: string
     landlordName?: string
   },
@@ -2734,36 +2772,36 @@ export async function emailBalanceDue(
 
   const rows = args.lines.map(l =>
     `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#b8c4d8;margin-bottom:5px">
-       <span>${l.label}${l.dueDate ? `<span style="color:#7a8aaa"> &middot; due ${l.dueDate}</span>` : ''}</span>
+       <span>${escapeHtml(l.label)}${l.dueDate ? `<span style="color:#7a8aaa"> &middot; due ${escapeHtml(l.dueDate)}</span>` : ''}${l.detail ? `<span style="display:block;font-size:.74rem;color:#7a8aaa">${escapeHtml(l.detail)}</span>` : ''}</span>
        <span>${money(l.amount)}</span>
      </div>`).join('')
+  const credit = Math.max(0, Math.round((args.creditAvailable ?? 0) * 100) / 100)
 
   return await send(to, `Balance due — ${money(args.total)} for ${args.unitLabel}`,
     base(
       h('You Have a Balance Due') +
-      p(`Hi ${args.tenantName},`) +
+      p(`Hi ${escapeHtml(args.tenantName)},`) +
       p(`This is a reminder that <strong style="color:#eef1f8">${money(args.total)}</strong> is currently owed on your account.`) +
       `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
-         <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">${args.unitLabel}</div>
-         ${rows}` +
-      (args.creditApplied && args.creditApplied > 0
-        ? `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#5fbf7f;margin-bottom:5px">
-             <span>Credit on your account</span><span>-${money(args.creditApplied)}</span>
-           </div>`
-        : '') +
-      `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+         <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">${escapeHtml(args.unitLabel)}</div>
+         ${rows}
+         <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
                      border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
            <span>Total due</span><span>${money(args.total)}</span>
          </div>
        </div>` +
+      (credit > 0
+        ? p(`You have <strong style="color:#eef1f8">${money(credit)}</strong> credit available — you can use it when you pay.`)
+        : '') +
       (args.portalUrl ? btn('Pay now', args.portalUrl) : '') +
-      p(`If any of this looks wrong, reply to this email and ${args.landlordName || 'your landlord'} will take a look.`)
+      p(`If any of this looks wrong, reply to this email and ${escapeHtml(args.landlordName || 'your landlord')} will take a look.`)
     ),
     {
       category: 'balance_due_reminder',
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,
+      metadata: { total: args.total, credit_available: credit },
     },
     'support',
   )
@@ -2876,15 +2914,14 @@ export async function emailInvoiceReady(
     unitLabel: string
     invoiceNumber: string
     dueDateLabel: string
+    /** S655: the FULL bill still owed. Credit is never taken off it. */
     total: number
-    /** S653: a covered line was settled before this email (paid-ahead credit, a check) — listed, not owed. */
-    lines: Array<{ label: string; amount: number; covered?: boolean; coveredHow?: string }>
+    /** Each charge by name ("Rent", "Water"); a covered line was settled before this email — listed, not owed. */
+    lines: Array<{ label: string; detail?: string | null; amount: number; covered?: boolean; coveredHow?: string }>
     /** Work traded off this cycle — owed by nobody, but it belongs on the bill. */
     workTradeCredit?: number
-    /** S653: paid-ahead money this month will use, already netted out of `total`. */
-    prepaidApplied?: number
-    /** Credit on account, already netted out of `total`. */
-    creditApplied?: number
+    /** S655: the credit Pay Now will offer for this bill — said beside it, never netted. */
+    creditAvailable?: number
     portalUrl?: string
     landlordName?: string
     /** S654: the bill changed after it was announced — say so, so the earlier email is not the one they pay. */
@@ -2895,9 +2932,10 @@ export async function emailInvoiceReady(
   const money = (n: number) =>
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
 
+  // The covered tag sits BESIDE the line's name, never in place of it.
   const rows = args.lines.map(l =>
     `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:${l.covered ? '#7a8aaa' : '#b8c4d8'};margin-bottom:5px">
-       <span>${escapeHtml(l.label)}${l.covered ? ` <span style="font-size:.72rem;color:#5fbf7f">&mdash; covered (${escapeHtml(l.coveredHow || 'already paid')})</span>` : ''}</span><span style="${l.covered ? 'text-decoration:line-through' : ''}">${money(l.amount)}</span>
+       <span>${escapeHtml(l.label)}${l.covered ? ` <span style="font-size:.72rem;color:#5fbf7f">&mdash; covered (${escapeHtml(l.coveredHow || 'already paid')})</span>` : ''}${l.detail ? `<span style="display:block;font-size:.74rem;color:#7a8aaa">${escapeHtml(l.detail)}</span>` : ''}</span><span style="${l.covered ? 'text-decoration:line-through' : ''}">${money(l.amount)}</span>
      </div>`).join('')
 
   const deduction = (label: string, amount: number) =>
@@ -2908,6 +2946,7 @@ export async function emailInvoiceReady(
   // A zero balance is still worth sending: it is the tenant's proof that the
   // month was covered, and the commonest cause is work trade.
   const settled = args.total <= 0
+  const credit = Math.max(0, Math.round((args.creditAvailable ?? 0) * 100) / 100)
 
   const updated = !!args.updated && !settled
   return await send(to,
@@ -2928,13 +2967,16 @@ export async function emailInvoiceReady(
          <div style="font-size:.72rem;color:#7a8aaa;margin-bottom:10px">Invoice ${escapeHtml(args.invoiceNumber)} &middot; due ${escapeHtml(args.dueDateLabel)}</div>
          ${rows}` +
       (args.workTradeCredit && args.workTradeCredit > 0 ? deduction('Work trade', args.workTradeCredit) : '') +
-      (args.prepaidApplied && args.prepaidApplied > 0 ? deduction('Your paid-ahead credit', args.prepaidApplied) : '') +
-      (args.creditApplied && args.creditApplied > 0 ? deduction('Credit on your account', args.creditApplied) : '') +
       `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
                      border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
            <span>${settled ? 'Balance' : 'Total due'}</span><span>${money(Math.max(0, args.total))}</span>
          </div>
        </div>` +
+      // S655 (Nic, 10/2): credit is used when they pay — they choose "Use all"
+      // or "Save it for later" — so it is said here, not taken off the bill.
+      (!settled && credit > 0
+        ? p(`You have <strong style="color:#eef1f8">${money(credit)}</strong> credit available — you can use it when you pay.`)
+        : '') +
       (!settled && args.portalUrl ? btn('Pay now', args.portalUrl) : '') +
       p(`If any of this looks wrong, reply to this email and ${escapeHtml(args.landlordName || 'your landlord')} will take a look.`)
     ),
@@ -2943,6 +2985,7 @@ export async function emailInvoiceReady(
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.invoiceId ? 'invoice' : (ctx?.tenantId ? 'tenant' : null),
       relatedEntityId: ctx?.invoiceId ?? ctx?.tenantId ?? null,
+      metadata: { total: Math.max(0, args.total), credit_available: credit },
     },
     'support',
   )

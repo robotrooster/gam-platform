@@ -44,11 +44,13 @@
  *     early termination, the landlord waiving its fee, a lease that replaced
  *     it). Nobody is staying on to take the new lease up. If nobody in the
  *     household signed it, it never takes over (scheduler.activatePendingLeases),
- *     nobody can sign it any more (POST /esign/sign), the tenant portal no
+ *     nobody can sign it any more (POST /esign/sign; an old emailed link opens
+ *     it read-only with the reason, GET /esign/sign), the tenant portal no
  *     longer shows it, and it is canceled (scheduler.processNewLeaseSignings) —
- *     unless money was already paid on it: then the landlord side and GAM are
- *     told once, the deposit record goes back to the lease that ended, and it
- *     is canceled once that payment has been returned or moved. If someone did
+ *     unless money was already paid on it: then the deposit record goes back to
+ *     the lease that ended, what it billed that was never owed comes off
+ *     (clearNeverOwedOnHeldNewLease), the landlord side and GAM are told once,
+ *     and it is canceled once that payment has been returned or moved. If someone did
  *     sign, it stands (S558, decisions 10/2 #8) and the leaving date goes on it
  *     once it starts. Ending a lease early while its new lease waits is refused
  *     up front, in the same words the front desk gets (newLeaseBlocksEarlyEnd),
@@ -110,8 +112,8 @@ export function someoneSignedNewLease(alias: string): string {
  * walkthrough (moveOutInspections), nobody is told it "takes over whether or
  * not they sign" (renewalPing, the landlord's Leases page), the tenant is not
  * reminded about it, shown it, or let sign it (processNewLeaseSignings' 9am
- * reminders, GET /tenants/me, /lease and /leases, POST /esign/sign), and it is
- * canceled (processNewLeaseSignings). ONE definition for all of them, so they
+ * reminders, GET /tenants/me, /lease and /leases, GET and POST /esign/sign), and
+ * it is canceled (processNewLeaseSignings). ONE definition for all of them, so they
  * never disagree.
  */
 export function followsLeaseEndedEarlyUnsigned(alias: string): string {
@@ -331,7 +333,8 @@ export async function newLeaseFollowing(q: Q, leaseId: string): Promise<{
 
 /**
  * Ending a lease EARLY (services/leaseTermination — the tenant's "End lease
- * early", or the landlord waiving its fee and ending it) while the household's
+ * early", or the landlord waiving its fee and ending it; PATCH /leases/:id to
+ * 'terminated' or 'expired', the API's and the agent's door) while the household's
  * new lease waits is the contradiction the front desk's leaving date already
  * refuses (moveOutNotice.recordMoveOutNotice): leaving, and staying on a new
  * lease, cannot both be true. Ended anyway, the new lease came into force on its
@@ -426,4 +429,250 @@ export async function newLeasesAfterEarlyEnd(q: Q): Promise<any[]> {
         AND d.status NOT IN ('completed', 'voided')
         AND ${followsLeaseEndedEarlyUnsigned('s')}
       ORDER BY p.name, COALESCE(u.display_label, u.unit_number)`)).rows
+}
+
+/**
+ * What a signer is told when they open (GET /esign/sign) or try to sign (POST
+ * /esign/sign) a new lease whose lease ENDED EARLY with nobody in the household
+ * signed (followsLeaseEndedEarlyUnsigned): it can no longer be signed, it is
+ * being canceled, and who to ask if they meant to stay. One set of words for
+ * both, so the page never offers a Sign button the submit then refuses.
+ */
+export const NEW_LEASE_AFTER_EARLY_END_CANNOT_SIGN =
+  'The lease this new lease was to follow has ended, so it can no longer be signed — it is being canceled. ' +
+  'If you meant to stay, contact the office.'
+
+/** A charge row on a held new lease that could not be taken off (see clearNeverOwedOnHeldNewLease). */
+export interface KeptCharge {
+  /** The charge row (payments.id); null for a utility bill that has no charge row yet. */
+  paymentId: string | null
+  /** The utility bill it belongs to, when it is a utility charge. */
+  utilityBillId: string | null
+  /** Plain words: "deposit", "utility", "late fee"… */
+  kind: string
+  amount: number
+  /** YYYY-MM-DD, or null when it has none. */
+  dueDate: string | null
+}
+
+/** What a charge row is, in plain words (payments.type → words; never the raw value). */
+const CHARGE_KIND_WORDS: Record<string, string> = {
+  rent: 'rent', fee: 'fee', deposit: 'deposit', utility: 'utility', late_fee: 'late fee',
+  home_payment: 'home payment', carried_balance: 'carried-over balance',
+  float_fee: 'FlexPay fee', platform_fee: 'platform fee',
+}
+function chargeKindWords(type: string | null | undefined): string {
+  return CHARGE_KIND_WORDS[String(type ?? '')] ?? 'charge'
+}
+
+/**
+ * The kept charges, named for GAM: "the $100.00 deposit charge due November 12,
+ * 2026" — one, or a list joined in plain English.
+ */
+export function sayKeptCharges(kept: KeptCharge[]): string {
+  const one = (k: KeptCharge) =>
+    `the ${sayMoney(k.amount)} ${k.kind} charge` + (k.dueDate ? ` due ${sayDate(k.dueDate)}` : '')
+  const named = kept.map(one)
+  if (named.length <= 1) return named[0] ?? ''
+  return `${named.slice(0, -1).join(', ')} and ${named[named.length - 1]}`
+}
+
+/**
+ * A new lease that will never start (its lease ended early and nobody in the
+ * household signed it) but cannot be canceled yet because money was paid on it
+ * (scheduler.processNewLeaseSignings' held step). What it billed that was never
+ * owed comes off NOW, so the household that left is not shown a deposit due on
+ * a lease that will never start, asked to pay it, or charged a late fee on it
+ * while the paid money is sorted out — every further payment would only be
+ * more money to return before the cancel can finish.
+ *
+ * Exactly the never-owed rows lib/unwindIssuedLease removes when the cancel
+ * does go through, and nothing else:
+ *
+ *   - a utility bill on it that nobody has paid goes back, unbilled, to the
+ *     lease that ended (the usage is real and the household's), and its unpaid
+ *     charge row goes;
+ *   - its unpaid charge rows ('pending' / 'failed') are removed;
+ *   - its open bills ('pending' / 'partial'), read BEFORE anything is removed:
+ *       · a bill with no money left on it that moved is voided at $0, with any
+ *         open work-trade settlement on it;
+ *       · a bill that still carries money that MOVED (a line paid, or a payment
+ *         on its way) is NOT voided — a void bill reads $0 with money on it, and
+ *         a void bill never changes status again, so a payment still on its way
+ *         would settle onto a dead $0 bill. Its total and subtotals are rebuilt
+ *         from the lines still on it, and its status follows them (the invoice
+ *         status rollup — 'settled' once everything left on it is paid, a line
+ *         paid from the deposit included).
+ *     Read before, because every removal re-rolls the bill's status: a bill
+ *     whose only unpaid line went would already read 'settled' — still totaling
+ *     the line that is gone — and be skipped.
+ *
+ * The rebuilt bill is totaled the way the move-in bundle built it: rent, fee and
+ * deposit lines, utility (released onto it) and home-payment lines each in their
+ * own subtotal (a deposit box tagged on the lease — a row with its lease_fee_id —
+ * counts under fees, as it was billed; the security deposit's own line under
+ * deposits); the total is every line still owed or paid that is not suspended
+ * for work trade and is not a late fee (late fees ride a bill as their own lines
+ * and are never in its total — jobs/lateFees). A 'failed' or 'returned' line is
+ * neither.
+ *
+ * Money that MOVED (settled, processing, paid from a deposit) is never touched:
+ * returning or moving it is what the hold waits on.
+ *
+ * Each removal is tried on its own (a savepoint), so one charge row that another
+ * record still points at — a bank remittance applied to it, an ACH log entry —
+ * stays where it is and is counted in `kept` (and named in `keptCharges`) for GAM
+ * to take off by hand, instead of failing the whole step on every run. Run
+ * INSIDE a transaction. Idempotent: run again it finds nothing new to do.
+ *
+ * Returns how many charge rows came off (`charges`), bills voided (`bills`),
+ * bills rebuilt around money still on them (`retotaled`), utility bills sent
+ * back (`utilityBills`), and what stayed (`kept` / `keptCharges`).
+ */
+export async function clearNeverOwedOnHeldNewLease(
+  q: Q, newLeaseId: string, endedLeaseId: string,
+): Promise<{
+  charges: number; bills: number; retotaled: number; utilityBills: number; kept: number; keptCharges: KeptCharge[]
+}> {
+  const alone = async (step: () => Promise<unknown>): Promise<boolean> => {
+    await q('SAVEPOINT never_owed_row')
+    try {
+      await step()
+      await q('RELEASE SAVEPOINT never_owed_row')
+      return true
+    } catch {
+      await q('ROLLBACK TO SAVEPOINT never_owed_row')
+      await q('RELEASE SAVEPOINT never_owed_row')
+      return false
+    }
+  }
+  // The open bills, read before anything below re-rolls their status.
+  const open = (await q(
+    `SELECT id FROM invoices WHERE lease_id = $1 AND status IN ('pending', 'partial') ORDER BY due_date, id`,
+    [newLeaseId])).rows.map((r: any) => r.id as string)
+  /** Bills a line was taken off. */
+  const touched = new Set<string>()
+  const keptCharges: KeptCharge[] = []
+
+  // Utility first: the bill points at its charge row.
+  let utilityBills = 0
+  const utility = (await q(
+    `SELECT ub.id, ub.payment_id, ub.charge_amount::text AS charge_amount,
+            pm.invoice_id, pm.amount::text AS amount, to_char(pm.due_date, 'YYYY-MM-DD') AS due_date
+       FROM utility_bills ub
+       LEFT JOIN payments pm ON pm.id = ub.payment_id
+      WHERE ub.lease_id = $1
+        AND (ub.payment_id IS NULL OR pm.status IN ('pending', 'failed'))
+      ORDER BY ub.billing_cycle_month, ub.id`, [newLeaseId])).rows
+  for (const b of utility) {
+    const moved = await alone(async () => {
+      await q(
+        `UPDATE utility_bills
+            SET lease_id = $2, payment_id = NULL,
+                status = CASE WHEN status = 'billed' THEN 'unbilled' ELSE status END,
+                updated_at = NOW()
+          WHERE id = $1`, [b.id, endedLeaseId])
+      if (b.payment_id) {
+        await q(`DELETE FROM payments WHERE id = $1 AND status IN ('pending', 'failed')`, [b.payment_id])
+      }
+    })
+    if (moved) {
+      utilityBills++
+      if (b.invoice_id) touched.add(b.invoice_id)
+    } else {
+      keptCharges.push({
+        paymentId: b.payment_id ?? null, utilityBillId: b.id, kind: 'utility',
+        amount: Number(b.amount ?? b.charge_amount ?? 0), dueDate: b.due_date ?? null,
+      })
+    }
+  }
+  let charges = 0
+  const unpaid = (await q(
+    `SELECT id, invoice_id, type, amount::text AS amount, to_char(due_date, 'YYYY-MM-DD') AS due_date
+       FROM payments
+      WHERE status IN ('pending', 'failed')
+        AND (lease_id = $1 OR invoice_id IN (SELECT id FROM invoices WHERE lease_id = $1))
+      ORDER BY due_date NULLS LAST, id`, [newLeaseId])).rows
+  // A utility bill that could not go back keeps its charge row with it — already
+  // counted above, once.
+  const keptWithBill = new Set(keptCharges.map(k => k.paymentId).filter(Boolean))
+  for (const r of unpaid) {
+    if (keptWithBill.has(r.id)) continue
+    if (await alone(() => q(`DELETE FROM payments WHERE id = $1`, [r.id]))) {
+      charges++
+      if (r.invoice_id) touched.add(r.invoice_id)
+    } else {
+      keptCharges.push({
+        paymentId: r.id, utilityBillId: null, kind: chargeKindWords(r.type),
+        amount: Number(r.amount), dueDate: r.due_date ?? null,
+      })
+    }
+  }
+
+  let bills = 0
+  let retotaled = 0
+  for (const invoiceId of open) {
+    const movedLeft = (await q(
+      `SELECT 1 FROM payments
+        WHERE invoice_id = $1 AND status IN ('settled', 'processing', 'paid_via_deposit') LIMIT 1`,
+      [invoiceId])).rows.length > 0
+    if (!movedLeft) {
+      await q(`DELETE FROM work_trade_settlements WHERE invoice_id = $1 AND status = 'open'`, [invoiceId])
+      await q(
+        `UPDATE invoices SET status = 'void', total_amount = 0, updated_at = NOW()
+          WHERE id = $1 AND status <> 'void'`, [invoiceId])
+      bills++
+      continue
+    }
+    // Money moved on it, and nothing was taken off it: it is left exactly as it is.
+    if (!touched.has(invoiceId)) continue
+    // Nothing on it is owed any more, so no hours are credited against it.
+    await q(`DELETE FROM work_trade_settlements WHERE invoice_id = $1 AND status = 'open'`, [invoiceId])
+    const changed = await q(
+      `WITH lines AS (
+         SELECT p.type, p.amount, p.lease_fee_id, p.work_trade_suspended_at
+           FROM payments p
+          WHERE p.invoice_id = $1
+            AND p.status IN ('pending', 'processing', 'settled', 'paid_via_deposit')),
+       t AS (
+         SELECT COALESCE(SUM(amount) FILTER (WHERE work_trade_suspended_at IS NULL AND type <> 'late_fee'), 0) AS total,
+                COALESCE(SUM(amount) FILTER (WHERE type = 'rent'), 0) AS rent,
+                COALESCE(SUM(amount) FILTER (WHERE type = 'fee'
+                                             OR (type = 'deposit' AND lease_fee_id IS NOT NULL)), 0) AS fees,
+                COALESCE(SUM(amount) FILTER (WHERE type = 'deposit' AND lease_fee_id IS NULL), 0) AS deposits,
+                COALESCE(SUM(amount) FILTER (WHERE type = 'utility'), 0) AS utilities,
+                COALESCE(SUM(amount) FILTER (WHERE type = 'home_payment'), 0) AS home
+           FROM lines)
+       UPDATE invoices i
+          SET total_amount = t.total, subtotal_rent = t.rent, subtotal_fees = t.fees,
+              subtotal_deposits = t.deposits, subtotal_utilities = t.utilities,
+              subtotal_home_payments = t.home, updated_at = NOW()
+         FROM t
+        WHERE i.id = $1
+          AND (i.total_amount, i.subtotal_rent, i.subtotal_fees, i.subtotal_deposits,
+               i.subtotal_utilities, i.subtotal_home_payments)
+              IS DISTINCT FROM (t.total, t.rent, t.fees, t.deposits, t.utilities, t.home)
+        RETURNING i.id`, [invoiceId])
+    // Its status follows what is left on it (the same rollup the payments
+    // trigger runs) — 'settled' once all of it is paid, 'pending' while a payment
+    // is on its way.
+    await q(`SELECT fn_invoice_status_rollup_single($1::uuid)`, [invoiceId])
+    // Final sweep (10/3): that rollup counts only 'settled' lines as paid, so a
+    // bill whose money left is a line paid from the deposit read 'pending' — an
+    // open-looking bill with nothing owed on it (it used to be voided). Paid is
+    // paid: when every line left is paid (settled, or paid from the deposit) —
+    // a returned line is not in its total, and its re-billed charge came off
+    // above — the bill reads 'settled'. Done here, not in the shared rollup,
+    // which every bill on the platform runs.
+    await q(
+      `UPDATE invoices i SET status = 'settled', updated_at = NOW()
+        WHERE i.id = $1 AND i.status NOT IN ('settled', 'void')
+          AND EXISTS (SELECT 1 FROM payments p
+                       WHERE p.invoice_id = i.id AND p.status IN ('settled', 'paid_via_deposit'))
+          AND NOT EXISTS (SELECT 1 FROM payments p
+                           WHERE p.invoice_id = i.id
+                             AND p.status NOT IN ('settled', 'paid_via_deposit', 'returned'))`, [invoiceId])
+    if (changed.rows.length) retotaled++
+  }
+  return { charges, bills, retotaled, utilityBills, kept: keptCharges.length, keptCharges }
 }

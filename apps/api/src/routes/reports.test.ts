@@ -98,6 +98,9 @@ async function seed(): Promise<Fixture> {
   finally { c.release() }
 }
 
+// S655: a row paid with no settle time given was paid ON its due date (noon,
+// Phoenix), so "Money received" (settle day) and "Money billed" (due date)
+// put it in the same month; with no due date either, it is due and paid now.
 async function seedSettledRentPayment(opts: {
   unitId: string; tenantId: string; landlordId: string
   amount?: number; settledAt?: string; dueDate?: string
@@ -108,7 +111,9 @@ async function seedSettledRentPayment(opts: {
         entry_description, due_date, settled_at)
      VALUES ($1,$2,$3,'rent',$4,'settled','RENT',
              COALESCE($5::date, CURRENT_DATE),
-             COALESCE($6::timestamptz, NOW())) RETURNING id`,
+             COALESCE($6::timestamptz,
+                      ($5::date + TIME '12:00') AT TIME ZONE 'America/Phoenix',
+                      NOW())) RETURNING id`,
     [opts.unitId, opts.tenantId, opts.landlordId,
      opts.amount ?? 1000, opts.dueDate ?? null, opts.settledAt ?? null])
   return id
@@ -328,15 +333,15 @@ describe('GET /api/reports/monthly-statement', () => {
   it('cross-landlord: payments returned are caller-scoped only', async () => {
     const f = await seed()
     await seedSettledRentPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id,
-                                    landlordId: f.aLid, amount: 1000 })
+                                    landlordId: f.aLid, amount: 1000, dueDate: '2026-06-01' })
     await seedSettledRentPayment({ unitId: f.bUnitId, tenantId: f.tenant1Id,
-                                    landlordId: f.bLid, amount: 2000 })
+                                    landlordId: f.bLid, amount: 2000, dueDate: '2026-06-01' })
     const res = await request(buildApp())
       .get('/api/reports/monthly-statement?year=2026&month=6')
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
     expect(res.status).toBe(200)
-    const ids = (res.body.data.payments as any[]).map(p => p.landlord_id)
-    expect(ids.every(lid => lid === f.aLid)).toBe(true)
+    const rows = res.body.data.payments as any[]
+    expect(rows.map(p => [p.landlordId, p.amount])).toEqual([[f.aLid, 1000]])
   })
 })
 
@@ -1116,30 +1121,60 @@ describe('S654: every dollar counted once in the landlord reports', () => {
     expect(d.monthlyTrend.find((t: any) => t.month === '2026-09').collected).toBe(700)
   })
 
-  it('paid-ahead money GAM holds counts once — as rent when drawn down, not when paid', async () => {
+  // S655 (Nic, 10/2, binding): "Money received" is strictly the day money
+  // ARRIVED. Paid-ahead money GAM holds counts in full in August, when the
+  // card payment arrived, on its own line — and $0 in September when it pays
+  // the rent. "Money billed" counts the September bill, covered by money paid
+  // ahead. Either way the money counts once.
+  it('paid-ahead money GAM holds counts once: received when it arrived, $0 when it pays; billed covered by money paid ahead', async () => {
     const f = await seed()
-    const base = { unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid }
-    // August: the tenant pays September ahead (a 'prepaid' box → revenue_owner 'held').
-    await seedSettledRow({ ...base, type: 'fee', amount: 700, revenueOwner: 'held', entry: 'OTHERFEE',
-      dueDate: '2026-08-01', settledAt: '2026-08-05T10:00:00-07:00' })
-    // September: the rent bill is covered by that credit and settles.
-    await seedSettledRow({ ...base, type: 'rent', amount: 700, revenueOwner: 'landlord', entry: 'RENT',
-      dueDate: '2026-09-01', settledAt: '2026-09-01T06:00:00-07:00' })
-    const get = (m: number) => request(buildApp()).get(`/api/reports/monthly-pl?year=2026&month=${m}`)
+    // August: the tenant pays September ahead (a 'prepaid' box → revenue_owner
+    // 'held'); settling it banks the paid-ahead credit (M3 trigger), funded by GAM.
+    const box = await db.query<{ id: string }>(
+      `INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing, money_kind)
+       VALUES ($1,'last_month_rent',700,false,'move_in','prepaid') RETURNING id`, [f.lease1Id])
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description,
+                             due_date, settled_at, revenue_owner, lease_fee_id, platform_held, stripe_charge_id)
+       VALUES ($1,$2,$3,$4,'fee',700,'settled','OTHERFEE','2026-08-01','2026-08-05T10:00:00-07:00','held',$5,TRUE,'ch_box')`,
+      [f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid, box.rows[0].id])
+    const credit = await db.query<{ id: string; funded_by: string }>(
+      `SELECT id, funded_by FROM lease_prepaid_credits WHERE lease_id = $1`, [f.lease1Id])
+    expect(credit.rows[0].funded_by).toBe('gam')
+    // September: the rent bill is paid by that credit and settles.
+    const sep = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'rent',700,'pending','RENT','2026-09-01') RETURNING id`,
+      [f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid])
+    await db.query(
+      `INSERT INTO credit_uses (prepaid_credit_id, payment_id, lease_id, amount, billing_month, source, status, applied_at)
+       VALUES ($1,$2,$3,700,'2026-09-01','whole_bill','applied','2026-09-01T07:00:00-07:00')`,
+      [credit.rows[0].id, sep.rows[0].id, f.lease1Id])
+    await db.query(`UPDATE payments SET status='settled', settled_at='2026-09-01T07:00:00-07:00', platform_held=TRUE WHERE id=$1`,
+      [sep.rows[0].id])
+
+    const get = (m: number, basis: string) => request(buildApp()).get(`/api/reports/monthly-pl?year=2026&month=${m}&basis=${basis}`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-    const aug = (await get(8)).body.data
-    const sep = (await get(9)).body.data
-    expect(aug.gross.total).toBe(0)
+    const aug = (await get(8, 'received')).body.data
+    const sep9 = (await get(9, 'received')).body.data
+    expect(aug.gross.total).toBe(700)
+    expect(aug.lines).toEqual([{ line: 'paidAhead', label: 'Paid ahead for later bills', amount: 700 }])
     expect(aug.payments).toHaveLength(0)
-    expect(sep.gross.rent).toBe(700)
-    expect(aug.gross.total + sep.gross.total).toBe(700)
+    expect(sep9.gross.rent).toBe(0)
+    expect(sep9.gross.total).toBe(0)
+    expect(aug.gross.total + sep9.gross.total).toBe(700)
+    const sepBilled = (await get(9, 'billed')).body.data
+    expect(sepBilled.gross.rent).toBe(700)
+    expect(sepBilled.parts).toEqual([{ part: 'coveredByPaidAhead', label: 'Covered by money paid ahead', amount: 700 }])
+    expect((await get(8, 'billed')).body.data.gross.total).toBe(0)
+
     const tax = (await request(buildApp()).get('/api/reports/tax-summary?year=2026')
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)).body.data
     expect(parseFloat(tax.income.totalRent)).toBe(700)
     const augStatement = (await request(buildApp()).get('/api/reports/monthly-statement?year=2026&month=8')
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)).body.data.summary
-    expect(augStatement.otherIncome).toBe(0)
-    expect(augStatement.totalIncome).toBe(0)
+    expect(augStatement.totalIncome).toBe(700)
+    expect(augStatement.rentCollected).toBe(0)
   })
 })
 
@@ -1246,14 +1281,17 @@ describe('S654: one definition of landlord income — every report says 1,150 fo
     expect(s.depositsCollected).toBe(pl.depositsHeld)
     expect(s.totalExpenses).toBe(pl.expenses.total)
     expect(s.netToOwner).toBe(pl.net)
-    // The GAM fee is not on the landlord's statement; the settled rows are
-    // income (summing to the income total) plus the deposit held.
+    // S655: the GAM fee is not on the landlord's statement; the rows are the
+    // charges behind the income total (they sum to rowsTotal), and the deposit
+    // held is its own list — never income.
     const settled = res.body.data.payments.filter((p: any) => p.status === 'settled')
-    expect(types(settled)).toEqual(['carried_balance', 'deposit', 'home_payment', 'rent'])
-    expect(sum(settled.filter((p: any) => p.type !== 'deposit'))).toBe(s.totalIncome - s.bankedOtherIncome)
-    expect(sum(settled.filter((p: any) => p.type === 'deposit'))).toBe(s.depositsCollected)
-    expect(s.totalCollected).toBe(1650)
-    expect(s.settledPayments).toBe(4)
+    expect(types(settled)).toEqual(['carried_balance', 'home_payment', 'rent'])
+    expect(sum(settled)).toBe(s.totalIncome - s.bankedOtherIncome)
+    expect(res.body.data.rowsTotal).toBe(1150)
+    expect(res.body.data.deposits.map((d: any) => d.amount)).toEqual([500])
+    expect(sum(res.body.data.deposits)).toBe(s.depositsCollected)
+    expect(s.totalCollected).toBe(1150)
+    expect(s.settledPayments).toBe(3)
   })
 
   it('tax-summary: totalRent 1,150, broken out by kind, and the months sum to it', async () => {
@@ -1332,8 +1370,16 @@ describe('S654: one definition of landlord income — every report says 1,150 fo
     }
     const sep = (await get(f, '/api/reports/monthly-statement?year=2026&month=9')).body.data
     expect(sep.summary.totalIncome).toBe(700)
-    // The late August payment and September's open bill are both on September's statement.
-    expect(sep.payments.map((p: any) => p.status).sort()).toEqual(['pending', 'settled'])
+    // S655: Money received lists the money that arrived — the late August
+    // payment — and the rows sum to the total. September's open bill brought
+    // nothing in; it is counted as late, and it is on the Money billed statement.
+    expect(sep.payments.map((p: any) => [p.dueDate, p.status])).toEqual([['2026-08-01', 'settled']])
+    expect(sep.rowsTotal).toBe(700)
+    expect(sep.summary.latePayments).toBe(1)
+    const sepBilled = (await get(f, '/api/reports/monthly-statement?year=2026&month=9&basis=billed')).body.data
+    expect(sepBilled.payments.map((p: any) => [p.dueDate, p.status, p.parts])).toEqual([['2026-09-01', 'pending', { stillOwed: 700 }]])
+    expect(sepBilled.summary.totalCollected).toBe(0)
+    expect(sepBilled.rowsTotal).toBe(sepBilled.summary.totalIncome)
     const aug = (await get(f, '/api/reports/monthly-statement?year=2026&month=8')).body.data
     expect(aug.summary.totalIncome).toBe(0)
     expect(aug.payments).toHaveLength(0)
@@ -1363,7 +1409,7 @@ describe('S654: a FlexPay pull is not landlord income in any report', () => {
     expect(pl.payments).toHaveLength(1)
     const st = (await get(f, '/api/reports/monthly-statement?year=2026&month=9')).body.data
     expect(st.summary.totalIncome).toBe(700)
-    expect(st.payments.map((p: any) => p.entry_description)).toEqual(['RENT'])
+    expect(st.payments.map((p: any) => p.entryDescription)).toEqual(['RENT'])
     const tax = (await get(f, '/api/reports/tax-summary?year=2026')).body.data
     expect(parseFloat(tax.income.totalRent)).toBe(700)
     const ppl = (await get(f, '/api/reports/property-pl?year=2026&month=9')).body.data
@@ -1386,5 +1432,232 @@ describe('S654: a FlexPay pull is not landlord income in any report', () => {
     const d = (await get(f, '/api/reports/summary')).body.data
     expect(d.ytdCollected).toBe(700)
     expect(d.monthly.reduce((s: number, m: any) => s + m.collected, 0)).toBe(700)
+  })
+})
+
+// ── S655: "Money received" / "Money billed" on every report ──────────────────
+describe('S655: the basis switch on every report', () => {
+  const get = (f: Fixture, path: string) =>
+    request(buildApp()).get(path).set('Authorization', `Bearer ${f.tokenLandlordA}`)
+
+  async function seedSept(f: Fixture) {
+    const base = { unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid }
+    await seedSettledRow({ ...base, type: 'rent', amount: 700, revenueOwner: 'landlord', entry: 'RENT',
+      dueDate: '2026-09-01', settledAt: '2026-09-03T10:00:00-07:00' })
+    await seedSettledRow({ ...base, type: 'home_payment', amount: 400, revenueOwner: 'landlord', entry: 'HOMEPMT',
+      dueDate: '2026-09-01', settledAt: '2026-09-04T10:00:00-07:00' })
+    await seedSettledRow({ ...base, type: 'carried_balance', amount: 50, revenueOwner: 'landlord', entry: 'BALANCE',
+      dueDate: '2026-09-01', settledAt: '2026-09-06T10:00:00-07:00' })
+    await seedSettledRow({ ...base, type: 'fee', amount: 6, revenueOwner: 'gam', entry: 'DECLINEFEE',
+      dueDate: '2026-09-04', settledAt: '2026-09-05T10:00:00-07:00' })
+    await seedSettledRow({ ...base, type: 'deposit', amount: 500, revenueOwner: 'landlord', entry: 'DEPOSIT',
+      dueDate: '2026-09-01', settledAt: '2026-09-02T10:00:00-07:00' })
+  }
+
+  it('every report says 1,150 for September under Money billed too (the bills were due and paid in September)', async () => {
+    const f = await seed()
+    await seedSept(f)
+    const q = 'basis=billed'
+    expect((await get(f, `/api/reports/monthly-pl?year=2026&month=9&${q}`)).body.data.gross.total).toBe(1150)
+    expect((await get(f, `/api/reports/monthly-statement?year=2026&month=9&${q}`)).body.data.summary.totalIncome).toBe(1150)
+    expect((await get(f, `/api/reports/tax-summary?year=2026&${q}`)).body.data.income.totalRent).toBe(1150)
+    expect((await get(f, `/api/reports/property-pl?year=2026&month=9&${q}`)).body.data.properties[0].rent_collected).toBe(1150)
+    expect((await get(f, `/api/reports/property-detail?propertyId=${f.aPropId}&year=2026&month=9&${q}`)).body.data.breakdown.total).toBe(1150)
+    expect((await get(f, `/api/reports/query?start=2026-09-01&end=2026-09-30&level=unit&bucket=total&${q}`)).body.data.totals.income.total).toBe(1150)
+    expect((await get(f, `/api/reports/t12?asOf=2026-10-15&${q}`)).body.data.totals.income.total).toBe(1150)
+  })
+
+  it('every report echoes meta.basis and refuses an unknown basis', async () => {
+    const f = await seed()
+    for (const path of [
+      '/api/reports/summary', '/api/reports/monthly-pl?year=2026&month=9',
+      '/api/reports/monthly-statement?year=2026&month=9', '/api/reports/tax-summary?year=2026',
+      '/api/reports/property-pl?year=2026', `/api/reports/property-detail?propertyId=${f.aPropId}&year=2026`,
+      '/api/reports/query?start=2026-09-01&end=2026-09-30', '/api/reports/t12?asOf=2026-10-15',
+    ]) {
+      const ok = await get(f, path)
+      expect(ok.status).toBe(200)
+      expect(ok.body.data.meta.basis).toMatchObject({ basis: 'received', label: 'Money received' })
+      expect(ok.body.data.meta.basis.note).toMatch(/day the money arrived/)
+      const billed = await get(f, `${path}${path.includes('?') ? '&' : '?'}basis=billed`)
+      expect(billed.body.data.meta.basis.label).toBe('Money billed')
+      const bad = await get(f, `${path}${path.includes('?') ? '&' : '?'}basis=accrual`)
+      expect(bad.status).toBe(400)
+    }
+  })
+
+  it('tax-summary net equals the P&L', async () => {
+    const f = await seed()
+    await seedSept(f)
+    await seedMaint({ unitId: f.aUnitId, landlordId: f.aLid, actualCost: 75, completedAt: '2026-09-12T10:00:00-07:00' })
+    await db.query(
+      `INSERT INTO landlord_expenses (landlord_id, property_id, category, amount, expense_date, description)
+       VALUES ($1,$2,'insurance',120,'2026-06-01','Policy')`, [f.aLid, f.aPropId])
+    for (const basis of ['received', 'billed']) {
+      const tax = (await get(f, `/api/reports/tax-summary?year=2026&basis=${basis}`)).body.data
+      const { computeLandlordPL } = await import('../services/landlordPL')
+      const { periodMonths } = await import('../services/platformFee')
+      const pl = await computeLandlordPL(f.aLid, '2026-01-01', '2026-12-31', periodMonths(2026, null), basis as any)
+      expect(tax.netIncome).toBe(pl.net)
+      expect(tax.income.totalRent).toBe(pl.gross.total)
+      expect(tax.deductions.enteredExpenses).toBe(120)
+      const months = tax.monthlyBreakdown.reduce((s: number, m: any) => s + m.collected, 0)
+      expect(Math.round(months * 100) / 100).toBe(tax.income.totalRent)
+    }
+  })
+
+  it('tax-summary shows paid ahead, not used yet at Dec 31 beside the total', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by, received_at, created_at)
+       VALUES ($1,$2,920,920,'landlord','2026-12-20T10:00:00-07:00','2026-12-20T10:00:00-07:00')`,
+      [f.lease1Id, f.tenant1Id])
+    const tax = (await get(f, '/api/reports/tax-summary?year=2026')).body.data
+    expect(tax.income.totalRent).toBe(920)
+    expect(tax.paidAheadUnusedAtYearEnd).toBe(920)
+    // The label depends on whether 2026 has ended (paidAheadLeftoverLabel, tested on its own).
+    const { paidAheadLeftoverLabel } = await import('./reports')
+    expect(tax.paidAheadNextYear).toEqual({ label: paidAheadLeftoverLabel(2026), amount: 920 })
+    expect(tax.beside.find((b: any) => b.key === 'paidAheadUnused').amount).toBe(920)
+  })
+
+  it('the summary row equals the P&L it opens', async () => {
+    const f = await seed()
+    const today = new Date().toISOString().slice(0, 10)
+    const base = { unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid }
+    await seedSettledRow({ ...base, type: 'rent', amount: 700, revenueOwner: 'landlord', entry: 'RENT',
+      dueDate: today, settledAt: new Date().toISOString() })
+    await seedSettledRow({ ...base, type: 'utility', amount: 35, revenueOwner: 'landlord', entry: 'UTILITY',
+      dueDate: today, settledAt: new Date().toISOString() })
+    await db.query(
+      `INSERT INTO landlord_other_income (landlord_id, category, amount, income_date) VALUES ($1,'laundry',15,CURRENT_DATE)`, [f.aLid])
+    for (const basis of ['received', 'billed']) {
+      const sum = (await get(f, `/api/reports/summary?basis=${basis}`)).body.data
+      for (const row of sum.monthly) {
+        const [y, m] = row.month.split('-').map(Number)
+        const pl = (await get(f, `/api/reports/monthly-pl?year=${y}&month=${m}&basis=${basis}`)).body.data
+        expect(row.collected).toBe(pl.gross.total)
+      }
+      // The KPI is the shared rent card — the dashboard's own figure.
+      const { collectedRentMtd } = await import('../lib/rentCollected')
+      const card = await collectedRentMtd([f.aLid], null, { basis: basis as any })
+      expect(sum.collectedMtd).toBe(basis === 'received' ? card.collected : card.billed.collected)
+      expect(sum.collectedMtd).toBe(700)
+      expect(sum.incomeCard[basis].amount).toBe(sum.monthly[0].collected)
+    }
+  })
+
+  it('monthly-pl lists the charges behind the total, and they sum to rowsTotal', async () => {
+    const f = await seed()
+    await seedSept(f)
+    const d = (await get(f, '/api/reports/monthly-pl?year=2026&month=9')).body.data
+    expect(d.rowsTotal).toBe(1150)
+    expect(d.payments.map((p: any) => p.categoryLabel).sort()).toEqual(['Balances collected', 'Home/trailer payments', 'Lot/space rent'])
+    expect(d.lines.map((l: any) => l.line)).toEqual(['rent', 'homeSale', 'balances'])
+  })
+
+  it('a move-out shortfall paid in the month is one charge in the list, its whole payment, with no single category; the rent card and the property breakdown collect the swept rent', async () => {
+    const f = await seed()
+    const fin = '2026-09-15T10:00:00-07:00'
+    // $700 of rent swept to a $400 deposit, $100 of cleaning: the $400 gap is paid on Sep 20.
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at)
+       VALUES ($1,$2,$3,$4,'rent',700,'paid_via_deposit','RENT','2026-09-01',$5)`,
+      [f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid, fin])
+    const gap = (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at, manual_method)
+       VALUES ($1,$2,$3,$4,'fee',400,'settled','DEPOSIT','2026-09-15','2026-09-20T10:00:00-07:00','cash') RETURNING id`,
+      [f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid])).rows[0].id
+    await db.query(
+      `INSERT INTO deposit_returns (lease_id, tenant_id, landlord_id, total_deposit, cleaning_fee_amount, damage_lines,
+                                    other_deductions, unpaid_balance_amount, total_deductions, gap_amount, gap_payment_id,
+                                    status, finalized_at)
+       VALUES ($1,$2,$3,400,100,'[]','[]',700,800,400,$4,'sent_gap',$5)`,
+      [f.lease1Id, f.tenant1Id, f.aLid, gap, fin])
+    const d = (await get(f, '/api/reports/monthly-pl?year=2026&month=9')).body.data
+    expect(d.gross.total).toBe(800)
+    const shortfall = d.payments.find((p: any) => p.id === gap)
+    expect(shortfall).toMatchObject({ amount: 400, category: null, categoryLabel: null })
+    const swept = d.payments.find((p: any) => p.id !== gap)
+    expect(swept).toMatchObject({ amount: 400, category: 'space_rent' })
+    const detail = (await get(f, `/api/reports/property-detail?propertyId=${f.aPropId}&year=2026&month=9`)).body.data
+    expect(detail.breakdown.categories.find((c: any) => c.category === 'space_rent').collected).toBe(700)
+    expect(detail.breakdown.total).toBe(800)
+  })
+
+  it('a team member assigned to another property gets no P&L for this one', async () => {
+    const f = await seed()
+    await seedSept(f)
+    const pmUid = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name) VALUES ($1,'x','property_manager','P','M') RETURNING id`,
+      [`pm-${randomUUID()}@t.dev`])).rows[0].id
+    const otherProp = await seedProperty(db as any, { landlordId: f.aLid, ownerUserId: f.aUid, managedByUserId: f.aUid })
+    await db.query(
+      `INSERT INTO property_manager_scopes (user_id, landlord_id, property_ids) VALUES ($1,$2,ARRAY[$3]::uuid[])`,
+      [pmUid, f.aLid, otherProp])
+    const token = sign({ userId: pmUid, role: 'property_manager', email: 'pm@t.dev', profileId: null,
+                         landlordId: f.aLid, permissions: { 'payments.view_all': true } })
+    const detail = await request(buildApp()).get(`/api/reports/property-detail?propertyId=${f.aPropId}&year=2026&month=9`)
+      .set('Authorization', `Bearer ${token}`)
+    expect(detail.status).toBe(404)
+    const ppl = await request(buildApp()).get('/api/reports/property-pl?year=2026&month=9')
+      .set('Authorization', `Bearer ${token}`)
+    expect(ppl.status).toBe(200)
+    expect(ppl.body.data.properties.map((p: any) => p.id)).toEqual([otherProp])
+  })
+
+  it('a park-2-only manager sees no park-1 money on /summary or /monthly-pl, and is refused the company-wide tax summary, owner statement and 1099 summary', async () => {
+    const f = await seed()
+    const today = (await db.query<{ d: string }>(`SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS d`)).rows[0].d
+    const [y, m] = today.split('-').map(Number)
+    const at = `${today}T12:00:00-07:00`
+    // Park 1 (f.aPropId): $700 of rent and a $75 repair this month. Park 2: $300 of rent.
+    await seedSettledRow({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, type: 'rent', amount: 700,
+      revenueOwner: 'landlord', entry: 'RENT', dueDate: today, settledAt: at })
+    await seedMaint({ unitId: f.aUnitId, landlordId: f.aLid, actualCost: 75, completedAt: at })
+    await db.query(`INSERT INTO unit_out_of_order (unit_id, landlord_id, starts_on) VALUES ($1,$2,CURRENT_DATE - 3)`,
+      [f.aUnitId, f.aLid])
+    const park2 = await seedProperty(db as any, { landlordId: f.aLid, ownerUserId: f.aUid, managedByUserId: f.aUid })
+    const unit2 = await seedUnit(db as any, { propertyId: park2, landlordId: f.aLid })
+    await seedSettledRow({ unitId: unit2, tenantId: f.tenant1Id, landlordId: f.aLid, type: 'rent', amount: 300,
+      revenueOwner: 'landlord', entry: 'RENT', dueDate: today, settledAt: at })
+    const pmUid = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name) VALUES ($1,'x','property_manager','P','M') RETURNING id`,
+      [`pm2-${randomUUID()}@t.dev`])).rows[0].id
+    await db.query(
+      `INSERT INTO property_manager_scopes (user_id, landlord_id, property_ids) VALUES ($1,$2,ARRAY[$3]::uuid[])`,
+      [pmUid, f.aLid, park2])
+    const token = sign({ userId: pmUid, role: 'property_manager', email: 'pm2@t.dev', profileId: null,
+                         landlordId: f.aLid, permissions: { 'payments.view_all': true, 'books.view': true } })
+    const pm = (path: string) => request(buildApp()).get(path).set('Authorization', `Bearer ${token}`)
+
+    const sumPm = (await pm('/api/reports/summary')).body.data
+    expect(sumPm.collectedMtd).toBe(300)
+    expect(sumPm.monthly[0].collected).toBe(300)
+    expect(sumPm.totalUnits).toBe(1)
+    const sumOwner = (await get(f, '/api/reports/summary')).body.data
+    expect(sumOwner.collectedMtd).toBe(1000)
+
+    const plPm = (await pm(`/api/reports/monthly-pl?year=${y}&month=${m}`)).body.data
+    expect(plPm.gross.total).toBe(300)
+    expect(plPm.payments.map((p: any) => p.amount)).toEqual([300])
+    expect(plPm.expenses.maintenance).toBe(0)
+    const plOwner = (await get(f, `/api/reports/monthly-pl?year=${y}&month=${m}`)).body.data
+    expect(plOwner.gross.total).toBe(1000)
+    expect(plOwner.expenses.maintenance).toBe(75)
+
+    for (const path of [`/api/reports/tax-summary?year=${y}`, `/api/reports/monthly-statement?year=${y}&month=${m}`,
+                        `/api/reports/work-trade-1099?year=${y}`]) {
+      const refused = await pm(path)
+      expect(refused.status).toBe(403)
+      expect(refused.body.error ?? refused.body.message).toMatch(/covers the whole company/)
+      expect(JSON.stringify(refused.body)).not.toMatch(/700/)
+      expect((await get(f, path)).status).toBe(200)
+    }
+
+    const downPm = (await pm(`/api/reports/site-downtime?year=${y}&month=${m}`)).body.data
+    expect(downPm.rows).toEqual([])
+    const downOwner = (await get(f, `/api/reports/site-downtime?year=${y}&month=${m}`)).body.data
+    expect(downOwner.rows.map((r: any) => r.property_id)).toEqual([f.aPropId])
   })
 })

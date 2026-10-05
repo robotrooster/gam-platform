@@ -1,6 +1,8 @@
 import type { PoolClient } from 'pg'
-import { appendEvent } from './creditLedger'
-import type { CreditEventType, CreditAttestationSource } from '@gam/shared'
+import { appendEvent, supersedeEvent } from './creditLedger'
+import type { CreditEventType, CreditAttestationSource, CreditScoreDimension } from '@gam/shared'
+import { getClient } from '../db'
+import { recomputeAndSnapshot } from './creditScore'
 import { dateIn, addDaysTo } from '../lib/timezone'
 import { logger } from '../lib/logger'
 
@@ -42,17 +44,9 @@ export function classifyPaymentTier(args: {
   propertyTz?: string | null
 }): CreditEventType {
   const due = calendarDay(args.dueDate)
-  // S654: an unrecognized zone (e.g. 'Arizona' typed on a CSV import) makes
-  // Intl throw; this runs inside the settle transaction, so a throw would undo
-  // the whole settlement on every retry. Read it on Phoenix's calendar instead,
-  // and warn so the bad zone gets fixed.
-  let paid: string
-  try {
-    paid = dateIn(args.propertyTz, args.settledAt)
-  } catch {
-    logger.warn({ propertyTz: args.propertyTz }, '[credit-ledger] property timezone not recognized; payment tier read on Phoenix time')
-    paid = dateIn(null, args.settledAt)
-  }
+  // S654: an unrecognized zone reads on Phoenix's calendar, with a warning
+  // (dayAtProperty): a throw here would undo the whole settlement.
+  const paid = dayAtProperty(args.propertyTz, args.settledAt, true)
   if (paid <= due) return 'payment_received_on_time'
   const lastGraceDay = addDaysTo(due, args.graceDays)
   if (paid <= lastGraceDay) return 'payment_received_late_grace'
@@ -60,6 +54,36 @@ export function classifyPaymentTier(args: {
   if (daysPastGrace <= 3) return 'payment_received_late_minor'
   if (daysPastGrace <= 15) return 'payment_received_late_major'
   return 'payment_received_late_severe'
+}
+
+/**
+ * An instant as a calendar day where the property is. S654: an unrecognized
+ * zone (e.g. 'Arizona' typed on a CSV import) makes Intl throw; this runs
+ * inside the settle transaction, so a throw would undo the whole settlement on
+ * every retry. Read it on Phoenix's calendar instead (and, with `warn`, log it
+ * so the bad zone gets fixed).
+ */
+function dayAtProperty(propertyTz: string | null | undefined, at: Date, warn = false): string {
+  try {
+    return dateIn(propertyTz, at)
+  } catch {
+    if (warn) logger.warn({ propertyTz }, '[credit-ledger] property timezone not recognized; payment tier read on Phoenix time')
+    return dateIn(null, at)
+  }
+}
+
+/**
+ * The day a payment's lateness counts from: its due date, or the day GAM wrote
+ * the bill when that is later (a bill cannot be paid before it exists) — but
+ * only when the bill was written on or before the day the money came in. A row
+ * written AFTER its money arrived is a record of an older bill (history
+ * recorded later: an import, a backfill, the desk writing up a payment it took
+ * earlier), so it counts from its due date; otherwise a late payment recorded
+ * later would read as on time. THE rule, for the emitter and the correction of
+ * marks written before it.
+ */
+export function lateCountsFrom(dueDay: string, writtenOn: string | null, paidDay: string): string {
+  return writtenOn != null && writtenOn > dueDay && writtenOn <= paidDay ? writtenOn : dueDay
 }
 
 async function isOnboardingMonthCharge(client: PoolClient, paymentId: string): Promise<boolean> {
@@ -71,6 +95,56 @@ async function isOnboardingMonthCharge(client: PoolClient, paymentId: string): P
        FROM payments p JOIN leases l ON l.id = p.lease_id
       WHERE p.id = $1`, [paymentId])
   return rows[0]?.onboarding === true
+}
+
+/**
+ * The note rentCharge and manualPaymentSettle write on the rest of a row that
+ * was paid in part (an old balance paid down): that row carries over a bill
+ * written earlier, it is not a new one.
+ */
+export const PART_PAID_REST_NOTE = 'What is left of the old balance after a part payment'
+
+/**
+ * A payment row's kind, and the day GAM wrote the bill it belongs to on the
+ * property's calendar (null when the row has no creation time). Null when the
+ * row is not found.
+ *
+ * A bill cannot be paid before it exists, so it cannot be late before then
+ * either. A longer stay's rent (bookingLeaseBilling billLongerStay) is written
+ * on the day the stay grew but carries its month's own due date; paid that
+ * same day it is on time, not weeks late.
+ *
+ * A row that carries over an older bill counts from that bill, never from the
+ * day it was copied: a row reopened after a reversal (it keeps the original due
+ * date so late fees count from it), and the rest of a row paid in part. Their
+ * bill is the earliest row of the same lease, tenant, type, due date and
+ * invoice.
+ */
+async function billFacts(
+  client: PoolClient, paymentId: string, propertyTz: string | null | undefined,
+): Promise<{ type: string; writtenOn: string | null } | null> {
+  const { rows } = await client.query<{ type: string; written_at: Date | null }>(
+    `SELECT p.type, CASE
+              WHEN p.reversal_id IS NOT NULL
+                OR (p.is_remainder AND p.notes LIKE ($2 || '%'))
+              THEN (SELECT MIN(f.created_at) FROM payments f
+                     WHERE f.lease_id IS NOT DISTINCT FROM p.lease_id
+                       AND f.tenant_id IS NOT DISTINCT FROM p.tenant_id
+                       AND f.type = p.type
+                       AND f.due_date = p.due_date
+                       AND f.invoice_id IS NOT DISTINCT FROM p.invoice_id
+                       AND f.created_at <= p.created_at)
+              ELSE p.created_at
+            END AS written_at
+       FROM payments p
+      WHERE p.id = $1`,
+    [paymentId, PART_PAID_REST_NOTE])
+  const row = rows[0]
+  if (!row) return null
+  const at = row.written_at
+  if (!at) return { type: row.type, writtenOn: null }
+  // Same fallback as classifyPaymentTier: a bad zone must not undo the settle.
+  return { type: row.type, writtenOn: dayAtProperty(propertyTz, at) }
 }
 
 /**
@@ -92,6 +166,17 @@ function daysBetween(fromYmd: string, toYmd: string): number {
  * Tags the payment_reliability dimension. Visibility:
  *   - on_time / late_grace → visible_to_current_landlord (positive routine)
  *   - late_* / partial / nsf / skipped → visible_to_gam_network (adverse)
+ *
+ * Lateness counts from the later of the due date and the day GAM wrote the
+ * bill (billFacts), read on the same client. A bill written after its due
+ * date (a longer stay's rent, a utility bill written late) gets its grace days
+ * from the day it was written; the event then records that day as billed_on.
+ * A row written after its money came in counts from its due date
+ * (lateCountsFrom): it records an older bill.
+ *
+ * Only rent and utility rows carry a payment mark (settleHooks writes marks for
+ * those alone). A late fee, a fee or a home payment the card or bank webhook
+ * settles beside them writes nothing.
  */
 export async function emitPaymentSettledEvent(
   client: PoolClient,
@@ -114,15 +199,20 @@ export async function emitPaymentSettledEvent(
     attestationEvidence?: Record<string, unknown>
   },
 ): Promise<void> {
+  const facts = await billFacts(client, args.paymentId, args.propertyTz)
+  if (facts && facts.type !== 'rent' && facts.type !== 'utility') return
+  const dueDay = calendarDay(args.dueDate)
+  const writtenOn = facts?.writtenOn ?? null
+  const countsFrom = lateCountsFrom(dueDay, writtenOn, dayAtProperty(args.propertyTz, args.settledAt))
+  const billedLate = countsFrom !== dueDay
   const eventType = classifyPaymentTier({
-    dueDate: args.dueDate,
+    dueDate: countsFrom,
     settledAt: args.settledAt,
     graceDays: args.graceDays ?? DEFAULT_GRACE_DAYS,
     propertyTz: args.propertyTz,
   })
 
-  const positive =
-    eventType === 'payment_received_on_time' || eventType === 'payment_received_late_grace'
+  const positive = isPositivePaymentTier(eventType)
 
   // S652 (Nic): "don't count the onboarding month for anything negative, only
   // positive." A household moved onto GAM mid-tenancy gets its first bill on
@@ -143,7 +233,9 @@ export async function emitPaymentSettledEvent(
         payment_type: args.paymentType,
         amount: typeof args.amount === 'string' ? args.amount : String(args.amount),
         // S654: the due date is a calendar day, recorded as one.
-        due_date: calendarDay(args.dueDate),
+        due_date: dueDay,
+        // The bill was written after its due date: lateness counted from this day.
+        ...(billedLate ? { billed_on: writtenOn } : {}),
         paid_at: args.settledAt.toISOString(),
         grace_days: args.graceDays ?? DEFAULT_GRACE_DAYS,
       },
@@ -156,6 +248,145 @@ export async function emitPaymentSettledEvent(
     },
     client,
   )
+}
+
+/** On time or within grace: a good mark the current landlord sees. Anything later is adverse. */
+function isPositivePaymentTier(t: CreditEventType): boolean {
+  return t === 'payment_received_on_time' || t === 'payment_received_late_grace'
+}
+
+const LATE_PAYMENT_TIERS = [
+  'payment_received_late_minor', 'payment_received_late_major', 'payment_received_late_severe',
+] as const
+
+/** One late mark re-rated from the day its bill was written. */
+export interface LateMarkCorrection {
+  eventId: string
+  /** The mark that replaces it; null on a dry run. */
+  correctedEventId: string | null
+  tenantId: string
+  paymentId: string
+  dueDate: string
+  billedOn: string
+  was: CreditEventType
+  now: CreditEventType
+}
+
+/**
+ * Corrects the late marks already on tenants' credit records for bills GAM
+ * wrote after their due date, written before emitPaymentSettledEvent counted
+ * lateness from the day the bill was written. A bill paid the day it was
+ * written got a late mark the GAM network sees.
+ *
+ * Each active late mark (late_minor, late_major, late_severe) on a rent or
+ * utility row is rated again exactly as the emitter rates a payment today:
+ * from the later of the due date and the day the bill was written (billFacts),
+ * unless the row was written after the money came in (lateCountsFrom), with
+ * the mark's own grace days and payment time. When the tier changes, a
+ * corrected mark is appended (same payment, payment time and evidence; it
+ * records billed_on and the mark it corrects) and the old mark is superseded
+ * with 'data_entry_error_corrected', so scores skip it. The chain is never
+ * rewritten. A mark whose tier does not change is left alone, and a mark that
+ * already records billed_on was rated under the current rule. A mark that is
+ * still late in the household's onboarding month is left alone too: the
+ * emitter writes nothing there now, and no late mark is written in its place.
+ *
+ * Run once at deploy, dry run first. A second run finds nothing. Scores of the
+ * tenants whose marks changed are recomputed after the commit (a recompute
+ * that fails is logged; the nightly score run picks it up).
+ */
+export async function correctLateMarksForBillsWrittenLate(
+  opts: { dryRun: boolean },
+): Promise<LateMarkCorrection[]> {
+  const client = await getClient()
+  const out: LateMarkCorrection[] = []
+  const subjects = new Set<string>()
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query<{
+      id: string; event_type: CreditEventType; event_data: Record<string, unknown>; occurred_at: Date
+      attestation_source: CreditAttestationSource; attestation_evidence: Record<string, unknown>
+      dimension_tags: string[]; subject_id: string; tenant_id: string
+      payment_id: string; due_date: string; timezone: string | null
+    }>(
+      `SELECT e.id, e.event_type, e.event_data, e.occurred_at, e.attestation_source,
+              e.attestation_evidence, e.dimension_tags, e.subject_id, s.subject_ref_id AS tenant_id,
+              p.id AS payment_id, p.due_date::text AS due_date, pr.timezone
+         FROM credit_events e
+         JOIN credit_subjects s ON s.id = e.subject_id AND s.subject_type = 'tenant'
+         JOIN payments p ON p.id::text = e.event_data->>'payment_id'
+         LEFT JOIN units u ON u.id = p.unit_id
+         LEFT JOIN properties pr ON pr.id = u.property_id
+        WHERE e.superseded_by IS NULL
+          AND e.event_type = ANY($1::text[])
+          AND NOT (e.event_data ? 'billed_on')
+          AND p.type IN ('rent', 'utility')
+        ORDER BY e.recorded_at, e.id
+        FOR UPDATE OF e`,
+      [LATE_PAYMENT_TIERS])
+    for (const e of rows) {
+      const facts = await billFacts(client, e.payment_id, e.timezone)
+      const paidAtRaw = e.event_data.paid_at
+      const paidAt = typeof paidAtRaw === 'string' && !Number.isNaN(Date.parse(paidAtRaw))
+        ? new Date(paidAtRaw) : e.occurred_at
+      // The emitter's own rule: a row written after its money came in records
+      // an older bill and keeps counting from its due date.
+      const countsFrom = lateCountsFrom(e.due_date, facts?.writtenOn ?? null, dayAtProperty(e.timezone, paidAt))
+      if (countsFrom === e.due_date) continue
+      const billedOn = countsFrom
+      const graceRaw = Number(e.event_data.grace_days)
+      const graceDays = Number.isFinite(graceRaw) ? graceRaw : DEFAULT_GRACE_DAYS
+      const now = classifyPaymentTier({ dueDate: billedOn, settledAt: paidAt, graceDays, propertyTz: e.timezone })
+      if (now === e.event_type) continue
+      // Still late in the onboarding month: the emitter writes no mark at all
+      // there now (S652), so a late mark is never written in its place. The
+      // old mark stays as it is (the ledger has no way to withdraw a mark
+      // without a replacement).
+      if (!isPositivePaymentTier(now) && await isOnboardingMonthCharge(client, e.payment_id)) continue
+
+      let correctedEventId: string | null = null
+      if (!opts.dryRun) {
+        const corrected = await appendEvent(
+          {
+            subjectType: 'tenant',
+            subjectRefId: e.tenant_id,
+            eventType: now,
+            eventData: { ...e.event_data, due_date: e.due_date, billed_on: billedOn, corrects_event_id: e.id },
+            occurredAt: e.occurred_at,
+            attestationSource: e.attestation_source,
+            attestationEvidence: e.attestation_evidence,
+            dimensionTags: e.dimension_tags as CreditScoreDimension[],
+            networkVisibility: isPositivePaymentTier(now) ? 'visible_to_current_landlord' : 'visible_to_gam_network',
+          },
+          client,
+        )
+        correctedEventId = corrected.eventId
+        await supersedeEvent(client, e.id, corrected.eventId, 'data_entry_error_corrected')
+        subjects.add(e.subject_id)
+      }
+      out.push({
+        eventId: e.id, correctedEventId, tenantId: e.tenant_id, paymentId: e.payment_id,
+        dueDate: e.due_date, billedOn, was: e.event_type, now,
+      })
+    }
+    await client.query(opts.dryRun ? 'ROLLBACK' : 'COMMIT')
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+
+  if (subjects.size > 0) {
+    for (const subjectId of subjects) {
+      try {
+        await recomputeAndSnapshot(subjectId)
+      } catch (err) {
+        logger.error({ err, subjectId }, '[credit-ledger] score recompute after a late-mark correction failed; the nightly run will pick it up')
+      }
+    }
+  }
+  return out
 }
 
 /**

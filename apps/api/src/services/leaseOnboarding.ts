@@ -18,10 +18,89 @@ import { BY_ROOM_LEASES_PER_BEDROOM, ROSTER_MAX_HOUSEHOLD } from '@gam/shared'
 import { resolveDefaultTemplateForUnit } from './templateResolve'
 import { createNotification } from './notifications'
 import { computeLeaseStart, computeLeaseEnd } from './leaseDates'
+import { queryOne } from '../db'
 
 type Client = { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> }
 
 const CO_TENANT_ROLES = ['co_tenant_1', 'co_tenant_2', 'co_tenant_3']
+
+/**
+ * Final sweep (10/3): a whole-unit household bigger than one lease holds, said
+ * the same way everywhere it shows (the invite screen, the emailed notice, the
+ * CSV check and the roster), with the one next step that works.
+ *
+ * GAM cannot put more than ROSTER_MAX_HOUSEHOLD people on one lease: the
+ * templates carry primary and co_tenant_1..3, and createDocumentRecord refuses
+ * any other signer role. The old advice, "draft this one by hand", was a dead
+ * end: Send Document's "A Unit" mode needs an active lease, and its "Specific
+ * Emails" mode hands the fifth person co_tenant_4, which createDocumentRecord
+ * refuses. Moving someone to another unit is the step that works.
+ *
+ * `people` null = the count is not final yet (the CSV check flags the row that
+ * goes over, before the rest of the file is read).
+ */
+export function tooManyForOneLease(unitLabel: string, people: number | null): string {
+  const who = people == null ? `more than ${ROSTER_MAX_HOUSEHOLD} people` : `${people} people`
+  return `Unit ${unitLabel} has ${who} on one lease; a lease holds up to ${ROSTER_MAX_HOUSEHOLD}. Move someone to another unit.`
+}
+
+/** The invite path's how-to after tooManyForOneLease (screen and email alike). */
+const MOVE_AN_INVITED_PERSON =
+  'To move someone, cancel their invite in Tenant Onboarding (Pending Pool), then invite them to the other unit. '
+  + 'The lease for the rest then drafts on its own within the hour.'
+
+/**
+ * Final sweep (10/3): ONE "could not draft" notice per unit and cause.
+ *
+ * The hourly retry (scheduler → draftAllPendingLeases → autoDraftLeasesForUnit)
+ * re-runs every unit still waiting, and every run sent its notice again, emailed
+ * each time. createNotification has no dedupe, so a cause nobody fixed meant one
+ * email to the landlord every hour, and a household too big for one lease is
+ * never fixed by the sweep, so those never stopped. Production holds four
+ * identical "Lease could not be drafted automatically" notices for one unit on
+ * 2026-09-02. One email per thing (S652).
+ *
+ * A notice is skipped while the same one stands: same landlord user, same
+ * title, the same `key` inside its data, and (when `body` is given) the same
+ * words, so a refusal with a NEW reason is a new cause and is sent. "Stands"
+ * means still unread, or sent within the last LEASE_DRAFT_BLOCKED_REMIND_DAYS;
+ * a read notice for a cause still not fixed after that is sent once more.
+ *
+ * Read on the pool, not the caller's client: createNotification writes on the
+ * pool, and a failed read here must never abort the caller's transaction (the
+ * tenant's accept). A failed read sends the notice: a repeat beats a stuck lease
+ * nobody hears about.
+ */
+export const LEASE_DRAFT_BLOCKED_REMIND_DAYS = 7
+async function blockedNoticeStands(n: {
+  userId: string; title: string; key: Record<string, string | null>; body?: string
+}): Promise<boolean> {
+  try {
+    const hit = await queryOne<{ x: number }>(
+      `SELECT 1 AS x FROM notifications
+        WHERE user_id = $1 AND type = 'lease_draft_blocked' AND title = $2
+          AND data @> $3::jsonb
+          AND ($4::text IS NULL OR body = $4::text)
+          AND (read IS NOT TRUE OR created_at > NOW() - ($5::int * INTERVAL '1 day'))
+        LIMIT 1`,
+      [n.userId, n.title, JSON.stringify(n.key), n.body ?? null, LEASE_DRAFT_BLOCKED_REMIND_DAYS])
+    return !!hit
+  } catch { return false }
+}
+
+/**
+ * Final sweep (10/3): a refusal's own words, ready for one more sentence after
+ * them. GAM's refusals already end with a period ("…Add one to the package
+ * first."), so adding ". Once that…" after one printed "first.. Once that…".
+ * Trailing periods, commas, colons, semicolons and spaces come off and exactly
+ * one period goes back; a question or exclamation keeps its own mark. Running
+ * it twice changes nothing, so a reason that already went through it is safe.
+ */
+export function reasonSentence(message: unknown, fallback = 'an unexpected error'): string {
+  const text = (typeof message === 'string' ? message : '').replace(/[\s.,;:]+$/, '').trim()
+  if (!text) return `${fallback}.`
+  return /[!?]$/.test(text) ? text : `${text}.`
+}
 
 /** Count active/pending leases on a unit. */
 async function activeLeaseCount(client: Client, unitId: string): Promise<number> {
@@ -146,7 +225,8 @@ export async function autoDraftLeasesForUnit(
   const blocked: string[] = []
   const unit = await client.query(
     // S654: available_date as text — a pg DATE arrives as local midnight, not a calendar day.
-    `SELECT u.id, u.occupancy_mode, u.unit_number, u.available_date::text AS available_date,
+    `SELECT u.id, u.occupancy_mode, u.unit_number, u.unit_type, u.property_id,
+            u.available_date::text AS available_date,
             p.landlord_id, p.name AS property_name, p.timezone
        FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id=$1`, [unitId]).then(r => r.rows[0])
   if (!unit) throw new AppError(404, 'Unit not found')
@@ -154,22 +234,43 @@ export async function autoDraftLeasesForUnit(
   const tmpl = await resolveDefaultTemplateForUnit(unitId, client)
   const landlord = await landlordSigner(client, unit.landlord_id, unitId)
 
-  const notifyNeedsTemplate = async () => {
-    if (quiet) {
-      blocked.push(`No default lease is set for this kind of unit, so the lease for Unit ${unit.unit_number} could not be drafted. Set one in E-Sign, then it drafts on its own.`)
-      return
-    }
+  // Every "could not draft" notice goes through here, once per unit and cause
+  // (blockedNoticeStands). S620: emailed for the same reason as the success
+  // case, and with more cause — a BLOCKED draft is silent progress that never
+  // happens. The tenant is waiting on a lease nobody knows is stuck.
+  const notifyBlocked = async (n: {
+    title: string; body: string; actionUrl: string
+    key: Record<string, string | null>; sameWords: boolean
+  }) => {
+    if (await blockedNoticeStands({
+      userId: landlord.userId, title: n.title, key: n.key, body: n.sameWords ? n.body : undefined,
+    })) return
     await createNotification({
       userId: landlord.userId, type: 'lease_draft_blocked',
-      title: 'Set a default lease template',
-      body: `A tenant accepted their invite for Unit ${unit.unit_number} — ${unit.property_name}, but no default lease template is set for this unit type. Set one to auto-draft the lease.`,
-      data: { unitId },
-      actionUrl: '/esign',
-      // S620: emailed for the same reason as the success case, and with more
-      // cause — a BLOCKED draft is silent progress that never happens. The
-      // tenant has accepted and is waiting on a lease nobody knows is stuck.
+      title: n.title, body: n.body,
+      data: { unitId, propertyId: unit.property_id, unitType: unit.unit_type ?? null },
+      actionUrl: n.actionUrl,
       sendEmail: true, emailTo: landlord.email,
     }).catch(() => {})
+  }
+
+  const notifyNeedsTemplate = async () => {
+    if (quiet) {
+      blocked.push(`No default lease is set for this kind of unit, so the lease for Unit ${unit.unit_number} could not be drafted. Set one in GoldSign (Templates), then it drafts on its own.`)
+      return
+    }
+    await notifyBlocked({
+      title: 'Set a default lease template',
+      body: `The lease for Unit ${unit.unit_number} — ${unit.property_name} could not be drafted: no default lease is set for this kind of unit. Set one in GoldSign (Templates), then it drafts on its own.`,
+      // The Templates tab, not Documents (ESignPage opens Documents by default).
+      actionUrl: '/esign?tab=templates',
+      // One default lease fixes every unit of this kind at the property, so it
+      // is one notice for all of them, not one per unit waiting on it.
+      key: unit.unit_type
+        ? { propertyId: unit.property_id, unitType: unit.unit_type }
+        : { unitId },
+      sameWords: false,
+    })
   }
   if (!tmpl) { await notifyNeedsTemplate(); return { draftedDocumentIds: [], blocked } }
 
@@ -280,17 +381,21 @@ export async function autoDraftLeasesForUnit(
         // screen and the agent can say which drafted and which did not.
         const whose = unit.occupancy_mode === 'by_room'
           ? ` (${members.map(m => `${m.first_name} ${m.last_name}`.trim()).join(', ')})` : ''
-        blocked.push(`The lease for Unit ${unit.unit_number}${whose} could not be drafted: ${err?.message || 'unexpected error'}. This is usually the unit's default lease missing a required field. Fix it, then it drafts on its own.`)
+        // Final sweep (10/3): the refusal already names its own cause (and
+        // often the step: "…Add one to the package first."), so it is said as
+        // it reads, with no guessed cause stuck on after it, and only what
+        // happens next is added: the hourly retry (draftAllPendingLeases).
+        blocked.push(`The lease for Unit ${unit.unit_number}${whose} could not be drafted: ${reasonSentence(err?.message)} Once that is fixed, it drafts on its own.`)
         return
       }
-      await createNotification({
-        userId: landlord.userId, type: 'lease_draft_blocked',
+      await notifyBlocked({
         title: 'Lease could not be drafted automatically',
-        body: `A tenant accepted their invite for Unit ${unit.unit_number} — ${unit.property_name}, but the lease couldn't be auto-drafted: ${err?.message || 'unexpected error'}. This is usually the unit's default lease template missing a required field. Fix it, then draft the lease.`,
-        data: { unitId },
+        body: `The lease for Unit ${unit.unit_number} — ${unit.property_name} could not be drafted: ${reasonSentence(err?.message)} Once that is fixed, it drafts on its own within the hour.`,
         actionUrl: '/esign',
-        sendEmail: true, emailTo: landlord.email,
-      }).catch(() => {})
+        // Same words = same cause. A different refusal on the same unit is
+        // news (the landlord fixed the first one) and is sent.
+        key: { unitId }, sameWords: true,
+      })
     }
   }
 
@@ -322,18 +427,20 @@ export async function autoDraftLeasesForUnit(
     const alreadyDrafted = roster.some(m => m.draft_document_id)
     if (!alreadyDrafted) {
       if (roster.length > ROSTER_MAX_HOUSEHOLD) {
+        // Final sweep (10/3): never "draft it by hand" — no lease GAM can draft
+        // holds more than ROSTER_MAX_HOUSEHOLD people (see tooManyForOneLease).
         if (quiet) {
-          blocked.push(`Unit ${unit.unit_number} has ${roster.length} people on one lease; a lease drafts itself for up to ${ROSTER_MAX_HOUSEHOLD}. Draft this one by hand in E-Sign.`)
+          blocked.push(`${tooManyForOneLease(unit.unit_number, roster.length)} ${MOVE_AN_INVITED_PERSON}`)
           return { draftedDocumentIds: [], blocked }
         }
-        await createNotification({
-          userId: landlord.userId, type: 'lease_draft_blocked',
-          title: 'Too many co-tenants to auto-draft',
-          body: `Unit ${unit.unit_number} — ${unit.property_name} has ${roster.length} people on one lease; auto-draft supports up to 4. Draft this lease manually.`,
-          data: { unitId },
-          actionUrl: '/esign',
-          sendEmail: true, emailTo: landlord.email,
-        }).catch(() => {})
+        await notifyBlocked({
+          title: 'Too many people for one lease',
+          body: `${tooManyForOneLease(`${unit.unit_number} — ${unit.property_name}`, roster.length)} ${MOVE_AN_INVITED_PERSON}`,
+          // Where the invites are cancelled.
+          actionUrl: '/tenant-onboarding/pending',
+          // The count is in the words: a different count is a new notice.
+          key: { unitId }, sameWords: true,
+        })
         return { draftedDocumentIds: [], blocked }
       }
       await draftFor(roster, `Lease — Unit ${unit.unit_number} — ${unit.property_name}`)

@@ -83,14 +83,26 @@ async function seed(opts: { allProperties?: boolean } = {}): Promise<Fixture> {
     const bookingBId = await seedBooking(unitBId, 'Guest B')
 
     // Unpaid invoice per unit → one balance row per property.
+    //
+    // S655 (money plan, Step 11): what is owed is read from the CHARGES on a
+    // bill (services/openBalances.openBalanceSql — the one rule the portal, the
+    // digest and the agents read), never from invoices.total_amount, which
+    // carried no late fee and missed a charge on no bill. A real bill always has
+    // its charge rows; this fixture used to write the invoice header alone, which
+    // no bill run ever does, so the list read it as owing nothing.
     const tenantId = await seedTenant(client)
     for (const unitId of [unitAId, unitBId]) {
       const leaseId = await seedLease(client, { unitId, landlordId })
-      await client.query(
+      const inv = await client.query<{ id: string }>(
         `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
            due_date, total_amount, status)
-         VALUES ($1, $2, $3, $4, $5, CURRENT_DATE - 10, 500, 'pending')`,
+         VALUES ($1, $2, $3, $4, $5, CURRENT_DATE - 10, 500, 'pending') RETURNING id`,
         [landlordId, tenantId, leaseId, unitId, `INV-${unitId.slice(0, 8)}`])
+      await client.query(
+        `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description)
+         VALUES ($1, $2, $3, $4, $5, 'rent', 500, 'pending', CURRENT_DATE - 10, 'RENT')`,
+        [inv.rows[0].id, unitId, leaseId, tenantId, landlordId])
     }
 
     const desk = await client.query<{ id: string }>(

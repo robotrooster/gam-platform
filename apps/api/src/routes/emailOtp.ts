@@ -140,16 +140,36 @@ function readPendingSession(token: string): EmailOtpClaims & { purpose: string }
  * must not mark the new address verified or start a session naming it. The
  * person signs in again and the code goes to the address they have now.
  * Compared case-insensitively, as login matches addresses.
+ *
+ * Both refusals say "session" ON PURPOSE. Every portal's code screen (landlord,
+ * tenant, invite, business, POS, admin, Support, GAM Books, PM) drops a dead
+ * pending pass and returns the person to the sign-in form only when the
+ * server's message matches /session/i. Without the word they stayed on the code
+ * screen typing codes that could never work, and a reload brought the dead pass
+ * back. The sentences still say why, then what to do.
  */
+export const PENDING_PASS_PASSWORD_CHANGED =
+  'Your password was changed, so this sign-in session has ended. Please sign in again.'
+export const PENDING_PASS_EMAIL_CHANGED =
+  'Your sign-in email changed, so this sign-in session has ended. Please sign in again.'
+
 async function liveAccountForPendingPass(
   session: EmailOtpClaims & { purpose: string },
 ): Promise<{ email: string }> {
   const account = await queryOne<{ email: string; sessions_valid_from: Date | null }>(
     `SELECT email, sessions_valid_from FROM users WHERE id = $1`, [session.userId])
   if (!account) throw new AppError(401, 'Invalid sign-in session.')
-  assertPassPostdatesPasswordChange(session, account.sessions_valid_from, { wholeSecond: true })
+  try {
+    assertPassPostdatesPasswordChange(session, account.sessions_valid_from, { wholeSecond: true })
+  } catch (e) {
+    // auth.ts words this for a FULL pass (/auth/me, /refresh), where the
+    // portal's 401 handler signs the person out whatever it says. Here the
+    // pending-pass wording is what sends them back to the sign-in form.
+    if (e instanceof AppError && e.statusCode === 401) throw new AppError(401, PENDING_PASS_PASSWORD_CHANGED)
+    throw e
+  }
   if (String(account.email ?? '').toLowerCase() !== String(session.email ?? '').toLowerCase()) {
-    throw new AppError(401, 'Your sign-in email changed. Please sign in again.')
+    throw new AppError(401, PENDING_PASS_EMAIL_CHANGED)
   }
   return account
 }
@@ -195,14 +215,22 @@ emailOtpRouter.post('/verify', async (req, res, next) => {
     // also verify the email (no separate link), and is a harmless no-op for an
     // already-verified login. S655: RETURNING says whether THIS code was the
     // address's first proof.
+    //
+    // Only for the address liveAccountForPendingPass checked. That check ran
+    // before the code lookup and the bcrypt compare; a landlord correcting the
+    // resident's address (new address, email_verified=FALSE) can land in
+    // between, and the code — which proves the OLD inbox — must not mark the
+    // NEW, unproven address verified. If the address moved, nothing is marked,
+    // firstVerification stays false, and no co-owner invitation is claimed.
     const firstVerification = (await query(
       `UPDATE users
           SET email_verified = TRUE,
               email_verified_at = COALESCE(email_verified_at, NOW()),
               updated_at = NOW()
         WHERE id = $1 AND email_verified IS NOT TRUE
+          AND lower(email) = lower($2)
         RETURNING id`,
-      [userId],
+      [userId, account.email],
     )).length > 0
 
     // S655 SECURITY: the address is proven NOW, so this — not the signup form —

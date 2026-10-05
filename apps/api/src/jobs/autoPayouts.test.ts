@@ -599,3 +599,22 @@ describe('one payout, one row', () => {
     expect(rows).toEqual([{ trigger_type: 'catch_up', status: 'settled' }])
   })
 })
+
+// 10/3 (Nic's admin cards): the payout record says what GAM kept back for the
+// fees the landlord owed it. Mountain View's 9/21 payout owed $495 and sent
+// $413; the $82 September platform fee taken out of it could only be inferred.
+describe('a payout record says what GAM kept back', () => {
+  it('stores the GAM fees kept out of a payout, and $0 when nothing was', async () => {
+    const c = await db.connect()
+    let landlordId = '', userId = ''
+    try { ({ landlordId, userId } = await seedLandlord(c)) } finally { c.release() }
+    const intent = async (gross: number, netted: number, sent: number) => (await db.query<{ kept: string }>(
+      `INSERT INTO platform_transfer_intents
+         (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, netted_amount, status)
+       VALUES ($1, $2, 'acct_kept', $3, $4, $5, 'transferred') RETURNING gam_fees_kept_amount::text AS kept`,
+      [landlordId, userId, sent, gross, netted])).rows[0].kept
+    expect(await intent(495, 0, 413)).toBe('82.00')            // the September platform fee
+    expect(await intent(600, 50, 520)).toBe('30.00')           // a returned payment taken back is not GAM's fee
+    expect(await intent(589, 0, 589)).toBe('0.00')
+  })
+})

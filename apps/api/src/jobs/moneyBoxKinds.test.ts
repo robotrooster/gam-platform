@@ -116,7 +116,12 @@ describe('the tag on a money box decides what the money is', () => {
     const calc = (await calculateDepositReturn(s.leaseId))!
     expect(calc.total_deposit).toBe(650)          // 500 security + 150 pet deposit
     expect(calc.prepaid_credit_remaining).toBe(1200) // the unspent pre-payment is the renter's too
-    expect(calc.refund_amount).toBe(650 + 1200)
+    // decisions #38 Q8 / #35.3: paid-ahead money is never refunded automatically.
+    // Nothing is deducted, so the deposit comes back and the $1,200 stays as
+    // paid-ahead credit for the landlord's refund choice.
+    expect(calc.refund_amount).toBe(650)
+    expect(calc.prepaid_credit_used).toBe(0)
+    expect(calc.prepaid_credit_left).toBe(1200)
   })
 
   it('an unpaid DEPOSIT box is not in the pool — only money that settled is held', async () => {

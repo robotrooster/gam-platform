@@ -469,3 +469,57 @@ describe('S539 GET /payments/remittances — per-line application display', () =
     expect(res.status).toBe(403)
   })
 })
+
+// ── S655 (money plan §1.4): ONE allocation order, everywhere ─────────────────
+describe('S655 one allocation order', () => {
+  it('comparator order everywhere: the portal quote, the charge, the desk window, the database and the shared comparator agree', async () => {
+    const { quoteLeaseCharge, chargeLeaseBalance } = await import('../services/rentCharge')
+    const { deskQuote } = await import('../services/manualPaymentSettle')
+    const { allocationOrderSql } = await import('../services/moneyPredicates')
+    const { sortForAllocation } = await import('@gam/shared')
+    const f = await fixture()
+    const line = async (type: string, amount: number, due: string, entry: string) => (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8) RETURNING id`,
+      [f.unitId, f.leaseId, f.tenantId, f.landlordId, type, amount.toFixed(2), due, entry])).rows[0].id
+    // Created in a scrambled order on purpose: creation time only breaks a tie
+    // between two lines of the same bucket, day and type.
+    const fee      = await line('fee', 15, '2026-10-01', 'OTHERFEE')
+    const late     = await line('late_fee', 25, '2026-10-01', 'LATEFEE')
+    const propane  = await line('utility', 60, '2026-09-01', 'PROPANE')
+    const water    = await line('utility', 30, '2026-10-01', 'UTILITY')
+    const old      = await line('carried_balance', 500, '2025-12-01', 'BALANCE')
+    const rentOct  = await line('rent', 440, '2026-10-01', 'RENT')
+    const home     = await line('home_payment', 200, '2026-10-01', 'HOMEPMT')
+    const rentSep  = await line('rent', 440, '2026-09-01', 'RENT')
+    // Older bill first; same day: rent, utility, late fee, fee, home payment;
+    // propane, then the old balance, sink below everything.
+    const current = [rentSep, rentOct, water, late, fee, home, propane]
+    const expected = [...current, old]
+
+    const dbOrder = (await db.query<{ id: string }>(
+      `SELECT p.id FROM payments p WHERE p.lease_id = $1 ORDER BY ${allocationOrderSql('p')}`, [f.leaseId])).rows.map(r => r.id)
+    expect(dbOrder).toEqual(expected)
+    const all = (await db.query<any>(
+      `SELECT id, amount::float AS amount, due_date::text AS due_date, type, entry_description, created_at
+         FROM payments WHERE lease_id = $1`, [f.leaseId])).rows
+    expect(sortForAllocation(all).map(r => r.id)).toEqual(expected)
+
+    const q = await quoteLeaseCharge({ tenantId: f.tenantId, leaseId: f.leaseId, paymentMethodType: 'ach' })
+    expect([...q.required, ...q.carried].map(r => r.id)).toEqual(expected)
+
+    const c = await db.connect()
+    try {
+      const d = await deskQuote(c, { tenantId: f.tenantId, landlordId: f.landlordId })
+      expect([...d.rows, ...d.carried].map(r => r.id)).toEqual(expected)
+    } finally { c.release() }
+
+    // The charge lands money in that order: the current bill whole, then the old balance last.
+    const dry = await chargeLeaseBalance({
+      tenantId: f.tenantId, leaseId: f.leaseId, amount: 1210 + 100, paymentMethodId: 'pm_x',
+      paymentMethodType: 'ach', source: 'portal', dryRun: true,
+    })
+    expect(dry.lines.map(l => l.payment_id)).toEqual(expected)
+    expect(dry.lines[dry.lines.length - 1]).toEqual({ payment_id: old, amount_applied: 100 })
+  })
+})

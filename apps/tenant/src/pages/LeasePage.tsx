@@ -5,6 +5,8 @@ import { FileText, Download, PenTool, CheckCircle, AlertCircle, RotateCcw } from
 import { ADDENDUM_DIFF_FIELD_LABEL, formatAddendumDiffValue } from '@gam/shared'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
+import { pendingDocHome } from '../lib/pendingLease'
+import { awaitingSignatureRow, leaseOnItsWay } from '../lib/awaitingSignature'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
@@ -238,12 +240,20 @@ function NextLeaseCard({ next, onOpen }: { next: any; onOpen: (docId: string) =>
 
 export function LeasePage() {
   const navigate = useNavigate()
+  // Always an array: the nav (main.tsx) reads this same cache key as a list.
   const { data: allPendingDocs = [] } = useQuery('pending-docs', () =>
-    get('/esign/pending?t=' + Date.now()).then((r: any) => r)
+    get('/esign/pending?t=' + Date.now()).then((r: any) => (Array.isArray(r) ? r : []))
   )
-  // S655: a NEW LEASE for the home they already live in shows as their next
-  // lease (below), not as a generic "document awaiting your signature".
-  const pendingDocs = (allPendingDocs as any[]).filter((d: any) => !d.renewsLeaseId)
+  // Final sweep (10/3): the one document that is waiting on THEM — sent to
+  // them (signer status sent/viewed), the portal's own waiting lease first
+  // (me.pendingLeaseDocumentId). The list also holds documents that have not
+  // reached them yet (S636), and its first row could be a lease the landlord
+  // had not signed, or a purchase agreement ahead of the lease. A NEW LEASE for
+  // the home they already live in (S655) shows as their next lease, below.
+  const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
+  const waitingDoc = awaitingSignatureRow(allPendingDocs as any[], me)
+  const waitingHome = pendingDocHome(waitingDoc)
+  const onItsWay = !waitingDoc && leaseOnItsWay(allPendingDocs as any[])
   const qc = useQueryClient()
   const [signMode, setSignMode] = useState<'type'|'draw'>('type')
   const [typedSig, setTypedSig] = useState('')
@@ -294,15 +304,15 @@ export function LeasePage() {
   // the portal and no reason to think one existed. The banner comes first now.
   if (!lease) return (
     <div style={{ padding:32, maxWidth:720, margin:'0 auto' }}>
-      {(pendingDocs as any[]).length > 0 ? (
+      {waitingDoc ? (
         <div style={{ background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.3)', borderRadius:12, padding:'20px 24px', display:'flex', alignItems:'center', justifyContent:'space-between', gap:16, flexWrap:'wrap' as const }}>
           <div>
-            <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>📋 Your lease is ready to sign</div>
+            <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>📋 Ready for your signature</div>
             <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>
-              {(pendingDocs as any[])[0].title}{(pendingDocs as any[])[0].propertyName ? ` · ${(pendingDocs as any[])[0].propertyName}` : ''}
+              {waitingDoc.title}{waitingHome ? ` · ${waitingHome}` : ''}
             </div>
             <div style={{ fontSize:'.75rem', color:'var(--text-3)', marginTop:4 }}>
-              Your landlord has already signed. Open it to read the terms and add your signature.
+              It is your turn. Open it to read it and add your signature.
             </div>
           </div>
           {/* S637: was `.token`, a field GET /esign/pending has never returned —
@@ -312,10 +322,18 @@ export function LeasePage() {
               have been waiting all day to sign" actually was. The identical bug
               was fixed on the LANDLORD banner in S535 and this copy of it was
               missed. */}
-          <button onClick={()=>navigate('/sign/'+(pendingDocs as any[])[0].documentId)}
+          <button onClick={()=>navigate('/sign/'+waitingDoc.documentId)}
             style={{ padding:'10px 20px', borderRadius:8, border:'none', background:'var(--gold, #c9a227)', color:'#060809', fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' as const, flexShrink:0 }}>
             Review &amp; Sign →
           </button>
+        </div>
+      ) : onItsWay ? (
+        <div style={{ padding:16, textAlign:'center' }}>
+          <FileText size={48} style={{ opacity:.2, display:'block', margin:'0 auto 12px' }} />
+          <div style={{ fontSize:'.9rem', color:'var(--text-2)' }}>Your lease is on its way.</div>
+          <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginTop:4 }}>
+            It needs another signature before it reaches you. You'll get an email when it's your turn to sign.
+          </div>
         </div>
       ) : (
         <div style={{ padding:16, textAlign:'center' }}>
@@ -396,13 +414,13 @@ export function LeasePage() {
       {lease.id && (lease.status === 'active' || lease.status === 'pending') && (
         <DepositPortabilitySection leaseId={lease.id} />
       )}
-      {(pendingDocs as any[]).length > 0 && (
+      {waitingDoc && (
         <div style={{ background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.3)', borderRadius:12, padding:'16px 20px', marginBottom:20, display:'flex', alignItems:'center', justifyContent:'space-between', gap:16 }}>
           <div>
             <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>📋 Document Awaiting Your Signature</div>
-            <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>{(pendingDocs as any[])[0].title} · {(pendingDocs as any[])[0].propertyName}</div>
+            <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>{waitingDoc.title}{waitingHome ? ` · ${waitingHome}` : ''}</div>
           </div>
-          <button onClick={()=>navigate('/sign/'+(pendingDocs as any[])[0].documentId)}
+          <button onClick={()=>navigate('/sign/'+waitingDoc.documentId)}
             style={{ padding:'10px 20px', borderRadius:8, border:'none', background:'var(--gold, #c9a227)', color:'#060809', fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' as const, flexShrink:0 }}>
             Sign Now →
           </button>

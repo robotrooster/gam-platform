@@ -38,6 +38,52 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── 10/4: move-out money, check-outs, and a card waiting on its bank ───────
+  // Every one of these moves money or says where money went, and each is a
+  // press on a screen that read the figures fresh at that moment (a 409 reads
+  // them again in place). decisions #38 Q6: the assistant makes no money
+  // decision; #46: the paid-ahead choice is the landlord's, never GAM's or an
+  // agent's. And as of #44 (10/4) every AI assistant is off until retrained,
+  // so none of these could be reached by one today anyway.
+  // 10/4 (gate review): the assistant's finalize_deposit_return and
+  // confirm_deposit_match were removed under #38 Q6. Finalizing sends the
+  // GAM-held refund by itself (#47a) and settles what is deducted; confirming
+  // a bank-deposit match settles charges. Both are money decisions.
+  'leases POST /:id/deposit-return/finalize':
+    'finalizes a move-out: settles what is deducted and sends the GAM-held refund back the way it was paid (decisions #47a). The owner\'s press on the move-out page with the deposit, every deduction and the refund on screen, read fresh; the assistant makes no money decision (#38 Q6).',
+  'bankFeed POST /deposits/:id/confirm':
+    'says which charges a bank deposit paid, which settles them. The owner\'s press on the Bank feed with the deposit and the shortlist on screen; in a park where every lot pays the same rent an amount names nobody, and the assistant makes no money decision (#38 Q6).',
+  'leases POST /:id/deposit-return/send-back':
+    'the owner sends a deposit return a team member parked for approval back to a draft, to change it. The owner\'s own approval decision, made on the move-out page with every deduction on screen.',
+  'leases POST /:id/deposit-return/refund-parts/:partId/try-again':
+    'sends a deposit refund that did not go out to the card or bank again. Pressed on the move-out page (or from the owner\'s to-do) on the one refund line it names, read fresh; a misheard line is money sent twice.',
+  'leases POST /:id/deposit-return/refund-parts/:partId/cash':
+    'says a deposit refund that could not go back to the card or bank is being handed over in cash at the office instead. Pressed with the cash in hand and the refund line on screen; the amount the page showed is checked again.',
+  'leases POST /:id/deposit-return/landlord-part/handed-back':
+    'records the day the landlord handed back the part of a deposit they hold themselves. The landlord\'s statement about their own money, with the day picked and the amount on the move-out page.',
+  'leases POST /:id/deposit-return/landlord-part/undo':
+    'takes back a "handed back" mark on the landlord\'s part of a deposit. The one-button back-out of the same move-out page.',
+  'leases POST /:id/never-moved-in':
+    'ends a lease whose tenant signed but never moved in and zeroes ONLY the unpaid move-in bill (deposit, move-in fees, first rent); later unpaid bills stay owed, and it is refused if the guest was ever checked in (decisions #46.4, #53). Confirmed in a window that lists every line it zeroes and what stays owed, and the server checks that total again; a misheard name ends somebody\'s real tenancy.',
+  'paidAheadChoice POST /:leaseId/paid-ahead-choice':
+    'the landlord\'s choice for paid-ahead money left on an ended lease: no refund, the unused days, or another amount, then keep it or leave it as their credit (decisions #46.1 — the landlord decides it, never GAM). Made on a page showing the money, how it was paid and the exact cost, read fresh.',
+  'paidAheadChoice POST /:leaseId/paid-ahead-choice/parts/:partId/retry':
+    'sends a paid-ahead refund that did not go out to the card or bank again. Pressed on the refund line it names, on the same page, read fresh.',
+  'paidAheadChoice POST /:leaseId/paid-ahead-choice/parts/:partId/cash':
+    'gives a paid-ahead refund that could not go back to the card or bank in cash at the office instead. Pressed before the hand-back, and the reply says how much to hand over — a person at the desk with the money.',
+  'stayCheckOut POST /:unitId/bookings/:bookingId/check-out':
+    'checks a guest out and records the money decision for the unused nights in one step. Done from the schedule\'s check-out window with what was booked, stayed and paid on screen (the booking tool already refuses to record a check-out).',
+  'stayCheckOut POST /:unitId/bookings/:bookingId/check-out/parts/:partId/retry':
+    'sends a check-out card refund that failed to the card again. Pressed on that refund line from the done screen, the schedule or the owner\'s to-do.',
+  'stayCheckOut POST /:unitId/bookings/:bookingId/check-out/parts/:partId/cash-instead':
+    'records a check-out card refund that failed as handed back in cash at the desk, so it is never sent to the card too. A person at the desk with the money.',
+  'bankFeed POST /deposits/:id/not-rent/undo':
+    'puts a deposit set aside as "not rent" back on the rent-matching list. The one-button back-out on that list, right where the deposit was set aside, read fresh.',
+  'payments POST /pay-balance/release':
+    'cancels a card payment the card\'s bank has not confirmed and opens the bill again — the tenant\'s "Cancel it and pay another way" on the pay screen. Nothing to ask an agent for: the sweep releases it by itself after the hold (decisions #48.4).',
+  'payments POST /pay-balance/resume':
+    'brings back the card bank\'s confirmation window for a payment waiting on it. That window opens in the tenant\'s own browser on the pay screen; an agent cannot show it.',
+
   // ── S654: a card on the counter reader ────────────────────────────────────
   // The person holding the card is standing at the desk and the clerk is
   // watching the reader's screen. A misheard name sends someone else's balance
@@ -222,7 +268,6 @@ const DELIBERATE = new Map(Object.entries({
   // CREDENTIALS AND BANK VERIFICATION.
   'tenants POST /accept-invite': 'sets a password',
   'tenants PATCH /password': 'credential change',
-  'tenants POST /verify-ach': 'bank verification — microdeposit amounts are entered by the person',
   'bankFeed POST /link-session': 'opens a bank-linking session; the person authenticates to their bank',
   'bankFeed POST /finalize': 'completes that bank-linking session',
 
@@ -236,6 +281,15 @@ const DELIBERATE = new Map(Object.entries({
   'landlords POST /flex-charge/accounts': 'FlexCharge account setup is a financing product, not a portal chore',
   'landlords PATCH /flex-charge/accounts/:id': 'editing a FlexCharge account is the same financing decision as opening one',
   'landlords PATCH /flex-charge/finance-rate': 'setting a finance rate is a lending decision',
+  // S655 bank reconciliation (decisions #38 Q6: the assistant makes no money
+  // decision). Each of these says which cash went to the bank, or settles or
+  // un-settles charges against a bank deposit — done by staff with the bag and
+  // the bank feed on screen.
+  'bankFeed POST /deposit-slips': 'records which cash and checks went into the bank bag; staff tick them with the money in hand',
+  'bankFeed POST /deposit-slips/:id/void': 'says a bank bag did not go; counterpart of making the slip',
+  'bankFeed POST /deposit-slips/:id/match': 'the owner says a bank deposit IS this slip, which settles money',
+  'bankFeed POST /deposits/:id/undo': 'takes a bank-deposit match back, which un-settles charges',
+  'bankFeed POST /transactions/:id/undo-auto-file': 'takes back a deposit the bank feed filed by itself; the owner decides',
 
   // ADMIN-ONLY, DEV-ONLY, OR ANOTHER SURFACE ENTIRELY.
   'payments POST /initiate-rent-collection': 'requireAdmin — platform operations',
@@ -322,13 +376,21 @@ function routerAreas(): Record<string, string> {
   return out
 }
 
-/** '/api/units' -> router variable. Mounts may have more than two segments. */
-function mounts(): Record<string, string> {
+/**
+ * Every [base path, router variable] mount. Mounts may have more than two
+ * segments. A LIST, not a map keyed by path: several routers share one base
+ * ('/api/leases' serves paidAheadChoiceRouter and leasesRouter, '/api/units'
+ * serves stayCheckOutRouter and unitsRouter). Keyed by path, the last router
+ * won and every earlier one read as "not mounted — dead router", so its
+ * endpoints silently left the count (10/4 gate: the paid-ahead choice routes
+ * were invisible this way).
+ */
+export function mounts(): Array<[string, string]> {
   const src = readFileSync(join(API, 'index.ts'), 'utf8')
-  const out: Record<string, string> = {}
+  const out: Array<[string, string]> = []
   for (const m of src.matchAll(/app\.use\(\s*'(\/api\/[a-z0-9/-]+)'\s*,\s*([\s\S]{0,140}?)\)/g)) {
     const r = (m[2].match(/(\w+Router)/) || [])[1]
-    if (r) out[m[1]] = r
+    if (r) out.push([m[1], r])
   }
   return out
 }
@@ -338,7 +400,7 @@ const norm = (p: string) => (p.replace(/:[A-Za-z0-9_]+/g, ':x') || '/')
 const AREAS = routerAreas()
 const MOUNTS = mounts()
 const MOUNT_OF: Record<string, string> = {}          // router -> longest mount serving it
-for (const [base, r] of Object.entries(MOUNTS)) {
+for (const [base, r] of MOUNTS) {
   if (!MOUNT_OF[r] || base.length > MOUNT_OF[r].length) MOUNT_OF[r] = base
 }
 
@@ -435,6 +497,23 @@ const missingTools = [...new Set<string>(Object.values(HAND_BUILT))]
   .filter((n: string) => !toolSrc.includes(`name: '${n}'`))
 for (const k of Object.keys(HAND_BUILT)) reached.add(k)
 
+/**
+ * 10/4 gate review: a DELIBERATE entry whose route was removed or renamed
+ * left its reason behind, and nothing noticed — the siloed areas (pos, admin)
+ * are not in the endpoint count at all, so "matches nothing counted" could not
+ * tell stale from siloed. This checks every entry against what the route files
+ * still DECLARE, every verb and every area, siloed or not.
+ */
+const declaredAnywhere = new Set<string>()
+for (const fn of readdirSync(ROUTES)) {
+  if (!fn.endsWith('.ts') || fn.endsWith('.test.ts')) continue
+  const src = readFileSync(join(ROUTES, fn), 'utf8')
+  for (const m of src.matchAll(/^\s*\w+Router\.(get|post|patch|put|delete)\(\s*'([^']*)'/gm)) {
+    declaredAnywhere.add(`${fn.slice(0, -3)} ${m[1].toUpperCase()} ${m[2] || '/'}`)
+  }
+}
+const staleDeliberate = [...DELIBERATE.keys()].filter((k) => !declaredAnywhere.has(k))
+
 const openOnes = endpoints.filter((e) =>
   !reached.has(e.key) && !DELIBERATE.has(`${e.area} ${e.declared}`))
 const deliberate = endpoints.filter((e) => DELIBERATE.has(`${e.area} ${e.declared}`))
@@ -451,6 +530,8 @@ export interface ActionGap {
   open: Endpoint[]
   /** HAND_BUILT names that no tool defines — the map has rotted. */
   missingTools: string[]
+  /** DELIBERATE keys no route file declares any more — a reason left behind by a removed or renamed route. */
+  staleDeliberate: string[]
 }
 
 export function computeActionGap(): ActionGap {
@@ -461,6 +542,7 @@ export function computeActionGap(): ActionGap {
     deliberate: deliberate.map((e) => ({ ...e, why: DELIBERATE.get(`${e.area} ${e.declared}`)! })),
     open: openOnes,
     missingTools,
+    staleDeliberate,
   }
 }
 

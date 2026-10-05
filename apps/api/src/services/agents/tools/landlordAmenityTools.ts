@@ -13,7 +13,7 @@
  */
 
 import { query, queryOne, getClient } from '../../../db'
-import { lockArea, findApprovedConflict, billReservationFee } from '../../commonAreas'
+import { lockArea, findApprovedConflict, billReservationFee, landlordDecisionNote } from '../../commonAreas'
 import { fireAmenityAlert } from '../../../routes/commonAreas'
 import { notifyReservationDecision } from '../../notifications'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
@@ -72,7 +72,10 @@ export const decideAmenityReservation: AgentTool = {
   async execute(args, actor: AgentActor) {
     const rid = String(args.reservationId ?? '').trim()
     const approve = args.approve === true
-    const note = typeof args.note === 'string' && args.note.trim() ? args.note.trim().slice(0, 2000) : null
+    // Neutralized like the page route's note (routes/commonAreas.ts): a note
+    // that reads as GAM's waiting-fee key ('[fee_wait:') would make the sweep
+    // treat a canceled reservation as waiting on its fee.
+    const note = landlordDecisionNote(typeof args.note === 'string' && args.note.trim() ? args.note.trim().slice(0, 2000) : null)
     if (!rid) return { ok: false, error: 'A reservationId is required (from get_pending_amenity_requests).' }
 
     const r = await queryOne<any>(

@@ -22,7 +22,7 @@
 import { query } from '../../../db'
 import { cashBankingPosition } from '../../cashBankingControl'
 import { unmatchedDepositsWithCandidates, settledPayersAround } from '../../bankDepositCandidates'
-import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
+import { type AgentTool, type AgentActor } from './types'
 import { resolveActorCompany, COMPANY_PARAM } from './companyScope'
 
 export const getUnreconciledCash: AgentTool = {
@@ -44,9 +44,17 @@ export const getUnreconciledCash: AgentTool = {
   },
   audiences: ['landlord'],
   async execute(args, actor: AgentActor) {
+    // S634: bank reconciliation is per COMPANY — each entity has its own
+    // connected account, so deposits from two of them cannot be reconciled in
+    // one list without inventing a relationship that does not exist.
+    // S655 (Step 12): the company is resolved FIRST, and the "is a bank linked"
+    // check is that company's own — a bank linked at another of the owner's
+    // companies used to read as this one's.
+    const company = await resolveActorCompany(actor, (args as any).company)
+    if (!company.ok) return { ok: false, error: company.error }
     const connected = await query<{ n: string }>(
       `SELECT COUNT(*) AS n FROM bank_connections
-        WHERE landlord_id = ANY($1::uuid[]) AND status = 'active'`, [actorLandlordIds(actor)])
+        WHERE landlord_id = $1 AND status = 'active'`, [company.landlordId])
     if (parseInt(connected[0]?.n ?? '0', 10) === 0) {
       return {
         ok: true,
@@ -59,11 +67,6 @@ export const getUnreconciledCash: AgentTool = {
 
     const raw = Number(args.graceDays)
     const graceDays = Number.isFinite(raw) ? Math.min(30, Math.max(0, Math.trunc(raw))) : 3
-    // S634: bank reconciliation is per COMPANY — each entity has its own
-    // connected account, so deposits from two of them cannot be reconciled in
-    // one list without inventing a relationship that does not exist.
-    const company = await resolveActorCompany(actor, (args as any).company)
-    if (!company.ok) return { ok: false, error: company.error }
     const [position, deposits] = await Promise.all([
       cashBankingPosition(company.landlordId, { graceDays }),
       unmatchedDepositsWithCandidates(company.landlordId, 25),
@@ -106,17 +109,32 @@ export const getUnreconciledCash: AgentTool = {
         'around then, in case one deposit covers several. Only fall back to likelyFrom (what is still ' +
         'unpaid) when nothing settled fits. Never tell a landlord a deposit matches nothing without ' +
         'having looked at who actually paid.',
+      // S655 (Step 12): what was taken by hand and is not in the bank yet, in
+      // two groups — put on a deposit slip (in the bag, waiting for the bank)
+      // and on no slip at all (still in the drawer, or never slipped).
       collectedNotBanked: {
         count: position.unbanked.length,
         total: position.unbankedTotal,
         oldestDays: position.oldestDays,
-        items: position.unbanked.slice(0, 10).map(u => ({
-          tenant: u.tenantName, unit: u.unitNumber, amount: u.amount,
-          collectedOn: u.collectedOn, daysOutstanding: u.daysOutstanding,
-        })),
+        onADepositSlip: {
+          count: position.onSlip.items.length, total: position.onSlip.total,
+          items: position.onSlip.items.slice(0, 10).map(u => ({
+            who: u.payerName, unit: u.unitNumber, amount: u.amount, method: u.method,
+            collectedOn: u.collectedOn, slipDay: u.slipDepositDate,
+          })),
+        },
+        notOnAnySlip: {
+          count: position.notOnSlip.items.length, total: position.notOnSlip.total,
+          items: position.notOnSlip.items.slice(0, 10).map(u => ({
+            who: u.payerName, unit: u.unitNumber, amount: u.amount, method: u.method,
+            collectedOn: u.collectedOn, daysOutstanding: u.daysOutstanding,
+          })),
+        },
+        slipsNotSeenAtTheBank: position.slipsOverdue,
       },
       // Stated so the agent frames it as a prompt to check rather than a finding.
-      caveat: 'Cash can legitimately sit uncollected over a weekend, and one deposit can cover several days of collection. These figures are a prompt to check, not a discrepancy on their own.',
+      caveat: 'Cash can legitimately sit uncollected over a weekend, and one deposit can cover several days of collection. These figures are a prompt to check, not a discrepancy on their own. ' +
+        'Money on a deposit slip has left the drawer; only a slip the bank has not shown within 5 business days (slipsNotSeenAtTheBank) is worth asking about.',
     }
   },
 }

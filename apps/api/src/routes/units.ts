@@ -1,13 +1,15 @@
 import { Router } from 'express'
 import { z } from 'zod'
+import type { PoolClient } from 'pg'
 import { db, query, queryOne, getClient } from '../db'
-import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
+import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope, userHasPerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { landlordScopeIds } from '../lib/landlordScope'
-import { canonicalUnitNumber, UNIT_TYPE_PREFIX } from '@gam/shared'
+import { canonicalUnitNumber, UNIT_TYPE_PREFIX, BOOKING_STATUSES, BOOKING_STATUS_LABEL, SUB_PERMISSION_LABEL, PERMISSION_CATALOG, type BookingStatus } from '@gam/shared'
+import { centsWords, NEVER_MOVED_IN_NOTE, NEVER_MOVED_IN_REASON } from '../lib/unwindIssuedLease'
 import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
-import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
+import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE, type StayConflict } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
 import { todayIn, addDaysTo } from '../lib/timezone'
@@ -17,6 +19,8 @@ import { recordBookingEvent, recordBookingChange } from '../services/bookingEven
 import { maybeDraftLeaseFromBooking } from '../services/bookingLeaseDraft'
 import { unitPendingReads } from '../services/utilityReadingRuns'
 import { syncLeaseWithBookingDates } from '../services/bookingLeaseBilling'
+import { bookedDayBeforeEarlyCheckOut, checkOutChangeRefusal, onCheckOutUndone, afterPatchEarlyCheckOut, refundNeedsRetrySql, healLeaseEnds } from '../services/earlyCheckOut'
+import { scheduleStayPrice } from '../services/registerStay'
 import { assertLateFeeDecision } from '../services/lateFeePolicy'
 import {
   sendBookingGuestAccessEmail,
@@ -185,6 +189,470 @@ unitsRouter.get('/', async (req, res, next) => {
     res.json({ success: true, data: units })
   } catch (e) { next(e) }
 })
+
+// S655: a request date as a plain calendar day ('YYYY-MM-DD'), or null when it
+// is not a real day. Accepts a full ISO timestamp too (its first ten
+// characters), the way every other date in this file is read.
+function calendarDay(v: unknown): string | null {
+  const s = String(v ?? '').slice(0, 10)
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s)
+  if (!m) return null
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  const t = new Date(Date.UTC(y, mo - 1, d))
+  return t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d ? s : null
+}
+
+// S655: 'YYYY-MM-DD' → "October 5, 2026" for a sentence a person reads.
+function longDay(ymd: string): string {
+  return new Date(`${ymd}T12:00:00Z`).toLocaleDateString('en-US',
+    { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
+
+// Step 9 final fix (fix pass 1): what canceling a stay did to the lease
+// drafted with it, in plain words (the save's `leaseClosed` notice).
+// Fix pass 2 (review): what STAYS owed is said too — GAM's own fees (the $1
+// declined-card fee, the returned-payment fee) and charges billed on purpose
+// are never zeroed (the close's keptWords). "Nothing was owed on it" only when
+// nothing is left owed either.
+//
+// Final fix (fix pass 1, decisions #53): the close zeroes ONLY the move-in bill
+// (a later bill stays owed and keptWords names it), so "the move-in bill" is
+// now the whole truth of what was zeroed — one bill per lease ("bills" when
+// more than one lease was drafted with the stay).
+function leaseClosedWords(guest: string, c: { amount: number; leases: number; keptTotal: number; keptWords: string[] }): string {
+  const whose = guest === 'This guest' ? 'The' : `${guest}'s`
+  const lease = c.leases === 1 ? 'lease' : 'leases'
+  const it = c.leases === 1 ? 'it' : 'them'
+  const kept = c.keptTotal > 0 && c.keptWords.length > 0 ? ` ${c.keptWords.join(' ')}` : ''
+  return `${whose} ${lease} drafted with this reservation ended with it. `
+    + (c.amount > 0
+      ? `Nothing was paid on ${it}, so the ${centsWords(Math.round(c.amount * 100))} move-in ${c.leases === 1 ? 'bill is' : 'bills are'} no longer owed.${kept}`
+      : c.keptTotal > 0
+        ? `Nothing on ${it} was zeroed.${kept}`
+        : `Nothing was owed on ${it}.`)
+}
+
+/**
+ * Final fix (fix pass 1): a checked-out stay can't be canceled or marked a
+ * no-show — it happened. The words name no step that undoes it (there is none
+ * on the Schedule, and undoing a stay is how rent for nights stayed got
+ * zeroed): the stay stays on the schedule as its record.
+ */
+function stayHappenedRefusal(guest: string, status: 'cancelled' | 'no_show'): string {
+  return status === 'cancelled'
+    ? `${guest} has already checked out, so the stay can't be canceled — a stay that happened stays on the schedule as its record, and nothing was changed.`
+    : `${guest} checked in and out, so they came and can't be marked a no-show — the stay stays on the schedule as its record, and nothing was changed.`
+}
+
+/**
+ * Final fix (fix pass 2, review): a checked-in stay can't be canceled or
+ * marked a no-show either — the guest is on the site, so "the site is free
+ * for those nights" would be untrue and the nights they are staying would go
+ * unbilled. The step that exists is Check out (on the day, or early — it
+ * settles the nights they stayed). Never "set it back to Confirmed".
+ */
+function stayUnderWayRefusal(guest: string, status: 'cancelled' | 'no_show'): string {
+  return status === 'cancelled'
+    ? `${guest} is checked in, so the stay can't be canceled — they are on the site, and nothing was changed. `
+      + 'When they leave, use Check out on the Schedule; it settles the nights they stayed.'
+    : `${guest} is checked in, so they came and can't be marked a no-show — nothing was changed. `
+      + 'When they leave, use Check out on the Schedule; it settles the nights they stayed.'
+}
+
+/**
+ * Step 9 final fix (fix pass 1 of the #53 close, review LOW): bringing back a
+ * canceled or no-show stay whose drafted lease the never-moved-in close ended.
+ *
+ * Fix pass 2 (review): it says "(its move-in bill zeroed)" only when the close
+ * actually zeroed one (`billZeroed`); a signed lease the close ended with no
+ * bill on it is named as signed.
+ */
+export function closedStayRefusal(guest: string, was: 'cancelled' | 'no_show', billZeroed = true): string {
+  const whose = guest === 'This guest' ? 'This' : `${guest}'s`
+  return `${was === 'no_show' ? `${guest} was marked a no-show` : `${whose} reservation was canceled`}, and the lease drafted with it `
+    + (billZeroed
+      ? 'was ended as never moved in (its move-in bill zeroed), '
+      : 'had been signed and was ended as never moved in, ')
+    + 'so the reservation can’t be brought back — nothing was changed. '
+    + `If ${guest === 'This guest' ? 'they' : guest} ${guest === 'This guest' ? 'are' : 'is'} coming after all, book a new reservation on the Schedule.`
+}
+
+/**
+ * Step 9 final fix (fix pass 2, review MEDIUM): the drafted lease of a
+ * canceled or no-show stay that the never-moved-in close ended AS AN ISSUED
+ * LEASE — the close zeroed something on it (its move-in bill voided with
+ * NEVER_MOVED_IN_NOTE, or a line zeroed with it), or the lease had been signed
+ * by the landlord (the landlord's signature is what issues the lease — S647,
+ * the landlord signs FIRST; signed_by_landlord is written TRUE only when a
+ * lease is issued, so it marks an issued lease). Such a
+ * stay can't be brought back: the lease stays ended and its bill zeroed, so
+ * the guest would be back on the site with no lease and nothing billing them.
+ *
+ * Unsigned paperwork the cancel ended with nothing zeroed is NOT returned: a
+ * mistaken Cancel on it can be undone, as S639 allowed, and any reservation
+ * money stays on the stay it was paid toward. (Fix pass 1 refused on the
+ * close's reason alone, which every lease the cancel ends carries — including
+ * an unsigned draft with no bill — and told staff a bill was zeroed when none
+ * existed, sending them to book a new stay while the money paid stayed on the
+ * old one.)
+ *
+ * Read before the save, and again inside it once the stay's row is locked
+ * (a "They never moved in" on the Leases page between the two locks the same
+ * row first — assessNeverMovedIn — so it is seen).
+ */
+async function closedLeaseOfStay(
+  bookingId: string, client?: PoolClient,
+): Promise<{ billZeroed: boolean } | null> {
+  const sql = `
+    SELECT z.bill_zeroed FROM (
+      SELECT l.id, l.signed_by_landlord, l.termination_reason,
+             (EXISTS (SELECT 1 FROM invoices i
+                       WHERE i.lease_id = l.id AND i.status = 'void' AND strpos(COALESCE(i.notes, ''), $3) > 0)
+              OR EXISTS (SELECT 1 FROM payments p
+                          WHERE (p.lease_id = l.id OR p.invoice_id IN (SELECT i.id FROM invoices i WHERE i.lease_id = l.id))
+                            AND strpos(COALESCE(p.notes, ''), $3) > 0)) AS bill_zeroed
+        FROM leases l
+       WHERE l.source_booking_id = $1 AND l.status IN ('terminated', 'expired')
+    ) z
+    WHERE z.bill_zeroed OR (z.termination_reason = $2 AND z.signed_by_landlord IS TRUE)
+    ORDER BY z.bill_zeroed DESC
+    LIMIT 1`
+  const params = [bookingId, NEVER_MOVED_IN_REASON, NEVER_MOVED_IN_NOTE]
+  const row = client
+    ? (await client.query<{ bill_zeroed: boolean }>(sql, params)).rows[0]
+    : await queryOne<{ bill_zeroed: boolean }>(sql, params)
+  return row ? { billZeroed: row.bill_zeroed === true } : null
+}
+
+/** What a cancel (or a no-show) of a stay with a drafted lease says before the close's own refusal words. */
+function cancelRefusalLead(guest: string, status: 'cancelled' | 'no_show'): string {
+  return `${guest === 'This guest' ? 'This' : `${guest}'s`} reservation has a lease drafted with it, and `
+    + `${status === 'no_show' ? 'marking the reservation a no-show' : 'canceling the reservation'} ends that lease — but `
+}
+
+/** What canceling the stay does to its drafted lease, in a sentence ("Canceling this reservation ends the lease …"). */
+function cancelEndsLeaseWords(status: 'cancelled' | 'no_show', inForce: boolean, amount: number): string {
+  const act = status === 'no_show' ? 'Marking this reservation a no-show' : 'Canceling this reservation'
+  return `${act} ends the lease drafted with it${inForce ? ', which is already in force' : ''}`
+    + (amount > 0 ? `${inForce ? ',' : ''} and zeroes its unpaid ${centsWords(Math.round(amount * 100))} move-in bill` : '')
+}
+
+/** The 403 when the person may cancel stays but not end leases (Terminate leases). */
+function cancelNeedsTerminateWords(status: 'cancelled' | 'no_show', inForce: boolean, amount: number): string {
+  return `${cancelEndsLeaseWords(status, inForce, amount)}. `
+    + `That needs the "${SUB_PERMISSION_LABEL['leases.terminate']}" permission, so nothing was changed. `
+    + `Ask the account owner to turn on "${SUB_PERMISSION_LABEL['leases.terminate']}" for you on the Team page.`
+}
+
+/**
+ * Final fix (fix pass 1, decisions #53: "never runs blind"): a cancel that
+ * would zero a bill or end a lease in force, sent without the total its
+ * confirm showed, is refused with nothing changed. The step that exists:
+ * Cancel reservation on the Schedule, which shows what is zeroed and what
+ * stays owed before anything changes.
+ */
+/**
+ * Fix pass 2 (review): the leases drafted with the stay are not the ones the
+ * Schedule's confirm showed (one was drafted, or ended, since it read).
+ */
+export const CANCEL_LEASES_CHANGED_WORDS = 'The leases drafted with this reservation changed since you opened this, so nothing was changed. '
+  + 'The window now shows what canceling it does — check it and confirm again.'
+
+/** Fix pass 3 (review): Cancel reservation on a stay already marked a no-show. */
+export const NO_SHOW_ALREADY_WORDS = 'This reservation is already marked a no-show, so its site is already free. Nothing else to do.'
+
+export const CANCEL_NEEDS_CONFIRM_TAIL = 'Nothing was changed. Use Cancel reservation on the Schedule — it shows, by name, '
+  + 'what is zeroed and what stays owed before you confirm.'
+
+// S655: a reservation's status, and the words the schedule shows for it —
+// BOOKING_STATUSES (every status unit_bookings_status_check allows) and
+// BOOKING_STATUS_LABEL, from packages/shared. The PATCH refuses anything else
+// in words instead of letting the database's own error text out as a 500.
+const isBookingStatus = (s: unknown): s is BookingStatus =>
+  typeof s === 'string' && (BOOKING_STATUSES as readonly string[]).includes(s)
+const bookingStatusLabel = (s: string) => (isBookingStatus(s) ? BOOKING_STATUS_LABEL[s] : s)
+// "Tentative, Confirmed, … Canceled or No-show" — the statuses a refusal names, from the shared list.
+const BOOKING_STATUS_CHOICES = (() => {
+  const words = BOOKING_STATUSES.map(st => BOOKING_STATUS_LABEL[st])
+  return `${words.slice(0, -1).join(', ')} or ${words[words.length - 1]}`
+})()
+
+// S655 (Step 6 fix round): everybody who puts a stay on a site waits for
+// everybody else doing the same, so a site's free-check and the write that
+// takes the nights happen with nobody else in between. Two keys exist today
+// and both are taken: the register's (services/registerStay createStayBooking)
+// and the booking page's (services/propertyBooking bookStay). Sites in a fixed
+// order, so two saves moving stays between the same two sites cannot each
+// hold one site while waiting for the other.
+//
+// Lock order: a caller locks the booking ROWS it changes first and the sites
+// second — the register's sale does the same (it locks the unpaid holds it
+// moves, then the site), so the two can never wait on each other in a circle.
+// The one exception is a paid reservation made on the schedule (the booking
+// POST): it takes its site first and then waits on nothing (see
+// HOLD_CLEARING_LOCK_WAIT).
+//
+// 10/3 (review, fix pass 2): before all of that, a save that will WRITE a stay
+// onto a site takes that site's own row (FOR KEY SHARE) — the booking POST, a
+// move on the schedule (the booking PATCH), putting back a reservation moved
+// for an extension that did not happen (putRelocatedBack) and the register's
+// sale alike. A pay
+// link being sent for a site holds the row and then waits for the site, so
+// the row has to come first or the two end each other with a deadlock.
+async function lockSitesForStays(client: PoolClient, unitIds: string[]): Promise<void> {
+  for (const id of [...new Set(unitIds)].sort()) {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`unit-booking:${id}`])
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`unit_booking:${id}`])
+  }
+}
+
+// S655: the statuses in which a guest still holds their site. Moving a
+// checked-out stay back to one of these is undoing the check-out.
+const SITE_HOLDING_STATUSES = ['tentative', 'confirmed', 'checked_in']
+
+// 10/3 (review, fix pass 2): what a booking PATCH from somebody WITHOUT "Edit /
+// move / cancel reservations" may do — check a guest in, check one out, or
+// correct the day a checked-out guest left, and nothing else (see the PATCH's
+// "CHECKING A GUEST IN OR OUT NEEDS ONLY ITS OWN PERMISSION"). Returns the
+// refusal in plain words, or null when the save is only that. Whether they hold
+// "Check guests in" / "Check guests out" for the act itself is checked before.
+// The edit permission's name is read from the permissions catalog, so the
+// words match the toggle on the Team page.
+const EDIT_RESERVATION_LABEL = PERMISSION_CATALOG
+  .flatMap(g => g.sections.flatMap(s => s.items))
+  .find(i => i.key === 'schedule.edit_reservation')?.label ?? 'Edit / move / cancel reservations'
+
+function deskOnlyRefusal(
+  booking: {
+    status: string; notes: string | null; guest_name: string | null; guest_email: string | null
+    guest_phone: string | null; required_site_layout: string | null; required_amp_service: string | null
+    locked_to_unit: boolean | null; avoided_unit_ids: string[] | null
+  },
+  sent: {
+    status: unknown; notes: unknown; guestName: unknown; guestEmail: unknown; guestPhone: unknown
+    requiredSiteLayout: unknown; requiredAmpService: unknown; lockedToUnit: unknown; avoidedIn: string[] | null
+    checkInChanged: boolean; checkOutChanged: boolean; unitChanged: boolean; toCheckOut: boolean
+  },
+): string | null {
+  // A field counts only when it is sent AND differs from what is stored: the
+  // schedule sends some of them back unchanged.
+  const differs = (v: unknown, stored: unknown) => v != null && String(v) !== String(stored ?? '')
+  const parts: string[] = []
+  if (sent.checkInChanged) parts.push('arrival day')
+  // On a check-out the day typed in is the day they left, which is the check-out itself.
+  if (sent.checkOutChanged && !sent.toCheckOut) parts.push('check-out day')
+  if (sent.unitChanged) parts.push('site')
+  if (differs(sent.guestName, booking.guest_name) || differs(sent.guestEmail, booking.guest_email)
+      || differs(sent.guestPhone, booking.guest_phone)) parts.push("guest's details")
+  // (Blank notes leave the notes as they are.)
+  if (sent.notes && differs(sent.notes, booking.notes)) parts.push('notes')
+  if (differs(sent.requiredSiteLayout, booking.required_site_layout)
+      || differs(sent.requiredAmpService, booking.required_amp_service)) parts.push('site needs')
+  if (typeof sent.lockedToUnit === 'boolean' && sent.lockedToUnit !== (booking.locked_to_unit === true)) {
+    parts.push('lock to the site')
+  }
+  if (sent.avoidedIn) {
+    const now = new Set(booking.avoided_unit_ids ?? [])
+    const asked = new Set(sent.avoidedIn)
+    if (now.size !== asked.size || [...asked].some(id => !now.has(id))) parts.push('sites to avoid')
+  }
+  const turnOn = `Ask the account owner to turn on "${EDIT_RESERVATION_LABEL}" for you on the Team page.`
+  if (parts.length) {
+    const what = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`
+    return `Changing the ${what} needs the "${EDIT_RESERVATION_LABEL}" permission, and nothing was changed. ${turnOn}`
+  }
+  const to = typeof sent.status === 'string' && sent.status !== '' ? sent.status : null
+  if (to === null || to === booking.status) return null
+  const checkIn = to === 'checked_in' && (booking.status === 'tentative' || booking.status === 'confirmed')
+  const checkOut = to === 'checked_out' && booking.status === 'checked_in'
+  if (checkIn || checkOut) return null
+  return `Changing a reservation from ${bookingStatusLabel(booking.status)} to ${bookingStatusLabel(to)} `
+    + `needs the "${EDIT_RESERVATION_LABEL}" permission, and nothing was changed. ${turnOn}`
+}
+
+// S655 (Step 6 fix round 6): a transaction the database ended to break a
+// deadlock (two saves each waiting on a lock the other holds) did nothing, so
+// it is safe to run again from the top. A save that keeps meeting one is
+// answered in plain words instead of the database's own text in a 500.
+const DEADLOCKED = '40P01'
+const isDeadlock = (e: unknown) => (e as { code?: string } | null)?.code === DEADLOCKED
+const SAVED_AT_THE_SAME_MOMENT =
+  'Another reservation was being saved for the same sites at the same moment, so this one was not saved. Try again.'
+
+// 10/3 (review, fix round 3): A PAID RESERVATION NEVER WAITS ON ANYBODY ONCE IT
+// HAS ITS SITE.
+//
+// Moving an unpaid hold out of the way takes locks on OTHER things: the hold
+// itself, the site it moves to (and that site's row), its ticket and its pay
+// link. The register's sale takes some of the same things in its own order
+// (pos.ts: the holds on its site, then the site a hold moves to, then its own
+// site), and no single order for this save works against it. Waiting for its
+// own site after the hold's new one ended a sale moving a hold the other way
+// (probe PE). Waiting for the hold's new site after its own ended a sale on the
+// same site moving its hold to that same new site. The database ends whichever
+// of the two it checks first, and the register's sale has no second try.
+//
+// So once this save has its site, every lock it asks for while moving holds is
+// given up after HOLD_CLEARING_LOCK_WAIT, far under the database's one-second
+// deadlock check. The save then lets go of everything (ROLLBACK, so its site
+// goes too), pauses and starts again from the top. Whoever it was in the way of
+// finishes, and this save then sees what they stored. After BOOKING_SAVE_TRIES
+// tries it is answered in plain words (SAVED_AT_THE_SAME_MOMENT).
+const LOCK_BUSY = '55P03'
+const isLockBusy = (e: unknown) => (e as { code?: string } | null)?.code === LOCK_BUSY
+const HOLD_CLEARING_LOCK_WAIT = '50ms'
+const BOOKING_SAVE_TRIES = 6
+// 50ms, 100ms, 200ms, 400ms, 800ms, plus up to 50ms at random so two saves that
+// let go together do not come back together. About two seconds in all, longer
+// than a card being taken at the register keeps a site.
+const pauseBeforeTry = (retry: number) => new Promise<void>(r =>
+  setTimeout(r, Math.min(800, 50 * 2 ** (retry - 1)) + Math.floor(Math.random() * 50)))
+
+async function withShortLockWaits<T>(client: PoolClient, work: () => Promise<T>): Promise<T> {
+  const prior = (await client.query<{ v: string }>(`SELECT current_setting('lock_timeout') AS v`)).rows[0].v
+  await client.query(`SELECT set_config('lock_timeout', $1, true)`, [HOLD_CLEARING_LOCK_WAIT])
+  const out = await work()
+  await client.query(`SELECT set_config('lock_timeout', $1, true)`, [prior])
+  return out
+}
+
+// S655 (Step 6 fix round): the stay's row, locked, compared with the row a
+// save decided everything from. True when somebody changed its status, site
+// or dates in between (or it is gone). The caller holds the lock until its
+// transaction ends.
+async function stayChangedSince(
+  client: PoolClient,
+  b: { id: string; status: string; unit_id: string; check_in_day: string; check_out_day: string },
+): Promise<boolean> {
+  const fresh = (await client.query<{ status: string; unit_id: string; ci: string; co: string }>(
+    `SELECT status, unit_id, to_char(check_in, 'YYYY-MM-DD') AS ci, to_char(check_out, 'YYYY-MM-DD') AS co
+       FROM unit_bookings WHERE id = $1 FOR UPDATE`, [b.id])).rows[0]
+  return !fresh || fresh.status !== b.status || fresh.unit_id !== b.unit_id
+    || fresh.ci !== b.check_in_day || fresh.co !== b.check_out_day
+}
+
+// S655 (Step 6 fix round 6): a reservation the extension rule (W-20,
+// services/scheduleCompression relocateBlockingBookings) moved off the
+// extending guest's site to make room. That move is written on its own, ahead
+// of the extension's save — scheduleCompression takes no transaction — so when
+// the save is then refused, the move is undone here instead of being left
+// behind for an extension that never happened.
+type RelocatedStay = { bookingId: string; fromUnitId: string; toUnitId: string }
+
+async function stillRelocated(bookingIds: string[], fromUnitId: string): Promise<RelocatedStay[]> {
+  if (!bookingIds.length) return []
+  const rows = await query<{ id: string; unit_id: string }>(
+    `SELECT id, unit_id FROM unit_bookings WHERE id = ANY($1::uuid[]) AND unit_id <> $2`,
+    [bookingIds, fromUnitId])
+  return rows.map(r => ({ bookingId: r.id, fromUnitId, toUnitId: r.unit_id }))
+}
+
+// Each one goes back only while it is still where the move put it, still
+// holds a site, and its nights on the site it came from are still free —
+// checked with that site locked against everybody who books it. Lock order is
+// lockSitesForStays' (the same as a move on the schedule): the site's own row
+// (FOR KEY SHARE) first, then the stay's row, then the site. Otherwise it stays
+// where it is: it has a site either way, never a shared one. Best-effort; a
+// failure is logged.
+async function putRelocatedBack(moves: RelocatedStay[]): Promise<void> {
+  for (const m of moves) {
+    let c: PoolClient
+    try { c = await getClient() } catch (err) {
+      logger.error({ err, bookingId: m.bookingId }, '[extend] could not put a moved reservation back on its site')
+      continue
+    }
+    try {
+      await c.query('BEGIN')
+      // 10/3 (review, fix pass): the site's own row first. Writing the stay
+      // back onto the site needs that row (the foreign-key check of the
+      // UPDATE below), and a pay link being sent for the site holds the row
+      // while it waits for the site. Reaching the row last, after the site, let
+      // the two end each other with a deadlock (the link answered with a 500 at
+      // the counter). Taken first, this waits for the link holding nothing.
+      await c.query(`SELECT 1 FROM units WHERE id = $1 FOR KEY SHARE`, [m.fromUnitId])
+      const r = (await c.query<{ unit_id: string; status: string; ci: string; co: string }>(
+        `SELECT b.unit_id, b.status, to_char(b.check_in, 'YYYY-MM-DD') AS ci, to_char(b.check_out, 'YYYY-MM-DD') AS co
+           FROM unit_bookings b WHERE b.id = $1
+            FOR UPDATE`, [m.bookingId])).rows[0]
+      if (!r || r.unit_id !== m.toUnitId || !SITE_HOLDING_STATUSES.includes(r.status)) {
+        await c.query('ROLLBACK')
+        continue
+      }
+      await lockSitesForStays(c, [m.fromUnitId])
+      const conflict = await findStayConflict(m.fromUnitId, {
+        checkIn: r.ci, checkOut: r.co, excludeBookingId: m.bookingId,
+      })
+      if (conflict) {
+        await c.query('ROLLBACK')
+        logger.info({ bookingId: m.bookingId, conflict }, '[extend] moved reservation stays on its new site: its old nights were taken')
+        continue
+      }
+      await c.query(`UPDATE unit_bookings SET unit_id = $2, updated_at = NOW() WHERE id = $1`, [m.bookingId, m.fromUnitId])
+      await c.query('COMMIT')
+      logger.info({ bookingId: m.bookingId }, '[extend] a reservation moved for an extension that did not happen on that site is back on it')
+    } catch (err) {
+      await c.query('ROLLBACK').catch(() => {})
+      logger.error({ err, bookingId: m.bookingId }, '[extend] could not put a moved reservation back on its site')
+    } finally {
+      c.release()
+    }
+  }
+}
+
+// S655: bookedDayBeforeEarlyCheckOut — the check-out day an EARLY CHECK-OUT
+// replaced, read from the schedule's own history — lives in
+// services/earlyCheckOut (10/4) so the schedule's Check out window and this
+// PATCH read it the same way. Other readers of the length a stay was sold for
+// read unit_bookings.booked_check_out (services/registerStay soldCheckOutSql).
+
+// S655 (Step 6 fix round 5): the first night from `from` up to (not
+// including) `to` that ANOTHER reservation holds on the site — the same
+// reservations the site check (findStayConflict) counts — or null when none
+// does. Lets a refusal say whether an Edit can still give nights back, or
+// whether the other reservation sits right on the day they left.
+async function firstNightHeldByAnother(
+  unitId: string, from: string, to: string, bookingId: string,
+): Promise<string | null> {
+  const r = await queryOne<{ d: string }>(
+    `SELECT to_char(GREATEST(check_in, $2::date), 'YYYY-MM-DD') AS d
+       FROM unit_bookings
+      WHERE unit_id = $1 AND status NOT IN ('cancelled') AND id <> $4
+        AND check_in < $3::date AND check_out > $2::date
+      ORDER BY check_in
+      LIMIT 1`, [unitId, from, to, bookingId])
+  return r?.d ?? null
+}
+
+// What holds a site, in words, for "… for some of the nights between …".
+const SITE_HELD_BY: Record<Exclude<StayConflict, null>, string> = {
+  booking:        'Another reservation now holds this site',
+  lease:          'Another lease now covers this site',
+  out_of_order:   'This site is marked out of order',
+  owner_use:      "This site is in the owner's own use",
+  pending_tenant: 'This site is held for a tenant completing onboarding',
+}
+
+// S655 (Step 6 fix round 5): after an early check-out, the steps that end the
+// stay's lease on the day the guest left — the landlord's deliberate date edit
+// (S548) — that work NOW. The first step puts the stay back, and that needs
+// the nights the check-out freed (the day they left up to the booked day) to
+// be free. If somebody has been booked onto them since, or the site is held
+// some other way, the steps start with freeing them. Naming only the three
+// steps sent staff into a refusal, then to an Edit save of the day they left,
+// which changes nothing (see "AFTER AN EARLY CHECK-OUT" in the booking PATCH).
+async function endLeaseOnDayLeftSteps(
+  o: { bookingId: string; unitId: string; leftDay: string; booked: string },
+): Promise<string> {
+  const steps = `put the stay back to Checked in, change its check-out to ${longDay(o.leftDay)}`
+  const conflict = await findStayConflict(o.unitId, {
+    checkIn: o.leftDay, checkOut: o.booked, excludeBookingId: o.bookingId,
+  })
+  if (!conflict) return `To end the lease on the day they left instead, ${steps}, then check them out again.`
+  return `${SITE_HELD_BY[conflict]} for some of the nights between ${longDay(o.leftDay)} and ${longDay(o.booked)}. `
+    + 'To end the lease on the day they left instead, '
+    + (conflict === 'booking' ? 'move that reservation first' : 'free those nights on the site first')
+    + `; then ${steps}, and check them out again.`
+}
 
 // S653: the avoid list is body-supplied ids. Keep only units that exist at the
 // property the stay is at — a stray id from another park (or another landlord)
@@ -1766,31 +2234,77 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // S652: clearing the site and taking it are one act. Either this guest has
     // the site and the holder has been moved or told, or neither happened —
     // a half-applied version leaves a site with two claims on it.
+    //
+    // 10/3 (review, fix round 3): the ORDER, for everybody else booking these
+    // sites at the same moment (see HOLD_CLEARING_LOCK_WAIT):
+    //   1. The site's own row. This save's write needs it at the end, and a pay
+    //      link being sent for the site (posPayLinks) takes the row first and
+    //      the site second; a save that took the site first and the row last
+    //      ended the link with a deadlock.
+    //   2. The site itself (lockSitesForStays): wait for anybody else putting a
+    //      stay on it. Nothing a sale or a link waits for is held yet.
+    //   3. Only a reservation being paid for: the unpaid holds on these nights
+    //      are moved or told (services/holdDisplacement) — after the site, so a
+    //      hold that landed while this save waited (a new one, or one another
+    //      payer's sale moved here, review V8) is cleared too, and nobody can
+    //      put one back before the write. Every lock this asks for is given up
+    //      quickly (withShortLockWaits) rather than waited for, and the save
+    //      starts again from the top.
     let booking: any
     let displaced: import('../services/holdDisplacement').DisplacementOutcome[] = []
-    const bookingClient = await getClient()
-    try {
-      await bookingClient.query('BEGIN')
-      if (takingMoney) {
-        const { clearUnpaidHolds } = await import('../services/holdDisplacement')
-        displaced = await clearUnpaidHolds(bookingClient, unit.id, body.checkIn, body.checkOut)
-      }
-      booking = (await bookingClient.query<any>(`INSERT INTO unit_bookings
-        (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
-         lease_type, check_in, check_out, nights, nightly_rate, weekly_rate,
-         total_amount, platform_fee, notes, source, required_site_layout, required_amp_service,
-         locked_to_unit, status, hold_expires_at, avoided_unit_ids)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NULL,$21::uuid[]) RETURNING *`,
-        [unit.id, unit.landlord_id, body.tenantId ?? null, body.guestName ?? null, body.guestEmail ?? null,
-         body.guestPhone ?? null, body.leaseType, body.checkIn, body.checkOut, nights,
-         body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
-         total, platformFee, body.notes ?? null, body.source ?? 'direct', body.requiredSiteLayout ?? 'none', body.requiredAmpService ?? 'none',
-         body.lockedToUnit === true, bookingStatus, avoided])).rows[0]
-      await bookingClient.query('COMMIT')
-    } catch (e) {
-      await bookingClient.query('ROLLBACK').catch(() => {})
-      throw e
-    } finally { bookingClient.release() }
+    for (let attempt = 1; ; attempt++) {
+      if (attempt > 1) await pauseBeforeTry(attempt - 1)
+      displaced = []
+      const bookingClient = await getClient()
+      try {
+        await bookingClient.query('BEGIN')
+        await bookingClient.query(`SELECT 1 FROM units WHERE id = $1 FOR KEY SHARE`, [unit.id])
+        await lockSitesForStays(bookingClient, [unit.id])
+        if (takingMoney) {
+          const { clearUnpaidHolds } = await import('../services/holdDisplacement')
+          displaced = await withShortLockWaits(bookingClient,
+            () => clearUnpaidHolds(bookingClient, unit.id, body.checkIn, body.checkOut))
+        }
+        // Then the nights are checked again: one booked between the check above
+        // and this write is seen now, not after both are stored. The check
+        // reads what is committed (not this transaction's own moves), so the
+        // holds just moved still look as if they were here: the ones that step
+        // aside for money are ignored — every one of them has been moved or
+        // told above, under the site's lock. Anything else on the nights (a
+        // hold already moved once, a guest paying online right now) refuses
+        // this save rather than share a night with it.
+        const takenSince = await findStayConflict(unit.id, {
+          checkIn: body.checkIn, checkOut: body.checkOut, ignoreUnpaidHolds: takingMoney,
+        })
+        if (takenSince) throw new AppError(409, STAY_CONFLICT_MESSAGE[takenSince])
+        // 10/3 (decisions #33): booked_check_out is the length the stay is sold
+        // for; an early check-out later moves check_out only.
+        booking = (await bookingClient.query<any>(`INSERT INTO unit_bookings
+          (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
+           lease_type, check_in, check_out, nights, nightly_rate, weekly_rate,
+           total_amount, platform_fee, notes, source, required_site_layout, required_amp_service,
+           locked_to_unit, status, hold_expires_at, avoided_unit_ids, booked_check_out)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NULL,$21::uuid[],$9) RETURNING *`,
+          [unit.id, unit.landlord_id, body.tenantId ?? null, body.guestName ?? null, body.guestEmail ?? null,
+           body.guestPhone ?? null, body.leaseType, body.checkIn, body.checkOut, nights,
+           body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
+           total, platformFee, body.notes ?? null, body.source ?? 'direct', body.requiredSiteLayout ?? 'none', body.requiredAmpService ?? 'none',
+           body.lockedToUnit === true, bookingStatus, avoided])).rows[0]
+        await bookingClient.query('COMMIT')
+        break
+      } catch (e) {
+        await bookingClient.query('ROLLBACK').catch(() => {})
+        // S655 (Step 6 fix round 6): a deadlock, or a lock given up above,
+        // changed nothing — so the save runs again from the top and sees what
+        // the other one stored.
+        if (!isDeadlock(e) && !isLockBusy(e)) throw e
+        if (attempt >= BOOKING_SAVE_TRIES) throw new AppError(409, SAVED_AT_THE_SAME_MOMENT)
+        logger.warn({ unitId: unit.id, checkIn: body.checkIn, checkOut: body.checkOut, attempt, code: (e as { code?: string }).code },
+          isLockBusy(e)
+            ? '[booking] something the save needed to move an unpaid hold was busy; saving again'
+            : '[booking] deadlocked with another reservation on the same sites; saving again')
+      } finally { bookingClient.release() }
+    }
 
     // Somebody lost the site they were holding. A moved guest may never need to
     // know; a displaced one is a phone call, and neither belongs only in a log.
@@ -2008,8 +2522,117 @@ unitsRouter.get('/:id/bookings', requirePerm(
   } catch (e) { next(e) }
 })
 
+// ── GET /api/units/:id/bookings/:bookingId/cancel-check — the Cancel
+// reservation confirm (final fix, fix pass 1, decisions #53) ───────────────
+//
+// "Never runs blind: Cancel reservation on the Schedule opens the same
+// confirm, showing fresh figures and names, before anything is zeroed." Read
+// fresh when the button is pressed (and again after any refusal): each lease
+// drafted with the stay, the people on it by name, the move-in bill lines the
+// cancel zeroes, the lines that stay owed, the reservation — or the words the
+// cancel would be refused in (the same functions the PATCH below refuses
+// with), so the window never offers a press the server turns down. The press
+// sends `total` back as expectedNeverMovedInTotal. `?status=no_show` reads a
+// no-show the same way (no Schedule button sends one today).
+unitsRouter.get('/:id/bookings/:bookingId/cancel-check', requirePerm('schedule.edit_reservation'), async (req, res, next) => {
+  try {
+    const status: 'cancelled' | 'no_show' = req.query.status === 'no_show' ? 'no_show' : 'cancelled'
+    const booking = await queryOne<any>(
+      `SELECT id, unit_id, landlord_id, guest_name, status,
+              to_char(check_in, 'YYYY-MM-DD') AS check_in, to_char(check_out, 'YYYY-MM-DD') AS check_out
+         FROM unit_bookings WHERE id = $1`, [req.params.bookingId])
+    if (!booking) throw new AppError(404, 'This reservation is no longer on the schedule.')
+    if (!canManageLandlordResource(req.user, booking.landlord_id)) throw new AppError(403, 'This reservation isn’t on your account.')
+    const unit = await queryOne<{ property_id: string }>(`SELECT property_id FROM units WHERE id = $1`, [booking.unit_id])
+    await assertPropertyInScope(req.user, unit?.property_id)
+    const guest = booking.guest_name || 'This guest'
+    const { assessNeverMovedIn, leaseHouseholdNames, reservationCanceledWords } = await import('../lib/unwindIssuedLease')
+    const q = async (sql: string, params?: any[]) => ({ rows: await query<any>(sql, params) })
+    const reader = {
+      canMarkLeaving: userHasPerm(req.user, 'leases.edit', 'front_desk.mark_leaving'),
+      canMoveOut: userHasPerm(req.user, 'leases.deposit_return'),
+    }
+    let words: string | null = null
+    if (booking.status === status) {
+      words = status === 'cancelled' ? 'This reservation is already canceled. Nothing else to do.' : 'This reservation is already marked a no-show. Nothing else to do.'
+    } else if (booking.status === 'no_show' && status === 'cancelled') {
+      // Fix pass 3 (review): the no-show already freed the site (and ran the
+      // never-moved-in close on a lease drafted with it) — canceling it too
+      // changes nothing, and "the site is free for those nights" would only
+      // repeat what already happened.
+      words = NO_SHOW_ALREADY_WORDS
+    } else if (booking.status === 'checked_out') {
+      words = stayHappenedRefusal(guest, status)
+    } else if (booking.status === 'checked_in') {
+      words = stayUnderWayRefusal(guest, status)
+    }
+    const drafted = words ? [] : await query<{ id: string; status: string }>(
+      `SELECT id, status FROM leases
+        WHERE source_booking_id = $1 AND status IN ('pending', 'draft', 'active')
+        ORDER BY created_at, id`, [booking.id])
+    const leases: any[] = []
+    let amountCents = 0
+    let keptCents = 0
+    for (const l of drafted) {
+      const a = await assessNeverMovedIn(q, l.id, { attested: true, lock: false, reader, cancelingBooking: booking.id })
+      if (!a.applies && !words) {
+        const w = a.words ?? 'This lease can’t be closed as never moved in.'
+        words = `${cancelRefusalLead(guest, status)}${w.charAt(0).toLowerCase()}${w.slice(1)}`
+      }
+      amountCents += Math.round(a.total * 100)
+      keptCents += Math.round(a.keptTotal * 100)
+      leases.push({
+        lease_id: l.id,
+        status: l.status,
+        applies: a.applies,
+        words: a.words,
+        start_date: a.startDate,
+        lines: a.lines.map((x) => ({ payment_id: x.paymentId, label: x.label, amount: x.amount, due_date: x.dueDate, utility: x.utility })),
+        total: a.total,
+        kept: a.kept.map((k) => ({ payment_id: k.paymentId, label: k.label, amount: k.amount, why: k.why, due_date: k.dueDate,
+                                   period_start: k.periodStart ?? null, period_end: k.periodEnd ?? null })),
+        kept_total: a.keptTotal,
+        kept_words: a.keptWords,
+        reservation_words: a.applies && a.reservation ? reservationCanceledWords(a.reservation) : null,
+        // Fix pass 3 (review): the wire shape the Leases page's confirm
+        // sends (snake_case), from the one names helper both use.
+        household: await (async () => {
+          const h = await leaseHouseholdNames(q, l.id)
+          return { tenant_names: h.tenantNames, unit_number: h.unitNumber, property_name: h.propertyName }
+        })(),
+      })
+    }
+    const inForce = drafted.some((l) => l.status === 'active')
+    const amount = amountCents / 100
+    // The same permission the PATCH asks for, said before the press.
+    if (!words && leases.length > 0 && (amount > 0 || inForce) && !userHasPerm(req.user, 'leases.terminate')) {
+      words = cancelNeedsTerminateWords(status, inForce, amount)
+    }
+    res.json({ success: true, data: {
+      booking: { id: booking.id, unit_id: booking.unit_id, guest_name: booking.guest_name, status: booking.status,
+                 check_in: booking.check_in, check_out: booking.check_out },
+      applies: words === null,
+      words,
+      leases: words === null ? leases : leases.map((l) => ({ ...l, lines: [], total: 0 })),
+      total: words === null ? amount : 0,
+      kept_total: keptCents / 100,
+      // The confirm must send its total with the press (the PATCH refuses a blind one).
+      needs_total: leases.length > 0 && (amount > 0 || inForce),
+    } })
+  } catch (e) { next(e) }
+})
+
 // PATCH /api/units/:id/bookings/:bookingId — update booking (status, move dates, swap unit)
-unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reservation'), async (req, res, next) => {
+//
+// 10/3 (review, fix pass 2): "Check guests in" or "Check guests out" alone
+// also gets in — a desk person who may only check guests in (or out) does it
+// here. What such a save may change is held to exactly that inside (see
+// "CHECKING A GUEST IN OR OUT NEEDS ONLY ITS OWN PERMISSION" below).
+unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reservation', 'guests.check_in', 'guests.check_out'), async (req, res, next) => {
+  // S655 (Step 6 fix round 6): reservations an extension moved off this site
+  // to make room (W-20) and that the save has not yet made final. A refusal
+  // anywhere after the move puts them back (catch, below); the commit empties it.
+  let relocated: RelocatedStay[] = []
   try {
     const { status, notes, checkIn, checkOut, unitId, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, lockedToUnit } = req.body
     // S653: an avoid list on an edit replaces the whole list (null/absent = unchanged).
@@ -2021,22 +2644,581 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     if (requiredAmpService != null && !RV_AMP_SERVICES.includes(requiredAmpService)) {
       throw new AppError(400, `Invalid requiredAmpService '${requiredAmpService}'`)
     }
-    const booking = await queryOne<any>('SELECT * FROM unit_bookings WHERE id=$1', [req.params.bookingId])
+    // S655 (Step 6 fix round): a status the schedule does not have is refused
+    // in words, with nothing written. It used to reach the database and come
+    // back as a 500 carrying the constraint's own text. (Absent or blank still
+    // means "leave the status as it is", as before.)
+    if (status != null && status !== '' && !isBookingStatus(status)) {
+      throw new AppError(400,
+        `That is not a reservation status. Use ${BOOKING_STATUS_CHOICES}.`)
+    }
+    // S655: the stored days as plain 'YYYY-MM-DD' text, so they compare with the
+    // request's dates and the property's "today" without any clock or zone.
+    const booking = await queryOne<any>(
+      `SELECT *, to_char(check_in,  'YYYY-MM-DD') AS check_in_day,
+                 to_char(check_out, 'YYYY-MM-DD') AS check_out_day
+         FROM unit_bookings WHERE id=$1`, [req.params.bookingId])
     if (!booking) throw new AppError(404, 'Booking not found')
     if (!canManageLandlordResource(req.user, booking.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
     // Property-locked workers may only edit reservations at their properties.
-    const bookingUnit = await queryOne<any>('SELECT property_id FROM units WHERE id=$1', [booking.unit_id])
+    // The property's time zone decides what "today" is for an early check-out.
+    const bookingUnit = await queryOne<any>(
+      `SELECT u.property_id, p.timezone
+         FROM units u JOIN properties p ON p.id = u.property_id
+        WHERE u.id=$1`, [booking.unit_id])
     await assertPropertyInScope(req.user, bookingUnit?.property_id)
 
+    // S655: a date that is not a date is refused in words, not stored as nights
+    // of NaN or turned into a database error.
+    const checkInDay  = checkIn  ? calendarDay(checkIn)  : null
+    const checkOutDay = checkOut ? calendarDay(checkOut) : null
+    if (checkIn && !checkInDay) throw new AppError(400, 'Check-in is not a date. Pick the day from the calendar and try again.')
+    if (checkOut && !checkOutDay) throw new AppError(400, 'Check-out is not a date. Pick the day from the calendar and try again.')
+
+    // S655: what CHANGED, not what was sent. The edit form sends check-in,
+    // check-out and the site back on every save, so "it was in the request" read
+    // a phone-number edit as a date change: the stay was repriced at whatever
+    // the rates are today and the lease sync ran. After an early check-out
+    // (below) that same save would have cut the total to the shortened stay and
+    // pulled the lease's end in — exactly what an early check-out must not do.
+    const checkInChanged  = !!checkInDay  && checkInDay  !== booking.check_in_day
+    let   checkOutChanged = !!checkOutDay && checkOutDay !== booking.check_out_day
+    const unitChanged     = !!unitId && unitId !== booking.unit_id
+    const guest = booking.guest_name || 'This guest'
+
+    // ── 10/3: CHECKING A GUEST IN OR OUT IS ITS OWN PERMISSION
+    //
+    // "Edit / move / cancel reservations" (schedule.edit_reservation, the
+    // permission every other change on this route needs) says on its face:
+    // "Checking a guest in is not part of this." So putting a guest into
+    // Checked in needs "Check guests in" (guests.check_in), and checking one
+    // out — or correcting the day a checked-out guest left — needs "Check
+    // guests out" (guests.check_out).
+    // Owners always may. Refused before anything is written.
+    const toCheckIn = status === 'checked_in' && booking.status !== 'checked_in'
+    const toCheckOut = status === 'checked_out'
+      && (booking.status !== 'checked_out' || (!!checkOutDay && checkOutDay !== booking.check_out_day))
+    for (const [wants, perm, act] of [
+      [toCheckIn, 'guests.check_in', 'Checking a guest in'],
+      [toCheckOut, 'guests.check_out', 'Checking a guest out'],
+    ] as const) {
+      if (wants && !userHasPerm(req.user, perm)) {
+        throw new AppError(403,
+          `${act} needs the "${SUB_PERMISSION_LABEL[perm]}" permission, and nothing was changed. `
+          + `Ask the account owner to turn on "${SUB_PERMISSION_LABEL[perm]}" for you on the Team page.`)
+      }
+    }
+
+    // ── 10/3 (review, fix pass 2): CHECKING A GUEST IN OR OUT NEEDS ONLY ITS
+    // OWN PERMISSION
+    //
+    // A desk person with "Check guests in" but not "Edit / move / cancel
+    // reservations" pressed Check in on the schedule and was always told
+    // "Insufficient permissions". The Team page says "Check guests in" marks a guest
+    // as arrived, and decisions #38 says "Check guests out" alone is enough to
+    // check a guest out. So this route lets either one in (above), and without
+    // the edit permission a save may do exactly one of these and nothing else:
+    //   - check in a guest whose reservation is Tentative or Confirmed (what the
+    //     schedule's Check in button offers), or
+    //   - check out a guest who is Checked in, or correct the day a checked-out
+    //     guest left. The day they left is the one date such a save may carry.
+    // Everything else stays with the edit permission, as before: the dates, the
+    // site, the guest's details, notes, site needs, the lock, the sites to
+    // avoid, and any other status — canceling, a no-show, undoing a check-out,
+    // or bringing back a no-show or canceled reservation. The fields the
+    // schedule sends back unchanged do not count. Refused before anything is
+    // written.
+    if (!userHasPerm(req.user, 'schedule.edit_reservation')) {
+      const refusal = deskOnlyRefusal(booking, {
+        status, notes, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, lockedToUnit,
+        avoidedIn, checkInChanged, checkOutChanged, unitChanged, toCheckOut,
+      })
+      if (refusal) throw new AppError(403, refusal)
+    }
+
+    // ── S655 (Step 6 fix round 3): A CHECK-OUT NEEDS A STAY, AND A STAY THAT
+    // HAPPENED IS NOT A NO-SHOW OR A CANCELLATION
+    //
+    // Checking out a cancelled reservation cleared its cancellation and gave it
+    // nights GAM bills for; a no-show has no stay to end either. The other way
+    // round, a checked-out stay moved to No-show or Cancelled lost the day the
+    // guest had booked — the undo below reads it back only from Checked out, so
+    // Checked out → No-show → Checked in left the guest checked in on the
+    // shortened stay. Each is refused in plain words with the step that gets
+    // there, and nothing is written.
+    // Step 9 final fix (fix pass 1 of the #53 close, review LOW): a canceled
+    // or no-show stay whose drafted lease the never-moved-in close ended (its
+    // move-in bill zeroed, its paperwork voided) can't be brought back — not
+    // to Tentative, Confirmed or Checked in, nor checked out. The lease stays
+    // ended and its bill stays zeroed, so the guest would be back on the site
+    // with no lease and nothing billing them. The step that exists: a new
+    // reservation. Refused before anything is written.
+    //
+    // Fix pass 2 (review MEDIUM): only a lease the close ended as an ISSUED
+    // lease (something zeroed, or signed) — closedLeaseOfStay. An unsigned
+    // draft the cancel ended with nothing zeroed comes back with its stay, as
+    // S639 allowed, and the reservation money stays on the stay. Checked again
+    // inside the save, with the stay's row locked (below).
+    const bringsBackClosedStay = (booking.status === 'cancelled' || booking.status === 'no_show') && typeof status === 'string'
+        && status !== booking.status && [...SITE_HOLDING_STATUSES, 'checked_out'].includes(status)
+    if (bringsBackClosedStay) {
+      const closedLease = await closedLeaseOfStay(booking.id)
+      if (closedLease) throw new AppError(409, closedStayRefusal(guest, booking.status as 'cancelled' | 'no_show', closedLease.billZeroed))
+    }
+    if (status === 'checked_out' && booking.status === 'cancelled') {
+      throw new AppError(409,
+        `${guest === 'This guest' ? 'This' : `${guest}'s`} reservation was canceled, so there is no stay to check out. `
+        + 'To bring it back, set it to Confirmed first.')
+    }
+    if (status === 'checked_out' && booking.status === 'no_show') {
+      throw new AppError(409,
+        `${guest} was marked a no-show, so there is no stay to check out. `
+        + 'If they did come, set the reservation to Checked in first.')
+    }
+    // Final fix (fix pass 1, decisions #53): these never tell staff to set the
+    // stay back to Confirmed — that step does not exist on the Schedule, and
+    // undoing a stay that happened is exactly how rent for nights stayed got
+    // zeroed. A stay that happened stays on the schedule as its record.
+    if (booking.status === 'checked_out' && (status === 'cancelled' || status === 'no_show')) {
+      throw new AppError(409, stayHappenedRefusal(guest, status))
+    }
+    // Fix pass 2 (review): nor a stay under way — the guest is on the site.
+    if (booking.status === 'checked_in' && (status === 'cancelled' || status === 'no_show')) {
+      throw new AppError(409, stayUnderWayRefusal(guest, status))
+    }
+
+    // "Today" is the PROPERTY's calendar day, never the server's (S654).
+    const today = todayIn(bookingUnit?.timezone)
+
+    // ── S655 (Step 6 fix round): NOBODY CHECKS OUT BEFORE THEY ARRIVE
+    //
+    // A stay that starts after today has no guest to check out, whatever day
+    // is typed in. This was refused only when no day was given: Oct 5 to Oct 8
+    // sent {status:'checked_out', checkOut:'2026-10-07'} on Oct 2 was stored
+    // as checked out before arrival and repriced from three nights to two as
+    // a date edit. The arrival the save would leave is the one that counts
+    // (one typed in with the check-out, or the stored one). A plain save of a
+    // stay that is already checked out (a phone number, a note) is left alone.
+    const arrival: string = checkInChanged ? checkInDay! : booking.check_in_day
+    if (status === 'checked_out' && today < arrival
+        && (booking.status !== 'checked_out' || checkInChanged || checkOutChanged)) {
+      throw new AppError(409,
+        `${guest} has not arrived yet — check-in is ${longDay(arrival)}. `
+        + 'To take the reservation off the schedule, cancel it instead.')
+    }
+
+    // ── S655 (Step 6 fix round 6): A CHECK-OUT IS SAVED ON ITS OWN
+    //
+    // A check-out — the status moving to Checked out, or the day a checked-out
+    // guest left being corrected — that also changes the arrival day or the
+    // site used to skip the check-out rules below and take the date-edit path:
+    // the stay was repriced, the booking-lease sync ran (ending the lease on
+    // whatever check-out the save left), and a check-out with no day typed in
+    // was stored as Checked out with the site still held to the booked day.
+    // Two different acts in one save, so one at a time, with nothing written.
+    // (An arrival-day correction on a stay that is already checked out — no
+    // new day they left — is still the plain edit it was.)
+    const checkOutShaped = status === 'checked_out' && (booking.status !== 'checked_out' || checkOutChanged)
+    if (checkOutShaped && (checkInChanged || unitChanged)) {
+      throw new AppError(409,
+        `${guest === 'This guest' ? "This guest's" : `${guest}'s`} check-out can't be saved together with a new `
+        + `${checkInChanged && unitChanged ? 'arrival day and site' : checkInChanged ? 'arrival day' : 'site'}. `
+        + `Make that change with Edit first, then ${booking.status === 'checked_out'
+          ? 'set the day they left' : 'check them out'}.`)
+    }
+
+    // ── S655 (Step 6 fix round): NIGHTS THIS SAVE GIVES THE STAY ARE CHECKED
+    // AGAIN AT THE MOMENT OF THE WRITE
+    //
+    // Every save that gives the stay nights on a site — an undo, a correction
+    // that says they left later, a cancelled or no-show reservation brought
+    // back, a date edit or a site move — checks those nights here first, so a
+    // refusal comes before anything is decided. Each check is kept (the nights,
+    // and the words if somebody else has them) and run AGAIN inside the write's
+    // transaction, after the site is locked against everybody else who books
+    // it (lockSitesForStays). The first check alone left a gap: a reservation
+    // made on the freed nights between it and the write was not seen, and an
+    // undo put the guest back onto nights a new guest now held (Oct 3 to Oct 5
+    // held by two stays on one site).
+    type SiteClaim = {
+      unitId: string; checkIn: string; checkOut: string
+      refusal: (c: Exclude<StayConflict, null>) => string | Promise<string>
+    }
+    const siteClaims: SiteClaim[] = []
+    const claimNights = async (claim: SiteClaim) => {
+      const conflict = await findStayConflict(claim.unitId, {
+        checkIn: claim.checkIn, checkOut: claim.checkOut, excludeBookingId: booking.id,
+      })
+      if (conflict) throw new AppError(409, await claim.refusal(conflict))
+      siteClaims.push(claim)
+    }
+
+    // S655 (Step 6 fix round 2): while the stored check-out is still an early
+    // check-out's, the booked day it replaced is known here once — for a
+    // correction of the day they left and the undo below, and for every other
+    // edit of the stay (see "AFTER AN EARLY CHECK-OUT" below).
+    const early = await bookedDayBeforeEarlyCheckOut(booking)
+
+    // ── S655 (money plan Step 6): AN EARLY CHECK-OUT MOVES THE DATE, NOT THE MONEY
+    //
+    // Nic (10/2): "early checkout moves the check-out date." A guest who leaves
+    // before their booked day is gone from the site that day: the schedule
+    // frees it, the closing meter read is due that day, and GAM's per-night
+    // count (services/billableUnits, read off check_out) stops there.
+    //
+    // The money does not move. The total is NOT repriced and the booking-lease
+    // sync does NOT run — the lease is law. A landlord who means to shorten a
+    // monthly stay (and bank what was paid past the new end) edits the dates
+    // deliberately; that is the S548 path below.
+    //
+    // What counts as a check-out: the status moves to checked_out from any
+    // other status, check-in and the site stay as they are, and either no
+    // check-out day is given (they left today) or the day given is on or before
+    // today (they left that day — "Pat left yesterday"). The landlord agent's
+    // natural call for "Pat left today" is {status:'checked_out',
+    // checkOut:<today>}, so the day they left can be typed; it is still the day
+    // they left, not a new length of stay. A day typed AFTER today is refused
+    // (fix rounds 5 and 6, below): nobody has left on a day that has not come.
+    //
+    // "Today" is the PROPERTY's calendar day, never the server's (S654).
+    //   - Leaving on or after the booked check-out day: nothing moves (a late
+    //     departure is not an extension), whether or not the day was typed in
+    //     (fix round 2: "Pat left today" on a stay booked to end yesterday used
+    //     to reprice the whole stay at today's rates, run the lease sync and,
+    //     on a busy site, relocate the next guest). Billing the extra nights
+    //     is a deliberate date edit.
+    //   - Before check-in: they cannot have left a stay they never started —
+    //     refused, with the next step.
+    //   - On the arrival day itself: one night stays. A stay that started is a
+    //     stay (S652), and no booking is ever zero nights — so the stored
+    //     check-out is the day AFTER they left. Known consequence (documented,
+    //     routed to the meter-read owner): the closing-read rule in
+    //     services/utilityReadingRuns clears a departure only with a read dated
+    //     on or after check_out, so a read taken on the arrival day itself does
+    //     not clear it and a second read is due the next day. The day they
+    //     actually left is kept in the history event (detail.left_on).
+    //
+    // Fix round 3: CORRECTING THE DAY A CHECKED-OUT GUEST LEFT. "Pat left
+    // today", then "actually it was yesterday", reaches a stay that is already
+    // checked out as {status:'checked_out', checkOut:<that day>}. It is the
+    // same request as the first check-out and means the same thing — the day
+    // they left — so it follows the same rules, measured against the day the
+    // guest had BOOKED (an early check-out's booked day, from its history
+    // event; otherwise the stored check-out): before it, the check-out moves to
+    // the corrected day; on or after it, the booked day comes back (a late
+    // departure is not an extension). It used to take the date-edit path: the
+    // stay was repriced on the shortened length, the lease was ended on that
+    // day, the next month's rent deleted and the rest banked. A bare
+    // {checkOut} (the Edit form, or the agent without a status) is still the
+    // landlord's deliberate date edit (S548).
+    let checkOutMoved: { from: string; to: string } | null = null
+    let checkOutRestored: { from: string; to: string } | null = null
+    let leftOn: string | null = null
+    // The booked day an early check-out (or a correction of one) records.
+    let bookedForEvent: string | null = null
+    // Set when a request corrected the day a checked-out guest left.
+    let leftOnCorrected = false
+    // (A check-out that also changed the arrival day or the site was refused
+    // above, so every check-out-shaped request is a check-out here.)
+    const checkOutRequest = checkOutShaped
+    if (checkOutRequest) {
+      // (A guest who has not arrived yet was refused above, before any of this.)
+      const typed = checkOutChanged ? checkOutDay! : null
+      if (typed === null || typed <= today) {
+        const leaving = typed ?? today
+        const booked = early?.booked ?? booking.check_out_day
+        if (leaving < booked) {
+          // Fix round 4: a day typed in BEFORE the arrival is a wrong day (the
+          // wrong month or year), not a departure. It used to be read as "left
+          // on the arrival day": a Sep 1 to Dec 1 stay typed out on Aug 15
+          // dropped to one night, cutting the nights GAM bills for, and the
+          // history recorded a departure that never happened. Refused, with
+          // nothing written.
+          if (leaving < booking.check_in_day) {
+            throw new AppError(400,
+              `${guest} arrived ${longDay(booking.check_in_day)}, so they can't have left `
+              + `${longDay(leaving)}. Check the day and try again.`)
+          }
+          leftOn = leaving > booking.check_in_day ? leaving : booking.check_in_day
+          const newOut = leaving > booking.check_in_day ? leaving : addDaysTo(booking.check_in_day, 1)
+          if (newOut !== booking.check_out_day) {
+            checkOutMoved = { from: booking.check_out_day, to: newOut }
+            bookedForEvent = booked
+          }
+        } else if (booking.check_out_day !== booked) {
+          // They stayed to (or past) the day they had booked: that day comes
+          // back. Only a correction gets here — a first check-out's stored
+          // check-out IS the booked day.
+          leftOn = leaving
+          checkOutRestored = { from: booking.check_out_day, to: booked }
+        }
+        // A correction that gives the guest back nights the check-out had
+        // freed needs those nights to still be free.
+        const later = checkOutRestored?.to
+          ?? (checkOutMoved && checkOutMoved.to > booking.check_out_day ? checkOutMoved.to : null)
+        if (later) {
+          await claimNights({
+            unitId: booking.unit_id, checkIn: booking.check_out_day, checkOut: later,
+            refusal: (conflict) => conflict === 'booking'
+              ? 'Another reservation now holds this site for some of the nights between '
+                + `${longDay(booking.check_out_day)} and ${longDay(later)}, `
+                + `so ${guest}'s check-out can't be moved to ${longDay(later)}. Move that reservation first.`
+              : `${STAY_CONFLICT_MESSAGE[conflict]}, so ${guest}'s check-out can't be moved to ${longDay(later)}. `
+                + 'Free those nights on the site first, then try again.',
+          })
+        }
+        leftOnCorrected = booking.status === 'checked_out'
+        // The typed day was the day they left, not a new length of stay.
+        checkOutChanged = false
+      } else {
+        // A day after today is not a day anybody left on. Refused, with
+        // nothing written:
+        //  - Fix round 5: on a stay that is already checked out, this used to
+        //    fall through to the date edit: a lease stay checked out Oct 2 and
+        //    sent {status:'checked_out', checkOut:'2026-10-03'} was repriced to
+        //    $1,596.77, its lease ended Oct 3, November's rent deleted and
+        //    $1,403.23 banked; a nightly stay given back its (still future)
+        //    booked day was repriced and held the site again for a guest who
+        //    had gone.
+        //  - Fix round 6: on a guest who is still here, too. {status:
+        //    'checked_out', checkOut:'2026-10-05'} sent on Oct 2 for a Sep 28 to
+        //    Oct 10 stay at $600 stored the stay as Checked out three days
+        //    before the guest leaves, repriced it to $392 and ran the lease
+        //    sync. Staff on the schedule are the only sender of a check-out
+        //    (the landlord agent is refused in portalActions
+        //    refuseAgentCheckOut), and "Pat leaves Monday, check her out"
+        //    shortened the stay and its lease by accident.
+        // The bare {checkOut} edit (the Edit form, or the agent without a
+        // status) is still the landlord's deliberate date edit (S548).
+        const hasLease = await queryOne(
+          `SELECT 1 FROM leases WHERE source_booking_id = $1 AND status IN ('active', 'pending') LIMIT 1`,
+          [booking.id])
+        const howLong = `how long the stay${hasLease ? ' and its lease run' : ' runs'}`
+        throw new AppError(409, booking.status === 'checked_out'
+          ? `${guest} has already checked out, so the day they left can't be after today. `
+            + `To change ${howLong}, change the check-out with Edit.`
+          : `${guest} hasn't left yet. To change ${howLong}, change the check-out with Edit; `
+            + 'check them out on the day they leave.')
+      }
+    }
+
+    // 10/4 (decisions #38 Q11): the day a checked-out guest left can't be
+    // corrected once a refund went out for it (or the stay was charged only the
+    // nights stayed) — that money was decided on that day.
+    if (leftOnCorrected && (checkOutMoved || checkOutRestored)) {
+      const refusal = await checkOutChangeRefusal(booking.id, 'correct', guest)
+      if (refusal) throw new AppError(409, refusal)
+    }
+
+    // ── S655 (Step 6 fix round): UNDOING A CHECK-OUT PUTS THE BOOKED DAY BACK
+    //
+    // A check-out recorded by mistake has a one-step back-out: move the status
+    // back (checked in, confirmed) and, when that check-out had moved the
+    // check-out day, the booked day comes back with it — the site is held for
+    // the guest again, GAM's per-night count resumes, and no closing read is
+    // due. Like the check-out itself it moves no money: no reprice, no lease
+    // sync. The booked day comes from the check-out's own history event, and
+    // only while nothing has changed the check-out since. A request that names
+    // a different check-out day is a date edit instead; one that sends the
+    // stored (early) check-out back unchanged, or the booked day itself, is
+    // still the undo. If somebody has been booked into the freed nights since,
+    // it is refused with the next step. (No-show and Cancelled cannot be
+    // reached from Checked out — refused above — so the booked day is never
+    // stranded behind them.)
+    const undoing = !!early && booking.status === 'checked_out' && SITE_HOLDING_STATUSES.includes(status)
+      && (!checkOutChanged || checkOutDay === early.booked)
+    if (undoing && (checkInChanged || unitChanged)) {
+      // Undoing the check-out AND moving the stay in one save would decide
+      // the money twice over (which site's price, which nights). One at a time.
+      throw new AppError(409,
+        `${guest} checked out early, so put the check-out back first: set the status to `
+        + `${bookingStatusLabel(status)} on its own. Then change the site or the arrival day.`)
+    }
+    // 10/4 (decisions #38 Q11): once a refund has gone out for an early
+    // check-out, the check-out cannot be undone. Refused before anything is
+    // written. (An undo after "Charge only the nights stayed" puts the booked
+    // price back with the booked day — services/earlyCheckOut onCheckOutUndone.)
+    if (undoing) {
+      const refusal = await checkOutChangeRefusal(booking.id, 'undo', guest)
+      if (refusal) throw new AppError(409, refusal)
+    }
+    if (undoing) {
+      const booked = early!.booked
+      await claimNights({
+        unitId: booking.unit_id, checkIn: booking.check_out_day, checkOut: booked,
+        refusal: async (conflict) => {
+          // Fix round 5: name only a next step that works. "Or set a new
+          // check-out with Edit" sent staff to save the day they left — which
+          // is already the stored check-out, so the save changed nothing (no
+          // message, the lease still running). An Edit can give nights back
+          // only up to the night the other reservation starts; when it starts
+          // on the day they left there is nothing to give, so moving it is the
+          // one step. A site held some other way (owner's use, out of order, a
+          // lease, onboarding) has to be freed first.
+          //
+          // Fix round 6: the Edit is named only when it would go through and
+          // only when it is what staff mean by "put them back".
+          //  - It runs the full site check over the stay's whole window (the
+          //    arrival day to the new check-out), not just other reservations:
+          //    a site out of order, in the owner's use or held some other way
+          //    before the other reservation's first night made that Edit fail
+          //    too ("That site is out of order for those dates"). Checked the
+          //    same way here; if it would fail, only the move is named.
+          //  - On a stay with a lease, that Edit is the landlord's deliberate
+          //    shortening (S548): it ends the lease on that day, drops the
+          //    rent after it and banks what was paid past it — a probe stay of
+          //    $4,500 to Dec 1 went to $1,935.48 with the lease ending Oct 10,
+          //    November's rent deleted and $1,064.52 banked, while the stay
+          //    still read Checked out. Staff putting a guest back are never
+          //    sent into that, so a lease stay names only the move.
+          //
+          // 10/3 (review): the Edit is named with the whole path back. Saving
+          // it is the landlord's deliberate date change, so the stay is then
+          // sold — and priced — for the shorter dates (decisions #33: its
+          // booked check-out becomes that day), and it is still Checked out;
+          // a second save sets the status back. And when the freed nights are
+          // held by a reservation AND some other way (out of order, the
+          // owner's use, a lease, onboarding), moving the reservation alone
+          // would only be refused again, so both steps are named.
+          let next = 'Free those nights on the site first, then try again.'
+          if (conflict === 'booking') {
+            const alsoHeld = await findStayConflict(booking.unit_id, {
+              checkIn: booking.check_out_day, checkOut: booked, excludeBookingId: booking.id, ignoreBookings: true,
+            })
+            const first = alsoHeld
+              ? 'Move that reservation and free those nights on the site first'
+              : 'Move that reservation first'
+            next = `${first}.`
+            const heldFrom = await firstNightHeldByAnother(booking.unit_id, booking.check_out_day, booked, booking.id)
+            if (heldFrom && heldFrom > booking.check_out_day) {
+              const hasLease = await queryOne(
+                `SELECT 1 FROM leases WHERE source_booking_id = $1 AND status IN ('active', 'pending') LIMIT 1`,
+                [booking.id])
+              const editWouldWork = !hasLease && (await findStayConflict(booking.unit_id, {
+                checkIn: booking.check_in_day, checkOut: heldFrom, excludeBookingId: booking.id,
+              })) === null
+              if (editWouldWork) {
+                next = `${first}, or use Edit to set a check-out no later than ${longDay(heldFrom)} `
+                  + `(the stay is priced on the shorter dates), then set it back to ${bookingStatusLabel(status)}.`
+              }
+            }
+          }
+          return conflict === 'booking'
+            ? 'Another reservation now holds this site for some of the nights between '
+              + `${longDay(booking.check_out_day)} and ${longDay(booked)}, `
+              + `so ${guest}'s stay can't be put back to ${longDay(booked)}. ${next}`
+            : `${STAY_CONFLICT_MESSAGE[conflict]}, so ${guest}'s stay can't be put back to ${longDay(booked)}. ${next}`
+        },
+      })
+      checkOutRestored = { from: booking.check_out_day, to: booked }
+      // The booked day typed back in is the undo, not a date edit.
+      checkOutChanged = false
+    }
+
+    const datesOrUnitChanged = checkInChanged || checkOutChanged || unitChanged
+
+    // 10/4 (decisions #38): a deliberate new check-out on a stay that is
+    // already checked out is a new length of stay — the money question its
+    // early check-out asked goes with it (the price follows the dates). After a
+    // refund it is refused, like an undo (Q11).
+    const redatesCheckedOut = booking.status === 'checked_out' && checkOutChanged
+    if (redatesCheckedOut) {
+      const refusal = await checkOutChangeRefusal(booking.id, 'redate', guest)
+      if (refusal) throw new AppError(409, refusal)
+    }
+
+    // ── S655 (Step 6 fix round 4): BRINGING BACK A CANCELLED OR NO-SHOW
+    // RESERVATION NEEDS ITS NIGHTS TO STILL BE FREE
+    //
+    // A cancelled or no-show reservation lets go of its site, and somebody may
+    // have been booked onto those nights since. Setting it back to Tentative,
+    // Confirmed or Checked in (the step the check-out refusals above name) is a
+    // status change only, and the site check below runs only when the dates or
+    // the site change — so both reservations ended up holding the same site.
+    // When the dates or site change too, that check covers it; otherwise the
+    // stay's own nights are checked here. Refused in plain words with the next
+    // step, and nothing is written.
+    if ((booking.status === 'cancelled' || booking.status === 'no_show')
+        && SITE_HOLDING_STATUSES.includes(status) && !datesOrUnitChanged) {
+      const whose = guest === 'This guest' ? "this guest's" : `${guest}'s`
+      const whom = guest === 'This guest' ? 'them' : guest
+      await claimNights({
+        unitId: booking.unit_id, checkIn: booking.check_in_day, checkOut: booking.check_out_day,
+        refusal: (conflict) => conflict === 'booking'
+          ? `Another reservation now holds this site for some of ${whose} nights. `
+            + `Move that reservation first, or give ${whom} new dates with Edit.`
+          : `${STAY_CONFLICT_MESSAGE[conflict]}, so ${whose} reservation can't be brought back on this site. `
+            + `Give ${whom} new dates or another site with Edit.`,
+      })
+    }
+
+    // ── S655 (Step 6 fix round 2): AFTER AN EARLY CHECK-OUT, ONLY A CHECK-OUT
+    // EDIT MOVES MONEY
+    //
+    // While the stored check-out is still the day an early check-out put there,
+    // it is the day the guest LEFT — not the length of the stay that was sold.
+    // A later edit that leaves the check-out alone (a site move by drag or by
+    // Edit, an arrival-day correction, the agent's edit) must not price the
+    // stay on the shortened length or sync the lease to the day they left:
+    // that would move the money the check-out deliberately did not (a $4,500
+    // three-month stay repriced to $1,548.39, the lease ended Oct 2, November's
+    // rent deleted and the rest banked). So: the total stays what it was (a
+    // stay with no price yet is priced on the nights it was booked for), and
+    // the lease sync does not run. The landlord's deliberate check-out edit is
+    // still the one way to shorten the stay and its lease (S548).
+    const keepsEarlyCheckOut = !!early && !checkOutChanged && !checkOutMoved && !checkOutRestored
+
     let newUnitId = unitId || booking.unit_id
-    const newCheckIn = checkIn || booking.check_in
-    const newCheckOut = checkOut || booking.check_out
-    const datesOrUnitChanged = !!(checkIn || checkOut || unitId)
+    // Every date in this handler is plain 'YYYY-MM-DD' text — the request's day
+    // or the stored day read as text above. pg hands DATE columns back as JS
+    // Dates, and computeMonthlyStaySchedule calls .slice on its dates: a
+    // one-date edit of a monthly stay ("two more nights") crashed with a 500.
+    const newCheckIn: string = checkInChanged ? checkInDay! : booking.check_in_day
+    const newCheckOut: string = checkOutMoved?.to ?? checkOutRestored?.to
+      ?? (checkOutChanged ? checkOutDay! : booking.check_out_day)
+    // Every stay keeps at least one night — the same rule booking creation holds.
+    if ((checkInChanged || checkOutChanged) && dayDiff(newCheckIn, newCheckOut) < 1) {
+      throw new AppError(400, 'Check-out has to be at least one day after check-in.')
+    }
     // W-20: set when the extension fallback moved the EXTENDING guest to a
     // different site — surfaced in the response so staff can tell them.
     let extendedGuestMovedTo: { unitId: string; unitNumber: string } | null = null
+
+    // S655 (Step 6 fix round): fresh at the moment of action. Everything above
+    // was decided from the row as it was read at the start; if somebody else
+    // changed the stay's status, site or dates since, this save is refused
+    // rather than written over theirs — with code 'reservation_changed' and the
+    // stay as it is now in `data`, so the screen can put the latest in front of
+    // staff without another call. Checked inside the write (below) and, when
+    // an extension is about to move the next reservation, before that move.
+    //
+    // 10/3: staff screens put the latest in place (the schedule loads `data`
+    // into the open stay), so the words say what happened and what to do —
+    // never "open it again".
+    const reservationChanged =
+      `${guest === 'This guest' ? 'This reservation' : `${guest}'s reservation`} was just changed by someone else, `
+      + 'so your change was not saved. The latest is shown now; make your change again if it is still needed.'
+    const answerChanged = async () => {
+      const latest = await queryOne<any>('SELECT * FROM unit_bookings WHERE id = $1', [booking.id])
+      return res.status(409).json({ success: false, code: 'reservation_changed', error: reservationChanged, data: latest })
+    }
+    // The check on its own, for before the extension's move: waits for
+    // anybody mid-save on the stay, then lets go of it at once — nothing is
+    // held while the move runs on its own connection.
+    const stayChangedNow = async (): Promise<boolean> => {
+      const c = await getClient()
+      try {
+        await c.query('BEGIN')
+        const changed = await stayChangedSince(c, booking)
+        await c.query('COMMIT')
+        return changed
+      } catch (e) {
+        await c.query('ROLLBACK').catch(() => {})
+        throw e
+      } finally { c.release() }
+    }
 
     // If dates or unit changed, verify target unit exists, belongs to the
     // same landlord, and check for conflicts. Repricing below reads its rates.
@@ -2067,8 +3249,15 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       if (conflict === 'booking' && !unitId && (checkIn || checkOut)) {
         const { relocateBlockingBookings, rankUnitsBestFit } =
           await import('../services/scheduleCompression')
+        // S655 (Step 6 fix round 6): the move below is written on its own,
+        // ahead of this save. So first: is the stay still as this save read
+        // it? Anybody mid-save on it is waited for, and a change refuses the
+        // save before anything is moved. (A refusal that still comes after
+        // the move puts the moved reservations back — putRelocatedBack.)
+        if (await stayChangedNow()) return answerChanged()
         const relo = await relocateBlockingBookings(
           newUnitId, { checkIn: newCheckIn, checkOut: newCheckOut }, booking.id)
+        relocated = await stillRelocated(relo.moves.map(m => m.bookingId), newUnitId)
         if (relo.ok) {
           conflict = await findStayConflict(newUnitId, {
             checkIn: newCheckIn, checkOut: newCheckOut, excludeBookingId: booking.id,
@@ -2111,6 +3300,12 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         }
       }
       if (conflict) throw new AppError(409, STAY_CONFLICT_MESSAGE[conflict])
+      // Checked again inside the write (see SiteClaim above): the nights on
+      // the site the stay ends up on, after any extension move.
+      siteClaims.push({
+        unitId: newUnitId, checkIn: newCheckIn, checkOut: newCheckOut,
+        refusal: (c) => STAY_CONFLICT_MESSAGE[c],
+      })
     }
 
     // S559: same-day turnover guard — do NOT check a new guest into a spot
@@ -2119,11 +3314,28 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // take it inline (blind) and retry; a landlord (properties.edit) may
     // override for a broken/unreadable meter so a paying guest is never
     // stranded. Broken meters are already excluded (they bill from comparables).
-    if (status === 'checked_in' && booking.status !== 'checked_in') {
+    //
+    // S655: undoing a check-out on the same site is not a turnover — it is the
+    // same guest going back onto their own spot, and their own (mistaken)
+    // departure is what makes a closing read look due. Asking for that read
+    // would block the back-out and stamp a "closing" read for a guest who never
+    // left. On a different site it is a new arrival there, and the guard holds.
+    const sameGuestBackOnSite = booking.status === 'checked_out' && newUnitId === booking.unit_id
+    if (status === 'checked_in' && booking.status !== 'checked_in' && !sameGuestBackOnSite) {
       const pending = await unitPendingReads(newUnitId)
       const isOwner = ['landlord', 'admin', 'super_admin'].includes(req.user!.role)
       const canOverride = isOwner || (req.user!.permissions as any)?.['properties.edit'] === true
       if (pending.length > 0 && !(req.body.overrideMeterRead && canOverride)) {
+        // 10/3 (review, V1): this refusal answers here rather than throwing, so
+        // the catch below never sees it. A check-in that also extended the
+        // stay may already have moved the next reservation off the site to
+        // make room (W-20) — that extension is not happening, so it goes back
+        // before the answer.
+        if (relocated.length) {
+          const moved = relocated
+          relocated = []
+          await putRelocatedBack(moved)
+        }
         return res.status(409).json({
           success: false,
           code: 'meter_read_due',
@@ -2134,61 +3346,466 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       }
     }
 
-    // S553: newCheckIn/newCheckOut mix 'YYYY-MM-DD' strings (from the
-    // request) with pg DATE Dates (from the row) — dayDiff is immune to
-    // the representation; raw ms math was host-timezone-dependent.
+    // S553: both are 'YYYY-MM-DD' text now (above); dayDiff takes either.
     const nights = dayDiff(newCheckIn, newCheckOut)
 
     // Reprice when dates or the unit change — the stored total must never drift
     // from the new stay. Same unit-rate-then-property-default rule as create.
     // A pure status/notes/guest edit keeps the existing total.
+    //
+    // S655 (Step 6 fix round): a reservation with NO price yet — $0, booked
+    // before the site had rates — takes the site's price when it is saved from
+    // the edit form (which always sends the dates and the site), even with the
+    // dates unchanged. The register refuses a $0 reservation ("Set its price on
+    // the schedule"), and the schedule has no price box: this save is how staff
+    // give it one. A stay that already took money is never repriced here, and
+    // neither is a check-out (early, on time or late — the day typed in or
+    // not) or its undo (those move no money).
+    //
+    // Fix round 2: after an early check-out (keepsEarlyCheckOut, above) a
+    // priced stay keeps its total through a site move or an arrival-day
+    // correction, and a stay with no price yet is priced on the nights it was
+    // BOOKED for (arrival to the booked check-out), never on the shortened stay.
+    const unpriced = !(Number(booking.total_amount) > 0)
+      && !booking.pos_transaction_id && !booking.deposit_paid_at && !booking.balance_paid_at
+    // (A correction of the day a checked-out guest left is a check-out too.)
+    const isCheckOut = status === 'checked_out' && (booking.status !== 'checked_out' || leftOnCorrected)
+    const priceUnpriced = unpriced && !isCheckOut && !checkOutMoved && !checkOutRestored
+      && !!(checkIn || checkOut || unitId)
+    const repriceDue = keepsEarlyCheckOut ? priceUnpriced : (datesOrUnitChanged || priceUnpriced)
+    const priceThrough = keepsEarlyCheckOut ? early!.booked : newCheckOut
+    if (repriceDue && !targetUnit) {
+      targetUnit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [newUnitId, booking.landlord_id])
+    }
     let newTotal: number | null = null
-    if (datesOrUnitChanged) {
+    if (repriceDue && targetUnit) {
       const prop = await queryOne<any>(
         'SELECT nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate FROM properties WHERE id=$1',
         [targetUnit.property_id])
-      const monthlyRate = targetUnit.monthly_rate ?? prop?.monthly_rate
-      const price = computeStayPrice(
+      // 10/4 (early check-out plan, BUG-D): the schedule's ONE pricing function
+      // (services/registerStay scheduleStayPrice: computeStayPrice tiered by
+      // length plus the lodging tax under 30 nights; a monthly-tier stay on the
+      // calendar-aligned schedule, S547) — the copy that lived here could drift
+      // from what the register, a pay link and the early check-out price.
+      const priced = scheduleStayPrice(
         { nightly: targetUnit.nightly_rate ?? prop?.nightly_rate,
           weekly:  targetUnit.weekly_rate  ?? prop?.weekly_rate,
-          monthly: monthlyRate },
-        Number(prop?.short_term_tax_rate || 0), nights)
-      // S547: monthly-tier stays reprice on the calendar-aligned schedule —
-      // same rule as booking creation, so edits never drift from invoices.
-      if (price.tier === 'monthly' && monthlyRate != null) {
-        newTotal = computeMonthlyStaySchedule(newCheckIn, newCheckOut, Number(monthlyRate)).total
-      } else if (price.total > 0) newTotal = price.total
+          monthly: targetUnit.monthly_rate ?? prop?.monthly_rate },
+        prop?.short_term_tax_rate ?? 0, newCheckIn, priceThrough)
+      if (priced.total > 0) newTotal = priced.total
     }
 
-    const updated = await queryOne<any>(`
-      UPDATE unit_bookings
-      SET status=COALESCE($1,status), notes=COALESCE($2,notes),
-          unit_id=$3, check_in=$4, check_out=$5, nights=$6,
-          guest_name=COALESCE($8,guest_name),
-          guest_email=COALESCE($9,guest_email),
-          guest_phone=COALESCE($10,guest_phone),
-          total_amount=COALESCE($11,total_amount),
-          platform_fee=COALESCE($12,platform_fee),
-          required_site_layout=COALESCE($13,required_site_layout),
-          required_amp_service=COALESCE($14,required_amp_service),
-          locked_to_unit=COALESCE($15,locked_to_unit),
-          avoided_unit_ids=COALESCE($16::uuid[],avoided_unit_ids),
-          -- S652: stamp WHEN it was cancelled, once. Nights are exempt from
-          -- GAM's fee only when this lands before arrival, so the moment has to
-          -- be recorded at the moment — updated_at moves for every later edit
-          -- and could not answer the question afterwards.
-          cancelled_at = CASE
-            WHEN $1 = 'cancelled' AND cancelled_at IS NULL THEN NOW()
-            WHEN $1 IS NOT NULL AND $1 <> 'cancelled' THEN NULL
-            ELSE cancelled_at END,
-          updated_at=NOW()
-      WHERE id=$7 RETURNING *`,
-      [status||null, notes||null, newUnitId, newCheckIn, newCheckOut, nights, booking.id,
-       guestName ?? null, guestEmail ?? null, guestPhone ?? null,
-       // Reprice zeroes the fee too (S526: reservations carry no platform fee).
-       newTotal, newTotal != null ? 0 : null, requiredSiteLayout ?? null, requiredAmpService ?? null,
-       typeof lockedToUnit === 'boolean' ? lockedToUnit : null,
-       avoidedIn ? await scopedAvoidedUnits(avoidedIn, (targetUnit ?? await queryOne<any>('SELECT property_id FROM units WHERE id=$1', [booking.unit_id]))!.property_id) : null])
+    const avoidedFinal = avoidedIn
+      ? await scopedAvoidedUnits(avoidedIn, targetUnit?.property_id ?? bookingUnit!.property_id)
+      : null
+
+    // S655 (Step 6 fix round): the write, and — for a check-out that moved the
+    // day or its undo — the history event that records the booked day, land
+    // together or not at all: the undo reads that event, so a check-out without
+    // it could never be backed out cleanly.
+    //
+    // Fresh at the moment of action (see answerChanged above): the stay is
+    // locked and compared with the row everything above was decided from.
+    //
+    // Then the nights this save gives the stay (siteClaims) are checked again
+    // with the site locked against every other way a stay is put on it (see
+    // lockSitesForStays for the lock order: the claimed sites' own rows first,
+    // then this stay's row, then the sites).
+    // 10/4 (decisions #38 Q8): a long stay on a lease is NEVER billed past the
+    // day the guest leaves. An early check-out of a stay with a lease makes the
+    // day they left the length it is sold for, so the lease follows it (the
+    // sync after the save ends the lease that day, drops the rent past it and
+    // banks what was paid past it; the existing move-out machinery makes the
+    // final bill). The history event still records the booked day, so an undo
+    // puts it — and the lease — back.
+    const endsLease = !!checkOutMoved && !!(await queryOne(
+      `SELECT 1 FROM leases WHERE source_booking_id = $1 AND status IN ('active', 'pending') LIMIT 1`, [booking.id]))
+    const restoresLease = !!checkOutRestored && !!(await queryOne(
+      `SELECT 1 FROM leases WHERE source_booking_id = $1 AND status IN ('active', 'pending') LIMIT 1`, [booking.id]))
+
+    let updated: any
+    // Step 9 final fix (fix pass 1): what canceling the stay closed on the
+    // lease drafted with it, and the bank pulls that close stopped (canceled
+    // after the commit).
+    let leaseClosedOnCancel: { amount: number; leases: number; keptTotal: number; keptWords: string[] } | null = null
+    let stopAfterCancel: string[] = []
+    // Final fix (fix pass 2, review): a status change into or out of Checked
+    // in / Checked out is written to the stay's history inside the save
+    // (below), so the after-commit history diff leaves it out.
+    let statusRecordedInSave = false
+    let changedBySomeoneElse = false
+    let failure: unknown = null
+    // 10/3 (review, fix pass 2): a write the database ended to break a
+    // deadlock did nothing, so it runs again from the top, like a reservation
+    // made on the schedule (the booking POST). One that keeps meeting one is
+    // answered in plain words (SAVED_AT_THE_SAME_MOMENT, below), never the
+    // database's own text in a 500.
+    for (let attempt = 1; ; attempt++) {
+      if (attempt > 1) await pauseBeforeTry(attempt - 1)
+      failure = null
+      leaseClosedOnCancel = null
+      stopAfterCancel = []
+      statusRecordedInSave = false
+      const tx = await getClient()
+      try {
+        await tx.query('BEGIN')
+        // 10/3 (review, fix pass 2): the claimed sites' own rows first, before
+        // this stay's row and the sites. Moving the stay onto a site needs that
+        // site's row for the write, and a pay link being sent for the site
+        // (posPayLinks) holds the row while it waits for the site. This save
+        // used to take the site and then wait on the row, and the database
+        // ended one of the two with a deadlock (probe C3: the move failed 3
+        // times out of 3). Taken first, this save waits for the link while
+        // holding nothing, then goes on. FOR KEY SHARE only keeps the row from
+        // going away, so the one thing it waits for is a lock like the link's.
+        // The booking POST and the register take the same first step.
+        const claimedSites = [...new Set(siteClaims.map(c => c.unitId))].sort()
+        if (claimedSites.length) {
+          await tx.query(`SELECT 1 FROM units WHERE id = ANY($1::uuid[]) ORDER BY id FOR KEY SHARE`, [claimedSites])
+        }
+        if (await stayChangedSince(tx, booking)) {
+          changedBySomeoneElse = true
+          throw new AppError(409, reservationChanged)
+        }
+        // Step 9 final fix (fix pass 2, review LOW): the closed-lease check
+        // again, now that the stay's row is locked. "They never moved in" on
+        // the Leases page, run on this stay's already-ended lease while this
+        // save was on its way, changes nothing on the stay row (it is already
+        // canceled), so stayChangedSince cannot see it; it takes this same row
+        // first (assessNeverMovedIn), so by now it has committed or waits.
+        if (bringsBackClosedStay) {
+          const closedNow = await closedLeaseOfStay(booking.id, tx)
+          if (closedNow) throw new AppError(409, closedStayRefusal(guest, booking.status as 'cancelled' | 'no_show', closedNow.billZeroed))
+        }
+        if (siteClaims.length) {
+          await lockSitesForStays(tx, claimedSites)
+          for (const claim of siteClaims) {
+            const conflict = await findStayConflict(claim.unitId, {
+              checkIn: claim.checkIn, checkOut: claim.checkOut, excludeBookingId: booking.id,
+            })
+            if (conflict) throw new AppError(409, await claim.refusal(conflict))
+          }
+        }
+        // 10/4 (decisions #38): a check-out put back — or the day they left
+        // corrected, or a new length set — takes its money question with it (a
+        // stay charged only the nights stayed goes back to its booked price,
+        // before any reprice below). A new check-out asks again.
+        //
+        // Fix pass (review r3, #38 Q11): the refusals above read before this
+        // transaction; a refund decided in between (another person deciding
+        // the money on a stay already checked out — it changes neither the
+        // status, the site nor the dates, so stayChangedSince cannot see it) is
+        // caught here, with the stay's row and its decision locked: the same
+        // words, and nothing is saved.
+        if (checkOutRestored || (checkOutMoved && leftOnCorrected) || redatesCheckedOut) {
+          await onCheckOutUndone(tx, booking.id, {
+            guest,
+            change: leftOnCorrected && (checkOutMoved || checkOutRestored) ? 'correct' : undoing ? 'undo' : 'redate',
+          })
+        }
+        // ── Step 9 final fix (fix pass 1, decisions #46.4): CANCELING A STAY
+        // CLOSES THE LEASE DRAFTED WITH IT — IN THIS SAVE ────────────────────
+        //
+        // A stay of 30 nights or more drafts a lease alongside it (S526). S639
+        // made canceling the stay end that lease while it is still paperwork
+        // ('pending' / 'draft') — but with a bare UPDATE after the save, so a
+        // lease the tenant had signed and the landlord had issued kept its
+        // move-in bill owed for a tenancy that never happened, and "They never
+        // moved in" then answered "This lease has already ended. Nothing else
+        // to do." There is no no-show button on the Schedule: canceling the
+        // stay IS staff saying the guest is not coming. So the cancel runs the
+        // same close as "They never moved in — end the lease"
+        // (lib/unwindIssuedLease.endLeaseNeverMovedIn, attested), here, in this
+        // transaction: the unpaid move-in bill zeroed, the lease ended, the
+        // household taken off it. When the close does not apply — money was
+        // paid on the lease, a payment is on its way, the stay was checked in —
+        // the cancel is refused in the close's own words, naming the real next
+        // step, and nothing changes.
+        //
+        // Fix pass 3 (review, HIGH): an ACTIVE drafted lease too. Once the
+        // landlord has signed, the scheduler makes the drafted lease 'active'
+        // on its start date — the check-in day — and a no-show is noticed on
+        // or after that day. The cancel used to answer 200 and leave that lease
+        // active: rent billing every month, the move-in bill owed, the space
+        // occupied. The S639 "an active lease is never touched here" rule
+        // predates the attested close; a landlord-signed 'pending' lease is
+        // just as signed, and the close refuses every lease anyone lived under
+        // (checked in, a finalized walkthrough, money paid or on its way, a
+        // renewal) with the move-out step. So the cancel never succeeds
+        // silently while a lease drafted with the stay keeps billing.
+        //
+        // A No-show (status 'no_show' — the API and the landlord assistant can
+        // send it; the Schedule has no such button) is the same fact as
+        // canceling the stay, so it runs the same close.
+        const closesDraftedLease = (status === 'cancelled' || status === 'no_show') && booking.status !== status
+        if (closesDraftedLease) {
+          const drafted = (await tx.query<{ id: string; unit_id: string; status: string }>(
+            `SELECT id, unit_id, status FROM leases
+              WHERE source_booking_id = $1 AND status IN ('pending', 'draft', 'active')
+              ORDER BY created_at, id`, [booking.id])).rows
+          if (drafted.length > 0) {
+            const { endLeaseNeverMovedIn } = await import('../lib/unwindIssuedLease')
+            const reader = {
+              canMarkLeaving: userHasPerm(req.user, 'leases.edit', 'front_desk.mark_leaving'),
+              canMoveOut: userHasPerm(req.user, 'leases.deposit_return'),
+            }
+            let amount = 0
+            let keptCents = 0
+            const keptWords: string[] = []
+            for (const l of drafted) {
+              const closed = await endLeaseNeverMovedIn(tx, l, {
+                reader, cancelingBooking: booking.id, actorUserId: req.user!.userId,
+                refusalLead: cancelRefusalLead(guest, status),
+              })
+              stopAfterCancel.push(...closed.cancelAfterCommit)
+              amount += closed.closedAmount
+              keptCents += Math.round(closed.assessment.keptTotal * 100)
+              if (closed.assessment.keptWords) keptWords.push(closed.assessment.keptWords)
+            }
+            amount = Math.round(amount * 100) / 100
+            // Step 9 final fix (fix pass 2, review): zeroing a move-in bill
+            // writes money off — the same close through "They never moved in"
+            // (and Discard) needs "Terminate leases". "Edit / move / cancel
+            // reservations" alone used to be enough to forgive a bill of any
+            // size by canceling the stay. Checked on what the close would
+            // zero NOW (fresh, under its locks); refused before the commit, so
+            // nothing changes. A drafted lease with nothing to zero (unsigned
+            // paperwork) still ends with the stay, as S639 made it.
+            //
+            // Fix pass 3: ending a lease already in force is ending a tenancy
+            // — "Terminate leases" too, even with nothing to zero.
+            const inForce = drafted.some(l => l.status === 'active')
+            if ((amount > 0 || inForce) && !userHasPerm(req.user, 'leases.terminate')) {
+              throw new AppError(403, cancelNeedsTerminateWords(status, inForce, amount))
+            }
+            // Fresh at the moment of action: a Schedule confirm that showed
+            // what would be zeroed sends its total; a different figure now
+            // (a bill changed in between) is refused with nothing changed.
+            //
+            // Final fix (fix pass 1, decisions #53 — "never runs blind"): the
+            // total is REQUIRED when the cancel would zero a bill or end a
+            // lease in force. A bare {status:'cancelled'} (an old screen, the
+            // API) used to zero it with nobody shown the lines.
+            const expectedRaw = req.body?.expectedNeverMovedInTotal
+            if ((amount > 0 || inForce) && (expectedRaw === undefined || expectedRaw === null)) {
+              throw new AppError(409, `${cancelEndsLeaseWords(status, inForce, amount)}. ${CANCEL_NEEDS_CONFIRM_TAIL}`)
+            }
+            // Fix pass 2 (review): the Schedule's confirm also sends how many
+            // drafted leases it showed. A lease drafted after it read (with
+            // nothing to zero, so the totals would agree) is not ended unseen.
+            const expectedLeasesRaw = req.body?.expectedNeverMovedInLeases
+            // Fix pass 3 (review): the count is REQUIRED whenever the cancel
+            // would zero a bill or end a lease in force, or a total was sent.
+            // A total alone (an older screen, the API) read before a lease was
+            // drafted said $0 — and a drafted lease that became active since,
+            // with nothing to zero, agreed with it and was ended unseen.
+            const totalSent = expectedRaw !== undefined && expectedRaw !== null
+            if ((amount > 0 || inForce || totalSent) && typeof expectedLeasesRaw !== 'number') {
+              throw new AppError(409, `${cancelEndsLeaseWords(status, inForce, amount)}. ${CANCEL_NEEDS_CONFIRM_TAIL}`)
+            }
+            if (typeof expectedLeasesRaw === 'number' && expectedLeasesRaw !== drafted.length) {
+              throw new AppError(409, CANCEL_LEASES_CHANGED_WORDS)
+            }
+            if (expectedRaw !== undefined && expectedRaw !== null) {
+              const expected = Number(expectedRaw)
+              if (!Number.isFinite(expected) || Math.round(expected * 100) !== Math.round(amount * 100)) {
+                const { NEVER_MOVED_IN_CHANGED_WORDS } = await import('../lib/unwindIssuedLease')
+                throw new AppError(409, NEVER_MOVED_IN_CHANGED_WORDS)
+              }
+            }
+            leaseClosedOnCancel = { amount, leases: drafted.length, keptTotal: keptCents / 100, keptWords }
+          }
+        }
+        updated = (await tx.query<any>(`
+          UPDATE unit_bookings
+          SET status=COALESCE($1,status), notes=COALESCE($2,notes),
+              unit_id=$3, check_in=$4, check_out=$5, nights=$6,
+              guest_name=COALESCE($8,guest_name),
+              guest_email=COALESCE($9,guest_email),
+              guest_phone=COALESCE($10,guest_phone),
+              total_amount=COALESCE($11,total_amount),
+              platform_fee=COALESCE($12,platform_fee),
+              required_site_layout=COALESCE($13,required_site_layout),
+              required_amp_service=COALESCE($14,required_amp_service),
+              locked_to_unit=COALESCE($15,locked_to_unit),
+              avoided_unit_ids=COALESCE($16::uuid[],avoided_unit_ids),
+              -- 10/3 (decisions #33): the length the stay is sold for. A
+              -- deliberate change of the check-out ($17) is a new length. An
+              -- early check-out, a correction of the day they left and an undo
+              -- ($18, the booked day) keep the length as it read BEFORE this save
+              -- (soldCheckOutSql: the later of the column and the stored
+              -- check-out — these SET expressions see the old values), and never
+              -- less than the booked day: a path that lengthened the stay without
+              -- writing the column (the guest agent's extra night) would
+              -- otherwise leave the shorter day standing across the check-out.
+              booked_check_out = CASE
+                WHEN $17::date IS NOT NULL THEN $17::date
+                WHEN $18::date IS NOT NULL THEN GREATEST(booked_check_out, check_out, $18::date)
+                ELSE booked_check_out END,
+              -- S652: stamp WHEN it was cancelled, once. Nights are exempt from
+              -- GAM's fee only when this lands before arrival, so the moment has to
+              -- be recorded at the moment — updated_at moves for every later edit
+              -- and could not answer the question afterwards.
+              cancelled_at = CASE
+                WHEN $1 = 'cancelled' AND cancelled_at IS NULL THEN NOW()
+                WHEN $1 IS NOT NULL AND $1 <> 'cancelled' THEN NULL
+                ELSE cancelled_at END,
+              updated_at=NOW()
+          WHERE id=$7 RETURNING *`,
+          [status||null, notes||null, newUnitId, newCheckIn, newCheckOut, nights, booking.id,
+           guestName ?? null, guestEmail ?? null, guestPhone ?? null,
+           // Reprice zeroes the fee too (S526: reservations carry no platform fee).
+           newTotal, newTotal != null ? 0 : null, requiredSiteLayout ?? null, requiredAmpService ?? null,
+           typeof lockedToUnit === 'boolean' ? lockedToUnit : null,
+           avoidedFinal,
+           checkOutChanged || endsLease ? newCheckOut : null,
+           checkOutMoved ? (bookedForEvent ?? booking.check_out_day) : checkOutRestored ? checkOutRestored.to : null,
+          ])).rows[0]
+
+        if (checkOutMoved || checkOutRestored) {
+          const from = { check_in: booking.check_in_day, check_out: booking.check_out_day }
+          const to   = { check_in: newCheckIn, check_out: newCheckOut }
+          const n = Math.abs(dayDiff(booking.check_out_day, newCheckOut))
+          const days = `${n} day${n === 1 ? '' : 's'}`
+          const who = booking.guest_name || 'Guest'
+          const base = {
+            client: tx, bookingId: booking.id, unitId: booking.unit_id,
+            landlordId: booking.landlord_id, actorUserId: req.user!.userId,
+          }
+          // Fix round 3: a correction of the day a checked-out guest left says
+          // so, and — while the check-out is still before the booked day — keeps
+          // the early check-out's mark and the booked day, so an undo still puts
+          // the booked day back.
+          const later = newCheckOut > booking.check_out_day
+          const moveFrom = longDay(from.check_out)
+          const moveTo = longDay(to.check_out)
+          let summary: string
+          if (checkOutMoved && !leftOnCorrected) {
+            summary = `${who} checked out early — check-out moved from ${moveFrom} to ${moveTo} (${days} removed)`
+          } else if (checkOutMoved) {
+            summary = later
+              ? `${who} left later than recorded — check-out moved from ${moveFrom} to ${moveTo} (${days} added back)`
+              : `${who} left earlier than recorded — check-out moved from ${moveFrom} to ${moveTo} (${days} removed)`
+          } else if (leftOnCorrected) {
+            summary = `${who} stayed to the day they had booked — check-out back to ${moveTo} (${days} added back)`
+          } else {
+            summary = `${who}'s check-out undone — check-out back to ${moveTo} (${days} added back)`
+          }
+          await recordBookingEvent({
+            ...base, eventType: 'dates_changed',
+            summary,
+            detail: checkOutMoved
+              ? { from, to, delta: `${days} ${later ? 'added' : 'removed'}`, early_check_out: true,
+                  booked_check_out: bookedForEvent ?? from.check_out, left_on: leftOn,
+                  ...(leftOnCorrected ? { left_on_corrected: true } : {}) }
+              : { from, to, delta: `${days} added`, check_out_restored: true,
+                  ...(leftOnCorrected ? { left_on: leftOn, left_on_corrected: true } : {}) },
+          })
+          if (updated.status !== booking.status) {
+            await recordBookingEvent({
+              ...base, eventType: 'status_changed',
+              summary: `${who} status: ${bookingStatusLabel(booking.status)} → ${bookingStatusLabel(updated.status)}`,
+              detail: { from_status: booking.status, to_status: updated.status },
+            })
+          }
+        }
+
+        // Fix round 2: an arrival-day correction after an early check-out keeps
+        // the check-out the guest left on, so its history event carries the
+        // early check-out's mark and the booked day forward — the next edit (or
+        // an undo) still knows the stored check-out is the day they left. Written
+        // with the save, like the check-out's own event, so the two never part.
+        if (keepsEarlyCheckOut && checkInChanged) {
+          const who = booking.guest_name || 'Guest'
+          await recordBookingEvent({
+            client: tx, bookingId: booking.id, unitId: newUnitId,
+            landlordId: booking.landlord_id, actorUserId: req.user!.userId,
+            eventType: 'dates_changed',
+            summary: `${who}'s check-in moved from ${longDay(booking.check_in_day)} to ${longDay(newCheckIn)}. `
+              + 'They had already checked out early, so the check-out, the price and any lease stay as they were',
+            detail: {
+              from: { check_in: booking.check_in_day, check_out: booking.check_out_day },
+              to:   { check_in: newCheckIn, check_out: newCheckOut },
+              delta: '', early_check_out: true, booked_check_out: early!.booked, left_on: early!.leftOn,
+              check_in_corrected: true,
+            },
+          })
+        }
+        // ── Final fix (fix pass 2, review): A GUEST'S ARRIVAL IS HISTORY THE
+        // SAVE ITSELF WRITES
+        //
+        // Decisions #53: the never-moved-in close (Cancel reservation, "They
+        // never moved in") is refused for a stay that was EVER checked in, and
+        // it reads that from the stay's history. That history used to be
+        // written after the commit, best-effort and not awaited — a failed
+        // insert, or a cancel landing first, left a stay checked in and set
+        // back to Confirmed with no trace of the check-in, and the close then
+        // zeroed rent for nights a guest was on the site. So a status change
+        // into or out of Checked in / Checked out is written here, with the
+        // save: both land, or neither does. (A check-out that moved the day,
+        // or its undo, wrote its own above.)
+        const ARRIVED = ['checked_in', 'checked_out']
+        if (updated.status !== booking.status && !checkOutMoved && !checkOutRestored
+            && (ARRIVED.includes(booking.status) || ARRIVED.includes(updated.status))) {
+          const who = booking.guest_name || 'Guest'
+          await recordBookingEvent({
+            client: tx, bookingId: booking.id, unitId: updated.unit_id,
+            landlordId: booking.landlord_id, actorUserId: req.user!.userId,
+            eventType: 'status_changed',
+            summary: `${who} status: ${bookingStatusLabel(booking.status)} → ${bookingStatusLabel(updated.status)}`,
+            detail: { from_status: booking.status, to_status: updated.status },
+          })
+          statusRecordedInSave = true
+        }
+        await tx.query('COMMIT')
+      } catch (e) {
+        await tx.query('ROLLBACK').catch(() => {})
+        failure = e
+      } finally {
+        tx.release()
+      }
+      if (!isDeadlock(failure) || attempt >= BOOKING_SAVE_TRIES) break
+      logger.warn({ bookingId: booking.id, attempt },
+        '[booking] a schedule change deadlocked with another save on the same sites; saving again')
+    }
+    if (failure && changedBySomeoneElse) {
+      // Fix round 6: a reservation the extension moved for this save goes back.
+      if (relocated.length) {
+        const moved = relocated
+        relocated = []
+        await putRelocatedBack(moved)
+      }
+      return answerChanged()
+    }
+    // Still deadlocked after every try: nothing was written. (The catch below
+    // puts back a reservation an extension moved for this save.)
+    if (isDeadlock(failure)) throw new AppError(409, SAVED_AT_THE_SAME_MOMENT)
+    if (failure) throw failure
+
+    // The save is final, so a reservation the extension moved for it stays
+    // moved — unless the extending guest went to another site after all (the
+    // W-20 fallback, after the next reservations could not all be moved): the
+    // ones moved before that gave up made room for nobody, and go back.
+    const movedForNobody = extendedGuestMovedTo ? relocated : []
+    relocated = []
+    if (movedForNobody.length) await putRelocatedBack(movedForNobody)
+
+    // 10/4 (decisions #38 Q8, Q5): an early check-out saved here ends a long
+    // stay's lease on the day they left, and any money question (the guest still
+    // owes, or paid more than the nights stayed are worth) WAITS on the stay as
+    // a pending decision with an owner to-do — nothing about the money is
+    // decided on this route. A check-out put back brings the lease back with
+    // the booked day.
+    let moneyDecisionNeeded: string | null = null
+    if (checkOutMoved && updated.status === 'checked_out') {
+      moneyDecisionNeeded = await afterPatchEarlyCheckOut(booking.id, req.user!.userId).catch((err) => {
+        logger.error({ err, bookingId: booking.id }, '[booking] early check-out money question could not be recorded')
+        return null
+      })
+    } else if (restoresLease) {
+      await syncLeaseWithBookingDates(booking.id)
+        .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] lease could not follow the put-back check-out'))
+    }
 
     // S526: an extension can push the stay over the lease threshold (30d, or
     // 7d in weekly-lease mode) — re-check on every edit. Best-effort.
@@ -2200,22 +3817,38 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // drafts follow the dates; an active lease's end moves, no-longer-owed
     // pending rent is dropped, and rent paid past the new end is banked as
     // a prepaid credit that nets against the final bill. Best-effort.
-    if (datesOrUnitChanged) {
+    //
+    // S655 (fix round 2): not after an early check-out the edit left in place
+    // (keepsEarlyCheckOut) — the sync reads the stored check-out as the lease's
+    // end, and that day is the day the guest left, not a deliberate shortening.
+    if (datesOrUnitChanged && !keepsEarlyCheckOut) {
       syncLeaseWithBookingDates(booking.id)
         .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] lease-billing sync failed'))
     }
 
     // S517: append the change-history events (moved / dates_changed / cancelled
-    // / status_changed) by diffing old → new. Best-effort.
-    recordBookingChange(booking, updated, req.user!.userId).catch(err =>
-      logger.error({ err, bookingId: booking.id }, '[booking] change event record failed'))
+    // / status_changed) by diffing old → new. Best-effort. (A check-out that
+    // moved the day, or its undo, wrote its own events with the write above;
+    // so did an arrival-day correction after an early check-out, whose dates
+    // are therefore not diffed again here — a second, unmarked 'dates_changed'
+    // event would drop the early check-out's mark.)
+    if (!checkOutMoved && !checkOutRestored) {
+      const datesBefore = keepsEarlyCheckOut && checkInChanged
+        ? { ...booking, check_in: updated.check_in, check_out: updated.check_out }
+        : booking
+      // A status change the save already wrote (above) is not diffed again.
+      const before = statusRecordedInSave ? { ...datesBefore, status: updated.status } : datesBefore
+      recordBookingChange(before, updated, req.user!.userId).catch(err =>
+        logger.error({ err, bookingId: booking.id }, '[booking] change event record failed'))
+    }
 
     // S517: a cancellation frees the dates — promote the next waitlister
     // (best-effort; mints a 1-hour claim link + emails them).
     if (status === 'cancelled' && booking.status !== 'cancelled') {
       promoteNextWaitlister(booking.unit_id).catch(err =>
         logger.error({ err, unit_id: booking.unit_id }, '[booking] waitlist promote on cancel failed'))
-
+    }
+    if (stopAfterCancel.length > 0) {
       // ── S639 (Nic): A CANCELLED RESERVATION TAKES ITS LEASE WITH IT ──────
       //
       // "When I click to delete it from the calendar, I clicked cancel. But it
@@ -2223,40 +3856,102 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       // page, it's still showing me pending for a thing that's not actually
       // there."
       //
-      // A stay of 30 nights or more drafts a lease alongside the booking.
-      // Canceling the booking left that lease behind as a live 'pending' row —
-      // it appeared in lease counts and on the leases page as a tenancy nobody
-      // could explain, for a reservation that no longer exists.
-      //
-      // Only a lease that has not been executed: 'pending' and 'draft' are still
-      // paperwork and follow the booking. An ACTIVE lease is a signed agreement
-      // and is never touched here — if somebody has signed, canceling the
-      // calendar entry is not the instrument that ends their tenancy.
-      try {
-        const killed = await query<{ id: string }>(
-          `UPDATE leases
-              SET status = 'terminated', updated_at = NOW()
-            WHERE source_booking_id = $1
-              AND status IN ('pending', 'draft')
-            RETURNING id`,
-          [booking.id])
-        if (killed.length) {
-          logger.info({ bookingId: booking.id, leaseIds: killed.map(k => k.id) },
-            '[booking] cancelled reservation also cancelled its unsigned draft lease(s)')
-        }
-      } catch (err) {
-        logger.error({ err, bookingId: booking.id }, '[booking] draft-lease cancel on booking cancel failed')
+      // Step 9 final fix (fix pass 1): the lease drafted with the stay ended
+      // inside the save above, through the never-moved-in close (its unpaid
+      // move-in bill zeroed). Here only the bank pulls that close stopped are
+      // canceled with the processor, after the commit (a No-show's close too —
+      // fix pass 3).
+      const { cancelSupersededIntents } = await import('../services/creditUse')
+      await cancelSupersededIntents(stopAfterCancel)
+    }
+
+    // S655 (Step 6 fix round 3): an early check-out moves the date, never the
+    // lease (§6.19). Whoever checked the guest out is told so in plain words,
+    // with the one way to end the lease on the day they left — the landlord's
+    // deliberate date edit (S548). Today the check-out is made through the
+    // landlord agent, and the agent's dispatch (services/agents/portalDispatch)
+    // hands it ONLY the response's `data` — so the sentence travels inside
+    // `data` (below) as well as beside it. Beside it alone, the agent never
+    // saw it, and nobody was told the lease (and its autopay) still runs.
+    //
+    // Fix round 5: the steps named are the ones that work NOW
+    // (endLeaseOnDayLeftSteps): if the nights the check-out freed are held
+    // again, the steps start with freeing them. And a later save that sends
+    // the early check-out's day back as the check-out (the Edit form, or the
+    // agent typing the day they left) is told the same thing: that day is
+    // already the stored check-out, so the save leaves the lease running. It
+    // used to answer with a bare success, and staff who had been told the
+    // lease could be ended believed they had ended it.
+    let leaseNote: string | null = null
+    const dayLeftSavedAgain = keepsEarlyCheckOut && checkOutDay === booking.check_out_day
+    if (checkOutMoved || dayLeftSavedAgain) {
+      const lease = await queryOne<{ end_day: string | null }>(
+        `SELECT to_char(end_date, 'YYYY-MM-DD') AS end_day
+           FROM leases
+          WHERE source_booking_id = $1 AND status IN ('active', 'pending')
+            AND (end_date IS NULL OR end_date > $2::date)
+          ORDER BY created_at DESC LIMIT 1`, [booking.id, newCheckOut])
+      if (lease) {
+        const whose = guest === 'This guest' ? 'The' : `${guest}'s`
+        const steps = await endLeaseOnDayLeftSteps({
+          bookingId: booking.id, unitId: updated.unit_id, leftDay: newCheckOut,
+          booked: checkOutMoved ? (bookedForEvent ?? booking.check_out_day) : early!.booked,
+        })
+        leaseNote = `${whose} lease still runs${lease.end_day ? ` to ${longDay(lease.end_day)}` : ''}, `
+          + 'and its rent stays as it is — '
+          + (checkOutMoved
+            ? 'a check-out does not end a lease. '
+            : `the check-out already reads ${longDay(newCheckOut)} from the early check-out, `
+              + 'and saving that day again does not end a lease. ')
+          + steps
       }
+    }
+
+    // Fix round 4: what the save did to the dates, and what that means for the
+    // lease, ride inside `data` too — the landlord agent reads only `data`
+    // (services/agents/portalDispatch), and today the agent is the one way a
+    // stay is checked out. Only the ones that are set, so a plain edit's row
+    // reads exactly as before.
+    const notices = {
+      ...(extendedGuestMovedTo ? { extendedGuestMovedTo } : {}),
+      ...(checkOutMoved ? { checkOutMoved } : {}),
+      ...(checkOutRestored ? { checkOutRestored } : {}),
+      ...(leaseNote ? { leaseNote } : {}),
+      ...(moneyDecisionNeeded ? { moneyDecisionNeeded } : {}),
+      ...(leaseClosedOnCancel ? { leaseClosed: leaseClosedWords(guest, leaseClosedOnCancel) } : {}),
     }
     res.json({
       success: true,
-      data: updated,
+      data: { ...updated, ...notices },
       // W-20: non-null when the extension moved the EXTENDING guest to a
       // new site — the UI tells staff so they can coordinate the physical
       // move with the guest.
       extendedGuestMovedTo,
+      // S655: non-null when an early check-out (or a correction of the day a
+      // checked-out guest left) moved the check-out day — the check-out it
+      // replaced and the new one — so staff can be told.
+      checkOutMoved,
+      // S655 (Step 6 fix round): non-null when moving a checked-out stay back
+      // (checked in, confirmed) put the booked check-out day back — or when a
+      // correction said the guest stayed to the day they had booked.
+      checkOutRestored,
+      // S655 (fix round 3): non-null when the stay has a lease that still runs
+      // past the new check-out — what that means, and how to end it instead.
+      leaseNote,
+      // 10/4 (decisions #38): non-null when an early check-out left a money
+      // question waiting on the stay — what it is, and where to decide it.
+      moneyDecisionNeeded,
     })
-  } catch (e) { next(e) }
+  } catch (e) {
+    // S655 (Step 6 fix round 6): refused after an extension had already moved
+    // the next reservation off the site — put it back before answering.
+    if (relocated.length) {
+      const moved = relocated
+      relocated = []
+      await putRelocatedBack(moved)
+    }
+    next(e)
+  }
 })
 
 // PATCH /api/units/:id/bookings/:bookingId/acknowledge — S179 / B3.
@@ -2294,10 +3989,12 @@ unitsRouter.patch('/:id/bookings/:bookingId/acknowledge', requirePerm('bookings.
 // the legacy pre-catalog keys so existing scope rows keep working.
 // Property-scoped: a property-locked worker only sees units/bookings/leases
 // at their assigned properties.
+// 10/4: "Check guests out" opens the schedule too — the Check out button lives
+// on it (decisions #38: that permission alone is enough to check a guest out).
 unitsRouter.get('/schedule/master', requirePerm(
   'schedule.tab.timeline', 'schedule.tab.list', 'schedule.tab.units', 'schedule.tab.history',
   'bookings.view',
-  'guests.check_in', 'units.view_status', 'units.edit',
+  'guests.check_in', 'guests.check_out', 'units.view_status', 'units.edit',
 ), async (req, res, next) => {
   try {
     const { from, to, unitType } = req.query
@@ -2359,9 +4056,19 @@ unitsRouter.get('/schedule/master', requirePerm(
     // requires_booking_acknowledgment flag so the schedule tile can
     // render an ack-needed badge (companion to S191's BookingsPage
     // surface).
+    // 10/4 (decisions #38 Q5): money_decision_pending — an early check-out's
+    // money question still waiting on the stay (the schedule shows "Decide the
+    // money"); refund_needs_retry — a decided one whose card or bank refund did
+    // not go out (the schedule shows Try again). A long stay whose lease did
+    // not end on the day they left is ended now (#38 Q8, healLeaseEnds).
+    await healLeaseEnds(callerLandlordIds, req.user!.userId)
+      .catch((err) => logger.error({ err }, '[schedule] lease end retry failed'))
     const bookings = await query<any>(`
       SELECT b.*, u.unit_number, u.unit_type, p.name as property_name,
-             p.requires_booking_acknowledgment
+             p.requires_booking_acknowledgment,
+             EXISTS (SELECT 1 FROM stay_checkout_decisions d
+                      WHERE d.booking_id = b.id AND d.status = 'pending') AS money_decision_pending,
+             ${refundNeedsRetrySql('b')} AS refund_needs_retry
       FROM unit_bookings b
       JOIN units u ON u.id = b.unit_id
       JOIN properties p ON p.id = u.property_id
@@ -2457,7 +4164,7 @@ unitsRouter.get('/schedule/master', requirePerm(
 // every reservation create / move / date-change / cancel, newest first.
 unitsRouter.get('/schedule/history', requirePerm(
   'schedule.tab.history',
-  'guests.check_in', 'units.view_status', 'units.edit',
+  'guests.check_in', 'guests.check_out', 'units.view_status', 'units.edit',
 ), async (req, res, next) => {
   try {
     // S633: the account's companies, not one.

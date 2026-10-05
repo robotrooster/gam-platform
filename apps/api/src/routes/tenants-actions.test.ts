@@ -8,6 +8,7 @@
  *   - GET  /flexsuite/re-acceptance-preview — service pass-through
  *
  * Slice 1 (S374): /me + landlord-banking + verify-ach + deposit-interest.
+ *   (S655: the mock POST /verify-ach was removed — banks verify through Stripe only.)
  * Slice 2 (S375): all Flex (FlexCharge/FlexPay/FlexDeposit/FlexSuite re-
  *   accept + DELETE flex*) + portability eligibility/authorize.
  *

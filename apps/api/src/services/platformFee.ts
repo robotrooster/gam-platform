@@ -1,5 +1,6 @@
 import { query, queryOne } from '../db'
 import { NIGHTS_AGGREGATION_UNIT_TYPES } from '@gam/shared'
+import { soldCheckOutSql } from './registerStay'
 
 // SQL literal list of the nights/30-aggregation unit types ('rv_spot').
 // Short-stays on every OTHER type bill str_fee_pct of revenue instead.
@@ -13,6 +14,47 @@ const AGG_TYPES_SQL = NIGHTS_AGGREGATION_UNIT_TYPES.map(t => `'${t}'`).join(',')
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100
+}
+
+/**
+ * 10/3 (decisions #33) — A SHORT STAY'S REVENUE IN ONE MONTH, as SQL.
+ *
+ * Short stays on every type but the nights-aggregation ones bill str_fee_pct of
+ * revenue, attributed to each month by nights. The stay is split by the length
+ * it was SOLD for (services/registerStay soldCheckOutSql), never by an early
+ * check-out: each month gets the nights the guest was on the site in it, and
+ * the nights sold but not stayed (left early) count in the month the guest
+ * left (the month of their last night). Dividing by the shortened stay counted
+ * it less than once.
+ *
+ * The months add up to the stay's whole total ONLY when the check-out is
+ * recorded in the same month the guest left (or before any month of the stay
+ * is billed). Each month is billed once, from the check-out as it reads on
+ * billing day, and is never re-billed. So a check-out recorded after its month
+ * was billed, or an early check-out undone after a month was billed, counts the
+ * stay more or less than once: e.g. a stay Oct 25 to Nov 10, checked out Oct 28,
+ * October billed Nov 1, the check-out undone Nov 3, November billed Dec 1 —
+ * October already took the unstayed nights, and November takes them again.
+ * Fixing that needs a per-stay true-up (bill each month as the stay's share to
+ * date, less what earlier months already billed for that stay); that is a
+ * product choice for Nic, not made here.
+ *
+ * `b` is the unit_bookings alias; `monthStart` a SQL date expression for the
+ * first of the month. The caller keeps its row filter (check_in before the
+ * month ends, check_out after it starts) — every row this can give a share to
+ * passes it.
+ */
+export function stayRevenueInMonthSql(b: string, monthStart: string): string {
+  const sold = soldCheckOutSql(b)
+  // The day they left (never past the length sold).
+  const stayed = `LEAST(${b}.check_out, ${sold})`
+  const start = `(${monthStart})::date`
+  const end = `((${monthStart}) + INTERVAL '1 month')::date`
+  return `(COALESCE(${b}.total_amount, 0)
+      * (GREATEST(LEAST(${stayed}, ${end}) - GREATEST(${b}.check_in, ${start}), 0)
+         + CASE WHEN ${stayed} > ${start} AND ${stayed} <= ${end}
+                THEN GREATEST(${sold} - ${stayed}, 0) ELSE 0 END)::numeric
+      / GREATEST(${sold} - ${b}.check_in, 1)::numeric)`
 }
 
 // First-of-month ISO strings ('YYYY-MM-01') covered by a period. Months that
@@ -175,11 +217,8 @@ export async function platformFeesByProperty(
           AND b.status NOT IN ('cancelled','no_show')
           AND b.check_in  < m.month + INTERVAL '1 month'
           AND b.check_out > m.month), 0)::int AS nights,
-      COALESCE((SELECT SUM(COALESCE(b.total_amount, 0)
-            * GREATEST(
-                LEAST(b.check_out, m.month + INTERVAL '1 month')::date
-                  - GREATEST(b.check_in, m.month)::date, 0)::numeric
-            / GREATEST((b.check_out - b.check_in), 1)::numeric)
+      -- 10/3 (decisions #33): split by the length sold (stayRevenueInMonthSql).
+      COALESCE((SELECT SUM(${stayRevenueInMonthSql('b', 'm.month')})
          FROM unit_bookings b JOIN units u ON u.id = b.unit_id
         WHERE u.property_id = p.id
           AND u.unit_type NOT IN (${AGG_TYPES_SQL})

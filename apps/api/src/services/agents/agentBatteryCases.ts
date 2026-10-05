@@ -451,6 +451,9 @@ export const LANDLORD_INTENTS: Intent[] = [
     // Verified 2026-08-24: 2026 income $11,702, expenses $240 (the GAM fee),
     // net $11,462 — from computeLandlordPL, the SAME definition the reports
     // page and Books use, so the agent and the portal cannot disagree.
+    // S655: computeLandlordPL now reads services/incomeBasis ("Money received"
+    // by default: paid-ahead money counts the day it arrives, a credit the
+    // landlord gives is never income), still the same figures as the page.
     audience: 'landlord', id: 'profit-and-loss', needsTool: true,
     expectTool: 'get_profit_and_loss',
     mustNotContain: ["I've escalated"],
@@ -459,6 +462,22 @@ export const LANDLORD_INTENTS: Intent[] = [
       'what did I make this year',
       'what were my expenses',
       'am I profitable',
+    ],
+  },
+  {
+    // S655 (Nic, 10/2): "a landlord should be able to see how much money came
+    // in this month, ACTUALLY came in, versus how much money actually was
+    // SCHEDULED to come in... people need to be able to see it both ways."
+    // get_profit_and_loss takes basis 'received' (the day money arrived; the
+    // default) or 'billed' (bills by the month they were due), the same switch
+    // as the reports page. Whichever it picks, the answer names it.
+    audience: 'landlord', id: 'profit-and-loss-both-ways', needsTool: true,
+    expectTool: 'get_profit_and_loss',
+    mustNotContain: ["I've escalated"],
+    phrasings: [
+      'how much money actually came in this month',
+      'how much did I bill this month, paid or not',
+      'what was scheduled to come in last month',
     ],
   },
   {

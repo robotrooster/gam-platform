@@ -853,7 +853,9 @@ tenantsRouter.get('/me/payment-health', async (req, res, next) => {
         COUNT(*) FILTER (WHERE status = 'failed')  AS failed,
         COALESCE(SUM(amount) FILTER (WHERE status = 'settled'), 0) AS total_paid,
         MIN(due_date) AS first_payment
-      FROM payments WHERE tenant_id = $1`, [req.user!.profileId!])
+      FROM payments WHERE tenant_id = $1
+        -- A voided charge (decisions #48.5) was owed by nobody: it is not a payment.
+        AND status <> 'voided'`, [req.user!.profileId!])
     const total = parseInt(s?.total_payments || 0)
     const settled = parseInt(s?.settled || 0)
     const firstPayment = s?.first_payment ? new Date(s.first_payment) : null
@@ -879,6 +881,8 @@ tenantsRouter.get('/me/payment-health', async (req, res, next) => {
           LEFT JOIN leases l ON l.id = p.lease_id
          WHERE p.tenant_id = $1
            AND p.type IN ('rent','utility','fee','home_payment')
+           -- A voided charge was owed by nobody: never an on-time or late mark.
+           AND p.status <> 'voided'
            AND p.due_date >= (date_trunc('month', CURRENT_DATE) - interval '5 months')::date
       )
       SELECT to_char(m, 'Mon') AS month, to_char(m, 'YYYY-MM') AS ym,
@@ -1130,50 +1134,13 @@ tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// ── POST /api/tenants/verify-ach ──────────────────────────────────────────
-// Simulates ACH verification (real impl would use Plaid/Stripe).
-// Sets ach_verified=true and reports whether the security deposit is fully funded.
-tenantsRouter.post('/verify-ach', async (req, res, next) => {
-  try {
-    const { bankName, last4 } = req.body
-    if (!last4 || last4.length !== 4) {
-      return res.status(400).json({ success: false, error: 'Valid bank last 4 digits required' })
-    }
-
-    // Check deposit status
-    const row = await queryOne<any>(`
-      SELECT
-        CASE
-          WHEN sd.id IS NULL THEN false
-          WHEN sd.flex_deposit_enabled = true AND sd.installments_remaining > 0 THEN false
-          WHEN sd.collected_amount >= sd.total_amount THEN true
-          ELSE false
-        END AS deposit_fully_funded
-      FROM tenants t
-      LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
-      WHERE t.id = $1`, [req.user!.profileId!])
-
-    const qualifies = row?.deposit_fully_funded === true
-
-    await query(`
-      UPDATE tenants
-         SET ach_verified = TRUE,
-             bank_last4   = $1
-       WHERE id = $2`,
-      [last4, req.user!.profileId!])
-
-    res.json({
-      success: true,
-      data: {
-        ach_verified: true,
-        deposit_fully_funded: qualifies,
-        message: qualifies
-          ? 'Bank verified!'
-          : 'Bank verified. Your security deposit is not yet fully funded.'
-      }
-    })
-  } catch (e) { next(e) }
-})
+// ── POST /api/tenants/verify-ach — REMOVED (S655, money plan Step 5) ──────
+// It was a mock left from before Stripe: any tenant could type four digits and
+// mark themselves bank-verified with no bank behind it, which is the gate for
+// FlexPay and FlexDeposit. A bank is verified only by Stripe's microdeposits
+// (routes/stripe.ts confirm-setup and microdeposits/verify; the
+// setup_intent.succeeded webhook), and recorded by
+// services/tenantBankMethods.recordVerifiedTenantBank.
 
 
 
@@ -2582,15 +2549,28 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
         AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
       ORDER BY is_current DESC, start_date DESC`, [req.params.id, scope, propScope])
 
+    // FlexPay never surfaces to the landlord (CLAUDE.md S541): GAM's FlexPay
+    // pull rows are left out of the list and the stats for every viewer, and
+    // the unscoped branch (GAM admin, the resident) names its columns so
+    // flexpay_advance_id is never sent.
     const payments = !seesPayments ? [] : await query<any>(`
       SELECT ${scoped
         ? `p.id, p.type, p.amount, p.status, p.due_date, p.settled_at, p.processed_at,
            p.manual_method, p.work_trade_suspended_at`
-        : 'p.*'}, u.unit_number, pr.name as property_name
+        : `p.id, p.unit_id, p.lease_id, p.tenant_id, p.landlord_id, p.type, p.amount, p.status,
+           p.stripe_payment_intent_id, p.stripe_charge_id, p.ach_trace_number, p.entry_description,
+           p.return_code, p.return_reason, p.zero_tolerance_flag, p.due_date, p.processed_at,
+           p.settled_at, p.retry_count, p.notes, p.created_at, p.lease_fee_id, p.invoice_id,
+           p.next_retry_at, p.last_retry_at, p.platform_held, p.sublease_credit_applied,
+           p.gam_supersedence_amount, p.gam_supersedence_breakdown, p.gam_supersedence_applied_at,
+           p.import_source, p.imported_at, p.import_extra_data, p.is_remainder, p.reversal_id,
+           p.manual_method, p.sublease_markup_amount, p.home_sale_installment_id, p.revenue_owner,
+           p.work_trade_suspended_at, p.payment_channel, p.issued_credit_amount`}, u.unit_number, pr.name as property_name
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
       WHERE p.tenant_id = $1
+        AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
         AND ($2::uuid[] IS NULL OR p.landlord_id = ANY($2::uuid[]))
         AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
       ORDER BY p.due_date DESC
@@ -2629,6 +2609,11 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
         MAX(due_date) as last_payment
       FROM payments
       WHERE tenant_id = $1
+        AND entry_description IS DISTINCT FROM 'FLEXPAY'
+        -- A voided charge (decisions #48.5) was owed by nobody and paid by
+        -- nothing: it stays in the list above as a record, but it is never a
+        -- payment in these counts (it would drag the on-time rate down).
+        AND status <> 'voided'
         AND ($2::uuid[] IS NULL OR landlord_id = ANY($2::uuid[]))
         AND ($3::uuid[] IS NULL OR unit_id IN (SELECT id FROM units WHERE property_id = ANY($3::uuid[])))`,
       [req.params.id, scope, propScope])
@@ -2672,14 +2657,46 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
     // (take_payment), which needs it so the same check is not posted twice.
     // Everyone else gets null, never a number.
     const seesPaidAhead = seesPayments || userHasPerm(req.user, 'take_payment')
-    const paidAhead = !seesPaidAhead ? null : Number((await queryOne<{ n: string }>(
-      `SELECT COALESCE(SUM(c.amount_remaining), 0)::text AS n
-         FROM lease_prepaid_credits c
-         JOIN leases l ON l.id = c.lease_id
-        WHERE c.tenant_id = $1 AND c.amount_remaining > 0
-          AND ($2::uuid[] IS NULL OR l.landlord_id = ANY($2::uuid[]))
-          AND ($3::uuid[] IS NULL OR l.unit_id IN (SELECT id FROM units WHERE property_id = ANY($3::uuid[])))`,
-      [req.params.id, scope, propScope]))?.n ?? 0)
+
+    // S655 (Nic, 10/2): ALL the credit on their account, and what of it would
+    // pay their bills right now. They differ: paid-ahead money stops at a
+    // monthly draw cap, credit pays only the landlord's own rent, utilities and
+    // fees (never a GAM fee, a home payment or a neighbor's utility), and
+    // credit tied to one lease pays only that lease. Usable is the household
+    // plan the tenant's Pay Now and the desk offer ("credit available $X"); the
+    // balance itself is never netted. Same money rule as seesPaidAhead above: only
+    // a viewer who may see payments, or the desk that takes them. A
+    // property-locked viewer sees only the credit of the leases at their
+    // properties (a general credit is the person's with this company, shown).
+    let credit: null | {
+      total: number; usable: number; paidAhead: number; fromLandlord: number; depositInterest: number
+    } = null
+    // "Paid ahead: $X — covers their next invoice" (the post-payment card).
+    // S655: the same household money the credit figures read (creditBeside —
+    // one rule): a withdrawn credit is not in it, and neither is paid-ahead
+    // money a dispute or bank return of its own funding still claims (it is
+    // not the tenant's; creditUse.householdQuote withholds it). Money a
+    // scheduled retry is holding is already set against a bill, so it is not
+    // "paid ahead" here (credit.paidAhead, everything on file, includes it).
+    let paidAhead: number | null = null
+    if (seesPaidAhead) {
+      const companies = scope ?? (await query<{ landlord_id: string }>(
+        `SELECT DISTINCT l.landlord_id FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id WHERE lt.tenant_id = $1
+         UNION SELECT DISTINCT tc.landlord_id FROM tenant_credits tc WHERE tc.tenant_id = $1
+         UNION SELECT DISTINCT l.landlord_id FROM lease_prepaid_credits c JOIN leases l ON l.id = c.lease_id WHERE c.tenant_id = $1`,
+        [req.params.id])).map(r => r.landlord_id)
+      const leaseScope = propScope === null ? null : (await query<{ id: string }>(
+        `SELECT l.id FROM leases l JOIN units u ON u.id = l.unit_id
+          WHERE l.landlord_id = ANY($1::uuid[]) AND u.property_id = ANY($2::uuid[])`,
+        [companies, propScope])).map(r => r.id)
+      const { creditBeside } = await import('../services/openBalances')
+      const c = await creditBeside({ tenantId: req.params.id, landlordIds: companies, leaseIds: leaseScope })
+      credit = {
+        total: c.onFile, usable: c.usable,
+        paidAhead: c.paidAhead, fromLandlord: c.fromLandlord, depositInterest: c.depositInterest,
+      }
+      paidAhead = c.paidAheadRemaining
+    }
 
     // Lifetime metrics
     const firstPayment = paymentStats?.first_payment ? new Date(paymentStats.first_payment) : null
@@ -2699,6 +2716,7 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
         maintenance,
         workTrade,
         paidAhead,
+        credit,
         // True when this viewer may not see payment history (S641). The page
         // hides the payment cards rather than drawing zeros.
         paymentsHidden: !seesPayments,
@@ -2860,22 +2878,100 @@ tenantsRouter.post('/avatar', requireAuth, avatarUpload.single('file'), async (r
 // /avatar-files/:filename is declared at the top of this file,
 // BEFORE tenantsRouter.use(requireAuth). See pre-auth header.
 
+// S654: a password change ends every OTHER session (every pass minted before
+// it). It used to end the tenant's own too: the stamp was NOW() and the reply
+// carried no new pass, so the very next /auth/me or /auth/refresh refused the
+// pass they had just used and threw them out of the portal for changing their
+// own password. Now:
+//   - the stamp is a WHOLE second, taken from the clock that stamps passes
+//     (a pass's iat is whole seconds; /auth/me and /refresh compare exactly),
+//     and the fresh pass is minted after it, so it can never read as "before";
+//   - the reply carries that fresh pass, and the Profile page stores it;
+//   - the pass asking must itself postdate the last change (the /refresh rule):
+//     this mints a pass, and a pass a previous change ended must not trade the
+//     password for a new one without the emailed code;
+//   - a wrong current password is 400, not 401, so no portal reads a typo as
+//     "your session ended" and signs the person out;
+//   - a pass minted earlier in the SAME whole second as the change is not
+//     ended by it. The window is under a second, and closing it would also end
+//     a real new sign-in made in the rest of that second.
+//
+// S655 (final sweep): the fresh pass goes to a TENANT only, built from the
+// database. This route is open to every signed-in role, and the pass used to be
+// copied from the asking pass's own claims. A team member whose access the
+// landlord had pulled (scope row deleted, so /auth/refresh answers 403
+// "deactivated") could trade their own password for a fresh seven days still
+// carrying the pulled permissions, and repeat it every week. Now:
+//   - only a tenant (the pass AND the account) gets a pass back — the tenant
+//     Profile page is the only caller. Its claims are the ones /auth/refresh
+//     builds for a tenant, read from the database, never copied forward;
+//   - every other role still changes the password and gets no pass, as before:
+//     the change ends their current pass, and signing in again runs the scope
+//     check;
+//   - a locked account (users.locked_until still ahead) is refused with 401
+//     before anything changes, as /auth/refresh refuses it. The pass still
+//     works, so the sentence says how many minutes are left and never "sign in
+//     again"; the Profile page shows it and keeps the pass;
+//   - the new password follows the one minimum every password door uses
+//     (PASSWORD_MIN_LEN, S631).
 tenantsRouter.patch('/password', requireAuth, async (req, res, next) => {
   try {
-    const { currentPassword, newPassword } = req.body
-    if (!currentPassword || !newPassword) throw new AppError(400, 'Current and new password required')
-    if (typeof newPassword !== 'string' || newPassword.length < 8) {
-      throw new AppError(400, 'New password must be at least 8 characters')
+    const { currentPassword, newPassword } = req.body ?? {}
+    if (!currentPassword || !newPassword || typeof currentPassword !== 'string') {
+      throw new AppError(400, 'Current and new password required')
+    }
+    const { PASSWORD_MIN_LEN } = await import('@gam/shared')
+    if (typeof newPassword !== 'string' || newPassword.length < PASSWORD_MIN_LEN) {
+      throw new AppError(400, `New password must be at least ${PASSWORD_MIN_LEN} characters`)
     }
     const bcrypt = require('bcryptjs')
-    const user = await queryOne<any>('SELECT * FROM users WHERE id=$1', [req.user!.userId])
+    const user = await queryOne<{
+      password_hash: string; sessions_valid_from: Date | null; locked_until: Date | null
+      role: string; email: string; tenant_id: string | null
+    }>(
+      `SELECT u.password_hash, u.sessions_valid_from, u.locked_until, u.role, u.email,
+              (SELECT t.id FROM tenants t WHERE t.user_id = u.id LIMIT 1) AS tenant_id
+         FROM users u WHERE u.id=$1`, [req.user!.userId])
     if (!user) throw new AppError(404, 'User not found')
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      // The pass itself still works, so the sentence never says "sign in
+      // again" — the tenant is still signed in and only this change waits.
+      // It says how long, in whole minutes, so the next step is plain.
+      const minutesLeft = Math.max(1, Math.ceil((new Date(user.locked_until).getTime() - Date.now()) / 60_000))
+      throw new AppError(401,
+        `Your account is temporarily locked after too many sign-in attempts. ` +
+        `Try again in ${minutesLeft} ${minutesLeft === 1 ? 'minute' : 'minutes'}, or reset your password from the sign-in page.`)
+    }
+    const { assertPassPostdatesPasswordChange } = await import('./auth')
+    assertPassPostdatesPasswordChange(req.user, user.sessions_valid_from)
     const valid = await bcrypt.compare(currentPassword, user.password_hash)
-    if (!valid) throw new AppError(401, 'Incorrect current password')
+    if (!valid) throw new AppError(400, 'Your current password is incorrect. Check it and try again.')
     const hash = await bcrypt.hash(newPassword, 10)
-    // S654: a password change ends every other session (passes minted before now).
-    await query('UPDATE users SET password_hash=$1, sessions_valid_from=NOW() WHERE id=$2', [hash, req.user!.userId])
-    res.json({ success: true })
+    const changedAtSecond = Math.floor(Date.now() / 1000)
+    await query(
+      'UPDATE users SET password_hash=$1, sessions_valid_from=to_timestamp($3::double precision) WHERE id=$2',
+      [hash, req.user!.userId, changedAtSecond])
+    if (req.user!.role !== 'tenant' || user.role !== 'tenant') {
+      return res.json({ success: true })
+    }
+    // A tenant's claims as /auth/refresh builds them (sessionClaimsFor): no
+    // scope, no company, nothing carried over from the asking pass. Same
+    // policy: a rolling pass gets a fresh seven days, a fixed one keeps its
+    // original end (lib/sessionToken.ts).
+    const { renewSessionToken } = await import('../lib/sessionToken')
+    const tenantClaims = {
+      userId:      req.user!.userId,
+      role:        user.role,
+      email:       user.email,
+      profileId:   user.tenant_id,
+      landlordId:  null,
+      landlordIds: null,
+      businessId:  null,
+      staffRole:   null,
+      permissions: null,
+    }
+    const token = renewSessionToken(tenantClaims, req.user!)
+    res.json({ success: true, data: { token } })
   } catch (e) { next(e) }
 })
 

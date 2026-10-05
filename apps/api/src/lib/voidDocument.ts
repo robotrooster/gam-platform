@@ -13,11 +13,11 @@
  */
 import { AppError } from '../middleware/errorHandler'
 import { cascadeLeaseTenantsOnVoid } from './leaseDocCascade'
-import { unwindIssuedLease } from './unwindIssuedLease'
+import { lockLeaseHousehold, unwindIssuedLease } from './unwindIssuedLease'
 
 type Q = (sql: string, params?: any[]) => Promise<{ rows: any[] }>
 
-export async function voidDocument(q: Q, doc: any, reason: string | null) {
+async function refuseUnvoidable(q: Q, doc: any): Promise<void> {
   if (doc.status === 'completed') throw new AppError(400, 'Cannot void a completed document')
   if (doc.status === 'voided') throw new AppError(400, 'Document is already voided')
 
@@ -25,6 +25,26 @@ export async function voidDocument(q: Q, doc: any, reason: string | null) {
     "SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND signed_at IS NOT NULL AND role NOT IN ('landlord','witness') LIMIT 1",
     [doc.id]).then(r => r.rows[0])
   if (tenantSigned) throw new AppError(409, 'Cannot void after a tenant has signed — create a superseding document instead')
+}
+
+export async function voidDocument(q: Q, doc: any, reason: string | null) {
+  await refuseUnvoidable(q, doc)
+
+  // 0. Lock order (S655): household, then the document, then its rows — the
+  //    order the scheduler's cancel and hold of a new lease take. The cascade
+  //    below writes lease_tenants rows before the unwind locks the household,
+  //    so without this a manual void racing the scheduler on the same document
+  //    took the locks in the opposite order and Postgres aborted one as a
+  //    deadlock. The advisory lock is re-entrant: the unwind's own call is
+  //    free. The document is then read again under its row lock — a tenant
+  //    who signed a moment ago, or a void that already happened, is refused
+  //    on the live row, not the copy the caller read.
+  if (doc.lease_id) await lockLeaseHousehold(q, doc.lease_id)
+  const live = (await q(`SELECT * FROM lease_documents WHERE id = $1 FOR UPDATE`, [doc.id])).rows[0]
+  if (live) {
+    await refuseUnvoidable(q, live)
+    doc = { ...doc, ...live }
+  }
 
   // 1. lease_tenants state, by document type.
   await cascadeLeaseTenantsOnVoid(q as any, doc)

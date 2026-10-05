@@ -534,7 +534,7 @@ export function SignPage() {
     </div>
   )
 
-  const { signer, document:doc, fields, readOnly, waitingOn, packageDocs } = data
+  const { signer, document:doc, fields, readOnly, waitingOn, closedReason, packageDocs } = data
   const allFields = fields || []
 
   // S652: the next document in this packet that still needs THIS signer. Blu
@@ -575,7 +575,7 @@ export function SignPage() {
   // fields, no Sign button, no draft persistence.
   if (readOnly) {
     return <ReadOnlyView doc={doc} signer={signer} fields={allFields}
-             waitingOn={waitingOn} onBack={()=>navigate('/')} />
+             waitingOn={waitingOn} closedReason={closedReason} onBack={()=>navigate('/')} />
   }
 
   const activeFields = allFields.filter(isFieldActive)
@@ -1054,13 +1054,18 @@ export function SignPage() {
 // — surfaced inline below the PDF for context, since not every viewer
 // has a PDF reader plugin available in-browser.
 function ReadOnlyView({
-  doc, signer, fields, waitingOn, onBack,
+  doc, signer, fields, waitingOn, closedReason, onBack,
 }: {
   doc: any
   signer: any
   fields: any[]
   /** S637: set when the document simply is not this signer's turn yet. */
   waitingOn?: string | null
+  /**
+   * S655: why this document can't be signed at all — a new lease whose lease
+   * before it ended early with nobody signed. The server's words, shown as is.
+   */
+  closedReason?: string | null
   onBack: () => void
 }) {
   const status = doc?.status as string
@@ -1071,6 +1076,9 @@ function ReadOnlyView({
     status === 'execution_failed'  ? { tone:'red',   label:'Execution failed', sub:'A problem occurred during execution. Contact your landlord for details.' } :
     signerStatus === 'signed'      ? { tone:'green', label:'You signed',     sub:'Awaiting other parties to complete.' } :
     signerStatus === 'declined'    ? { tone:'red',   label:'You declined',   sub: signer?.declineReason ? `Reason: ${signer.declineReason}` : 'No reason was provided.' } :
+    // S655: a new lease that is being canceled — its lease before it ended
+    // early and nobody signed. No turn is coming, so this wins over waitingOn.
+    closedReason                   ? { tone:'red',   label:'Can\u2019t be signed', sub: closedReason } :
     // S637 (Nic): say plainly that it is not their turn. People were filling
     // the whole document in before the landlord had signed, being refused at
     // the end, and then telling him they had signed it.

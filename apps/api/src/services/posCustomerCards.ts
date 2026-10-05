@@ -27,18 +27,61 @@ export interface CardIdentity {
   generatedCard: string | null
 }
 
-/** What the tap told us about the card — from a PaymentIntent retrieved with latest_charge expanded. */
+/**
+ * What the card told us — from a PaymentIntent retrieved with latest_charge
+ * expanded. A tap at the reader (card_present) or, 10/2, a card typed online on
+ * a pay link or charged on file (card): the same card has the same fingerprint
+ * either way, so an online payment lands on the same person a tap would. An
+ * online card carries no printed name; the name the payer typed on the card
+ * page stands in for it. Only a tap yields a reusable card to keep.
+ */
 export function cardIdentityFromIntent(pi: Stripe.PaymentIntent | null | undefined): CardIdentity | null {
   const ch: any = pi && typeof (pi as any).latest_charge === 'object' ? (pi as any).latest_charge : null
-  const cp = ch?.payment_method_details?.card_present ?? ch?.payment_method_details?.interac_present
-  if (!cp?.fingerprint) return null
-  return {
-    fingerprint:    String(cp.fingerprint),
-    brand:          cp.brand ?? null,
-    last4:          cp.last4 ?? null,
-    cardholderName: cp.cardholder_name ? String(cp.cardholder_name).trim() : null,
-    generatedCard:  cp.generated_card ?? null,
+  const pmd = ch?.payment_method_details
+  const cp = pmd?.card_present ?? pmd?.interac_present
+  if (cp?.fingerprint) {
+    return {
+      fingerprint:    String(cp.fingerprint),
+      brand:          cp.brand ?? null,
+      last4:          cp.last4 ?? null,
+      cardholderName: cp.cardholder_name ? String(cp.cardholder_name).trim() : null,
+      generatedCard:  cp.generated_card ?? null,
+    }
   }
+  const online = pmd?.card
+  if (online?.fingerprint) {
+    const typed = typeof ch?.billing_details?.name === 'string' ? ch.billing_details.name.trim() : ''
+    return {
+      fingerprint:    String(online.fingerprint),
+      brand:          online.brand ?? null,
+      last4:          online.last4 ?? null,
+      cardholderName: typed || null,
+      generatedCard:  null,
+    }
+  }
+  return null
+}
+
+/**
+ * 10/2: the card a recorded sale was paid with, read back from Stripe by the
+ * sale's PaymentIntent. Register sales and pay links are charged on GAM's own
+ * account, so a plain retrieve finds them. Null when the payment carried no
+ * card we can recognize.
+ */
+export async function readSaleCard(paymentIntentId: string): Promise<CardIdentity | null> {
+  const pi = await getStripe().paymentIntents.retrieve(paymentIntentId, { expand: ['latest_charge'] })
+  return cardIdentityFromIntent(pi)
+}
+
+/** "Visa ••9767" — how a card is named to the clerk. */
+export function cardLabel(card: { brand?: string | null; last4?: string | null } | null | undefined): string | null {
+  if (!card?.last4) return null
+  const names: Record<string, string> = {
+    visa: 'Visa', mastercard: 'Mastercard', amex: 'American Express', american_express: 'American Express',
+    discover: 'Discover', diners: 'Diners Club', jcb: 'JCB', unionpay: 'UnionPay', interac: 'Interac',
+  }
+  const b = String(card.brand ?? '').toLowerCase()
+  return `${names[b] ?? 'Card'} ••${card.last4}`
 }
 
 /** "JANE DOE" → Jane Doe; "DOE/JANE" (some issuers) → Jane Doe; blank → Card Customer. */
@@ -59,12 +102,15 @@ export interface CardCustomer { customerId: string; isNew: boolean; cardSaved: b
 
 /** The customer this card belongs to — made on the spot the first time it is seen at this company. */
 export async function findOrCreateCustomerForCard(client: PoolClient, opts: { landlordId: string; card: CardIdentity }): Promise<CardCustomer> {
+  // A card row belongs to one company once (UNIQUE landlord_id, fingerprint), so
+  // it is read whatever state its customer is in: a row left on a closed record
+  // is moved to the new one below, never inserted twice.
   const existing = await client.query<any>(
-    `SELECT c.pos_customer_id, c.stripe_payment_method_id, p.first_name, p.last_name
+    `SELECT c.pos_customer_id, c.stripe_payment_method_id, p.first_name, p.last_name, p.archived_at
        FROM pos_customer_cards c JOIN pos_customers p ON p.id = c.pos_customer_id
-      WHERE c.landlord_id = $1 AND c.fingerprint = $2 AND p.archived_at IS NULL`,
+      WHERE c.landlord_id = $1 AND c.fingerprint = $2`,
     [opts.landlordId, opts.card.fingerprint])
-  if (existing.rows[0]) {
+  if (existing.rows[0] && !existing.rows[0].archived_at) {
     await client.query(
       `UPDATE pos_customer_cards SET last_seen_at = NOW(), last4 = COALESCE($3, last4), brand = COALESCE($4, brand)
         WHERE landlord_id = $1 AND fingerprint = $2`,
@@ -77,6 +123,13 @@ export async function findOrCreateCustomerForCard(client: PoolClient, opts: { la
     `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, created_from)
      VALUES ($1, $2, $3, NULL, 'card_reader') RETURNING id`, [opts.landlordId, first, last])
   const customerId = created.rows[0].id
+  if (existing.rows[0]) {
+    await client.query(
+      `UPDATE pos_customer_cards SET pos_customer_id = $3, last_seen_at = NOW(), last4 = COALESCE($4, last4), brand = COALESCE($5, brand)
+        WHERE landlord_id = $1 AND fingerprint = $2`,
+      [opts.landlordId, opts.card.fingerprint, customerId, opts.card.last4, opts.card.brand])
+    return { customerId, isNew: true, cardSaved: !!existing.rows[0].stripe_payment_method_id, firstName: first, lastName: last }
+  }
   await client.query(
     `INSERT INTO pos_customer_cards (landlord_id, pos_customer_id, fingerprint, brand, last4, cardholder_name)
      VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -221,27 +274,58 @@ export async function saveCardForCustomer(opts: { landlordId: string; customerId
 }
 
 /**
+ * 10/2: exactly what a fold did, so it can be put back (posPeople undoLink) —
+ * the rows that moved, by id and table; the sales that took the survivor's
+ * tenant id; and both records' own details as they were before.
+ */
+export const MERGE_MOVED_TABLES = ['pos_transactions', 'pos_customer_cards', 'pos_open_tickets', 'pos_pay_links', 'pos_sessions', 'pos_customer_invitations', 'flex_charge_accounts'] as const
+export type MergeMovedTable = typeof MERGE_MOVED_TABLES[number]
+export interface MergeRecord {
+  loserId: string
+  into: string
+  moved: Partial<Record<MergeMovedTable, string[]>>
+  stamped: string[]
+  loserBefore: { email: string | null; phone: string | null; notes: string | null }
+  intoBefore: { email: string | null; phone: string | null; stripe_customer_id: string | null; tenant_id: string | null; elsewhere_ref: string | null }
+}
+
+/**
  * S654 (Nic): fold one customer record into another. Purchases, cards, open
  * tickets, pay links, register sessions, invitations and the charge account
  * move; the survivor keeps its own email/phone and takes the other's when it
  * had none; the folded record is archived, never deleted (its email moves
  * with the survivor when taken, because an address belongs to one live record
- * per company). Throws 409 when both hold something only one can.
+ * per company). Throws 409 when both hold something only one can. Returns what
+ * it did (MergeRecord), so a fold made by a wrong pick can be put back.
  */
-export async function mergePosCustomers(client: PoolClient, opts: { landlordId: string; loserId: string; into: string }): Promise<void> {
-  if (opts.loserId === opts.into) throw new AppError(400, 'Pick a different customer to merge into')
+export async function mergePosCustomers(client: PoolClient, opts: { landlordId: string; loserId: string; into: string }): Promise<MergeRecord> {
+  if (opts.loserId === opts.into) throw new AppError(400, 'That is the same customer — pick a different one to merge into.')
   const both = await client.query<any>(
-    `SELECT id, email, phone, stripe_customer_id FROM pos_customers
+    `SELECT id, email, phone, notes, stripe_customer_id, tenant_id, elsewhere_ref FROM pos_customers
       WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND archived_at IS NULL FOR UPDATE`,
     [[opts.loserId, opts.into], opts.landlordId])
-  if (both.rows.length !== 2) throw new AppError(404, 'Both customers must be yours and current')
+  if (both.rows.length !== 2) throw new AppError(404, 'One of those customers was already merged or closed — open the Customers tab again and pick from the fresh list.')
   const loser = both.rows.find((r: any) => r.id === opts.loserId)
   const survivor = both.rows.find((r: any) => r.id === opts.into)
+  // 10/2: a record that is a resident's carries them. Two different residents
+  // are two people, whatever their records say, and are never folded together.
+  if (loser.tenant_id && survivor.tenant_id && loser.tenant_id !== survivor.tenant_id) {
+    throw new AppError(409, 'Those are two different residents, so their records stay apart — press Cancel. If a sale is on the wrong one, open it in History and pick the right person.')
+  }
+  const tenantId: string | null = survivor.tenant_id ?? loser.tenant_id ?? null
   const takeEmail = !survivor.email && !!loser.email
   const takePhone = !survivor.phone && !!loser.phone
+  const record: MergeRecord = {
+    loserId: opts.loserId, into: opts.into, moved: {}, stamped: [],
+    loserBefore: { email: loser.email ?? null, phone: loser.phone ?? null, notes: loser.notes ?? null },
+    intoBefore: { email: survivor.email ?? null, phone: survivor.phone ?? null, stripe_customer_id: survivor.stripe_customer_id ?? null,
+                  tenant_id: survivor.tenant_id ?? null, elsewhere_ref: survivor.elsewhere_ref ?? null },
+  }
   try {
-    for (const table of ['pos_transactions', 'pos_customer_cards', 'pos_open_tickets', 'pos_pay_links', 'pos_sessions', 'pos_customer_invitations', 'flex_charge_accounts']) {
-      await client.query(`UPDATE ${table} SET pos_customer_id = $1 WHERE pos_customer_id = $2`, [opts.into, opts.loserId])
+    for (const table of MERGE_MOVED_TABLES) {
+      const moved = await client.query<{ id: string }>(
+        `UPDATE ${table} SET pos_customer_id = $1 WHERE pos_customer_id = $2 RETURNING id`, [opts.into, opts.loserId])
+      if (moved.rows.length) record.moved[table] = moved.rows.map((r) => r.id)
     }
     // The folded record lets go of what the survivor takes, then is archived.
     await client.query(
@@ -250,12 +334,25 @@ export async function mergePosCustomers(client: PoolClient, opts: { landlordId: 
               phone = CASE WHEN $4::boolean THEN NULL ELSE phone END,
               notes = TRIM(COALESCE(notes, '') || ' Merged into customer ' || $2 || COALESCE(' (email ' || email || ')', ''))
         WHERE id = $1`, [opts.loserId, opts.into, takeEmail, takePhone])
+    // The folded record is archived above first, so the survivor can take its
+    // resident link without two live records naming the same resident — and,
+    // 10/2, where it was picked from elsewhere, so picking that person again
+    // still finds this one record.
     await client.query(
       `UPDATE pos_customers SET email = COALESCE(email, $2), phone = COALESCE(phone, $3),
-              stripe_customer_id = COALESCE(stripe_customer_id, $4), updated_at = NOW()
-        WHERE id = $1`, [opts.into, takeEmail ? loser.email : null, takePhone ? loser.phone : null, loser.stripe_customer_id])
+              stripe_customer_id = COALESCE(stripe_customer_id, $4), tenant_id = COALESCE(tenant_id, $5),
+              elsewhere_ref = COALESCE(elsewhere_ref, $6), updated_at = NOW()
+        WHERE id = $1`, [opts.into, takeEmail ? loser.email : null, takePhone ? loser.phone : null, loser.stripe_customer_id, tenantId,
+                         loser.elsewhere_ref ?? null])
+    // A resident's purchases say so: every sale on the record names them.
+    if (tenantId) {
+      const stamped = await client.query<{ id: string }>(
+        `UPDATE pos_transactions SET tenant_id = $2 WHERE pos_customer_id = $1 AND tenant_id IS NULL RETURNING id`, [opts.into, tenantId])
+      record.stamped = stamped.rows.map((r) => r.id)
+    }
   } catch (e: any) {
-    if (e?.code === '23505') throw new AppError(409, 'Both customers have something only one can hold (a charge account) — close one first.')
+    if (e?.code === '23505') throw new AppError(409, 'Both customers have something only one can hold (a charge account) — press Cancel, close one of the two charge accounts, then press Merge again.')
     throw e
   }
+  return record
 }

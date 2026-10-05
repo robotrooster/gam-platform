@@ -5,7 +5,8 @@
  * Covered routes (5):
  *   - GET /me — full tenant profile + active-lease + deposit summary
  *   - GET /me/deposit-interest — statutory rate + accruals
- *   - POST /verify-ach — mock ACH verification + OTP-qualified stamp
+ *   - POST /verify-ach — REMOVED in S655 (money plan Step 5): a typed-in mock
+ *     that marked a tenant bank-verified with no bank behind it. Pinned gone below.
  *
  * Out of slice (future sessions):
  *   - FlexCharge / FlexPay / FlexDeposit / FlexSuite re-acceptance
@@ -381,64 +382,19 @@ describe('GET /api/tenants/me/deposit-interest', () => {
   })
 })
 
-describe('POST /api/tenants/verify-ach', () => {
-  it('invalid last4 (not 4 chars) → 400', async () => {
+describe('POST /api/tenants/verify-ach is gone (S655)', () => {
+  // It let any tenant type four digits and become "bank verified" — the gate
+  // for FlexPay and FlexDeposit — with no bank behind it. A bank is verified
+  // only by Stripe's microdeposits now (routes/stripe.ts).
+  it('the typed-in mock no longer marks anyone bank-verified', async () => {
     const f = await seedTFixture()
-    const res = await request(buildApp())
-      .post('/api/tenants/verify-ach')
-      .set('Authorization', `Bearer ${f.tenantToken}`)
-      .send({ bankName: 'Chase', last4: '123' })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/Valid bank last 4/)
-  })
-
-  it('S374 F1 regression pin: deposit fully funded → ach_verified=true + qualified message', async () => {
-    // Pre-S374 this path 500\'d with "column otp_qualified_at does
-    // not exist." Post-fix: ach_verified flips, deposit_fully_funded
-    // reflects state, message reflects qualification. OTP qualification
-    // is now a dynamic check via services/otp.getQualificationStatus
-    // (per S365), not a persisted timestamp on tenants.
-    const f = await seedTFixture()
-    const client = await db.connect()
-    try {
-      await seedSecurityDeposit(client, {
-        unitId: f.unitId, leaseId: f.leaseId!, tenantId: f.tenantId,
-        totalAmount: 1500, collectedAmount: 1500,
-      })
-    } finally { client.release() }
-
     const res = await request(buildApp())
       .post('/api/tenants/verify-ach')
       .set('Authorization', `Bearer ${f.tenantToken}`)
       .send({ bankName: 'Chase', last4: '4321' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.ach_verified).toBe(true)
-    expect(res.body.data.deposit_fully_funded).toBe(true)
-    expect(res.body.data.message).toMatch(/Bank verified/)
-
-    const row = await db.query<{ ach_verified: boolean; bank_last4: string }>(
+    expect(res.status).toBe(404)
+    const row = await db.query<{ ach_verified: boolean; bank_last4: string | null }>(
       `SELECT ach_verified, bank_last4 FROM tenants WHERE id=$1`, [f.tenantId])
-    expect(row.rows[0].ach_verified).toBe(true)
-    expect(row.rows[0].bank_last4).toBe('4321')
-  })
-
-  it('deposit NOT fully funded → ach_verified=true + deposit-not-funded message', async () => {
-    const f = await seedTFixture()
-    const client = await db.connect()
-    try {
-      await seedSecurityDeposit(client, {
-        unitId: f.unitId, leaseId: f.leaseId!, tenantId: f.tenantId,
-        totalAmount: 1500, collectedAmount: 500,  // partial
-      })
-    } finally { client.release() }
-
-    const res = await request(buildApp())
-      .post('/api/tenants/verify-ach')
-      .set('Authorization', `Bearer ${f.tenantToken}`)
-      .send({ bankName: 'Chase', last4: '4321' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.ach_verified).toBe(true)
-    expect(res.body.data.deposit_fully_funded).toBe(false)
-    expect(res.body.data.message).toMatch(/deposit is not yet fully funded/)
+    expect(row.rows[0]).toEqual({ ach_verified: false, bank_last4: null })
   })
 })

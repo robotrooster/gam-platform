@@ -66,7 +66,7 @@ export function BackgroundChecksPage() {
             <thead><tr><th>Applicant</th><th>Started</th><th>Screening</th><th>Intake score</th><th>Status</th><th></th></tr></thead>
             <tbody>
               {shown.length ? shown.map((c: any) => (
-                <tr key={c.id} onClick={() => setSelected(c)} style={{cursor:'pointer'}}>
+                <tr key={c.id} onClick={() => { setSelected(c); refetch() }} style={{cursor:'pointer'}}>
                   <td style={{fontWeight:500}}>{[c.firstName, c.lastName].filter(Boolean).join(' ') || '—'}</td>
                   <td className="mono">{c.createdAt ? new Date(c.createdAt).toLocaleDateString() : '—'}</td>
                   <td>
@@ -104,8 +104,11 @@ export function BackgroundChecksPage() {
 
       {selected && (
         <ReviewModal
-          check={selected}
-          onClose={() => setSelected(null)}
+          // 10/4: always the row as it is NOW — the list refetches when the
+          // window opens and closes, so an approval left at "Which space?"
+          // reopens on that step, never on Approve / Deny again.
+          check={(checks as any[]).find(c => c.id === selected.id) ?? selected}
+          onClose={() => { setSelected(null); refetch() }}
           onDecided={(denied) => {
             refetch()
             if (denied) {
@@ -194,6 +197,13 @@ function ReviewModal({ check, onClose, onDecided }: {
     setBusy(decision)
     try {
       const res: any = await apiPatch(`/background/${check.id}/decision`, { decision })
+      if (decision === 'approved' && res?.alreadyApproved) {
+        // An older screen: it was approved already — show the next step here.
+        toast(res.needsUnit ? 'Already approved. Which space are they taking?' : 'Already approved. Draft their lease, or mark them not moving in for now.')
+        setApprovedNow(true)
+        setBusy('')
+        return
+      }
       if (decision === 'approved') {
         // S653 (Nic): "When we approve somebody... it doesn't automatically draft
         // up a lease for me to sign." Now it does: the approval drafted it, so

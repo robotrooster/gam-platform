@@ -154,3 +154,51 @@ describe('S654 outstanding vs delinquent vs accruing', () => {
     expect(res.body.data.delinquent_units_accruing_late_fees).toBe(0)
   })
 })
+
+// S655 (decision #4): the trend and the property-health card read the same
+// category totals as the property report. They used to sum EVERY settled row,
+// so a deposit held for a tenant and GAM's own fee showed as the landlord's
+// revenue on the heartbeat.
+describe('S655 the trend and the property-health card count income only', () => {
+  async function rowsOn(propertyId: string, rows: Array<[string, string, number, string]>) {
+    const { rows: [u] } = await db.query<{ id: string; landlord_id: string }>(
+      `SELECT id, landlord_id FROM units WHERE property_id = $1 ORDER BY id LIMIT 1`, [propertyId])
+    const { rows: [{ d }] } = await db.query<{ d: string }>(`SELECT (now() AT TIME ZONE 'America/Phoenix')::date::text AS d`)
+    for (const [i, [type, entry, amount, owner]] of rows.entries()) {
+      await db.query(
+        `INSERT INTO payments (unit_id, landlord_id, type, amount, status, entry_description, due_date, settled_at, revenue_owner)
+         VALUES ($1,$2,$3,$4,'settled',$5,$6::date - $8::int,now(),$7)`,
+        [u.id, u.landlord_id, type, amount, entry, d, owner, i])
+    }
+  }
+
+  it('a deposit held and a GAM fee are not revenue on the trend', async () => {
+    await rowsOn(propA, [
+      ['rent', 'RENT', 500, 'landlord'],
+      ['utility', 'UTILITY', 40, 'landlord'],
+      ['deposit', 'DEPOSIT', 700, 'held'],
+      ['fee', 'DECLINEFEE', 6, 'gam'],
+    ])
+    const res = await dash()
+    const now = res.body.data.trend[res.body.data.trend.length - 1]
+    expect(now.revenue).toBe(540)
+    expect(now.rent_revenue).toBe(500)
+    expect(now.other_revenue).toBe(40)
+    expect(res.body.data.property_health.total).toBe(540)
+    expect(res.body.data.trend).toHaveLength(6)
+  })
+
+  it('narrowing to a property narrows the trend and the property-health card too', async () => {
+    await rowsOn(propA, [['rent', 'RENT', 500, 'landlord']])
+    await rowsOn(propB, [['rent', 'RENT', 300, 'landlord']])
+    expect((await dash()).body.data.property_health.total).toBe(800)
+    const a = (await dash(`?propertyId=${propA}`)).body.data
+    expect(a.property_health.total).toBe(500)
+    expect(a.trend[a.trend.length - 1].revenue).toBe(500)
+    expect((await dash(`?propertyId=${propB}`)).body.data.property_health.total).toBe(300)
+  })
+
+  it('refuses an unknown basis', async () => {
+    expect((await dash('?basis=accrual')).status).toBe(400)
+  })
+})

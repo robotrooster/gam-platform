@@ -13,9 +13,10 @@ import { EntityPicker } from '../components/EntityPicker'
 import { apiGet, apiPost , apiPut } from '../lib/api'
 import {
   EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, OTHER_INCOME_CATEGORIES, OTHER_INCOME_CATEGORY_LABEL,
-  BANK_TXN_IGNORED_REASON_LABEL, BANK_TXN_MATCH_KIND_LABEL,
-  type BankTxnIgnoredReason,
+  BANK_TXN_IGNORED_REASON_LABEL, BANK_TXN_MATCH_KIND_LABEL, DEPOSIT_SLIP_SOURCE_LABEL,
+  type BankTxnIgnoredReason, type DepositSlipSource,
 } from '@gam/shared'
+import '../styles/bank-reconciliation.css'
 import { toast, appConfirm } from '../components/dialogs'
 import { PayoutBreakdown } from '../components/PayoutBreakdown'
 import { Landmark, RefreshCw, Check, X, Plus } from 'lucide-react'
@@ -190,9 +191,48 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
     onError: (e: any) => toast(e?.response?.data?.error || e?.response?.data?.message || 'Sync failed.'),
   })
 
+  // S655 (Step 12): the last bank GAM can collect its fees from is refused, in
+  // the server's words; when the fee debit moves to the bank that stays, say so.
   const disconnect = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/disconnect`, { entityId }), {
-    onSuccess: () => { qc.invalidateQueries('bank-connections'); toast('Bank disconnected.') },
+    onSuccess: (r: any) => {
+      qc.invalidateQueries('bank-connections')
+      const moved = r?.data?.debitMovedTo
+      toast(moved
+        ? `Bank disconnected. GAM now collects its fees from ${moved.name}${moved.last4 ? ` ••${moved.last4}` : ''}.`
+        : 'Bank disconnected.')
+    },
+    onError: (e: any) => toast.error(e?.message || 'That bank could not be disconnected.'),
   })
+
+  // S655 (Step 12, K-C / K-D): take a match or a filing back, exactly.
+  const undoMatch = useMutation((id: string) => apiPost(`/bank-feed/deposits/${id}/undo`, { entityId }), {
+    onSuccess: (r: any) => {
+      qc.invalidateQueries(['bank-txns']); qc.invalidateQueries('unmatched-deposits')
+      qc.invalidateQueries('cash-position'); qc.invalidateQueries('deposit-slips'); qc.invalidateQueries('undeposited-cash')
+      const d = r?.data
+      toast(d?.kind === 'deposit_slip'
+        ? (d?.slipReopened ? 'Match undone. The deposit slip is waiting for the bank again.' : 'Match undone. Those payments are back on the "not banked" list.')
+        : `Match undone. ${d?.reopenedChargeIds?.length ?? 0} bill line(s) are owed again; the deposit is back in review.`)
+    },
+    onError: (e: any) => toast.error(e?.message || 'That match could not be undone.'),
+  })
+  const undoFiling = useMutation(
+    ({ id, stop }: { id: string; stop: boolean }) => apiPost(`/bank-feed/transactions/${id}/undo-auto-file`, { entityId, stopAutoFiling: stop }), {
+    onSuccess: (r: any) => {
+      qc.invalidateQueries(['bank-txns'])
+      const payer = r?.data?.stoppedForPayer
+      toast(payer ? `Undone. Deposits from ${payer} will no longer file themselves.` : 'Undone. The deposit is back in review.')
+    },
+    onError: (e: any) => toast.error(e?.message || 'That filing could not be undone.'),
+  })
+  const askUndoMatch = async (t: any) => {
+    const ok = await appConfirm(
+      t.matchKind === 'deposit_slip'
+        ? 'Undo this match? The deposit goes back to review and its slip waits for the bank again. Any "other money" on the slip comes back out of your income.'
+        : 'Undo this match? The bills it paid are owed again, any late fees it took off come back, credit it created is withdrawn, and the deposit goes back to review. Nothing is undone if any of that changed since.',
+      { title: 'Undo this match', confirmLabel: 'Undo it' })
+    if (ok) undoMatch.mutate(t.id)
+  }
 
   const categorize = useMutation(
     ({ id, body }: { id: string; body: any }) => apiPost(`/bank-feed/transactions/${id}/categorize`, { ...body, entityId }), {
@@ -460,9 +500,25 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                         Still pending at your bank — the amount or wording can change when it posts.
                       </div>
                     )}
-                    {t.status === 'categorized' && (
+                    {t.status === 'categorized' && t.matchKind !== 'auto_filed' && (
                       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
                         Added to your {isExpense ? 'expenses' : 'income'}.
+                      </div>
+                    )}
+                    {/* S655 (Step 12): a deposit that filed itself, labeled, with one-click undo. */}
+                    {t.status === 'categorized' && t.matchKind === 'auto_filed' && (
+                      <div className="bankrec-matched">
+                        <span>
+                          {BANK_TXN_MATCH_KIND_LABEL['auto_filed']} — added to your income like the last deposit from {t.normalizedMerchant || 'this payer'}.
+                        </span>
+                        <span className="bankrec-undo-box">
+                          <button className="btn btn-primary btn-sm" disabled={undoFiling.isLoading}
+                            onClick={() => undoFiling.mutate({ id: t.id, stop: false })}>Undo</button>
+                          <button className="btn btn-primary btn-sm" disabled={undoFiling.isLoading}
+                            onClick={() => undoFiling.mutate({ id: t.id, stop: true })}>
+                            Undo and stop filing {t.normalizedMerchant || 'this payer'} by itself
+                          </button>
+                        </span>
                       </div>
                     )}
                     {/* S655: a row already filed or matched that the bank later
@@ -475,6 +531,13 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                       </div>
                     )}
                     {t.status === 'matched' && <MatchedLine t={t} />}
+                    {t.status === 'matched' && t.canUndo && (
+                      <div className="bankrec-undo-box">
+                        <button className="btn btn-primary btn-sm" disabled={undoMatch.isLoading} onClick={() => askUndoMatch(t)}>
+                          {undoMatch.isLoading ? 'Undoing…' : 'Undo this match'}
+                        </button>
+                      </div>
+                    )}
                     {t.status === 'ignored' && (
                       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
                         {t.ignoredReason && t.ignoredReason in BANK_TXN_IGNORED_REASON_LABEL
@@ -523,8 +586,20 @@ function MatchedLine({ t }: { t: any }) {
     const more = Number(t.matchedChargeCount) > 1 ? ` (${t.matchedChargeCount} charges)` : ''
     return (
       <div style={line}>
-        {BANK_TXN_MATCH_KIND_LABEL['tenant_deposit']} — applied to {who ? `${who}’s` : 'a tenant’s'} rent{more};
+        {BANK_TXN_MATCH_KIND_LABEL['tenant_deposit']} — applied to {who ? `${who}’s` : 'a tenant’s'} rent{more}
+        {t.autoSettledAt ? ' by itself (it was exactly their whole bill, and nothing else fit)' : ''};
         already in your books, never counted twice.
+      </div>
+    )
+  }
+  if (t.matchKind === 'deposit_slip') {
+    const n = Number(t.slipItemCount) || 0
+    return (
+      <div style={line}>
+        {BANK_TXN_MATCH_KIND_LABEL['deposit_slip']} of {t.slipDepositDate}
+        {t.slipSource === 'inferred' ? ` (${DEPOSIT_SLIP_SOURCE_LABEL['inferred' as DepositSlipSource].toLowerCase()})` : ''} —
+        {' '}{n} payment{n === 1 ? '' : 's'} already in your books
+        {Number(t.slipOtherAmount) > 0 ? `, plus ${fmt(t.slipOtherAmount)} of other money added to your income` : ''}; never counted twice.
       </div>
     )
   }

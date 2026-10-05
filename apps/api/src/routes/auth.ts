@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { db, query, queryOne } from '../db'
-import { UserRole, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN, SIGN_IN_PORTAL_VALUES, type SignInPortal } from '@gam/shared'
+import { UserRole, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN, SIGN_IN_PORTAL_VALUES, type SignInPortal, FALLBACK_TIMEZONE } from '@gam/shared'
 import { signSessionToken, renewSessionToken, sessionPolicyFor } from '../lib/sessionToken'
 import { createFoundingLandlordEntity, claimInvitationsOnProvenAddress } from '../services/coOwnerInvites'
 import { requireAuth } from '../middleware/auth'
@@ -357,6 +357,82 @@ authRouter.post('/register', async (req, res, next) => {
 const LOGIN_FAIL_LIMIT = 5
 const LOGIN_LOCK_MINUTES = 15
 
+// Final sweep (10/3): a locked sign-in is told WHEN, in plain words, on the
+// person's own clock. It used to read "Try again after
+// 2026-10-03T20:11:27.596Z": a machine timestamp in UTC, seven hours off for
+// anyone in Arizona, on the screen most people see a lock on.
+//
+// The server cannot see where the person is sitting, so the clock is their
+// place's: a tenant's lease's property, a worker's own property (when they are
+// kept to certain ones), a landlord's or worker's company's first property,
+// else GAM's default zone. The minutes beside it are right
+// wherever they are, so a wrong guess about the zone never leaves them waiting
+// on the wrong hour. The time shown is rounded UP to the minute, so "after
+// 1:12 PM" is never a moment when the lock is still on.
+export function lockedSignInMessage(lockedUntil: Date, timeZone: string, now: Date = new Date()): string {
+  const shownAt = new Date(Math.ceil(lockedUntil.getTime() / 60_000) * 60_000)
+  let clock: string
+  try {
+    clock = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', minute: '2-digit' }).format(shownAt)
+  } catch {
+    clock = new Intl.DateTimeFormat('en-US', { timeZone: FALLBACK_TIMEZONE, hour: 'numeric', minute: '2-digit' }).format(shownAt)
+  }
+  // Newer ICU puts a narrow no-break space before AM/PM; say it with a plain one.
+  clock = clock.replace(/[\u202f\u00a0]/g, ' ')
+  const minutes = Math.max(1, Math.ceil((lockedUntil.getTime() - now.getTime()) / 60_000))
+  return `Your account is temporarily locked after too many sign-in attempts. `
+    + `Try again after ${clock} (in ${minutes} minute${minutes === 1 ? '' : 's'}), or reset your password.`
+}
+
+// The zone a lock message is told in (see lockedSignInMessage). Never throws:
+// a message with GAM's default clock beats no message.
+//
+// A worker kept to certain properties hears the first of THOSE properties'
+// clock, not the company's first property: a company can run parks in more
+// than one zone, and a manager who works only the Chicago park should not be
+// told an Arizona time. A worker on every property hears the company's.
+async function lockClockZone(user: { id: string; role: string }): Promise<string> {
+  try {
+    const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper'].includes(user.role)
+    const scope = isWorkerRole ? await getScopeForUser(user.id, user.role) : null
+    const workerLandlordId = scope?.landlordId ?? null
+    const workerPropertyIds = scope && !scope.allProperties ? (scope.propertyIds ?? []) : []
+    const row = await queryOne<{ timezone: string | null }>(
+      `SELECT COALESCE(
+         -- A tenant: the property of their lease (the live one first, else the latest).
+         (SELECT p.timezone
+            FROM tenants t
+            JOIN lease_tenants lt ON lt.tenant_id = t.id
+            JOIN leases l         ON l.id = lt.lease_id
+            JOIN units un         ON un.id = l.unit_id
+            JOIN properties p     ON p.id = un.property_id
+           WHERE t.user_id = $1
+           ORDER BY (l.status = 'active') DESC, l.start_date DESC
+           LIMIT 1),
+         -- A worker kept to certain properties: the first of those (in their company).
+         (SELECT p.timezone
+            FROM properties p
+           WHERE p.id = ANY($3::uuid[])
+             AND p.landlord_id = $2::uuid
+           ORDER BY p.created_at ASC
+           LIMIT 1),
+         -- A landlord (owner or member) or a worker: their company's first property.
+         (SELECT p.timezone
+            FROM properties p
+           WHERE p.landlord_id = $2::uuid
+              OR p.landlord_id IN (SELECT lm.landlord_id FROM landlord_members lm WHERE lm.user_id = $1
+                                   UNION
+                                   SELECT x.id FROM landlords x WHERE x.user_id = $1)
+           ORDER BY p.created_at ASC
+           LIMIT 1)
+       ) AS timezone`, [user.id, workerLandlordId, workerPropertyIds])
+    return row?.timezone || FALLBACK_TIMEZONE
+  } catch (err) {
+    logger.warn({ err, userId: user.id }, '[auth] could not read the zone for a lock message; using the default')
+    return FALLBACK_TIMEZONE
+  }
+}
+
 // POST /api/auth/login
 // S654: a password change ends every other session. Sessions renew while in
 // use now, so a stolen signed-in device would otherwise keep renewing forever;
@@ -494,11 +570,10 @@ authRouter.post('/login', async (req, res, next) => {
     // right password, a locked account stays locked until the
     // window expires. (Successful unlock requires either waiting
     // out the timer or using password reset.)
+    // Final sweep (10/3): said in plain words on the person's clock — see
+    // lockedSignInMessage.
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
-      throw new AppError(
-        401,
-        `Account temporarily locked. Try again after ${new Date(user.locked_until).toISOString()} or reset your password.`
-      )
+      throw new AppError(401, lockedSignInMessage(new Date(user.locked_until), await lockClockZone(user)))
     }
 
     const valid = await bcrypt.compare(password, user.password_hash)
@@ -837,15 +912,30 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
 // days. The renewed pass is rebuilt from the database, not copied from the old
 // one: a worker whose scope was pulled is out at the next renewal, a company
 // the account was added to shows up at the next renewal.
+//
+// Final sweep (10/3): A LOCK IS NOT A SIGN-OUT. A lock (five wrong passwords,
+// perhaps typed by someone else) answered 401 here, and every portal treats a
+// 401/403 from renewal as "this pass is dead" (isAuthRejection) — so a tenant
+// signed in on their phone was thrown out without a word the next time the app
+// came into view, and then could not sign back in until the lock ran out. The
+// pass they hold is still good: nothing else refuses it during a lock. So a
+// lock answers 423 ("Locked"), which no portal reads as a rejection: the
+// renewal is skipped, the current pass keeps its own expiry (seven days; a lock
+// lasts fifteen minutes), and the next renewal after the lock goes through.
+// The checks that DO end a session run first, so a lock never shields a pass a
+// password change revoked or a worker whose access was pulled.
+export const RENEWAL_LOCKED_STATUS = 423
 authRouter.post('/refresh', requireAuth, async (req, res, next) => {
   try {
     const user = await loadUserForSession('id', req.user!.userId)
     if (!user) throw new AppError(401, 'Invalid or expired token')
-    if (user.locked_until && new Date(user.locked_until) > new Date()) {
-      throw new AppError(401, 'Account temporarily locked.')
-    }
     assertPassPostdatesPasswordChange(req.user, user.sessions_valid_from)
     const { claims } = await sessionClaimsFor(user)
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      throw new AppError(RENEWAL_LOCKED_STATUS,
+        'Your account is temporarily locked after too many sign-in attempts. You are still signed in; '
+        + 'your sign-in renews on its own once the lock ends.')
+    }
     // S655: a fixed-length pass (admin console, Support, GAM Books without
     // "Keep me signed in") is rebuilt here but keeps its original expiry, so no
     // portal — not even one that renews automatically — can stretch it.

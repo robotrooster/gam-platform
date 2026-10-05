@@ -28,6 +28,24 @@ import { resolveBookingGuestToken } from '../services/bookingGuestTokens'
 import { resolveProperty } from '../services/propertyBookingQuote'
 import type { AgentAudience, ChatMessage } from '../services/agents/types'
 import { landlordScopeIds } from '../lib/landlordScope'
+import { isFeatureEnabled } from '../services/systemFeatures'
+
+// 10/4 (Nic): "I want all of the AI agents disabled until we get them worked
+// out… we're changing so much stuff in the software, we're going to have to
+// train them again." ONE platform switch for every assistant — tenant,
+// landlord, sales, guest stay page and booking-site — off unless the
+// system_features row says on (a missing row reads as off). The owner flips it
+// in admin feature switches. Lease-template field placement (autoFieldPlacement)
+// is not an assistant and does not read this.
+export const AI_ASSISTANTS_FEATURE = 'ai_assistants_enabled'
+export const ASSISTANT_OFF_MESSAGE =
+  'Our assistant is turned off for now. Please call or email the office and we will help you directly.'
+const assistantsOn = () => isFeatureEnabled(AI_ASSISTANTS_FEATURE).catch(() => false)
+const refuseWhenOff = async (res: any): Promise<boolean> => {
+  if (await assistantsOn()) return false
+  res.status(503).json({ success: false, code: 'assistant_off', error: ASSISTANT_OFF_MESSAGE })
+  return true
+}
 
 export const agentRouter = Router()
 agentRouter.use(requireAuth)
@@ -56,6 +74,7 @@ agentRouter.use(agentRateLimiter)
 agentRouter.get('/visibility', async (req, res, next) => {
   try {
     const { userId, role } = req.user!
+    if (!await assistantsOn()) return res.json({ success: true, data: { visible: false } })
     const hidden = await isAssistantHidden(userId, role).catch(() => false)
     res.json({ success: true, data: { visible: !hidden } })
   } catch (e) { next(e) }
@@ -115,6 +134,7 @@ agentRouter.get('/chat/waiting', async (req, res, next) => {
 // POST /api/agent/chat — one conversational turn.
 agentRouter.post('/chat', async (req, res, next) => {
   try {
+    if (await refuseWhenOff(res)) return
     const body = chatSchema.parse(req.body)
     const { userId, role, profileId } = req.user!
 
@@ -206,8 +226,16 @@ const salesChatSchema = z.object({
 })
 
 // POST /api/sales/chat — one sales-conversation turn (public).
+// GET /api/sales/assistant — public: is any assistant switched on? The
+// marketing site, the booking sites and the guest stay page hide their chat
+// when it is not.
+salesAgentRouter.get('/assistant', async (_req, res, next) => {
+  try { res.json({ success: true, data: { visible: await assistantsOn() } }) } catch (e) { next(e) }
+})
+
 salesAgentRouter.post('/chat', async (req, res, next) => {
   try {
+    if (await refuseWhenOff(res)) return
     const body = salesChatSchema.parse(req.body)
     const conversationId = body.conversationId ?? randomUUID()
     // Anonymous prospect actor: the session id stands in for identity; the
@@ -464,6 +492,7 @@ const guestChatSchema = z.object({
 // POST /api/guest/chat — one stay-assistant turn (token-authenticated).
 guestAgentRouter.post('/chat', async (req, res, next) => {
   try {
+    if (await refuseWhenOff(res)) return
     const body = guestChatSchema.parse(req.body)
     const guest = await resolveBookingGuestToken(body.token)
     if (!guest) {
@@ -540,6 +569,7 @@ const propertyChatSchema = z.object({
 // POST /api/property/:slug/agent/chat — one property-agent turn (public).
 propertyAgentRouter.post('/:slug/agent/chat', async (req, res, next) => {
   try {
+    if (await refuseWhenOff(res)) return
     const body = propertyChatSchema.parse(req.body)
     // Resolve slug → property FIRST. resolveProperty 404s unless the booking
     // site is published, so a disabled/unknown slug can never open a chat.

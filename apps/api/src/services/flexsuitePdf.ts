@@ -1,4 +1,5 @@
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib'
+import { FLEXPAY_TERMS } from '@gam/shared'
 
 // S322: render a populated FlexSuite acceptance snapshot (Subscription
 // Terms / Service Agreement) to a PDF byte buffer. Output is a clean
@@ -40,6 +41,35 @@ const HEADER_HEIGHT = 68
 
 function productTitle(p: 'flexpay' | 'flexdeposit'): string {
   return p === 'flexpay' ? 'FlexPay Subscription Terms' : 'FlexDeposit Service Agreement'
+}
+
+/**
+ * S655 (money plan Step 4): FlexPay's terms in plain words — the ONE set of
+ * sections the tenant app, emails and admin show (FLEXPAY_TERMS in
+ * packages/shared), so the PDF in the tenant's inbox says exactly what the app
+ * said when they joined: FlexPay pays the whole monthly bill on the last grace
+ * day, GAM collects on the pull day (never the 1st-5th), the retry schedule,
+ * and the $25 taken even in a month the tenant paid.
+ *
+ * It comes FIRST and is labeled apart from the accepted text, because the
+ * footer's sha256 fingerprints the accepted text only.
+ */
+export function flexPayPlainTermsText(): string {
+  return [
+    'FLEXPAY IN PLAIN WORDS',
+    'These are the same terms the GAM app shows. The full Subscription Terms you accepted follow; the fingerprint in the footer is of that full text.',
+    '',
+    ...FLEXPAY_TERMS.flatMap(sec => [sec.title, sec.body, '']),
+    'THE SUBSCRIPTION TERMS YOU ACCEPTED',
+    '',
+  ].join('\n')
+}
+
+/** The text the PDF draws: FlexPay's plain terms, then the accepted snapshot. */
+export function acceptancePdfBody(ctx: Pick<FlexsuiteAcceptancePdfContext, 'product' | 'renderedText'>): string {
+  return ctx.product === 'flexpay'
+    ? `${flexPayPlainTermsText()}\n${ctx.renderedText}`
+    : ctx.renderedText
 }
 
 // pdf-lib's Helvetica doesn't support all unicode; replace the few
@@ -110,7 +140,7 @@ export async function renderAcceptancePdf(
   const helvBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
 
   const bodyMaxWidth = PAGE_W - MARGIN_X * 2
-  const lines = wrapLines(sanitizeForWinAnsi(ctx.renderedText), helv, FONT_SIZE, bodyMaxWidth)
+  const lines = wrapLines(sanitizeForWinAnsi(acceptancePdfBody(ctx)), helv, FONT_SIZE, bodyMaxWidth)
 
   const footerY = MARGIN_BOTTOM - 28
   const footerHashFragment = ctx.contentHash.slice(0, 16) + '…'

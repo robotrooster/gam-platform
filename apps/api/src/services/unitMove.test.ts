@@ -207,6 +207,63 @@ describe('billing a month with a move in it', () => {
     expect(Number(bills.rows[0].reading_end)).toBe(4210)
   })
 
+  // 10/3: they are staying, only on another space. The old space's usage is
+  // theirs and rides their next regular bill (labeled with the old space) —
+  // no same-day "final" invoice and no "your last days here" email.
+  it('a space move sends no final utility invoice; the old space waits for the next regular bill', async () => {
+    const w = await world({ withMeters: true })
+    const c = await db.connect()
+    let tenantId: string
+    try { tenantId = await seedTenant(c) } finally { c.release() }
+    await db.query(`INSERT INTO lease_tenants (lease_id, tenant_id, role, status) VALUES ($1,$2,'primary','active')`, [w.leaseId, tenantId])
+    await db.query(`INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible) VALUES ($1,'electric',true)`, [w.leaseId])
+    await db.query(`UPDATE utility_meters SET rate_per_unit = 0.21`)
+    const [m12, m23] = (await db.query<{ id: string }>(`SELECT id FROM utility_meters ORDER BY label`)).rows
+    await db.query(
+      `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
+       VALUES ($1, '2026-06-01', 4000, '2026-05-01', $2, 'monthly_cycle')`, [m12.id, w.userId])
+
+    await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15', actorUserId: w.userId,
+      reads: [{ meterId: m12.id, value: 4210 }, { meterId: m23.id, value: 118 }] })
+
+    const bills = await db.query<any>(`SELECT status, payment_id FROM utility_bills WHERE lease_id = $1`, [w.leaseId])
+    expect(bills.rows).toEqual([{ status: 'unbilled', payment_id: null }])
+    expect((await db.query(`SELECT 1 FROM invoices WHERE lease_id = $1`, [w.leaseId])).rows).toHaveLength(0)
+    expect((await db.query(`SELECT 1 FROM notifications WHERE type = 'final_utility_invoice'`)).rows).toHaveLength(0)
+  })
+
+  // 10/3 (final sweep): a household that left the old space earlier without a
+  // read of its own must not be billed for what the mover used there.
+  it('a space move bills the mover, never a household that left that space earlier with no read', async () => {
+    const w = await world({ withMeters: true })
+    const c = await db.connect()
+    let gone: string
+    try {
+      gone = await seedLease(c, { unitId: w.shady, landlordId: w.landlordId, startDate: '2026-01-01' })
+      await c.query(`UPDATE leases SET status = 'expired', end_date = '2026-06-05' WHERE id = $1`, [gone])
+      await c.query(`INSERT INTO lease_tenants (lease_id, tenant_id, role, status) VALUES ($1,$2,'primary','active')`, [gone, await seedTenant(c)])
+      await c.query(`INSERT INTO lease_tenants (lease_id, tenant_id, role, status) VALUES ($1,$2,'primary','active')`, [w.leaseId, await seedTenant(c)])
+    } finally { c.release() }
+    await db.query(`UPDATE leases SET start_date = '2026-06-06' WHERE id = $1`, [w.leaseId])
+    await db.query(`UPDATE lease_unit_history SET effective_from = '2026-06-06' WHERE lease_id = $1`, [w.leaseId])
+    await db.query(
+      `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible) VALUES ($1,'electric',true), ($2,'electric',true)`,
+      [w.leaseId, gone])
+    await db.query(`UPDATE utility_meters SET rate_per_unit = 0.21`)
+    const [m12, m23] = (await db.query<{ id: string }>(`SELECT id FROM utility_meters ORDER BY label`)).rows
+    await db.query(
+      `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
+       VALUES ($1, '2026-06-01', 4000, '2026-05-01', $2, 'monthly_cycle')`, [m12.id, w.userId])
+
+    await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-20', actorUserId: w.userId,
+      reads: [{ meterId: m12.id, value: 4100 }, { meterId: m23.id, value: 118 }] })
+
+    const bills = await db.query<any>(`SELECT lease_id, usage_amount::float AS usage FROM utility_bills WHERE meter_id = $1`, [m12.id])
+    expect(bills.rows).toEqual([{ lease_id: w.leaseId, usage: 100 }])
+    expect((await db.query(`SELECT 1 FROM utility_bills WHERE lease_id = $1`, [gone])).rows).toHaveLength(0)
+    expect((await db.query(`SELECT 1 FROM notifications WHERE type = 'final_utility_invoice'`)).rows).toHaveLength(0)
+  })
+
   it('attributes the OLD spot’s usage to the resident who was there', async () => {
     const w = await world()
     await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15' })

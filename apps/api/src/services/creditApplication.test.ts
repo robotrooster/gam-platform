@@ -1,39 +1,23 @@
 /**
- * S607 — a credit lands on the OPEN balance immediately.
+ * S607 → S655 — services/creditApplication is now a thin wrapper over the
+ * whole-bill rule (creditUse.settleWholeBillIfCovered), kept for the bill run
+ * and the portal charge until they call the rule themselves (Steps 7 and 8),
+ * deleted in Step 18.
  *
- * Nic: "The credit needs to go to the balance and kind of zero it out so that
- * the landlord's not thinking that the tenant still owes money, the books look
- * good, everything's zeroed out."
- *
- * Before this, credits were only consumed when the NEXT invoice was generated —
- * so forgiving a late fee left it showing as owed for the rest of the month, and
- * because rent is pay-in-full, the forgiven charge also blocked the tenant from
- * paying anything at all.
+ * Nic (10/2): credit applies by itself only when it covers the WHOLE bill.
+ * The S638 rule ("posting a credit changes no charge") still holds for a credit
+ * smaller than the bill; what a credit route does after issuing one is the
+ * route's own test (routes/tenantCredits.test.ts, Step 7).
  */
 import { describe, it, expect, beforeEach } from 'vitest'
-import express from 'express'
-import request from 'supertest'
-import jwt from 'jsonwebtoken'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
-  seedLease, seedLeaseTenant,
+  seedLease, seedLeaseTenant, seedAllocationRule,
 } from '../test/dbHelpers'
-import { tenantCreditsRouter } from '../routes/tenantCredits'
-import { errorHandler } from '../middleware/errorHandler'
+import { applyCreditsToOpenCharges } from './creditApplication'
 
-function buildApp() {
-  const app = express()
-  app.use(express.json())
-  app.use('/api/tenant-credits', tenantCreditsRouter)
-  app.use(errorHandler)
-  return app
-}
-
-beforeEach(async () => {
-  await cleanupAllSchema()
-  process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_credits'
-})
+beforeEach(async () => { await cleanupAllSchema() })
 
 async function seedLeaseWithCharges(charges: number[]) {
   const c = await db.connect()
@@ -41,6 +25,7 @@ async function seedLeaseWithCharges(charges: number[]) {
     await c.query('BEGIN')
     const { userId, landlordId } = await seedLandlord(c)
     const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+    await seedAllocationRule(c, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
     const unitId = await seedUnit(c, { propertyId, landlordId })
     const tenantId = await seedTenant(c)
     const leaseId = await seedLease(c, { unitId, landlordId, status: 'active' })
@@ -53,9 +38,7 @@ async function seedLeaseWithCharges(charges: number[]) {
         [unitId, leaseId, tenantId, landlordId, amt, day++])
     }
     await c.query('COMMIT')
-    const token = jwt.sign({ userId, role: 'landlord', email: 'l@t.dev', profileId: landlordId },
-      process.env.JWT_SECRET!, { expiresIn: '1h' })
-    return { leaseId, tenantId, token }
+    return { leaseId, tenantId, landlordId, unitId }
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
 
@@ -63,116 +46,68 @@ const openBalance = async (leaseId: string) => Number((await db.query<{ t: strin
   `SELECT COALESCE(SUM(amount),0)::text AS t FROM payments
     WHERE lease_id = $1 AND status = 'pending'`, [leaseId])).rows[0].t)
 
-// ─── S638 (Nic, DIRECTIVE) — REWRITTEN. A CREDIT SETTLES NOTHING. ───────────
-//
-//   "The credit doesn't settle individual items. It takes just the total down.
-//    It's not separatable. It's her rent, her trash, her water are line items
-//    that combine to one bill. That one total charge has the credit applied
-//    against it... The credit has to be applied and visible before they pay."
-//
-// Every test below used to assert the opposite: that posting a credit closed
-// open charges one at a time, oldest first. That is what happened to Kim
-// Harland — a $450 Move In Special was issued and instantly spent settling a
-// $10.45 water row, a $25 trash row and five $5 late fees. Her credit read
-// $389.55, her landlord saw settled charges no money had arrived for, and she
-// was still shown the full rent.
-//
-// S637 had already banned SPLITTING a charge. This goes further: a credit does
-// not touch a charge at all. It sits whole on the account and nets against the
-// one total wherever a balance is shown or paid.
-describe('S638 posting a credit changes no charge', () => {
-  it('leaves every open charge exactly as it was', async () => {
+async function apply(leaseId: string) {
+  const c = await db.connect()
+  try {
+    await c.query('BEGIN')
+    const r = await applyCreditsToOpenCharges(c, { leaseId, scope: 'lease' })
+    await c.query('COMMIT')
+    return r
+  } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+}
+
+const credit = (landlordId: string, tenantId: string, leaseId: string | null, amount: number) => db.query(
+  `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+   VALUES ($1,$2,$3,$4,$4,'goodwill')`, [landlordId, tenantId, leaseId, amount])
+
+describe('the wrapper delegates to the whole-bill rule', () => {
+  it('a credit smaller than the whole bill changes no charge and stays whole (Kim Harland)', async () => {
     const f = await seedLeaseWithCharges([25, 5, 5])
+    await credit(f.landlordId, f.tenantId, f.leaseId, 30)
+    expect(await apply(f.leaseId)).toEqual({ applied: 0, rowsTouched: 0 })
+    // The charges stand: nothing settled, nothing split, nothing invented.
     expect(await openBalance(f.leaseId)).toBeCloseTo(35, 2)
-
-    const res = await request(buildApp()).post('/api/tenant-credits')
-      .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 35, category: 'late_fee_refund', reason: 'waived' })
-    expect(res.status).toBe(201)
-
-    // The charges stand. Nothing was settled, nothing was split, nothing was
-    // invented — the ledger still says what the resident was billed.
-    expect(await openBalance(f.leaseId)).toBeCloseTo(35, 2)
-    const { rows } = await db.query<{ n: string }>(
-      `SELECT COUNT(*)::text AS n FROM payments
-        WHERE lease_id = $1 AND status = 'settled'`, [f.leaseId])
-    expect(Number(rows[0].n)).toBe(0)
+    const settled = await db.query(`SELECT 1 FROM payments WHERE lease_id = $1 AND status <> 'pending'`, [f.leaseId])
+    expect(settled.rowCount).toBe(0)
+    expect(Number((await db.query(`SELECT amount_remaining FROM tenant_credits`)).rows[0].amount_remaining)).toBe(30)
+    expect((await db.query(`SELECT 1 FROM credit_uses`)).rowCount).toBe(0)
   })
 
-  it('keeps the credit whole, at its full face value', async () => {
+  it('a credit covering the whole bill settles every row, through the credit ledger', async () => {
     const f = await seedLeaseWithCharges([25, 5, 5])
-    const res = await request(buildApp()).post('/api/tenant-credits')
-      .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 35, category: 'goodwill' })
-    expect(res.status).toBe(201)
-    expect(Number(res.body.data.amountRemaining ?? res.body.data.amount_remaining))
-      .toBeCloseTo(35, 2)
+    await credit(f.landlordId, f.tenantId, f.leaseId, 50)
+    expect(await apply(f.leaseId)).toEqual({ applied: 35, rowsTouched: 3 })
+    expect(await openBalance(f.leaseId)).toBe(0)
+    expect(Number((await db.query(`SELECT amount_remaining FROM tenant_credits`)).rows[0].amount_remaining)).toBe(15)
+    const uses = await db.query<any>(`SELECT source, status, SUM(amount)::float AS a FROM credit_uses GROUP BY 1, 2`)
+    expect(uses.rows).toEqual([{ source: 'whole_bill', status: 'applied', a: 35 }])
   })
 
-  // A credit bigger than the bill is not change — the rest stays on account.
-  it('a credit larger than the balance stays whole too', async () => {
-    const f = await seedLeaseWithCharges([50])
-    const res = await request(buildApp()).post('/api/tenant-credits')
-      .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 500, category: 'goodwill' })
-    expect(res.status).toBe(201)
-    expect(await openBalance(f.leaseId)).toBeCloseTo(50, 2)
-    expect(Number(res.body.data.amountRemaining ?? res.body.data.amount_remaining))
-      .toBeCloseTo(500, 2)
-  })
-
-  it('posts fine against a lease with nothing open', async () => {
-    const f = await seedLeaseWithCharges([])
-    const res = await request(buildApp()).post('/api/tenant-credits')
-      .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 100, category: 'goodwill' })
-    expect(res.status).toBe(201)
-    expect(Number(res.body.data.amountRemaining ?? res.body.data.amount_remaining))
-      .toBeCloseTo(100, 2)
-  })
-})
-
-// ── S648 (Nic): "every dollar should only be counted once. Everywhere." ────
-//
-// The pay flows take a GENERAL (lease-less) credit off what is owed, so the
-// step that spends credits has to be able to spend it too — otherwise the same
-// general credit comes off every bill forever. And it is only ever the issuing
-// landlord's to spend.
-describe('S648 general credits', () => {
-  it('are spent by the lease they cover, once', async () => {
+  // S648 (Nic): "every dollar should only be counted once." A general
+  // (lease-less) credit is spent by the lease it covers, once, and only the
+  // issuing landlord's.
+  it('a general credit is spent by the lease it covers, once', async () => {
     const f = await seedLeaseWithCharges([40])
-    const { applyCreditsToOpenCharges } = await import('./creditApplication')
-    const ll = (await db.query(`SELECT landlord_id FROM leases WHERE id=$1`, [f.leaseId])).rows[0].landlord_id
-    await db.query(
-      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
-       VALUES ($1,$2,NULL,50,50,'goodwill')`, [ll, f.tenantId])
-    const c = await db.connect()
-    try {
-      await c.query('BEGIN')
-      const r = await applyCreditsToOpenCharges(c, { leaseId: f.leaseId, scope: 'lease' })
-      await c.query('COMMIT')
-      expect(r.applied).toBe(40)
-    } finally { c.release() }
+    await credit(f.landlordId, f.tenantId, null, 50)
+    expect((await apply(f.leaseId)).applied).toBe(40)
+    expect((await apply(f.leaseId)).applied).toBe(0)
     const left = (await db.query(`SELECT amount_remaining::float AS a FROM tenant_credits WHERE tenant_id=$1`, [f.tenantId])).rows[0].a
     expect(left).toBe(10)
   })
 
-  it('never cross to another landlord', async () => {
+  it('a general credit never crosses to another landlord', async () => {
     const f = await seedLeaseWithCharges([40])
     const other = await (async () => {
       const c = await db.connect()
       try { return (await seedLandlord(c)).landlordId } finally { c.release() }
     })()
-    await db.query(
-      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
-       VALUES ($1,$2,NULL,50,50,'goodwill')`, [other, f.tenantId])
-    const { applyCreditsToOpenCharges } = await import('./creditApplication')
-    const c = await db.connect()
-    try {
-      await c.query('BEGIN')
-      const r = await applyCreditsToOpenCharges(c, { leaseId: f.leaseId, scope: 'lease' })
-      await c.query('COMMIT')
-      expect(r.applied).toBe(0)
-    } finally { c.release() }
+    await credit(other, f.tenantId, null, 50)
+    expect((await apply(f.leaseId)).applied).toBe(0)
+  })
+
+  it('a lease with nothing open is a clean no-op', async () => {
+    const f = await seedLeaseWithCharges([])
+    await credit(f.landlordId, f.tenantId, f.leaseId, 100)
+    expect(await apply(f.leaseId)).toEqual({ applied: 0, rowsTouched: 0 })
   })
 })

@@ -1,12 +1,57 @@
-import { PERMISSION_CATALOG, PERMISSION_PRESETS } from '@gam/shared'
+import type { CSSProperties } from 'react'
+import { PERMISSION_CATALOG, PERMISSION_PRESETS, type PermissionItem } from '@gam/shared'
+
+// 10/3 (Nic): "each permission that you're going to toggle on or off should
+// have a little description of what it does next to it." One row, used by BOTH
+// permission editors (this invite form and the member's own permissions page),
+// so the description can never show on one and not the other. The label sits
+// on its own line with the description in small gray text beneath it, and the
+// grid drops to one column on a phone (min(100%, …) keeps a narrow modal from
+// scrolling sideways).
+export const PERMISSION_ROW_GRID: CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 280px), 1fr))',
+  gap: '4px 20px',
+}
+
+export function PermissionToggleRow({
+  item, checked, onToggle, disabled = false,
+}: {
+  item: PermissionItem
+  checked: boolean
+  onToggle: () => void
+  disabled?: boolean
+}) {
+  return (
+    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '6px 0', minWidth: 0, cursor: disabled ? 'default' : 'pointer' }}>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={onToggle}
+        disabled={disabled}
+        style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
+      />
+      <span style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+        <span style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, fontSize: '.84rem', fontWeight: 500, color: 'var(--text-1)', lineHeight: 1.35 }}>
+          {item.label}
+          {item.sensitive && (
+            <span style={{ fontSize: '.6rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.04em', color: 'var(--gold)', background: 'rgba(201,162,39,.12)', border: '1px solid rgba(201,162,39,.3)', borderRadius: 4, padding: '1px 5px' }}>sensitive</span>
+          )}
+        </span>
+        <span style={{ fontSize: '.76rem', color: 'var(--text-3)', lineHeight: 1.45 }}>{item.hint}</span>
+      </span>
+    </label>
+  )
+}
 
 // S576 (Nic, B-10): controlled permission editor — presets + the full grouped
-// 105-key catalog — driven by a local permissions map. Used in the Team invite
+// catalog — driven by a local permissions map. Used in the Team invite
 // form so an owner sets exact grants BEFORE sending (they apply the moment the
 // invitee accepts, still editable later on the member's permissions page).
 //
 // Presentational + fully controlled (value/onChange). This deliberately mirrors
-// StaffPermissionsPage's grid but does NOT share its toggle logic: that page
+// StaffPermissionsPage's grid (and shares its row, PermissionToggleRow, above)
+// but does NOT share its toggle logic: that page
 // full-replaces the server jsonb on every flip, whereas here nothing exists yet
 // — edits batch in local state until the invite is sent. All buttons are
 // type="button" so the editor is safe inside the invite <form>.
@@ -85,21 +130,15 @@ export function PermissionCatalogEditor({
                   <div style={{ fontSize: '.68rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>
                     {section.label}
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 6 }}>
+                  <div style={PERMISSION_ROW_GRID}>
                     {section.items.map(item => (
-                      <label key={item.key} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.82rem', color: 'var(--text-1)', cursor: 'pointer', padding: '3px 0' }}>
-                        <input
-                          type="checkbox"
-                          checked={!!value[item.key]}
-                          onChange={() => toggle(item.key)}
-                          disabled={disabled}
-                        />
-                        <span>{item.label}</span>
-                        {item.sensitive && (
-                          <span style={{ fontSize: '.6rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.04em', color: 'var(--gold)', background: 'rgba(201,162,39,.12)', border: '1px solid rgba(201,162,39,.3)', borderRadius: 4, padding: '1px 5px' }}>sensitive</span>
-                        )}
-                        {item.hint && <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>— {item.hint}</span>}
-                      </label>
+                      <PermissionToggleRow
+                        key={item.key}
+                        item={item}
+                        checked={!!value[item.key]}
+                        onToggle={() => toggle(item.key)}
+                        disabled={disabled}
+                      />
                     ))}
                   </div>
                 </div>

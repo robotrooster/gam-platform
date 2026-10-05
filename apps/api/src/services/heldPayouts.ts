@@ -149,15 +149,33 @@ export async function reconcileBusinessHeldFunds(businessId: string): Promise<{ 
  * deposit, business invoice or register sale). There is no customer to bill,
  * so the payee owes back the disputed amount plus Stripe's fee (GAM absorbs
  * nothing, S512). It nets against their next payout.
+ *
+ * Step 10 final fix (decisions #55): only money Stripe took is netted. A
+ * bank's INQUIRY (warning_*) takes nothing, so it nets nobody; the event that
+ * turns it into a dispute (charge.dispute.updated / funds_withdrawn / closed
+ * 'lost') nets it then, once (one line per Stripe dispute). A dispute GAM WON
+ * gives the payee back what the chargeback took off their payout — the
+ * disputed amount, plus Stripe's dispute fee when Stripe gave that back too —
+ * on the line stripeCosts reads for it (wonChargebackReturnSourceId), once.
  */
 export async function recordChargeback(input: {
   paymentIntentId: string | null
   amountCents: number
   feeCents: number
   stripeDisputeId: string
+  /**
+   * The dispute's status at this event. Left out (older callers), money is
+   * taken. An inquiry or any status under which Stripe holds no money nets
+   * nobody; 'won' gives a chargeback back.
+   */
+  disputeStatus?: string | null
+  /** 'won' only: cents of Stripe's dispute fee Stripe gave back (stripeCosts.disputeFeeReturnedOnWinCents). */
+  feeReturnedCents?: number
 }): Promise<{ handled: boolean; reason?: string }> {
   if (!input.paymentIntentId) return { handled: false, reason: 'no payment intent' }
   const pi = input.paymentIntentId
+  const { DISPUTE_STATUSES_MONEY_TAKEN, DISPUTE_STATUS_WON } = await import('./creditUse')
+  const status = input.disputeStatus ?? null
   const payee = await queryOne<{ landlord_id: string | null; business_id: string | null; what: string }>(
     `SELECT landlord_id, NULL::uuid AS business_id, 'register sale' AS what
        FROM pos_transactions WHERE stripe_payment_intent_id = $1
@@ -171,13 +189,77 @@ export async function recordChargeback(input: {
      SELECT NULL, business_id, 'register sale' FROM business_pos_transactions WHERE stripe_payment_intent_id = $1
      LIMIT 1`, [pi])
   if (!payee) return { handled: false, reason: 'not a held charge' }
+
+  // Fix pass 2 (review): the decision and its line are one step per dispute
+  // (a lock on the dispute id). Stripe does not deliver events in order: a
+  // stale event that says money is taken, handled at the same moment as the
+  // win, reads the dispute on file under the lock — once it says 'won' (or
+  // any status under which Stripe holds no money) it nets nobody. A win is not
+  // given back here in this deploy (decisions #55-AMENDED): the webhook raises
+  // paymentReversal.raiseWonDisputeNotice, which waits on this same lock and
+  // lists the chargeback line to give back by hand. The 'won' branch below is
+  // kept for the automatic follow-up and is reached only by tests today.
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`chargeback:${input.stripeDisputeId}`])
+    const onFile = (await client.query<{ status: string }>(
+      `SELECT status FROM connect_disputes WHERE stripe_dispute_id = $1`, [input.stripeDisputeId])).rows[0]?.status ?? null
+    const r = await chargebackUnderLock(client, input, pi, payee, status, onFile, { DISPUTE_STATUSES_MONEY_TAKEN, DISPUTE_STATUS_WON })
+    await client.query('COMMIT')
+    return r
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+async function chargebackUnderLock(
+  client: PoolClient,
+  input: { amountCents: number; feeCents: number; stripeDisputeId: string; feeReturnedCents?: number },
+  pi: string,
+  payee: { landlord_id: string | null; business_id: string | null; what: string },
+  status: string | null,
+  onFile: string | null,
+  c: { DISPUTE_STATUSES_MONEY_TAKEN: readonly string[]; DISPUTE_STATUS_WON: string },
+): Promise<{ handled: boolean; reason?: string }> {
+  if (status === c.DISPUTE_STATUS_WON) {
+    // What the chargeback took off their payout (none: nothing to give back).
+    const taken = (await client.query<{ amount: string }>(
+      `SELECT (-amount)::text AS amount FROM held_payout_items WHERE source_type = 'dispute' AND source_id = $1 AND amount < 0`,
+      [input.stripeDisputeId])).rows[0]
+    if (!taken) return { handled: false, reason: 'nothing was charged back' }
+    const takenCents = Math.round(parseFloat(taken.amount) * 100)
+    const backCents = Math.min(takenCents, Math.max(0, input.amountCents) + Math.max(0, input.feeReturnedCents ?? 0))
+    if (backCents <= 0) return { handled: false, reason: 'nothing to give back' }
+    const { wonChargebackReturnSourceId } = await import('./stripeCosts')
+    const recorded = await recordHeldItem({
+      landlordId: payee.landlord_id, businessId: payee.business_id,
+      sourceType: 'dispute', sourceId: wonChargebackReturnSourceId(input.stripeDisputeId),
+      amount: backCents / 100,
+      description: `Chargeback on a ${payee.what} given back: the card company decided the dispute for us`,
+    }, client)
+    if (!recorded) return { handled: false, reason: 'already given back' }
+    logger.info({ ...payee, pi, backCents }, '[chargeback] dispute won — the chargeback is given back on the next payout')
+    return { handled: true }
+  }
+  if (status != null && !c.DISPUTE_STATUSES_MONEY_TAKEN.includes(status)) {
+    return { handled: false, reason: 'no money taken' }
+  }
+  // The dispute on file holds no money now (won while this event was on its way, or still an inquiry): nobody is netted.
+  if (onFile != null && !c.DISPUTE_STATUSES_MONEY_TAKEN.includes(onFile)) {
+    return { handled: false, reason: 'no money taken' }
+  }
+
   const feeCents = input.feeCents > 0 ? input.feeCents : 1500
   const owedBack = (Math.max(0, input.amountCents) + feeCents) / 100
   const recorded = await recordHeldItem({
     landlordId: payee.landlord_id, businessId: payee.business_id,
     sourceType: 'dispute', sourceId: input.stripeDisputeId,
     amount: -owedBack, description: `Chargeback on a ${payee.what} (includes Stripe's dispute fee)`,
-  })
+  }, client)
   if (!recorded) return { handled: false, reason: 'already recorded' }
   logger.warn({ ...payee, pi, owedBack }, '[chargeback] held charge disputed — nets against the next payout')
   return { handled: true }

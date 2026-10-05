@@ -130,6 +130,12 @@ describe('ringing a stay at the register', () => {
     const [paid] = await query<any>(`SELECT balance_billed_at, balance_paid_at FROM unit_bookings WHERE unit_id = $1`, [f.unitId])
     expect(paid.balance_billed_at).not.toBeNull()
     expect(paid.balance_paid_at).not.toBeNull()
+    // 10/4 (decisions #37.B, #38): the payment toward the stay is itemized —
+    // how it was paid and how much was for the stay — so an early check-out
+    // can give it back that way.
+    expect(await query<any>(
+      `SELECT kind, method, toward_stay::text, card_fee::text, pos_transaction_id FROM stay_payments WHERE booking_id = (SELECT id FROM unit_bookings WHERE unit_id = $1)`,
+      [f.unitId])).toEqual([{ kind: 'pos_sale', method: 'cash', toward_stay: '120.00', card_fee: '0.00', pos_transaction_id: res.body.data.id }])
   })
 
   it('refuses a stay with no site or date, and takes no money', async () => {
@@ -193,12 +199,18 @@ describe('one price, and it is the site\'s', () => {
     expect(Number(res.body.data.total)).toBe(120)
 
     const [line] = await query<any>(
-      `SELECT unit_price::text, subtotal::text FROM pos_transaction_items
+      `SELECT item_name, qty::text, unit_price::text, subtotal::text FROM pos_transaction_items
         WHERE transaction_id = $1`, [res.body.data.id])
     // The receipt has to agree with the total, or the guest is handed a piece
-    // of paper that contradicts what came out of their wallet.
-    expect(Number(line.unit_price)).toBe(40)
+    // of paper that contradicts what came out of their wallet. 10/3 (decisions
+    // #9): the stay is one line at what its nights cost — the way a stay paid
+    // on a link or a reservation ticket is recorded — and says which nights.
+    expect(Number(line.qty)).toBe(1)
+    expect(Number(line.unit_price)).toBe(120)
     expect(Number(line.subtotal)).toBe(120)
+    expect(line.item_name).toBe('RV site — night — 3 nights at site RV 01 (Oct 1 → Oct 4)')
+    // The register is handed the sale's own lines for the receipt.
+    expect(res.body.data.items).toEqual([{ id: f.itemId, name: line.item_name, qty: 1, price: 120, tax: 0 }])
   })
 
   it('charges a week from the weekly rate, not a multiple of nights', async () => {
@@ -231,11 +243,11 @@ describe('one price, and it is the site\'s', () => {
     expect(Number(res.body.data.total)).toBe(275)
   })
 
-  it('refuses the sale when the site has no rate for that length, and says which', async () => {
+  it('refuses the sale when neither the site nor the property has a rate to price it, and says what to set', async () => {
     // The honest failure. Charging the catalog price instead is exactly how the
     // two numbers drifted apart in the first place.
-    const f = await seed('month', 589, { night: 40, week: 200, month: null })
-    await query(`UPDATE properties SET monthly_rate = NULL WHERE id = $1`, [f.propertyId])
+    const f = await seed('month', 589, { night: null, week: null, month: null })
+    await query(`UPDATE properties SET nightly_rate = NULL, weekly_rate = NULL, monthly_rate = NULL WHERE id = $1`, [f.propertyId])
     const res = await request(buildApp()).post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.token}`)
       .send({
@@ -244,9 +256,29 @@ describe('one price, and it is the site\'s', () => {
         stay: { unitId: f.unitId, checkIn: '2026-10-01', guestName: 'Dale Carter' },
       })
     expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/monthly rate/i)
+    expect(res.body.error).toBe('Site RV 01 has no stay rate set, and neither does the property, so this stay cannot be priced — nothing was charged. '
+      + 'Set the site\'s nightly rate (or the property\'s), then press Charge again.')
     expect(await query('SELECT 1 FROM pos_transactions')).toHaveLength(0)
     expect(await query('SELECT 1 FROM unit_bookings')).toHaveLength(0)
+  })
+
+  it('10/3 (decisions #9): a month with no monthly rate costs what the schedule charges for those nights — never the catalog price', async () => {
+    const f = await seed('month', 589, { night: 40, week: 200, month: null })
+    await query(`UPDATE properties SET monthly_rate = NULL WHERE id = $1`, [f.propertyId])
+    const { priceStayBySchedule } = await import('../services/registerStay')
+    const schedule = await priceStayBySchedule(db, f.unitId, '2026-10-01', '2026-11-01')
+    expect(schedule.total).toBe(885.71)   // 31 nights at the weekly rate, as the schedule prices it
+    const res = await request(buildApp()).post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({
+        items: [{ id: f.itemId, name: 'RV site', qty: 1, price: 589, tax: 0 }],
+        paymentMethod: 'cash', propertyId: f.propertyId,
+        stay: { unitId: f.unitId, checkIn: '2026-10-01', guestName: 'Dale Carter' },
+      })
+    expect(res.status, JSON.stringify(res.body)).toBe(201)
+    expect(Number(res.body.data.total)).toBe(885.71)
+    const [b] = await query<any>(`SELECT total_amount::float AS total FROM unit_bookings WHERE unit_id = $1`, [f.unitId])
+    expect(b.total).toBe(885.71)
   })
 
   it('a cashier with no pricing permission can still ring a stay', async () => {

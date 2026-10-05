@@ -1,0 +1,172 @@
+{
+  "payer": {
+    "totalOutstanding": 0,
+    "paymentBlocked": false,
+    "leases": [
+      {
+        "leaseId": "00000000-0000-4000-8000-000000000001",
+        "propertyName": "Oak Park",
+        "unitNumber": "MH 09",
+        "landlordId": "00000000-0000-4000-8000-000000000002",
+        "paymentBlocked": false,
+        "outstanding": 0,
+        "grossOutstanding": 0,
+        "carriedBalance": 0,
+        "requiredNow": 0,
+        "usableCredit": 0,
+        "expectedCredit": 0,
+        "creditOnFile": 0,
+        "payIfUsed": 0,
+        "payIfSaved": 0,
+        "coversWholeBill": false,
+        "creditWaiting": 0,
+        "creditWaitingNote": null,
+        "creditWaitingHeldBy": [],
+        "creditKeptElsewhere": 0,
+        "creditKeptForLater": 0,
+        "creditAlsoHeld": 0,
+        "creditRestNote": null,
+        "payAll": null,
+        "gamCharges": 0,
+        "clearing": 0,
+        "awaitingConfirmation": [
+          {
+            "paymentIntentId": "pi_screen",
+            "remittanceId": "00000000-0000-4000-8000-000000000003",
+            "amount": 1005,
+            "confirmBy": "2026-10-04T18:30:00.000Z",
+            "canConfirm": true,
+            "mine": true,
+            "payerName": null,
+            "leaseId": "00000000-0000-4000-8000-000000000001",
+            "serviceAgreementId": null
+          }
+        ],
+        "scheduledRetries": [],
+        "methodCosts": [
+          {
+            "method": "ach",
+            "label": "Bank account",
+            "fee": 0,
+            "total": 0
+          },
+          {
+            "method": "card",
+            "label": "Card or debit",
+            "fee": 0,
+            "total": 0
+          },
+          {
+            "method": "manual",
+            "label": "Cash, check or money order — free",
+            "fee": 0,
+            "total": 0
+          }
+        ],
+        "methodCostsIfUsed": null,
+        "suggestedPayAhead": 12000,
+        "rows": []
+      }
+    ],
+    "serviceAgreements": [],
+    "awaitingCardConfirmations": [
+      {
+        "paymentIntentId": "pi_screen",
+        "remittanceId": "00000000-0000-4000-8000-000000000003",
+        "amount": 1005,
+        "confirmBy": "2026-10-04T18:30:00.000Z",
+        "canConfirm": true,
+        "mine": true,
+        "payerName": null,
+        "leaseId": "00000000-0000-4000-8000-000000000001",
+        "serviceAgreementId": null
+      }
+    ],
+    "rows": []
+  },
+  "coTenant": {
+    "totalOutstanding": 0,
+    "paymentBlocked": false,
+    "leases": [
+      {
+        "leaseId": "00000000-0000-4000-8000-000000000001",
+        "propertyName": "Oak Park",
+        "unitNumber": "MH 09",
+        "landlordId": "00000000-0000-4000-8000-000000000002",
+        "paymentBlocked": false,
+        "outstanding": 0,
+        "grossOutstanding": 0,
+        "carriedBalance": 0,
+        "requiredNow": 0,
+        "usableCredit": 0,
+        "expectedCredit": 0,
+        "creditOnFile": 0,
+        "payIfUsed": 0,
+        "payIfSaved": 0,
+        "coversWholeBill": false,
+        "creditWaiting": 0,
+        "creditWaitingNote": null,
+        "creditWaitingHeldBy": [],
+        "creditKeptElsewhere": 0,
+        "creditKeptForLater": 0,
+        "creditAlsoHeld": 0,
+        "creditRestNote": null,
+        "payAll": null,
+        "gamCharges": 0,
+        "clearing": 0,
+        "awaitingConfirmation": [
+          {
+            "paymentIntentId": "pi_screen",
+            "remittanceId": "00000000-0000-4000-8000-000000000003",
+            "amount": 1005,
+            "confirmBy": "2026-10-04T18:30:00.000Z",
+            "canConfirm": false,
+            "mine": false,
+            "payerName": "Jane Doe",
+            "leaseId": "00000000-0000-4000-8000-000000000001",
+            "serviceAgreementId": null
+          }
+        ],
+        "scheduledRetries": [],
+        "methodCosts": [
+          {
+            "method": "ach",
+            "label": "Bank account",
+            "fee": 0,
+            "total": 0
+          },
+          {
+            "method": "card",
+            "label": "Card or debit",
+            "fee": 0,
+            "total": 0
+          },
+          {
+            "method": "manual",
+            "label": "Cash, check or money order — free",
+            "fee": 0,
+            "total": 0
+          }
+        ],
+        "methodCostsIfUsed": null,
+        "suggestedPayAhead": 12000,
+        "rows": []
+      }
+    ],
+    "serviceAgreements": [],
+    "awaitingCardConfirmations": [
+      {
+        "paymentIntentId": "pi_screen",
+        "remittanceId": "00000000-0000-4000-8000-000000000003",
+        "amount": 1005,
+        "confirmBy": "2026-10-04T18:30:00.000Z",
+        "canConfirm": false,
+        "mine": false,
+        "payerName": "Jane Doe",
+        "leaseId": "00000000-0000-4000-8000-000000000001",
+        "serviceAgreementId": null
+      }
+    ],
+    "rows": []
+  }
+}

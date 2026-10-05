@@ -6039,8 +6039,24 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     // order_index still unsigned, or any unsigned landlord on a tenant's view.
     // Not a new restriction — it is the existing restriction, made visible
     // before someone wastes their time instead of after.
+    //
+    // S655, the same idea for a NEW LEASE whose lease before it ENDED EARLY
+    // while nobody in the household had signed it: the submit refuses every
+    // tenant signature on it (it is being canceled — renewalSuccessor
+    // .followsLeaseEndedEarlyUnsigned), so someone opening an old emailed link
+    // reads it, with that reason in the same words, instead of filling it all
+    // in and being refused at the end. `closedReason` says why; it wins over
+    // `waitingOn` — no turn is coming.
+    let closedReason: string | null = null
+    if (!docTerminal && !signerTerminal && doc.renews_lease_id && doc.lease_id && isTenantRole(signer.role)) {
+      const { followsLeaseEndedEarlyUnsigned, NEW_LEASE_AFTER_EARLY_END_CANNOT_SIGN } =
+        await import('../services/renewalSuccessor')
+      const gone = await queryOne(
+        `SELECT 1 FROM leases nl WHERE nl.id = $1 AND ${followsLeaseEndedEarlyUnsigned('nl')}`, [doc.lease_id])
+      if (gone) closedReason = NEW_LEASE_AFTER_EARLY_END_CANNOT_SIGN
+    }
     let waitingOn: string | null = null
-    if (!docTerminal && !signerTerminal) {
+    if (!docTerminal && !signerTerminal && !closedReason) {
       const blocker = await queryOne<{ name: string; role: string }>(
         `SELECT name, role FROM lease_document_signers
           WHERE document_id = $1 AND status != 'signed'
@@ -6049,7 +6065,7 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
         [doc.id, signer.order_index, isTenantRole(signer.role)])
       if (blocker) waitingOn = blocker.role === 'landlord' ? 'the landlord' : blocker.name
     }
-    const readOnly = docTerminal || signerTerminal || waitingOn !== null
+    const readOnly = docTerminal || signerTerminal || waitingOn !== null || closedReason !== null
 
     // S636 (Nic): THE SIGNER SEES THE WHOLE DOCUMENT, not just their own slots.
     //
@@ -6278,7 +6294,7 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
           `SELECT p.rent_due_mode AS m FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
           [doc.unit_id]))?.m ?? 'fixed_day'
       : 'fixed_day'
-    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, renewal_billing, property_late_fee, existing_tenancy, rent_due_mode, readOnly, waitingOn, packageDocs } })
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, renewal_billing, property_late_fee, existing_tenancy, rent_due_mode, readOnly, waitingOn, closedReason, packageDocs } })
   } catch (e) { next(e) }
 })
 

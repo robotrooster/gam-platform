@@ -4,6 +4,11 @@
  * ended, their deposit-return summary. Hard-scoped to actor.profileId
  * (tenant_id). Deliberately selects ONLY basic fields — never the
  * FlexDeposit / interest / advance columns (legally sensitive).
+ *
+ * S655: security_deposits.disbursed_to_landlord is not read. Nothing writes it
+ * (numeric, default 0), so the agent only ever saw '0.00'. How a deposit ended
+ * is the deposit_returns summary below; whoever holds the deposit refunds the
+ * rest (decisions #46.3).
  */
 
 import { query } from '../../../db'
@@ -14,7 +19,6 @@ interface DepositRow {
   collected_amount: string | null
   status: string
   damage_claimed: boolean | null
-  disbursed_to_landlord: boolean | null
   held_by: string | null
 }
 interface ReturnRow {
@@ -34,7 +38,7 @@ export const getMyDeposit: AgentTool = {
   audiences: ['tenant'],
   async execute(_args, actor: AgentActor) {
     const deposits = await query<DepositRow>(
-      `SELECT total_amount, collected_amount, status, damage_claimed, disbursed_to_landlord, held_by
+      `SELECT total_amount, collected_amount, status, damage_claimed, held_by
          FROM security_deposits WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1`,
       [actor.profileId]
     )
@@ -55,7 +59,6 @@ export const getMyDeposit: AgentTool = {
         collectedAmount: d.collected_amount != null ? Number(d.collected_amount) : null,
         status: d.status,
         damageClaimed: d.damage_claimed,
-        disbursedToLandlord: d.disbursed_to_landlord,
         heldBy: d.held_by,
         // Friendly holder description so the agent never parrots the raw enum.
         // gam_escrow = GAM holds it in trust (new-tenant deposits); landlord =

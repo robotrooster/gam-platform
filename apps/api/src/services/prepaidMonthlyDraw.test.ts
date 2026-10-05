@@ -5,14 +5,18 @@
  * credit each month, to where she would still get a partial bill each month."
  *
  * leases.prepaid_monthly_draw caps what one billing month may take from the
- * paid-ahead money. Three places spend that money and all three read the cap:
- * the invoice run (whole bills only), the tenant's Pay Now (nets the capped
- * amount, then spends it), and the desk (cash + capped credit settle one bill).
+ * paid-ahead money. S655: every spend reads the cap from the credit ledger
+ * (credit_uses, held + applied, by billing month), whoever spends it:
+ *   - the bill run (whole bills only: Nic 10/2, credit applies by itself only
+ *     when it covers the whole bill — a cap below the bill means the tenant
+ *     chooses, and nothing settles by itself);
+ *   - the tenant's Pay Now and the desk, which offer "credit available $X" from
+ *     the household quote (creditUse.planCredit) and spend it when chosen.
  */
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest'
 import { db } from '../db'
 import { consumePrepaidCreditForInvoice, prepaidDrawAvailable } from './prepaidRelease'
-import { postTenantPayment } from './postPayment'
+import { householdQuote, planCredit, applyCredit } from './creditUse'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedAllocationRule,
@@ -83,50 +87,59 @@ describe('a monthly draw on paid-ahead credit', () => {
     expect(await remaining(f.leaseId)).toBe(2000 - 589)
   })
 
-  it('with a $200 cap, the invoice run leaves a $589 rent whole — but covers a $60 water line, which counts toward the month', async () => {
+  // S655 (Nic 10/2): this used to settle the $60 water line by itself and leave
+  // the $589 rent open — credit picking off part of a bill. Credit now applies
+  // by itself only when it covers the WHOLE bill; a $200 cap cannot cover $649,
+  // so nothing settles and the $200 is offered to the tenant when they pay.
+  it('with a $200 cap, the invoice run leaves a $589 rent and a $60 water line both open — whole bills only', async () => {
     const f = await fixture(200)
     const inv = await invoiceFor(f, '2026-11-01', [
       { type: 'rent', amount: 589, entry: 'RENT' }, { type: 'utility', amount: 60, entry: 'UTILITY' }])
     const r = await release(f, inv.invoiceId)
-    expect(r.consumed).toBe(60)
+    expect(r.consumed).toBe(0)
     expect(await status(inv.paymentIds[0])).toBe('pending')
-    expect(await status(inv.paymentIds[1])).toBe('settled')
-    const avail = await prepaidDrawAvailable(db as any, f.leaseId, '2026-11-01')
-    expect(avail).toMatchObject({ remaining: 1940, cap: 200, drawnThisMonth: 60, available: 140 })
-    // December is a fresh month
+    expect(await status(inv.paymentIds[1])).toBe('pending')
+    expect(await prepaidDrawAvailable(db as any, f.leaseId, '2026-11-01'))
+      .toMatchObject({ remaining: 2000, cap: 200, drawnThisMonth: 0, available: 200 })
+  })
+
+  it('a bill the month\'s draw does cover settles by itself and counts toward the month', async () => {
+    const f = await fixture(200)
+    const inv = await invoiceFor(f, '2026-11-01', [{ type: 'utility', amount: 60, entry: 'UTILITY' }])
+    const r = await release(f, inv.invoiceId)
+    expect(r.consumed).toBe(60)
+    expect(await status(inv.paymentIds[0])).toBe('settled')
+    expect(await prepaidDrawAvailable(db as any, f.leaseId, '2026-11-01'))
+      .toMatchObject({ remaining: 1940, cap: 200, drawnThisMonth: 60, available: 140 })
+    // December is a fresh month.
     expect((await prepaidDrawAvailable(db as any, f.leaseId, '2026-12-01')).available).toBe(200)
   })
 
-  it('at the desk, a $200 cap means she pays $389 on a $589 bill and the credit takes the rest', async () => {
+  it('at the desk, a $200 cap offers $200 of credit on a $589 bill; using it leaves $389 to pay', async () => {
     const f = await fixture(200)
     const inv = await invoiceFor(f, '2026-11-01', [{ type: 'rent', amount: 589, entry: 'RENT' }])
     const c = await db.connect()
     try {
       await c.query('BEGIN')
-      const r = await postTenantPayment(c, { tenantId: f.tenantId, landlordIds: [f.landlordId], method: 'cash', amount: 389, postedBy: f.userId })
+      const q = await householdQuote(c, { tenantId: f.tenantId, landlordId: f.landlordId, lock: true })
+      expect(q.leases[0].usableCredit).toBe(200)
+      expect(q.leases[0].requiredTotal - q.leases[0].usableCredit).toBe(389)
+      await applyCredit(c, planCredit(q, f.leaseId), { source: 'desk' })
       await c.query('COMMIT')
-      expect(r.applied).toBe(389)
-      expect(r.paidAhead).toBe(0)
     } finally { c.release() }
-    expect(await status(inv.paymentIds[0])).toBe('settled')
     expect(await remaining(f.leaseId)).toBe(1800)
-    const draws = (await db.query(`SELECT amount::float AS a, billing_month::text AS m, payment_id FROM lease_prepaid_credit_draws WHERE lease_id=$1`, [f.leaseId])).rows
-    expect(draws).toHaveLength(1)
-    expect(draws[0]).toMatchObject({ a: 200, m: '2026-11-01', payment_id: inv.paymentIds[0] })
-    // the landlord's $200 is GAM-held money — it rides the payout as a held item
-    const held = (await db.query(`SELECT amount::float AS a, source_type FROM held_payout_items WHERE source_id=$1`, [inv.paymentIds[0]])).rows
-    expect(held).toEqual([{ a: 200, source_type: 'prepaid_draw' }])
+    const uses = (await db.query(`SELECT amount::float AS a, billing_month::text AS m, payment_id, source FROM credit_uses WHERE lease_id=$1`, [f.leaseId])).rows
+    expect(uses).toEqual([{ a: 200, m: '2026-11-01', payment_id: inv.paymentIds[0], source: 'desk' }])
+    expect((await prepaidDrawAvailable(db as any, f.leaseId, '2026-11-01')).available).toBe(0)
   })
 
-  it('at the desk, $389 is short when the cap is only $100', async () => {
+  it('at the desk, a $100 cap offers only $100', async () => {
     const f = await fixture(100)
     await invoiceFor(f, '2026-11-01', [{ type: 'rent', amount: 589, entry: 'RENT' }])
     const c = await db.connect()
     try {
-      await c.query('BEGIN')
-      await expect(postTenantPayment(c, { tenantId: f.tenantId, landlordIds: [f.landlordId], method: 'cash', amount: 389, postedBy: f.userId }))
-        .rejects.toThrow()
-      await c.query('ROLLBACK')
+      const q = await householdQuote(c, { tenantId: f.tenantId, landlordId: f.landlordId })
+      expect(q.leases[0].usableCredit).toBe(100)
     } finally { c.release() }
   })
 
@@ -138,11 +151,21 @@ describe('a monthly draw on paid-ahead credit', () => {
       const c = await db.connect()
       try {
         await c.query('BEGIN')
-        await postTenantPayment(c, { tenantId: f.tenantId, landlordIds: [f.landlordId], method: 'cash', amount: 389, postedBy: f.userId })
+        const q = await householdQuote(c, { tenantId: f.tenantId, landlordId: f.landlordId, lock: true })
+        expect(planCredit(q, f.leaseId)).toMatchObject([{ paymentId: inv.paymentIds[0], amount: 200, billingMonth: due }])
+        await applyCredit(c, planCredit(q, f.leaseId), { source: 'desk' })
+        // The desk then records the $389 cash for the rest.
+        await c.query(`UPDATE payments SET status='settled', settled_at=now(), manual_method='cash' WHERE id=$1`, [inv.paymentIds[0]])
         await c.query('COMMIT')
       } finally { c.release() }
       expect(await status(inv.paymentIds[0])).toBe('settled')
     }
     expect(await remaining(f.leaseId)).toBe(1600)
+  })
+
+  it('a withdrawn paid-ahead credit is out of the month\'s available money', async () => {
+    const f = await fixture(null)
+    await db.query(`UPDATE lease_prepaid_credits SET voided_at = now(), void_reason = 'bank deposit undone' WHERE lease_id = $1`, [f.leaseId])
+    expect(await prepaidDrawAvailable(db as any, f.leaseId, '2026-11-01')).toMatchObject({ remaining: 0, available: 0 })
   })
 })

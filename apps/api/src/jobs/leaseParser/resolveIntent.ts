@@ -25,6 +25,7 @@ import { getClient, query, queryOne } from '../../db'
 import { emailTenantOnboarded } from '../../services/email'
 import { AppError } from '../../middleware/errorHandler'
 import { assertLateFeeDecisionForUnit } from '../../services/lateFeePolicy'
+import { reasonSentence } from '../../services/leaseOnboarding'
 import { extractUploadFilename } from '../../lib/uploadPaths'
 import type {
   ParserOutput, ParserExtractedField,
@@ -86,6 +87,12 @@ interface ResolveSentToSign {
   draftedDocumentIds: string[]
   /** Why no lease drafted, when one didn't — said on screen, never emailed. */
   draftBlocked: string[]
+  /**
+   * Final sweep (10/3): when nothing drafted, the usual invite went instead
+   * (inviteHouseholdToNewLease's fallback). True only when it actually reached
+   * them; the message says which, or that nothing has.
+   */
+  fallbackSent: boolean
   message: string
 }
 type ResolveResult = ResolveSuccess | ResolveNeedsConfirm | ResolveSentToSign
@@ -598,18 +605,32 @@ async function sendImportToSign(a: {
   firstName: string; lastName: string; phone: string | null
   byUserId: string | null
 }): Promise<ResolveSentToSign> {
-  const message =
-    `${a.firstName} ${a.lastName} already has a GAM account with another company, so they sign this lease themselves. ` +
-    `It's drafted from your setup for Unit ${a.unit.unit_number} and waiting for your signature in Front Desk; it starts when they sign.`
+  // Final sweep (10/3): the same words POST /landlords/me/onboard-tenant uses
+  // for the same person (routes/landlords.ts, the sentToSign branch). This
+  // said "It's drafted… waiting for your signature" even when nothing had
+  // drafted, so the landlord (and the agent reading it to him) went looking in
+  // Front Desk for a lease that was not there.
+  const who = `${String(a.firstName ?? '').trim()} ${String(a.lastName ?? '').trim()}`.trim()
+  const lead = `${who} already has a GAM account with another company, so they sign this lease themselves`
+  const drafted = (unitNumber: string, landlordSigned: boolean) => landlordSigned
+    ? `${lead}. The lease for Unit ${unitNumber} is drafted and you have signed it; it is waiting on their signature, and it starts when they sign. Nothing is billed before then.`
+    : `${lead}. It is drafted from your setup for Unit ${unitNumber} (the unit's rent and default lease, not the paper's terms; check them when you sign) ` +
+      `and is waiting for your signature in Front Desk. Once you sign, they get one email to sign it, and it starts when they do. Nothing is billed before then.`
   if (a.intent.draft_document_id) {
-    const live = await queryOne<{ id: string }>(
-      `SELECT id FROM lease_documents WHERE id = $1 AND status NOT IN ('voided', 'execution_failed')`,
+    const live = await queryOne<{ id: string; landlord_signed: boolean }>(
+      `SELECT d.id,
+              EXISTS (SELECT 1 FROM lease_document_signers s
+                       WHERE s.document_id = d.id AND s.role = 'landlord' AND s.status = 'signed') AS landlord_signed
+         FROM lease_documents d
+        WHERE d.id = $1 AND d.status NOT IN ('voided', 'execution_failed')`,
       [a.intent.draft_document_id])
     if (live) {
+      // Pressing Build again: nothing new is drafted or sent.
       return {
         sentToSign: true, tenantId: a.userTenant.tenant_id ?? '', userId: a.userTenant.user_id,
         email: a.userTenant.email, unitId: a.unit.id, unitNumber: a.unit.unit_number,
-        draftedDocumentIds: [live.id], draftBlocked: [], message,
+        draftedDocumentIds: [live.id], draftBlocked: [], fallbackSent: false,
+        message: drafted(a.unit.unit_number, live.landlord_signed === true),
       }
     }
   }
@@ -631,10 +652,22 @@ async function sendImportToSign(a: {
     rebindIntentId: a.intentId,
   })
   const person = res.people[0]
+  // Nothing drafted: say so, with the reason as it reads (it already says how
+  // it gets drafted), then only the step after it, then what actually reached
+  // them, and that nothing did when nothing did.
+  const reached = person.notified === 'notice' ? ' They were sent a notice in their GAM account that you added them.'
+    : person.notified === 'email' ? ' They were sent an email to set up their account.'
+    : ' Nothing has reached them yet; they get one email once you sign it.'
+  const message = res.draftedDocumentIds.length > 0
+    ? drafted(res.unitNumber, false)
+    : `${lead}, but it could not be drafted yet. ` +
+      `${reasonSentence(res.draftBlocked[0] ?? `The lease for Unit ${res.unitNumber} is not ready to draft yet.`)} ` +
+      `Once it is drafted, sign it in Front Desk.${reached}`
   return {
     sentToSign: true, tenantId: person.tenantId, userId: person.userId, email: person.email,
     unitId: res.unitId, unitNumber: res.unitNumber,
-    draftedDocumentIds: res.draftedDocumentIds, draftBlocked: res.draftBlocked, message,
+    draftedDocumentIds: res.draftedDocumentIds, draftBlocked: res.draftBlocked,
+    fallbackSent: res.fallbackSent, message,
   }
 }
 

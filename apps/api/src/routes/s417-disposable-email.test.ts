@@ -164,7 +164,7 @@ describe('POST /api/books/contractors — S417 disposable-domain block', () => {
       const { userId, landlordId } = await seedLandlord(c)
       await c.query('COMMIT')
       token = sign({ userId, role: 'landlord', email: 'l@t.dev',
-                     profileId: landlordId, permissions: {} })
+                     profileId: null, landlordIds: [landlordId], permissions: {} })
     } finally { c.release() }
     const res = await request(buildBooksApp())
       .post('/api/books/contractors')
@@ -193,7 +193,7 @@ describe('POST /api/books/vendors — S417 disposable-domain block', () => {
       const { userId, landlordId } = await seedLandlord(c)
       await c.query('COMMIT')
       token = sign({ userId, role: 'landlord', email: 'l@t.dev',
-                     profileId: landlordId, permissions: {} })
+                     profileId: null, landlordIds: [landlordId], permissions: {} })
     } finally { c.release() }
     const res = await request(buildBooksApp())
       .post('/api/books/vendors')
@@ -224,7 +224,7 @@ describe('POST /api/books/employees — S417 disposable-domain block', () => {
       const { userId, landlordId } = await seedLandlord(c)
       await c.query('COMMIT')
       token = sign({ userId, role: 'landlord', email: 'l@t.dev',
-                     profileId: landlordId, permissions: {} })
+                     profileId: null, landlordIds: [landlordId], permissions: {} })
     } finally { c.release() }
     const res = await request(buildBooksApp())
       .post('/api/books/employees')

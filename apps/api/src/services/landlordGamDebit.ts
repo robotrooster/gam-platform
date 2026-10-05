@@ -50,6 +50,7 @@ import { getStripe } from '../lib/stripe'
 import { getClient, query, queryOne } from '../db'
 import { logger } from '../lib/logger'
 import { chargeLandlord, outstandingForLandlord, debitThresholdForLandlord } from './landlordGamAccount'
+import { recordPlatformRevenue } from './platformRevenue'
 // GAM has ONE ACH price — $6 flat — and a fee debit is not allowed to invent a
 // second one. See ACH_DEBIT_FLAT below.
 import { PROCESSING_FEES } from '@gam/shared'
@@ -327,16 +328,38 @@ export async function settleGamDebit(
   const client = await getClient()
   try {
     await client.query('BEGIN')
+    // Claimed first, and only while still pending: two deliveries of the same
+    // webhook racing each other settle it once (the read above is outside this
+    // transaction and both could pass it).
+    const claimed = await client.query<{ bank_cost_amount: string }>(
+      `UPDATE landlord_gam_debits
+          SET status='succeeded', settled_at=NOW(), updated_at=NOW()
+        WHERE id=$1 AND status='pending'
+        RETURNING bank_cost_amount::text AS bank_cost_amount`,
+      [debit.id])
+    if (!claimed.rows.length) { await client.query('ROLLBACK'); return }
     await client.query(
       `UPDATE landlord_gam_charges
           SET collected_amount = amount, collected_at = NOW(), updated_at = NOW()
         WHERE id = ANY($1::uuid[])`,
       [debit.charge_ids])
-    await client.query(
-      `UPDATE landlord_gam_debits
-          SET status='succeeded', settled_at=NOW(), updated_at=NOW()
-        WHERE id=$1`,
-      [debit.id])
+    // 10/3 (Nic's admin cards): the $6 bank cost is GAM's processing revenue —
+    // GAM's one ACH price, charged for the transfer that collected its fees —
+    // and it was never written down: the pull's Stripe fee ($0.27 on Oak Park's
+    // $54) was counted as a cost while the $6 that paid for it was counted
+    // nowhere. Booked when the money lands, like a bank rent payment's fee, as
+    // a processing spread (the month's true-up subtracts what Stripe took).
+    const bankCost = Math.round(parseFloat(claimed.rows[0].bank_cost_amount) * 100) / 100
+    if (bankCost > 0) {
+      await recordPlatformRevenue({
+        type: 'banking_spread',
+        amount: bankCost,
+        customerFeeCharged: bankCost,
+        referenceId: debit.id,
+        referenceType: 'gam_bank_debit',
+        notes: 'Bank transfer cost on a debit of GAM fees ($6 flat, GAM\'s one ACH price)',
+      }, client)
+    }
     await client.query('COMMIT')
   } catch (e) {
     try { await client.query('ROLLBACK') } catch {}

@@ -92,3 +92,14 @@ describe('GET /reports/monthly-pl', () => {
     expect([400, 403, 404]).toContain(res.status)
   })
 })
+
+// S655: the switch does not change who the statement belongs to — a P&L is
+// still ONE company's, asked for by name when the account owns two.
+describe('GET /reports/monthly-pl under Money billed', () => {
+  it('still asks which company, and answers once one is named', async () => {
+    expect((await pl('year=2026&month=9&basis=billed', twoCoToken)).status).toBe(400)
+    const res = await pl(`year=2026&month=9&basis=billed&landlordId=${coA}`, twoCoToken)
+    expect(res.status).toBe(200)
+    expect(res.body.data.meta.basis.basis).toBe('billed')
+  })
+})

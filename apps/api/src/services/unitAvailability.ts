@@ -27,24 +27,53 @@ export interface StayWindow {
    * boots them as unconfirmed when there's no other spaces"). Callers that are
    * about to take money pass this and then call clearUnpaidHolds in the same
    * transaction — the hold is moved to an equivalent site, or the holder is
-   * told. Nothing that has taken a deposit is ever ignored.
+   * told. Nothing that has taken a deposit is ever ignored, and neither is a
+   * timed hold (hold_expires_at set: a guest paying on the booking page now)
+   * or a hold already moved once (displaced_at set) — the same set
+   * clearUnpaidHolds moves.
    */
   ignoreUnpaidHolds?: boolean
+  /**
+   * 10/3: look only at what holds the site OTHER than reservations (the
+   * owner's use, a lease, out-of-order nights, a tenant completing
+   * onboarding) — for a refusal that has to name every step that frees the
+   * nights, not only the first thing found.
+   */
+  ignoreBookings?: boolean
 }
 
 export type StayConflict = 'booking' | 'lease' | 'pending_tenant' | 'out_of_order' | 'owner_use' | null
 
+/**
+ * 10/3 — AN UNPAID HOLD THAT STEPS ASIDE FOR MONEY, as a SQL condition on the
+ * unit_bookings row `alias`: no deposit taken, no clock on it (a TIMED hold is
+ * a guest on the booking page in the middle of paying), and never moved once
+ * already for somebody who paid. findStayConflict ignores exactly these for a
+ * paying save, and services/holdDisplacement unpaidHoldsOn moves (and locks)
+ * the same set.
+ */
+export function yieldingHoldSql(alias: string): string {
+  return `(${alias}.status = 'tentative' AND ${alias}.deposit_paid_at IS NULL`
+    + ` AND ${alias}.hold_expires_at IS NULL AND ${alias}.displaced_at IS NULL)`
+}
+
 export async function findStayConflict(unitId: string, w: StayWindow): Promise<StayConflict> {
-  const booking = await queryOne<any>(`
-    SELECT id FROM unit_bookings
-    WHERE unit_id = $1 AND status NOT IN ('cancelled')
-      AND ($2::uuid IS NULL OR id != $2)
-      AND ($3::date IS NULL OR check_in < $3)
-      AND check_out > $4
+  const booking = w.ignoreBookings === true ? null : await queryOne<any>(`
+    SELECT b.id FROM unit_bookings b
+    WHERE b.unit_id = $1 AND b.status NOT IN ('cancelled')
+      AND ($2::uuid IS NULL OR b.id != $2)
+      AND ($3::date IS NULL OR b.check_in < $3)
+      AND b.check_out > $4
       -- S652: an unpaid hold steps aside for money. deposit_paid_at, not the
       -- status, decides — a booking somebody has paid for is never ignored
       -- however its status reads.
-      AND NOT ($5::boolean AND status = 'tentative' AND deposit_paid_at IS NULL)`,
+      -- 10/3: exactly the holds clearUnpaidHolds moves (services/
+      -- holdDisplacement unpaidHoldsOn), so nothing ignored here is left on
+      -- the site. A TIMED hold is a guest on the booking page in the middle
+      -- of paying, and a hold already MOVED once for somebody who paid is not
+      -- moved again (the register keeps both off its list too): neither is
+      -- ignored, so a reservation over one is refused, never sold on top of it.
+      AND NOT ($5::boolean AND ${yieldingHoldSql('b')})`,
     [unitId, w.excludeBookingId ?? null, w.checkOut ?? null, w.checkIn, w.ignoreUnpaidHolds === true])
   if (booking) return 'booking'
   // S654 (Nic): "If I mark a unit as owner use, that should mark it as occupied

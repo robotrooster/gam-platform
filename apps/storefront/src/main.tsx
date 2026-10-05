@@ -229,7 +229,7 @@ function App() {
         <HomePage slug={s} profile={profile} />
       )}
       <div className="footer wrap">Reservations powered by Gold Asset Management</div>
-      <PropertyChat slug={s} propertyName={p.name} />
+      <AssistantGate><PropertyChat slug={s} propertyName={p.name} /></AssistantGate>
     </Shell>
   )
 }
@@ -965,6 +965,20 @@ function ChatRow({ role, text }: { role: 'user' | 'agent'; text: string }) {
       <div className={`pc-b ${me ? 'me' : 'them'}`}>{text}</div>
     </div>
   )
+}
+
+// 10/4 (Nic): every AI assistant is off until it is retrained. The chat
+// renders only when the platform switch says it is on — no bubble otherwise.
+function AssistantGate({ children }: { children: React.ReactNode }) {
+  const [on, setOn] = useState(false)
+  useEffect(() => {
+    let live = true
+    axios.get(`${API}/api/sales/assistant`)
+      .then(r => { if (live) setOn(r.data?.data?.visible === true) })
+      .catch(() => { /* stays hidden */ })
+    return () => { live = false }
+  }, [])
+  return on ? <>{children}</> : null
 }
 
 function PropertyChat({ slug, propertyName }: { slug: string; propertyName: string }) {

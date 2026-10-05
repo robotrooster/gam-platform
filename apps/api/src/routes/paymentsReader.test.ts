@@ -240,24 +240,75 @@ describe('S654 card on the counter reader', () => {
     expect(paymentIntentsCaptureMock).toHaveBeenCalledWith('pi_reader_1')
   })
 
-  // S654 review: the counter takes what is OWED — credit on the account netted,
-  // exactly the figure the portal and the desk show.
-  it('credit on the account comes off the reader total, and the quote says so', async () => {
+  // S655 (Nic, 10/2): credit is the payer's to use or save — the desk asks
+  // before the amount goes to the reader, never nets it by itself.
+  it('the reader asks before using credit', async () => {
     const f = await fixture()
     await db.query(
       `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
        VALUES ($1,$2,$3,100,100,'other')`, [f.landlordId, f.tenantId, f.leaseId])
+    const feeUsed = processingFeeFor({ amount: 382.47, paymentMethod: 'card' })
+    const totalUsed = Math.round((382.47 + feeUsed) * 100) / 100
+
+    // Before the desk answers: the whole bill, the credit beside it, both prices.
     const q = await request(buildApp()).get(`/api/payments/${f.rentId}/reader/quote`).set('Authorization', `Bearer ${f.token}`)
     expect(q.status).toBe(200)
-    const fee = processingFeeFor({ amount: 382.47, paymentMethod: 'card' })
-    expect(q.body.data).toMatchObject({ outstanding: 482.47, creditApplied: 100, balance: 382.47, cardFee: fee, total: Math.round((382.47 + fee) * 100) / 100 })
-    // The reader shows what the CARD pays: the credit clears the rest after allocation.
-    expect(q.body.data.lineItems.map((l: any) => l.amountCents)).toEqual([38247])
-    const res = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
+    expect(q.body.data).toMatchObject({
+      outstanding: 482.47, usableCredit: 100, needsCreditChoice: true, creditApplied: 0, balance: 482.47, total: TOTAL,
+    })
+    expect(q.body.data.ifUsed).toMatchObject({ balance: 382.47, cardFee: feeUsed, total: totalUsed })
+    expect(q.body.data.ifSaved).toMatchObject({ balance: 482.47, cardFee: FEE, total: TOTAL })
+
+    // No answer: nothing goes to the reader.
+    const unanswered = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
       .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1' })
-    expect(res.status).toBe(201)
-    expect(res.body.data.total).toBe(q.body.data.total)
-    expect(createRentReaderPaymentIntentMock).toHaveBeenCalledWith(expect.objectContaining({ amountCents: Math.round(q.body.data.total * 100) }))
+    expect(unanswered.status).toBe(422)
+    expect(unanswered.body.error).toMatch(/use it or save it/)
+    expect(createRentReaderPaymentIntentMock).not.toHaveBeenCalled()
+
+    // "Use": the card pays the bill less the credit; the choice rides on the intent.
+    const used = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1', useCredit: true, expectedCredit: 100 })
+    expect(used.status, JSON.stringify(used.body)).toBe(201)
+    expect(used.body.data).toMatchObject({ creditUsed: 100, total: totalUsed })
+    expect(createRentReaderPaymentIntentMock).toHaveBeenLastCalledWith(expect.objectContaining({ amountCents: Math.round(totalUsed * 100) }))
+    expect(paymentIntentsUpdateMock).toHaveBeenCalledWith('pi_reader_1', { metadata: expect.objectContaining({
+      gam_use_credit: 'true', gam_expected_credit: '100.00' }) })
+    // The credit pays the oldest line first (rent); the card pays the rest of it and the water.
+    expect(used.body.data.lineItems.map((l: any) => l.amountCents)).toEqual([36000, 2247])
+
+    // "Save": the whole bill goes on the card and the credit stays.
+    const saved = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1', useCredit: false, expectedCredit: 100 })
+    expect(saved.status).toBe(201)
+    expect(saved.body.data).toMatchObject({ creditUsed: 0, total: TOTAL })
+    expect((await db.query(`SELECT 1 FROM credit_uses`)).rowCount).toBe(0)
+  })
+
+  it('on approval with the credit used: the credit is set aside on the receipt and the card pays the rest', async () => {
+    const f = await fixture()
+    const { rows: [credit] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,100,100,'other') RETURNING id`, [f.landlordId, f.tenantId, f.leaseId])
+    const feeUsed = processingFeeFor({ amount: 382.47, paymentMethod: 'card' })
+    const totalUsed = Math.round((382.47 + feeUsed) * 100) / 100
+    retrieveTerminalPaymentIntentMock.mockResolvedValue({
+      id: 'pi_reader_1', status: 'requires_capture', amount: Math.round(totalUsed * 100),
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId,
+                  gam_use_credit: 'true', gam_expected_credit: '100.00' },
+    } as any)
+    const res = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/capture`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data.total).toBe(totalUsed)
+    const { rows: [rem] } = await db.query<any>(`SELECT id, amount::float AS amount FROM tenant_remittances`)
+    expect(rem.amount).toBe(382.47)
+    const { rows: uses } = await db.query<any>(`SELECT status, source, remittance_id, amount::float AS amount FROM credit_uses`)
+    expect(uses).toEqual([{ status: 'held', source: 'front_desk_reader', remittance_id: rem.id, amount: 100 }])
+    const { rows: [c] } = await db.query<any>(`SELECT amount_remaining::float AS r FROM tenant_credits WHERE id=$1`, [credit.id])
+    expect(c.r).toBe(0)
+    const { rows } = await db.query<any>(`SELECT status, stripe_payment_intent_id FROM payments WHERE invoice_id=$1`, [f.invoiceId])
+    expect(rows.every((r: any) => r.status === 'processing' && r.stripe_payment_intent_id === 'pi_reader_1')).toBe(true)
   })
 
   it('a credit that covers the whole balance means nothing goes to the reader', async () => {
@@ -266,11 +317,187 @@ describe('S654 card on the counter reader', () => {
       `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
        VALUES ($1,$2,$3,600,600,'other')`, [f.landlordId, f.tenantId, f.leaseId])
     const q = await request(buildApp()).get(`/api/payments/${f.rentId}/reader/quote`).set('Authorization', `Bearer ${f.token}`)
-    expect(q.status).toBe(409)
+    expect(q.status).toBe(200)
+    expect(q.body.data).toMatchObject({ usableCredit: 482.47, needsCreditChoice: true })
+    expect(q.body.data.ifUsed.total).toBe(0)
+    const res = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1', useCredit: true, expectedCredit: 482.47 })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/nothing goes on a card/)
     expect(createRentReaderPaymentIntentMock).not.toHaveBeenCalled()
   })
 
-  it('refuses to book when the balance moved since the reader was sent the amount', async () => {
+  it('old balance may be added to the reader amount and is paid last', async () => {
+    const f = await fixture()
+    const { rows: [old] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'carried_balance',300,'pending',CURRENT_DATE - 200,'BALANCE') RETURNING id`,
+      [f.unitId, f.leaseId, f.tenantId, f.landlordId])
+    const feeOld = processingFeeFor({ amount: 582.47, paymentMethod: 'card' })
+    const totalOld = Math.round((582.47 + feeOld) * 100) / 100
+    // Without the extra the old balance is never asked for.
+    const plain = await request(buildApp()).get(`/api/payments/${f.rentId}/reader/quote`).set('Authorization', `Bearer ${f.token}`)
+    expect(plain.body.data).toMatchObject({ oldBalance: 300, towardOldBalance: 0, balance: 482.47, total: TOTAL })
+    const q = await request(buildApp()).get(`/api/payments/${f.rentId}/reader/quote?towardOldBalance=100`).set('Authorization', `Bearer ${f.token}`)
+    expect(q.status).toBe(200)
+    expect(q.body.data).toMatchObject({ towardOldBalance: 100, balance: 582.47, total: totalOld })
+    // The old balance is the last line, after the current bill.
+    expect(q.body.data.lineItems.map((l: any) => l.amountCents)).toEqual([46000, 2247, 10000])
+    expect(q.body.data.lineItems[2].description).toBe('Earlier balance')
+
+    retrieveTerminalPaymentIntentMock.mockResolvedValue({
+      id: 'pi_reader_1', status: 'requires_capture', amount: Math.round(totalOld * 100),
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId,
+                  gam_toward_old: '100.00' },
+    } as any)
+    const cap = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/capture`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    expect(cap.status, JSON.stringify(cap.body)).toBe(200)
+    const parts = await db.query<any>(
+      `SELECT amount::float AS amount, status, is_remainder FROM payments WHERE type='carried_balance' ORDER BY is_remainder`)
+    expect(parts.rows).toEqual([
+      { amount: 100, status: 'processing', is_remainder: false },
+      { amount: 200, status: 'pending', is_remainder: true },
+    ])
+    const { rows: [app] } = await db.query<any>(
+      `SELECT amount_applied::float AS a FROM remittance_applications WHERE payment_id=$1`, [old.id])
+    expect(app.a).toBe(100)
+  })
+
+  // Fix round 1: the reader was priced with the desk's whole added amount, so
+  // the capture must re-price with the same amount — not just the part the
+  // old balance took — or every capture of a pay-ahead refuses.
+  async function sendThenCapture(f: Awaited<ReturnType<typeof fixture>>, body: Record<string, unknown>) {
+    const sent = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1', ...body })
+    expect(sent.status, JSON.stringify(sent.body)).toBe(201)
+    const amountCents = (createRentReaderPaymentIntentMock.mock.calls as any[]).at(-1)[0].amountCents
+    const metadata = (paymentIntentsUpdateMock.mock.calls as any[]).at(-1)[1].metadata
+    retrieveTerminalPaymentIntentMock.mockResolvedValue({
+      id: 'pi_reader_1', status: 'requires_capture', amount: amountCents,
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId, ...metadata },
+    } as any)
+    const cap = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/capture`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    return { sent, cap, amountCents }
+  }
+
+  it('an amount added with no old balance at all is captured as sent and becomes paid-ahead money', async () => {
+    const f = await fixture()
+    const fee = processingFeeFor({ amount: 582.47, paymentMethod: 'card' })
+    const { sent, cap, amountCents } = await sendThenCapture(f, { towardOldBalance: 100 })
+    expect(amountCents).toBe(Math.round((582.47 + fee) * 100))
+    expect(sent.body.data).toMatchObject({ towardOldBalance: 0, paidAhead: 100 })
+    expect(cap.status, JSON.stringify(cap.body)).toBe(200)
+    expect(cap.body.data).toMatchObject({ status: 'captured', total: Math.round((582.47 + fee) * 100) / 100 })
+    expect(paymentIntentsCaptureMock).toHaveBeenCalledWith('pi_reader_1')
+    expect(cancelTerminalPaymentIntentMock).not.toHaveBeenCalled()
+    const { rows: [rem] } = await db.query<any>(
+      `SELECT amount::float AS amount, applied_amount::float AS applied, unapplied_amount::float AS unapplied FROM tenant_remittances`)
+    expect(rem).toEqual({ amount: 582.47, applied: 482.47, unapplied: 100 })   // the webhook banks the $100 as paid ahead
+  })
+
+  it('an amount added above the old balance pays the old balance and the rest is paid ahead', async () => {
+    const f = await fixture()
+    const { rows: [old] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'carried_balance',50,'pending',CURRENT_DATE - 200,'BALANCE') RETURNING id`,
+      [f.unitId, f.leaseId, f.tenantId, f.landlordId])
+    const { sent, cap } = await sendThenCapture(f, { towardOldBalance: 100 })
+    expect(sent.body.data).toMatchObject({ oldBalance: 50, towardOldBalance: 50, paidAhead: 50 })
+    expect(cap.status, JSON.stringify(cap.body)).toBe(200)
+    const { rows: [rem] } = await db.query<any>(
+      `SELECT amount::float AS amount, applied_amount::float AS applied, unapplied_amount::float AS unapplied FROM tenant_remittances`)
+    expect(rem).toEqual({ amount: 582.47, applied: 532.47, unapplied: 50 })
+    const { rows: [o] } = await db.query<any>(`SELECT status, amount::float AS amount FROM payments WHERE id=$1`, [old.id])
+    expect(o).toEqual({ status: 'processing', amount: 50 })
+  })
+
+  it('the answer to use or save never goes to the reader without the credit figure it answered', async () => {
+    const f = await fixture()
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,100,100,'other')`, [f.landlordId, f.tenantId, f.leaseId])
+    const res = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1', useCredit: true })
+    expect(res.status).toBe(422)
+    expect(res.body.error).toMatch(/credit figure/)
+    expect(createRentReaderPaymentIntentMock).not.toHaveBeenCalled()
+  })
+
+  // Probe B: a late fee waived while the card was on the reader leaves the
+  // credit covering the whole bill. Nothing goes on the card: the hold is
+  // released and the desk is told so — never "captured" with a hold left on.
+  it('a bill the credit came to cover while the card was on the reader releases the hold and books nothing', async () => {
+    const f = await fixture()
+    const { rows: [late] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'late_fee',26.43,'pending',CURRENT_DATE,'LATEFEE') RETURNING id`,
+      [f.invoiceId, f.unitId, f.leaseId, f.tenantId, f.landlordId])
+    const { rows: [credit] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,482.47,482.47,'other') RETURNING id`, [f.landlordId, f.tenantId, f.leaseId])
+    const fee = processingFeeFor({ amount: 26.43, paymentMethod: 'card' })
+    retrieveTerminalPaymentIntentMock.mockResolvedValue({
+      id: 'pi_reader_1', status: 'requires_capture', amount: Math.round((26.43 + fee) * 100),
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId,
+                  gam_use_credit: 'true', gam_expected_credit: '482.47' },
+    } as any)
+    // The late fee is waived before the desk captures.
+    await db.query(`UPDATE payments SET status = 'settled', amount = 0, settled_at = NOW() WHERE id = $1`, [late.id])
+    const res = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/capture`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/credit now covers this whole bill/)
+    expect(res.body.error.match(/nothing was charged/gi)).toHaveLength(1)
+    expect(cancelTerminalPaymentIntentMock).toHaveBeenCalledWith({ paymentIntentId: 'pi_reader_1' })
+    expect(paymentIntentsCaptureMock).not.toHaveBeenCalled()
+    const { rows } = await db.query<any>(`SELECT status FROM payments WHERE invoice_id=$1 AND type <> 'late_fee'`, [f.invoiceId])
+    expect(rows.every((r: any) => r.status === 'pending')).toBe(true)
+    expect((await db.query(`SELECT 1 FROM credit_uses`)).rowCount).toBe(0)
+    const { rows: [c] } = await db.query<any>(`SELECT amount_remaining::float AS r FROM tenant_credits WHERE id=$1`, [credit.id])
+    expect(c.r).toBe(482.47)
+  })
+
+  // A double-clicked Capture: the second request waits behind the first,
+  // which books and captures. It is told the payment is recorded — never
+  // "released, nothing was charged" — and nothing is canceled.
+  it('a second click on Capture is told the payment is already recorded', async () => {
+    const f = await fixture()
+    retrieveTerminalPaymentIntentMock.mockResolvedValue({
+      id: 'pi_reader_1', status: 'requires_capture', amount: Math.round(TOTAL * 100),
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId },
+    } as any)
+    const first = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/capture`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    expect(first.status, JSON.stringify(first.body)).toBe(200)
+    // The second request read the intent before the first captured it.
+    const second = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/capture`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    expect(second.status, JSON.stringify(second.body)).toBe(200)
+    expect(second.body.data).toMatchObject({ alreadyBooked: true, remittanceId: first.body.data.remittanceId })
+    expect(cancelTerminalPaymentIntentMock).not.toHaveBeenCalled()
+    expect(paymentIntentsCaptureMock).toHaveBeenCalledTimes(1)
+    expect((await db.query(`SELECT 1 FROM tenant_remittances`)).rowCount).toBe(1)
+  })
+
+  it('two Capture clicks at once book the card once, and neither is told "nothing was charged"', async () => {
+    const f = await fixture()
+    retrieveTerminalPaymentIntentMock.mockResolvedValue({
+      id: 'pi_reader_1', status: 'requires_capture', amount: Math.round(TOTAL * 100),
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId },
+    } as any)
+    const capture = () => request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/capture`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    const both = await Promise.all([capture(), capture()])
+    expect(both.map(r => r.status), JSON.stringify(both.map(r => r.body))).toEqual([200, 200])
+    expect(both.filter(r => r.body.data.alreadyBooked === true)).toHaveLength(1)
+    expect(cancelTerminalPaymentIntentMock).not.toHaveBeenCalled()
+    expect(paymentIntentsCaptureMock).toHaveBeenCalledTimes(1)
+    expect((await db.query(`SELECT 1 FROM tenant_remittances`)).rowCount).toBe(1)
+  })
+
+  it('a moved balance at capture cancels the hold and books nothing', async () => {
     const f = await fixture()
     retrieveTerminalPaymentIntentMock.mockResolvedValue({
       id: 'pi_reader_1', status: 'requires_capture', amount: Math.round(TOTAL * 100) - 100,
@@ -279,9 +506,38 @@ describe('S654 card on the counter reader', () => {
     const res = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/capture`)
       .set('Authorization', `Bearer ${f.token}`).send({})
     expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/hold on the card was released and nothing was charged/)
     expect(captureTerminalPaymentIntentMock).not.toHaveBeenCalled()
-    const { rows } = await db.query(`SELECT status FROM payments WHERE invoice_id=$1`, [f.invoiceId])
-    expect(rows.every((r: any) => r.status === 'pending')).toBe(true)
+    expect(paymentIntentsCaptureMock).not.toHaveBeenCalled()
+    expect(cancelTerminalPaymentIntentMock).toHaveBeenCalledWith({ paymentIntentId: 'pi_reader_1' })
+    const { rows } = await db.query(`SELECT status, stripe_payment_intent_id FROM payments WHERE invoice_id=$1`, [f.invoiceId])
+    expect(rows.every((r: any) => r.status === 'pending' && r.stripe_payment_intent_id === null)).toBe(true)
+    expect((await db.query(`SELECT 1 FROM tenant_remittances`)).rowCount).toBe(0)
+  })
+
+  it('a credit that moved since the reader was sent the amount cancels the hold and books nothing', async () => {
+    const f = await fixture()
+    // The reader was sent "use the $100 credit"; the credit is $50 now.
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,50,50,'other')`, [f.landlordId, f.tenantId, f.leaseId])
+    const feeUsed = processingFeeFor({ amount: 382.47, paymentMethod: 'card' })
+    retrieveTerminalPaymentIntentMock.mockResolvedValue({
+      id: 'pi_reader_1', status: 'requires_capture', amount: Math.round((382.47 + feeUsed) * 100),
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId,
+                  gam_use_credit: 'true', gam_expected_credit: '100.00' },
+    } as any)
+    const res = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/capture`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/credit changed/)
+    // Each part said once: the cause, the released hold, the next step.
+    expect(res.body.error).toBe(
+      "Your credit changed — it's now $50.00. The hold on the card was released and nothing was charged — look at the balance again and start over.")
+    expect(cancelTerminalPaymentIntentMock).toHaveBeenCalledWith({ paymentIntentId: 'pi_reader_1' })
+    expect(paymentIntentsCaptureMock).not.toHaveBeenCalled()
+    expect((await db.query(`SELECT 1 FROM credit_uses`)).rowCount).toBe(0)
+    expect((await db.query(`SELECT 1 FROM tenant_remittances`)).rowCount).toBe(0)
   })
 
   it('will not book before the reader has approved the card', async () => {
@@ -409,6 +665,41 @@ describe('S654 card on the counter reader', () => {
     expect(processPaymentIntentOnReaderMock).not.toHaveBeenCalled()
   })
 
+  it('a staffer assigned to another property cannot quote, send or capture this balance', async () => {
+    const f = await fixture()
+    const c = await db.connect()
+    let otherProperty = ''
+    try {
+      await c.query('BEGIN')
+      otherProperty = await seedProperty(c, { landlordId: f.landlordId, ownerUserId: f.userId, managedByUserId: f.userId })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const { rows: [u] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ('desk-elsewhere-' || gen_random_uuid() || '@t.dev','x','onsite_manager','Desk','Elsewhere',TRUE) RETURNING id`)
+    await db.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, property_ids, permissions)
+       VALUES ($1,$2,$3,'{"take_payment":true}'::jsonb)`, [u.id, f.landlordId, [otherProperty]])
+    const desk = jwt.sign({ userId: u.id, role: 'onsite_manager', email: 'd@t.dev', profileId: null,
+      landlordId: f.landlordId, permissions: { take_payment: true } }, SECRET, { expiresIn: '1h' })
+    const q = await request(buildApp()).get(`/api/payments/${f.rentId}/reader/quote`).set('Authorization', `Bearer ${desk}`)
+    expect(q.status).toBe(403)
+    const send = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
+      .set('Authorization', `Bearer ${desk}`).send({ stripeReaderId: 'tmr_1' })
+    expect(send.status).toBe(403)
+    expect(createRentReaderPaymentIntentMock).not.toHaveBeenCalled()
+    retrieveTerminalPaymentIntentMock.mockResolvedValue({
+      id: 'pi_reader_1', status: 'requires_capture', amount: Math.round(TOTAL * 100),
+      metadata: { gam_purpose: 'rent_terminal_pending', gam_landlord_id: f.landlordId, gam_anchor_payment_id: f.rentId },
+    } as any)
+    const cap = await request(buildApp()).post(`/api/payments/reader/intents/pi_reader_1/capture`)
+      .set('Authorization', `Bearer ${desk}`).send({})
+    expect(cap.status).toBe(403)
+    expect(paymentIntentsCaptureMock).not.toHaveBeenCalled()
+    const { rows } = await db.query(`SELECT status FROM payments WHERE invoice_id=$1`, [f.invoiceId])
+    expect(rows.every((r: any) => r.status === 'pending')).toBe(true)
+  })
+
   it('the history says how it was paid', async () => {
     const f = await fixture()
     await db.query(`UPDATE payments SET status='settled', settled_at=NOW(), manual_method='check' WHERE id=$1`, [f.rentId])
@@ -416,5 +707,63 @@ describe('S654 card on the counter reader', () => {
     expect(res.status).toBe(200)
     const row = res.body.data.find((p: any) => p.id === f.rentId)
     expect(row.paid_by).toBe('check')   // camelized by the app-level middleware, not here
+  })
+})
+
+// Review (pay7 money-3): the reader reads the bill as it really stands — a card
+// hold of this household's that nobody confirmed in 30 minutes (decisions.md
+// #48.4) is released before the reader is quoted, sent or captured, the same
+// as the desk window. Otherwise the reader would ask for less than is owed and
+// the resident would have to pay twice.
+describe('the reader and a card hold on the bill (3-D Secure)', () => {
+  const DEFAULT_RETRIEVE = async () => ({ id: 'pi_reader_1', status: 'requires_capture' })
+  /** A pay-screen card payment of the resident's holding `rowId`, made `minutesAgo` minutes ago, its bank still asking. */
+  async function portalHold(f: Awaited<ReturnType<typeof fixture>>, rowId: string, pi: string, minutesAgo: number, amount: number) {
+    await db.query(`UPDATE payments SET status = 'processing', stripe_payment_intent_id = $2 WHERE id = $1`, [rowId, pi])
+    await db.query(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       payment_method, gross_amount, processing_fee_amount, stripe_payment_intent_id, status, created_at)
+       VALUES ($1,$2,$3,$4,$4,0,'card',$4,0,$5,'processing', now() - ($6 || ' minutes')::interval)`,
+      [f.tenantId, f.leaseId, f.landlordId, amount, pi, String(minutesAgo)])
+    ;(paymentIntentsRetrieveMock as any).mockImplementation(async (id: string) => id === pi
+      ? { id, status: 'requires_action', metadata: { gam_confirm_on_screen: 'true' } }
+      : DEFAULT_RETRIEVE())
+  }
+  afterEach(() => { (paymentIntentsRetrieveMock as any).mockImplementation(DEFAULT_RETRIEVE) })
+  const utilityRow = async (f: Awaited<ReturnType<typeof fixture>>) => (await db.query<{ id: string }>(
+    `SELECT id FROM payments WHERE lease_id = $1 AND type = 'utility'`, [f.leaseId])).rows[0].id
+
+  it('a hold 40 minutes old is released before the reader quote, and the quote includes those rows', async () => {
+    const f = await fixture()
+    const water = await utilityRow(f)
+    await portalHold(f, water, 'pi_portal_old', 40, 22.47)
+    const res = await request(buildApp()).get(`/api/payments/${f.rentId}/reader/quote`).set('Authorization', `Bearer ${f.token}`)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_portal_old')
+    expect(res.body.data.balance).toBe(482.47)
+    expect(res.body.data.total).toBe(TOTAL)
+    expect((await db.query<any>(`SELECT status FROM payments WHERE id = $1`, [water])).rows[0].status).toBe('pending')
+  })
+
+  it('a hold 40 minutes old on the very charge the reader starts from is released, and the charge goes to the reader for the whole bill', async () => {
+    const f = await fixture()
+    await portalHold(f, f.rentId, 'pi_portal_anchor', 40, 460)
+    const res = await request(buildApp()).post(`/api/payments/${f.rentId}/reader/charge`)
+      .set('Authorization', `Bearer ${f.token}`).send({ stripeReaderId: 'tmr_1' })
+    expect(res.status, JSON.stringify(res.body)).toBe(201)
+    expect(paymentIntentsCancelMock).toHaveBeenCalledWith('pi_portal_anchor')
+    expect(res.body.data.total).toBe(TOTAL)
+  })
+
+  it('a hold still inside its 30 minutes keeps the charge closed: refused in plain words, with how the resident can pay another way now — nothing canceled', async () => {
+    const f = await fixture()
+    await portalHold(f, f.rentId, 'pi_portal_fresh', 5, 460)
+    const res = await request(buildApp()).get(`/api/payments/${f.rentId}/reader/quote`).set('Authorization', `Bearer ${f.token}`)
+    expect(res.status).toBe(409)
+    const msg = JSON.stringify(res.body)
+    expect(msg).toContain('waiting on the resident\'s card payment to be confirmed by their card\'s bank — nothing has been charged yet')
+    expect(msg).toContain('Cancel it and pay another way')
+    expect(msg).not.toContain('status:')
+    expect(paymentIntentsCancelMock).not.toHaveBeenCalled()
   })
 })

@@ -44,6 +44,20 @@ export async function cleanupAllSchema(): Promise<void> {
       `Tests must run with DB_NAME=gam_test (use \`npm test\` from apps/api). ` +
       `This guard exists because a stray run once wiped the dev DB.`)
   }
+  // S655 (money plan): the credit ledger FKs both credit tables, payments,
+  // deposit returns, reversals, remittances and leases, so it clears FIRST.
+  // TRUNCATE, not DELETE: a credit use refuses deletion ("kept forever") and
+  // TRUNCATE does not fire row triggers. Nothing references credit_uses.
+  // The deposit-slip tables FK remittances, register sales and bank rows; the
+  // items reference the slips, so both go in one TRUNCATE.
+  await db.query(`TRUNCATE credit_uses`)
+  // 10/4 (decisions #38): an early check-out's refund parts point at the
+  // payments they went back to (RESTRICT — never erased from under them), so
+  // they clear before those payments, with their decisions and the stay ledger.
+  await db.query(`DELETE FROM stay_refund_parts`)
+  await db.query(`DELETE FROM stay_checkout_decisions`)
+  await db.query(`DELETE FROM stay_payments`)
+  await db.query(`TRUNCATE bank_deposit_slip_items, bank_deposit_slips`)
   // S553: call slots FK sales_leads — clear child first. Availability has
   // no FKs but tests seed their own windows.
   // S652: card-reader orders FK to properties/landlords; clear first.
@@ -126,6 +140,10 @@ export async function cleanupAllSchema(): Promise<void> {
   // (same NO ACTION posture as otp_advances above). Without this clear,
   // any test that creates a FlexPay advance traps the next file's
   // cleanupAllSchema on leases/users delete.
+  // S655 (money plan M2): a covered bill line and the FLEXPAY pull row point
+  // back at their advance (payments.flexpay_advance_id), so that link is cut
+  // before the advances go; payments themselves are cleared further down.
+  await db.query(`UPDATE payments SET flexpay_advance_id = NULL WHERE flexpay_advance_id IS NOT NULL`)
   await db.query(`DELETE FROM flexpay_advances`)
   // S629: suspended_utility_charges.released_bill_id FKs utility_bills — the
   // bill a held share became when the tenant signed. Held rows go first or the
@@ -203,11 +221,25 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM flex_charge_statements`)
   await db.query(`DELETE FROM flex_charge_accounts`)
   await db.query(`DELETE FROM remittance_applications`)
+  // lease_prepaid_credit_draws stays until contract step C3 drops the table.
   await db.query(`DELETE FROM lease_prepaid_credit_draws`)
   await db.query(`DELETE FROM lease_prepaid_credits`)
+  // S655: tenant_credits now carries an audit trigger, so it is cleared here,
+  // before audit_row_changes below, instead of by the landlord cascade at the
+  // end (whose audit rows would pile up across files). Interest accruals point
+  // at a credit ON DELETE SET NULL, so nothing blocks this.
+  await db.query(`DELETE FROM tenant_credits`)
   // S609: tenant autopay schedules (one per lease, cascades from leases anyway,
   // but leases are deleted later in this chain).
   await db.query(`DELETE FROM tenant_autopay`)
+  // S624: a confirmed declaration RESTRICTs its bank transaction, and an
+  // allocation RESTRICTs both the transaction and the payment — the proof of a
+  // settled rent payment is not throwaway. Both clear before either parent.
+  // S655: a RECORDED declaration also RESTRICTs the receipt it became
+  // (tenant_declared_deposits.recorded_remittance_id), so both clear before
+  // tenant_remittances too.
+  await db.query(`DELETE FROM bank_deposit_allocations`)
+  await db.query(`DELETE FROM tenant_declared_deposits`)
   await db.query(`DELETE FROM tenant_remittances`)
   // S616: a one-off charge FKs a payments row, plus the lease, unit and tenant
   // — all NO ACTION, so it clears before the earliest of them.
@@ -220,12 +252,8 @@ export async function cleanupAllSchema(): Promise<void> {
   // FIRST. This was latent until the deposit-match path became the first thing
   // to ever populate that column — the constraint has always been there, nothing
   // had exercised it. (bank_transactions is deleted again further down with its
-  // connection; a second DELETE on an empty table is free.)
-  // S624: a confirmed declaration RESTRICTs its bank transaction, and an
-  // allocation RESTRICTs both the transaction and the payment — the proof of a
-  // settled rent payment is not throwaway. Both clear before either parent.
-  await db.query(`DELETE FROM bank_deposit_allocations`)
-  await db.query(`DELETE FROM tenant_declared_deposits`)
+  // connection; a second DELETE on an empty table is free.) Allocations and
+  // declarations, which RESTRICT it, were cleared above with tenant_remittances.
   await db.query(`DELETE FROM bank_transactions`)
   await db.query(`DELETE FROM payments`)
   // S550: the audit journal records every DELETE this cleanup performs —

@@ -27,7 +27,14 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { lockArea, findApprovedConflict, computeReservationFee, billReservationFee, settleReservationFeeOnCancel, assertMonthlyReservationLimit } from '../services/commonAreas'
+import {
+  lockArea, findApprovedConflict, computeReservationFee, billReservationFee, settleReservationFeeOnCancel,
+  settleEventDepositOnCancel, assertMonthlyReservationLimit, tellReservationFeeKept, notifyReservationFeeRefundDue,
+  reservationFeePaidSql, landlordDecisionNote, type ReservationFeeOutcome,
+} from '../services/commonAreas'
+import { lockHousehold } from '../services/moneyPredicates'
+import { logger } from '../lib/logger'
+import { cancelSupersededIntents } from '../services/creditUse'
 import {
   notifyReservationRequested,
   notifyReservationDecision,
@@ -135,10 +142,13 @@ export async function fireAmenityAlert(reservationId: string) {
   // W-44: a tenant-booked EVENT with a deposit announces only once the
   // deposit is PAID (the hourly event sweep fires it) — never at approval.
   if (r.kind === 'event' && r.reserved_by_tenant_id && Number(r.fee_amount) > 0) {
-    const pay = r.fee_payment_id
-      ? await queryOne<any>(`SELECT status FROM payments WHERE id = $1`, [r.fee_payment_id])
+    // Paid = the deposit's money arrived — or, after a dispute took it back,
+    // the bill that dispute reopened was paid again (reservationFeePaidSql).
+    const paid = r.fee_payment_id
+      ? await queryOne<{ paid: boolean }>(
+          `SELECT ${reservationFeePaidSql('$1::uuid', ['settled'])} AS paid`, [r.fee_payment_id])
       : null
-    if (!pay || pay.status !== 'settled') return
+    if (!paid?.paid) return
   }
   const count = await notifyAmenityUnavailable({
     propertyId: r.property_id, landlordId: r.landlord_id, propertyName: r.property_name,
@@ -305,6 +315,10 @@ commonAreasRouter.post('/reservations/:rid/decide', requirePerm('amenities.revie
       approve: z.boolean(),
       note: z.string().trim().max(2000).optional(),
     }).parse(req.body)
+    // Fix pass 1 (review LOW): the landlord's words never carry GAM's
+    // waiting-fee key (services/commonAreas readFeeWait), so a note can never
+    // make a canceled reservation read as a fee still waiting.
+    const note = landlordDecisionNote(b.note ?? null)
     const r = await queryOne<any>(`SELECT * FROM common_area_reservations WHERE id = $1`, [req.params.rid])
     if (!r) throw new AppError(404, 'Reservation not found')
     if (!canManageLandlordResource(u, r.landlord_id)) throw new AppError(403, 'Forbidden')
@@ -316,7 +330,7 @@ commonAreasRouter.post('/reservations/:rid/decide', requirePerm('amenities.revie
       const rej = await query(
         `UPDATE common_area_reservations
             SET status='rejected', decided_by_user_id=$2, decided_at=now(), decision_note=$3, updated_at=now()
-          WHERE id=$1 AND status='pending' RETURNING id`, [r.id, u.userId, b.note ?? null])
+          WHERE id=$1 AND status='pending' RETURNING id`, [r.id, u.userId, note])
       if (rej.length === 0) throw new AppError(409, 'Reservation was already decided')
     } else {
       const client = await getClient()
@@ -331,7 +345,7 @@ commonAreasRouter.post('/reservations/:rid/decide', requirePerm('amenities.revie
         const upd = await client.query(
           `UPDATE common_area_reservations
               SET status='approved', decided_by_user_id=$2, decided_at=now(), decision_note=$3, updated_at=now()
-            WHERE id=$1 AND status='pending' RETURNING id`, [r.id, u.userId, b.note ?? null])
+            WHERE id=$1 AND status='pending' RETURNING id`, [r.id, u.userId, note])
         if (upd.rows.length === 0) throw new AppError(409, 'Reservation was already decided')
         await client.query('COMMIT')
       } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
@@ -349,7 +363,7 @@ commonAreasRouter.post('/reservations/:rid/decide', requirePerm('amenities.revie
       await notifyReservationDecision({
         tenantUserId: tenantUser.user_id, tenantEmail: tenantUser.email,
         areaName: meta.area_name, propertyName: meta.property_name, approved: b.approve,
-        startsAt: r.starts_at, endsAt: r.ends_at, decisionNote: b.note ?? null,
+        startsAt: r.starts_at, endsAt: r.ends_at, decisionNote: note,
       })
     }
     if (b.approve) { await fireAmenityAlert(r.id); await billReservationFee(r.id) }
@@ -497,66 +511,73 @@ commonAreasRouter.post('/:id/request', async (req, res, next) => {
 commonAreasRouter.post('/reservations/:rid/cancel', async (req, res, next) => {
   try {
     const u = req.user!
-    const r = await queryOne<any>(`SELECT * FROM common_area_reservations WHERE id = $1`, [req.params.rid])
-    if (!r) throw new AppError(404, 'Reservation not found')
-    const isOwningTenant = u.role === 'tenant' && r.reserved_by_tenant_id === u.profileId
-    const isManager = canManageLandlordResource(u, r.landlord_id)
+    const r0 = await queryOne<any>(`SELECT * FROM common_area_reservations WHERE id = $1`, [req.params.rid])
+    if (!r0) throw new AppError(404, 'Reservation not found')
+    const isOwningTenant = u.role === 'tenant' && r0.reserved_by_tenant_id === u.profileId
+    const isManager = canManageLandlordResource(u, r0.landlord_id)
     if (!isOwningTenant && !isManager) throw new AppError(403, 'Forbidden')
-    if (r.status === 'cancelled' || r.status === 'rejected')
-      throw new AppError(400, `Reservation is already ${r.status}`)
-    await query(
-      `UPDATE common_area_reservations SET status='cancelled', updated_at=now() WHERE id=$1`, [r.id])
-    // #4: apply the fee refund policy (≥48h ahead → refundable; inside 48h →
-    // fee stands). W-44: EVENT deposits are NON-REFUNDABLE by design — a
-    // paid deposit always stands; an unpaid one is voided.
-    let feeOutcome: string
-    if (r.kind === 'event' && r.reserved_by_tenant_id) {
-      const pay = r.fee_payment_id
-        ? await queryOne<any>(`SELECT status FROM payments WHERE id = $1`, [r.fee_payment_id])
-        : null
-      if (pay && (pay.status === 'settled' || pay.status === 'processing')) {
-        feeOutcome = 'fee_stands'
-      } else if (r.fee_payment_id) {
-        await query(`DELETE FROM payments WHERE id = $1 AND status IN ('pending','failed')`, [r.fee_payment_id])
-        await query(`UPDATE common_area_reservations SET fee_voided = true, fee_payment_id = NULL WHERE id = $1`, [r.id])
-        feeOutcome = 'voided'
-      } else {
-        feeOutcome = 'none'
-      }
-      // The space "becomes not private": if the event had been announced,
-      // tell the property it's open again.
-      if (r.residents_notified_at && r.notify_residents) {
-        const meta2 = await queryOne<any>(
-          `SELECT ca.name AS area_name, p.name AS property_name
-             FROM common_areas ca JOIN properties p ON p.id = ca.property_id
-            WHERE ca.id = $1`, [r.common_area_id])
-        const { notifyAmenityEventReleased } = await import('../services/notifications')
-        await notifyAmenityEventReleased({
-          propertyId: r.property_id, landlordId: r.landlord_id,
-          propertyName: meta2?.property_name ?? '', areaName: meta2?.area_name ?? 'The amenity',
-          startsAt: r.starts_at, endsAt: r.ends_at,
-        })
-      }
-    } else {
-      feeOutcome = await settleReservationFeeOnCancel(r)
+
+    // S655: one transaction. The fee is household money, so the household
+    // lock comes first, then the reservation, read fresh: the cancel and the
+    // fee's fate land together or not at all (the reservation used to be
+    // marked canceled before the fee was looked at, and a fee that could not
+    // be removed left a canceled reservation still billing).
+    let r: any
+    let feeOutcome: ReservationFeeOutcome
+    // A bank retry of the fee alone that the cancel stopped: canceled after COMMIT.
+    const stopped: string[] = []
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      if (r0.reserved_by_tenant_id) await lockHousehold(client, r0.reserved_by_tenant_id, r0.landlord_id)
+      r = (await client.query<any>(
+        `SELECT * FROM common_area_reservations WHERE id = $1 FOR UPDATE`, [r0.id])).rows[0]
+      if (r.status === 'cancelled') throw new AppError(400, 'This reservation was already canceled.')
+      if (r.status === 'rejected') throw new AppError(400, 'This reservation was already turned down.')
+      await client.query(
+        `UPDATE common_area_reservations SET status='cancelled', updated_at=now() WHERE id=$1`, [r.id])
+      // #4: apply the fee refund policy (≥48h ahead → refundable; inside 48h →
+      // fee stands). W-44: EVENT deposits are NON-REFUNDABLE by design — a
+      // paid deposit always stands; an unpaid one is voided. Either way, a fee
+      // whose payment is still going through WAITS (decisions #52): nothing is
+      // flagged, emailed or voided now; the hourly sweep decides it once that
+      // payment clears or fails for good (decideWaitingReservationFee).
+      feeOutcome = r.kind === 'event' && r.reserved_by_tenant_id
+        ? await settleEventDepositOnCancel(client, r, stopped)
+        : await settleReservationFeeOnCancel(client, r, stopped)
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      client.release()
     }
-    if (feeOutcome === 'refund_due') {
-      // The fee was already paid — flag the landlord to process the Stripe refund.
-      const meta = await queryOne<any>(
-        `SELECT lu.id AS landlord_user_id, lu.email, ca.name AS area_name
-           FROM common_areas ca JOIN landlords l ON l.id = ca.landlord_id
-           JOIN users lu ON lu.id = l.user_id WHERE ca.id = $1`, [r.common_area_id])
-      if (meta?.landlord_user_id) {
-        await createNotification({
-          userId: meta.landlord_user_id, landlordId: r.landlord_id,
-          type: 'amenity_fee_refund_due',
-          title: `Refund due — ${meta.area_name} reservation cancelled`,
-          body: `A paid ${meta.area_name} reservation was cancelled 48h+ ahead. Refund the $${Number(r.fee_amount).toFixed(2)} reservation fee.`,
-          data: { reservationId: r.id, amount: r.fee_amount },
-          sendEmail: true, emailTo: meta.email,
-        })
-      }
+
+    // Never throws: a pull that cannot be canceled cannot be retried either
+    // (its schedule is already cleared), and GAM is told.
+    await cancelSupersededIntents(stopped)
+    if (feeOutcome === 'kept') {
+      // GAM and the tenant are told why the fee still shows — in the
+      // auto-release's own words (reservationFeeKeptLine) — whoever pressed
+      // Cancel. The response's feeOutcome alone reached nobody: no screen reads it.
+      await tellReservationFeeKept(r, stopped.length > 0)
     }
+    // The space "becomes not private": if the event had been announced,
+    // tell the property it's open again.
+    if (r.kind === 'event' && r.reserved_by_tenant_id && r.residents_notified_at && r.notify_residents) {
+      const meta2 = await queryOne<any>(
+        `SELECT ca.name AS area_name, p.name AS property_name
+           FROM common_areas ca JOIN properties p ON p.id = ca.property_id
+          WHERE ca.id = $1`, [r.common_area_id])
+      const { notifyAmenityEventReleased } = await import('../services/notifications')
+      await notifyAmenityEventReleased({
+        propertyId: r.property_id, landlordId: r.landlord_id,
+        propertyName: meta2?.property_name ?? '', areaName: meta2?.area_name ?? 'The amenity',
+        startsAt: r.starts_at, endsAt: r.ends_at,
+      })
+    }
+    // The fee was already paid — flag the landlord to process the refund.
+    if (feeOutcome === 'refund_due') await notifyReservationFeeRefundDue(r)
     res.json({ success: true, data: { feeOutcome } })
   } catch (e) { next(e) }
 })

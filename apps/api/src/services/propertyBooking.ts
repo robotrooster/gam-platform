@@ -413,6 +413,15 @@ export async function confirmBookingDeposit(
           amount: held, description: 'Stay deposit',
         }, client)
       }
+      // 10/4 (decisions #37.B, #38): the deposit is a payment toward the stay,
+      // itemized — an early check-out gives it back to this card.
+      if (paid.paymentIntentId) {
+        const { recordSiteDeposit } = await import('./stayPayments')
+        await recordSiteDeposit(client, {
+          bookingId, landlordId: b.landlord_id, paymentIntentId: paid.paymentIntentId,
+          deposit, charged: (paid.amountTotalCents ?? 0) / 100, gamFee: cardFee,
+        })
+      }
     }
     await client.query('COMMIT')
   } catch (e) {
@@ -543,6 +552,69 @@ export async function claimWaitlistSpot(token: string, _stayType?: 'nightly' | '
 }
 
 /**
+ * The booking sweep let a hold go but could not close the signed lease drafted
+ * with it (money was paid on it, a payment is on its way, or the close failed):
+ * the lease is left pending on a site that is no longer held. The landlord is
+ * told once — in the app and by email — naming the lease, the tenant and the
+ * close's own words (which name the next step). Never throws.
+ */
+async function notifyHoldLeaseLeftOpen(
+  l: { id: string; source_booking_id: string }, refusal: string | null,
+): Promise<void> {
+  try {
+    const r = await queryOne<{
+      landlord_id: string; owner_user_id: string; owner_email: string | null
+      unit_number: string | null; property_name: string | null; tenant_name: string | null; start_date: string | null
+    }>(
+      `SELECT l.landlord_id, ll.user_id AS owner_user_id, ou.email AS owner_email,
+              un.unit_number, pr.name AS property_name,
+              to_char(l.start_date, 'FMMonth FMDD, YYYY') AS start_date,
+              COALESCE(
+                (SELECT NULLIF(TRIM(CONCAT(tu.first_name, ' ', tu.last_name)), '')
+                   FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id JOIN users tu ON tu.id = t.user_id
+                  WHERE lt.lease_id = l.id
+                  ORDER BY (lt.role = 'primary') DESC, lt.tenant_id LIMIT 1),
+                (SELECT NULLIF(TRIM(b.guest_name), '') FROM unit_bookings b WHERE b.id = $2)) AS tenant_name
+         FROM leases l
+         JOIN landlords ll ON ll.id = l.landlord_id
+         LEFT JOIN users ou ON ou.id = ll.user_id
+         LEFT JOIN units un ON un.id = l.unit_id
+         LEFT JOIN properties pr ON pr.id = un.property_id
+        WHERE l.id = $1`, [l.id, l.source_booking_id])
+    if (!r) return
+    const who = r.tenant_name ?? 'the tenant'
+    const site = [r.property_name, r.unit_number ? `site ${r.unit_number}` : null].filter(Boolean).join(', ')
+    const why = refusal ?? 'GAM could not close it on its own.'
+    const title = `A hold ran out but ${who}'s lease is still open`
+    const body =
+      `The unpaid hold for ${who}${site ? ` at ${site}` : ''} ran out and the site was let go, ` +
+      `but the lease signed with it was not ended. ${why} ` +
+      `Open the lease and decide what happens to it${r.start_date ? ` before it starts on ${r.start_date}` : ''}.`
+    const { createNotification, emailTemplate } = await import('./notifications')
+    const { portalLink } = await import('../lib/portalUrls')
+    const actionUrl = `/leases?open=${l.id}`
+    // The in-app copy is plain text (the screen escapes it). The email is
+    // HTML, and the name can be the guest name typed on the public booking
+    // form, so every word goes in escaped — with a button to the lease.
+    const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+    await createNotification({
+      userId: r.owner_user_id,
+      landlordId: r.landlord_id,
+      type: 'hold_lease_left_open',
+      title, body,
+      data: { leaseId: l.id, bookingId: l.source_booking_id },
+      actionUrl,
+      sendEmail: !!r.owner_email, emailTo: r.owner_email ?? undefined,
+      emailSubject: title.replace(/\s+/g, ' '),   // one line, whatever was typed
+      emailHtml: emailTemplate(esc(title), esc(body), { label: 'Open the lease', url: portalLink('landlord', actionUrl) }),
+    })
+  } catch (err) {
+    logger.error({ err, leaseId: l.id }, '[booking-sweep] telling the landlord about a lease left open failed')
+  }
+}
+
+/**
  * Sweep: expire abandoned tentative holds and stale waitlist claims, promoting
  * the next waitlister for any unit a cancellation/expiry frees. Cron-driven.
  */
@@ -559,17 +631,63 @@ export async function sweepBookingHoldsAndClaims(): Promise<{ holdsExpired: numb
   // had no way to delete. Unsigned paperwork only; an executed lease is never
   // touched by an expiring hold.
   if (expiredHolds.length) {
+    const holdIds = expiredHolds.map(h => h.id)
+    // Paperwork only — the landlord never signed it and no bill was made on
+    // it — ends with a bare status change, as before.
     try {
       const killed = await query<{ id: string }>(
         `UPDATE leases SET status = 'terminated', needs_review = FALSE, updated_at = NOW()
           WHERE source_booking_id = ANY($1::uuid[]) AND status IN ('pending', 'draft')
-          RETURNING id`, [expiredHolds.map(h => h.id)])
+            AND signed_by_landlord IS NOT TRUE
+            AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.lease_id = leases.id)
+          RETURNING id`, [holdIds])
       if (killed.length) {
         logger.info({ leaseIds: killed.map(k => k.id) },
           '[booking-sweep] expired holds also cancelled their unsigned draft leases')
       }
     } catch (err) {
       logger.error({ err }, '[booking-sweep] draft-lease cancel on hold expiry failed')
+    }
+    // 10/4 (review LOW): a lease the landlord signed, or one that already has
+    // its move-in bill, goes through the one never-moved-in close (decisions
+    // #46.4 / #53: "if they never pay the deposit or never move in, zero it
+    // out and end the lease") — the unpaid move-in bill zeroed and voided,
+    // the household taken off — never a bare status change that would leave
+    // that bill owed on an ended lease. When the close does not apply (money
+    // paid on it, a payment on its way) nothing changes and it is logged for
+    // a person to look at.
+    const issued = await query<{ id: string; unit_id: string; source_booking_id: string }>(
+      `SELECT id, unit_id, source_booking_id FROM leases
+        WHERE source_booking_id = ANY($1::uuid[]) AND status IN ('pending', 'draft')
+        ORDER BY created_at, id`, [holdIds]).catch((err) => {
+      logger.error({ err }, '[booking-sweep] reading signed leases of expired holds failed')
+      return [] as { id: string; unit_id: string; source_booking_id: string }[]
+    })
+    for (const l of issued) {
+      const { endLeaseNeverMovedIn } = await import('../lib/unwindIssuedLease')
+      const client = await getClient()
+      let stop: string[] = []
+      try {
+        await client.query('BEGIN')
+        const closed = await endLeaseNeverMovedIn(client, l, { cancelingBooking: l.source_booking_id })
+        stop = closed.cancelAfterCommit
+        await client.query('COMMIT')
+        logger.info({ leaseId: l.id, zeroed: closed.closedAmount },
+          '[booking-sweep] an expired hold ended its signed lease through the never-moved-in close')
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {})
+        logger.error({ err, leaseId: l.id, bookingId: l.source_booking_id },
+          '[booking-sweep] an expired hold\'s signed lease could not be closed as never moved in; left as it is')
+        // 10/4 (review LOW): the hold is canceled and the site let go, but the
+        // lease stays pending — and no later sweep looks at it again (only
+        // holds canceled in this run come back). Tell the landlord, naming the
+        // lease, the tenant and why, so a person decides before its start day.
+        await notifyHoldLeaseLeftOpen(l, err instanceof AppError ? err.message : null)
+      } finally { client.release() }
+      if (stop.length) {
+        const { cancelSupersededIntents } = await import('./creditUse')
+        await cancelSupersededIntents(stop)   // never throws
+      }
     }
   }
   const expiredClaims = await query<{ unit_id: string }>(

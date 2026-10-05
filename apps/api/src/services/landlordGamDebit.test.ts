@@ -169,6 +169,40 @@ describe('settling a pull', () => {
     expect(d.failure_reason).toContain('insufficient funds')
   })
 
+  // 10/3 (Nic's admin cards): the $6 that paid for the pull is GAM's
+  // processing revenue. Stripe's fee on the pull was always counted as a cost;
+  // the $6 was counted nowhere.
+  it('books the $6 bank cost as GAM\'s processing revenue when the money lands — once, however often the webhook comes', async () => {
+    const chargeId = await owe(48, '99999999-5555-5555-5555-555555555555')
+    const [d] = await query<{ id: string }>(
+      `INSERT INTO landlord_gam_debits
+         (landlord_id, charges_amount, bank_cost_amount, total_amount, status,
+          stripe_payment_intent_id, charge_ids)
+       VALUES ($1, 48, 6, 54, 'pending', 'pi_cost', ARRAY[$2::uuid]) RETURNING id`,
+      [landlordId, chargeId])
+
+    await settleGamDebit('pi_cost', true)
+    await query(`UPDATE landlord_gam_debits SET status = 'pending' WHERE id = $1`, [d.id])   // a replay racing the first
+    await settleGamDebit('pi_cost', true)
+
+    const rows = await query<any>(
+      `SELECT type, amount::text AS amount, customer_fee_charged::text AS fee, reference_type
+         FROM platform_revenue_ledger WHERE reference_id = $1`, [d.id])
+    expect(rows).toEqual([{ type: 'banking_spread', amount: '6.00', fee: '6.00', reference_type: 'gam_bank_debit' }])
+  })
+
+  it('books nothing when the bank refuses the pull', async () => {
+    const chargeId = await owe(48, '99999999-6666-6666-6666-666666666666')
+    const [d] = await query<{ id: string }>(
+      `INSERT INTO landlord_gam_debits
+         (landlord_id, charges_amount, bank_cost_amount, total_amount, status,
+          stripe_payment_intent_id, charge_ids)
+       VALUES ($1, 48, 6, 54, 'pending', 'pi_cost_nsf', ARRAY[$2::uuid]) RETURNING id`,
+      [landlordId, chargeId])
+    await settleGamDebit('pi_cost_nsf', false, 'insufficient funds')
+    expect(await query(`SELECT 1 FROM platform_revenue_ledger WHERE reference_id = $1`, [d.id])).toEqual([])
+  })
+
   it('ignores a webhook replayed after the debit already settled', async () => {
     const chargeId = await owe(82, '77777777-7777-7777-7777-777777777777')
     await query(

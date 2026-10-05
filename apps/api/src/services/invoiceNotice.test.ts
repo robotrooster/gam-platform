@@ -12,10 +12,24 @@ const { resendSendMock } = vi.hoisted(() => ({
   resendSendMock: vi.fn(async () => ({ data: { id: `m_${Math.random().toString(36).slice(2)}` }, error: null }) as any),
 }))
 vi.mock('resend', () => ({ Resend: class { emails = { send: resendSendMock } } }))
+// A real dispute runs paymentReversal.handlePaymentReversal; its side trips
+// (late-fee back-fill, the landlord's alert, the recovery decision) are not read here.
+vi.mock('../jobs/lateFees', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  generateLateFeesForInvoice: vi.fn(async () => ({ invoicesScanned: 0, rowsWritten: 0, capsHit: 0, errors: [] })),
+}))
+vi.mock('./responsibleParty', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()), getPropertyResponsibleParty: vi.fn(async () => null),
+}))
+vi.mock('./reversalRecovery', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()), decideReversalRecovery: vi.fn(async () => null),
+}))
 
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant } from '../test/dbHelpers'
-import { sendPendingInvoiceNotices, payNowLink } from './invoiceNotice'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant, seedUtilityMeter, seedUtilityBill } from '../test/dbHelpers'
+import { sendPendingInvoiceNotices, payNowLink, chargeLabel, chargeDetail, chargeLabelColumnsSql } from './invoiceNotice'
+import { handlePaymentReversal } from './paymentReversal'
+import { sendPaymentReceipt } from './paymentReceipt'
 import { portalLink } from '../lib/portalUrls'
 import { verifyEmailFactorToken } from '../routes/emailOtp'
 
@@ -224,36 +238,260 @@ describe('invoice notices', () => {
 })
 
 // S653 (Nic): "most people are going to see that email, think they owe $900 or
-// whatever... they just saw the headline on the email." The headline is the
-// number they will actually be asked for.
-describe('the headline is what they will actually pay', () => {
-  it('nets the paid-ahead money this month may use — capped by their monthly draw', async () => {
+// whatever... they just saw the headline on the email."
+// S655 (Nic, 10/2): "credit auto-applies only when it covers the WHOLE bill;
+// otherwise the tenant is asked, 'Use all $X' or 'Save it for later'." So the
+// headline is the FULL bill, and the credit is a sentence beside it saying what
+// Pay Now will offer — never a deduction they did not choose.
+describe('the full bill, with the credit Pay Now will offer beside it', () => {
+  it('the email shows the full bill and the credit Pay Now will offer (capped by the monthly draw)', async () => {
     const f = await seedInvoice({ rent: 589 })
     const leaseId = (await db.query(`SELECT lease_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0].lease_id
-    await db.query(`INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining) VALUES ($1,$2,2000,2000)`, [leaseId, f.tenantId])
+    await db.query(`INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by) VALUES ($1,$2,2000,2000,'landlord')`, [leaseId, f.tenantId])
     await db.query(`UPDATE leases SET prepaid_monthly_draw = 200 WHERE id=$1`, [leaseId])
     const r = await sendPendingInvoiceNotices()
     expect(r.sent).toBe(1)
     const mail = lastSend()
-    expect(mail.subject).toContain('$389.00')            // 589 − 200
-    expect(mail.html).toContain('Your paid-ahead credit')
-    expect(mail.html).toContain('$200.00')
+    expect(mail.subject).toContain('$589.00')            // nothing netted
+    expect(mail.html).toMatch(/You have <strong[^>]*>\$200\.00<\/strong> credit available — you can use it when you pay\./)
+    expect(mail.html).not.toContain('Your paid-ahead credit')
+    expect(mail.html).not.toContain('-$200.00')
   })
 
-  it('a line already covered when the bill was made is listed as covered, not due', async () => {
-    const f = await seedInvoice({ rent: 589 })
-    // a $60 water line the invoice run settled from paid-ahead credit
-    const inv = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
+  it('a credit smaller than the bill is said beside it and changes nothing (MH 25: $10 against $460)', async () => {
+    const f = await seedInvoice({ rent: 460 })
     await db.query(
-      `INSERT INTO payments (landlord_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id, notes)
-       VALUES ($1,$2,$3,'utility',60,'settled','UTILITY',CURRENT_DATE,$4,'Water — covered by prepaid credit (paid ahead)')`,
-      [inv.landlord_id, inv.unit_id, inv.lease_id, f.invoiceId])
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, status)
+       VALUES ($1,$2,NULL,10,10,'goodwill','test','active')`, [f.landlordId, f.tenantId])
+    await sendPendingInvoiceNotices()
+    const mail = lastSend()
+    expect(mail.subject).toContain('$460.00')
+    expect(mail.html).toContain('$10.00</strong> credit available')
+  })
+
+  it('no credit, no credit sentence', async () => {
+    await seedInvoice({ rent: 460 })
+    await sendPendingInvoiceNotices()
+    expect(lastSend().html).not.toContain('credit available')
+  })
+
+  it('a line the account credit already paid is listed as covered, not due', async () => {
+    const f = await seedInvoice({ rent: 589 })
+    const inv = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
+    // a $60 water line the bill run paid from paid-ahead money (credit_uses, applied)
+    const w = await db.query<{ id: string }>(
+      `INSERT INTO payments (landlord_id, unit_id, lease_id, tenant_id, type, amount, status, entry_description, due_date, invoice_id, notes)
+       VALUES ($1,$2,$3,$4,'utility',60,'pending','UTILITY',CURRENT_DATE,$5,'Water — covered by prepaid credit (paid ahead)') RETURNING id`,
+      [inv.landlord_id, inv.unit_id, inv.lease_id, f.tenantId, f.invoiceId])
+    const c = await db.query<{ id: string }>(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by)
+       VALUES ($1,$2,60,60,'landlord') RETURNING id`, [inv.lease_id, f.tenantId])
+    await db.query(
+      `INSERT INTO credit_uses (prepaid_credit_id, payment_id, lease_id, amount, billing_month, source, status, applied_at)
+       VALUES ($1,$2,$3,60,date_trunc('month', CURRENT_DATE)::date,'whole_bill','applied',NOW())`,
+      [c.rows[0].id, w.rows[0].id, inv.lease_id])
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [w.rows[0].id])
     await db.query(`UPDATE invoices SET total_amount = 649 WHERE id=$1`, [f.invoiceId])
     const r = await sendPendingInvoiceNotices()
     expect(r.sent).toBe(1)
     const mail = lastSend()
     expect(mail.subject).toContain('$589.00')            // the water is not owed
-    expect(mail.html).toContain('covered (paid-ahead credit)')
+    expect(mail.html).toContain('covered (paid with your account credit)')
+    // the tag is beside the name, never the name
+    expect(mail.html).not.toContain('covered by prepaid credit')
+  })
+
+  it('a late fee already on the bill is part of what it owes', async () => {
+    const f = await seedInvoice({ rent: 460 })
+    const inv = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
+    await db.query(
+      `INSERT INTO payments (landlord_id, unit_id, lease_id, tenant_id, type, amount, status, entry_description, due_date, invoice_id)
+       VALUES ($1,$2,$3,$4,'late_fee',15,'pending','LATEFEE',CURRENT_DATE,$5)`,
+      [inv.landlord_id, inv.unit_id, inv.lease_id, f.tenantId, f.invoiceId])
+    await sendPendingInvoiceNotices({ invoiceId: f.invoiceId, updated: true })
+    const mail = lastSend()
+    expect(mail.subject).toContain('$475.00')
+    expect(mail.html).toContain('Late fee')
+  })
+})
+
+// decisions #17 (Nic, 10/3): "Bill and email lines name the utility: 'Water',
+// 'Electric', 'Trash', 'Sewer' — never a generic 'Utilities' line." Kim
+// Harland's October email read "Utilities $10.45" (water) and "Utilities $25" (trash).
+describe('each line names what it is', () => {
+  async function utilityLine(f: { invoiceId: string; tenantId: string | null }, type: 'water' | 'trash' | 'electric', amount: number, note: string | null) {
+    const c = await db.connect()
+    try {
+      const inv = (await c.query(`SELECT i.lease_id, i.unit_id, i.landlord_id, u.property_id FROM invoices i JOIN units u ON u.id = i.unit_id WHERE i.id=$1`, [f.invoiceId])).rows[0]
+      const p = await c.query<{ id: string }>(
+        `INSERT INTO payments (landlord_id, unit_id, lease_id, tenant_id, type, amount, status, entry_description, due_date, invoice_id, notes)
+         VALUES ($1,$2,$3,$4,'utility',$5,'pending','UTILITY',CURRENT_DATE,$6,$7) RETURNING id`,
+        [inv.landlord_id, inv.unit_id, inv.lease_id, f.tenantId, amount, f.invoiceId, note])
+      const meterId = await seedUtilityMeter(c, { propertyId: inv.property_id, utilityType: type })
+      await seedUtilityBill(c, { meterId, unitId: inv.unit_id, tenantId: f.tenantId!, leaseId: inv.lease_id,
+        landlordId: inv.landlord_id, chargeAmount: amount, paymentId: p.rows[0].id, utilityType: type })
+    } finally { c.release() }
+  }
+
+  it('Kim Harland, October: Water and Trash, never "Utilities"', async () => {
+    const f = await seedInvoice({ rent: 450 })
+    await utilityLine(f, 'water', 10.45, null)
+    await utilityLine(f, 'trash', 25, null)
+    await sendPendingInvoiceNotices()
+    const mail = lastSend()
+    expect(mail.html).toContain('Water')
+    expect(mail.html).toContain('Trash')
+    expect(mail.html).not.toContain('Utilities')
+    expect(mail.subject).toContain('$485.45')
+  })
+
+  it('a payment tag in a note is never the line\'s name; the meter read is its detail', async () => {
+    const f = await seedInvoice({ rent: 450 })
+    await utilityLine(f, 'electric', 46.2, 'Electric meter 44999 → 45219 (Sep 2 → Sep 30) · 220 kWh — Recorded as manual cash payment')
+    await sendPendingInvoiceNotices()
+    const html: string = lastSend().html
+    expect(html).toContain('Electric')
+    expect(html).toContain('meter 44999 → 45219 (Sep 2 → Sep 30) · 220 kWh')
+    expect(html).not.toContain('Recorded as manual')
+  })
+
+  // A dispute or bank return reopens a charge as a NEW row (paymentReversal):
+  // no utility bill, no lease fee, only the note "Reopened after payment
+  // reversal". It is still the same charge, and is named as it was.
+  const disputeIt = (paymentId: string, amount: number, eventId: string) => handlePaymentReversal({
+    paymentId, reversalType: 'card_dispute', reversedAmount: amount, reversalFee: 0, stripeEventId: eventId, rawEvent: {},
+  })
+  const settleByCard = (id: string, pi: string) => db.query(
+    `UPDATE payments SET status='settled', settled_at=NOW(), stripe_payment_intent_id=$2 WHERE id=$1`, [id, pi])
+  const reopenedBy = async (reversalId: string | undefined) =>
+    (await db.query<{ id: string }>(`SELECT id FROM payments WHERE reversal_id = $1`, [reversalId])).rows[0].id
+
+  it('a disputed water line\'s reopened row is named Water on the bill email and the receipt', async () => {
+    const f = await seedInvoice({ rent: 450 })
+    await utilityLine(f, 'water', 40, null)
+    const water = (await db.query<{ id: string }>(
+      `SELECT id FROM payments WHERE invoice_id = $1 AND type = 'utility'`, [f.invoiceId])).rows[0].id
+    await settleByCard(water, 'pi_water_disputed')
+    const rev = await disputeIt(water, 40, 'evt_water_disputed')
+    expect(rev.handled).toBe(true)
+    const reopened = await reopenedBy(rev.reversalId)
+
+    // The bill email: the original is not owed, the reopened row is, as Water.
+    await sendPendingInvoiceNotices({ invoiceId: f.invoiceId })
+    const bill: string = lastSend().html
+    expect(bill).toContain('Water')
+    expect(bill).not.toMatch(/Reopened|>\s*Utility\s*</)
+    expect(lastSend().subject).toContain('$490.00')
+
+    // The receipt once the reopened water is paid at the desk.
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW(), manual_method='cash' WHERE id=$1`, [reopened])
+    resendSendMock.mockClear()
+    expect(await sendPaymentReceipt({ paymentIds: [reopened], method: 'cash' })).not.toBeNull()
+    const receipt: string = lastSend().html
+    expect(receipt).toContain('Water')
+    expect(receipt).not.toMatch(/Reopened|>\s*Utility\s*</)
+  })
+
+  it('a reopened lease fee keeps its fee name, and a line disputed twice is still named by the charge first billed', async () => {
+    const f = await seedInvoice({ rent: 450 })
+    const inv = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
+    const fee = (await db.query<{ id: string }>(
+      `INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing, description)
+       VALUES ($1,'pet_rent',25,false,'monthly_ongoing',NULL) RETURNING id`, [inv.lease_id])).rows[0].id
+    const pet = (await db.query<{ id: string }>(
+      `INSERT INTO payments (landlord_id, unit_id, lease_id, tenant_id, type, amount, status, entry_description, due_date, invoice_id, lease_fee_id)
+       VALUES ($1,$2,$3,$4,'fee',25,'pending','OTHERFEE',CURRENT_DATE,$5,$6) RETURNING id`,
+      [inv.landlord_id, inv.unit_id, inv.lease_id, f.tenantId, f.invoiceId, fee])).rows[0].id
+    const elec = (await db.query<{ id: string }>(
+      `INSERT INTO payments (landlord_id, unit_id, lease_id, tenant_id, type, amount, status, entry_description, due_date, invoice_id, notes)
+       VALUES ($1,$2,$3,$4,'utility',22.47,'pending','UTILITY',CURRENT_DATE,$5,
+               'Electric meter 86386 → 86493 (Sep 2 → Sep 30) · 107 kWh') RETURNING id`,
+      [inv.landlord_id, inv.unit_id, inv.lease_id, f.tenantId, f.invoiceId])).rows[0].id
+
+    await settleByCard(pet, 'pi_pet_1')
+    const petAgain = await reopenedBy((await disputeIt(pet, 25, 'evt_pet_1')).reversalId)
+    // Paid again by card, and disputed again.
+    await settleByCard(petAgain, 'pi_pet_2')
+    const petThird = await reopenedBy((await disputeIt(petAgain, 25, 'evt_pet_2')).reversalId)
+    await settleByCard(elec, 'pi_elec_1')
+    const elecAgain = await reopenedBy((await disputeIt(elec, 22.47, 'evt_elec_1')).reversalId)
+
+    const row = async (id: string) => (await db.query<any>(
+      `SELECT p.type, p.notes, p.entry_description, ${chargeLabelColumnsSql('p')} FROM payments p WHERE p.id = $1`, [id])).rows[0]
+    for (const id of [petAgain, petThird]) {
+      const r = await row(id)
+      expect(r.fee_type).toBe('pet_rent')
+      expect(chargeLabel(r)).toBe('Pet rent')
+      expect(chargeDetail(r)).toBeNull()
+    }
+    // Named by its meter read, which only the charge first billed carries.
+    const e = await row(elecAgain)
+    expect(chargeLabel(e)).toBe('Electric')
+    expect(chargeDetail(e)).toBe('meter 86386 → 86493 (Sep 2 → Sep 30) · 107 kWh')
+    // A charge that was never reopened reads exactly as before.
+    expect(await row(elec).then(r => r.origin_notes)).toBeNull()
+
+    // A note with more than one segment: the reopen copies only its first
+    // ("Final electric — reopened after a payment reversal"), and the line
+    // owed again still reads the whole original, meter read included.
+    const fin = (await db.query<{ id: string }>(
+      `INSERT INTO payments (landlord_id, unit_id, lease_id, tenant_id, type, amount, status, entry_description, due_date, invoice_id, notes)
+       VALUES ($1,$2,$3,$4,'utility',18.20,'pending','UTILITY',CURRENT_DATE,$5,'Final electric — meter 100 → 200') RETURNING id`,
+      [inv.landlord_id, inv.unit_id, inv.lease_id, f.tenantId, f.invoiceId])).rows[0].id
+    await settleByCard(fin, 'pi_fin_1')
+    const finAgain = await reopenedBy((await disputeIt(fin, 18.20, 'evt_fin_1')).reversalId)
+    const fa = await row(finAgain)
+    expect(fa.notes).toBe('Final electric — reopened after a payment reversal')
+    expect(chargeLabel(fa)).toBe('Electric')
+    expect(chargeDetail(fa)).toBe(chargeDetail(await row(fin)))
+    expect(chargeDetail(fa)).toBe('Final electric — meter 100 → 200')
+  })
+})
+
+describe('chargeLabel / chargeDetail', () => {
+  it('names a charge by what it is, from its bill, its fee, its code, its type', () => {
+    expect(chargeLabel({ type: 'rent', notes: 'Recorded as manual cash payment' })).toBe('Rent')
+    expect(chargeLabel({ type: 'utility', utility_type: 'water', notes: 'Recorded as manual money_order payment (ref 55187081609)' })).toBe('Water')
+    expect(chargeLabel({ type: 'utility', notes: 'RV 44 — Electric meter 22646 → 22734 (Sep 27 → Sep 30) · 88 kWh' })).toBe('Electric')
+    expect(chargeLabel({ type: 'utility', notes: null })).toBe('Utility')
+    expect(chargeLabel({ type: 'utility', entry_description: 'PROPANE', notes: null })).toBe('Propane')
+    expect(chargeLabel({ type: 'fee', fee_type: 'trash_fee', notes: null })).toBe('Trash')
+    expect(chargeLabel({ type: 'fee', fee_type: 'pet_rent', notes: null })).toBe('Pet rent')
+    expect(chargeLabel({ type: 'fee', entry_description: 'DECLINEFEE', notes: null })).toBe('Declined-payment fee')
+    expect(chargeLabel({ type: 'late_fee', notes: 'Waived by landlord 10/3: moved' })).toBe('Late fee')
+    expect(chargeLabel({ type: 'home_payment', notes: 'Home payment 104 of 132' })).toBe('Home payment')
+  })
+
+  it('keeps the read or the period as detail, and drops payment tags, the space and internal notes', () => {
+    expect(chargeDetail({ type: 'utility', notes: 'Water — Aug 2026 (used before the lease was signed) — Recorded as manual check payment (ref 1292)' }))
+      .toBe('Aug 2026 (used before the lease was signed)')
+    expect(chargeDetail({ type: 'utility', notes: 'RV 44 — Electric meter 22646 → 22734 · 88 kWh' })).toBe('meter 22646 → 22734 · 88 kWh')
+    expect(chargeDetail({ type: 'home_payment', notes: 'Home payment 104 of 132' })).toBe('104 of 132')
+    expect(chargeDetail({ type: 'rent', notes: 'S652: corrected to the agreed $440 rent' })).toBeNull()
+    expect(chargeDetail({ type: 'utility', notes: 'Work trade — suspended while the hours are worked; settled at month close' })).toBeNull()
+    expect(chargeDetail({ type: 'rent', notes: null })).toBeNull()
+  })
+
+  it('a reopened charge is named and detailed by the charge it was reopened from, never by its reopen note', () => {
+    const reopened = { type: 'utility', notes: 'Reopened after payment reversal', origin_notes: 'Water — Aug 2026 (used before the lease was signed)' }
+    expect(chargeLabel(reopened)).toBe('Water')
+    expect(chargeDetail(reopened)).toBe('Aug 2026 (used before the lease was signed)')
+    expect(chargeLabel({ type: 'utility', notes: 'Reopened after payment reversal', origin_notes: null })).toBe('Utility')
+    // Its own note wins when it says what the charge is.
+    expect(chargeLabel({ type: 'utility', notes: 'Trash', origin_notes: 'Water' })).toBe('Trash')
+    // The reopen copies only the FIRST segment of the original's note: a final
+    // meter bill keeps its read wherever the line is owed again.
+    const finalBill = {
+      type: 'utility', utility_type: 'electric',
+      notes: 'Final electric — reopened after a payment reversal',
+      origin_notes: 'Final electric — meter 100 → 200',
+    }
+    expect(chargeLabel(finalBill)).toBe('Electric')
+    expect(chargeDetail(finalBill)).toBe('Final electric — meter 100 → 200')
+    expect(chargeDetail({ type: 'utility', utility_type: 'electric', notes: 'Final electric — meter 100 → 200' }))
+      .toBe('Final electric — meter 100 → 200')
+    // Disputed twice: the copy of a copy still reads the original whole.
+    expect(chargeDetail({ ...finalBill, notes: 'Final electric — reopened after a payment reversal' })).toBe('Final electric — meter 100 → 200')
   })
 })
 

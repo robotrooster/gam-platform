@@ -1,0 +1,70 @@
+{
+  "remittances": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "amount": 1000,
+      "appliedAmount": 1000,
+      "unappliedAmount": 0,
+      "status": "failed",
+      "paymentMethod": "card",
+      "createdAt": "2026-10-04T18:30:00.000Z",
+      "settledAt": null,
+      "creditUsed": 0,
+      "canceledBeforeCharge": false,
+      "declinedBeforeCharge": true,
+      "lines": [
+        {
+          "remittanceId": "00000000-0000-4000-8000-000000000001",
+          "paymentId": "00000000-0000-4000-8000-000000000002",
+          "amountApplied": 1000,
+          "type": "rent",
+          "dueDate": "2026-10-04",
+          "entryDescription": "RENT",
+          "paymentStatus": "pending"
+        }
+      ]
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "amount": 1000,
+      "appliedAmount": 1000,
+      "unappliedAmount": 0,
+      "status": "failed",
+      "paymentMethod": "card",
+      "createdAt": "2026-10-04T18:30:00.000Z",
+      "settledAt": null,
+      "creditUsed": 0,
+      "canceledBeforeCharge": true,
+      "declinedBeforeCharge": false,
+      "lines": [
+        {
+          "remittanceId": "00000000-0000-4000-8000-000000000003",
+          "paymentId": "00000000-0000-4000-8000-000000000002",
+          "amountApplied": 1000,
+          "type": "rent",
+          "dueDate": "2026-10-04",
+          "entryDescription": "RENT",
+          "paymentStatus": "pending"
+        }
+      ]
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000004",
+      "amount": 25,
+      "appliedAmount": 25,
+      "unappliedAmount": 0,
+      "status": "failed",
+      "paymentMethod": "card",
+      "createdAt": "2026-10-04T18:30:00.000Z",
+      "settledAt": null,
+      "creditUsed": 0,
+      "canceledBeforeCharge": false,
+      "declinedBeforeCharge": false,
+      "lines": []
+    }
+  ],
+  "prepaidRemaining": 0,
+  "prepaidMonthlyDraw": null,
+  "depositInterestCredit": 0,
+  "otherCreditTotal": 0
+}

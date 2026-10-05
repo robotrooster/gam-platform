@@ -217,8 +217,46 @@ describe('S609 prepaid release', () => {
       `SELECT status, platform_held, notes FROM payments WHERE id=$1`, [paymentId])
     expect(p.status).toBe('settled')
     expect(p.platform_held).toBe(false)          // the landlord has the money already
-    expect(p.notes).toMatch(/collected by the landlord/)
+    expect(p.notes).toMatch(/Paid with account credit/)
     expect(await ownerShare(paymentId)).toBeNull() // nothing for Tuesday's batch
+  })
+
+  // S655: the funding is now stamped on the credit itself (funded_by), and it
+  // decides, not the remittance it came from.
+  it('S655: landlord-held paid-ahead money (funded_by landlord) settles the month and releases nothing', async () => {
+    const { paymentId, invoiceId } = await makeInvoiceWithRent(f, 1000)
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by, received_at)
+       VALUES ($1, $2, 1000, 1000, 'landlord', now())`, [f.leaseId, f.tenantId])
+    expect(await release(f, invoiceId)).toMatchObject({ consumed: 1000, rowsCovered: 1, releasedToLandlord: 0 })
+    expect(await ownerShare(paymentId)).toBeNull()
+  })
+
+  it('S655: GAM-held paid-ahead money (funded_by gam) releases the landlord share', async () => {
+    const { paymentId, invoiceId } = await makeInvoiceWithRent(f, 1000)
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by, received_at)
+       VALUES ($1, $2, 1000, 1000, 'gam', now())`, [f.leaseId, f.tenantId])
+    expect(await release(f, invoiceId)).toMatchObject({ consumed: 1000, rowsCovered: 1, releasedToLandlord: 1000 })
+    expect(await ownerShare(paymentId)).toBeCloseTo(1000, 2)
+  })
+
+  it('S655: rent already paid on a shortened stay (funded_by reclassified) releases nothing again', async () => {
+    const { paymentId, invoiceId } = await makeInvoiceWithRent(f, 1000)
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by, received_at)
+       VALUES ($1, $2, 1000, 1000, 'reclassified', now())`, [f.leaseId, f.tenantId])
+    expect(await release(f, invoiceId)).toMatchObject({ consumed: 1000, rowsCovered: 1, releasedToLandlord: 0 })
+    expect(await ownerShare(paymentId)).toBeNull()
+  })
+
+  it('S655: every spend is a credit-ledger record, written once', async () => {
+    await bankPrepaid(f, 1000)
+    const { invoiceId, paymentId } = await makeInvoiceWithRent(f, 1000)
+    await release(f, invoiceId)
+    await release(f, invoiceId)        // a second run finds nothing left to pay
+    const uses = await db.query<any>(`SELECT payment_id, amount::float AS amount, status, source FROM credit_uses`)
+    expect(uses.rows).toEqual([{ payment_id: paymentId, amount: 1000, status: 'applied', source: 'whole_bill' }])
   })
 
   it('a credit the landlord typed in with no payment behind it releases nothing either', async () => {
@@ -296,28 +334,29 @@ describe('S609 whose money a charge is', () => {
     expect(await ownerShare(paymentId)).toBeCloseTo(75, 2)
   })
 
-  it("GAM's own fee stays with GAM", async () => {
+  // S655 (shelved 3): credit is the landlord's to settle the landlord's own
+  // bills. GAM's fee is never paid by it — the tenant pays it online — and a
+  // bill carrying one never settles itself.
+  it("GAM's own fee is never paid by credit: it stays owed and the landlord gets nothing", async () => {
     // Byte-identical to the charge above apart from revenue_owner — which is
     // exactly why the column exists. A landlord's hand-billed fee and a GAM
     // subscription are both written as type 'fee', description 'SUBSCRIP'.
     await bankPrepaid(f, 10)
     const { invoiceId, paymentId } = await invoiceWithCharge(10, 'fee', 'SUBSCRIP', 'gam')
     const r = await release(f, invoiceId)
-
-    // The tenant's charge is still settled by their credit — they paid it.
     const row = await db.query<{ status: string; platform_held: boolean }>(
       `SELECT status, platform_held FROM payments WHERE id = $1`, [paymentId])
-    expect(row.rows[0].status).toBe('settled')
-    // But no owner share, and it is not queued for the landlord's payout.
+    expect(row.rows[0].status).toBe('pending')
     expect(await ownerShare(paymentId)).toBeNull()
-    expect(row.rows[0].platform_held).toBe(false)
-    expect(r.releasedToLandlord).toBeCloseTo(0, 2)
+    expect(r).toEqual({ consumed: 0, rowsCovered: 0, releasedToLandlord: 0 })
   })
 
-  it('an ACH return fee stays with GAM', async () => {
+  it('an ACH return fee is never paid by credit either', async () => {
     await bankPrepaid(f, 4)
     const { invoiceId, paymentId } = await invoiceWithCharge(4, 'fee', 'RETURNFEE', 'gam')
     await release(f, invoiceId)
     expect(await ownerShare(paymentId)).toBeNull()
+    const row = await db.query<{ status: string }>(`SELECT status FROM payments WHERE id = $1`, [paymentId])
+    expect(row.rows[0].status).toBe('pending')
   })
 })

@@ -17,6 +17,7 @@
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { generateBillsForProperty } from './utilityBilling'
+import { PAUSED_CYCLE_MARKER_SQL } from './utilityPausedCycle'
 
 const cycleDateOf = (d: any) => {
   const s = d instanceof Date
@@ -51,6 +52,7 @@ export async function billReview(runId: string) {
                     OR (cur.id IS NOT NULL AND pr.reading_date < cur.reading_date))
              ORDER BY pr.reading_date DESC, pr.created_at DESC LIMIT 1)) AS prior_value,
            ub.id AS bill_id, ub.usage_amount, ub.charge_amount, ub.status AS bill_status, ub.payment_id,
+           ${PAUSED_CYCLE_MARKER_SQL} AS paused_cycle,
            u.unit_number, tu.first_name AS tenant_first, tu.last_name AS tenant_last
       FROM utility_meters m
       LEFT JOIN utility_meter_readings cur
@@ -74,7 +76,10 @@ export async function billReview(runId: string) {
     tenant: [r.tenant_first, r.tenant_last].filter(Boolean).join(' ') || null,
     usage: r.usage_amount != null ? Number(r.usage_amount) : null,
     charge: r.charge_amount != null ? Number(r.charge_amount) : null,
-    issued: r.bill_id ? (r.bill_status !== 'unbilled' || !!r.payment_id) : false,
+    // 10/3 (final sweep): the record of a paused cycle (lease hibernating, the
+    // meter did not move) is a $0.00 void row nobody was ever sent — not issued,
+    // so its read can still be fixed here.
+    issued: r.bill_id ? ((r.bill_status !== 'unbilled' && !r.paused_cycle) || !!r.payment_id) : false,
   }))
   const total = lines.reduce((s, l) => s + (l.charge ?? 0), 0)
   return {
@@ -102,10 +107,17 @@ export async function billReview(runId: string) {
  */
 export async function dropUnissuedBillsFrom(meterId: string, cycleMonth: any): Promise<boolean> {
   const cycle = cycleDateOf(cycleMonth)
+  // 10/3 (final sweep): the record of a paused cycle (PAUSED_CYCLE_MARKER_SQL —
+  // a $0.00 void row, never billed, never paid) is not an issued bill. It used
+  // to count as one, so a 409 claimed "a tenant has already seen" a bill that
+  // was never sent, for that read and every earlier one on the meter. It stays
+  // where it is: the engine prices the cycle again from the corrected read and
+  // drops the record itself when the corrected read shows the meter moving.
   const issued = await queryOne<{ n: number }>(
-    `SELECT COUNT(*)::int AS n FROM utility_bills
-      WHERE meter_id = $1 AND billing_cycle_month >= $2::date
-        AND (status <> 'unbilled' OR payment_id IS NOT NULL)`, [meterId, cycle])
+    `SELECT COUNT(*)::int AS n FROM utility_bills ub
+      WHERE ub.meter_id = $1 AND ub.billing_cycle_month >= $2::date
+        AND (ub.status <> 'unbilled' OR ub.payment_id IS NOT NULL)
+        AND NOT ${PAUSED_CYCLE_MARKER_SQL}`, [meterId, cycle])
   if ((issued?.n ?? 0) > 0) return false
   await query(
     `DELETE FROM utility_bills ub USING utility_meters m, utility_meters me

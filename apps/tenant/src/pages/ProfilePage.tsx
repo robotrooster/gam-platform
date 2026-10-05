@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { User, Check, AlertCircle } from 'lucide-react'
-import { isCriticalNotificationType } from '@gam/shared'
+import { isCriticalNotificationType, PASSWORD_MIN_LEN } from '@gam/shared'
 
 import axios from 'axios'
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -11,6 +11,13 @@ api.interceptors.request.use(c => { const t = localStorage.getItem('gam_tenant_t
 function get<T>(path: string): Promise<T> { return api.get(path).then(r => r.data?.data ?? r.data) }
 function patchReq(path: string, body: any) { return api.patch(path, body).then(r => r.data) }
 function putReq(path: string, body: any) { return api.put(path, body).then(r => r.data?.data ?? r.data) }
+
+// The server's sentences for a 401 that means the session itself has ended:
+// no pass ("No token provided"), a bad or expired one ("Invalid or expired
+// token", "Unauthenticated"), or one minted before a password change ("Your
+// password was changed. Please sign in again."). A locked account is also a
+// 401, but the pass still works, so it is NOT one of these.
+const SESSION_ENDED = /password was changed|session|token|unauthenticated/i
 
 const NOTIF_TYPES = [
   { type:'payment_failed',              label:'Payment Failed',         desc:'When your rent payment fails' },
@@ -82,10 +89,36 @@ export function ProfilePage() {
     { onSuccess: () => { qc.invalidateQueries('notif-prefs-tenant'); setSaved('pref'); setTimeout(() => setSaved(''), 2000) } }
   )
 
+  // A password change ends every session minted before it — including the one
+  // this page is using — so the server hands back a fresh pass and it replaces
+  // the old one here. Without that, the next check of the session signed the
+  // tenant out for changing their own password. Every request reads the pass
+  // from storage, so nothing else needs telling.
   const pwMut = useMutation(
     () => patchReq('/tenants/password', { currentPassword: pwCurrent, newPassword: pwNew }),
-    { onSuccess: () => { setPwCurrent(''); setPwNew(''); setPwConfirm(''); setSaved('pw'); setTimeout(() => setSaved(''), 2500) },
-      onError: () => setPwError('Incorrect current password') }
+    { onSuccess: (res: any) => {
+        const fresh = res?.data?.token
+        if (typeof fresh === 'string' && fresh) localStorage.setItem('gam_tenant_token', fresh)
+        setPwError(''); setPwCurrent(''); setPwNew(''); setPwConfirm(''); setSaved('pw'); setTimeout(() => setSaved(''), 4000)
+      },
+      // This page's own client has no sign-out-on-401 and does not copy the
+      // server's sentence into err.message, so both are done here. Only a
+      // session that has itself ended signs the tenant out: the pass is gone,
+      // expired, or older than a password change. Every other refusal — a
+      // wrong current password (400), or an account locked by too many
+      // sign-in attempts (401, while this pass still works) — shows the
+      // server's own sentence here and keeps the pass, so the tenant is never
+      // thrown out of the portal without being told why.
+      onError: (err: any) => {
+        const said = err?.response?.data?.error
+        const sentence = typeof said === 'string' ? said.trim() : ''
+        if (err?.response?.status === 401 && (!sentence || SESSION_ENDED.test(sentence))) {
+          localStorage.removeItem('gam_tenant_token')
+          window.location.href = '/login'
+          return
+        }
+        setPwError(sentence || 'Could not change your password. Please try again.')
+      } }
   )
 
   // ── Email-2FA (S571) ────────────────────────────────────────────────────
@@ -302,21 +335,29 @@ export function ProfilePage() {
 
           {[
             { label:'Current Password', val:pwCurrent, set:setPwCurrent, type:'password' },
-            { label:'New Password', val:pwNew, set:setPwNew, type:'password' },
+            { label:'New Password', val:pwNew, set:setPwNew, type:'password', minHint:true },
             { label:'Confirm New Password', val:pwConfirm, set:setPwConfirm, type:'password' },
           ].map(f => (
             <div key={f.label} style={{ marginBottom:14 }}>
               <label style={s(f.label)}>{f.label}</label>
               <input className="input" type={f.type} value={f.val} onChange={e => { f.set(e.target.value); setPwError('') }} style={{ width:'100%' }} />
+              {/* The same minimum the server enforces (PASSWORD_MIN_LEN) — every password door uses one number. */}
+              {f.minHint && (
+                <div style={{ fontSize:'.72rem', marginTop:5, color: pwNew && pwNew.length < PASSWORD_MIN_LEN ? 'var(--red)' : 'var(--text-3)' }}>
+                  {pwNew && pwNew.length < PASSWORD_MIN_LEN
+                    ? `At least ${PASSWORD_MIN_LEN} characters. Add ${PASSWORD_MIN_LEN - pwNew.length} more.`
+                    : `At least ${PASSWORD_MIN_LEN} characters.`}
+                </div>
+              )}
             </div>
           ))}
           {pwError && <div style={{ color:'var(--red)', fontSize:'.75rem', marginBottom:10, display:'flex', alignItems:'center', gap:6 }}><AlertCircle size={12} /> {pwError}</div>}
-          {pwNew && pwConfirm && pwNew !== pwConfirm && <div style={{ color:'var(--red)', fontSize:'.75rem', marginBottom:10 }}>Passwords do not match</div>}
+          {pwNew && pwConfirm && pwNew !== pwConfirm && <div style={{ color:'var(--red)', fontSize:'.75rem', marginBottom:10 }}>The two new passwords do not match. Type the same new password in both boxes.</div>}
           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-            <button className="btn btn-primary" disabled={!pwCurrent || !pwNew || pwNew !== pwConfirm || pwMut.isLoading} onClick={() => pwMut.mutate()}>
+            <button className="btn btn-primary" disabled={!pwCurrent || !pwNew || pwNew.length < PASSWORD_MIN_LEN || pwNew !== pwConfirm || pwMut.isLoading} onClick={() => pwMut.mutate()}>
               {pwMut.isLoading ? <span className="spinner" /> : 'Update Password'}
             </button>
-            {saved==='pw' && <span style={{ fontSize:'.78rem', color:'var(--green)', display:'flex', alignItems:'center', gap:4 }}><Check size={12} /> Updated</span>}
+            {saved==='pw' && <span style={{ fontSize:'.78rem', color:'var(--green)', display:'flex', alignItems:'center', gap:4 }}><Check size={12} /> Password changed. You stay signed in here; other devices will need to sign in again.</span>}
           </div>
         </div>
       )}

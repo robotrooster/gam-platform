@@ -1,13 +1,16 @@
 import { useState, useRef, useEffect, useMemo, useLayoutEffect } from 'react'
 import { useUrlTab } from '../lib/useUrlTab'
+import { useLocation } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, type BookingStatus, camelizeKeys } from '@gam/shared'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
 import { OutOfOrderModal } from './OutOfOrderModal'
+import { EarlyCheckOutModal } from '../components/EarlyCheckOutModal'
+import { NeverMovedInBody, type NeverMovedInPreview, refreshAfterLeaseClose } from './LeasesPage'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -73,6 +76,8 @@ function getDaysInRange(from: string, to: string) {
 // (check_in = "2026-06-20T00:00:00.000Z"); slicing keeps the date math (which
 // appends T12:00:00) from producing an Invalid Date.
 const dayOnly = (s: any) => String(s ?? '').slice(0, 10)
+// A reservation's status in the schedule's own words (packages/shared).
+const bookingStatusWords = (s: string) => BOOKING_STATUS_LABEL[s as BookingStatus] ?? humanize(s)
 // The sticky Unit column. ONE width, used by the header cell, the table, the
 // floating names and the keyboard pan — it was written as a bare 180/184 in
 // five places. 200 since S652: at 180 "RV 08" wrapped under the "RV" while
@@ -308,6 +313,9 @@ export function SchedulePage() {
   const [customAmenity, setCustomAmenity] = useState('')
   const [newResvOpen, setNewResvOpen] = useState(false)
   const [detailBooking, setDetailBooking] = useState<any>(null)
+  // Final fix (fix pass 1, decisions #53): the stay whose Cancel reservation
+  // confirm is open (it reads, fresh, what canceling it changes).
+  const [cancelFor, setCancelFor] = useState<any>(null)
   // Edit mode for an existing reservation (the detail panel). null = view-only.
   const [editForm, setEditForm] = useState<{guestName:string; guestEmail:string; guestPhone:string; checkIn:string; checkOut:string; unitId:string; notes:string; requiredSiteLayout:string; requiredAmpService:string; avoid:string} | null>(null)
   const [editError, setEditError] = useState('')
@@ -641,6 +649,15 @@ export function SchedulePage() {
   const oooPastFor = (unitId: string, date: string) =>
     outOfOrderHistory.find((o: any) => o.unitId === unitId && date >= o.startsOn && date < o.endedOn)
   const [oooUnit, setOooUnit] = useState<any | null>(null)
+  // 10/4 (decisions #38): the Check out window — opened from a stay, or from
+  // the owner's to-do / notification (?checkout=<booking>&unit=<site>).
+  const [checkOutFor, setCheckOutFor] = useState<{ unitId: string; bookingId: string } | null>(null)
+  const location = useLocation()
+  useEffect(() => {
+    const sp = new URLSearchParams(location.search)
+    const b = sp.get('checkout'), u = sp.get('unit')
+    if (b && u) setCheckOutFor({ unitId: u, bookingId: b })
+  }, [location.search])
   const days = getDaysInRange(fromDate, toDate)
 
   // S526 (Nic): the create form is contact + dates ONLY. No total input (the
@@ -762,6 +779,44 @@ export function SchedulePage() {
     { onSuccess: () => { qc.invalidateQueries('schedule'); setTypeModal({show:false,unit:null}) } }
   )
 
+  // 10/3: a reservation as a save hands it back (camelized), laid over the open
+  // stay. The schedule's own rows are the same columns (b.*), so the whole row
+  // goes over; the site's number and park come from the site list.
+  const mergeLatestStay = (prev: any, b: any) => {
+    const site = units.find((u: any) => u.id === b?.unitId)
+    return {
+      ...prev, ...b,
+      checkIn: b?.checkIn ? dayOnly(b.checkIn) : prev.checkIn,
+      checkOut: b?.checkOut ? dayOnly(b.checkOut) : prev.checkOut,
+      unitNumber: site?.unitNumber ?? prev.unitNumber,
+      propertyName: site?.propertyName ?? prev.propertyName,
+    }
+  }
+  // 10/3 (staff screens self-heal): a save refused because somebody else
+  // changed the stay a moment before (409 'reservation_changed'). The schedule
+  // and its history are fetched again, the open stay shows the stay as it is
+  // now (the refusal carries it), an open Edit form is filled again from it so
+  // a second save can't write over the other change, and the refusal's words
+  // are shown once. True when that is what happened.
+  const takeLatestIfChanged = (e: any, opts: { inForm?: boolean } = {}): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'reservation_changed') return false
+    qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history')
+    const latest = body?.data ? camelizeKeys(body.data) as any : null
+    const words = body?.error || 'This reservation was just changed by someone else, so your change was not saved.'
+    if (latest?.id) {
+      setDetailBooking((prev: any) => prev && prev.id === latest.id ? mergeLatestStay(prev, latest) : prev)
+    }
+    if (opts.inForm) {
+      if (latest?.id) startEdit(mergeLatestStay(detailBooking ?? {}, latest))
+      setEditError(words)
+    } else {
+      toast.error(words)
+    }
+    return true
+  }
+  const saveError = (e: any, fallback: string) => e?.response?.data?.error || fallback
+
   const moveBookingMut = useMutation(
     (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string}) =>
       apiPatch(`/units/${payload.unitId}/bookings/${payload.bookingId}`, {
@@ -769,17 +824,18 @@ export function SchedulePage() {
       }),
     {
       onSuccess: () => { qc.invalidateQueries('schedule') },
-      onError: () => { toast.error('Cannot move reservation — date conflict on that unit.') }
+      onError: (e: any) => {
+        if (takeLatestIfChanged(e)) return
+        toast.error(saveError(e, 'Cannot move reservation — date conflict on that unit.'))
+      }
     }
   )
 
-  const cancelBookingMut = useMutation(
-    (b: any) => apiPatch(`/units/${b.unitId}/bookings/${b.id}`, { status: 'cancelled' }),
-    {
-      onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); setDetailBooking(null) },
-      onError: () => toast.error('Could not cancel the reservation.'),
-    }
-  )
+  // Final fix (fix pass 1, decisions #53): Cancel reservation no longer sends
+  // a bare {status:'cancelled'} after a one-line "Cancel this reservation?".
+  // It opens CancelReservationModal (below), which reads fresh what the cancel
+  // changes — the lease drafted with the stay, the people on it by name, the
+  // move-in bill it zeroes, what stays owed — and sends the total it showed.
 
   // S559: front-desk check-in. Blocked server-side when the previous guest's
   // submeter hasn't been read (same-day turnover) — the 409 carries the
@@ -792,6 +848,7 @@ export function SchedulePage() {
   const checkInMut = useMutation((b: any) => doCheckIn(b), {
     onSuccess: () => { qc.invalidateQueries('schedule'); toast('Guest checked in'); setDetailBooking(null) },
     onError: (e: any) => {
+      if (takeLatestIfChanged(e)) return
       const data = e?.response?.data
       if (data?.code === 'meter_read_due') { setCheckInPrompt({ booking: detailBooking, meters: data.meters || [], canOverride: !!data.canOverride }); return }
       toast.error(data?.error || 'Could not check the guest in.')
@@ -802,13 +859,16 @@ export function SchedulePage() {
     setCheckInBusy(true)
     try {
       for (const m of checkInPrompt.meters) {
-        await apiPost(`/utility/meters/${m.meterId}/reads`, { readingValue: Number(values[m.meterId]), reason: m.reason })
+        await apiPost(`/utility/meters/${m.meterId}/reads`, { readingValue: Number(values[m.meterId]), reason: m.reason, ...(m.leaseId ? { leaseId: m.leaseId } : {}) })
       }
       await doCheckIn(checkInPrompt.booking)
       qc.invalidateQueries('schedule')
       toast('Read recorded — guest checked in')
       setCheckInPrompt(null); setDetailBooking(null)
-    } catch (e: any) { toast.error(e?.response?.data?.error || 'Could not complete check-in.') }
+    } catch (e: any) {
+      if (takeLatestIfChanged(e)) { setCheckInPrompt(null); return }
+      toast.error(e?.response?.data?.error || 'Could not complete check-in.')
+    }
     finally { setCheckInBusy(false) }
   }
   const overrideCheckIn = async () => {
@@ -819,7 +879,10 @@ export function SchedulePage() {
       qc.invalidateQueries('schedule')
       toast('Checked in — meter read still due')
       setCheckInPrompt(null); setDetailBooking(null)
-    } catch (e: any) { toast.error(e?.response?.data?.error || 'Could not check in.') }
+    } catch (e: any) {
+      if (takeLatestIfChanged(e)) { setCheckInPrompt(null); return }
+      toast.error(e?.response?.data?.error || 'Could not check in.')
+    }
     finally { setCheckInBusy(false) }
   }
 
@@ -833,7 +896,7 @@ export function SchedulePage() {
         setDetailBooking((prev: any) => prev ? { ...prev, lockedToUnit: updated?.lockedToUnit ?? !b.lockedToUnit } : prev)
         toast(updated?.lockedToUnit ?? !b.lockedToUnit ? 'Locked to its site — automatic scheduling will not move this stay.' : 'Unlocked — automatic scheduling may re-site this stay again.')
       },
-      onError: () => toast.error('Could not update the site lock.'),
+      onError: (e: any) => { if (!takeLatestIfChanged(e)) toast.error(saveError(e, 'Could not update the site lock.')) },
     }
   )
 
@@ -865,23 +928,13 @@ export function SchedulePage() {
         // global middleware + axios interceptor camelize every key — so `resp`
         // IS the booking and its fields are camelCase (matches lockBookingMut).
         const b = resp
-        setDetailBooking((prev:any)=> prev ? {
-          ...prev,
-          guestName: b?.guestName ?? prev.guestName,
-          guestEmail: b?.guestEmail ?? prev.guestEmail,
-          guestPhone: b?.guestPhone ?? prev.guestPhone,
-          checkIn: b?.checkIn ? String(b.checkIn).split('T')[0] : prev.checkIn,
-          checkOut: b?.checkOut ? String(b.checkOut).split('T')[0] : prev.checkOut,
-          nights: b?.nights ?? prev.nights,
-          totalAmount: b?.totalAmount ?? prev.totalAmount,
-          unitId: b?.unitId ?? prev.unitId,
-          unitNumber: units.find((u:any)=>u.id===(b?.unitId))?.unitNumber ?? prev.unitNumber,
-          notes: b?.notes ?? prev.notes,
-          avoidedUnitIds: b?.avoidedUnitIds ?? prev.avoidedUnitIds,
-        } : prev)
+        setDetailBooking((prev:any)=> prev && b?.id ? mergeLatestStay(prev, b) : prev)
         setEditForm(null); setEditError('')
       },
-      onError: (e:any) => setEditError(e?.response?.data?.error || e?.message || 'Could not save changes.'),
+      onError: (e:any) => {
+        if (takeLatestIfChanged(e, { inForm: true })) return
+        setEditError(e?.response?.data?.error || e?.message || 'Could not save changes.')
+      },
     }
   )
   const startEdit = (d:any) => {
@@ -1646,7 +1699,10 @@ export function SchedulePage() {
                             const bk = { ...booking, unitId: unit.id, unitNumber: unit.unitNumber, propertyName: unit.propertyName, isLease }
                             return (
                               <div
-                                draggable={!isLease}
+                                // 10/3 (fix pass 2): moving or stretching a stay is an edit. A desk
+                                // person who may only check guests in or out does not get a bar
+                                // that drags only to be refused.
+                                draggable={!isLease && can('schedule.edit_reservation')}
                                 onDragStart={e => {
                                   // Mode from grab position: the outer ~10px of a start/end
                                   // cell resizes that edge; anywhere else moves the stay.
@@ -1832,7 +1888,7 @@ export function SchedulePage() {
                 <span style={{fontWeight:600,fontSize:'.88rem'}}>{b.unitNumber}</span>
                 <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{b.propertyName}</span>
                 <span className="badge badge-green" style={{fontSize:'.65rem'}}>{LEASE_TYPE_LABELS[b.leaseType] || humanize(b.leaseType)}</span>
-                <span className={`badge ${STATUS_COLORS[b.status]||'badge-muted'}`} style={{fontSize:'.65rem'}}>{humanize(b.status)}</span>
+                <span className={`badge ${STATUS_COLORS[b.status]||'badge-muted'}`} style={{fontSize:'.65rem'}}>{bookingStatusWords(b.status)}</span>
               </div>
               <div style={{fontSize:'.82rem',color:'var(--text-2)'}}>
                 {b.guestName||'Guest'} · {new Date(dayOnly(b.checkIn)+'T12:00:00').toLocaleDateString()} — {new Date(dayOnly(b.checkOut)+'T12:00:00').toLocaleDateString()} ({b.nights} nights)
@@ -1873,7 +1929,7 @@ export function SchedulePage() {
               </div>
             </div>
           ))}
-          {past.length > 0 && divider(`Past / cancelled (${past.length})`)}
+          {past.length > 0 && divider(`Past / canceled (${past.length})`)}
           {past.map(bookingCard)}
         </div>
         )
@@ -1927,7 +1983,7 @@ export function SchedulePage() {
             <div style={{padding:48,textAlign:'center',color:'var(--text-3)'}}>No reservation changes yet.</div>
           ) : history.map((e:any) => {
             const COLORS:Record<string,string> = { created:'var(--green)', moved:'var(--blue)', dates_changed:'var(--gold)', status_changed:'var(--amber)', cancelled:'var(--red)' }
-            const LABELS:Record<string,string> = { created:'Created', moved:'Moved', dates_changed:'Dates', status_changed:'Status', cancelled:'Cancelled' }
+            const LABELS:Record<string,string> = { created:'Created', moved:'Moved', dates_changed:'Dates', status_changed:'Status', cancelled:'Canceled' }
             return (
               <div key={e.id} style={{display:'flex',gap:12,alignItems:'center',padding:'9px 16px',borderBottom:'1px solid var(--border-1)'}}>
                 <span style={{fontSize:'.6rem',fontWeight:700,color:'#fff',background:COLORS[e.eventType]||'var(--text-3)',borderRadius:4,padding:'2px 7px',minWidth:64,textAlign:'center'}}>{LABELS[e.eventType]||e.eventType}</span>
@@ -1962,11 +2018,7 @@ export function SchedulePage() {
                 <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Status</label>
                 <select value={resvStatus} onChange={e => setResvStatus(e.target.value)} className="input">
                   <option value="">All</option>
-                  <option value="confirmed">Confirmed</option>
-                  <option value="checked_in">Checked-in</option>
-                  <option value="checked_out">Checked-out</option>
-                  <option value="cancelled">Cancelled</option>
-                  <option value="no_show">No-show</option>
+                  {BOOKING_STATUSES.map(st => <option key={st} value={st}>{BOOKING_STATUS_LABEL[st]}</option>)}
                 </select>
               </div>
               <div>
@@ -2040,7 +2092,7 @@ export function SchedulePage() {
                 <tbody>
                   {resvList.map(b => (
                     <tr key={b.id}>
-                      <td><span className={`badge ${RESV_STATUS_BADGE[b.status] || 'badge-muted'}`}>{humanize(b.status)}</span></td>
+                      <td><span className={`badge ${RESV_STATUS_BADGE[b.status] || 'badge-muted'}`}>{bookingStatusWords(b.status)}</span></td>
                       <td>
                         <div style={{ color: 'var(--text-0)', fontWeight: 600 }}>{b.guestName || '—'}</div>
                         <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{b.guestEmail || ''}</div>
@@ -2355,6 +2407,19 @@ export function SchedulePage() {
 
       {/* ── RESERVATION DETAIL ── click a bar to view */}
       {oooUnit && <OutOfOrderModal unit={oooUnit} onClose={() => setOooUnit(null)} />}
+      {checkOutFor && (
+        <EarlyCheckOutModal unitId={checkOutFor.unitId} bookingId={checkOutFor.bookingId}
+          onClose={() => {
+            setCheckOutFor(null)
+            try {
+              const url = new URL(window.location.href)
+              if (url.searchParams.has('checkout')) {
+                url.searchParams.delete('checkout'); url.searchParams.delete('unit')
+                window.history.replaceState(null, '', url.toString())
+              }
+            } catch { /* nothing to tidy */ }
+          }} />
+      )}
       {detailBooking && (() => {
         const d = detailBooking
         const isLease = !!d.isLease
@@ -2457,7 +2522,7 @@ export function SchedulePage() {
                     )}
                   </div></>
                 )}
-                <div style={{color:'var(--text-3)'}}>Status</div><div>{humanize(d.status)}</div>
+                <div style={{color:'var(--text-3)'}}>Status</div><div>{isLease ? humanize(d.status) : bookingStatusWords(d.status)}</div>
                 {!isLease && (d.avoidedUnitIds||[]).length>0 && <><div style={{color:'var(--text-3)'}}>Avoids</div><div>{(d.avoidedUnitIds as string[]).map(id=>unitNumberOf(id)).filter(Boolean).join(', ')}</div></>}
                 {d.notes && <><div style={{color:'var(--text-3)'}}>Notes</div><div>{d.notes}</div></>}
               </div>
@@ -2473,6 +2538,23 @@ export function SchedulePage() {
                       {checkInMut.isLoading?'…':'Check in'}
                     </button>
                   )}
+                  {/* 10/4 (decisions #38): check out — on the day or early — and settle the money. */}
+                  {can('guests.check_out') && d.status === 'checked_in' && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>{ setCheckOutFor({ unitId: d.unitId, bookingId: d.id }); setDetailBooking(null) }}>
+                      Check out
+                    </button>
+                  )}
+                  {(can('guests.check_out') || can('pos.refund')) && d.status === 'checked_out' && d.moneyDecisionPending && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>{ setCheckOutFor({ unitId: d.unitId, bookingId: d.id }); setDetailBooking(null) }}>
+                      Decide the money
+                    </button>
+                  )}
+                  {/* 10/4 (#38): a card or bank refund on this early check-out did not go out — send it again. */}
+                  {can('pos.refund') && d.status === 'checked_out' && !d.moneyDecisionPending && d.refundNeedsRetry && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>{ setCheckOutFor({ unitId: d.unitId, bookingId: d.id }); setDetailBooking(null) }}>
+                      Try the refund again
+                    </button>
+                  )}
                   {/* S547: snowbird lock — pin the stay to this exact site, exempt from auto re-siting */}
                   {can('schedule.edit_reservation') && d.status!=='cancelled' && (
                     <button className="btn btn-ghost btn-sm"
@@ -2485,13 +2567,7 @@ export function SchedulePage() {
                       {lockBookingMut.isLoading ? '…' : d.lockedToUnit ? '🔒 Locked to site' : 'Lock to site'}
                     </button>
                   )}
-                  {can('schedule.edit_reservation') && (
-                    <button className="btn btn-sm" style={{marginLeft:'auto',color:'var(--red,#ff6b81)',borderColor:'var(--red,#ff6b81)'}}
-                      disabled={cancelBookingMut.isLoading || d.status==='cancelled'}
-                      onClick={()=>{ appConfirm('Cancel this reservation?', { danger: true, confirmLabel: 'Cancel reservation' }).then(ok => { if (ok) cancelBookingMut.mutate(d) }) }}>
-                      {cancelBookingMut.isLoading?'Canceling…':'Cancel reservation'}
-                    </button>
-                  )}
+                  <CancelReservationButton booking={d} onCancel={()=>setCancelFor(d)} />
                 </div>
               )}
               </>)}
@@ -2500,6 +2576,12 @@ export function SchedulePage() {
         </div>
         )
       })()}
+
+      {cancelFor && (
+        <CancelReservationModal booking={cancelFor}
+          onClose={() => setCancelFor(null)}
+          onDone={() => { setCancelFor(null); setDetailBooking(null) }} />
+      )}
 
       {checkInPrompt && (
         <CheckInReadModal prompt={checkInPrompt} busy={checkInBusy}
@@ -2898,6 +2980,168 @@ export function SchedulePage() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * The stays Cancel reservation is never offered on:
+ *   - canceled — nothing left to cancel;
+ *   - checked out — the stay happened; it stays on the schedule as its record
+ *     (final fix, fix pass 1);
+ *   - checked in — the guest is on the site; the next step is Check out
+ *     (fix pass 2, review);
+ *   - no-show — the no-show already freed the site, so there is nothing else
+ *     to do (fix pass 3, review; the cancel-check says the same in words).
+ */
+export const CANCEL_HIDDEN_STATUSES: readonly string[] = ['cancelled', 'checked_out', 'checked_in', 'no_show']
+
+/**
+ * The detail panel's Cancel reservation button (opens CancelReservationModal),
+ * shown only to someone who may cancel reservations and only on a stay that
+ * can still be canceled.
+ */
+export function CancelReservationButton({ booking, onCancel }: { booking: { status: string }; onCancel: () => void }) {
+  const { can } = usePerms()
+  if (!can('schedule.edit_reservation') || CANCEL_HIDDEN_STATUSES.includes(booking.status)) return null
+  return (
+    <button className="btn btn-sm" style={{marginLeft:'auto',color:'var(--red,#ff6b81)',borderColor:'var(--red,#ff6b81)'}}
+      onClick={onCancel}>
+      Cancel reservation
+    </button>
+  )
+}
+
+/** What GET /units/:id/bookings/:bookingId/cancel-check answers (camelCased). */
+type CancelCheck = {
+  booking: { id: string; unitId: string; guestName: string | null; status: string; checkIn: string; checkOut: string }
+  applies: boolean
+  words: string | null
+  leases: Array<NeverMovedInPreview & { leaseId: string }>
+  total: number
+  keptTotal: number
+  needsTotal: boolean
+}
+
+/** "Oct 4, 2026" from a calendar day — never moved by a time zone. */
+const cancelDay = (ymd: string | null | undefined) => ymd
+  ? new Date(`${String(ymd).slice(0, 10)}T12:00:00Z`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+  : ''
+
+/**
+ * Final fix (fix pass 1, decisions #53): the Cancel reservation confirm. "Never
+ * runs blind: Cancel reservation on the Schedule opens the same confirm,
+ * showing fresh figures and names, before anything is zeroed."
+ *
+ * It reads, fresh when it opens, what canceling the stay changes: each lease
+ * drafted with it, the people on it by name, the move-in bill lines zeroed and
+ * the lines that stay owed (the Leases page's never-moved-in body, one copy) —
+ * or the words the cancel would be refused in, with only Close. The gold
+ * button sends the total it showed; a refusal or a 409 (something changed) is
+ * said once and the window reads again in place. On success a toast says what
+ * happened and the Schedule, the Leases page and the dashboard read again.
+ */
+export function CancelReservationModal({ booking, onClose, onDone }: { booking: any; onClose: () => void; onDone: () => void }) {
+  const qc = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+  const check = useQuery<CancelCheck>(
+    ['cancel-check', booking.id],
+    () => apiGet<CancelCheck>(`/units/${booking.unitId}/bookings/${booking.id}/cancel-check`),
+    { staleTime: 0, cacheTime: 0, retry: false, refetchOnWindowFocus: false },
+  )
+  const cancel = useMutation(
+    // Fix pass 2 (review): the total the window showed ALWAYS goes with the
+    // press — $0 when its read found no lease. A lease drafted with the stay
+    // after the read is then answered "changed since you opened this" (and
+    // read again here), never "use Cancel reservation on the Schedule" inside
+    // the very window that is Cancel reservation.
+    // The number of drafted leases it showed goes too, so one drafted since
+    // (even with nothing to zero) is never ended unseen.
+    (v: { total: number; leases: number }) => apiPatch<any>(`/units/${booking.unitId}/bookings/${booking.id}`,
+      { status: 'cancelled', expectedNeverMovedInTotal: v.total, expectedNeverMovedInLeases: v.leases }),
+    {
+      onSuccess: (data: any) => {
+        // The Schedule, the Leases page, the dashboard and its to-dos, and the
+        // Payments ledger read again — pages not on screen too.
+        refreshAfterLeaseClose(qc)
+        toast(data?.leaseClosed ? `Reservation canceled. ${data.leaseClosed}` : 'Reservation canceled.')
+        onDone()
+      },
+      onError: (e: any) => {
+        setError(e?.response?.data?.error || 'The reservation could not be canceled. Nothing changed. Try again.')
+        // Read it again in place — what the cancel changes now, or why it can't.
+        qc.invalidateQueries('schedule')
+        check.refetch()
+      },
+    },
+  )
+  const d = check.data
+  const guest = d?.booking.guestName || booking.guestName || 'This guest'
+  const dates = d ? `${cancelDay(d.booking.checkIn)} – ${cancelDay(d.booking.checkOut)}` : `${cancelDay(booking.checkIn)} – ${cancelDay(booking.checkOut)}`
+  // Each error once: a refusal the fresh read now shows is not repeated above it.
+  const shownError = error && error !== d?.words && !check.isError ? error : null
+  const close = () => { if (!cancel.isLoading) onClose() }
+  const names = (l: CancelCheck['leases'][number]) => {
+    const n = (l.household?.tenantNames ?? []).filter(Boolean)
+    const people = n.length === 0 ? 'Nobody is on this lease yet'
+      : n.length === 1 ? n[0] : `${n.slice(0, -1).join(', ')} and ${n[n.length - 1]}`
+    const space = [l.household?.unitNumber, l.household?.propertyName].filter(Boolean).join(', ')
+    return `Lease drafted with this stay: ${people}${space ? ` — ${space}` : ''}`
+  }
+  return (
+    <div className="modal-overlay" onClick={close}>
+      <div className="modal" role="dialog" aria-label="Cancel reservation" style={{ maxWidth: 540 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <span className="modal-title" style={{ marginBottom: 0 }}>Cancel reservation</span>
+          <button className="btn btn-ghost btn-sm" aria-label="Close" disabled={cancel.isLoading} onClick={close}><X size={14} /></button>
+        </div>
+        <div data-testid="cancel-who" style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 10 }}>
+          {guest}<span style={{ color: 'var(--text-3)' }}> — {dates}</span>
+        </div>
+        {shownError && (
+          <div role="alert" style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'rgba(239,68,68,.08)', border: '1px solid rgba(239,68,68,.3)', color: 'var(--red)', fontSize: '.78rem' }}>{shownError}</div>
+        )}
+        {check.isLoading ? (
+          <div style={{ fontSize: '.84rem', color: 'var(--text-3)', padding: '8px 0' }}>Reading what canceling this changes…</div>
+        ) : check.isError || !d ? (
+          // Fix pass 2 (review): the error once, with its next step — Read again.
+          <div role="alert" style={{ fontSize: '.84rem', color: 'var(--red)', padding: '8px 0' }}>
+            {(check.error as any)?.response?.data?.error || 'What canceling this changes could not be read, so nothing was changed. Press Read again.'}
+          </div>
+        ) : !d.applies ? (
+          <div data-testid="cancel-refusal" style={{ fontSize: '.84rem', color: 'var(--text-1)', lineHeight: 1.5, padding: '4px 0 8px' }}>{d.words}</div>
+        ) : d.leases.length === 0 ? (
+          <div data-testid="cancel-plain" style={{ fontSize: '.84rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+            The reservation comes off the Schedule and the site is free for those nights.
+          </div>
+        ) : (
+          <div>
+            {d.leases.map(l => (
+              <div key={l.leaseId} data-testid="cancel-lease" style={{ marginBottom: 10 }}>
+                <div data-testid="cancel-lease-who" style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 6 }}>{names(l)}</div>
+                <NeverMovedInBody d={l} ended={false} />
+              </div>
+            ))}
+            <div style={{ fontSize: '.84rem', color: 'var(--text-2)' }}>The reservation comes off the Schedule too.</div>
+          </div>
+        )}
+        <div className="modal-footer" style={{ display: 'flex', gap: 8 }}>
+          {/* Fix pass 3 (review): Read again is the next step and the only
+              action while the read has failed, so it is the gold button. */}
+          {check.isError && (
+            <button className="btn btn-primary" disabled={check.isFetching} onClick={() => { setError(null); check.refetch() }}>
+              {check.isFetching ? 'Reading…' : 'Read again'}
+            </button>
+          )}
+          <button className="btn btn-ghost" style={{ marginLeft: 'auto' }} disabled={cancel.isLoading} onClick={close}>{d && !d.applies ? 'Close' : 'Keep the reservation'}</button>
+          {d?.applies && (
+            <button className="btn btn-primary" disabled={cancel.isLoading || check.isFetching}
+              onClick={() => { setError(null); cancel.mutate({ total: d.total, leases: d.leases.length }) }}>
+              {cancel.isLoading ? 'Canceling…' : d.total > 0 ? `Cancel reservation — ${fmt(d.total)} no longer owed` : 'Cancel reservation'}
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   )
 }

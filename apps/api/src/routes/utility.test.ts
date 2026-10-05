@@ -680,7 +680,7 @@ describe('POST /bills/:id/pay (deprecated)', () => {
     expect(res.body.error).toMatch(/not been invoiced yet/i)
   })
 
-  it('tenant own bill with payment_id → 410 with redirect to /payments/:id/pay', async () => {
+  it('tenant own bill with payment_id → 410 pointing to pay-balance (the whole bill), never a one-row pay', async () => {
     const f = await seed()
     const m = await seedMeter(f, f.propertyAId)
     // Seed a payment first to link the bill to
@@ -703,7 +703,9 @@ describe('POST /bills/:id/pay (deprecated)', () => {
       .post(`/api/utility/bills/${bill}/pay`)
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(410)
-    expect(res.body.error).toContain(p.rows[0].id)
+    expect(res.body.error).toContain('/api/payments/pay-balance')
+    // S655: /payments/:id/pay is retired too — never point anyone at it.
+    expect(res.body.error).not.toMatch(/\/api\/payments\/[^ ]+\/pay\b/)
   })
 })
 
@@ -857,12 +859,15 @@ describe('S605 meter baselines', () => {
 // assignment was refused the meter had ALREADY been created and stayed behind —
 // three failed attempts left three orphaned meters with no unit.
 describe('S605 meter + unit assignment is atomic', () => {
+  // 10/3: unit A has a resident (an active lease), so a submeter for it is
+  // created with its opening read (see "an occupied unit's own meter").
+  const OPENING = { baselineReading: 1000, baselineDate: '2026-09-30' }
   it('creates and assigns in one call', async () => {
     const f = await seed()
     const res = await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'RV 03 water',
-              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId })
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId, ...OPENING })
     expect(res.status).toBe(201)
     const { rows } = await db.query<any>(
       `SELECT unit_id FROM utility_meter_units WHERE meter_id = $1`, [res.body.data.id])
@@ -876,7 +881,7 @@ describe('S605 meter + unit assignment is atomic', () => {
     await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 03 electric',
-              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId })
+              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId, ...OPENING })
 
     const { rows: before } = await db.query<any>(
       `SELECT id FROM utility_meters WHERE property_id = $1`, [f.propertyAId])
@@ -885,7 +890,7 @@ describe('S605 meter + unit assignment is atomic', () => {
     const dup = await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 03 electric',
-              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId })
+              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId, ...OPENING })
     expect(dup.status).toBe(400)
 
     // ...and must not have created anything. This is the orphan regression.
@@ -899,12 +904,12 @@ describe('S605 meter + unit assignment is atomic', () => {
     await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 03 electric',
-              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId })
+              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId, ...OPENING })
     // Exactly what Nic was trying to do: add water to a unit that has electric.
     const water = await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'RV 03 water',
-              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId })
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId, ...OPENING })
     expect(water.status).toBe(201)
   })
 
@@ -918,6 +923,84 @@ describe('S605 meter + unit assignment is atomic', () => {
     const { rows } = await db.query<any>(
       `SELECT id FROM utility_meters WHERE label = 'X'`)
     expect(rows).toHaveLength(0)   // and nothing created
+  })
+})
+
+// ── 10/3 (final sweep): an occupied unit's own meter needs its opening read ──
+// Oak Park RV 24 was moved onto a new water submeter on 9/30 with no starting
+// read: its first read would only have been a starting point, so the first
+// month on the new meter would have billed no water for a space somebody lives
+// in. Creating a unit's own meter on an occupied unit now asks for the read.
+describe("an occupied unit's own meter needs its opening read", () => {
+  const meterCount = async (propertyId: string) =>
+    Number((await db.query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM utility_meters WHERE property_id = $1`, [propertyId])).rows[0].n)
+
+  it('refuses a submeter for a unit with a resident and no opening read, in plain words, creating nothing', async () => {
+    const f = await seed()
+    await db.query(`UPDATE units SET unit_number = 'RV 24' WHERE id = $1`, [f.unitAId])
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'RV 24 water',
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('Someone lives in RV 24, so its new water meter needs an opening read: the number on the '
+      + 'meter face today and the date you read it. Without it, their first month on this meter would not bill. '
+      + 'Nothing was added. To add it, open the Utilities page, choose "Add meter", fill in the opening read and the '
+      + 'date you read it, then assign the meter to RV 24.')
+    expect(await meterCount(f.propertyAId)).toBe(0)
+  })
+
+  it('creates it with the opening read, stamped as the starting point', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'RV 24 water',
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId,
+              baselineReading: 4200, baselineDate: '2026-09-30' })
+    expect(res.status).toBe(201)
+    const { rows } = await db.query<any>(
+      `SELECT reading_value::float AS v, reason, to_char(billing_cycle_month, 'YYYY-MM-DD') AS cycle
+         FROM utility_meter_readings WHERE meter_id = $1`, [res.body.data.id])
+    expect(rows).toEqual([{ v: 4200, reason: 'baseline', cycle: '2026-09-01' }])
+  })
+
+  it('an empty unit needs none — its first read is the right starting point', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    let empty = ''
+    try { empty = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId }) } finally { c.release() }
+    await db.query(`UPDATE units SET status = 'vacant' WHERE id = $1`, [empty])
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 60 electric',
+              billingMethod: 'submeter', ratePerUnit: 0.21, assignUnitId: empty })
+    expect(res.status).toBe(201)
+  })
+
+  it('a unit whose residents are invited (no lease yet) counts as lived in', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    let invited = ''
+    try { invited = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId }) } finally { c.release() }
+    await db.query(`UPDATE units SET status = 'vacant' WHERE id = $1`, [invited])
+    const tenantId = (await db.query<{ id: string }>(`SELECT id FROM tenants LIMIT 1`)).rows[0].id
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id) VALUES ($1, $2, $3)`,
+      [f.landlordAId, tenantId, invited])
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 61 electric',
+              billingMethod: 'submeter', ratePerUnit: 0.21, assignUnitId: invited })
+    expect(res.status).toBe(400)
+  })
+
+  it('a flat charge (trash) reads nothing, so it needs no opening read', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'trash', label: 'Trash',
+              billingMethod: 'flat_rate', assignUnitId: f.unitAId })
+    expect(res.status).toBe(201)
   })
 })
 

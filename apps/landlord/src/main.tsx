@@ -126,6 +126,7 @@ import { ApplicationsPage } from './pages/ApplicationsPage'
 import { NotificationsPage } from './pages/NotificationsPage'
 import { DepositReturnPage } from './pages/DepositReturnPage'
 import { LeaseTerminationPage } from './pages/LeaseTerminationPage'
+import { PaidAheadChoicePage } from './pages/PaidAheadChoicePage'
 import { FlexChargePage } from './pages/FlexChargePage'
 import './styles/globals.css'
 import { FrontDeskPage } from './pages/FrontDeskPage'
@@ -339,6 +340,8 @@ function App() {
               <Route path="notifications"     element={<NotificationsPage />} />
               <Route path="leases/:id/deposit-return" element={<DepositReturnPage />} />
               <Route path="leases/:id/termination"   element={<LeaseTerminationPage />} />
+              {/* 10/4 (decisions #46.1): the landlord's choice for money paid ahead left on an ended lease. */}
+              <Route path="leases/:leaseId/paid-ahead-choice" element={<PaidAheadChoicePage />} />
               <Route path="flex-charge"               element={LAUNCH_HIDDEN.has('/flex-charge') ? <Navigate to="/dashboard" replace /> : <FlexChargePage />} />
               {/* S632 (Nic): "Clicking back to lease at the end of the signing
                   flow just takes us to a black screen." The button pointed at

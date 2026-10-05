@@ -46,7 +46,7 @@ import { todayIn } from '../lib/timezone'
 import { applyMapping, type CsvImportPlatform } from '../lib/csvImportMappings'
 import { ROSTER_MAX_HOUSEHOLD } from '@gam/shared'
 import { assertLateFeeDecisionForUnit } from './lateFeePolicy'
-import { assertUnitCanAcceptNewLease } from './leaseOnboarding'
+import { assertUnitCanAcceptNewLease, reasonSentence, tooManyForOneLease } from './leaseOnboarding'
 import { applyScreeningWaive, isExistingTenancyInvite, getOnboardingWindow } from './onboardingWindow'
 import { allocateInvoiceNumber } from './invoiceNumbers'
 import { emailTenantOnboarded, emailTenantInvite } from './email'
@@ -420,7 +420,8 @@ export async function inviteHouseholdToNewLease(o: InviteHouseholdOpts): Promise
     logger.error({ err, unitId: unit.id }, '[new-lease-invite] draft failed')
     // Every reason ends with what happens next, like autoDraftLeasesForUnit's:
     // the hourly retry (householdLeaseDraft) drafts it once the cause is gone.
-    draftBlocked = [`The lease for Unit ${unit.unit_number} could not be drafted: ${err?.message || 'unexpected error'}. GAM tries again every hour, so it drafts on its own once that is fixed.`]
+    // The refusal's own text keeps its one period (reasonSentence), never "..".
+    draftBlocked = [`The lease for Unit ${unit.unit_number} could not be drafted: ${reasonSentence(err?.message)} GAM tries again every hour, so it drafts on its own once that is fixed.`]
   } finally {
     draftClient.release()
   }
@@ -526,9 +527,10 @@ async function sendFallbackInvites(unit: any, landlordId: string, invited: Invit
  *     PROPOSED does not count: an add-a-roommate addendum writes a 'pending_add'
  *     row the moment it is drafted, before anyone signs, and counting that let
  *     the landlord's signature alone attach the person (to the addendum's lease,
- *     and to any other lease he drafted for them). Nor does that row once a
- *     lease ending has marked it 'removed' — it never activated (added_at is
- *     still NULL), so the person never signed onto anything;
+ *     and to any other lease he drafted for them). Nor does that row once its
+ *     lease ends: it is 'void' then (final sweep, 10/3; before that a lease
+ *     ending marked it 'removed', and added_at still NULL tells the two apart),
+ *     so the person never signed onto anything;
  *   - a tie to GAM's own renter pool (landlords.is_system): a marketplace
  *     applicant who screened through the pool has no other company.
  */
@@ -566,9 +568,10 @@ export async function tenantsNeedingOwnSignature(
           AND lt.add_document_id IS DISTINCT FROM $3
           -- A spot that never activated. An add-a-roommate addendum writes
           -- its row with added_at NULL, and only the addendum's own execution
-          -- (executeAddendumAdd) stamps it; a lease ending (PATCH /leases,
-          -- leaseTermination, the nightly lease-end job) turns that unsigned
-          -- 'pending_add' row into 'removed' too. Ended is not attached.
+          -- (executeAddendumAdd) stamps it. A lease ending (PATCH /leases,
+          -- leaseTermination, the nightly lease-end job) makes that unsigned
+          -- 'pending_add' row 'void' since 10/3; before that it became
+          -- 'removed', which this still excludes. Ended is not attached.
           AND NOT (lt.add_document_id IS NOT NULL AND lt.added_at IS NULL)
         LIMIT 1`, [s.user_id, own, documentId])
     if (attached) continue
@@ -852,9 +855,11 @@ export async function reviewTenantCsv(a: {
               message: `The file says rent ${usd(fileRent)}; Unit ${unit.unit_number}'s rent in GAM is ${usd(row.unitRent)}. The lease drafts at ${usd(row.unitRent)}. Change the unit's rent first if ${usd(fileRent)} is right.` })
           }
         }
+        // Final sweep (10/3): the same words as the roster and the invite, and
+        // never "draft that lease by hand" — no lease GAM drafts holds more.
         if (unit.occupancy_mode !== 'by_room' && n === ROSTER_MAX_HOUSEHOLD + 1) {
           issues.push({ severity: 'warn', field: 'unit_number',
-            message: `More than ${ROSTER_MAX_HOUSEHOLD} people are on Unit ${unit.unit_number}. A lease drafts itself for up to ${ROSTER_MAX_HOUSEHOLD}; move someone or draft that lease by hand.` })
+            message: `${tooManyForOneLease(unit.unit_number, null)} Pick their new unit on the review screen.` })
         }
       }
     }
@@ -1059,7 +1064,7 @@ export async function loadRoster(actor: AuthPayload, propertyId: string) {
 async function unitBlockers(u: any, peopleCount: number): Promise<string[]> {
   const out: string[] = []
   if (u.rent_amount == null || Number(u.rent_amount) <= 0) out.push(`Unit ${u.unit_number} has no rent set. Set its rent on the unit's page, then come back.`)
-  if (!(await resolveDefaultTemplateForUnit(u.id))) out.push(`No default lease is set for this kind of unit. Set one in E-Sign, then come back.`)
+  if (!(await resolveDefaultTemplateForUnit(u.id))) out.push(`No default lease is set for this kind of unit. Set one in GoldSign (Templates), then come back.`)
   try { await assertLateFeeDecisionForUnit(u.id) } catch (e: any) { out.push(e?.message || 'Decide the late fee for this kind of unit first.') }
   if (u.occupancy_mode === 'by_room') {
     const cap = Math.max(1, Number(u.bedrooms || 1) * 2)
@@ -1068,8 +1073,10 @@ async function unitBlockers(u: any, peopleCount: number): Promise<string[]> {
   } else {
     if (u.lease_count > 0) out.push(`Unit ${u.unit_number} already has an active lease. Move these people to another unit or remove them.`)
     const invited: string[] = Array.isArray(u.invited) ? u.invited : []
-    if (invited.length > 0) out.push(`Unit ${u.unit_number} already has ${invited.join(', ')} invited (see Front Desk). Cancel that invite there, or move these people.`)
-    if (peopleCount > ROSTER_MAX_HOUSEHOLD) out.push(`Unit ${u.unit_number} has ${peopleCount} people; a lease drafts itself for up to ${ROSTER_MAX_HOUSEHOLD}. Move someone to another unit.`)
+    // Final sweep (10/3): invites are cancelled in the Pending Pool; Front
+    // Desk is a call list with no cancel button.
+    if (invited.length > 0) out.push(`Unit ${u.unit_number} already has ${invited.join(', ')} invited. Cancel that invite in Tenant Onboarding (Pending Pool), or move these people.`)
+    if (peopleCount > ROSTER_MAX_HOUSEHOLD) out.push(tooManyForOneLease(u.unit_number, peopleCount))
   }
   return out
 }

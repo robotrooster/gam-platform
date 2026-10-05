@@ -180,6 +180,11 @@ export function visibleNavItemsFor(user: { role?: string; permissions?: Record<s
     // S640: Front Desk moved to its own category; onboarding staff who already
     // had it keep it rather than silently losing a page they use daily.
     const cats = item.to === '/front-desk' ? ['front_desk', 'tenant_onboarding'] : [item.category]
+    // decisions.md #48.2: whoever takes payments makes the bank deposit for the
+    // cash they took, on the Front Desk page — so take_payment alone shows it.
+    // The API camelizes the dotless key to takePayment (see lib/permissions.ts);
+    // both spellings count.
+    if (item.to === '/front-desk' && (perms['take_payment'] === true || perms.takePayment === true)) return true
     return cats.some(c => (CATALOG_KEYS_BY_CATEGORY[c] || []).some(k => perms[k] === true))
   })
 }

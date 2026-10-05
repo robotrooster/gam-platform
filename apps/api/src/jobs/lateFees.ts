@@ -12,6 +12,9 @@
 // remaining amount, then stops accruing (locked decision: cap-edge partial).
 // Idempotent via ux_payments_late_fee_idempotent partial unique index —
 // the 6 firings per timezone per night are safe; first writes, rest no-op.
+//
+// S655: each invoice is decided under the household lock, right after the
+// whole-bill credit rule, and re-read fresh before any fee (lateFeeForInvoice).
 
 import type { PoolClient } from 'pg'
 import { getClient } from '../db'
@@ -26,11 +29,13 @@ import {
 } from '@gam/shared'
 import { registerEngine } from './timezoneCronManager'
 import { logger } from '../lib/logger'
+import { lockHousehold } from '../services/moneyPredicates'
+import { settleWholeBillIfCovered, billHouseholdTenant, type WholeBillResult } from '../services/creditUse'
 
 interface QualifyingInvoice {
   invoice_id: number
   // S615: NULL on a utility-service invoice — it has an agreement, not a lease.
-  lease_id: number | null
+  lease_id: string | null
   landlord_id: string
   unit_id: string | null
   resolved_unit_id: string
@@ -218,22 +223,82 @@ export async function generateLateFeesForTimezone(
     result.invoicesScanned = invoices.length
 
     for (const inv of invoices) {
+      let receipts: WholeBillResult['afterCommit'] | null = null
       try {
         await client.query('BEGIN')
-        await processInvoice(client, inv, result)
+        receipts = await lateFeeForInvoice(client, inv, result)
         await client.query('COMMIT')
       } catch (e: unknown) {
         await client.query('ROLLBACK').catch(() => {})
         const msg = e instanceof Error ? e.message : String(e)
         result.errors.push({ invoice_id: inv.invoice_id, error: msg })
         logger.error({ err: e, tz, invoice_id: inv.invoice_id }, '[LateFees] invoice error')
+        continue
       }
+      // A bill the credit paid gets its "paid with your account credit"
+      // receipt once the settle is committed. Never throws.
+      if (receipts) await receipts()
     }
   } finally {
     client.release()
   }
 
   return result
+}
+
+/**
+ * One invoice, inside the caller's transaction (S655 money plan §1.5 and the
+ * whole-bill rule, Nic 10/2):
+ *   1. The household lock, like every writer of the household's money. The
+ *      invoice was picked by a scan that ran before this transaction, so a
+ *      tenant may have paid, or a credit landed, in between.
+ *   2. The whole-bill rule, right before the fee: a credit that covers the
+ *      whole bill pays it now, and a bill paid in full is not late. Saved
+ *      credit that covers less settles nothing and does NOT stop the fee
+ *      (Nic: "saved credit doesn't stop a late fee unless it covers the whole
+ *      bill"). Savepoint-guarded: if the credit step fails, the bill stays
+ *      open and the fee is raised exactly as before.
+ *   3. The invoice is asked again, fresh, under the lock: the fee is raised
+ *      only if it still qualifies (anything paid since the scan — by credit
+ *      here, by the tenant, the desk or a bank deposit — means no fee).
+ * Returns the credit receipts to send after COMMIT, if the credit paid a bill.
+ */
+async function lateFeeForInvoice(
+  client: PoolClient,
+  scanned: QualifyingInvoice,
+  result: LateFeeResult,
+): Promise<WholeBillResult['afterCommit'] | null> {
+  let receipts: WholeBillResult['afterCommit'] | null = null
+  // The bill's household: the invoice's tenant, else (an invoice written
+  // without one) the lease's resident.
+  const hh = scanned.tenant_id
+    ? { tenantId: scanned.tenant_id, landlordId: scanned.landlord_id }
+    : scanned.lease_id ? await billHouseholdTenant(client, scanned.lease_id) : null
+  if (hh) {
+    await lockHousehold(client, hh.tenantId, hh.landlordId)
+    await client.query('SAVEPOINT late_fee_whole_bill')
+    try {
+      const wb = await settleWholeBillIfCovered(client, {
+        tenantId: hh.tenantId, landlordId: hh.landlordId, source: 'whole_bill',
+      })
+      await client.query('RELEASE SAVEPOINT late_fee_whole_bill')
+      if (wb.settledIds.length > 0) {
+        receipts = wb.afterCommit
+        logger.info({ invoice_id: scanned.invoice_id, settled: wb.settledIds.length },
+          '[LateFees] the account credit covered the whole bill — paid before any late fee')
+      }
+    } catch (e) {
+      await client.query('ROLLBACK TO SAVEPOINT late_fee_whole_bill')
+      logger.error({ err: e, invoice_id: scanned.invoice_id },
+        '[LateFees] the credit check before the fee failed — the bill is treated as unpaid')
+    }
+  }
+  const { rows } = await client.query<QualifyingInvoice>(
+    qualifyingInvoicesSql('i.id = $1'), [scanned.invoice_id])
+  const fresh = rows[0]
+  if (!fresh) return receipts
+  await processInvoice(client, fresh, result)
+  return receipts
 }
 
 /**
@@ -245,6 +310,14 @@ export async function generateLateFeesForTimezone(
  * if the payment never happened") instead of waiting for the next nightly run.
  * No-op if the invoice doesn't qualify (grace not crossed, no late-fee config,
  * nothing unpaid, an in-flight retry, etc.).
+ *
+ * S655: it runs on its OWN connection and takes the household lock
+ * (lateFeeForInvoice). Call it only AFTER the caller's transaction has
+ * committed — never from inside a transaction that holds that household's
+ * lock: it would wait on the caller, the caller on it, and Postgres cannot see
+ * that as a deadlock (the caller's connection is merely idle in its
+ * transaction), so both hang for good. paymentReversal calls it after its
+ * COMMIT. creditUse.runWholeBillCheckAfterCommit has the same rule.
  */
 export async function generateLateFeesForInvoice(invoiceId: string): Promise<LateFeeResult> {
   const result: LateFeeResult = { invoicesScanned: 0, rowsWritten: 0, capsHit: 0, errors: [] }
@@ -255,16 +328,19 @@ export async function generateLateFeesForInvoice(invoiceId: string): Promise<Lat
     )
     result.invoicesScanned = invoices.length
     for (const inv of invoices) {
+      let receipts: WholeBillResult['afterCommit'] | null = null
       try {
         await client.query('BEGIN')
-        await processInvoice(client, inv, result)
+        receipts = await lateFeeForInvoice(client, inv, result)
         await client.query('COMMIT')
       } catch (e: unknown) {
         await client.query('ROLLBACK').catch(() => {})
         const msg = e instanceof Error ? e.message : String(e)
         result.errors.push({ invoice_id: inv.invoice_id, error: msg })
         logger.error({ err: e, invoice_id: inv.invoice_id }, '[LateFees] on-demand invoice error')
+        continue
       }
+      if (receipts) await receipts()
     }
   } finally {
     client.release()

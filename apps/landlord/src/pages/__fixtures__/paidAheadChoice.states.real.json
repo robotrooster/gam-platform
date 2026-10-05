@@ -1,0 +1,619 @@
+{
+  "unrecorded": {
+    "leaseId": "00000000-0000-4000-8000-000000000001",
+    "unit": {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "number": "MH 08"
+    },
+    "property": {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "name": "Oak Park"
+    },
+    "tenants": [
+      {
+        "id": "00000000-0000-4000-8000-000000000004",
+        "name": "Glenda Ross"
+      }
+    ],
+    "leaseStatus": "expired",
+    "endedOn": "2026-09-30",
+    "ended": true,
+    "left": 0,
+    "credits": [],
+    "sources": [],
+    "maxRefund": 0,
+    "refundAnswered": 0,
+    "refundNotes": [],
+    "owedOnLease": 0,
+    "waits": null,
+    "refundOptions": [],
+    "restOptions": [],
+    "latest": {
+      "id": "00000000-0000-4000-8000-000000000005",
+      "refundChoice": "refund_all",
+      "refundChoiceLabel": "Refund the unused days",
+      "restChoice": null,
+      "restChoiceLabel": null,
+      "leftAmount": 100,
+      "refundTotal": 100,
+      "restAmount": 0,
+      "releasedAmount": 0,
+      "leftGamHeld": 0,
+      "decidedBy": "Test Landlord",
+      "decidedAt": "2026-10-04T18:00:00.000Z",
+      "decidedOn": "October 4, 2026 at 11:00 AM",
+      "parts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000006",
+          "kind": "card",
+          "label": "Card · Sep 3",
+          "amount": 103.55,
+          "status": "failed",
+          "stale": false,
+          "attention": true,
+          "retry": true,
+          "failure": "$103.55 went back to the card, but GAM could not finish recording it — press Try again to record it (nothing is sent again).",
+          "cashInstead": false,
+          "checkAgain": false,
+          "recordOnly": true,
+          "replacesPartId": null,
+          "cashReply": null,
+          "cashReplyHandBack": null,
+          "words": "$103.55 went back to the card — GAM has to finish recording it"
+        }
+      ],
+      "words": []
+    },
+    "quoteToken": "quote-token"
+  },
+  "unrecordedRetry": {
+    "leaseId": "00000000-0000-4000-8000-000000000001",
+    "choice": {
+      "id": "00000000-0000-4000-8000-000000000005",
+      "refundChoice": "refund_all",
+      "refundChoiceLabel": "Refund the unused days",
+      "restChoice": null,
+      "restChoiceLabel": null,
+      "leftAmount": 100,
+      "refundTotal": 100,
+      "restAmount": 0,
+      "releasedAmount": 0,
+      "leftGamHeld": 0,
+      "decidedBy": "Test Landlord",
+      "decidedAt": "2026-10-04T18:00:00.000Z",
+      "decidedOn": "October 4, 2026 at 11:00 AM",
+      "parts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000006",
+          "kind": "card",
+          "label": "Card · Sep 3",
+          "amount": 103.55,
+          "status": "refunded",
+          "stale": false,
+          "attention": false,
+          "retry": false,
+          "failure": null,
+          "cashInstead": false,
+          "checkAgain": false,
+          "recordOnly": false,
+          "replacesPartId": null,
+          "cashReply": null,
+          "cashReplyHandBack": null,
+          "words": "$103.55 back to the card they paid with (Card · Sep 3) — sent"
+        }
+      ],
+      "words": [
+        "$103.55 back to the card they paid with (Card · Sep 3) — sent."
+      ]
+    },
+    "words": [
+      "Recorded — the $103.55 had already gone back to the card; nothing was sent again."
+    ],
+    "handBack": [
+      false
+    ],
+    "next": "done"
+  },
+  "stopping": {
+    "leaseId": "00000000-0000-4000-8000-000000000007",
+    "unit": {
+      "id": "00000000-0000-4000-8000-000000000008",
+      "number": "MH 08"
+    },
+    "property": {
+      "id": "00000000-0000-4000-8000-000000000009",
+      "name": "Oak Park"
+    },
+    "tenants": [
+      {
+        "id": "00000000-0000-4000-8000-000000000010",
+        "name": "Glenda Ross"
+      }
+    ],
+    "leaseStatus": "expired",
+    "endedOn": "2026-09-30",
+    "ended": true,
+    "left": 0,
+    "credits": [],
+    "sources": [],
+    "maxRefund": 0,
+    "refundAnswered": 0,
+    "refundNotes": [],
+    "owedOnLease": 0,
+    "waits": null,
+    "refundOptions": [],
+    "restOptions": [],
+    "latest": {
+      "id": "00000000-0000-4000-8000-000000000011",
+      "refundChoice": "refund_all",
+      "refundChoiceLabel": "Refund the unused days",
+      "restChoice": null,
+      "restChoiceLabel": null,
+      "leftAmount": 100,
+      "refundTotal": 100,
+      "restAmount": 0,
+      "releasedAmount": 0,
+      "leftGamHeld": 0,
+      "decidedBy": "Test Landlord",
+      "decidedAt": "2026-10-04T18:00:00.000Z",
+      "decidedOn": "October 4, 2026 at 11:00 AM",
+      "parts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000012",
+          "kind": "card",
+          "label": "Card · Sep 3",
+          "amount": 103.55,
+          "status": "pending",
+          "stale": true,
+          "attention": true,
+          "retry": false,
+          "failure": "$103.55 to the card is being stopped: the payment it came from was disputed with their card company, so the card company will not take a refund. Press Check again in a moment; then \"Give it back in cash instead\" is offered (GAM tells you when to hand the cash over).",
+          "cashInstead": false,
+          "checkAgain": true,
+          "recordOnly": false,
+          "replacesPartId": null,
+          "cashReply": null,
+          "cashReplyHandBack": null,
+          "words": "$103.55 to the card is being stopped — the payment it came from was disputed with their card company"
+        }
+      ],
+      "words": []
+    },
+    "quoteToken": "quote-token"
+  },
+  "stopped": {
+    "leaseId": "00000000-0000-4000-8000-000000000007",
+    "unit": {
+      "id": "00000000-0000-4000-8000-000000000008",
+      "number": "MH 08"
+    },
+    "property": {
+      "id": "00000000-0000-4000-8000-000000000009",
+      "name": "Oak Park"
+    },
+    "tenants": [
+      {
+        "id": "00000000-0000-4000-8000-000000000010",
+        "name": "Glenda Ross"
+      }
+    ],
+    "leaseStatus": "expired",
+    "endedOn": "2026-09-30",
+    "ended": true,
+    "left": 0,
+    "credits": [],
+    "sources": [],
+    "maxRefund": 0,
+    "refundAnswered": 0,
+    "refundNotes": [],
+    "owedOnLease": 0,
+    "waits": null,
+    "refundOptions": [],
+    "restOptions": [],
+    "latest": {
+      "id": "00000000-0000-4000-8000-000000000011",
+      "refundChoice": "refund_all",
+      "refundChoiceLabel": "Refund the unused days",
+      "restChoice": null,
+      "restChoiceLabel": null,
+      "leftAmount": 100,
+      "refundTotal": 100,
+      "restAmount": 0,
+      "releasedAmount": 0,
+      "leftGamHeld": 0,
+      "decidedBy": "Test Landlord",
+      "decidedAt": "2026-10-04T18:00:00.000Z",
+      "decidedOn": "October 4, 2026 at 11:00 AM",
+      "parts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000012",
+          "kind": "card",
+          "label": "Card · Sep 3",
+          "amount": 103.55,
+          "status": "failed",
+          "stale": false,
+          "attention": true,
+          "retry": false,
+          "failure": "$103.55 cannot go back to the card: the payment it came from was disputed with their card company, so the card company will not take a refund. Press \"Give it back in cash instead\" (GAM first checks that it did not reach the card, then tells you when to hand the cash over).",
+          "cashInstead": true,
+          "checkAgain": false,
+          "recordOnly": false,
+          "replacesPartId": null,
+          "cashReply": null,
+          "cashReplyHandBack": null,
+          "words": "$103.55 could not go back to the card — the payment it came from was disputed with their card company"
+        }
+      ],
+      "words": []
+    },
+    "quoteToken": "quote-token"
+  },
+  "split": {
+    "leaseId": "00000000-0000-4000-8000-000000000013",
+    "unit": {
+      "id": "00000000-0000-4000-8000-000000000014",
+      "number": "MH 08"
+    },
+    "property": {
+      "id": "00000000-0000-4000-8000-000000000015",
+      "name": "Oak Park"
+    },
+    "tenants": [
+      {
+        "id": "00000000-0000-4000-8000-000000000016",
+        "name": "Glenda Ross"
+      }
+    ],
+    "leaseStatus": "expired",
+    "endedOn": "2026-09-30",
+    "ended": true,
+    "left": 0,
+    "credits": [],
+    "sources": [],
+    "maxRefund": 0,
+    "refundAnswered": 0,
+    "refundNotes": [],
+    "owedOnLease": 0,
+    "waits": null,
+    "refundOptions": [],
+    "restOptions": [],
+    "latest": {
+      "id": "00000000-0000-4000-8000-000000000017",
+      "refundChoice": "refund_all",
+      "refundChoiceLabel": "Refund the unused days",
+      "restChoice": null,
+      "restChoiceLabel": null,
+      "leftAmount": 100,
+      "refundTotal": 100,
+      "restAmount": 0,
+      "releasedAmount": 0,
+      "leftGamHeld": 0,
+      "decidedBy": "Test Landlord",
+      "decidedAt": "2026-10-04T18:00:00.000Z",
+      "decidedOn": "October 4, 2026 at 11:00 AM",
+      "parts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000018",
+          "kind": "card",
+          "label": "Card · Sep 3",
+          "amount": 10,
+          "status": "failed",
+          "stale": false,
+          "attention": false,
+          "retry": false,
+          "failure": null,
+          "cashInstead": false,
+          "checkAgain": false,
+          "recordOnly": false,
+          "replacesPartId": null,
+          "cashReply": null,
+          "cashReplyHandBack": null,
+          "words": "$10.00 was not sent to the card — the payment it came from was disputed with their card company, so that $10.00 already went back to them"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000019",
+          "kind": "card",
+          "label": "Card · Sep 3",
+          "amount": 93.55,
+          "status": "failed",
+          "stale": false,
+          "attention": true,
+          "retry": false,
+          "failure": "$93.55 cannot go back to the card: the payment it came from was disputed with their card company, so the card company will not take a refund. Press \"Give it back in cash instead\" (GAM first checks that it did not reach the card, then tells you when to hand the cash over).",
+          "cashInstead": true,
+          "checkAgain": false,
+          "recordOnly": false,
+          "replacesPartId": "00000000-0000-4000-8000-000000000018",
+          "cashReply": null,
+          "cashReplyHandBack": null,
+          "words": "$93.55 could not go back to the card — the payment it came from was disputed with their card company"
+        }
+      ],
+      "words": [
+        "$10.00 was not sent to the card — the payment it came from was disputed with their card company, so that $10.00 already went back to them."
+      ]
+    },
+    "quoteToken": "quote-token"
+  },
+  "cashOpen": {
+    "leaseId": "00000000-0000-4000-8000-000000000020",
+    "unit": {
+      "id": "00000000-0000-4000-8000-000000000021",
+      "number": "MH 08"
+    },
+    "property": {
+      "id": "00000000-0000-4000-8000-000000000022",
+      "name": "Oak Park"
+    },
+    "tenants": [
+      {
+        "id": "00000000-0000-4000-8000-000000000023",
+        "name": "Glenda Ross"
+      }
+    ],
+    "leaseStatus": "expired",
+    "endedOn": "2026-09-30",
+    "ended": true,
+    "left": 0,
+    "credits": [],
+    "sources": [],
+    "maxRefund": 0,
+    "refundAnswered": 0,
+    "refundNotes": [],
+    "owedOnLease": 0,
+    "waits": null,
+    "refundOptions": [],
+    "restOptions": [],
+    "latest": {
+      "id": "00000000-0000-4000-8000-000000000024",
+      "refundChoice": "refund_all",
+      "refundChoiceLabel": "Refund the unused days",
+      "restChoice": null,
+      "restChoiceLabel": null,
+      "leftAmount": 100,
+      "refundTotal": 100,
+      "restAmount": 0,
+      "releasedAmount": 0,
+      "leftGamHeld": 0,
+      "decidedBy": "Test Landlord",
+      "decidedAt": "2026-10-04T18:00:00.000Z",
+      "decidedOn": "October 4, 2026 at 11:00 AM",
+      "parts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000025",
+          "kind": "card",
+          "label": "Card · Sep 3",
+          "amount": 103.55,
+          "status": "failed",
+          "stale": false,
+          "attention": true,
+          "retry": true,
+          "failure": "Stripe could not send this refund just now ($103.55) — press Try again, or press \"Give it back in cash instead\" (GAM first checks that it did not reach the card, then tells you when to hand the cash over).",
+          "cashInstead": true,
+          "checkAgain": false,
+          "recordOnly": false,
+          "replacesPartId": null,
+          "cashReply": null,
+          "cashReplyHandBack": null,
+          "words": "$103.55 could not be refunded to the card yet — press Try again"
+        }
+      ],
+      "words": []
+    },
+    "quoteToken": "quote-token"
+  },
+  "cashBusy": {
+    "status": 409,
+    "body": {
+      "success": false,
+      "code": "refund_busy",
+      "error": "Another request is working on this refund right now, so nothing was handed back. Wait a moment, then press Check again."
+    }
+  },
+  "cashDone": {
+    "leaseId": "00000000-0000-4000-8000-000000000020",
+    "unit": {
+      "id": "00000000-0000-4000-8000-000000000021",
+      "number": "MH 08"
+    },
+    "property": {
+      "id": "00000000-0000-4000-8000-000000000022",
+      "name": "Oak Park"
+    },
+    "tenants": [
+      {
+        "id": "00000000-0000-4000-8000-000000000023",
+        "name": "Glenda Ross"
+      }
+    ],
+    "leaseStatus": "expired",
+    "endedOn": "2026-09-30",
+    "ended": true,
+    "left": 0,
+    "credits": [],
+    "sources": [],
+    "maxRefund": 0,
+    "refundAnswered": 0,
+    "refundNotes": [],
+    "owedOnLease": 0,
+    "waits": null,
+    "refundOptions": [],
+    "restOptions": [],
+    "latest": {
+      "id": "00000000-0000-4000-8000-000000000024",
+      "refundChoice": "refund_all",
+      "refundChoiceLabel": "Refund the unused days",
+      "restChoice": null,
+      "restChoiceLabel": null,
+      "leftAmount": 100,
+      "refundTotal": 100,
+      "restAmount": 0,
+      "releasedAmount": 0,
+      "leftGamHeld": 0,
+      "decidedBy": "Test Landlord",
+      "decidedAt": "2026-10-04T18:00:00.000Z",
+      "decidedOn": "October 4, 2026 at 11:00 AM",
+      "parts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000026",
+          "kind": "cash",
+          "label": "Card · Sep 3",
+          "amount": 103.55,
+          "status": "handed_back",
+          "stale": false,
+          "attention": false,
+          "retry": false,
+          "failure": null,
+          "cashInstead": false,
+          "checkAgain": false,
+          "recordOnly": false,
+          "replacesPartId": "00000000-0000-4000-8000-000000000025",
+          "cashReply": [
+            "This was recorded as given back in cash ($103.55) by you at October 4, 2026 at 11:30 AM — GAM checked first that it did not reach the card. If you have not handed that $103.55 over yet, hand it back in cash now; if you have, give nothing more.",
+            "It is recorded as given back — nothing goes to the card. The $100.00 GAM held for them is added to your next payout."
+          ],
+          "cashReplyHandBack": [
+            true,
+            false
+          ],
+          "words": "$103.55 recorded as handed back in cash instead of to the card by Test Landlord on October 4, 2026 at 11:30 AM"
+        }
+      ],
+      "words": [
+        "$103.55 recorded as handed back in cash instead of to the card by Test Landlord on October 4, 2026 at 11:30 AM — the $100.00 GAM held for them is added to your next payout."
+      ]
+    },
+    "quoteToken": "quote-token"
+  },
+  "cashDoneOther": {
+    "leaseId": "00000000-0000-4000-8000-000000000020",
+    "unit": {
+      "id": "00000000-0000-4000-8000-000000000021",
+      "number": "MH 08"
+    },
+    "property": {
+      "id": "00000000-0000-4000-8000-000000000022",
+      "name": "Oak Park"
+    },
+    "tenants": [
+      {
+        "id": "00000000-0000-4000-8000-000000000023",
+        "name": "Glenda Ross"
+      }
+    ],
+    "leaseStatus": "expired",
+    "endedOn": "2026-09-30",
+    "ended": true,
+    "left": 0,
+    "credits": [],
+    "sources": [],
+    "maxRefund": 0,
+    "refundAnswered": 0,
+    "refundNotes": [],
+    "owedOnLease": 0,
+    "waits": null,
+    "refundOptions": [],
+    "restOptions": [],
+    "latest": {
+      "id": "00000000-0000-4000-8000-000000000024",
+      "refundChoice": "refund_all",
+      "refundChoiceLabel": "Refund the unused days",
+      "restChoice": null,
+      "restChoiceLabel": null,
+      "leftAmount": 100,
+      "refundTotal": 100,
+      "restAmount": 0,
+      "releasedAmount": 0,
+      "leftGamHeld": 0,
+      "decidedBy": "Test Landlord",
+      "decidedAt": "2026-10-04T18:00:00.000Z",
+      "decidedOn": "October 4, 2026 at 11:00 AM",
+      "parts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000026",
+          "kind": "cash",
+          "label": "Card · Sep 3",
+          "amount": 103.55,
+          "status": "handed_back",
+          "stale": false,
+          "attention": false,
+          "retry": false,
+          "failure": null,
+          "cashInstead": false,
+          "checkAgain": false,
+          "recordOnly": false,
+          "replacesPartId": "00000000-0000-4000-8000-000000000025",
+          "cashReply": [
+            "This was recorded as given back in cash ($103.55) by Test Landlord at October 4, 2026 at 11:30 AM — GAM checked first that it did not reach the card. Ask Test Landlord whether it was handed over before giving anything.",
+            "It is recorded as given back — nothing goes to the card. The $100.00 GAM held for them is added to your next payout."
+          ],
+          "cashReplyHandBack": [
+            false,
+            false
+          ],
+          "words": "$103.55 recorded as handed back in cash instead of to the card by Test Landlord on October 4, 2026 at 11:30 AM"
+        }
+      ],
+      "words": [
+        "$103.55 recorded as handed back in cash instead of to the card by Test Landlord on October 4, 2026 at 11:30 AM — the $100.00 GAM held for them is added to your next payout."
+      ]
+    },
+    "quoteToken": "quote-token"
+  },
+  "cashAgain": {
+    "leaseId": "00000000-0000-4000-8000-000000000020",
+    "choice": {
+      "id": "00000000-0000-4000-8000-000000000024",
+      "refundChoice": "refund_all",
+      "refundChoiceLabel": "Refund the unused days",
+      "restChoice": null,
+      "restChoiceLabel": null,
+      "leftAmount": 100,
+      "refundTotal": 100,
+      "restAmount": 0,
+      "releasedAmount": 0,
+      "leftGamHeld": 0,
+      "decidedBy": "Test Landlord",
+      "decidedAt": "2026-10-04T18:00:00.000Z",
+      "decidedOn": "October 4, 2026 at 11:00 AM",
+      "parts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000026",
+          "kind": "cash",
+          "label": "Card · Sep 3",
+          "amount": 103.55,
+          "status": "handed_back",
+          "stale": false,
+          "attention": false,
+          "retry": false,
+          "failure": null,
+          "cashInstead": false,
+          "checkAgain": false,
+          "recordOnly": false,
+          "replacesPartId": "00000000-0000-4000-8000-000000000025",
+          "cashReply": [
+            "This was recorded as given back in cash ($103.55) by you at October 4, 2026 at 11:30 AM — GAM checked first that it did not reach the card. If you have not handed that $103.55 over yet, hand it back in cash now; if you have, give nothing more.",
+            "It is recorded as given back — nothing goes to the card. The $100.00 GAM held for them is added to your next payout."
+          ],
+          "cashReplyHandBack": [
+            true,
+            false
+          ],
+          "words": "$103.55 recorded as handed back in cash instead of to the card by Test Landlord on October 4, 2026 at 11:30 AM"
+        }
+      ],
+      "words": [
+        "$103.55 recorded as handed back in cash instead of to the card by Test Landlord on October 4, 2026 at 11:30 AM — the $100.00 GAM held for them is added to your next payout."
+      ]
+    },
+    "words": [
+      "This was already recorded as given back in cash ($103.55) by you at October 4, 2026 at 11:30 AM — GAM checked first that it did not reach the card. If you have not handed that $103.55 over yet, hand it back in cash now; if you have, give nothing more.",
+      "It is recorded as given back — nothing goes to the card. The $100.00 GAM held for them is added to your next payout."
+    ],
+    "handBack": [
+      true,
+      false
+    ],
+    "next": "done"
+  }
+}

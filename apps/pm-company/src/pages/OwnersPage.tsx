@@ -14,6 +14,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useAuth } from '../context/AuthContext'
 import { apiGet, apiPost } from '../lib/api'
 import { Check } from 'lucide-react'
+import { EXPENSE_CATEGORY_LABEL, humanize } from '@gam/shared'
 
 interface OwnerRow {
   landlordId: string
@@ -26,23 +27,85 @@ interface OwnerRow {
   unitCount: number
 }
 
+/** S655: information only — this month's bills (by due date) and what became of them. */
+interface StatementBilled { billed: number; collectedSoFar: number; clearing: number; stillOwed: number }
 interface StatementProperty {
   propertyId: string; propertyName: string
-  grossCollected: number; ownerShare: number; managementFee: number
+  /** What residents paid, before anyone's cut (GROSS_LABEL says how it is dated). */
+  grossCollected: number
+  /** S655: of it, money GAM held and paid out (ties to the owner share and the management fee). */
+  collectedThroughGam?: number
+  /** S655: of it, money the manager took directly (cash, check, money paid ahead to the manager). */
+  collectedDirectly?: number
+  /** S655: what a dispute or bank return took back this month (negative) — beside gross, never in it. */
+  returnedOrDisputed?: number
+  billed?: StatementBilled
+  ownerShare: number; managementFee: number
   expenses: number; net: number
   expenseLines: Array<{ date: string; category: string; amount: number; description: string | null; vendor: string | null }>
 }
 interface Statement {
   periodMonth: string
   properties: StatementProperty[]
-  totals: { grossCollected: number; ownerShare: number; managementFee: number; expenses: number; net: number }
+  totals: {
+    grossCollected: number; collectedThroughGam?: number; collectedDirectly?: number; returnedOrDisputed?: number
+    billed?: StatementBilled
+    ownerShare: number; managementFee: number; expenses: number; net: number
+  }
 }
 
 const money = (n: number) =>
   new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
 
-/** This month, as the API wants it. */
-const thisMonth = () => new Date().toISOString().slice(0, 7)
+/**
+ * This month, as the API wants it ('YYYY-MM'), on the viewer's own calendar.
+ * S655: it read the UTC date, which turns over at 5 pm in Arizona — on the last
+ * evening of a month the statement opened on next month.
+ */
+const thisMonth = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+/** 'YYYY-MM' in words, "September 2026" — the month the statement is for, read as a calendar month. */
+const monthWords = (ym: string) => {
+  const [y, m] = ym.split('-').map(Number)
+  if (!y || !m) return ym
+  return new Date(y, m - 1, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+}
+
+/**
+ * S655: what the statement's gross is called. NOT "Money received": that name
+ * means strictly the day money arrived (money plan §0.0), and this figure counts
+ * money paid ahead through GAM on the day GAM pays it toward a bill (when the
+ * owner's share of it is set aside for the next payout). Which way it should
+ * go — count that money on the day it arrived, or keep this name — is Nic's
+ * call; this is the one place to change it.
+ */
+const GROSS_LABEL = 'Collected'
+
+/**
+ * How the gross is dated, under the figures. Money paid ahead through GAM
+ * counts the day GAM pays it toward a bill: that day the owner's share is SET
+ * ASIDE (allocation_owner_share), and it reaches the owner in the next payout —
+ * so the note never says it is paid out that day.
+ */
+export const GROSS_NOTE =
+  `${GROSS_LABEL} is what residents paid, before anyone's cut, counted on the day it arrived — except ` +
+  `money paid ahead through GAM, which counts on the day GAM pays it toward a bill (that day the ` +
+  `owner's share of it is set aside for the owner's next payout). A deposit held for a tenant, a GAM ` +
+  `fee and a credit the owner gave are never in it.`
+
+/** S655: the gross, split by who held the money (it adds up to the gross). */
+function GrossSplit({ through, direct }: { through?: number; direct?: number }) {
+  if (through == null && direct == null) return null
+  return (
+    <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.5 }}>
+      <div>Collected through GAM {money(Number(through || 0))}</div>
+      <div>Collected by the manager directly {money(Number(direct || 0))}</div>
+    </div>
+  )
+}
 
 export function OwnersPage() {
   const { activePmCompany } = useAuth()
@@ -64,6 +127,9 @@ export function OwnersPage() {
   )
 
   const owners = ownersQ.data ?? []
+  // Nothing to list because the load failed (a failed background refresh with
+  // a list already on screen keeps the list): say why, never "No owners yet".
+  const ownersFailed = ownersQ.isError && !ownersQ.data
 
   return (
     <div style={{ padding: 24 }}>
@@ -77,15 +143,31 @@ export function OwnersPage() {
 
       {ownersQ.isLoading && <div style={{ color: 'var(--text-3)' }}>Loading…</div>}
 
-      {!ownersQ.isLoading && owners.length === 0 && (
+      {/* A list that did not load says why, once — never "No owners yet". */}
+      {ownersFailed && (
+        <div className="card" style={{ padding: 16, color: 'var(--red, #e06666)', fontSize: '.88rem' }}>
+          {ownersErrorText(ownersQ.error)}
+        </div>
+      )}
+
+      {!ownersQ.isLoading && !ownersFailed && owners.length === 0 && (
         <div className="card" style={{ padding: 16, color: 'var(--text-2)', fontSize: '.88rem' }}>
           No owners yet. An owner appears here the moment one of their properties is linked
           to your company.
         </div>
       )}
 
+      {/* A failed "Give access" says so once, with what to do next. */}
+      {openPortal.isError && (
+        <div style={{ color: 'var(--red, #e06666)', fontSize: '.8rem', marginBottom: 10 }}>
+          {giveAccessErrorText(openPortal.error)}
+        </div>
+      )}
+
+      {/* Scrolls sideways inside its own frame on a narrow screen, so the
+          Statement button is never cut off. */}
       {owners.length > 0 && (
-        <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+        <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ background: 'var(--bg-2)' }}>
@@ -123,8 +205,8 @@ export function OwnersPage() {
                   </Td>
                   <Td>
                     <button
-                      className="btn"
-                      style={{ fontSize: '.72rem', padding: '4px 10px' }}
+                      className={openOwner === o.landlordId ? 'btn btn-ghost' : 'btn btn-primary'}
+                      style={{ fontSize: '.72rem', padding: '4px 10px', whiteSpace: 'nowrap' }}
                       onClick={() => setOpenOwner(openOwner === o.landlordId ? null : o.landlordId)}
                     >
                       {openOwner === o.landlordId ? 'Hide statement' : 'Statement'}
@@ -186,32 +268,77 @@ function OwnerStatement(props: {
       </div>
 
       {q.isLoading && <div style={{ color: 'var(--text-3)', marginTop: 12 }}>Loading…</div>}
+      {q.isError && (
+        <div style={{ color: 'var(--red, #e06666)', fontSize: '.8rem', marginTop: 12 }}>
+          {statementErrorText(q.error)}
+        </div>
+      )}
 
       {s && (
         <>
           <div style={{ display: 'flex', gap: 22, flexWrap: 'wrap', marginTop: 14 }}>
-            <Figure label="Collected" value={money(s.totals.grossCollected)} />
+            <div>
+              <Figure label={GROSS_LABEL} value={money(s.totals.grossCollected)} />
+              <GrossSplit through={s.totals.collectedThroughGam} direct={s.totals.collectedDirectly} />
+            </div>
             <Figure label="Owner's share" value={money(s.totals.ownerShare)} />
             <Figure label="Management fee" value={money(s.totals.managementFee)} />
             <Figure label="Expenses" value={money(s.totals.expenses)} />
             <Figure label="Net to owner" value={money(s.totals.net)} accent />
           </div>
 
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.5, maxWidth: 680 }}>
+            {GROSS_NOTE}
+            {Number(s.totals.returnedOrDisputed || 0) !== 0 && (
+              <> In {monthWords(s.periodMonth || props.month)} a dispute or bank return took back {money(Math.abs(Number(s.totals.returnedOrDisputed)))} —
+              shown here beside the total; the payment it reversed stays in the month it arrived.</>
+            )}
+          </div>
 
+          {s.totals.billed && (
+            <div style={{
+              marginTop: 12, padding: '10px 12px', border: '1px dashed var(--border-0)', borderRadius: 8,
+              fontSize: '.78rem', color: 'var(--text-2)', maxWidth: 680,
+            }}>
+              <strong style={{ color: 'var(--text-1)' }}>Money billed in {monthWords(s.periodMonth || props.month)} {money(s.totals.billed.billed)}</strong>
+              {' — '}collected so far {money(s.totals.billed.collectedSoFar)}
+              {s.totals.billed.clearing ? ` · clearing ${money(s.totals.billed.clearing)}` : ''}
+              {' · '}still owed {money(s.totals.billed.stillOwed)}.
+              <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 2 }}>
+                For information: bills by the day they were due. It changes no share or fee.
+              </div>
+            </div>
+          )}
 
           {s.properties.length > 0 && (
+            <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 16 }}>
               <thead>
                 <tr style={{ background: 'var(--bg-2)' }}>
-                  <Th>Property</Th><Th>Collected</Th><Th>Their share</Th>
+                  <Th>Property</Th><Th>{GROSS_LABEL}</Th><Th>Their share</Th>
                   <Th>Fee</Th><Th>Expenses</Th><Th>Net</Th>
                 </tr>
               </thead>
               <tbody>
                 {s.properties.map(p => (
                   <tr key={p.propertyId} style={{ borderTop: '1px solid var(--border-0)' }}>
-                    <Td>{p.propertyName}</Td>
-                    <Td>{money(p.grossCollected)}</Td>
+                    <Td>
+                      {p.propertyName}
+                      {p.billed && (p.billed.billed || p.billed.stillOwed) ? (
+                        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3 }}>
+                          Billed {money(p.billed.billed)} · still owed {money(p.billed.stillOwed)}
+                        </div>
+                      ) : null}
+                    </Td>
+                    <Td>
+                      {money(p.grossCollected)}
+                      <GrossSplit through={p.collectedThroughGam} direct={p.collectedDirectly} />
+                      {Number(p.returnedOrDisputed || 0) !== 0 && (
+                        <div style={{ fontSize: '.7rem', color: 'var(--red, #e06666)', marginTop: 2 }}>
+                          Returned or disputed {money(Number(p.returnedOrDisputed))}
+                        </div>
+                      )}
+                    </Td>
                     <Td>{money(p.ownerShare)}</Td>
                     <Td>{money(p.managementFee)}</Td>
                     <Td>
@@ -220,7 +347,7 @@ function OwnerStatement(props: {
                         <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3 }}>
                           {p.expenseLines.map((l, i) => (
                             <div key={i}>
-                              {l.date} · {l.category}
+                              {l.date} · {(EXPENSE_CATEGORY_LABEL as Record<string, string>)[l.category] ?? humanize(l.category)}
                               {l.vendor ? ` · ${l.vendor}` : ''} · {money(l.amount)}
                             </div>
                           ))}
@@ -232,11 +359,12 @@ function OwnerStatement(props: {
                 ))}
               </tbody>
             </table>
+            </div>
           )}
 
           {s.properties.length === 0 && (
             <div style={{ color: 'var(--text-3)', fontSize: '.84rem', marginTop: 14 }}>
-              Nothing on this owner's books for this month.
+              Nothing on this owner's books for {monthWords(s.periodMonth || props.month)}.
             </div>
           )}
         </>
@@ -244,6 +372,36 @@ function OwnerStatement(props: {
     </div>
   )
 }
+
+/**
+ * Why something failed, once: the server's own sentence for a refusal or a bad
+ * request (a 4xx carries its own next step, so no "try again" — it would send
+ * the reader in a circle), and "Try again in a moment" only when trying again
+ * can help (the connection, a server failure, or too many requests). This
+ * app's API client does not rewrite axios' own words, so "Request failed with
+ * status code 403", "Network Error" and "timeout of …" are never shown — the
+ * fallback is.
+ */
+export function errorText(error: unknown, fallback: string): string {
+  const e = error as any
+  const status: number | undefined = e?.response?.status ?? e?.status
+  const server = e?.response?.data?.error ?? e?.response?.data?.message
+  const said: string = typeof server === 'string' && server.trim() ? server.trim()
+    : typeof e?.message === 'string' ? e.message.trim() : ''
+  const axiosWords = /^Network Error$|^Request failed with status code|^timeout of/i
+  // Too many requests (the API's rate limit answers 429 in plain text):
+  // waiting is the next step.
+  if (status === 429) return `${said && !axiosWords.test(said) ? said : fallback} Try again in a moment.`
+  if (status && status >= 400 && status < 500) return said && !axiosWords.test(said) ? said : fallback
+  // A 500's message is an unexpected failure's own words (a database error) —
+  // the server's insides, never shown. Another 5xx may carry a real sentence.
+  const plain = status !== 500 && said && !axiosWords.test(said) ? said : fallback
+  return `${plain} Try again in a moment.`
+}
+
+export const statementErrorText = (error: unknown) => errorText(error, 'Could not load this statement.')
+export const giveAccessErrorText = (error: unknown) => errorText(error, 'Could not give portal access.')
+export const ownersErrorText = (error: unknown) => errorText(error, 'Could not load your owners.')
 
 const selectStyle: React.CSSProperties = {
   background: 'var(--bg-2)', color: 'var(--text-1)',

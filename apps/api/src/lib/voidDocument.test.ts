@@ -8,8 +8,10 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, query } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant } from '../test/dbHelpers'
 import { voidDocument } from './voidDocument'
+import { lockLeaseHousehold } from './unwindIssuedLease'
+import { householdLockKey } from '../services/moneyPredicates'
 
 let f: { landlordId: string; unitId: string; tenantId: string }
 
@@ -86,5 +88,99 @@ describe('voiding an unsigned installment agreement', () => {
        VALUES ($1,$2,'Lot lease','original_lease','sent') RETURNING id`, [f.landlordId, f.unitId])
     await query(`UPDATE lease_documents SET status='voided' WHERE id=$1`, [other[0].id])
     expect(await saleStatus(saleId)).toBe('pending_signature')
+  })
+})
+
+// S655 lock order: household, then the document, then its rows — the order the
+// scheduler's 15-minute cancel and its hold take. The manual void used to write
+// lease_tenants rows before the unwind locked the household, so a manual void
+// and the scheduler on the same document could deadlock.
+describe('the void takes the household lock first, as the scheduler does', () => {
+  async function addendumAdd() {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const leaseId = await seedLease(client, { unitId: f.unitId, landlordId: f.landlordId })
+      await seedLeaseTenant(client, { leaseId, tenantId: f.tenantId })
+      const joiner = await seedTenant(client)
+      const doc = (await client.query(
+        `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status)
+         VALUES ($1,$2,$3,'Add a tenant','addendum_add','sent') RETURNING *`,
+        [f.landlordId, f.unitId, leaseId])).rows[0]
+      await client.query(
+        `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, add_document_id)
+         VALUES ($1,$2,'co_tenant','pending_add',$3)`, [leaseId, joiner, doc.id])
+      await client.query('COMMIT')
+      return { doc, leaseId }
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+  const HELD = `SELECT EXISTS (
+      SELECT 1 FROM pg_locks
+       WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted AND objsubid = 1
+         AND classid = ((hashtextextended($1, 0) >> 32) & 4294967295)::oid
+         AND objid   = (hashtextextended($1, 0) & 4294967295)::oid) AS held`
+
+  it('holds the household lock before it writes any lease_tenants row', async () => {
+    const { doc } = await addendumAdd()
+    const key = householdLockKey(f.tenantId, f.landlordId)
+    const client = await db.connect()
+    const heldAtCascade: boolean[] = []
+    try {
+      await client.query('BEGIN')
+      const q = async (sql: string, params?: any[]) => {
+        if (/UPDATE\s+lease_tenants/i.test(sql)) {
+          heldAtCascade.push((await client.query(HELD, [key])).rows[0].held)
+        }
+        return client.query(sql, params)
+      }
+      await voidDocument(q as any, doc, 'redrafting')
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+    expect(heldAtCascade).toEqual([true])
+    const rows = await query<{ status: string }>(
+      `SELECT status FROM lease_tenants WHERE add_document_id = $1`, [doc.id])
+    expect(rows.map(r => r.status)).toEqual(['void'])
+  })
+
+  it('runs cleanly inside a transaction that already took the scheduler order (household, then document)', async () => {
+    const { doc, leaseId } = await addendumAdd()
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      await lockLeaseHousehold(client.query.bind(client) as any, leaseId)
+      const live = (await client.query(
+        `SELECT * FROM lease_documents WHERE id = $1 FOR UPDATE`, [doc.id])).rows[0]
+      await voidDocument(client.query.bind(client) as any, live, 'canceled')
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+    const d = await query<{ status: string }>(`SELECT status FROM lease_documents WHERE id = $1`, [doc.id])
+    expect(d[0].status).toBe('voided')
+  })
+
+  it('refuses on the live row: a copy read before a tenant signed is not voided', async () => {
+    const { doc } = await addendumAdd()
+    await query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, email, name, token, status, signed_at)
+       SELECT $1, t.user_id, 'tenant', 'pat@example.com', 'Pat', gen_random_uuid()::text, 'signed', now()
+         FROM tenants t WHERE t.id = $2`, [doc.id, f.tenantId])
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      await expect(voidDocument(client.query.bind(client) as any, doc, 'redrafting'))
+        .rejects.toThrow('Cannot void after a tenant has signed')
+      await client.query('ROLLBACK')
+    } finally { client.release() }
+  })
+
+  it('refuses a document already voided since the caller read it', async () => {
+    const { doc } = await addendumAdd()
+    await query(`UPDATE lease_documents SET status = 'voided' WHERE id = $1`, [doc.id])
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      await expect(voidDocument(client.query.bind(client) as any, doc, 'again'))
+        .rejects.toThrow('Document is already voided')
+      await client.query('ROLLBACK')
+    } finally { client.release() }
   })
 })

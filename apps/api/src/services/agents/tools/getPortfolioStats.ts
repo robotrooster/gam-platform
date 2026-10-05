@@ -42,6 +42,9 @@
 
 import { query } from '../../../db'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
+import { incomeTotals } from '../../incomeBasis'
+import { incomeCardMtd } from '../../../lib/rentCollected'
+import { todayIn, addDaysTo } from '../../../lib/timezone'
 
 /** Occupied = a unit someone lives in. Same set the portfolio and KPI use. */
 const OCCUPIED = `('active','delinquent','suspended')`
@@ -246,26 +249,38 @@ export const getPortfolioStats: AgentTool = {
     // landlord's own book — money in and out, what deposits cost at move-out,
     // how applications convert, what short stays bring in, and inspections.
     if (want.includes('money')) {
-      const [r] = await query<any>(
-        `SELECT
-           (SELECT COALESCE(SUM(amount),0) FROM landlord_expenses
-             WHERE landlord_id= ANY($1::uuid[]) AND voided_at IS NULL
-               AND expense_date >= CURRENT_DATE - INTERVAL '12 months') AS expenses,
-           (SELECT COALESCE(SUM(amount),0) FROM landlord_other_income
-             WHERE landlord_id= ANY($1::uuid[]) AND voided_at IS NULL
-               AND income_date >= CURRENT_DATE - INTERVAL '12 months') AS other_income,
-           (SELECT COALESCE(SUM(amount),0) FROM payments
-             WHERE landlord_id= ANY($1::uuid[]) AND type='rent' AND status='settled'
-               AND settled_at >= CURRENT_DATE - INTERVAL '12 months') AS rent_collected`,
-        [id])
-      const rent = Number(r.rent_collected), exp = Number(r.expenses), other = Number(r.other_income)
+      // S655: income from the same facts as the reports page and the dashboard
+      // card ("Money received": money on the day it arrived; paid-ahead money
+      // the day it arrives; a credit the landlord gave is never income), over
+      // the last 12 months to today. thisMonth IS the dashboard's income card.
+      const today = todayIn(null)
+      const from = addDaysTo(`${Number(today.slice(0, 4)) - 1}${today.slice(4, 10)}`, 1)
+      const [inc, card, [r]] = await Promise.all([
+        incomeTotals({ landlordIds: id, start: from, end: today, basis: 'received' }),
+        incomeCardMtd(id, null, 'received'),
+        query<any>(
+          `SELECT
+             (SELECT COALESCE(SUM(amount),0) FROM landlord_expenses
+               WHERE landlord_id= ANY($1::uuid[]) AND voided_at IS NULL
+                 AND expense_date >= $2::date AND expense_date <= $3::date) AS expenses`,
+          [id, from, today]),
+      ])
+      const exp = Number(r.expenses)
       if (exp === 0) missing.push('no expenses have been recorded, so there is no cost side to this')
       out.money = {
         windowMonths: 12,
-        rentCollected: rent,
-        otherIncome: other,
+        basis: inc.meta.label,
+        incomeReceived: inc.total,
+        rentCollected: inc.lines.rent,
+        paidAheadForLaterBills: inc.lines.paidAhead,
+        otherIncome: inc.lines.otherIncome,
         expensesRecorded: exp,
-        net: Math.round((rent + other - exp) * 100) / 100,
+        net: Math.round((inc.total - exp) * 100) / 100,
+        thisMonth: {
+          moneyReceived: card.received.amount,
+          includesPaidAhead: card.received.paidAhead,
+          stillClearing: card.received.clearing,
+        },
         netNote: exp === 0
           ? 'Net equals income because no expenses are on file — it is NOT a profit figure.'
           : 'Income minus the expenses recorded on the platform. Off-platform costs are not included.',

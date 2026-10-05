@@ -153,7 +153,10 @@ export async function moveLeaseToUnit(params: {
        RETURNING id`,
       [m.meter_id, params.movedOn, given.get(m.meter_id), params.actorUserId ?? null,
        `Closing read — resident moved out on ${params.movedOn}`])
-    const billed = await billMoveOutRead(m.meter_id, read!.id)
+    // 10/3: name the mover. Without it the move-out rule can pick a household
+    // that left this space earlier with no read of its own and bill IT for
+    // usage the mover ran up.
+    const billed = await billMoveOutRead(m.meter_id, read!.id, { leaseId: params.leaseId, spaceMove: true })
     if (billed.billed) closingBills.push(m.meter_id)
     else logger.info({ leaseId: params.leaseId, meterId: m.meter_id, reason: billed.reason }, '[unit-move] closing read not billed')
   }

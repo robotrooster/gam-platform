@@ -7,7 +7,7 @@ import multer from 'multer'
 import { streamStoredFile } from '../lib/fileServe'
 import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, METER_USAGE_ALERT_THRESHOLDS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
+import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 import { logger } from '../lib/logger'
@@ -238,7 +238,20 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
       ${where}
       ORDER BY p.name, m.utility_type, m.label
     `, params)
-    res.json({ success: true, data: meters })
+    // 10/3: blind entry (S559). Someone who cannot change meter setup never gets
+    // a reading value back — the opening read keeps its id and date, not its
+    // number. A staffer who only reads meters (no unit access) gets no prices
+    // either; they need the meter, not what it bills at.
+    if (userHasPerm(req.user, 'properties.edit', 'units.edit')) return res.json({ success: true, data: meters })
+    const seesPrices = userHasPerm(req.user, 'units.view_status')
+    res.json({ success: true, data: meters.map((m: any) => {
+      const { opening_read, rate_per_unit, base_fee, sewer_rate_per_unit, rubs_weights, ...rest } = m
+      return {
+        ...rest,
+        opening_read: opening_read ? { id: opening_read.id, date: opening_read.date } : null,
+        ...(seesPrices ? { rate_per_unit, base_fee, sewer_rate_per_unit, rubs_weights } : {}),
+      }
+    }) })
   } catch (e) { next(e) }
 })
 
@@ -337,6 +350,39 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
         throw new AppError(400,
           `This unit is already on "${clash.label}" for ${body.utilityType}. ` +
           `A unit can only be on one ${body.utilityType} meter — remove it from that one first.`)
+      }
+
+      // ── 10/3 (final sweep): AN OCCUPIED UNIT'S OWN METER NEEDS ITS OPENING READ ──
+      //
+      // Oak Park RV 24 was moved onto a new water submeter on 9/30 with no
+      // starting read. A submeter's first cycle read is only a starting point
+      // (services/utilityBilling: "no prior reading — first cycle baseline, no
+      // bill produced"), so the first month on the new meter would bill no water
+      // at all for a space somebody lives in, and nothing would say so until the
+      // bill went out without it. On an empty space the first read is the right
+      // starting point; on an occupied one the number on the face today is
+      // required with the meter. Occupied = the same test the stuck-meter rule
+      // uses: not vacant or available, or an active lease, or residents invited.
+      if (body.billingMethod === 'submeter' && body.baselineReading == null) {
+        const occ = await queryOne<{ unit_number: string; occupied: boolean }>(
+          `SELECT u.unit_number,
+                  (u.status NOT IN ('vacant', 'available')
+                   OR EXISTS (SELECT 1 FROM leases l
+                               WHERE l.unit_id = u.id AND l.status IN ('active', 'delinquent', 'suspended'))
+                   OR EXISTS (SELECT 1 FROM pending_tenant_intents pti
+                               WHERE pti.unit_id = u.id AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL)
+                  ) AS occupied
+             FROM units u WHERE u.id = $1`,
+          [body.assignUnitId])
+        if (occ?.occupied) {
+          // utilityType is a plain word (water, electric, gas...) — said as-is,
+          // like the clash message above.
+          throw new AppError(400,
+            `Someone lives in ${occ.unit_number}, so its new ${body.utilityType} meter needs an opening read: ` +
+            `the number on the meter face today and the date you read it. Without it, their first month on this ` +
+            `meter would not bill. Nothing was added. To add it, open the Utilities page, choose "Add meter", ` +
+            `fill in the opening read and the date you read it, then assign the meter to ${occ.unit_number}.`)
+        }
       }
     }
 
@@ -1658,7 +1704,10 @@ utilityRouter.get('/reads-due', requirePerm('properties.edit', 'utility.read_met
 // This returns one row per master reading per cycle — what the provider
 // billed, what was measured, and how much of it was pushed back out to
 // tenants (so the un-recovered remainder is visible at a glance).
-utilityRouter.get('/master-bills', requirePerm('properties.edit', 'utility.read_meters'), async (req, res, next) => {
+// 10/3: owners / properties.edit only. A staffer who only reads meters reads
+// them blind (S559) — past master readings and the provider's dollars are not
+// theirs to see.
+utilityRouter.get('/master-bills', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)
     const property = await queryOne<{ landlord_id: string }>(
@@ -1702,6 +1751,10 @@ utilityRouter.post('/meters/:id/reads', requirePerm('properties.edit', 'utility.
       readingValue: z.number().int().min(0),
       reason: z.enum(METER_READ_REASONS as unknown as [string, ...string[]]),
       reasonNote: z.string().max(500).optional(),
+      // 10/3: the reads-due row says whose move-out this is. It only breaks a
+      // tie between households the move-out rule already counts — it can never
+      // put a bill on someone the rule would skip.
+      leaseId: z.string().uuid().optional(),
     }).parse(req.body)
     if (body.reason === 'monthly_cycle') {
       throw new AppError(400, 'Monthly-cycle reads are entered through the reading run, not as a special read')
@@ -1729,7 +1782,14 @@ utilityRouter.post('/meters/:id/reads', requirePerm('properties.edit', 'utility.
     let billed = false
     let billingNote: string | undefined
     if (body.reason === 'move_out_final') {
-      const r = await billMoveOutRead(meter.id, reading.id)
+      // A lease from another company is ignored, never an error — the read
+      // still bills by the normal rule.
+      const named = body.leaseId
+        ? await queryOne<{ id: string }>(
+            `SELECT l.id FROM leases l JOIN units u ON u.id = l.unit_id JOIN properties p ON p.id = u.property_id
+              WHERE l.id = $1 AND p.landlord_id = $2`, [body.leaseId, property.landlord_id])
+        : null
+      const r = await billMoveOutRead(meter.id, reading.id, { leaseId: named?.id ?? null })
       billed = r.billed
       // S639: say WHY it did not bill. Rollover refusals, an unattached meter
       // and an already-billed cycle all looked identical (a bare false) to the
@@ -2048,10 +2108,10 @@ utilityRouter.post('/bills/:id/finalize', requirePerm('properties.edit'), async 
 //
 // S178 fixed-forward by wiring utility_bills into invoiceGeneration:
 // utilities now ride the rent invoice as type='utility' child payment
-// rows linked via invoice_id. Tenants pay them through the standard
-// /api/payments/:id/pay flow against the utility-typed payment row;
-// the existing S122 webhook handler still flips utility_bills.status='paid'
-// on settlement.
+// rows linked via invoice_id. Tenants pay them with the rest of the bill
+// through POST /api/payments/pay-balance (S655: the one-row /payments/:id/pay
+// is retired too); the S122 webhook handler still flips
+// utility_bills.status='paid' on settlement.
 //
 // This handler returns 410 Gone with a pointer to the new path. Kept
 // registered so any cached frontend or third-party integration calling
@@ -2061,8 +2121,8 @@ utilityRouter.post('/bills/:id/pay', async (req: any, _res, next) => {
     if (req.user!.role !== 'tenant') {
       throw new AppError(403, 'Only tenants can call this endpoint')
     }
-    // Look up the linked invoice payment so the error message can point
-    // the caller directly at the correct /payments/:id/pay path.
+    // Look up the linked invoice payment: a bill not yet on an invoice gets
+    // its own answer (it will be on the next one).
     const linked = await queryOne<{ payment_id: string | null }>(
       `SELECT payment_id FROM utility_bills WHERE id = $1 AND tenant_id = $2`,
       [req.params.id, req.user!.profileId],
@@ -2075,7 +2135,7 @@ utilityRouter.post('/bills/:id/pay', async (req: any, _res, next) => {
     }
     throw new AppError(
       410,
-      `This endpoint was retired in S178. Pay this utility through POST /api/payments/${linked.payment_id}/pay (utility now invoices as a line item on the rent invoice).`,
+      'This endpoint was retired. Utilities are a line on the rent bill now — pay the whole bill with POST /api/payments/pay-balance (Pay Now on the Payments page).',
     )
   } catch (e) { next(e) }
 })

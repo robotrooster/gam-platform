@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeEach, beforeAll } from 'vitest'
 import { db, query } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
-import { checkOutFor, nightsBetween, createStayBooking, siteIsFree } from './registerStay'
+import { checkOutFor, nightsBetween, createStayBooking, siteIsFree, bookingLeaseTypeFor, reservationDue, priceStayBySchedule, stayTaxRate, taxInside } from './registerStay'
 
 let landlordId = '', userId = '', propertyId = '', unitId = ''
 
@@ -145,6 +145,19 @@ describe('selling a stay at the counter', () => {
       .rejects.toThrow(/not at this property/i)
   })
 
+  // 10/2 (review): the bookings CHECK knows 'month_to_month', not 'monthly' —
+  // every month stay rung at the register failed on it and rolled the sale back.
+  it('sells a month: on the schedule as a month-to-month stay, a calendar month long', async () => {
+    const r = await sell(line('month', 1, 900), { checkIn: '2026-10-15' })
+    expect(r.checkOut).toBe('2026-11-15')
+    expect(r.nights).toBe(31)
+    const [b] = await query<any>(`SELECT lease_type, status, total_amount::float AS total FROM unit_bookings WHERE id = $1`, [r.bookingId])
+    expect(b).toMatchObject({ lease_type: 'month_to_month', status: 'confirmed', total: 900 })
+    expect(bookingLeaseTypeFor('night')).toBe('nightly')
+    expect(bookingLeaseTypeFor('week')).toBe('weekly')
+    expect(bookingLeaseTypeFor('month')).toBe('month_to_month')
+  })
+
   it('refuses two different stay lengths on one sale', async () => {
     // A stay whose length depends on which line you read has no dates.
     await expect(sell([...line('night', 1, 49), ...line('week', 1, 250)]))
@@ -154,5 +167,96 @@ describe('selling a stay at the counter', () => {
   it('asks for the things it cannot derive', async () => {
     await expect(sell(line('night', 1, 49), { guestName: '' })).rejects.toThrow(/who is the stay for/i)
     await expect(sell(line('night', 1, 49), { checkIn: '' })).rejects.toThrow(/what date/i)
+  })
+})
+
+/**
+ * 10/2 (decisions #9): what a reservation still owes is its own quoted price
+ * less what was paid toward it — never re-priced by the till.
+ */
+describe('what a reservation still owes', () => {
+  async function booking(cols: Record<string, any> = {}) {
+    const r = await query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, lease_type, check_in, check_out, nights, total_amount, status,
+                                  deposit_amount, deposit_paid_at, balance_paid_at)
+       VALUES ($1,$2,'Gina Guest','nightly','2027-05-01','2027-05-08',7,$3,$4,$5,$6,$7) RETURNING id`,
+      [unitId, landlordId, cols.total ?? 280, cols.status ?? 'tentative', cols.depositAmount ?? null,
+       cols.depositPaid ? new Date() : null, cols.balancePaid ? new Date() : null])
+    return r[0].id
+  }
+
+  it('is the whole quote with nothing paid, the rest after a deposit, nothing once the balance is paid', async () => {
+    expect(await reservationDue(db, await booking())).toMatchObject({ total: 280, paid: 0, owed: 280, paidInFull: false, closed: false, noPrice: false, nights: 7, unitNumber: 'RV 01' })
+    expect(await reservationDue(db, await booking({ depositAmount: 56, depositPaid: true, status: 'confirmed' })))
+      .toMatchObject({ paid: 56, owed: 224, paidInFull: false })
+    // A deposit set but not paid yet is not money in.
+    expect(await reservationDue(db, await booking({ depositAmount: 56 }))).toMatchObject({ paid: 0, owed: 280 })
+    expect(await reservationDue(db, await booking({ depositAmount: 56, depositPaid: true, balancePaid: true })))
+      .toMatchObject({ paid: 280, owed: 0, paidInFull: true })
+    // Paid whole at the counter (deposit stamped with no amount): nothing left.
+    expect(await reservationDue(db, await booking({ depositPaid: true, status: 'confirmed' }))).toMatchObject({ owed: 0, paidInFull: true })
+  })
+
+  it('says when there is nothing to take money for', async () => {
+    expect(await reservationDue(db, await booking({ status: 'cancelled' }))).toMatchObject({ closed: true })
+    expect(await reservationDue(db, await booking({ total: 0 }))).toMatchObject({ noPrice: true, paidInFull: false })
+    expect(await reservationDue(db, '00000000-0000-0000-0000-000000000000')).toBeNull()
+    expect(await reservationDue(db, 'not-an-id')).toBeNull()
+  })
+
+  // 10/3 (decisions #15): a stay its lease bills is never owed whole at the register.
+  it('a stay at the lease threshold owes the register only its deposit — 30 nights, or 7 at a weekly-lease park; never one the register sold itself', async () => {
+    await query(`UPDATE units SET weekly_rate = 210, monthly_rate = 900 WHERE id = $1`, [unitId])
+    await query(`UPDATE properties SET booking_deposit_pct = 10, booking_monthly_deposit = 150 WHERE id = $1`, [propertyId])
+    const make = async (nights: number, total: number, source = 'direct') => (await query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, lease_type, check_in, check_out, nights, total_amount, status, source)
+       VALUES ($1,$2,'Gina Guest','month_to_month','2027-05-01', DATE '2027-05-01' + $3::int, $3, $4, 'tentative', $5) RETURNING id`,
+      [unitId, landlordId, nights, total, source]))[0].id
+    const month = await make(30, 900)
+    expect(await reservationDue(db, month)).toMatchObject({ leaseBillsRest: true, depositDue: 150, owed: 150, paidInFull: false })
+    // Its deposit paid: nothing more for the register — the lease bills the rest.
+    await query(`UPDATE unit_bookings SET deposit_amount = 150, deposit_paid_at = NOW() WHERE id = $1`, [month])
+    expect(await reservationDue(db, month)).toMatchObject({ paid: 150, owed: 0, paidInFull: true, leaseBillsRest: true })
+    // A week is a short stay — until the park runs weekly leases (then 10% of the quote).
+    const week = await make(7, 210)
+    expect(await reservationDue(db, week)).toMatchObject({ leaseBillsRest: false, owed: 210 })
+    await query(`UPDATE properties SET weekly_lease_mode = TRUE WHERE id = $1`, [propertyId])
+    expect(await reservationDue(db, week)).toMatchObject({ leaseBillsRest: true, depositDue: 21, owed: 21 })
+    // Sold at the register as a month (no lease drafted): charged whole as ever.
+    expect(await reservationDue(db, await make(30, 900, 'register'))).toMatchObject({ leaseBillsRest: false, owed: 900 })
+  })
+})
+
+// 10/3 (decisions #9, #21): a new stay is priced the way the schedule prices it.
+describe('pricing a stay by the schedule', () => {
+  it('tiers by length from the site\'s rates (else the property\'s), adds the short-term tax under 30 nights, and refuses a site with no rate', async () => {
+    await query(`UPDATE units SET nightly_rate = 40, weekly_rate = 210 WHERE id = $1`, [unitId])
+    await query(`UPDATE properties SET short_term_tax_rate = 10, monthly_rate = 900 WHERE id = $1`, [propertyId])
+    expect(await priceStayBySchedule(db, unitId, '2027-01-12', '2027-01-14')).toMatchObject({ total: 88, nights: 2, tier: 'nightly' })
+    expect(await priceStayBySchedule(db, unitId, '2027-01-12', '2027-01-19')).toMatchObject({ total: 231, nights: 7, tier: 'weekly' })
+    // 30+ nights: the property's monthly rate on the calendar schedule, untaxed.
+    expect(await priceStayBySchedule(db, unitId, '2027-03-01', '2027-04-01')).toMatchObject({ total: 900, nights: 31, tier: 'monthly' })
+    await query(`UPDATE units SET nightly_rate = NULL, weekly_rate = NULL WHERE id = $1`, [unitId])
+    await query(`UPDATE properties SET monthly_rate = NULL WHERE id = $1`, [propertyId])
+    await expect(priceStayBySchedule(db, unitId, '2027-01-12', '2027-01-14')).rejects.toThrow(/has no stay rate set, so this stay cannot be priced — nothing was changed/)
+  })
+})
+
+// 10/3 (decisions #21): the tax inside a stay's price — the part a sale records as tax.
+describe('the lodging tax inside a stay\'s price', () => {
+  it('is the short-term rate for a nightly or weekly stay under 30 nights, and nothing for a month; priceStayBySchedule says how much', async () => {
+    const rates = { nightly: 40, weekly: 210, monthly: 900 }
+    expect(stayTaxRate(rates, 10, 2)).toBe(0.1)
+    expect(stayTaxRate(rates, 10, 7)).toBe(0.1)
+    expect(stayTaxRate(rates, 10, 30)).toBe(0)
+    expect(stayTaxRate({ nightly: null, weekly: null, monthly: 900 }, 10, 10)).toBe(0)   // priced on the monthly schedule, untaxed
+    expect(stayTaxRate(rates, 0, 2)).toBe(0)
+    expect(taxInside(88, 0.1)).toBe(8)
+    expect(taxInside(254.1, 0.1)).toBe(23.1)
+    expect(taxInside(50, 0)).toBe(0)
+    await query(`UPDATE units SET nightly_rate = 40, weekly_rate = 210 WHERE id = $1`, [unitId])
+    await query(`UPDATE properties SET short_term_tax_rate = 10, monthly_rate = 900 WHERE id = $1`, [propertyId])
+    expect(await priceStayBySchedule(db, unitId, '2027-01-12', '2027-01-14')).toMatchObject({ total: 88, base: 80, tax: 8, taxRate: 0.1 })
+    expect(await priceStayBySchedule(db, unitId, '2027-03-01', '2027-04-01')).toMatchObject({ total: 900, base: 900, tax: 0, taxRate: 0 })
   })
 })

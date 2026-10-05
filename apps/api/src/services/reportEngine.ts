@@ -24,9 +24,10 @@
 // common costs allocated per unit). If those definitions change, this must move
 // with them or a landlord's reports will disagree with their own Books.
 // ============================================================
+import type { IncomeBasis } from '@gam/shared'
 import { query } from '../db'
-import { platformFeesByProperty, platformFeesByPropertyForEntities } from './platformFee'
-import { landlordIncomeSql } from './landlordPL'
+import { platformFeesByPropertyForEntities } from './platformFee'
+import { incomeEvents, REPORT_LINES, type ReportLine } from './incomeBasis'
 
 /** Every month a range touches, as 'YYYY-MM-01' — the key format the
  *  platform-fee accrual lookup expects. A range landing mid-month still bills
@@ -62,6 +63,8 @@ export interface ReportQuery {
    *  to those properties — this is how a scoped team member's reports stay
    *  inside their assignment. An EMPTY array means "sees nothing". */
   propertyIds?: string[] | null
+  /** S655: "Money received" (default) or "Money billed" — services/incomeBasis. */
+  basis?: IncomeBasis
 }
 
 export interface ReportRow {
@@ -70,16 +73,22 @@ export interface ReportRow {
   propertyName: string | null
   unitId:       string | null
   unitNumber:   string | null
-  /** S654: other = "Balances collected" (carried_balance: pre-platform arrears
-   *  and work-trade deficits), the one income kind without its own field. */
+  /** S654: other = everything without its own field: "Balances collected"
+   *  (carried_balance: pre-platform arrears and work-trade deficits) and, S655,
+   *  paid ahead, register sales and stays, other income, kept from deposits and
+   *  the negatives (returned, stay shortened, credits given). fees includes
+   *  late fees. `lines` has every line on its own. */
   income: {
     rent: number; fees: number; utilities: number; homeSale: number; other: number; total: number
+    lines: Record<ReportLine, number>
   }
   expenses: {
     maintenance: number
     entered:     number
     byCategory:  Record<string, number>
     platformFee: number
+    /** S655: lot rent an investor-operator owes the park, by billing month (the P&L's own). */
+    lotRent:     number
     total:       number
   }
   net:           number
@@ -111,8 +120,9 @@ function keyOf(period: string | null, propertyId: string | null, unitId: string 
 function emptyRow(period: string | null, propertyId: string | null, unitId: string | null): ReportRow {
   return {
     period, propertyId, propertyName: null, unitId, unitNumber: null,
-    income:   { rent: 0, fees: 0, utilities: 0, homeSale: 0, other: 0, total: 0 },
-    expenses: { maintenance: 0, entered: 0, byCategory: {}, platformFee: 0, total: 0 },
+    income:   { rent: 0, fees: 0, utilities: 0, homeSale: 0, other: 0, total: 0,
+                lines: Object.fromEntries(REPORT_LINES.map(l => [l, 0])) as Record<ReportLine, number> },
+    expenses: { maintenance: 0, entered: 0, byCategory: {}, platformFee: 0, lotRent: 0, total: 0 },
     net: 0, occupiedUnits: 0,
     derived: { netPerUnit: null, costPerUnit: null, incomePerUnit: null, costPerDay: 0, netPerDay: 0 },
   }
@@ -138,37 +148,27 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
     return r
   }
 
-  // ── 1. INCOME — settled payments, dated by when money actually settled ────
-  // S654: the rows are landlordIncomeSql's, the one definition every landlord
-  // report uses. Deposits are EXCLUDED from income: a deposit is the tenant's
-  // money held as a liability, not revenue. Counting it would inflate a T-12
-  // and mislead a buyer or lender reading it. GAM's fees, held paid-ahead
-  // money and FlexPay pulls are not the landlord's money and are out too.
-  const incomeSql = `
-    SELECT ${bucketExpr(bucket, 'p.settled_at')} AS period,
-           ${wantProperty ? 'u.property_id' : 'NULL::uuid'} AS property_id,
-           ${wantUnit ? 'p.unit_id' : 'NULL::uuid'} AS unit_id,
-           COALESCE(SUM(p.amount) FILTER (WHERE p.type='rent'), 0)::float              AS rent,
-           COALESCE(SUM(p.amount) FILTER (WHERE p.type IN ('late_fee','fee')), 0)::float AS fees,
-           COALESCE(SUM(p.amount) FILTER (WHERE p.type='utility'), 0)::float           AS utilities,
-           COALESCE(SUM(p.amount) FILTER (WHERE p.type='home_payment'), 0)::float      AS home_sale,
-           COALESCE(SUM(p.amount) FILTER (WHERE p.type='carried_balance'), 0)::float   AS other
-      FROM payments p
-      LEFT JOIN units u ON u.id = p.unit_id
-     WHERE p.landlord_id = ANY($1::uuid[])
-       AND p.status = 'settled'
-       AND ${landlordIncomeSql('p')}
-       AND p.settled_at >= $2::date
-       AND p.settled_at < ($3::date + INTERVAL '1 day')
-       AND ($4::uuid[] IS NULL OR u.property_id = ANY($4))
-     GROUP BY 1, 2, 3`
-  for (const r of await query<any>(incomeSql, [landlordIds, start, end, scoped])) {
-    const row = upsert(r.period, r.property_id, r.unit_id)
-    row.income.rent      = round2(+r.rent)
-    row.income.fees      = round2(+r.fees)
-    row.income.utilities = round2(+r.utilities)
-    row.income.homeSale  = round2(+r.home_sale)
-    row.income.other     = round2(+r.other)
+  // ── 1. INCOME — services/incomeBasis, the one set of money facts ──────────
+  // S655: every landlord report reads the same facts under the same switch.
+  // Money received (default): each bill's own new money on the day it settled,
+  // paid-ahead money on the day it arrived, register sales, other income; a
+  // credit the landlord gave is never income. Money billed: each bill in the
+  // month it was due. Deposits are a held liability and never income; GAM's
+  // fees and FlexPay pulls are never the landlord's. Facts are dated on the
+  // property's own calendar day.
+  const basis: IncomeBasis = q.basis ?? 'received'
+  const events = await incomeEvents({ landlordIds, start, end, basis, propertyIds: scoped })
+  for (const e of events) {
+    if (!e.inTotal) continue
+    const period = bucket === 'monthly' ? e.day.slice(0, 7) : bucket === 'daily' ? e.day : null
+    const row = upsert(period, wantProperty ? e.propertyId : null, wantUnit ? e.unitId : null)
+    const amt = e.amount
+    row.income.lines[e.line as ReportLine] = round2(row.income.lines[e.line as ReportLine] + amt)
+    if (e.line === 'rent') row.income.rent = round2(row.income.rent + amt)
+    else if (e.line === 'fees' || e.line === 'lateFees') row.income.fees = round2(row.income.fees + amt)
+    else if (e.line === 'utilities') row.income.utilities = round2(row.income.utilities + amt)
+    else if (e.line === 'homeSale') row.income.homeSale = round2(row.income.homeSale + amt)
+    else row.income.other = round2(row.income.other + amt)
   }
 
   // ── 2. MAINTENANCE — real repair spend, dated by completion ───────────────
@@ -247,6 +247,32 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
     row.expenses.entered = round2(row.expenses.entered + amt)
   }
 
+  // ── 3b. LOT RENT — what an investor-operator owes the park ───────────────
+  // S655: the P&L subtracts lot rent (services/landlordPL: every charge whose
+  // billing month falls in the range — a bill owed is that month's cost), and
+  // so do the tax summary and the property report. Without it here a T-12's
+  // net disagreed with all three for any landlord who pays lot rent. Billed
+  // by the month like the platform fee, so it sits on a monthly or total
+  // bucket and never on a day (spreading it over days would invent
+  // precision). At unit level it stays on its own unit: each charge is one
+  // lot's.
+  if (bucket !== 'daily') {
+    const lotSql = `
+      SELECT ${bucket === 'monthly' ? "to_char(lrc.billing_month, 'YYYY-MM')" : 'NULL::text'} AS period,
+             ${wantProperty ? 'lrc.property_id' : 'NULL::uuid'} AS property_id,
+             ${wantUnit ? 'lrc.unit_id' : 'NULL::uuid'} AS unit_id,
+             COALESCE(SUM(lrc.amount), 0)::float AS amount
+        FROM lot_rent_charges lrc
+       WHERE lrc.landlord_id = ANY($1::uuid[])
+         AND lrc.billing_month >= $2::date AND lrc.billing_month <= $3::date
+         AND ($4::uuid[] IS NULL OR lrc.property_id = ANY($4))
+       GROUP BY 1, 2, 3`
+    for (const r of await query<any>(lotSql, [landlordIds, start, end, scoped])) {
+      const row = upsert(r.period, r.property_id, r.unit_id)
+      row.expenses.lotRent = round2(row.expenses.lotRent + (+r.amount))
+    }
+  }
+
   // ── 4. GAM PLATFORM FEE — the landlord's real cost of the platform ────────
   // Sourced from the SAME accrual the landlord is actually billed from, so a
   // report can never quote a fee they weren't charged. Accrual is monthly per
@@ -318,7 +344,7 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
     r.income.total = round2(
       r.income.rent + r.income.fees + r.income.utilities + r.income.homeSale + r.income.other)
     r.expenses.total = round2(
-      r.expenses.maintenance + r.expenses.entered + r.expenses.platformFee)
+      r.expenses.maintenance + r.expenses.entered + r.expenses.platformFee + r.expenses.lotRent)
     r.net = round2(r.income.total - r.expenses.total)
     if (r.occupiedUnits === 0) {
       r.occupiedUnits = r.unitId
@@ -351,9 +377,11 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
     totals.income.utilities += r.income.utilities
     totals.income.homeSale  += r.income.homeSale
     totals.income.other     += r.income.other
+    for (const l of REPORT_LINES) totals.income.lines[l] = round2(totals.income.lines[l] + r.income.lines[l])
     totals.expenses.maintenance += r.expenses.maintenance
     totals.expenses.entered     += r.expenses.entered
     totals.expenses.platformFee += r.expenses.platformFee
+    totals.expenses.lotRent     += r.expenses.lotRent
     for (const [cat, amt] of Object.entries(r.expenses.byCategory)) {
       totals.expenses.byCategory[cat] = round2((totals.expenses.byCategory[cat] ?? 0) + amt)
     }

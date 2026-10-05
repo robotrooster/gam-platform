@@ -310,6 +310,9 @@ describe('confirming the roster', () => {
     const res = await confirm(f)
     expect(res.status).toBe(409)
     expect(res.body.problems.join(' ')).toMatch(/No default lease is set/)
+    // Final sweep (10/3): the landlord's menu item is GoldSign, not "E-Sign".
+    expect(res.body.problems.join(' ')).toMatch(/Set one in GoldSign \(Templates\), then come back\./)
+    expect(res.body.problems.join(' ')).not.toMatch(/E-Sign/)
     expect((await db.query(`SELECT id FROM users WHERE role = 'tenant'`)).rows).toEqual([])
   })
 
@@ -389,5 +392,68 @@ describe('onboarding late in the month', () => {
     const w = res.body.data.find((x: any) => x.propertyId === f.propertyId)
     expect(typeof w.lateInMonth).toBe('boolean')
     expect(w.nextRentDueDate).toMatch(/^\d{4}-\d{2}-01$/)
+  })
+})
+
+// Final sweep (10/3): a whole-unit household bigger than one lease holds reads
+// the same on the CSV check, the roster and the invite, with the one step that
+// works. "Draft that lease by hand" was a dead end: no lease GAM drafts holds
+// more than ROSTER_MAX_HOUSEHOLD people (Send Document's fifth signer,
+// co_tenant_4, is refused).
+describe('a household bigger than one lease holds', () => {
+  const validate = (f: F, csv: string) => request(buildApp())
+    .post('/api/landlords/me/onboard-tenants-csv/validate')
+    .set('Authorization', `Bearer ${f.token}`)
+    .send({ csv, source: 'generic' })
+  const five = (f: F) => csvOf(f, [1, 2, 3, 4, 5].map(i =>
+    [`P${i}`, 'Big', em(`big${i}`), 'Apt 01'] as [string, string, string, string]))
+
+  it('the CSV check says it on the row that goes over, with a step that works and no "by hand"', async () => {
+    const { ROSTER_MAX_HOUSEHOLD } = await import('@gam/shared')
+    const f = await fixture()
+    const res = await validate(f, five(f))
+    expect(res.status).toBe(200)
+    const msgs = (res.body.data.rows as any[]).map(r =>
+      (r.issues as any[]).filter(i => /on one lease/.test(i.message)).map(i => i.message))
+    expect(msgs.slice(0, ROSTER_MAX_HOUSEHOLD).flat()).toEqual([])
+    expect(msgs[ROSTER_MAX_HOUSEHOLD]).toEqual([
+      `Unit Apt 01 has more than ${ROSTER_MAX_HOUSEHOLD} people on one lease; a lease holds up to ${ROSTER_MAX_HOUSEHOLD}. ` +
+      'Move someone to another unit. Pick their new unit on the review screen.'])
+    expect(JSON.stringify(res.body.data.rows)).not.toMatch(/by hand|drafts itself/)
+  })
+
+  it('the roster names the same limit in the same words, and confirm is refused', async () => {
+    const { ROSTER_MAX_HOUSEHOLD } = await import('@gam/shared')
+    const f = await fixture()
+    expect((await saveDraft(f, five(f))).status).toBe(200)
+    const r = await roster(f)
+    const apt1 = r.body.data.units.find((u: any) => u.unitNumber === 'Apt 01')
+    expect(apt1.blockers).toContain(
+      `Unit Apt 01 has 5 people on one lease; a lease holds up to ${ROSTER_MAX_HOUSEHOLD}. Move someone to another unit.`)
+    const c = await confirm(f)
+    expect(c.status).toBe(409)
+    expect((await db.query(`SELECT id FROM lease_documents`)).rows).toEqual([])
+  })
+
+  it('a unit someone is already invited to points at the Pending Pool, where an invite is cancelled', async () => {
+    const f = await fixture()
+    await standardRoster(f)
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const u = await c.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ($1, 'x', 'tenant', 'Ivy', 'Invited', TRUE) RETURNING id`, [em('ivy')])
+      const t = await c.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.rows[0].id])
+      await c.query(
+        `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, property_id)
+         VALUES ($1,$2,'not_uploaded',$3,$4)`, [f.landlordId, t.rows[0].id, f.unitA, f.propertyId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const r = await roster(f)
+    const apt1 = r.body.data.units.find((u: any) => u.unitNumber === 'Apt 01')
+    expect(apt1.blockers).toContain(
+      'Unit Apt 01 already has Ivy Invited invited. Cancel that invite in Tenant Onboarding (Pending Pool), or move these people.')
+    expect(apt1.blockers.join(' ')).not.toMatch(/Front Desk/)
   })
 })

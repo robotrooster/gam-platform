@@ -18,6 +18,10 @@
  *   - deposits are a HELD LIABILITY, never income
  *   - GAM's platform and float fees are GAM's revenue, not the landlord's
  *   - expenses = platform fee + maintenance + lot rent + entered expenses
+ *   - S655: "Money received" (default) counts money on the day it arrived —
+ *     paid-ahead money the day it arrives, $0 when it pays a later bill; a
+ *     credit the landlord gave is never income. "Money billed" counts bills
+ *     by due date. `basis` picks, exactly like the reports page's switch.
  *
  * WHAT IT CANNOT KNOW: an expense the landlord never entered. A portfolio with
  * no expenses on file will show net = income, and the reply says so rather than
@@ -26,6 +30,7 @@
  * Hard-scoped to actor.profileId. Read-only.
  */
 
+import { INCOME_BASES } from '@gam/shared'
 import { computeLandlordPL } from '../../landlordPL'
 import { periodMonths } from '../../platformFee'
 import type { AgentTool, AgentActor } from './types'
@@ -51,6 +56,7 @@ export const getProfitAndLoss: AgentTool = {
       ...COMPANY_PARAM,
       year: { type: 'integer', description: 'Calendar year (default: this year).' },
       month: { type: 'integer', description: 'Month 1-12 for a single month. Omit for the whole year.' },
+      basis: { type: 'string', enum: [...INCOME_BASES], description: "'received' (default): money by the day it arrived; 'billed': bills by the month they were due." },
     },
   },
   audiences: ['landlord'],
@@ -76,7 +82,10 @@ export const getProfitAndLoss: AgentTool = {
     // the account names which when it owns several.
     const company = await resolveActorCompany(actor, (args as any).company)
     if (!company.ok) return { ok: false, error: company.error }
-    const pl = await computeLandlordPL(company.landlordId, start, end, periodMonths(year, month))
+    // S655: an unknown basis falls back to the default rather than failing the answer.
+    const basis = (INCOME_BASES as readonly string[]).includes(String((args as any).basis))
+      ? (String((args as any).basis) as typeof INCOME_BASES[number]) : 'received'
+    const pl = await computeLandlordPL(company.landlordId, start, end, periodMonths(year, month), basis)
 
     const noExpensesEntered = pl.expenses.enteredExpenses === 0
 
@@ -94,7 +103,12 @@ export const getProfitAndLoss: AgentTool = {
         otherIncome: money(pl.gross.otherIncome),
         other: money(pl.gross.other),
         total: money(pl.gross.total),
+        // S655: every line on its own (paid ahead, register sales, credits
+        // given, returned...), labeled as the reports page labels them.
+        lines: pl.lineItems,
       },
+      basis: pl.basis.label,
+      basisNote: pl.basis.note,
       expenses: {
         gamPlatformFee: money(pl.expenses.platformFee),
         maintenance: money(pl.expenses.maintenance),

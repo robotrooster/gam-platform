@@ -60,6 +60,11 @@ export async function unpaidHoldsOn(
         AND b.status = 'tentative'
         AND b.deposit_paid_at IS NULL
         AND b.displaced_at IS NULL
+        -- 10/3 (review): only an UNTIMED hold yields (S652: "an unpaid hold has
+        -- no timer"). A timed hold is a guest in the middle of paying online —
+        -- moving it would let their money land with nothing recorded; an
+        -- expired one is already gone and must not trigger a "site changed".
+        AND b.hold_expires_at IS NULL
         AND b.check_in < $3::date AND b.check_out > $2::date
       FOR UPDATE OF b`,
     [unitId, checkIn, checkOut])
@@ -118,6 +123,53 @@ export interface DisplacementOutcome {
   fromUnitNumber: string
   /** They had asked to be pinned to that exact site. Worth a human knowing. */
   wasLocked: boolean
+  /**
+   * 10/2 (review): a hold that was CANCELLED for want of a site had its unpaid
+   * pay link(s) closed with it — there is no reservation left to pay for.
+   * Never true for a hold that was moved (decisions #12).
+   */
+  linkClosed: boolean
+  /**
+   * 10/3 (decisions #12): a hold that was MOVED keeps its unpaid pay link — it
+   * pays the same booking, now on the new site. True when one is still out.
+   */
+  linkKept?: boolean
+}
+
+/**
+ * 10/2 (review): a hold CANCELLED for want of a site loses its unpaid pay link
+ * too — there is no reservation left for it to pay for, and paid, it would be
+ * money for a site somebody else now has. The link is closed (kept, never
+ * deleted), and a card page the guest may already have open is closed at
+ * Stripe too — a payment that lands anyway is handled when it arrives
+ * (finalizePayLink tells the landlord). Its register ticket gives up its stay:
+ * a ticket that carried only the stay is voided; one that also carries other
+ * things (a tank of propane held on it) stays open for those
+ * (registerStay releaseReservationTickets).
+ *
+ * 10/3 (decisions #12): a hold that was MOVED is not touched here. It is the
+ * same booking on another site — its link pays it (at the reservation's own
+ * price, read when the link is paid) and its ticket settles it.
+ */
+async function closeHoldPayment(client: PoolClient, hold: UnpaidHold): Promise<boolean> {
+  const closed = await client.query<{ id: string; landlord_id: string; last_checkout_session_id: string | null }>(
+    `UPDATE pos_pay_links SET status = 'cancelled', updated_at = NOW()
+      WHERE booking_id = $1 AND status = 'open'
+      RETURNING id, landlord_id, last_checkout_session_id`, [hold.id])
+  const { releaseReservationTickets } = await import('./registerStay')
+  await releaseReservationTickets(client, hold.id, 'The reservation lost its site to a guest who paid first')
+  for (const l of closed.rows) {
+    if (!l.last_checkout_session_id) continue
+    try {
+      const { expirePayLinkCheckoutSession } = await import('./stripeConnect')
+      await expirePayLinkCheckoutSession(l.landlord_id, l.last_checkout_session_id)
+    } catch (e) {
+      // Already paid or already gone: a payment that lands anyway is caught
+      // when it arrives (routes/posPayLinks finalizePayLink).
+      logger.warn({ err: e, payLinkId: l.id, holdId: hold.id }, '[hold-displacement] could not close the pay link\'s card page')
+    }
+  }
+  return closed.rows.length > 0
 }
 
 /**
@@ -142,7 +194,18 @@ export async function clearUnpaidHolds(
   const out: DisplacementOutcome[] = []
   const taken: string[] = []
   for (const hold of holds) {
-    const dest = await equivalentSiteFor(client, hold, taken)
+    // 10/3 (review): take the destination's booking lock (the same key
+    // createStayBooking takes) and re-check it is free, so a register selling
+    // that site at the same instant can never end up sharing it with the moved
+    // hold. A destination lost to the race is skipped for the next candidate.
+    let dest = await equivalentSiteFor(client, hold, taken)
+    while (dest) {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('unit-booking:' || $1::text))`, [dest.id])
+      const { siteIsFree } = await import('./registerStay')
+      if (await siteIsFree(client, dest.id, hold.check_in, hold.check_out)) break
+      taken.push(dest.id)
+      dest = await equivalentSiteFor(client, hold, taken)
+    }
     if (dest) {
       taken.push(dest.id)
       await client.query(
@@ -151,10 +214,30 @@ export async function clearUnpaidHolds(
                 displaced_reason = $4, updated_at = NOW()
           WHERE id = $1`,
         [hold.id, dest.id, hold.unit_id, `${reason} — moved to ${dest.unit_number}`])
+      // 10/3 (review): a long stay drafts its lease alongside the booking
+      // (services/bookingLeaseDraft). Still unsigned paperwork ('pending' or
+      // 'draft'), it follows the booking to the new site — never left naming a
+      // site the guest is no longer on, or the site a paying guest now has. A
+      // signed (active) lease is never touched here.
+      // (Its unit history says it moves on its start day, or today if that has
+      // passed — the move-date column the history trigger reads.)
+      await client.query(
+        `UPDATE leases SET unit_id = $2, unit_moved_on = GREATEST(start_date, CURRENT_DATE), updated_at = NOW()
+          WHERE source_booking_id = $1 AND status IN ('pending', 'draft') AND unit_id IS DISTINCT FROM $2`, [hold.id, dest.id])
+      // decisions #12: its pay link stays open — it pays the same booking, now
+      // on the new site. Its register ticket says where they are now.
+      const kept = await client.query(
+        `SELECT 1 FROM pos_pay_links WHERE booking_id = $1 AND status = 'open' LIMIT 1`, [hold.id])
+      await client.query(
+        `UPDATE pos_open_tickets
+            SET note = TRIM(BOTH ' ·' FROM COALESCE(note, '') || ' · ' || $2), updated_at = NOW()
+          WHERE booking_id = $1 AND status = 'open'`,
+        [hold.id, `moved to site ${dest.unit_number} (a paid reservation took site ${hold.unit_number})`])
       out.push({
         holdId: hold.id, guestName: hold.guest_name, guestEmail: hold.guest_email,
         guestPhone: hold.guest_phone, outcome: 'moved', toUnitId: dest.id, toUnitNumber: dest.unit_number,
-        fromUnitNumber: hold.unit_number, wasLocked: hold.locked_to_unit,
+        fromUnitNumber: hold.unit_number, wasLocked: hold.locked_to_unit, linkClosed: false,
+        linkKept: kept.rows.length > 0,
       })
     } else {
       // Nothing free anywhere. They lose the site — recorded, never deleted
@@ -165,9 +248,18 @@ export async function clearUnpaidHolds(
                 displaced_reason = $2, updated_at = NOW()
           WHERE id = $1`,
         [hold.id, `${reason} — the property had nothing else free for those dates`])
+      // 10/3 (review): a cancelled reservation takes its unsigned lease with it
+      // — exactly as cancelling it on the schedule does (routes/units PATCH
+      // bookings, S639): 'pending' and 'draft' are terminated; a signed
+      // (active) lease is never touched.
+      await client.query(
+        `UPDATE leases SET status = 'terminated', updated_at = NOW()
+          WHERE source_booking_id = $1 AND status IN ('pending', 'draft')`, [hold.id])
+      const linkClosed = await closeHoldPayment(client, hold)
       out.push({
         holdId: hold.id, guestName: hold.guest_name, guestEmail: hold.guest_email,
         guestPhone: hold.guest_phone, outcome: 'displaced', fromUnitNumber: hold.unit_number, wasLocked: hold.locked_to_unit,
+        linkClosed,
       })
     }
   }
@@ -211,7 +303,8 @@ export async function notifyDisplacedHolds(
         title: `${who} moved to site ${o.toUnitNumber}`,
         body: `${who} was holding site ${o.fromUnitNumber} without a deposit and a paid reservation took it. `
           + `They are now on ${o.toUnitNumber}, free for their whole stay.`
-          + (o.wasLocked ? ' They had asked to be pinned to the original site — worth a call.' : ''),
+          + (o.wasLocked ? ' They had asked to be pinned to the original site — worth a call.' : '')
+          + (o.linkKept ? ` Their pay link still works — it now pays for site ${o.toUnitNumber}; nothing to resend.` : ''),
       }).catch(() => {})
       if (o.guestEmail) {
         await emailBookingSiteChanged(
@@ -227,9 +320,10 @@ export async function notifyDisplacedHolds(
         type: 'booking_displaced',
         title: `${who} lost site ${o.fromUnitNumber} — call them`,
         body: `${who} was holding site ${o.fromUnitNumber} without a deposit, a paid reservation took it, `
-          + `and ${propName} had nothing else free for those dates. Their reservation is cancelled. `
+          + `and ${propName} had nothing else free for those dates. Their reservation is canceled. `
           + `They have NOT been emailed — this one needs a phone call`
-          + (o.guestPhone ? `: ${o.guestPhone}.` : ', and no phone number was taken.'),
+          + (o.guestPhone ? `: ${o.guestPhone}.` : ', and no phone number was taken.')
+          + (o.linkClosed ? ' Their unpaid pay link was closed, so it can no longer be paid.' : ''),
       }).catch(() => {})
     }
   }

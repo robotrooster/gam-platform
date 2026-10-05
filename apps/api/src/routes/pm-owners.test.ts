@@ -6,7 +6,7 @@
  * about who is refused. The rest holds the one rule Nic stated as a directive:
  * a manager can let an owner in and cannot keep them out.
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
@@ -322,5 +322,54 @@ describe('what an owner reads for themselves', () => {
       .get('/api/pm/my-statements')
       .set('Authorization', `Bearer ${staff.token}`)
     expect(res.status).toBe(403)
+  })
+})
+
+// S655: a statement with no month named is THIS month by GAM's home calendar
+// (Phoenix). The UTC date turns over at 5 pm here, so on the evening of the
+// last day the old default showed next month's empty statement.
+describe('the statement month', () => {
+  it('defaults to the Phoenix month, not the UTC one', async () => {
+    const o = await managedOwner()
+    const staff = await pmStaffUser()
+    await makeStaff(o.pmCompanyId, staff.userId)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    // 8 pm on Sept 30 in Phoenix is already Oct 1 in UTC.
+    vi.setSystemTime(new Date('2026-10-01T03:00:00Z'))
+    try {
+      const res = await request(buildApp())
+        .get(`/api/pm/companies/${o.pmCompanyId}/owners/${o.landlordId}/statement`)
+        .set('Authorization', `Bearer ${staff.token}`)
+      expect(res.status).toBe(200)
+      expect(res.body.data.periodMonth).toBe('2026-09-01')
+      const mine = await request(buildApp())
+        .get('/api/pm/my-statements')
+        .set('Authorization', `Bearer ${o.ownerToken}`)
+      expect(mine.status).toBe(200)
+      for (const s of mine.body.data) expect(s.statement.periodMonth).toBe('2026-09-01')
+    } finally { vi.useRealTimers() }
+  })
+
+  it('refuses a month that is not a month, in plain words', async () => {
+    const o = await managedOwner()
+    const staff = await pmStaffUser()
+    await makeStaff(o.pmCompanyId, staff.userId)
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${o.pmCompanyId}/owners/${o.landlordId}/statement?month=September`)
+      .set('Authorization', `Bearer ${staff.token}`)
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/YYYY-MM/)
+  })
+
+  it('the statement carries the gross split and the billed block', async () => {
+    const o = await managedOwner()
+    const staff = await pmStaffUser()
+    await makeStaff(o.pmCompanyId, staff.userId)
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${o.pmCompanyId}/owners/${o.landlordId}/statement?month=2026-08`)
+      .set('Authorization', `Bearer ${staff.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.totals).toMatchObject({ collectedThroughGam: 0, collectedDirectly: 0 })
+    expect(res.body.data.totals.billed).toEqual({ billed: 0, collectedSoFar: 0, clearing: 0, stillOwed: 0 })
   })
 })

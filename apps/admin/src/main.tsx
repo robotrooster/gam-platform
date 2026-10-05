@@ -28,7 +28,7 @@ import {
 } from 'lucide-react'
 import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
-import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch, FLEXPAY_TERMS } from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
 import { RentVolumeMonitor } from './components/RentVolumeMonitor'
 
@@ -535,7 +535,7 @@ function AdminOnboardingOverview(){
                       <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{t.firstName} {t.lastName}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{t.email}</div></td>
                       <td style={{fontSize:'.72rem'}}>{t.propertyName?`${t.propertyName} · ${t.unitNumber}`:<span style={{color:'var(--t3)'}}>—</span>}</td>
                       <td><span className={`badge ${t.achVerified?'bg2':'br'}`}>{t.achVerified?'✓':'No'}</span></td>
-                      <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'Active':'None'}</span></td>
+                      <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.flexpayEnrolled)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.flexpayEnrolled)?'Active':'None'}</span></td>
                     </tr>
                   ))}
                 </tbody>
@@ -1042,6 +1042,234 @@ function AgentAnalytics(){
 const INCOME_COLORS:Record<string,string>={platform_unit:'#c9a227',processing:'#3b82f6',flexpay:'#22c55e',flex_deposit:'#ec4899',flex_credit:'#eab308',business_pos:'#06b6d4',placement:'#f97316',instant_withdrawal:'#14b8a6',background_checks:'#e10600'}
 const incomeColorOf=(k:string)=>INCOME_COLORS[k]||'#94a3b8'
 
+// ── 10/3 (Nic): the two admin money cards ──────────────────────────────────
+// Server shapes: GET /admin/platform-balance and GET /admin/processing-margin
+// (+ /payments?month=). The API camelizes, so everything here is camelCase.
+
+const money=(n:number|null|undefined)=>n==null?'—':formatCurrency(n)
+
+/** GAM's own money: what is GAM's, what sits beside it, and the check against GAM's records. */
+function GamsOwnMoneyCard({bal}:{bal:any}){
+  const[showCheck,setShowCheck]=useState(false)
+  const r=bal.reconciliation
+  const c=bal.clearing||{}
+  const gap=r?.gap
+  const ties=gap!=null&&Math.abs(gap)<0.005
+  return(
+    <div className="kpi"><div className="kl">GAM's Own Money</div>
+      <div className="kv g">{money(bal.gamsOwn)}</div>
+      <div className="ks">{bal.gamsOwn==null?'Stripe could not be read just now, so the balance cannot be split — try again in a moment':'earned, and on the Stripe balance now'}</div>
+      {(bal.checkrHeld||0)>0&&<div className="ks" style={{marginTop:4}}>Background-check money held for Checkr: <strong style={{color:'var(--t1)'}}>{money(bal.checkrHeld)}</strong></div>}
+      {(c.gamTotal||0)>0&&<div className="ks" style={{marginTop:2}}>GAM's money still clearing: <strong style={{color:'var(--t1)'}}>{money(c.gamTotal)}</strong> — counted once it clears
+        <div style={{fontSize:'.68rem',color:'var(--t3)'}}>{[
+          (c.gamOnBalance||0)>0||(c.stripeTook||0)>0?`${money(c.gamOnBalance||0)} of it on the balance now, after Stripe's ${money(c.stripeTook||0)} cut`:null,
+          (c.gamNotYetOnBalance||0)>0?`${money(c.gamNotYetOnBalance)} not on the balance yet`:null,
+        ].filter(Boolean).join(' · ')}</div>
+      </div>}
+      {r&&<div className="ks" style={{marginTop:6,color:ties?'var(--green)':'var(--amber)'}}>
+        {ties?'Matches GAM’s records to the cent'
+          :gap>0?`The balance holds ${money(gap)} more than GAM’s records say (${money(r.book)})`
+          :`The balance is ${money(-gap)} short of what GAM’s records say (${money(r.book)})`}
+      </div>}
+      <div className="ks" style={{marginTop:2}}>book: {money(bal.revenueThisMonth||0)} earned this month, {money(bal.revenueAllTime||0)} all time{(bal.owedByLandlordsUncollected||0)>0?` — ${money(bal.owedByLandlordsUncollected)} of that still owed by landlords`:''}</div>
+      {r&&<button className="btn btn-primary btn-sm" style={{marginTop:8}} onClick={()=>setShowCheck(v=>!v)}>{showCheck?'Hide the check':'Show the check'}</button>}
+      {r&&showCheck&&<div style={{marginTop:8}}>
+        <div className="dr"><span className="dk">Bank and card fees on payments that cleared</span><span className="dv mono">{money(r.collectedParts?.processingFees)}</span></div>
+        <div className="dr"><span className="dk">Register and pay-link card fees</span><span className="dv mono">{money(r.collectedParts?.registerCardFees)}</span></div>
+        <div className="dr"><span className="dk">Background checks — GAM's part</span><span className="dv mono">{money(r.collectedParts?.screeningKept)}</span></div>
+        <div className="dr"><span className="dk">GAM fees collected from landlords</span><span className="dv mono">{money(r.collectedParts?.landlordChargesCollected)}</span></div>
+        {(r.collectedParts?.flexpayKept||0)!==0&&<div className="dr"><span className="dk">FlexPay fees</span><span className="dv mono">{money(r.collectedParts?.flexpayKept)}</span></div>}
+        {(r.collectedParts?.sweptIn||0)!==0&&<div className="dr"><span className="dk">August test payments kept by GAM</span><span className="dv mono">{money(r.collectedParts?.sweptIn)}</span></div>}
+        {(r.collectedParts?.keptFeesRecovered||0)!==0&&<div className="dr"><span className="dk">Stripe's fees on refunded held payments, taken back from landlords</span><span className="dv mono">{money(r.collectedParts?.keptFeesRecovered)}</span></div>}
+        {(r.collectedParts?.stayDepositFees||0)!==0&&<div className="dr"><span className="dk">Card fees on stay deposits paid online</span><span className="dv mono">{money(r.collectedParts?.stayDepositFees)}</span></div>}
+        {(r.collectedParts?.businessPaymentFees||0)!==0&&<div className="dr"><span className="dk">GAM's cut of business invoice and register card payments</span><span className="dv mono">{money(r.collectedParts?.businessPaymentFees)}</span></div>}
+        {(r.collectedParts?.businessInvoicingFees||0)!==0&&<div className="dr"><span className="dk">Business invoicing fees collected</span><span className="dv mono">{money(r.collectedParts?.businessInvoicingFees)}</span></div>}
+        {(r.collectedParts?.tenantPaidPlatformFees||0)!==0&&<div className="dr"><span className="dk">Platform fees properties pass to tenants, paid with rent</span><span className="dv mono">{money(r.collectedParts?.tenantPaidPlatformFees)}</span></div>}
+        {(r.gamOwnedBillLinesByKind||[]).map((b:any)=>(
+          <div key={b.kind} className="dr"><span className="dk">{b.label}</span><span className="dv mono">{money(b.amount)}</span></div>
+        ))}
+        <div className="dr"><span className="dk">Collected</span><span className="dv mono">{money(r.collected)}</span></div>
+        {(r.takenBack?.feesGivenBack||0)!==0&&<div className="dr"><span className="dk">Less fees on top given back to payers in disputes</span><span className="dv mono">−{money(r.takenBack.feesGivenBack)}</span></div>}
+        {(r.takenBack?.feesChargedToLandlords||0)!==0&&<div className="dr"><span className="dk">Fees on disputed payments, charged to landlords' payouts</span><span className="dv mono">{money(r.takenBack.feesChargedToLandlords)}</span></div>}
+        {(r.takenBack?.feesOwedBackOnWins||0)!==0&&<div className="dr"><span className="dk">Less those fees owed back to landlords on disputes GAM won</span><span className="dv mono">−{money(r.takenBack.feesOwedBackOnWins)}</span></div>}
+        {(r.takenBack?.chargebackFeesFromPayees||0)!==0&&<div className="dr"><span className="dk">Dispute fees on register sales, stay deposits and business payments, charged to the landlord or business</span><span className="dv mono">{money(r.takenBack.chargebackFeesFromPayees)}</span></div>}
+        {(r.takenBack?.gamLinesTakenBack||0)!==0&&<div className="dr"><span className="dk">Less GAM's own bill lines taken back in disputes (billed to the tenant again)</span><span className="dv mono">−{money(r.takenBack.gamLinesTakenBack)}</span></div>}
+        {(r.takenBack?.rentNotRepaid||0)!==0&&<div className="dr"><span className="dk">Less rent and bills taken back in disputes that landlords have not repaid yet</span><span className="dv mono">−{money(r.takenBack.rentNotRepaid)}</span></div>}
+        <div className="dr"><span className="dk">Less what Stripe charged GAM (bank feeds and sales tax included)</span><span className="dv mono">−{money((r.stripeCosts||0)+(r.stripeCostsNotYetRecorded||0))}</span></div>
+        {(r.paidOutToGamBank||0)>0&&<div className="dr"><span className="dk">Less paid out to GAM's own bank</span><span className="dv mono">−{money(r.paidOutToGamBank)}</span></div>}
+        {(r.flexpayFronted||0)>0&&<div className="dr"><span className="dk">Less FlexPay rent covered, not yet repaid</span><span className="dv mono">−{money(r.flexpayFronted)}</span></div>}
+        <div className="dr"><span className="dk">GAM's records say</span><span className="dv mono">{money(r.book)}</span></div>
+        <div className="dr"><span className="dk">The Stripe balance says</span><span className="dv mono">{money(r.onBalance)}</span></div>
+        <div className="dr"><span className="dk">Difference</span><span className="dv mono" style={{color:ties?'var(--green)':'var(--amber)'}}>{money(gap)}</span></div>
+        <div className="ks" style={{marginTop:6}}>Not in this check: money a tenant's payment carried toward an older FlexDeposit or FlexCharge balance, and what GAM has paid Checkr. The Checkr line is every background check applicants paid that was not refunded — once GAM pays Checkr, that line reads high and GAM's own reads low by what was paid. A dispute GAM wins puts the money back on the balance: the fee on top in it is counted here (and what the landlords were charged for it is owed back to them), but GAM's records do not undo the rent part of the dispute yet, so that part reads as a difference of its amount.</div>
+        <div className="ks" style={{marginTop:4}}>Not in the earnings book one by one yet: card fees on stay deposits paid online and GAM's cut of business payments are counted in this check, but reach the earnings book only through the nightly processing true-up; businesses' invoicing fees are not in the earnings book at all yet.</div>
+      </div>}
+    </div>)
+}
+
+/** Everything on the balance that is not GAM's own (or not GAM's yet). */
+function NotGamsMoneyCard({bal}:{bal:any}){
+  const c=bal.clearing||{}
+  const total=bal.onBalance!=null&&bal.gamsOwn!=null?bal.onBalance-bal.gamsOwn
+    :(bal.owedToLandlords||0)+(bal.depositsInTrust||0)+(bal.managerPmCutsOwed||0)+(bal.paidAheadHeld||0)+(bal.checkrHeld||0)+(bal.heldPayLinkPayments||0)+(c.netOnBalance||0)
+  return(
+    <div className="kpi"><div className="kl">Not GAM's (or not GAM's yet)</div>
+      <div className="kv gold">{money(total)}</div>
+      <div className="ks">{money(bal.owedToLandlords||0)} owed to landlords</div>
+      {(bal.reconciliation?.takenBack?.chargebacksOwedBackOnWins||0)>0&&<div className="ks">{money(bal.reconciliation.takenBack.chargebacksOwedBackOnWins)} of that came back on chargebacks GAM won — the landlord or business repaid it, so it goes back on their payout</div>}
+      {(c.landlordsOnBalance||0)>0&&<div className="ks">{money(c.landlordsOnBalance)} landlords' bank payments still clearing{(c.landlordsNotYetOnBalance||0)>0?` (+${money(c.landlordsNotYetOnBalance)} more on the way, not on the balance yet)`:''}</div>}
+      {(c.businessesOnBalance||0)>0&&<div className="ks">{money(c.businessesOnBalance)} businesses' invoice bank payments still clearing</div>}
+      {(c.unrecorded?.count||0)>0&&<div className="ks" style={{color:'var(--amber)'}}>{money(c.unrecorded.netOnBalance)} in {c.unrecorded.count} bank payment{c.unrecorded.count===1?'':'s'} still clearing that GAM's records do not list — not counted as GAM's</div>}
+      {(c.gamOnBalance||0)>0.004&&<div className="ks">{money(c.gamOnBalance)} of GAM's own money still clearing (after Stripe's cut) — not counted until it clears</div>}
+      {(bal.checkrHeld||0)>0&&<div className="ks">{money(bal.checkrHeld)} background-check money held for Checkr</div>}
+      {(bal.heldPayLinkPayments||0)>0&&<div className="ks">{money(bal.heldPayLinkPayments)} pay-link payments held until the landlord decides on a refund (paid twice or at the wrong amount)</div>}
+      {(bal.depositsInTrust||0)>0&&<div className="ks">{money(bal.depositsInTrust)} tenant deposits in trust</div>}
+      {(bal.managerPmCutsOwed||0)>0&&<div className="ks">{money(bal.managerPmCutsOwed)} owed to managers and PM companies</div>}
+      {(bal.paidAheadHeld||0)>0&&<div className="ks">{money(bal.paidAheadHeld)} paid ahead by tenants, held for later bills</div>}
+      <div className="ks" style={{marginTop:4}}>Stripe: {money(bal.stripeAvailable)} available, {money(bal.stripePending)} not yet available</div>
+    </div>)
+}
+
+/** What GAM keeps on processing, month by month and payment by payment. */
+function ProcessingMarginCard({m}:{m:any}){
+  const[showList,setShowList]=useState(false)
+  const{data:detail,isLoading}=useQuery(['processing-margin-payments',m.month],
+    ()=>get<any>(`/admin/processing-margin/payments?month=${m.month}`),{enabled:showList,staleTime:60000})
+  const cl=m.clearing||{count:0}
+  const back=m.feesBack||{total:0,byKind:[]}
+  const early=m.clearingEarlier||{count:0}
+  const other=m.otherClearing||{count:0}
+  // 10/3 (review): Stripe's days as "Oct 3", listed in words.
+  const estimateDays=(m.estimateDays||[]).map((d:string)=>new Date(`${d}T12:00:00Z`).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'}))
+  const estimateDaysWords=estimateDays.length<=1?(estimateDays[0]||''):`${estimateDays.slice(0,-1).join(', ')} and ${estimateDays[estimateDays.length-1]}`
+  const rows:any[]=detail?.payments||[]
+  const backItems:any[]=detail?.feesBack?.items||[]
+  const backTotal=Number(detail?.feesBack?.total)||0
+  const cleared=rows.filter(p=>!p.clearing)
+  const sum=(xs:any[],k:string)=>Math.round(xs.reduce((a,p)=>a+(Number(p[k])||0),0)*100)/100
+  return(
+    <div className="card" style={{marginBottom:12}}>
+      <div className="ct" style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+        <span>Processing Margin · {m.month}</span>
+        <span style={{fontSize:'.7rem',color:'var(--t3)',textTransform:'none',letterSpacing:0}}>what payers paid GAM in processing fees, minus what Stripe charged GAM</span>
+      </div>
+      <div style={{display:'flex',gap:28,flexWrap:'wrap',alignItems:'flex-end',margin:'10px 0 16px'}}>
+        <div>
+          <div className="kl">Fee revenue</div>
+          <div className="kv" style={{fontSize:'1.5rem'}}>{money(m.feeRevenue)}</div>
+          <div className="ks">on payments that cleared</div>
+        </div>
+        <div>
+          <div className="kl">Stripe took</div>
+          <div className="kv r" style={{fontSize:'1.5rem'}}>−{money(m.stripeCost)}</div>
+          {(m.bankFeedCost||0)>0&&<div className="ks">includes {money(m.bankFeedCost)} for landlords' bank feeds</div>}
+          {(m.estimatedCost||0)>0&&<div className="ks" style={{color:'var(--amber)'}}>includes {money(m.estimatedCost)} estimate until Stripe posts</div>}
+        </div>
+        <div>
+          <div className="kl">We keep</div>
+          <div className="kv gold" style={{fontSize:'1.9rem'}}>{money(m.margin)}</div>
+          {m.marginPct!==null&&<div className="ks">{m.marginPct}% of fees charged</div>}
+          {back.total!==0&&<div className="ks">{back.total>0?'includes':'after'} {money(Math.abs(back.total))} {back.total>0?'back from':'lost to'} disputes and returned payments</div>}
+        </div>
+      </div>
+      {(cl.count>0||early.count>0||other.count>0)&&<div className="alert aw" style={{marginBottom:12}}>
+        {cl.count>0&&<div>Still clearing: {cl.count} bank payment{cl.count===1?'':'s'} made this month ({money(cl.amount)}), {money(cl.fees)} of fees, Stripe's cut {money(cl.stripeCost)}.</div>}
+        {early.count>0&&<div>Still clearing from earlier months: {early.count} bank payment{early.count===1?'':'s'} ({money(early.amount)}), {money(early.fees)} of fees, Stripe's cut {money(early.stripeCost)}.</div>}
+        {other.count>0&&<div>Also still clearing: {other.count} other bank payment{other.count===1?'':'s'} (a FlexPay pull, a GAM fee charged on its own, or a business invoice paid by bank), Stripe's cut {money(other.stripeCost)}.</div>}
+        <div>Not counted above until {cl.count+early.count+other.count===1?'it clears':'they clear'} — each counts in the month it clears.</div>
+      </div>}
+      {(m.estimatedCost||0)>0&&<div className="ks" style={{marginBottom:10}}>
+        Stripe posts each day's card costs the next day (its days run on UTC time). Card payments on {estimateDaysWords} are estimated at {m.estimateRateLabel||'a card cost rate'} until it does.
+      </div>}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:20}}>
+        <div>
+          <div className="kl" style={{marginBottom:6}}>Charged to payers</div>
+          {(m.byRail||[]).map((r:any)=>(
+            <div key={r.rail} className="dr">
+              <span className="dk">{r.label} · {r.count}</span>
+              <span className="dv mono">{money(r.charged)}</span>
+            </div>
+          ))}
+        </div>
+        <div>
+          <div className="kl" style={{marginBottom:6}}>What Stripe charged us</div>
+          {(m.byCategory||[]).map((c:any)=>(
+            <div key={c.category} className="dr">
+              <span className="dk">{c.label}</span>
+              <span className="dv mono">{money(c.amount)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      {(back.byKind||[]).length>0&&<div style={{marginTop:14}}>
+        <div className="kl" style={{marginBottom:6}}>Disputes and returned payments</div>
+        {(back.byKind||[]).map((k:any)=>(
+          <div key={k.kind} className="dr">
+            <span className="dk">{k.label} · {k.count}</span>
+            <span className="dv mono">{k.amount<0?'−':'+'}{money(Math.abs(k.amount))}</span>
+          </div>
+        ))}
+        <div className="ks" style={{marginTop:4}}>Stripe's own fee for a dispute or a returned payment is in what Stripe charged us. What came back for it — off a payout, or the fee billed to the tenant once paid — counts here, in the month it came back.</div>
+      </div>}
+      <button className="btn btn-primary btn-sm" style={{marginTop:12}} onClick={()=>setShowList(v=>!v)}>
+        {showList?'Hide each payment':'Show each payment'}
+      </button>
+      {showList&&(isLoading&&!detail?<div className="ks" style={{marginTop:10}}>Loading the month's payments…</div>:
+        <div style={{overflowX:'auto',marginTop:10}}>
+          <table className="tbl" style={{minWidth:760}}>
+            <thead><tr>
+              <th>Date</th><th>Who</th><th>Card or bank</th>
+              <th style={{textAlign:'right'}}>Paid</th><th style={{textAlign:'right'}}>Fee charged</th>
+              <th style={{textAlign:'right'}}>Stripe took</th><th style={{textAlign:'right'}}>GAM kept</th>
+            </tr></thead>
+            <tbody>
+              {rows.length===0&&backItems.length===0&&<tr><td colSpan={7} style={{color:'var(--t3)'}}>No payments this month.</td></tr>}
+              {rows.map((p:any)=>(
+                <tr key={`${p.kind}:${p.id}`} style={p.clearing?{opacity:.75}:undefined}>
+                  <td className="mono">{new Date(p.at).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'America/Phoenix'})}</td>
+                  <td>{p.who}{p.clearing&&<span className="badge ba" style={{marginLeft:6}}>Clearing</span>}{p.disputed&&<span className="badge ba" style={{marginLeft:6}}>{p.disputeWon?'Dispute won':'Disputed'}</span>}<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{p.kindLabel}</div></td>
+                  <td>{p.methodLabel}</td>
+                  <td className="mono" style={{textAlign:'right'}}>{money(p.amount)}</td>
+                  <td className="mono" style={{textAlign:'right'}}>
+                    {money(p.feeCharged)}
+                    {(p.feeGivenBack||0)>0&&<div style={{fontSize:'.62rem',color:'var(--t3)'}}>fee given back: {money(p.feeGivenBack)} (see Disputes)</div>}
+                  </td>
+                  <td className="mono" style={{textAlign:'right'}} title={p.costBasisLabel}>
+                    {money(p.stripeCost)}{p.costBasis==='estimate_unposted'&&<span className="badge ba" style={{marginLeft:6}}>Estimate</span>}
+                    {p.costBasis==='estimate_unposted'&&<div style={{fontSize:'.62rem',color:'var(--t3)'}}>until Stripe posts</div>}
+                    {p.costBasis==='day_share'&&<div style={{fontSize:'.62rem',color:'var(--t3)'}}>estimate · share of the day</div>}
+                  </td>
+                  <td className="mono" style={{textAlign:'right'}}>{money(p.gamKeeps)}</td>
+                </tr>
+              ))}
+              {(detail?.notTiedToAPayment||[]).map((c:any)=>(
+                <tr key={`not-tied:${c.category}`}>
+                  <td/><td colSpan={4} style={{color:'var(--t3)'}}>{c.label} — a Stripe charge not tied to one payment</td>
+                  <td className="mono" style={{textAlign:'right'}}>{money(c.amount)}</td>
+                  <td className="mono" style={{textAlign:'right'}}>−{money(c.amount)}</td>
+                </tr>
+              ))}
+              {backItems.map((f:any)=>(
+                <tr key={`back:${f.id}`}>
+                  <td className="mono">{new Date(f.at).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'America/Phoenix'})}</td>
+                  <td colSpan={4}>{f.who}<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{f.label}</div></td>
+                  <td/>
+                  <td className="mono" style={{textAlign:'right'}}>{f.amount<0?'−':'+'}{money(Math.abs(f.amount))}</td>
+                </tr>
+              ))}
+              {(rows.length>0||backItems.length>0)&&<tr>
+                <td/><td colSpan={3} style={{fontWeight:700,color:'var(--t0)'}}>Cleared this month — same as the card above</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700}}>{money(sum(cleared,'feeCharged'))}</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700}}>{money(Math.round((sum(cleared,'stripeCost')+(detail?.notTiedTotal||0))*100)/100)}</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700}}>{money(Math.round((sum(cleared,'feeCharged')-sum(cleared,'stripeCost')-(detail?.notTiedTotal||0)+backTotal)*100)/100)}</td>
+              </tr>}
+            </tbody>
+          </table>
+          <div className="ks" style={{marginTop:6}}>A bank payment shows Stripe's own fee on it. Stripe bills card costs only as each day's total, so a card payment's cost is an estimate: its share of that day's card costs, by size.</div>
+        </div>)}
+    </div>)
+}
+
 function Overview(){
   const{user}=useAuth()
   const navigate=useNavigate()
@@ -1178,13 +1406,11 @@ function Overview(){
         <div className="kpi"><div className="kl">Held for Landlords</div><div className="kv gold">{formatCurrency(stats?.heldForLandlords||0)}</div><div className="ks">collected, not yet paid out{(stats?.paymentsInFlight||0)>0?` · ${stats.paymentsInFlight} more in ACH flight (${formatCurrency(stats?.paymentsInFlightAmount||0)})`:''}</div></div>
         {/* S650 (Nic): "I want to see somewhere where our subscription to the
             platform fee and our card markups — where that money is pooling."
-            One Stripe balance holds three people's money; this is the split. */}
-        {isSuperAdmin&&bal&&<div className="kpi"><div className="kl">GAM's Own Money</div>
-          <div className="kv g">{bal.gamsOwn==null?'—':formatCurrency(bal.gamsOwn)}</div>
-          <div className="ks">cash on the balance after everyone else is paid · book: {formatCurrency(bal.revenueThisMonth||0)} earned this month, {formatCurrency(bal.revenueAllTime||0)} all time{(bal.owedByLandlordsUncollected||0)>0?` — ${formatCurrency(bal.owedByLandlordsUncollected)} of that still owed by landlords`:''}</div></div>}
-        {isSuperAdmin&&bal&&<div className="kpi"><div className="kl">Not GAM's</div>
-          <div className="kv gold">{formatCurrency((bal.owedToLandlords||0)+(bal.depositsInTrust||0))}</div>
-          <div className="ks">{formatCurrency(bal.owedToLandlords||0)} owed to landlords{(bal.depositsInTrust||0)>0?` · ${formatCurrency(bal.depositsInTrust)} tenant deposits in trust`:''} · Stripe: {bal.stripeAvailable==null?'—':formatCurrency(bal.stripeAvailable)} available, {formatCurrency(bal.stripePending||0)} still clearing</div></div>}
+            10/3 (Nic): the balance holds landlords' rent (some of it still
+            clearing), Checkr's background-check money, and GAM's own; each is
+            named, and GAM's own is checked against GAM's records to the cent. */}
+        {isSuperAdmin&&bal&&<GamsOwnMoneyCard bal={bal}/>}
+        {isSuperAdmin&&bal&&<NotGamsMoneyCard bal={bal}/>}
         <div className="kpi"><div className="kl">Pending Disbursements</div><div className={`kv ${(stats?.pendingDisbursements||0)>0?'a':'g'}`}>{stats?.pendingDisbursements||0}</div><div className="ks">landlord payouts queued</div></div>
       </div>}
 
@@ -1192,59 +1418,9 @@ function Overview(){
 
       {/* ── S642: WHAT WE KEEP ON PROCESSING ────────────────────────────────
           Nic: "I want to see our margin on that too… if they got charged a $26
-          fee, how much of that comes to us."
-          Month level, not per payment, and deliberately: the account is on
-          unbundled pricing so Stripe attributes NO cost to an individual charge
-          (fee = 0, fee_details = []) and bills the day's volume in aggregate.
-          Interchange varies by card type too. Per-payment would be invented. */}
-      {isSuperAdmin&&marginData.length>0&&(()=>{
-        const m:any=marginData[0]
-        return(
-        <div className="card" style={{marginBottom:12}}>
-          <div className="ct" style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
-            <span>Processing Margin · {m.month}</span>
-            <span style={{fontSize:'.7rem',color:'var(--t3)'}}>what tenants paid in fees, minus what Stripe charged us</span>
-          </div>
-          <div style={{display:'flex',gap:28,flexWrap:'wrap',alignItems:'flex-end',margin:'10px 0 16px'}}>
-            <div>
-              <div className="kl">Fee revenue</div>
-              <div className="kv" style={{fontSize:'1.5rem'}}>{formatCurrency(m.feeRevenue)}</div>
-            </div>
-            <div>
-              <div className="kl">Stripe took</div>
-              <div className="kv r" style={{fontSize:'1.5rem'}}>−{formatCurrency(m.stripeCost)}</div>
-              {/* S650: the bank-feed subscription is billed monthly whether or not
-                  anybody pays rent, so it sits beside the margin, not inside it. */}
-              {m.bankFeedCost>0&&<div className="ks">plus {formatCurrency(m.bankFeedCost)} bank feed (not processing)</div>}
-            </div>
-            <div>
-              <div className="kl">We keep</div>
-              <div className="kv gold" style={{fontSize:'1.9rem'}}>{formatCurrency(m.margin)}</div>
-              {m.marginPct!==null&&<div className="ks">{m.marginPct}% of fees charged</div>}
-            </div>
-          </div>
-          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:20}}>
-            <div>
-              <div className="kl" style={{marginBottom:6}}>Charged to tenants</div>
-              {m.byRail.map((r:any)=>(
-                <div key={r.rail} className="dr">
-                  <span className="dk">{r.rail==='ach'?'Bank transfer':r.rail==='card'?'Card':r.rail} · {r.count}</span>
-                  <span className="dv mono">{formatCurrency(r.charged)}</span>
-                </div>
-              ))}
-            </div>
-            <div>
-              <div className="kl" style={{marginBottom:6}}>What Stripe charged us</div>
-              {m.byCategory.map((c:any)=>(
-                <div key={c.category} className="dr">
-                  <span className="dk">{c.label}</span>
-                  <span className="dv mono">{formatCurrency(c.amount)}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>)
-      })()}
+          fee, how much of that comes to us." 10/3 ("Is that actually
+          accurate?"): every payment on GAM's balance, payment by payment. */}
+      {isSuperAdmin&&marginData.length>0&&<ProcessingMarginCard m={marginData[0]}/>}
       {isSuperAdmin&&<div className="grid2">
         <RentVolumeMonitor months={trendData} windowMonths={trendMonths} onWindowChange={setTrendMonths} />
         <div className="card">
@@ -2479,8 +2655,8 @@ function Tenants(){
   const{user}=useAuth()
   const{data:tenants=[],isLoading}=useQuery<any[]>('admin-tenants-page',()=>get('/admin/tenants'),{enabled:!!user,refetchOnWindowFocus:false})
   const sortedTenants=React.useMemo(()=>[...(tenants as any[])].sort((a,b)=>{
-    const aInc=(!a.achVerified||(!!a.creditReportingEnrolled&&!a.flexDepositEnrolled&&!a.floatFeeActive))?0:1
-    const bInc=(!b.achVerified||(!!b.creditReportingEnrolled&&!b.flexDepositEnrolled&&!b.floatFeeActive))?0:1
+    const aInc=(!a.achVerified||(!!a.creditReportingEnrolled&&!a.flexDepositEnrolled&&!a.flexpayEnrolled))?0:1
+    const bInc=(!b.achVerified||(!!b.creditReportingEnrolled&&!b.flexDepositEnrolled&&!b.flexpayEnrolled))?0:1
     return aInc-bInc
   }),[tenants])
   const[tSearch,setTSearch]=React.useState('')
@@ -2518,7 +2694,7 @@ function Tenants(){
                     <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{t.firstName} {t.lastName}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{t.email}</div></td>
                     <td style={{fontSize:'.72rem'}}>{t.unitNumber?<span><span style={{color:'var(--t3)'}}>{t.propertyName}</span> · {t.unitNumber}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                     <td><span className={`badge ${t.achVerified?'bg2':'br'}`}>{t.achVerified?'✓':'No'}</span></td>
-                    <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'Active':'None'}</span></td>
+                    <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.flexpayEnrolled)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.flexpayEnrolled)?'Active':'None'}</span></td>
                     <td className="mono" style={{color:(t.latePaymentCount||0)>1?'var(--amber)':'var(--t3)'}}>{t.latePaymentCount||0}</td>
                   </tr>
                 ))}
@@ -5207,7 +5383,7 @@ function FlexPayRequests() {
           <div className="kpi">
             <div className="kpi-l">Monthly front commitment</div>
             <div className="kpi-v" style={{ color: 'var(--gold)' }}>{fmt(funnel.monthlyFloat)}</div>
-            <div className="kpi-s">Sum of enrolled tenants' rent — bankroll out each cycle</div>
+            <div className="kpi-s">Enrolled tenants' rent — FlexPay pays their whole monthly bill, so utilities and fees come on top</div>
           </div>
         </div>
       )}
@@ -5260,6 +5436,23 @@ function FlexPayRequests() {
 
         {renderTable(decided, "Decided")}
       </>}
+
+      {/* S655: the FlexPay terms tenants see, from the ONE shared set
+          (FLEXPAY_TERMS) — the same words as the tenant app, the PDF and the
+          emails, so a review here is a review of what the tenant agreed to. */}
+      <details className="card" style={{ padding: 14, marginBottom: 16 }}>
+        <summary style={{ cursor: 'pointer', fontWeight: 700, color: 'var(--t0)', fontSize: '.85rem' }}>
+          FlexPay terms — what tenants agree to
+        </summary>
+        <div style={{ marginTop: 10, display: 'grid', gap: 10 }}>
+          {FLEXPAY_TERMS.map(sec => (
+            <div key={sec.key}>
+              <div style={{ fontWeight: 600, color: 'var(--t0)', fontSize: '.8rem' }}>{sec.title}</div>
+              <div style={{ fontSize: '.78rem', color: 'var(--t2)', lineHeight: 1.5 }}>{sec.body}</div>
+            </div>
+          ))}
+        </div>
+      </details>
 
       {review && (
         <div className="modal-ov" onClick={() => setReview(null)}>

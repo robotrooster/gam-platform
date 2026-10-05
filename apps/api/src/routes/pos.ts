@@ -1,18 +1,36 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { insertPosSale } from '../services/posSale'
+import { recordSaleTowardStay } from '../services/stayPayments'
 import { cardFeeSplit, type CardFeePayer } from '@gam/shared'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
-import { query, queryOne, getClient } from '../db'
-import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
+import { db, query, queryOne, getClient } from '../db'
+import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { calculateCartTax, computeCartTotals, aggregateCartTotals, effectiveItemTaxes } from '../services/posTax'
 import { holdForTheCart, createConnectionToken, registerReader, listReaders, archiveReader, createCardPresentPaymentIntent, processPaymentIntentOnReader, captureTerminalPaymentIntent, cancelTerminalPaymentIntent, retrieveTerminalPaymentIntent, cancelReaderAction, showCartOnReader, clearCartOnReader, readerAction, retrieveTerminalPaymentIntentWithCharge } from '../services/posTerminal'
 import crypto from 'crypto'
+import { DateTime } from 'luxon'
 import { logger } from '../lib/logger'
 import { resolveLandlordTarget, ownsLandlord, landlordScopeIds } from '../lib/landlordScope'
-import { cardIdentityFromIntent, findOrCreateCustomerForCard, startSaveCardPrompt, readSaveCardAnswer, saveCardForCustomer, mergePosCustomers, type CardIdentity, type CardCustomer } from '../services/posCustomerCards'
+import { cardIdentityFromIntent, findOrCreateCustomerForCard, startSaveCardPrompt, readSaveCardAnswer, saveCardForCustomer, mergePosCustomers, readSaleCard, type CardIdentity, type CardCustomer } from '../services/posCustomerCards'
+import {
+  personOnSale, salePerson, nameForReader, residentRecord, applyCardToPerson, withSavepoint, cardOutcomeSentence, addCustomer, customerFromElsewhere,
+  findSamePerson, standInNow, foldStandInInto, recordContactSql, tenantOfCompanySql, tenantLivesHereSql, NOT_ON_REGISTER, SALE_GONE,
+  parseForStaff, cartLineWords, lowerLineIds, assertItemsAreOurs, assertWholeStays,
+  linkSaleToPerson, undoLink, saleTimeUndo, letGoOfPick, searchPeople, peopleQueryGuard, peopleSearchLimiter, crossCompanyLimiter,
+  type CardOutcome, type LinkTarget, type StandIn,
+} from '../services/posPeople'
+import { reservationDue, releaseReservationTickets, ticketCarriesStay, stayItemIdsIn, stayTaxRate, taxInsidePayment, checkOutFor, priceStayBySchedule, type ReservationDue } from '../services/registerStay'
+import {
+  LINK_PAID_ONLINE, LINK_PAGE_STUCK, reservationNoDiscountWords, reservationPaidWords, reservationWhat, reservationLineName,
+  closeLinkPageNow, closeOtherLinkCheckouts, closeIfPaidInFull, expireClosedLinks, linkOpenedMeanwhileWords,
+  linkStayOf, linkBookingLines, assertLinkBookingLinesKept, linkReservation, linkReservationLine, linkReservationNowWords,
+  linkAsksNow, linkReservationGoneWords, settleLinkBooking, closeStaleLinkPages, assertLinkStayWhole, linkStayNightsNowWords,
+  reservationSaleLine, withLodgingTax, linkStayAsSent, tellLandlordIfLeftOwed,
+  type ClosedLink, type PagesClosed, type LinkReservation,
+} from './posPayLinks'
 
 export const posRouter = Router()
 posRouter.use(requireAuth)
@@ -81,6 +99,24 @@ const ROW_TABLE: Record<string, string> = {
 
 function posLandlordId(req: any): string {
   return resolveLandlordTarget(req.user!, req.body?.landlordId ?? req.query?.landlordId ?? req.posPropertyLandlordId, 'register')
+}
+
+/**
+ * 10/2: a sale is acted on only by somebody assigned to its property. Refund,
+ * void, receipt email and the customer link all load a sale by id; the company
+ * check alone let a cashier scoped to one park reach another park's sales of
+ * the same company. A sale with no property (before W-12) is an owner's.
+ */
+async function assertSaleInScope(user: any, propertyId: string | null | undefined): Promise<void> {
+  if (propertyId) return assertPropertyInScope(user, propertyId)
+  if ((await getScopedPropertyIds(user)) !== null) throw new AppError(403, 'You are not assigned to this property')
+}
+
+/** What a list of sales is limited to for this caller: one property, their properties, or everything. */
+async function salesScope(req: any): Promise<{ propertyId: string | null; scoped: string[] | null }> {
+  const propertyId = req.query?.propertyId ? String(req.query.propertyId) : null
+  if (propertyId) { await assertPropertyInScope(req.user, propertyId); return { propertyId, scoped: null } }
+  return { propertyId: null, scoped: await getScopedPropertyIds(req.user) }
 }
 
 // POS money/quantity fields are never negative. Mirrors the client-side nonNeg
@@ -545,27 +581,209 @@ function assertCatalogItems(lines: { itemId?: string | null }[]): void {
   }
 }
 
-function canSetPrices(user: any): boolean {
+/**
+ * 10/2 (front desk foolproof): a cart line whose price or tax is below zero
+ * (or not a number) is refused in the clerk's words, with the button to press —
+ * the same words a ticket or a pay link uses (cartLineWords). 10/2 (review): a
+ * quantity has to be ABOVE zero, as the words say — a line of nothing reached
+ * the database's own check and put a raw 500 on the clerk's screen.
+ */
+function assertCartNumbers(items: any[], press: string): void {
+  const words = cartLineWords(press)
+  const bad = (v: unknown) => v !== undefined && v !== null && v !== '' && !(Number.isFinite(Number(v)) && Number(v) >= 0)
+  const badQty = (v: unknown) => typeof v === 'boolean' || !(Number.isFinite(Number(v)) && Number(v) > 0)
+  for (const it of items) {
+    if (badQty(it?.qty)) throw new AppError(400, words['items.N.qty'])
+    if (bad(it?.price)) throw new AppError(400, words['items.N.price'])
+    if (bad(it?.tax ?? it?.tax_rate)) throw new AppError(400, words['items.N.tax'])
+  }
+}
+
+/**
+ * 10/2 (review): settling a pay link, a cart line that is a STAY must be one of
+ * the link's own stay lines — the same item at the same price, and no more
+ * nights than the link carries. The link's stay was priced from its site and
+ * the site held when it was sent; anything else that is a stay has no site and
+ * no dates, and a price nobody checked (stays are not held to the catalog —
+ * the site decides). Extra nights are rung as their own stay.
+ */
+async function assertStaysAreTheLinks(landlordId: string, items: any[], payLink: any): Promise<void> {
+  // 10/2 (review): compared lowercase, as the database writes ids — an id sent
+  // in capitals is the same stay, not a line to skip.
+  const ids = [...new Set(items.map((it: any) => lowerId(it?.id)).filter((x) => /^[0-9a-f-]{36}$/.test(x)))]
+  if (!ids.length) return
+  const stays = await query<{ id: string; name: string }>(
+    `SELECT id, name FROM pos_items WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND stay_unit IS NOT NULL`, [ids, landlordId])
+  if (!stays.length) return
+  const left = linkLineQty(payLink)
+  for (const it of items) {
+    const s = stays.find((x) => x.id === lowerId(it?.id))
+    if (!s) continue
+    const k = priceKey(it.id, it.price)
+    const have = left.get(k) ?? 0
+    const q = Number(it.qty) || 0
+    if (have <= 0 || q > have + 1e-9) {
+      throw new AppError(400, `"${s.name}" in the cart is not the stay on this pay link — nothing was charged. `
+        + 'Put that line back the way the link had it (or take it out), then press Charge; ring any extra nights on their own, with a site and dates.')
+    }
+    left.set(k, have - q)
+  }
+}
+
+/** A register item id as the database writes it (lowercase), or '' for none. */
+const lowerId = (x: unknown): string => (typeof x === 'string' ? x.trim().toLowerCase() : '')
+
+export function canSetPrices(user: any): boolean {
   if (!user) return false
   if (['admin', 'super_admin', 'landlord'].includes(user.role)) return true
   const perms = user.permissions || {}
   return perms['pos.discount'] === true || perms['pos.manage_inventory'] === true
 }
-async function assertCashierPricing(req: any, lines: { itemId?: string | null; price: any }[],
-                                    discountAmount?: any): Promise<void> {
+/**
+ * 10/2 (review): a pay link's own terms — the prices on its lines and the
+ * discount it was sent with — were set when it was sent. A cashier settling it
+ * at the counter is not setting a price or giving a discount, so those are not
+ * held to the cashier's pricing rule (without this, a cashier could not settle
+ * a discounted link at all). Anything the cashier changes still is.
+ */
+/**
+ * `lines`: how many of each (item, price) the link carries — the most of that
+ * line a cashier settles on the link's word. `discount`: the link's own
+ * discount; settling for that much off, or less, is the link's terms.
+ */
+type LinkTerms = { lines: Map<string, number>; discount: number }
+const priceKey = (itemId: unknown, price: unknown) => `${lowerId(itemId)}:${(Number(price) || 0).toFixed(2)}`
+/** How many of each (item, price) a link's lines carry. Lines with no register item are keyed by none. */
+function linkLineQty(link: any): Map<string, number> {
+  const out = new Map<string, number>()
+  for (const l of (Array.isArray(link?.items) ? link.items : [])) {
+    if (!l?.id) continue
+    const k = priceKey(l.id, l.price)
+    out.set(k, (out.get(k) ?? 0) + (Number(l.qty) || 0))
+  }
+  return out
+}
+function termsOfLink(link: any): LinkTerms {
+  return { lines: linkLineQty(link), discount: Math.max(0, Number(link?.discount_amount) || 0) }
+}
+
+/**
+ * 10/2 (review): how much of a pay link's own lines this cart keeps, by value
+ * — 1 when it keeps every one. Lines are matched the way the counter matches
+ * them: a register line by (item, price), a typed line by (name, price); a cart
+ * keeps at most as many of each as the link carries.
+ */
+export function linkShareKept(link: any, items: any[]): number {
+  const key = (l: any) => (l?.id ? `i:${priceKey(l.id, l.price)}` : `t:${String(l?.name ?? '')}|${(Number(l?.price) || 0).toFixed(2)}`)
+  const sent = new Map<string, { qty: number; price: number }>()
+  for (const l of (Array.isArray(link?.items) ? link.items : [])) {
+    const e = sent.get(key(l)) ?? { qty: 0, price: Number(l?.price) || 0 }
+    e.qty += Number(l?.qty) || 0
+    sent.set(key(l), e)
+  }
+  const kept = new Map<string, number>()
+  for (const it of (Array.isArray(items) ? items : [])) kept.set(key(it), (kept.get(key(it)) ?? 0) + Math.max(0, Number(it?.qty) || 0))
+  let whole = 0, keptValue = 0
+  sent.forEach((e, k) => { whole += e.qty * e.price; keptValue += Math.min(e.qty, kept.get(k) ?? 0) * e.price })
+  return whole > 0 ? Math.min(1, keptValue / whole) : 1
+}
+
+/**
+ * 10/2 (review): a link's discount was given for the WHOLE order. Settled (or
+ * adjusted) with every one of its lines it is the link's own; with only some of
+ * them, only that share of it is — a manager's $50 off ten tanks is $15 off
+ * three, never $50 off three (that was more off than anybody authorized: the
+ * clamp at the subtotal let a smaller cart come to $0).
+ */
+export function linkDiscountFor(link: any, items: any[]): number {
+  const d = Math.max(0, Number(link?.discount_amount) || 0)
+  return d > 0 ? round2(d * linkShareKept(link, items)) : 0
+}
+
+/** The link's own terms for THIS cart: its lines, and its discount for the share of it kept (linkDiscountFor). */
+export function termsOfLinkFor(link: any, items: any[]): LinkTerms {
+  return { lines: linkLineQty(link), discount: linkDiscountFor(link, items) }
+}
+
+/** What a clerk without "Apply discounts" is told when a link's discount outlives the lines it was for. */
+export const linkDiscountWholeWords = (press: string) =>
+  `The link's discount was for the whole order — put back the lines you took out, or ask a manager to change the discount, then press ${press} again.`
+
+/**
+ * True when a clerk who may not set prices is carrying MORE of a link's own
+ * discount than the share of the link they kept (and no more than the link's
+ * whole discount — beyond that it is simply a discount of their own).
+ */
+export function carriesLinkDiscountPastShare(user: any, link: any, items: any[], discount: unknown): boolean {
+  if (canSetPrices(user)) return false
+  const whole = Math.max(0, Number(link?.discount_amount) || 0)
+  const d = Number(discount) || 0
+  return whole > 0 && d > linkDiscountFor(link, items) + 0.005 && d <= whole + 0.005
+}
+/**
+ * The reader's breakdown names no pay link (it shows a cart), so for a cashier
+ * putting a link up its terms are read from this property's open links. Only
+ * the breakdown relies on this; the sale itself is checked against the one
+ * link it settles.
+ */
+async function termsOfOpenLinks(landlordId: string, propertyId: string): Promise<LinkTerms> {
+  const links = await query<{ items: any; discount_amount: string }>(
+    `SELECT items, discount_amount FROM pos_pay_links
+      WHERE landlord_id = $1 AND property_id = $2 AND kind = 'one_time' AND status = 'open'
+        AND (expires_at IS NULL OR expires_at > NOW())`, [landlordId, propertyId])
+  const out: LinkTerms = { lines: new Map(), discount: 0 }
+  for (const l of links) {
+    const t = termsOfLink(l)
+    t.lines.forEach((q, k) => out.lines.set(k, Math.max(out.lines.get(k) ?? 0, q)))
+    out.discount = Math.max(out.discount, t.discount)
+  }
+  return out
+}
+/**
+ * The lines and discount a cashier is answerable for — the link's own terms
+ * taken out. 10/2 (review): only as MUCH of a line as the link carries — a
+ * link for one tank at a special price does not make a hundred tanks at that
+ * price the link's; the rest is the cashier's, held to their pricing rule. A
+ * discount up to the link's own is the link's; more than that is theirs.
+ */
+export function cashiersOwn(lines: { itemId?: any; price: any; qty?: any }[], discount: any, terms: LinkTerms | null): { lines: { itemId?: any; price: any }[]; discount: any } {
+  if (!terms) return { lines, discount }
+  const left = new Map(terms.lines)
+  const own = lines.filter((l) => {
+    const k = priceKey(l.itemId, l.price)
+    const have = left.get(k) ?? 0
+    const q = Number(l.qty) || 0
+    if (have > 0 && q <= have + 1e-9) { left.set(k, have - q); return false }
+    return true
+  })
+  const d = Number(discount) || 0
+  return { lines: own, discount: d <= terms.discount + 0.005 ? 0 : discount }
+}
+
+/**
+ * 10/2 (review): every line naming a register item is checked — compared
+ * lowercase, as the database writes ids, and a line naming no item of this
+ * company's is REFUSED, never skipped. (An id sent in capitals used to miss
+ * every check keyed by the database's id while the sale still found the item:
+ * a $20 tank rang at a penny.) A line with no register item at all is the
+ * caller's to judge — a pay link's own typed line, or a refusal of its own.
+ * `press`: the button the clerk presses again.
+ */
+export async function assertCashierPricing(req: any, lines: { itemId?: string | null; price: any }[],
+                                    discountAmount?: any, landlordId?: string, press = 'Charge'): Promise<void> {
   if (canSetPrices(req.user)) return
   if (Number(discountAmount) > 0) {
     throw new AppError(403, 'Discounts need the "Apply discounts" permission — ask the owner or a manager.')
   }
-  const ids = [...new Set(lines.map((l) => l.itemId).filter((x): x is string =>
-    typeof x === 'string' && /^[0-9a-f-]{36}$/i.test(x)))]
-  if (!ids.length) return
-  const rows = await query<{ id: string; prices: string[]; stay_unit: string | null }>(
+  const own = lines.map((l) => ({ ...l, itemId: l.itemId == null || l.itemId === '' ? null : lowerId(l.itemId) }))
+  const ids = [...new Set(own.map((l) => l.itemId).filter((x): x is string => !!x && /^[0-9a-f-]{36}$/.test(x)))]
+  if (!own.some((l) => l.itemId)) return
+  const rows = ids.length ? await query<{ id: string; prices: string[]; stay_unit: string | null }>(
     `SELECT i.id, i.stay_unit, ARRAY[i.sell_price::text] || COALESCE(
               (SELECT array_agg(v.sell_price::text) FROM pos_item_variants v
                 WHERE v.item_id = i.id AND v.is_active = TRUE), '{}') AS prices
        FROM pos_items i WHERE i.id = ANY($1::uuid[]) AND i.landlord_id = $2`,
-    [ids, posLandlordId(req)])
+    [ids, landlordId ?? posLandlordId(req)]) : []
   const allowed = new Map(rows.map((r) => [r.id, r.prices.map(Number)]))
   // S652: a stay is not priced from the catalog — the site's rate card decides,
   // and the server sets it. Holding a cashier to the item's sell_price here
@@ -573,12 +791,13 @@ async function assertCashierPricing(req: any, lines: { itemId?: string | null; p
   // meant to be. Nothing is loosened: the price the browser sent for a stay is
   // discarded and replaced before anything is totaled.
   const stayItems = new Set(rows.filter((r) => r.stay_unit).map((r) => r.id))
-  for (const l of lines) {
-    if (!l.itemId || !allowed.has(l.itemId)) continue
+  for (const l of own) {
+    if (!l.itemId) continue
+    if (!allowed.has(l.itemId)) throw new AppError(400, cartLineWords(press)['items.N.id'])
     if (stayItems.has(l.itemId)) continue
     const price = Number(l.price)
     if (!allowed.get(l.itemId)!.some((p) => Math.abs(p - price) < 0.005)) {
-      throw new AppError(403, 'That price differs from the item\'s price. Changing a price needs the "Apply discounts" permission.')
+      throw new AppError(403, `That price differs from the item's price — take the line out and add it again at the register's price, then press ${press} again. Changing a price needs the "Apply discounts" permission (ask the owner or a manager).`)
     }
   }
 }
@@ -594,72 +813,460 @@ async function assertCashierPricing(req: any, lines: { itemId?: string | null; p
  * from the browser. "There's no variation allowed in terms of charging one
  * price in the booking flow and one price if they come in and get it on the
  * POS." The item says what one of quantity buys; the unit says what it costs.
+ *
+ * 10/3 (decisions #9, #21) — AND IT COSTS WHAT THE SCHEDULE CHARGES FOR THOSE
+ * NIGHTS. A stay rung straight at the counter was the item's rate × quantity
+ * plus the stay ITEM's own tax, while the same nights on a pay link (and on the
+ * schedule) were priced by the schedule's own pricing — tiered rates and the
+ * property's lodging tax: seven nights at a park with a $231 week and 12%
+ * lodging tax were $258.72 on "Send link" and $308.00 on "Charge" (7 × $40 +
+ * the item's 10%). Now the site and arrival the cashier picked price it by
+ * priceStayBySchedule, exactly as a link and the schedule do, and the stay is
+ * ONE line at that price with its lodging tax inside it (RESERVATION_LINE,
+ * STAY_TAX) — recorded split, the stay before tax and the lodging tax as tax,
+ * as a reservation's line is. The quote, the card reader's charge and
+ * breakdown, the sale and the booking (createStayBooking's lineTotal) all use
+ * that one figure. The site and arrival come with the sale (`stay`) or ride on
+ * the stay's own cart line (stayUnitId, stayCheckIn — the reader's calls carry
+ * nothing else); a cart that shows the stay at another figure (stayTotal, the
+ * register's own) is refused before any money moves — never charged a number
+ * the cashier did not see. One with no figure of its own is charged the
+ * schedule's (the browser's price for a stay is never used).
  */
-async function resolveStayLines(landlordId: string, items: any[], unitId?: string | null): Promise<any[]> {
-  const ids = [...new Set((items || []).map((it: any) => it.id).filter(Boolean))]
-  if (!ids.length) return []
-  const rows = await query<{ id: string; name: string; stay_unit: string | null }>(
-    `SELECT id, name, stay_unit FROM pos_items
-      WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND stay_unit IS NOT NULL`,
-    [ids, landlordId])
-  if (!rows.length) return []
-  const byId = new Map(rows.map((r) => [r.id, r]))
-  const { priceStayFromUnit } = await import('../services/registerStay')
-  const out: any[] = []
-  for (const it of (items || [])) {
-    if (!it.id || !byId.has(it.id)) continue
-    const row = byId.get(it.id)!
-    const qty = Number(it.qty) || 0
-    const stayUnit = row.stay_unit as 'night' | 'week' | 'month'
-    // No site yet means no price yet — the caller refuses the sale a few lines
-    // later for the same reason, so this only has to not invent a number.
-    if (!unitId) { out.push({ itemId: it.id, qty, stayUnit, name: row.name, lineTotal: 0, rate: null }); continue }
-    const priced = await priceStayFromUnit(query, unitId, landlordId, stayUnit, qty)
-    out.push({
-      itemId: it.id, qty, stayUnit, name: row.name,
-      rate: priced.rate, lineTotal: priced.lineTotal,
-    })
-  }
-  return out
+interface CounterStayAt { unitId: string; checkIn: string }
+
+/**
+ * 10/3 (review): a stay rung at the counter whose site and dates are not
+ * picked yet has no price. Set by priceCounterStay on that line (never read
+ * from the cart); the card reader's breakdown leaves the line off — and out of
+ * its total — rather than show the customer the item's catalog rate × nights
+ * plus a tax Charge will never take.
+ */
+const UNPRICED_STAY = Symbol('stay not priced yet')
+
+/** The site and arrival a stay is rung for — on the sale, else on the stay's cart line. */
+function counterStayAt(items: any[], stay: unknown): CounterStayAt | null {
+  const s: any = stay
+  if (s && typeof s.unitId === 'string' && s.unitId && typeof s.checkIn === 'string' && s.checkIn) return { unitId: s.unitId, checkIn: s.checkIn }
+  const line = (Array.isArray(items) ? items : []).find((i: any) => typeof i?.stayUnitId === 'string' && i.stayUnitId && typeof i?.stayCheckIn === 'string' && i.stayCheckIn)
+  return line ? { unitId: String(line.stayUnitId), checkIn: String(line.stayCheckIn) } : null
 }
 
 /**
- * S654 (Nic): "I need to be able to choose a customer from the drop-down menu to
- * link to that transaction and it should show their name on the pay screen."
- * The person a sale names must be THIS company's — a register customer of its,
- * or a resident on one of its leases — and their name is what the reader shows.
- * A name-less card record ("Card Customer") shows nothing.
+ * 10/3 (review): the stay's own cart line and the sale's `stay` say the same
+ * site and arrival. The line's figure (stayTotal) was priced for ITS site and
+ * dates; the booking is written for the sale's. Two different answers to
+ * "which site?" are refused before any money moves — never charged for one
+ * site and booked on another.
  */
-async function personOnSale(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }): Promise<string | null> {
-  const tenantId = typeof ids.tenantId === 'string' && ids.tenantId ? ids.tenantId : null
-  const posCustomerId = typeof ids.posCustomerId === 'string' && ids.posCustomerId ? ids.posCustomerId : null
-  if (tenantId && posCustomerId) throw new AppError(400, 'A sale belongs to one person — a resident or a customer, not both')
-  const uuid = /^[0-9a-f-]{36}$/i
-  if (posCustomerId) {
-    const c = uuid.test(posCustomerId) ? await queryOne<{ first_name: string; last_name: string }>(
-      `SELECT first_name, last_name FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL`,
-      [posCustomerId, landlordId]) : null
-    if (!c) throw new AppError(404, 'That customer is not on this register')
-    if (c.first_name === 'Card' && c.last_name === 'Customer') return null
-    return `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim() || null
+function assertStayLineMatches(items: any[], stay: unknown, press: string): void {
+  const s: any = stay
+  if (!s || typeof s !== 'object') return
+  for (const it of (Array.isArray(items) ? items : [])) {
+    const lineUnit = typeof it?.stayUnitId === 'string' && it.stayUnitId ? String(it.stayUnitId).toLowerCase() : null
+    const lineIn = typeof it?.stayCheckIn === 'string' && it.stayCheckIn ? String(it.stayCheckIn) : null
+    if (!lineUnit && !lineIn) continue
+    const unitDiffers = lineUnit && typeof s.unitId === 'string' && s.unitId && lineUnit !== String(s.unitId).toLowerCase()
+    const dayDiffers = lineIn && typeof s.checkIn === 'string' && s.checkIn && lineIn !== String(s.checkIn)
+    if (unitDiffers || dayDiffers) {
+      throw new AppError(409, 'The stay in the cart was priced for another site or arrival date than the one picked — nothing was charged. '
+        + `Tap the site and dates above Charge, press Use this site, then press ${press} again.`)
+    }
   }
-  if (tenantId) {
-    const t = uuid.test(tenantId) ? await queryOne<{ name: string | null }>(
-      `SELECT NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS name
-         FROM tenants tn JOIN users u ON u.id = tn.user_id
-        WHERE tn.id = $1
-          AND EXISTS (SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id
-                       WHERE lt.tenant_id = tn.id AND l.landlord_id = $2)`,
-      [tenantId, landlordId]) : null
-    if (!t) throw new AppError(404, "That resident is not at one of this company's properties")
-    return t.name
-  }
-  return null
 }
 
-/** The breakdown a register sale shows on the reader: each line, then the card fee. */
+/** What the clerk is told when the cart shows a stay at another figure than its nights cost. */
+const counterStayNowWords = (what: string, total: number, press: string) =>
+  `This stay — ${what} — comes to ${money(total)} — the cart shows something else, and nothing was charged. `
+  + `Tap the site and dates above Charge, press Use this site, then press ${press} again.`
+
+/**
+ * 10/3 (review, decisions #9): a stay rung at the counter is charged the
+ * schedule's price, like a reservation ticket or link — never less a register
+ * discount. A discount on a cart with a stay in it took dollars off what was
+ * collected while the sale still recorded the whole lodging tax and the
+ * booking was written, and stamped paid, at the full price nobody paid.
+ */
+export const counterStayNoDiscountWords = (press: string) =>
+  `A stay is charged at the schedule's price — take the discount off, then press ${press} again. `
+  + 'To charge less for the stay, change its price on the schedule; to discount other items, ring them on a sale of their own.'
+
+async function priceCounterStay(landlordId: string, propertyId: string | null, items: any[], at: CounterStayAt | null, press: string, discountAmount?: unknown): Promise<{
+  items: any[]; stayLines: { itemId: string; qty: number; stayUnit: 'night' | 'week' | 'month'; name: string; lineTotal: number }[]
+}> {
+  const lines = Array.isArray(items) ? items : []
+  const ids = [...new Set(lines.map((it: any) => lowerId(it?.id)).filter((x: string) => /^[0-9a-f-]{36}$/.test(x)))]
+  if (!ids.length) return { items: lines, stayLines: [] }
+  const rows = await query<{ id: string; name: string; stay_unit: string }>(
+    `SELECT id, name, stay_unit FROM pos_items
+      WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND stay_unit IS NOT NULL`,
+    [ids, landlordId])
+  if (!rows.length) return { items: lines, stayLines: [] }
+  const at_ = lines.map((it: any, n: number) => (rows.some((r) => r.id === lowerId(it?.id)) ? n : -1)).filter((n) => n >= 0)
+  if (at_.length > 1) {
+    // Two stay lines is a stay whose length depends on which line you read.
+    throw new AppError(400, new Set(at_.map((n) => lowerId(lines[n]?.id))).size > 1
+      ? 'Ring one kind of stay at a time — nights and weeks on the same sale have no single set of dates.'
+      : `Keep the stay on one line — set how many nights there — then press ${press} again.`)
+  }
+  if (Number(discountAmount) > 0) throw new AppError(400, counterStayNoDiscountWords(press))
+  const n = at_[0]
+  const line = lines[n]
+  const row = rows.find((r) => r.id === lowerId(line?.id))!
+  const qty = Number(line?.qty) || 0
+  const stayUnit = row.stay_unit as 'night' | 'week' | 'month'
+  // No site yet means no price yet — the sale refuses it for that reason, so
+  // this only has to not invent a number. The line is marked (UNPRICED_STAY)
+  // so the customer's screen on the reader leaves it off until it is priced.
+  if (!at) {
+    return { items: lines.map((it: any, k: number) => (k === n ? { ...it, [UNPRICED_STAY]: true } : it)),
+             stayLines: [{ itemId: row.id, qty, stayUnit, name: row.name, lineTotal: 0 }] }
+  }
+  if (!propertyId) throw new AppError(400, `Pick the property at the top of the register first, then press ${press} again.`)
+  // The site has to be this property's before anything about it is read.
+  const site = /^[0-9a-f-]{36}$/i.test(at.unitId) ? await queryOne<{ id: string }>(
+    `SELECT id FROM units WHERE id = $1 AND property_id = $2 AND landlord_id = $3 AND retired_at IS NULL`,
+    [at.unitId, propertyId, landlordId]) : null
+  if (!site) throw new AppError(400, `That site is not at this property — pick the site again, then press ${press} again.`)
+  const checkOut = checkOutFor(at.checkIn, stayUnit, qty)
+  const priced = await priceStayBySchedule(db, at.unitId, at.checkIn, checkOut,
+    (unit) => `Site ${unit} has no stay rate set, and neither does the property, so this stay cannot be priced — nothing was charged. `
+      + `Set the site's nightly rate (or the property's), then press ${press} again.`)
+  const what = reservationWhat({ nights: priced.nights, unitNumber: priced.unitNumber, checkIn: at.checkIn, checkOut })
+  const shown = line?.stayTotal
+  if (shown != null && shown !== '' && Math.round(Number(shown) * 100) !== Math.round(priced.total * 100)) {
+    throw new AppError(409, counterStayNowWords(what, priced.total, press))
+  }
+  const priced_ = lines.map((it: any, k: number) => (k !== n ? it : {
+    id: row.id, name: `${row.name} — ${what}`.slice(0, 160), qty: 1, price: priced.total, tax: 0, stay: true,
+    ...(it?.cat ? { cat: it.cat } : {}),
+    [RESERVATION_LINE]: true, [STAY_TAX]: { amount: priced.tax, rate: priced.taxRate },
+  }))
+  return { items: priced_, stayLines: [{ itemId: row.id, qty, stayUnit, name: row.name, lineTotal: priced.total }] }
+}
+
+const RESERVATION_NOT_WAITING = 'That reservation is no longer waiting to be paid — it was canceled or marked a no-show, and nothing was charged. Press Clear, then look the reservation up on the schedule.'
+/** A reservation ticket named at the till that is not one of this company's (or not any more). */
+const TICKET_NOT_OPEN = 'That ticket is not on the open list any more — nothing was charged. Press Clear, then open the list to see what is still out.'
+/** 10/3 (review): one sale, one ticket or one pay link — two reservations are never settled by one payment. */
+const ONE_TICKET_OR_LINK = 'A sale settles one ticket or one pay link — press Clear, then open just one.'
+
+/**
+ * 10/2 (decisions #9) — A RESERVATION TICKET CHARGES THE RESERVATION'S OWN
+ * PRICE, AND NOTHING ELSE.
+ *
+ * Nic, S652: "One price, and it is the site's." A reservation was quoted once —
+ * on the schedule, or on the booking site — and unit_bookings.total_amount is
+ * that quote, tax in it. What the till takes for it is that price less what was
+ * already paid toward it (services/registerStay reservationDue): never the stay
+ * item's rate × a quantity (the schedule's hand-off rounds nights to weeks, so a
+ * ten-night stay rang as one week), never the booking's price overwritten by
+ * whatever the till worked out. 10/3 (decisions #15): for a stay its lease
+ * bills, what the till takes is its deposit — the lease bills the rest.
+ *
+ * So the stay line on a reservation ticket is the reservation: one line, at
+ * what is owed, untaxed (its tax is in the quote). The register is handed that
+ * line when it opens the ticket (GET /tickets/:id) and shows it; every place
+ * that prices a cart — the quote, the card reader's charge and breakdown, the
+ * sale — prices it the same way here, and a cart that still shows any other
+ * figure (opened before a deposit came in online, or by a register still on an
+ * old screen that showed $0) is refused before any money moves, with the
+ * amount and what to press. A reservation is charged whole: no discount. A pay
+ * link for a reservation is priced the same way (priceLinkCart).
+ */
+const RESERVATION_LINE = Symbol('reservation line')
+/**
+ * 10/3 (decisions #21): the lodging tax inside a reservation line's price
+ * ({ amount, rate }), set by the server on the line it builds — never read
+ * from the cart. The sale records that part as tax (serverCartTotals,
+ * reservationSaleLine); what is charged is unchanged.
+ */
+const STAY_TAX = Symbol('stay tax')
+
+const money = (n: number) => `$${n.toFixed(2)}`
+
+/** A reservation the till may take money for — refused, in the clerk's words, when it may not. */
+function assertReservationChargeable(due: ReservationDue | null): asserts due is ReservationDue {
+  if (!due || due.closed) throw new AppError(409, RESERVATION_NOT_WAITING)
+  if (due.noPrice) throw new AppError(409, 'That reservation has no price on it — nothing was charged. Set its price on the schedule, then open the ticket again.')
+  if (due.paidInFull) throw new AppError(409, reservationPaidWords(due))
+}
+
+/** What the clerk is told when the cart shows another figure than the reservation owes. */
+const reservationNowWords = (due: ReservationDue, press: string) =>
+  `This reservation — ${reservationWhat(due)} — comes to ${money(due.owed)}`
+  + `${due.leaseBillsRest ? ' now (its deposit; its lease bills the rest)' : ''}`
+  + `${due.paid > 0 ? ` after the ${money(due.paid)} already paid` : ''} — the cart shows something else, and nothing was charged. `
+  + `Press Clear, open the ticket again, then press ${press}.`
+
+/**
+ * The open reservation ticket a cart settles: by the ticket named, or by its
+ * stay line (the reader's calls carry no ticket). 10/3 (review): a ticket
+ * whose reservation is over gave up its stay (registerStay
+ * releaseReservationTickets) and is an ordinary ticket from then on.
+ */
+async function reservationTicketOf(landlordId: string, items: any[], openTicketId: unknown, propertyId: string | null): Promise<{ ticketId: string; bookingId: string } | null> {
+  const named = namedTicketOf(items, openTicketId)
+  if (!named) return null
+  // 10/2 (review): a ticket is priced only at a register standing on its
+  // property — the reservation it names (nights, site, dates, what is owed and
+  // paid) is never read out to a register with no property, or another one.
+  if (!propertyId) throw new AppError(400, 'Pick the property at the top of the register first, then press Charge again.')
+  if (!/^[0-9a-f-]{36}$/i.test(String(named))) throw new AppError(404, TICKET_NOT_OPEN)
+  const t = await queryOne<{ id: string; booking_id: string | null; property_id: string; landlord_id: string; items: any }>(
+    `SELECT id, booking_id, property_id, landlord_id, items FROM pos_open_tickets WHERE id = $1 AND landlord_id = $2`, [named, landlordId])
+  if (!t) throw new AppError(404, TICKET_NOT_OPEN)
+  if (t.property_id !== propertyId) {
+    throw new AppError(400, 'That ticket is for another property — nothing was charged. Switch the register to that property, then press Charge again.')
+  }
+  if (!t.booking_id || !(await ticketCarriesStay(db, t))) return null
+  return { ticketId: t.id, bookingId: t.booking_id }
+}
+
+/** The ticket a cart names — on the call, or on its reservation line. */
+const namedTicketOf = (items: any[], openTicketId: unknown): string | null =>
+  (typeof openTicketId === 'string' && openTicketId ? openTicketId
+    : (Array.isArray(items) ? items : []).map((i: any) => i?.openTicketId).find((x: unknown) => typeof x === 'string' && x)) || null
+
+/** The pay link a cart names — on the call, or on its reservation line (the reader's calls carry it there). */
+const namedLinkOf = (items: any[], payLinkId: unknown): string | null =>
+  (typeof payLinkId === 'string' && payLinkId ? payLinkId
+    : (Array.isArray(items) ? items : []).map((i: any) => i?.payLinkId).find((x: unknown) => typeof x === 'string' && x)) || null
+
+/**
+ * Price a reservation ticket's cart: its one stay line becomes the reservation
+ * at what is owed (untaxed — RESERVATION_LINE), checked against what the cart
+ * shows. Everything else in the cart is priced as usual.
+ */
+async function priceReservationCart(landlordId: string, bookingId: string, items: any[], discountAmount: unknown, press: string): Promise<{ items: any[]; due: ReservationDue }> {
+  const due = await reservationDue(db, bookingId)
+  assertReservationChargeable(due)
+  if (Number(discountAmount) > 0) throw new AppError(400, reservationNoDiscountWords(press))
+  const lines = Array.isArray(items) ? items : []
+  const stays = await stayItemIdsIn(db, landlordId, lines)
+  const at = lines.map((i: any, n: number) => (stays.has(lowerId(i?.id)) ? n : -1)).filter((n) => n >= 0)
+  if (!at.length) {
+    throw new AppError(400, `That ticket is for a reservation, but nothing on it is a stay — press Clear, open the ticket again, then press ${press}.`)
+  }
+  if (at.length > 1) {
+    throw new AppError(400, `This ticket is for ${reservationWhat(due)} — keep just one stay line for it, then press ${press} again.`)
+  }
+  const line = lines[at[0]]
+  if (Math.round((Number(line.qty) || 0) * (Number(line.price) || 0) * 100) !== Math.round(due.owed * 100)) {
+    throw new AppError(409, reservationNowWords(due, press))
+  }
+  // decisions #21: the schedule priced it with its lodging tax in it (a stay
+  // under 30 nights); the sale records that part as tax. A long stay's charge
+  // here is its deposit (decisions #15) — no tax in that.
+  const rate = due.leaseBillsRest ? 0 : stayTaxRate(due.rates, due.taxPct, due.bookedNights)
+  // 10/3 (review): its share of the stay's tax — with what was paid ahead (a
+  // deposit), the parts add up to the stay's tax (taxInsidePayment).
+  const stayTax = { amount: taxInsidePayment(due.paid, due.owed, rate), rate }
+  const priced = lines.map((it: any, n: number) => (n === at[0] ? { ...it, tax: 0, [RESERVATION_LINE]: true, [STAY_TAX]: stayTax } : it))
+  return { items: priced, due }
+}
+
+/** The words for a pay link the till cannot settle — the same ones the sale uses. */
+const LINK_NOT_OPEN = 'That pay link has already been paid or closed — press Clear, then open the list to see what is still out.'
+
+/** A pay link named at the till: this company's emailed link, open, not run out, at this register's property. */
+async function openLinkAt(landlordId: string, propertyId: string | null, linkId: string): Promise<any> {
+  const link = /^[0-9a-f-]{36}$/i.test(String(linkId)) ? await queryOne<any>(
+    `SELECT * FROM pos_pay_links WHERE id = $1 AND landlord_id = $2`, [linkId, landlordId]) : null
+  if (!link || link.kind !== 'one_time') throw new AppError(404, PAY_LINK_GONE)
+  if (link.status !== 'open') throw new AppError(409, LINK_NOT_OPEN)
+  if (link.expires_at && new Date(link.expires_at) <= new Date()) {
+    throw new AppError(409, 'That pay link has run out — nothing was charged. Press Clear, then ring the sale up fresh (or send them a new link).')
+  }
+  if (!propertyId) throw new AppError(400, 'Pick the property at the top of the register first, then press Charge again.')
+  if (link.property_id !== propertyId) {
+    throw new AppError(400, 'That pay link is for another property — nothing was charged. Switch the register to that property, then press Charge again.')
+  }
+  link.items = lowerLineIds(Array.isArray(link.items) ? link.items : [])
+  return link
+}
+
+/**
+ * 10/3 (decisions #9, #23) — A PAY LINK FOR A RESERVATION IS CHARGED THE
+ * RESERVATION'S OWN AMOUNT, wherever the cart is priced (the quote, the
+ * reader's charge and breakdown, the sale): its reservation part — its stay
+ * line, or the deposit/balance/amount line it was sent for — becomes one line
+ * at what the link charges toward the reservation now (posPayLinks
+ * linkReservation), untaxed; the rest of the cart is priced as usual. The
+ * register shows that line (GET /tickets/:id), marked as the reservation, with
+ * its nights. decisions #23: the nights are the reservation's — never fewer or
+ * more here (they change only on the schedule); a cart that changes them, or
+ * shows another figure for it, is refused before any money moves, with the
+ * figure and what to press.
+ *
+ * Returns the cart as charged, the reservation, and the rest of the cart (what
+ * the cashier answers for). A link with no reservation is the cart as sent.
+ */
+async function priceLinkCart(link: any, items: any[], discountAmount: unknown, press: string): Promise<{
+  items: any[]; res: LinkReservation | null; rest: any[]
+}> {
+  const lines = Array.isArray(items) ? items : []
+  if (!link?.booking_id) return { items: lines, res: null, rest: lines }
+  const stay = await linkStayOf(db, link)
+  const own = linkBookingLines(link, stay)
+  if (!stay && !own.length) return { items: lines, res: null, rest: lines }
+  const marked = (l: any) => l?.reservation === true || (typeof l?.payLinkId === 'string' && l.payLinkId.trim().toLowerCase() === String(link.id))
+  let resLines: any[]
+  if (stay) {
+    resLines = lines.filter((l: any) => lowerId(l?.id) === stay.itemId)
+    if (resLines.some(marked) && resLines.length > 1) {
+      throw new AppError(400, `This link is for one stay — keep just its one line, then press ${press} again.`)
+    }
+  } else {
+    resLines = lines.filter((l: any) => !l?.id && marked(l))
+    if (!resLines.length) {
+      // A register still on the old screen shows the link's own line as it was sent.
+      assertLinkBookingLinesKept(link, null, lines, press)
+      const keys = new Set(own.map((l) => `${l.name}|${l.price.toFixed(2)}`))
+      resLines = lines.filter((l: any) => !l?.id && keys.has(`${String(l?.name ?? '')}|${(Number(l?.price) || 0).toFixed(2)}`))
+    }
+  }
+  // decisions #9: a reservation is charged at its own price — never less a discount.
+  if (Number(discountAmount) > 0) throw new AppError(400, reservationNoDiscountWords(press))
+  const res = await linkReservation(db, link, { press })
+  if (!res) return { items: lines, res: null, rest: lines }
+  // decisions #23: the stay is kept whole — the register's reservation line at
+  // the reservation's own nights, or (a register still on the old screen) the
+  // link's own stay line(s), as many as the link carries.
+  if (stay) {
+    const line = resLines.find(marked)
+    if (line) {
+      if (line.nights != null && line.nights !== '' && Number(line.nights) !== res.due.nights) {
+        throw new AppError(409, linkStayNightsNowWords(res.due, press))
+      }
+    } else {
+      assertLinkStayWhole(stay, res.due, lines, press, 'charged')
+    }
+  }
+  // What the cart shows for it: the register's reservation line as it is; a
+  // stay line as the link carried it — the whole stay at what the link last
+  // asked for it (a stay is the schedule's figure, never the line re-added).
+  // (Only while the cart's stay lines are the link's own, at its own price —
+  // a stay line at any other price is read as it stands, and refused.)
+  const keptWhole = !!stay && resLines.every((l: any) => Math.round((Number(l?.price) || 0) * 100) === Math.round(stay.price * 100))
+  const shown = resLines.some(marked) || !stay
+    ? round2(resLines.reduce((n: number, l: any) => n + (Number(l?.qty) || 0) * (Number(l?.price) || 0), 0))
+    : keptWhole ? await linkStayAsSent(db, link)
+    : round2(Number((await computeCartTotals(link.landlord_id, resLines, { surcharge: 0, discountAmount: 0 })).total))
+  if (Math.round(shown * 100) !== Math.round(res.charge * 100)) throw new AppError(409, linkReservationNowWords(res, press))
+  const rest = lines.filter((l: any) => !resLines.includes(l))
+  return { items: [{ ...linkReservationLine(link, res), [RESERVATION_LINE]: true, [STAY_TAX]: res.stayTax }, ...rest], res, rest }
+}
+
+/**
+ * The cart as every pricing endpoint prices it: a reservation ticket's stay is
+ * the reservation (priceReservationCart); so is a pay link's reservation
+ * (priceLinkCart); a stay rung straight at the counter is the schedule's price
+ * for its nights (priceCounterStay — its site and arrival from `opts.stay` or
+ * its own cart line); anything else is the cart as sent. `opts.needSite`: a
+ * card is about to be charged — a stay with no site and dates is refused first.
+ */
+async function cartAsCharged(landlordId: string, propertyId: string | null, items: any[], openTicketId: unknown, discountAmount: unknown, press: string,
+                             payLinkId?: unknown, opts: { stay?: unknown; needSite?: boolean } = {}): Promise<{ items: any[]; reservation: { ticketId: string; due: ReservationDue } | null; link: LinkReservation | null }> {
+  const linkNamed = namedLinkOf(items, payLinkId)
+  if (linkNamed && namedTicketOf(items, openTicketId)) throw new AppError(400, ONE_TICKET_OR_LINK)
+  if (linkNamed) {
+    const link = await openLinkAt(landlordId, propertyId, linkNamed)
+    const r = await priceLinkCart(link, items, discountAmount, press)
+    return { items: r.items, reservation: null, link: r.res }
+  }
+  const t = await reservationTicketOf(landlordId, items, openTicketId, propertyId)
+  if (!t) {
+    // 10/3 (decisions #9): a stay rung straight here costs what the schedule charges for its nights.
+    const c = await priceCounterStay(landlordId, propertyId, items, counterStayAt(items, opts.stay), press, discountAmount)
+    if (opts.needSite && c.stayLines.some((l) => !(l.lineTotal > 0))) {
+      throw new AppError(400, `A stay needs a site and an arrival date before it can be charged — press Pick a site and dates, then press ${press} again.`)
+    }
+    return { items: c.items, reservation: null, link: null }
+  }
+  const r = await priceReservationCart(landlordId, t.bookingId, items, discountAmount, press)
+  return { items: r.items, reservation: { ticketId: t.ticketId, due: r.due }, link: null }
+}
+
+/**
+ * GET /tickets: a reservation ticket's stay line as the register shows it — at
+ * what the reservation owes, marked as the reservation (the ticket itself was
+ * written at $0 by the schedule's hand-off; the price is never frozen on it).
+ * A ticket that gave up its stay (its reservation is over) is an ordinary ticket.
+ */
+async function ticketWithReservation(t: any): Promise<any> {
+  if (!t?.booking_id || !(await ticketCarriesStay(db, t))) return t
+  const due = await reservationDue(db, t.booking_id)
+  if (!due || due.closed || due.noPrice || due.paidInFull) {
+    return { ...t, reservation_status: due?.status === 'no_show' ? 'no_show' : !due || due.closed ? 'cancelled' : due.noPrice ? 'no_price' : 'paid',
+             reservation_lease_bills_rest: !!due?.leaseBillsRest, reservation_displaced: !!due?.displaced,
+             reservation_paid: due?.paid ?? 0 }
+  }
+  const items = Array.isArray(t.items) ? t.items : []
+  const ids = [...new Set(items.map((i: any) => lowerId(i?.id)).filter((x: string) => /^[0-9a-f-]{36}$/.test(x)))]
+  const stays = ids.length ? await query<{ id: string; name: string; stay_unit: string }>(
+    `SELECT id, name, stay_unit FROM pos_items WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND stay_unit IS NOT NULL`, [ids, t.landlord_id]) : []
+  let placed = false
+  const out: any[] = []
+  for (const i of items) {
+    const s = stays.find((x) => x.id === lowerId(i?.id))
+    if (!s) { out.push(i); continue }
+    if (placed) continue   // one reservation, one line
+    placed = true
+    out.push({ id: s.id, name: reservationLineName(s.name, due), qty: 1, price: due.owed, tax: 0,
+               stay: true, reservation: true, stay_unit: s.stay_unit })
+  }
+  return { ...t, items: out, reservation_owed: due.owed, reservation_paid: due.paid, reservation_total: due.total }
+}
+
+/**
+ * 10/2 (review): a reservation ticket whose reservation is over — cancelled
+ * (on the schedule, or its site lost to a guest who paid first), marked a
+ * no-show, or paid in full some other way — has nothing left for the till to
+ * take FOR THE STAY. It is never left open and hidden (nobody could charge or
+ * void it, yet it still counted as owed on Outstanding Balances). 10/3
+ * (review): the stay comes off it, the moment the register sees it; a ticket
+ * that carried only the stay is voided with the reason, and one that carries
+ * anything else (a tank of propane held on it) stays open for that, Void
+ * button and all (registerStay releaseReservationTickets). Kept, never deleted.
+ */
+function reservationOverReason(t: any): string | null {
+  switch (t?.reservation_status) {
+    case 'cancelled': return t.reservation_displaced ? 'The reservation lost its site to a guest who paid first' : 'The reservation was canceled'
+    case 'no_show': return 'The reservation was marked a no-show'
+    // 10/3 (review): a long stay with nothing due now (no deposit asked) was
+    // never "deposit paid" — nothing is due at the register; its lease bills it.
+    case 'paid': return !t.reservation_lease_bills_rest ? 'The reservation was paid in full'
+      : Number(t.reservation_paid) > 0.005 ? 'The reservation\'s deposit was paid — its lease bills the rest'
+      : 'Nothing is due on the reservation at the register — its lease bills the stay'
+    default: return null
+  }
+}
+/** Release the stays of over reservations; returns the tickets still open (as ordinary tickets) by id, with the words for each. */
+async function releaseOverReservationTickets(tickets: any[]): Promise<Map<string, { ticket: any; reason: string }>> {
+  const kept = new Map<string, { ticket: any; reason: string }>()
+  for (const t of tickets) {
+    const reason = reservationOverReason(t)
+    if (!reason || !t.booking_id) continue
+    const r = await releaseReservationTickets(db, t.booking_id, reason, { onlyTicketId: t.id })
+    if (r.kept.includes(t.id)) {
+      const fresh = await queryOne<any>(`SELECT t.*, ${ticketPersonNameSql('t')} AS customer_name FROM pos_open_tickets t WHERE t.id = $1`, [t.id])
+      if (fresh) kept.set(t.id, { ticket: fresh, reason })
+    }
+  }
+  return kept
+}
+
+// S654/10-2: who a sale names — personOnSale — lives in services/posPeople,
+// shared with pay links: one rule for "this company's person".
+
+/**
+ * The breakdown a register sale shows on the reader: each line, then the card
+ * fee. 10/3 (decisions #21): a reservation's line shows before its lodging
+ * tax, which the reader shows as tax — the lines, the tax and the total add up.
+ */
 function registerReaderLines(items: any[], surchargeDollars: number): { description: string; amountCents: number; quantity: number }[] {
-  const lines = items.filter((it: any) => Number(it.qty) > 0).map((it: any) => ({
+  const lines = items.map((it: any) => reservationSaleLine(it, it?.[STAY_TAX])).filter((it: any) => Number(it.qty) > 0).map((it: any) => ({
     description: `${String(it.name ?? 'Item')}${Number(it.qty) > 1 ? ` ×${Number(it.qty)}` : ''}`,
     amountCents: Math.round(Number(it.qty) * Number(it.price) * 100), quantity: 1,
   }))
@@ -670,11 +1277,25 @@ function registerReaderLines(items: any[], surchargeDollars: number): { descript
 async function serverCartTotals(landlordId: string, items: any[], paymentMethod: string | undefined,
                                 discountAmount: number | undefined, clientSurcharge?: number,
                                 propertyId?: string | null) {
+  // 10/2 (review): ids as the database writes them, and only this company's
+  // items — refused in words, never a database error from the tax lookup.
+  items = lowerLineIds(items || [])
+  await assertItemsAreOurs(landlordId, items, 'Charge')
+  // 10/2 (decisions #9): a reservation's line (priceReservationCart) is its
+  // quoted price with the tax already in it — totaled as it stands, untaxed.
   const lines = (items || [])
-    .filter((it: any) => !!it.id)
+    .filter((it: any) => !!it.id && !it[RESERVATION_LINE])
     .map((it: any) => ({ itemId: it.id, qty: Number(it.qty) || 0, unitPrice: Number(it.price) || 0 }))
   const tax = await calculateCartTax(landlordId, lines)
   const base = aggregateCartTotals(tax, items, { surcharge: 0, discountAmount })
+  // 10/3 (decisions #21): the lodging tax inside a reservation's price is
+  // recorded as tax, not as the stay's price — the total is the same.
+  const stayTax = (items || []).reduce((n: number, it: any) => n + (it?.[RESERVATION_LINE] ? Number(it?.[STAY_TAX]?.amount) || 0 : 0), 0)
+  const lodging = (items || []).find((it: any) => it?.[RESERVATION_LINE] && Number(it?.[STAY_TAX]?.amount) > 0)?.[STAY_TAX] ?? null
+  if (stayTax > 0) {
+    base.subtotal = round2(base.subtotal - stayTax)
+    base.taxAmount = round2(base.taxAmount + stayTax)
+  }
   let surcharge = 0
   // S648 (Nic): GAM's card fee is on every card sale; the property decides
   // whether the customer pays it on top or the landlord absorbs it.
@@ -696,7 +1317,18 @@ async function serverCartTotals(landlordId: string, items: any[], paymentMethod:
   }
   surcharge = Math.round(surcharge * 100) / 100
   return { ...base, surcharge, cardFee, total: Math.round((base.total + surcharge) * 100) / 100,
-           taxBreakdown: taxBreakdownFor(tax, base.taxAmount) }
+           taxBreakdown: stayTax > 0
+             ? withLodgingTax(taxBreakdownFor(tax, round2(base.taxAmount - stayTax)), { amount: round2(stayTax), rate: Number(lodging?.rate) || 0 })
+             : taxBreakdownFor(tax, base.taxAmount) }
+}
+
+/** 10/3: the named taxes on a cart of register items (a pay link's other lines, paid online) — the same rule the counter uses. */
+export async function cartTaxBreakdown(landlordId: string, items: any[]): Promise<{ name: string; rate: number; amount: number }[]> {
+  const lines = (items || []).filter((it: any) => !!it?.id)
+    .map((it: any) => ({ itemId: it.id, qty: Number(it.qty) || 0, unitPrice: Number(it.price) || 0 }))
+  const tax = await calculateCartTax(landlordId, lines)
+  const base = aggregateCartTotals(tax, items, { surcharge: 0, discountAmount: 0 })
+  return taxBreakdownFor(tax, base.taxAmount)
 }
 
 /**
@@ -730,14 +1362,31 @@ function taxBreakdownFor(tax: { lines: { appliedRates: { name: string; rate: num
 // a pos_tax_rates row differs from an item's own tax_rate). Read-only.
 posRouter.post('/cart-quote', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const { items, surcharge, discountAmount, paymentMethod } = req.body
-    if (!Array.isArray(items)) throw new AppError(400, 'items array required')
-    for (const it of items) {
-      assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
-    }
+    const { surcharge, discountAmount, paymentMethod } = req.body
+    // 10/2 (review): a quote is for a property the caller works, like every
+    // other pricing call (the card reader's charge, the sale) — a ticket named
+    // here is read out only at its own property's register.
+    const propertyId = typeof req.body.propertyId === 'string' && req.body.propertyId ? String(req.body.propertyId) : ''
+    if (!propertyId) throw new AppError(400, 'A property must be selected — pick it at the top of the register; sales are per-property.')
+    await assertPropertyInScope(req.user, propertyId)
+    await assertPropertyIsLandlords(posLandlordId(req), propertyId)
+    const items = lowerLineIds(req.body.items)
+    if (!Array.isArray(items)) throw new AppError(400, 'The cart is empty — add what they are buying, then press Charge again.')
+    assertCartNumbers(items, 'Charge')
     assertNonNeg([surcharge, 'Surcharge'], [discountAmount, 'Discount'])
-    const totals = await serverCartTotals(posLandlordId(req), items, paymentMethod, discountAmount, surcharge, req.body.propertyId ?? null)
-    res.json({ success: true, data: totals })
+    await assertWholeStays(posLandlordId(req), items, 'Charge')
+    // 10/2 (decisions #9): a reservation ticket is priced as the sale prices it.
+    // 10/3: so is a pay link's reservation — whole, at what it owes now
+    // (decisions #23: a quote never prices other nights; they change on the
+    // schedule) — and the register is handed back the reservation's line as
+    // priced.
+    assertStayLineMatches(items, req.body.stay, 'Charge')
+    const priced = await cartAsCharged(posLandlordId(req), propertyId, items, req.body.openTicketId, discountAmount, 'Charge', req.body.payLinkId,
+      { stay: req.body.stay })
+    const totals = await serverCartTotals(posLandlordId(req), priced.items, paymentMethod, discountAmount, surcharge, propertyId)
+    const line = priced.link ? priced.items.find((i: any) => i[RESERVATION_LINE]) : null
+    res.json({ success: true, data: { ...totals,
+      ...(line ? { reservationLine: { name: line.name, price: line.price, nights: line.nights ?? null } } : {}) } })
   } catch (e) { next(e) }
 })
 
@@ -754,11 +1403,11 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
     const checkIn = String(req.query.checkIn ?? '')
     const stayUnit = String(req.query.stayUnit ?? 'night') as 'night' | 'week' | 'month'
     const qty = Number(req.query.qty ?? 1)
-    if (!propertyId) throw new AppError(400, 'A property must be selected')
-    if (!['night', 'week', 'month'].includes(stayUnit)) throw new AppError(400, 'Unknown stay length')
+    if (!propertyId) throw new AppError(400, 'Pick the property at the top of the register first, then pick the stay again.')
+    if (!['night', 'week', 'month'].includes(stayUnit)) throw new AppError(400, 'That stay length could not be read — take the stay out of the cart, add it again, then pick the dates.')
     await assertPropertyInScope(req.user, propertyId)
 
-    const { checkOutFor, nightsBetween } = await import('../services/registerStay')
+    const { checkOutFor, nightsBetween, scheduleStayPrice } = await import('../services/registerStay')
     const checkOut = checkOutFor(checkIn, stayUnit, qty)
 
     const { STAY_RATE_COLUMN } = await import('../services/registerStay')
@@ -768,7 +1417,29 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
               -- The site's own rate, else the property's: the same two places
               -- and the same order the booking site quotes from, so the counter
               -- and the booking site cannot price a site differently.
-              COALESCE(u.${rateCol}, pr.${rateCol})::float AS rate
+              COALESCE(u.${rateCol}, pr.${rateCol})::float AS rate,
+              COALESCE(u.nightly_rate, pr.nightly_rate)::float AS nightly_rate_,
+              COALESCE(u.weekly_rate, pr.weekly_rate)::float AS weekly_rate_,
+              COALESCE(u.monthly_rate, pr.monthly_rate)::float AS monthly_rate_,
+              pr.short_term_tax_rate::float AS lodging_tax_pct_,
+              -- 10/3 (S652: an unpaid hold yields to anyone who pays): a site
+              -- held only by an unpaid hold can still be SOLD at the counter —
+              -- the sale moves the hold (holdDisplacement). It is listed last
+              -- and flagged; a pay link (not payment) still cannot take it.
+              -- 10/3 (review): only an UNTIMED hold yields — a timed hold is a
+              -- guest paying online right now and keeps the site hidden.
+              EXISTS (
+                SELECT 1 FROM unit_bookings h
+                 WHERE h.unit_id = u.id AND h.status = 'tentative' AND h.deposit_paid_at IS NULL
+                   AND h.displaced_at IS NULL AND h.hold_expires_at IS NULL
+                   AND h.check_in < $4::date AND h.check_out > $3::date) AS held_by_unpaid_hold,
+              -- Who is holding it, so the cashier can tell when it is the person
+              -- standing at the counter (then: settle their link or ticket).
+              (SELECT h.guest_name FROM unit_bookings h
+                WHERE h.unit_id = u.id AND h.status = 'tentative' AND h.deposit_paid_at IS NULL
+                  AND h.displaced_at IS NULL AND h.hold_expires_at IS NULL
+                  AND h.check_in < $4::date AND h.check_out > $3::date
+                ORDER BY h.created_at LIMIT 1) AS held_for
          FROM units u
          JOIN properties pr ON pr.id = u.property_id
         WHERE u.property_id = $1
@@ -779,27 +1450,48 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
             SELECT 1 FROM unit_bookings b
              WHERE b.unit_id = u.id AND b.status <> 'cancelled'
                AND NOT (b.status = 'tentative' AND b.hold_expires_at IS NOT NULL AND b.hold_expires_at < now())
+               AND NOT (b.status = 'tentative' AND b.deposit_paid_at IS NULL AND b.displaced_at IS NULL
+                        AND b.hold_expires_at IS NULL)
                AND b.check_in < $4::date AND b.check_out > $3::date)
           AND NOT EXISTS (
             SELECT 1 FROM leases l
              WHERE l.unit_id = u.id AND l.status IN ('active','pending')
-               AND l.start_date < $4::date AND (l.end_date IS NULL OR l.end_date > $3::date))
+               AND l.start_date < $4::date AND (l.end_date IS NULL OR l.end_date > $3::date)
+               -- 10/3 (review): a long-stay hold's unsigned lease (drafted
+               -- from it, bookingLeaseDraft) is that hold's paperwork, not a
+               -- tenancy — the sale moves it with the hold (holdDisplacement).
+               -- It does not hide a site its unpaid hold leaves listed.
+               AND NOT (l.status = 'pending' AND EXISTS (
+                 SELECT 1 FROM unit_bookings hb
+                  WHERE hb.id = l.source_booking_id AND hb.unit_id = u.id
+                    AND hb.status = 'tentative' AND hb.deposit_paid_at IS NULL AND hb.displaced_at IS NULL
+                    AND hb.hold_expires_at IS NULL
+                    AND hb.check_in < $4::date AND hb.check_out > $3::date)))
           AND NOT unit_out_of_order_overlaps(u.id, $3::date, $4::date)
-        ORDER BY u.unit_number`,
+        ORDER BY held_by_unpaid_hold, u.unit_number`,
       [propertyId, posLandlordId(req), checkIn, checkOut])
 
     // S652 (Nic): the price is the site's, so it travels with the site. A site
     // with no rate for this length is still LISTED — dropping it would read as
     // "occupied", which is a lie about a site that is standing empty — but it
     // cannot be picked until somebody sets the rate.
+    // 10/3 (decisions #9, #21): what the stay costs on each site is the
+    // schedule's price for those nights (scheduleStayPrice — tiered rates, the
+    // property's lodging tax inside), the same figure the sale, a pay link and
+    // the schedule charge; `lodgingTax` is the tax inside it. A site the
+    // schedule cannot price has no lineTotal and cannot be picked.
     res.json({ success: true, data: {
       checkIn, checkOut, nights: nightsBetween(checkIn, checkOut),
       stayUnit,
-      units: units.map((u: any) => ({
-        ...u,
-        rate: u.rate ?? null,
-        lineTotal: u.rate != null ? Math.round(u.rate * qty * 100) / 100 : null,
-      })),
+      units: units.map(({ nightly_rate_, weekly_rate_, monthly_rate_, lodging_tax_pct_, ...u }: any) => {
+        const priced = scheduleStayPrice({ nightly: nightly_rate_, weekly: weekly_rate_, monthly: monthly_rate_ }, lodging_tax_pct_, checkIn, checkOut)
+        return {
+          ...u,
+          rate: u.rate ?? null,
+          lineTotal: priced.total > 0 ? priced.total : null,
+          lodgingTax: priced.total > 0 ? priced.tax : null,
+        }
+      }),
     } })
   } catch (e) { next(e) }
 })
@@ -815,6 +1507,18 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
 // migration: freezing a price at write-up time would be a second pricing
 // authority, and a whole session went into deleting one of those.
 
+// 10/2: staff forms are refused in plain words — parseForStaff (services/posPeople).
+
+const TICKET_WORDS: Record<string, string> = {
+  propertyId: 'Pick the property at the top of the register first, then press the button again.',
+  tenantId: NOT_ON_REGISTER,
+  posCustomerId: NOT_ON_REGISTER,
+  items: 'The cart is empty — add what they are taking, then press the button again.',
+  ...cartLineWords('the button'),
+  note: 'That note is too long — shorten it to 500 characters, then press the button again.',
+}
+const TICKET_OTHERWISE = 'Something in the cart could not be read — take the last thing you added out, put it back, then press the button again.'
+
 const ticketSchema = z.object({
   propertyId:    z.string().uuid(),
   tenantId:      z.string().uuid().nullish(),
@@ -829,31 +1533,55 @@ const ticketSchema = z.object({
   note: z.string().max(500).nullish(),
 })
 
+/**
+ * The lines a ticket may carry: real, active items of this company's — the
+ * same rule the register enforces on a sale ("Items are set prices. There's no
+ * custom item thing"), applied at write-up so a bad ticket is refused in the
+ * office rather than at somebody's door. A stay is a booking with dates and a
+ * site and cannot sit on a ticket — except the reservation ticket the schedule
+ * hands the till, which keeps its stay.
+ */
+async function assertTicketLines(landlordId: string, items: { id: string }[], opts: { reservation: boolean }): Promise<void> {
+  const ids = [...new Set(items.map((i) => i.id))]
+  const known = await query<{ id: string; name: string; stay_unit: string | null }>(
+    `SELECT id, name, stay_unit FROM pos_items WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND is_active = TRUE`,
+    [ids, landlordId])
+  if (known.length !== ids.length) {
+    throw new AppError(400, 'One of those items is not on your register any more — take it out of the cart and try again.')
+  }
+  const stays = known.filter((k) => k.stay_unit)
+  if (!opts.reservation && stays.length) {
+    throw new AppError(400, `"${stays[0].name}" is a stay — take it out of the cart; a stay is rung at the register with a site and dates.`)
+  }
+  if (opts.reservation && !stays.length) {
+    throw new AppError(400, "This ticket is for a reservation — put the stay back in the cart, then press Clear again.")
+  }
+}
+
+/** The name a ticket or pay link goes by: the person's own record, else the name it was written with. */
+const ticketPersonNameSql = (t: string, fallback: string | null = null) => `COALESCE(
+  (SELECT NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '')
+     FROM tenants tn JOIN users u ON u.id = tn.user_id WHERE tn.id = ${t}.tenant_id),
+  -- 10/2: a resident's register record goes by their account's name.
+  (SELECT NULLIF(TRIM(COALESCE(cu.first_name, c.first_name, '') || ' ' || COALESCE(cu.last_name, c.last_name, '')), '')
+     FROM pos_customers c LEFT JOIN tenants ctn ON ctn.id = c.tenant_id LEFT JOIN users cu ON cu.id = ctn.user_id
+    WHERE c.id = ${t}.pos_customer_id)${fallback ? `,
+  ${fallback}` : ''})`
+
 posRouter.post('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
   try {
-    const body = ticketSchema.parse(req.body)
+    const body = parseForStaff(ticketSchema, req.body, TICKET_WORDS, TICKET_OTHERWISE)
+    body.items = lowerLineIds(body.items)   // 10/2 (review): ids as the database writes them
     if (!!body.tenantId === !!body.posCustomerId) {
-      throw new AppError(400, 'A ticket is for one person — pick a tenant or a customer, not both.')
+      throw new AppError(400, 'A ticket is for one person — type who it is for and pick them, then press Hold for delivery.')
     }
     await assertPropertyInScope(req.user, body.propertyId)
     const landlordId = posLandlordId(req)
     await assertPropertyIsLandlords(landlordId, body.propertyId)
-    // Every line has to be a real item of this landlord's — the same rule the
-    // register enforces on a sale ("Items are set prices. There's no custom
-    // item thing"), applied at write-up so a bad ticket is refused in the
-    // office rather than at somebody's door.
-    const ids = [...new Set(body.items.map((i) => i.id))]
-    const known = await query<{ id: string }>(
-      `SELECT id FROM pos_items WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND is_active = TRUE`,
-      [ids, landlordId])
-    if (known.length !== ids.length) throw new AppError(400, 'One of those items is not on your register.')
-    // A stay is a booking with dates and a site; it cannot sit on a ticket.
-    const stays = await query<{ name: string }>(
-      `SELECT name FROM pos_items WHERE id = ANY($1::uuid[]) AND stay_unit IS NOT NULL`, [ids])
-    if (stays.length) throw new AppError(400, `"${stays[0].name}" is a stay — ring it at the register with a site and dates.`)
+    await assertTicketLines(landlordId, body.items, { reservation: false })
 
-    // S654: the person on a ticket is this company's — a resident on one of its
-    // leases or one of its register customers.
+    // S654: the person on a ticket is this company's. 10/2: never gated on
+    // residency — anyone tied to this company in any way (services/posPeople).
     await personOnSale(landlordId, { tenantId: body.tenantId, posCustomerId: body.posCustomerId })
 
     const row = await queryOne<any>(
@@ -866,20 +1594,157 @@ posRouter.post('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, n
   } catch (e) { next(e) }
 })
 
+const TICKET_GONE = 'That ticket is not on the open list any more — it may have been settled or voided at another register. Open the list again to see what is still out.'
+const PAY_LINK_GONE = 'That pay link was already paid or closed — open the list again to see what is still out.'
+
+// GET /api/pos/tickets/:id?propertyId=&kind=ticket|pay_link — one open ticket
+// or emailed pay link, read fresh at the moment the cashier opens it.
+//
+// 10/2 (Nic, front desk foolproof): a list can be a minute old; the cart a
+// cashier is about to charge must not be. Reopening loads the ticket from here,
+// and one that was settled or voided at another register says so instead of
+// filling the cart.
+posRouter.get('/tickets/:id', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const id = String(req.params.id)
+    if (!/^[0-9a-f-]{36}$/i.test(id)) throw new AppError(404, TICKET_GONE)
+    const landlordId = posLandlordId(req)
+    // 10/2 (review): opened at a register, a ticket or link is that property's
+    // or it is not on this register's list — the same answer as one that is gone.
+    const atProperty = typeof req.query.propertyId === 'string' && req.query.propertyId ? String(req.query.propertyId) : null
+    if (req.query.kind === 'pay_link') {
+      const l = await queryOne<any>(
+        `SELECT l.id, l.property_id, l.landlord_id, l.items, l.total, l.discount_amount, l.label,
+                l.tenant_id, l.pos_customer_id, l.booking_id, l.status, l.kind AS link_kind, l.expires_at, l.created_at,
+                ${ticketPersonNameSql('l', 'l.customer_name')} AS customer_name,
+                'Emailed pay link — sent ' || to_char(l.created_at, 'Mon DD') AS note
+           FROM pos_pay_links l WHERE l.id = $1 AND l.landlord_id = $2`, [id, landlordId])
+      if (!l || l.link_kind !== 'one_time' || (atProperty && l.property_id !== atProperty)) throw new AppError(404, PAY_LINK_GONE)
+      await assertPropertyInScope(req.user, l.property_id)
+      if (l.status !== 'open' || (l.expires_at && new Date(l.expires_at) <= new Date())) throw new AppError(409, PAY_LINK_GONE)
+      // 10/2 (decisions #9): a link for a reservation with nothing left to pay is not opened to be paid again.
+      // 10/3 (decisions #9, #23): one that can be paid opens with its
+      // reservation as one line at what the link charges for it NOW (the
+      // reservation's own amount — never the link's lines frozen when it was
+      // sent), marked as the reservation, with its nights — the figure the
+      // till charges. Its nights are the reservation's; they change on the schedule.
+      let shown = { items: l.items, total: l.total }
+      if (l.booking_id) {
+        const due = await reservationDue(db, l.booking_id)
+        if (!due || due.closed) {
+          throw new AppError(409, linkReservationGoneWords(due, 'there is nothing to charge on it. Close the link under Pay Links; if they still want to stay, ring the stay fresh with a site and dates.'))
+        }
+        if (due.paidInFull) throw new AppError(409, reservationPaidWords(due, 'there is nothing to charge on this link. Close it under Pay Links.'))
+        const full = await queryOne<any>(`SELECT * FROM pos_pay_links WHERE id = $1`, [l.id])
+        // 10/3 (decisions #23): the same figure the Pay Links list, Send again
+        // and the card page show (linkAsksNow).
+        const c = await linkAsksNow(db, full, { press: 'Charge' })
+        if (c.res) shown = { items: c.items, total: c.total }
+      }
+      const { link_kind: _k, expires_at: _x, ...rest } = l
+      return res.json({ success: true, data: { ...rest, ...shown, kind: 'pay_link', pay_link_id: l.id } })
+    }
+    const t = await queryOne<any>(
+      `SELECT t.*, ${ticketPersonNameSql('t')} AS customer_name
+         FROM pos_open_tickets t WHERE t.id = $1 AND t.landlord_id = $2`, [id, landlordId])
+    if (!t || (atProperty && t.property_id !== atProperty)) throw new AppError(404, TICKET_GONE)
+    await assertPropertyInScope(req.user, t.property_id)
+    if (t.status !== 'open') throw new AppError(409, TICKET_GONE)
+    // 10/2 (decisions #9): a reservation ticket opens with its stay at what the
+    // reservation owes — the price the till charges — never the $0 it was
+    // written with. One with nothing to charge says so instead of filling the cart.
+    const shown = await ticketWithReservation(t)
+    // 10/2 (review): one with nothing left to take is voided as it is refused —
+    // never left open and hidden. 10/3 (review): one that carries anything
+    // besides the stay gives up only the stay, and opens with the rest.
+    const kept = await releaseOverReservationTickets([shown])
+    const left = kept.get(t.id)
+    if (left) {
+      return res.json({ success: true, data: { ...left.ticket, kind: 'ticket',
+        notice: `${left.reason} — its stay was taken off this ticket. The rest is still owed; charge it, or press Void.` } })
+    }
+    if (shown.reservation_status === 'cancelled') {
+      throw new AppError(409, 'That reservation was canceled — there is nothing to charge on this ticket, so it was taken off the list. Look it up on the schedule.')
+    }
+    if (shown.reservation_status === 'no_show') {
+      throw new AppError(409, 'That reservation was marked a no-show — there is nothing to charge on this ticket, so it was taken off the list. Look it up on the schedule.')
+    }
+    if (shown.reservation_status === 'paid') {
+      throw new AppError(409, reservationPaidWords({ leaseBillsRest: !!shown.reservation_lease_bills_rest, paid: Number(shown.reservation_paid) || 0 },
+        'there is nothing to charge on this ticket and it was taken off the list.'))
+    }
+    if (shown.reservation_status === 'no_price') {
+      throw new AppError(409, 'That reservation has no price on it — set its price on the schedule, then open the ticket again.')
+    }
+    res.json({ success: true, data: { ...shown, kind: 'ticket' } })
+  } catch (e) { next(e) }
+})
+
+// PUT /api/pos/tickets/:id — put a reopened ticket back on the list.
+//
+// 10/2 (Nic, the Scott Duffy ticket): Clear on a reopened ticket used to POST a
+// SECOND ticket and leave the first open — two tickets for one tank, and a
+// double charge waiting to happen. Clear now puts the ORIGINAL back: unchanged
+// when the cart still matches it (the register sends nothing), updated in place
+// when the cashier added, removed or changed something. Same lines and person
+// rules as writing one up; only this company's, only at a property the caller
+// works, and only while it is still open. No person sent = the ticket keeps its own.
+const ticketUpdateSchema = ticketSchema.extend({ propertyId: z.string().uuid().optional() })
+
+posRouter.put('/tickets/:id', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const body = parseForStaff(ticketUpdateSchema, req.body, TICKET_WORDS, TICKET_OTHERWISE)
+    body.items = lowerLineIds(body.items)   // 10/2 (review): ids as the database writes them
+    if (body.tenantId && body.posCustomerId) {
+      throw new AppError(400, 'A ticket is for one person — remove one of them (×), then press Clear again.')
+    }
+    const landlordId = posLandlordId(req)
+    const id = String(req.params.id)
+    const t = /^[0-9a-f-]{36}$/i.test(id) ? await queryOne<any>(
+      `SELECT id, property_id, status, tenant_id, pos_customer_id, booking_id, landlord_id, items FROM pos_open_tickets WHERE id = $1 AND landlord_id = $2`,
+      [id, landlordId]) : null
+    if (!t) throw new AppError(404, TICKET_GONE)
+    await assertPropertyInScope(req.user, t.property_id)
+    if (body.propertyId && body.propertyId !== t.property_id) {
+      throw new AppError(400, 'That ticket belongs to another property — switch the register to that property, then press Clear again.')
+    }
+    if (t.status !== 'open') throw new AppError(409, `That ticket was already ${t.status === 'settled' ? 'settled' : 'voided'} — there is nothing to put back. Press Clear to empty the cart.`)
+    // 10/3 (review): a reservation ticket keeps its stay — until its
+    // reservation is over and the stay came off it; then it is an ordinary ticket.
+    await assertTicketLines(landlordId, body.items, { reservation: !!t.booking_id && await ticketCarriesStay(db, t) })
+    await assertWholeStays(landlordId, body.items, 'Clear')   // 10/2 (review): a reservation's stay is whole nights
+
+    const named = !!(body.tenantId || body.posCustomerId)
+    const tenantId = named ? (body.tenantId ?? null) : t.tenant_id
+    const posCustomerId = named ? (body.posCustomerId ?? null) : t.pos_customer_id
+    // A person who cannot go on it is NOT a ticket that is gone: 422, so the
+    // register keeps the cart and says what to do, where a 404/409 (the ticket
+    // itself settled, voided or never this company's) clears it.
+    if (named) {
+      await personOnSale(landlordId, { tenantId, posCustomerId }).catch((e) => {
+        throw e instanceof AppError && e.statusCode === 404 ? new AppError(422, e.message) : e
+      })
+    }
+
+    const row = await queryOne<any>(
+      `UPDATE pos_open_tickets
+          SET items = $2::jsonb, tenant_id = $3, pos_customer_id = $4,
+              note = COALESCE($5, note), updated_at = NOW()
+        WHERE id = $1 AND status = 'open' RETURNING *`,
+      [t.id, JSON.stringify(body.items), tenantId, posCustomerId, body.note ?? null])
+    if (!row) throw new AppError(409, 'That ticket was settled or voided a moment ago — there is nothing to put back. Press Clear to empty the cart.')
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
 // GET /api/pos/tickets?propertyId= — what is still out. The driver's list.
 posRouter.get('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
   try {
     const propertyId = String(req.query.propertyId ?? '')
-    if (!propertyId) throw new AppError(400, 'A property must be selected')
+    if (!propertyId) throw new AppError(400, 'Pick the property at the top of the register first.')
     await assertPropertyInScope(req.user, propertyId)
     const rows = await query<any>(
-      `SELECT t.*,
-              COALESCE(
-                (SELECT u.first_name || ' ' || u.last_name
-                   FROM tenants tn JOIN users u ON u.id = tn.user_id WHERE tn.id = t.tenant_id),
-                (SELECT c.first_name || ' ' || c.last_name
-                   FROM pos_customers c WHERE c.id = t.pos_customer_id)
-              ) AS customer_name
+      `SELECT t.*, ${ticketPersonNameSql('t')} AS customer_name
          FROM pos_open_tickets t
         WHERE t.property_id = $1 AND t.landlord_id = $2 AND t.status = 'open'
         ORDER BY t.created_at`,
@@ -890,7 +1755,7 @@ posRouter.get('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, ne
     // this list, and settling it here pays the link.
     const links = await query<any>(
       `SELECT l.id, l.property_id, l.landlord_id, l.items, l.total, l.discount_amount, l.label,
-              l.tenant_id, l.pos_customer_id, l.booking_id, l.customer_name, l.created_at,
+              l.tenant_id, l.pos_customer_id, l.booking_id, ${ticketPersonNameSql('l', 'l.customer_name')} AS customer_name, l.created_at,
               'Emailed pay link — sent ' || to_char(l.created_at, 'Mon DD') AS note
          FROM pos_pay_links l
         WHERE l.property_id = $1 AND l.landlord_id = $2
@@ -898,9 +1763,38 @@ posRouter.get('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, ne
           AND (l.expires_at IS NULL OR l.expires_at > NOW())
         ORDER BY l.created_at`,
       [propertyId, posLandlordId(req)])
+    // 10/2 (decisions #9): a reservation ticket's stay is listed at what the
+    // reservation owes; one whose reservation was cancelled, marked a no-show or
+    // paid in full is not money still out — it is voided, with the reason, and
+    // not listed (voidTicketsForOverReservations). (One with no price yet stays
+    // listed — opening it says to set the price on the schedule.)
+    const withReservations = await Promise.all(rows.map((t: any) => ticketWithReservation(t)))
+    const kept = await releaseOverReservationTickets(withReservations)
+    const shownRows = withReservations
+      .map((t: any) => kept.get(t.id)?.ticket ?? t)
+      .filter((t: any) => kept.has(t.id) || !reservationOverReason(t))
+    // 10/3 (decisions #23): a link for a reservation is listed as it charges
+    // NOW (linkAsksNow — the figure the Pay Links list, Send again, the card
+    // page and Charge all use): its reservation one line, at what it owes, with
+    // the reservation's own nights. One that cannot be paid any more is listed
+    // as sent; opening it says why.
+    const shownLinks = []
+    for (const l of links) {
+      let shown = { items: l.items, total: l.total }
+      if (l.booking_id) {
+        try {
+          const full = await queryOne<any>(`SELECT * FROM pos_pay_links WHERE id = $1`, [l.id])
+          const now = full ? await linkAsksNow(db, full) : null
+          if (now?.res) shown = { items: now.items, total: now.total }
+        } catch (e) {
+          if (!(e instanceof AppError)) throw e
+        }
+      }
+      shownLinks.push({ ...l, ...shown, kind: 'pay_link', pay_link_id: l.id, status: 'open' })
+    }
     res.json({ success: true, data: [
-      ...rows.map((t: any) => ({ ...t, kind: 'ticket' })),
-      ...links.map((l: any) => ({ ...l, kind: 'pay_link', pay_link_id: l.id, status: 'open' })),
+      ...shownRows.map((t: any) => ({ ...t, kind: 'ticket' })),
+      ...shownLinks,
     ] })
   } catch (e) { next(e) }
 })
@@ -911,12 +1805,15 @@ posRouter.get('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, ne
 posRouter.post('/tickets/:id/void', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
   try {
     const reason = String(req.body?.reason ?? '').slice(0, 500) || null
+    // 10/3 (review): a real uuid's shape — 36 hex-and-dash characters that are
+    // not one (all dashes) still reached Postgres and came back a raw 500.
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(req.params.id))) throw new AppError(404, TICKET_GONE)
     const t = await queryOne<any>(
       `SELECT id, property_id, status FROM pos_open_tickets WHERE id = $1 AND landlord_id = $2`,
       [req.params.id, posLandlordId(req)])
-    if (!t) throw new AppError(404, 'No such ticket')
+    if (!t) throw new AppError(404, TICKET_GONE)
     await assertPropertyInScope(req.user, t.property_id)
-    if (t.status !== 'open') throw new AppError(409, `That ticket is already ${t.status}.`)
+    if (t.status !== 'open') throw new AppError(409, `That ticket is already ${t.status} — open the list again to see what is still out.`)
     await query(
       `UPDATE pos_open_tickets SET status='voided', voided_at=NOW(), void_reason=$2, updated_at=NOW()
         WHERE id=$1`, [t.id, reason])
@@ -935,6 +1832,8 @@ posRouter.get('/card-on-file', requirePerm('pos.ring_sale'), async (req: any, re
     const tenantId = req.query.tenantId ? String(req.query.tenantId) : null
     const posCustomerId = req.query.posCustomerId ? String(req.query.posCustomerId) : null
     if (!tenantId && !posCustomerId) return res.json({ success: true, data: null })
+    // 10/2 (review): asked from a register at a property the caller works.
+    await assertSaleInScope(req.user, req.query.propertyId ? String(req.query.propertyId) : null)
     await personOnSale(posLandlordId(req), { tenantId, posCustomerId })   // S654 (review): this company's person only
     const { savedCardFor } = await import('../services/posCardOnFile')
     const card = await savedCardFor({ tenantId, posCustomerId, landlordId: posLandlordId(req) })
@@ -956,12 +1855,33 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
             // arrival date and who it is for. Everything else about the stay is
             // derived from the item and its quantity.
             stay } = req.body
+    // 10/3 (review): one sale settles ONE ticket or ONE pay link — a payment
+    // that named both settled two reservations with one sale. Refused before
+    // anything is read or any money moves.
+    if (openTicketId && payLinkId) throw new AppError(400, ONE_TICKET_OR_LINK)
     let payLink: any = null
+    // The discount the pay link was sent with — the link's own, not one the
+    // cashier is giving (see the pricing check below).
+    let linkDiscount = 0
     if (payLinkId) {
-      payLink = await queryOne<any>(
-        `SELECT * FROM pos_pay_links WHERE id = $1 AND landlord_id = $2`, [payLinkId, posLandlordId(req)])
-      if (!payLink) throw new AppError(404, 'No such pay link')
-      if (payLink.status !== 'open') throw new AppError(409, 'That pay link has already been paid or closed.')
+      payLink = /^[0-9a-f-]{36}$/i.test(String(payLinkId)) ? await queryOne<any>(
+        `SELECT * FROM pos_pay_links WHERE id = $1 AND landlord_id = $2`, [payLinkId, posLandlordId(req)]) : null
+      // 10/2 (review): only an emailed (one-time) link is settled at the
+      // counter — a standing QR link is never "paid" by one sale.
+      if (!payLink || payLink.kind !== 'one_time') throw new AppError(404, PAY_LINK_GONE)
+      if (payLink.status !== 'open') throw new AppError(409, LINK_NOT_OPEN)
+      if (payLink.expires_at && new Date(payLink.expires_at) <= new Date()) {
+        throw new AppError(409, 'That pay link has run out — nothing was charged. Press Clear, then ring the sale up fresh (or send them a new link).')
+      }
+      // A link is settled at its own property's register, into that property's books.
+      if (propertyId && payLink.property_id !== propertyId) {
+        throw new AppError(400, 'That pay link is for another property — nothing was charged. Switch the register to that property, then press Charge again.')
+      }
+      // 10/3: by somebody who works that property — before its reservation is read out.
+      await assertPropertyInScope(req.user, payLink.property_id)
+      // 10/2 (review): the link's own lines, ids as the database writes them.
+      payLink.items = lowerLineIds(Array.isArray(payLink.items) ? payLink.items : [])
+      linkDiscount = Number(payLink.discount_amount) || 0
       // S652 (Nic): "if we need to do last minute prorations or adjustments,
       // the functionality of the front counter person needs to be there." The
       // cart the cashier settles is what is charged — the link's lines loaded
@@ -969,28 +1889,110 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       // cart falls back to the link as sent.
       if (!Array.isArray(items) || items.length === 0) {
         items = payLink.items
-        discountAmount = Number(payLink.discount_amount) || 0
+        discountAmount = linkDiscount
+      } else if (discountAmount == null) {
+        // 10/2 (review): a link sent at $20 less $5 was settled at the counter
+        // for $20 — its discount was dropped the moment the cart held its
+        // lines. The register now carries the discount into the cart; a cart
+        // that says nothing about a discount keeps the link's — for the share
+        // of the link it keeps (linkDiscountFor).
+        discountAmount = linkDiscountFor(payLink, items)
       }
     }
     if (!Array.isArray(items) || items.length === 0) {
-      throw new AppError(400, 'items array required')
+      throw new AppError(400, 'The cart is empty — add what they are buying, then press Charge again.')
     }
+    // 10/2 (review): every item id as the database writes it (lowercase) —
+    // before any check compares one. An id in capitals is the same item, so it
+    // is held to the same rules.
+    items = lowerLineIds(items)
     // Reject negative line values before they corrupt the sale total. Catalog
     // items get price/tax recomputed server-side below, but qty and walk-up
     // price/tax are client-declared — a negative would shrink or invert the total.
-    for (const it of items) {
-      assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
-    }
+    assertCartNumbers(items, 'Charge')
     assertNonNeg([surcharge, 'Surcharge'])
-    assertCatalogItems(items.map((it: any) => ({ itemId: it.id })))
-    await assertCashierPricing(req, items.map((it: any) => ({ itemId: it.id, price: it.price })), discountAmount)
+    // 10/2 (review): a stay is whole nights (or weeks, or months).
+    await assertWholeStays(posLandlordId(req), items, 'Charge')
+    // 10/3 (review): the stay's line and the sale's `stay` name one site and arrival.
+    assertStayLineMatches(items, stay, 'Charge')
+    // 10/3 (decisions #9, #15, #23): a pay link for a reservation is charged
+    // the RESERVATION'S own amount — its stay, whole, at what the reservation
+    // owes now (its nights, site and price change only on the schedule; a cart
+    // with fewer or more nights, or without the stay, is refused), or the
+    // deposit/balance/amount it was sent for, never more than is left to pay
+    // (for a stay its lease bills: its deposit). It is one line at that figure
+    // (priceLinkCart), checked against what the cart shows before any money
+    // moves; a reservation that is over — cancelled or a no-show — or already
+    // paid is refused. The rest of the cart is what the cashier answers for.
+    let linkRes: LinkReservation | null = null
+    let linkResLine: any = null
+    if (payLink?.booking_id) {
+      if (!propertyId) throw new AppError(400, 'A property must be selected — pick it at the top of the register; sales are per-property.')
+      const p = await priceLinkCart(payLink, items, discountAmount, 'Charge')
+      if (p.res) {
+        linkRes = p.res
+        linkResLine = p.items[0]
+        items = p.rest
+      }
+    }
+    const linkStay = linkRes?.stay ?? null
+    // 10/2: a pay link's own lines are its bill, and a stay balance or a
+    // one-off sent from a lease carries no register item. Settling THAT link
+    // at the counter may charge those lines — only the link's own (same name,
+    // same price, and no more of it than the link carries), never a line
+    // invented at the counter.
+    // (A link for a reservation has no typed lines of its own left here — they
+    // are its reservation, charged as the one line above.)
+    const linkOwnLeft = new Map<string, number>()
+    for (const l of (payLink && !linkRes && Array.isArray(payLink.items) ? payLink.items : [])) {
+      if (l?.id) continue
+      const k = `${String(l?.name ?? '')}|${(Number(l?.price) || 0).toFixed(2)}`
+      linkOwnLeft.set(k, (linkOwnLeft.get(k) ?? 0) + (Number(l?.qty) || 0))
+    }
+    const linkOwnLine = (it: any): boolean => {
+      if (!payLink || it?.id) return false
+      const k = `${String(it?.name ?? '')}|${(Number(it?.price) || 0).toFixed(2)}`
+      const have = linkOwnLeft.get(k) ?? 0
+      const q = Number(it?.qty) || 0
+      if (have <= 0 || !(q > 0) || q > have + 1e-9) return false
+      linkOwnLeft.set(k, have - q)
+      return true
+    }
+    assertCatalogItems(items.filter((it: any) => !linkOwnLine(it)).map((it: any) => ({ itemId: it.id })))
+    // 10/2 (review): a stay on a pay link was priced from its site, and its
+    // site held, when the link was sent. Settling the link charges THOSE
+    // nights at THAT price — nothing else that is a stay. A stay line the link
+    // never had (more nights, another price) would be a stay with no site and
+    // no dates, priced by whatever the cart said; it is rung on its own.
+    if (payLink) await assertStaysAreTheLinks(posLandlordId(req), items, payLink)
+    // A pay link's own prices and discount were set when it was sent; the
+    // cashier settling it answers only for what they change (termsOfLinkFor) —
+    // and its discount is theirs only for the share of the link they keep.
+    {
+      if (payLink && carriesLinkDiscountPastShare(req.user, payLink, items, discountAmount)) {
+        throw new AppError(403, linkDiscountWholeWords('Charge'))
+      }
+      const own = cashiersOwn(items.map((it: any) => ({ itemId: it.id, price: it.price, qty: it.qty })), discountAmount, payLink ? termsOfLinkFor(payLink, items) : null)
+      await assertCashierPricing(req, own.lines, own.discount)
+    }
     // W-12 (S531): propertyId is REQUIRED — every sale belongs to a
     // property (per-property books, EOD drawers, sales history).
-    if (!propertyId) throw new AppError(400, 'A property must be selected — sales are per-property')
+    if (!propertyId) throw new AppError(400, 'A property must be selected — pick it at the top of the register; sales are per-property.')
     // Property lock: a scoped worker (cashier) can only ring on a property in
     // their scope. Owners + all_properties bypass. Requires the client to send
     // propertyId on every sale (not just FlexCharge) — see POSPage checkout.
     await assertPropertyInScope(req.user, propertyId)
+    // 10/2 (review): a link's reservation is settled with it (below) — so one
+    // whose site already went to a guest who paid first is refused before any
+    // money moves, and a link that holds a site keeps its stay in the cart.
+    // 10/2 (decisions #9): does settling this link pay its reservation in full?
+    // A link carrying the stay pays all of it; so does the arrival-day balance
+    // link, or a link whose amount covers what is left.
+    // A link carrying the stay pays all of what is left on it; a
+    // deposit/balance/amount link pays it in full when what it charges
+    // covers what is owed (the arrival-day balance link is the rest only while
+    // nothing else has been paid toward it — no exemption).
+    const linkPaysInFull = !!linkRes && (!!linkRes.stay || linkRes.charge >= linkRes.due.owed - 0.005)
     // S654: whoever the sale names — picked at the register for any tender —
     // has to be this company's resident or customer.
     if (paymentMethod !== 'charge') await personOnSale(posLandlordId(req), { tenantId, posCustomerId })
@@ -1002,16 +2004,21 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     //   - every item with id must be charge_eligible
     let flexChargeAccountId: string | null = null
     if (paymentMethod === 'charge') {
-      if (!propertyId) throw new AppError(400, 'propertyId required for FlexCharge sales')
-      if ((tenantId && posCustomerId) || (!tenantId && !posCustomerId)) {
-        throw new AppError(400, 'Exactly one of tenantId or posCustomerId required for FlexCharge')
+      if (!propertyId) throw new AppError(400, 'Pick the property at the top of the register first, then press Charge again.')
+      if (tenantId && posCustomerId) {
+        throw new AppError(400, 'A charge account is one person\'s — remove the customer (×), pick just the one it is for, then press Charge again.')
+      }
+      if (!tenantId && !posCustomerId) {
+        throw new AppError(400, 'Pick who this charge account is for, then press Charge again.')
       }
       // chargeEligible check — every linked POS item must be eligible.
       // Walk-up "misc" items (no item.id) are NOT chargeable; they
       // require a real catalog entry with charge_eligible=true.
-      const linkedIds = items.filter((it: any) => !!it.id).map((it: any) => it.id)
-      if (linkedIds.length !== items.length) {
-        throw new AppError(400, 'Walk-up items (no catalog id) cannot be charged to FlexCharge')
+      // 10/3: a link's reservation line is on the account too.
+      const chargeLines = linkResLine ? [linkResLine, ...items] : items
+      const linkedIds = chargeLines.filter((it: any) => !!it.id).map((it: any) => it.id)
+      if (linkedIds.length !== chargeLines.length) {
+        throw new AppError(400, 'Every line on a charge account must be a register item — take that line out, then press Charge again.')
       }
       const eligible = await query<{ id: string }>(
         `SELECT id FROM pos_items
@@ -1021,7 +2028,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         [linkedIds, posLandlordId(req)],
       )
       if (eligible.length !== linkedIds.length) {
-        throw new AppError(400, 'One or more cart items are not eligible for FlexCharge')
+        throw new AppError(400, 'Something in the cart cannot go on a charge account — take it out (ring it on its own with cash or card), then press Charge again.')
       }
 
       // Look up the account at this (customer, property) and verify
@@ -1035,13 +2042,13 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         posCustomerId: posCustomerId ?? null,
       })
       if (!account) {
-        throw new AppError(404, 'No FlexCharge account at this property for this customer')
+        throw new AppError(404, 'They have no charge account at this property — take cash or a card instead, then press Charge again.')
       }
       if (account.status !== 'active') {
-        throw new AppError(409, `FlexCharge account is ${account.status}`)
+        throw new AppError(409, `Their charge account is ${account.status === 'suspended' ? 'on hold' : 'closed for now'} — take cash or a card instead, then press Charge again.`)
       }
       if (account.landlord_id !== posLandlordId(req)) {
-        throw new AppError(403, 'FlexCharge account belongs to a different landlord')
+        throw new AppError(403, 'That charge account belongs to another company — take cash or a card instead, then press Charge again.')
       }
       flexChargeAccountId = account.id
     }
@@ -1055,44 +2062,61 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // settled on the schedule and the cashier supplies neither.
     let ticketBookingId: string | null = null
     if (openTicketId) {
-      const t = await queryOne<{ booking_id: string | null; unit_id: string | null }>(
-        `SELECT t.booking_id, b.unit_id
+      const t = /^[0-9a-f-]{36}$/i.test(String(openTicketId)) ? await queryOne<{ booking_id: string | null; unit_id: string | null; property_id: string; landlord_id: string; items: any }>(
+        `SELECT t.booking_id, b.unit_id, t.property_id, t.landlord_id, t.items
            FROM pos_open_tickets t
            LEFT JOIN unit_bookings b ON b.id = t.booking_id
           WHERE t.id = $1 AND t.landlord_id = $2`,
-        [openTicketId, posLandlordId(req)])
-      ticketBookingId = t?.booking_id ?? null
+        [openTicketId, posLandlordId(req)]) : null
+      if (!t) throw new AppError(404, 'That ticket is not on the open list any more — nothing was charged. Press Clear, then open the list to see what is still out.')
+      // 10/2 (review): a ticket is settled into its own property's books, by
+      // somebody who works that property.
+      if (t.property_id !== propertyId) {
+        throw new AppError(400, 'That ticket is for another property — nothing was charged. Switch the register to that property, then press Charge again.')
+      }
+      // 10/3 (review): a ticket whose reservation is over gave up its stay
+      // (releaseReservationTickets) — it settles as an ordinary ticket.
+      ticketBookingId = t.booking_id && await ticketCarriesStay(db, t) ? t.booking_id : null
     }
 
+    // 10/2 (decisions #9): a reservation ticket charges THE RESERVATION'S OWN
+    // PRICE — what its quote still owes — checked against what the cart shows
+    // before any money moves (priceReservationCart). Its site and dates were
+    // settled on the schedule; nothing about the stay is read from the cart.
     // A pay link's stay was arranged when the link was made; its line is a
     // plain amount here, not a booking to place. (The cashier's cart for a
     // link is charged as sent, stay lines included, at the prices on it.)
-    const stayLines = payLink ? [] : await resolveStayLines(posLandlordId(req), items,
-      stay?.unitId ?? (ticketBookingId
-        ? (await queryOne<{ unit_id: string }>(
-            `SELECT unit_id FROM unit_bookings WHERE id = $1`, [ticketBookingId]))?.unit_id ?? null
-        : null))
-    if (stayLines.length && !stay && !ticketBookingId) {
-      throw new AppError(400,
-        'A stay needs a site and an arrival date before it can be rung up.')
+    let reservation: ReservationDue | null = null
+    let stayLines: any[] = []
+    let pricedItems: any[]
+    if (ticketBookingId) {
+      const r = await priceReservationCart(posLandlordId(req), ticketBookingId, items, discountAmount, 'Charge')
+      reservation = r.due
+      pricedItems = r.items
+    } else {
+      // S652 (Nic): the site's rate IS the price, so the cart the server totals
+      // is not quite the cart the browser sent — a stay line is repriced from the
+      // site before anything is added up. Done here, above serverCartTotals, so
+      // tax, the card fee and the amount checked against the card reader's
+      // authorization all come out of the same number the booking records.
+      // 10/3 (decisions #9, #21): priced by the schedule's own pricing for the
+      // nights picked (priceCounterStay) — the same figure a pay link and the
+      // schedule charge for them — as one line with its lodging tax inside.
+      const hasStayAt = !!(stay && typeof stay.unitId === 'string' && stay.unitId && typeof stay.checkIn === 'string' && stay.checkIn)
+      const counter = payLink ? { items, stayLines: [] as any[] }
+        : await priceCounterStay(posLandlordId(req), propertyId, items, hasStayAt ? { unitId: stay.unitId, checkIn: stay.checkIn } : null, 'Charge', discountAmount)
+      stayLines = counter.stayLines
+      if (stayLines.length && !hasStayAt) {
+        throw new AppError(400,
+          'A stay needs a site and an arrival date before it can be rung up — pick them for the stay in the cart, then press Charge again.')
+      }
+      if (!stayLines.length && stay) {
+        throw new AppError(400, 'Nothing in this cart is a stay any more — press Clear, then ring the sale again.')
+      }
+      pricedItems = counter.items
+      // 10/3: a pay link's reservation, as one line at what it charges.
+      if (linkResLine) pricedItems = [linkResLine, ...pricedItems]
     }
-    if (!stayLines.length && stay) {
-      throw new AppError(400, 'Nothing in this sale is a stay.')
-    }
-    if (ticketBookingId && !stayLines.length) {
-      throw new AppError(400, 'That ticket is for a reservation, but nothing on it is a stay.')
-    }
-
-    // S652 (Nic): the site's rate IS the price, so the cart the server totals
-    // is not quite the cart the browser sent — a stay line is repriced from the
-    // unit before anything is added up. Done here, above serverCartTotals, so
-    // tax, the card fee and the amount checked against the card reader's
-    // authorization all come out of the same number the booking records.
-    const pricedItems = (items || []).map((it: any) => {
-      const line = stayLines.find((sl: any) => sl.itemId === it.id)
-      if (!line || line.rate == null) return it
-      return { ...it, price: line.rate }
-    })
 
     // S554: ONE shared cart-total calc — calculateCartTax (S241 server tax,
     // falling back to item.tax_rate) + the pure aggregateCartTotals that the
@@ -1122,16 +2146,54 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // customer is whoever the cashier picked; failing that, the card's own.
     const saleReaderId: string | null = typeof req.body?.stripeReaderId === 'string' ? req.body.stripeReaderId : null
     let saleCustomerId: string | null = posCustomerId || null
+    let saleTenantId: string | null = tenantId || null
     let cardIdentity: CardIdentity | null = null
     let cardCustomer: CardCustomer | null = null
+    let cardOutcome: CardOutcome | null = null
     if (paymentMethod === 'card' && !stripePaymentIntentId) {
-      throw new AppError(400, 'Card sales go through the card reader')
+      throw new AppError(400, 'A card is taken on the card reader — connect the reader, then press Charge again.')
     }
     // S654: a card the reader took is a card sale — never recorded as cash or a
     // charge account, which would leave the card authorized and uncaptured.
     if (stripePaymentIntentId && paymentMethod !== 'card') {
-      throw new AppError(400, 'A card from the reader can only be recorded as a card sale.')
+      throw new AppError(400, 'A card from the reader can only be recorded as a card sale — press Charge again.')
     }
+
+    // 10/2 (review): ONE PAYMENT, ONE CHARGE — settled before any money moves.
+    // A pay link's card page may be open on the payer's phone right now: it is
+    // closed at Stripe first, and if the payer already finished paying on it,
+    // nothing is charged here. A sale that pays a reservation in full does the
+    // same for every OTHER link on it (a deposit link still in their inbox).
+    // 10/2 (review): the page is read fresh, just before it is closed, and the
+    // link is claimed below only while that is still its page — a payer who
+    // opens the link on their phone while the sale goes through gets a new
+    // page that would stay payable after the sale; the sale is refused instead.
+    let linkPageClosed: string | null = null
+    if (payLink) {
+      let page: { page: 'none' | 'closed' | 'paid'; closedId: string | null }
+      try { page = await closeLinkPageNow(payLink.id) } catch (e) {
+        logger.warn({ err: e, payLinkId: payLink.id }, '[POS] could not close the pay link\'s card page before charging it')
+        throw new AppError(503, LINK_PAGE_STUCK)
+      }
+      if (page.page === 'paid') throw new AppError(409, LINK_PAID_ONLINE)
+      linkPageClosed = page.closedId
+    }
+    const paidInFullHere: string | null = ticketBookingId ?? (payLink?.booking_id && linkPaysInFull ? payLink.booking_id : null)
+    // The other links' pages closed here; the sale is refused if one opened a new page meanwhile (closeIfPaidInFull).
+    let otherPagesClosed: PagesClosed | undefined
+    if (paidInFullHere) {
+      let others: { outcome: 'closed' | 'paid'; pages: PagesClosed }
+      try { others = await closeOtherLinkCheckouts(paidInFullHere, payLink?.id ?? null) } catch (e) {
+        logger.warn({ err: e, bookingId: paidInFullHere }, '[POS] could not close the card page of another link on this reservation')
+        throw new AppError(503, 'The card page of a pay link sent for this reservation could not be closed just now — nothing was charged. Wait a moment, then press Charge again.')
+      }
+      if (others.outcome === 'paid') {
+        throw new AppError(409, 'That reservation was just paid online — nothing was charged here. Press Clear, then open it again to see what is still owed.')
+      }
+      otherPagesClosed = others.pages
+    }
+    // Links the sale closes (its reservation paid in full); their card pages are closed once it commits.
+    let closedWithSale: ClosedLink[] = []
 
     // S652 — CHARGE THE CARD THEY ALREADY GAVE US.
     //
@@ -1145,6 +2207,17 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // money did: the opposite order would record a sale for a decline.
     let cardOnFileIntentId: string | null = null
     let cardOnFileLabel: string | null = null
+    // 10/2: the card on file is HELD until the sale is written, then captured
+    // with it; a sale that cannot be written lets the hold go.
+    let cardOnFileHeld: string | null = null
+    const releaseCardOnFile = async () => {
+      if (!cardOnFileHeld) return
+      const held = cardOnFileHeld
+      cardOnFileHeld = null
+      const { releaseSavedCardHold } = await import('../services/posCardOnFile')
+      await releaseSavedCardHold(held).catch((e) =>
+        logger.error({ err: e, paymentIntentId: held }, '[POS] could not release a card-on-file hold for a sale that was not written'))
+    }
     if (paymentMethod === 'card_on_file') {
       const { savedCardFor, chargeSavedCard } = await import('../services/posCardOnFile')
       const card = await savedCardFor({
@@ -1163,27 +2236,29 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         description: `${card.holderName ?? 'Register sale'} - Gold Asset Management`,
       })
       cardOnFileIntentId = charged.paymentIntentId
+      if (charged.held) cardOnFileHeld = charged.paymentIntentId
       cardOnFileLabel = [card.brand, card.last4].filter(Boolean).join(' ••••') || null
     }
     if (paymentMethod === 'card' && stripePaymentIntentId) {
       const intent = await retrieveTerminalPaymentIntentWithCharge({ paymentIntentId: stripePaymentIntentId })
       cardIdentity = cardIdentityFromIntent(intent)
       if (intent.metadata?.gam_purpose !== 'pos_terminal') {
-        throw new AppError(400, 'PaymentIntent is not a POS terminal sale')
+        throw new AppError(400, 'That card charge was not started at this register — nothing was taken. Press Charge again.')
       }
       if (intent.metadata?.gam_landlord_id !== posLandlordId(req)) {
-        throw new AppError(403, 'PaymentIntent belongs to a different landlord')
+        throw new AppError(403, 'That card charge belongs to a different company — nothing was taken. Switch the register to the right property, then press Charge again.')
       }
       // S648: the register sends the charge here still authorized-only; the
       // sale and the capture commit together (below), so money is never taken
       // without a sale on record to pay the landlord for.
       if (intent.status !== 'succeeded' && intent.status !== 'requires_capture') {
-        throw new AppError(400, `The card charge is ${intent.status} — it was not approved`)
+        throw new AppError(400, `The card charge is ${intent.status} — it was not approved. Press Charge to try the card again, or take another form of payment.`)
       }
       captureOnCommit = intent.status === 'requires_capture' ? intent.id : null
       const expectedCents = Math.round(total * 100)
       if (intent.amount !== expectedCents) {
-        throw new AppError(400, `PaymentIntent amount ${intent.amount} does not match transaction total ${expectedCents}`)
+        logger.warn({ paymentIntentId: intent.id, intentCents: intent.amount, cartCents: expectedCents }, '[POS] card charge does not match the cart')
+        throw new AppError(400, 'The card charge did not match the cart — nothing was taken. Press Charge again.')
       }
     }
 
@@ -1195,18 +2270,46 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // BEGIN/COMMIT. autoDraftPO stays post-commit + best-effort
     // (mirrors stampPdf / firePmTransfers pattern in e-sign) — a
     // botched auto-PO shouldn't roll back the sale.
-    const client = await getClient()
+    const client = await getClient().catch(async (e) => { await releaseCardOnFile(); throw e })
     let txnOpen = false
     const inventoryNeedsPO: any[] = []  // queued during loop, fired post-commit
 
     try {
       await client.query('BEGIN')
       txnOpen = true
+      // 10/2: a resident's sale carries their register record too, so their
+      // cards and purchases live where everyone else's do — and a register
+      // record that is a resident's names the resident on the sale.
+      let personLastName = ''
+      if (tenantId) {
+        saleCustomerId = await residentRecord(client, posLandlordId(req), tenantId)
+      }
+      if (saleCustomerId) {
+        const r = (await client.query<{ tenant_id: string | null; last_name: string | null }>(
+          `SELECT c.tenant_id, COALESCE(u.last_name, c.last_name) AS last_name
+             FROM pos_customers c LEFT JOIN tenants tn ON tn.id = c.tenant_id LEFT JOIN users u ON u.id = tn.user_id
+            WHERE c.id = $1`, [saleCustomerId])).rows[0]
+        saleTenantId = saleTenantId ?? r?.tenant_id ?? null
+        personLastName = r?.last_name ?? ''
+      }
       // S654 (Nic): the CARD is the customer — same card next time, same
       // person and their history; the printed name is the record's name.
-      if (cardIdentity && !tenantId && !saleCustomerId) {
+      // 10/2: when somebody was picked, the card is THEIRS — put on their
+      // record, or the card's unconfirmed record folded into theirs — by the
+      // same rule as linking a sale afterward. Card bookkeeping never costs
+      // the sale: anything it cannot do is left undone.
+      if (cardIdentity && saleCustomerId) {
+        const card = cardIdentity
+        const person = { id: saleCustomerId, lastName: personLastName }
+        cardOutcome = await withSavepoint(client,
+          () => applyCardToPerson(client, { landlordId: posLandlordId(req), card, person }),
+          (e) => { logger.warn({ err: e }, '[POS] card not put on the picked person'); return { kind: 'none' } as CardOutcome })
+      } else if (cardIdentity) {
         cardCustomer = await findOrCreateCustomerForCard(client, { landlordId: posLandlordId(req), card: cardIdentity })
         saleCustomerId = cardCustomer.customerId
+        // A card already linked to a resident names the resident on this sale too.
+        saleTenantId = (await client.query<{ tenant_id: string | null }>(
+          `SELECT tenant_id FROM pos_customers WHERE id = $1`, [saleCustomerId])).rows[0]?.tenant_id ?? null
       }
 
       // S652: a ticket is CLAIMED inside the sale's own transaction, and only
@@ -1216,10 +2319,10 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       if (openTicketId) {
         const claimed = await client.query(
           `UPDATE pos_open_tickets SET status='settled', settled_at=NOW(), updated_at=NOW()
-            WHERE id=$1 AND landlord_id=$2 AND status='open' RETURNING id`,
-          [openTicketId, posLandlordId(req)])
+            WHERE id=$1 AND landlord_id=$2 AND property_id=$3 AND status='open' RETURNING id`,
+          [openTicketId, posLandlordId(req), propertyId])
         if (!claimed.rows.length) {
-          throw new AppError(409, 'That ticket has already been settled or voided.')
+          throw new AppError(409, 'That ticket has already been settled or voided at another register — nothing was charged here. Press Clear, then open the list to see what is still out.')
         }
       }
 
@@ -1229,12 +2332,14 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         // a sale exactly the way the counter does.
         const sale = await insertPosSale(client, {
           landlordId: posLandlordId(req), propertyId: propertyId || null, cashierId: req.user!.userId,
-          paymentMethod, tenantId, posCustomerId: saleCustomerId, subtotal, taxAmount, surcharge: surchargeAmt, total,
+          paymentMethod, tenantId: saleTenantId, posCustomerId: saleCustomerId, subtotal, taxAmount, surcharge: surchargeAmt, total,
           changeGiven, platformFee, stripePaymentIntentId: stripePaymentIntentId ?? cardOnFileIntentId,
           discountAmount: discountAmt, discountReason,
           ...(paymentMethod === 'card' || paymentMethod === 'card_on_file'
             ? { payoutOwed: round2(total - cardFee) } : {}),
-          items: pricedItems, taxBreakdown,
+          // 10/3 (decisions #21): a reservation's line is recorded at its price
+          // less the lodging tax inside it, with that tax on the line.
+          items: pricedItems.map((it: any) => (it?.[RESERVATION_LINE] ? reservationSaleLine(it, it[STAY_TAX]) : it)), taxBreakdown,
         })
         tx = sale.tx
         inventoryNeedsPO.push(...sale.needsPO)
@@ -1252,9 +2357,37 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         if (payLink) {
           const claimed = await client.query(
             `UPDATE pos_pay_links SET status = 'paid', paid_at = NOW(), pos_transaction_id = $2, updated_at = NOW()
-              WHERE id = $1 AND status = 'open' RETURNING id`, [payLink.id, tx.id])
-          if (!claimed.rows.length) throw new AppError(409, 'That pay link was paid a moment ago.')
+              WHERE id = $1 AND status = 'open' AND kind = 'one_time' AND property_id = $3
+                AND (expires_at IS NULL OR expires_at > NOW())
+                AND last_checkout_session_id IS NOT DISTINCT FROM $4 RETURNING id`, [payLink.id, tx.id, propertyId, linkPageClosed])
+          if (!claimed.rows.length) {
+            const now = (await client.query<{ status: string }>(`SELECT status FROM pos_pay_links WHERE id = $1`, [payLink.id])).rows[0]
+            if (now?.status === 'open') throw new AppError(409, linkOpenedMeanwhileWords('charged', 'Charge'))
+            throw new AppError(409, 'That pay link was paid a moment ago — nothing was charged here. Press Clear; it is no longer owed.')
+          }
           await client.query(`UPDATE pos_transactions SET pay_link_id = $2 WHERE id = $1`, [tx.id, payLink.id])
+          // 10/2 (review): paid at the desk is paid — the link's reservation is
+          // the guest's, exactly as when it is paid online (settleLinkBooking):
+          // confirmed and no longer an unpaid hold another payer can take.
+          // (decisions #23: its nights, site and price are the schedule's —
+          // nothing about the booking is changed here but that it is paid.)
+          if (linkRes) {
+            // Read again under the booking's lock: a reservation cancelled,
+            // marked a no-show, paid, repriced or part paid a moment ago is
+            // refused here too (the sale rolls back, nothing is taken) — the
+            // figure charged is the one the reservation owes right now.
+            const now = await linkReservation(client, payLink, { lock: true, press: 'Charge' })
+            if (!now || Math.round(now.charge * 100) !== Math.round(linkRes.charge * 100)) {
+              throw new AppError(409, now ? linkReservationNowWords(now, 'Charge')
+                : 'That pay link\'s reservation changed a moment ago — nothing was charged. Press Clear, open the link again from the list, then press Charge.')
+            }
+            await settleLinkBooking(client, payLink, tx.id, now.stay, null, now.charge)
+            // 10/2 (decisions #9): paid in full now — every other way of paying it closes.
+            closedWithSale = await closeIfPaidInFull(client, payLink.booking_id, { linkId: payLink.id, pages: otherPagesClosed })
+          } else {
+            // A link with no reservation of its own (a stay balance link marks its balance paid).
+            await settleLinkBooking(client, payLink, tx.id, null)
+          }
         }
       } catch (e: any) {
         // UNIQUE on pos_transactions_stripe_pi_uniq — same PI already
@@ -1277,6 +2410,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       // that turns out to be taken rolls the money back rather than leaving a
       // paid stay nobody can actually have.
       let stayBooking: { bookingId: string; checkIn: string; checkOut: string; nights: number } | null = null
+      let displacedHolds: import('../services/holdDisplacement').DisplacementOutcome[] = []
       // S652 — A TICKET THAT CARRIES A RESERVATION CONFIRMS IT; IT DOES NOT
       // BOOK A SECOND ONE.
       //
@@ -1286,17 +2420,38 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       // a new one here would sell the same site twice in the same breath: the
       // guest's own hold would collide with the sale that is paying for it.
       if (ticketBookingId) {
+        // 10/2 (review): rung here, the stay is paid in full — nothing is left
+        // to bill on arrival day (services/stayBalance bills what a deposit
+        // left; with no deposit on record it would bill the whole stay again).
+        // 10/2 (decisions #9): paid what the reservation owed, read again under
+        // lock — a deposit that landed online, or a price changed on the
+        // schedule, a moment ago is not paid over here. The booking's own price
+        // is never touched: the quote is the price.
+        const now = await reservationDue(client, ticketBookingId, { lock: true })
+        assertReservationChargeable(now)
+        if (Math.round(now.owed * 100) !== Math.round(reservation!.owed * 100)) {
+          throw new AppError(409, reservationNowWords(now, 'Charge'))
+        }
+        // 10/3 (decisions #15): a stay its lease bills is paid its DEPOSIT here
+        // — recorded as the deposit, never as the stay paid in full — and its
+        // lease bills the rest. Any other stay is paid in full.
         const confirmed = await client.query(
           `UPDATE unit_bookings
-              SET status = 'confirmed', deposit_paid_at = COALESCE(deposit_paid_at, NOW()),
-                  hold_expires_at = NULL, pos_transaction_id = $2, updated_at = NOW()
-            WHERE id = $1 AND status = 'tentative'
+              SET status = CASE WHEN status = 'tentative' THEN 'confirmed' ELSE status END,
+                  deposit_amount = CASE WHEN $3::boolean THEN $4::numeric ELSE deposit_amount END,
+                  deposit_paid_at = COALESCE(deposit_paid_at, NOW()),
+                  hold_expires_at = NULL, pos_transaction_id = COALESCE(pos_transaction_id, $2),
+                  balance_billed_at = CASE WHEN $3::boolean THEN balance_billed_at ELSE COALESCE(balance_billed_at, NOW()) END,
+                  balance_paid_at = CASE WHEN $3::boolean THEN balance_paid_at ELSE COALESCE(balance_paid_at, NOW()) END,
+                  updated_at = NOW()
+            WHERE id = $1
             RETURNING id, check_in::text AS check_in, check_out::text AS check_out, nights`,
-          [ticketBookingId, tx.id])
-        if (!confirmed.rows.length) {
-          throw new AppError(409,
-            'That reservation is no longer waiting to be paid — it may have been cancelled or already settled.')
-        }
+          [ticketBookingId, tx.id, now.leaseBillsRest, round2(now.paid + now.owed)])
+        // 10/2 (decisions #9): paid in full — every other way of paying it closes.
+        closedWithSale = await closeIfPaidInFull(client, ticketBookingId, { ticketId: openTicketId, pages: otherPagesClosed })
+        // 10/4 (decisions #37.B, #38): what this sale paid toward the stay, and
+        // how — an early check-out gives it back that way.
+        await recordSaleTowardStay(client, { bookingId: ticketBookingId, saleId: tx.id, toward: now.owed })
         stayBooking = {
           bookingId: confirmed.rows[0].id,
           checkIn: confirmed.rows[0].check_in,
@@ -1304,7 +2459,41 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           nights: confirmed.rows[0].nights,
         }
       } else if (stayLines.length) {
-        const { createStayBooking } = await import('../services/registerStay')
+        const { createStayBooking, checkOutFor } = await import('../services/registerStay')
+        // 10/3 (S652 standing rule: an unpaid hold has no timer and yields to
+        // anyone who PAYS): a sale at the counter is payment on the spot, so it
+        // moves an unpaid hold on this site to an equivalent one, or bumps it
+        // when the park is full — exactly as the schedule does (routes/units).
+        // The guests are told after the commit.
+        // A charge-account sale is not money changing hands — it never moves a
+        // hold (10/3 review); createStayBooking refuses a held site as before.
+        if (stay?.unitId && stay?.checkIn && paymentMethod !== 'charge') {
+          const { clearUnpaidHolds } = await import('../services/holdDisplacement')
+          const line = stayLines[0]
+          const stayOut = checkOutFor(stay.checkIn, line.stayUnit, line.qty)
+          // 10/3 (review): if the hold on this site is the SAME guest's own
+          // (their emailed link or reservation ticket), selling them a fresh
+          // stay would charge them twice. Stop and point at Settle.
+          const own = (await client.query<{ guest_name: string | null }>(
+            `SELECT h.guest_name FROM unit_bookings h
+              WHERE h.unit_id = $1 AND h.status = 'tentative' AND h.deposit_paid_at IS NULL
+                AND h.displaced_at IS NULL AND h.hold_expires_at IS NULL
+                AND h.check_in < $3::date AND h.check_out > $2::date
+                AND (EXISTS (SELECT 1 FROM pos_pay_links pl WHERE pl.booking_id = h.id AND pl.status = 'open')
+                     OR EXISTS (SELECT 1 FROM pos_open_tickets t WHERE t.booking_id = h.id AND t.status = 'open'))
+                AND (   ($4::text IS NOT NULL AND lower(h.guest_email) = lower($4))
+                     OR ($5::text IS NOT NULL AND lower(trim(h.guest_name)) = lower(trim($5)))
+                     OR ($6::uuid IS NOT NULL AND EXISTS (SELECT 1 FROM pos_pay_links pl2 WHERE pl2.booking_id = h.id AND pl2.pos_customer_id = $6))
+                     OR ($7::uuid IS NOT NULL AND EXISTS (SELECT 1 FROM pos_pay_links pl3 WHERE pl3.booking_id = h.id AND pl3.tenant_id = $7)))
+              LIMIT 1`,
+            [stay.unitId, stay.checkIn, stayOut, (stay as any).guestEmail ?? null, stay.guestName ?? null,
+             posCustomerId ?? null, tenantId ?? null])).rows[0]
+          if (own) {
+            throw new AppError(409, `That site is held for ${own.guest_name || 'this guest'} — if this is them, open their link or ticket from the open list and press Settle. Nothing was charged.`)
+          }
+          displacedHolds = await clearUnpaidHolds(client, stay.unitId, stay.checkIn, stayOut,
+            'A paid sale at the counter took this site')
+        }
         stayBooking = await createStayBooking(client, {
           landlordId: posLandlordId(req),
           propertyId,
@@ -1312,6 +2501,14 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           lines: stayLines,
           details: stay,
         })
+        // 10/2 (review): paid in full at the counter — nothing left to bill on arrival day.
+        await client.query(
+          `UPDATE unit_bookings SET balance_billed_at = COALESCE(balance_billed_at, NOW()), balance_paid_at = COALESCE(balance_paid_at, NOW())
+            WHERE id = $1`, [stayBooking.bookingId])
+        // 10/4 (decisions #37.B, #38): the stay's share of this sale, itemized
+        // (never more than the sale took before its card fee).
+        await recordSaleTowardStay(client, { bookingId: stayBooking.bookingId, saleId: tx.id,
+          toward: Math.min(Number(stayLines[0].lineTotal) || 0, round2(total - surchargeAmt)) })
       }
 
       // S254: post the FlexCharge transaction record. Has its own row-lock
@@ -1334,9 +2531,29 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       if (captureOnCommit) {
         await captureTerminalPaymentIntent({ paymentIntentId: captureOnCommit })
       }
+      if (cardOnFileHeld) {
+        const { captureSavedCard } = await import('../services/posCardOnFile')
+        await captureSavedCard(cardOnFileHeld)
+        cardOnFileHeld = null   // taken: from here the sale stands
+      }
 
       await client.query('COMMIT')
       txnOpen = false
+      await expireClosedLinks(closedWithSale)
+      if (displacedHolds.length) {
+        await import('../services/holdDisplacement')
+          .then((m) => m.notifyDisplacedHolds(posLandlordId(req), propertyId, displacedHolds))
+          .catch((e) => logger.error({ err: e, saleId: tx.id }, '[POS] could not tell guests their unpaid hold was moved'))
+      }
+      // 10/3 (review): paid toward a reservation but not in full — other links'
+      // open card pages may ask more than is left now; those pages close.
+      if (linkRes && !linkPaysInFull) await closeStaleLinkPages(payLink.booking_id, payLink.id)
+      // 10/3 (review): paid toward it, something still owed, and nothing set to
+      // ask for it — the landlord is told once (posPayLinks tellLandlordIfLeftOwed).
+      if (linkRes && !linkPaysInFull) {
+        await tellLandlordIfLeftOwed({ link: payLink, saleId: tx.id, paid: linkRes.charge, payer: payLink.customer_name ?? null })
+          .catch((e) => logger.error({ err: e, payLinkId: payLink.id, saleId: tx.id }, '[POS] could not tell the landlord what is still owed on a reservation'))
+      }
 
       // Post-commit best-effort: fire any auto-PO drafts that were
       // queued during the line-item loop. autoDraftPO already has its
@@ -1356,33 +2573,71 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       // keeping it is an attach, not a second charge.
       let customerOut: any = null
       if (saleCustomerId) {
-        const c = await queryOne<any>(`SELECT id, first_name, last_name, email FROM pos_customers WHERE id = $1`, [saleCustomerId])
+        // 10/2 (review): the email on a resident's own account only while they
+        // live here (recordContactSql) — never to a company with a looser tie,
+        // and never to one they have left (decisions #10).
+        const c = await queryOne<any>(
+          `SELECT c.id, c.tenant_id, COALESCE(u.first_name, c.first_name) AS first_name, COALESCE(u.last_name, c.last_name) AS last_name,
+                  ${recordContactSql('c', 'u').email} AS email
+             FROM pos_customers c LEFT JOIN tenants tn ON tn.id = c.tenant_id LEFT JOIN users u ON u.id = tn.user_id
+            WHERE c.id = $1`, [saleCustomerId])
+        // 10/2 (review): "N previous purchases" is THIS company's count — a
+        // resident who also buys at another company's register brings none
+        // of those sales here.
         const prior = await queryOne<{ n: string }>(
-          `SELECT COUNT(*)::text AS n FROM pos_transactions WHERE pos_customer_id = $1 AND id <> $2`, [saleCustomerId, tx.id])
+          `SELECT COUNT(*)::text AS n FROM pos_transactions
+            WHERE id <> $2 AND landlord_id = $4 AND (pos_customer_id = $1 OR ($3::uuid IS NOT NULL AND tenant_id = $3))`,
+          [saleCustomerId, tx.id, c?.tenant_id ?? null, posLandlordId(req)])
+        const isResident = !!c?.tenant_id
+        // Whose the tapped card is now, and whether it is already kept.
+        const k = cardIdentity ? await queryOne<{ pos_customer_id: string; stripe_payment_method_id: string | null }>(
+          `SELECT pos_customer_id, stripe_payment_method_id FROM pos_customer_cards WHERE landlord_id = $1 AND fingerprint = $2`,
+          [posLandlordId(req), cardIdentity.fingerprint]) : null
+        const cardIsTheirs = !!k && k.pos_customer_id === saleCustomerId
+        const cardSaved = cardIsTheirs && !!k?.stripe_payment_method_id
         // Only what is missing is asked on the reader: keep the card (when the
-        // tap yielded a reusable one), a name (phone wallets carry none), an
-        // email for the receipt.
+        // tap yielded a reusable one and it is theirs), a name (phone wallets
+        // carry none — and never once somebody was picked), an email for the
+        // receipt. 10/2: a resident is never asked — card on file is for
+        // guests, and their email is on their account.
         const asks = {
-          askSave:  !!(cardCustomer && cardIdentity?.generatedCard && !cardCustomer.cardSaved),
+          askSave:  !!(cardIdentity?.generatedCard && cardIsTheirs && !cardSaved && !isResident),
           askName:  !!(cardCustomer && c && c.first_name === 'Card' && c.last_name === 'Customer'),
-          askEmail: !!(cardCustomer && c && !c.email),
+          askEmail: !!(cardIdentity && c && !c.email && !isResident),
         }
         let prompting = false
         if (saleReaderId && (asks.askSave || asks.askName || asks.askEmail)
             && await assertReaderBelongsToLandlord(posLandlordId(req), saleReaderId)) {
           prompting = await startSaveCardPrompt(saleReaderId, asks)
         }
+        const said = cardOutcome ? cardOutcomeSentence(cardOutcome) : null
         customerOut = c ? {
           id: c.id, firstName: c.first_name, lastName: c.last_name, email: c.email,
+          isResident, tenantId: c.tenant_id ?? null,
           last4: cardIdentity?.last4 ?? null, brand: cardIdentity?.brand ?? null,
           isNew: cardCustomer?.isNew ?? false, priorPurchases: Number(prior?.n ?? 0),
-          cardSaved: cardCustomer?.cardSaved ?? false, cardKeepable: !!cardIdentity?.generatedCard,
+          cardSaved, cardKeepable: !!cardIdentity?.generatedCard,
+          // 10/2: what happened to the card, when the clerk should know — the
+          // earlier sales on it are theirs now, or it is somebody else's card.
+          cardNote: said && cardOutcome && cardOutcome.kind !== 'attached' && cardOutcome.kind !== 'already'
+            ? `${said.charAt(0).toUpperCase()}${said.slice(1)}.` : null,
+          // 10/2 (review): the card's record and its other sales folded into the
+          // person picked — Undo puts them back if the pick was wrong.
+          cardUndo: c ? saleTimeUndo({ landlordId: posLandlordId(req), userId: req.user!.userId, saleId: tx.id,
+            customerId: c.id, tenantId: tx.tenant_id ?? null, outcome: cardOutcome }) : null,
           prompting, asks: prompting ? asks : null, readerId: prompting ? saleReaderId : null,
         } : null
       }
-      res.status(201).json({ success: true, data: { ...tx, stayBooking, customer: customerOut } })
+      // 10/3 (review): the sale's own lines — a reservation's or a stay's at
+      // its price before its lodging tax — so the receipt's lines and tax add
+      // up to its total.
+      const saleLines = pricedItems.map((it: any) => (it?.[RESERVATION_LINE] ? reservationSaleLine(it, it[STAY_TAX]) : it))
+        .filter((it: any) => Number(it?.qty) > 0)
+        .map((it: any) => ({ id: it.id ?? null, name: String(it.name ?? 'Item'), qty: Number(it.qty) || 0, price: Number(it.price) || 0, tax: Number(it.tax) || 0 }))
+      res.status(201).json({ success: true, data: { ...tx, stayBooking, customer: customerOut, items: saleLines } })
     } catch (e) {
       if (txnOpen) await client.query('ROLLBACK').catch(() => {})
+      await releaseCardOnFile()
       throw e
     } finally {
       client.release()
@@ -1424,9 +2679,10 @@ posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_da
     const { period = 'today' } = req.query
     // W-12 (S531): optional ?propertyId= — sales history is viewed per
     // property; the filter applies to every query below.
-    const salesProp = req.query.propertyId ? String(req.query.propertyId) : null
-    const propFilter = salesProp ? `AND t.property_id = $2` : ''
-    const salesParams: any[] = salesProp ? [posLandlordId(req), salesProp] : [posLandlordId(req)]
+    // 10/2: a cashier sees the properties they are assigned to, nothing more.
+    const { propertyId: salesProp, scoped } = await salesScope(req)
+    const propFilter = salesProp ? `AND t.property_id = $2` : scoped ? `AND t.property_id = ANY($2::uuid[])` : ''
+    const salesParams: any[] = salesProp ? [posLandlordId(req), salesProp] : scoped ? [posLandlordId(req), scoped] : [posLandlordId(req)]
 
     // S390: dateFilter must qualify `created_at` with the `t.` alias —
     // the topItems and byCategory queries JOIN pos_transaction_items
@@ -1976,9 +3232,11 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
   let txnOpen = false
   try {
     const { amount, reason, items, refundMethod } = req.body
-    const tx = await queryOne<any>('SELECT * FROM pos_transactions WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
-    if (!tx) throw new AppError(404, 'Transaction not found')
-    if (tx.status === 'voided') throw new AppError(400, 'Cannot refund a voided transaction')
+    const tx = /^[0-9a-f-]{36}$/i.test(String(req.params.id))
+      ? await queryOne<any>('SELECT * FROM pos_transactions WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)]) : null
+    if (!tx) throw new AppError(404, SALE_GONE)
+    await assertSaleInScope(req.user, tx.property_id)
+    if (tx.status === 'voided') throw new AppError(400, 'That sale was voided, so there is nothing to refund — press Cancel.')
 
     // S339: refund_method enforcement. GAM does not process refunds back
     // to a card via Stripe — cashier-physical payout only.
@@ -1994,7 +3252,7 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     } else {
       const picked = (refundMethod ?? 'cash') as string
       if (picked !== 'cash' && picked !== 'check') {
-        throw new AppError(400, `refundMethod must be 'cash' or 'check' for non-FlexCharge sales (got '${picked}')`)
+        throw new AppError(400, 'A refund is paid back in cash or by check — pick one, then press Refund again.')
       }
       resolvedMethod = picked
     }
@@ -2002,7 +3260,7 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     // Coerce both sides to numbers: tx.total comes back from pg numeric
     // as a string, and amount may arrive as a number or string from JSON.
     const refundAmt = Number(amount ?? tx.total)
-    if (!Number.isFinite(refundAmt) || refundAmt <= 0) throw new AppError(400, 'Refund amount must be positive')
+    if (!Number.isFinite(refundAmt) || refundAmt <= 0) throw new AppError(400, 'Type how much to refund (more than $0), then press Refund again.')
     const txTotalNum = Number(tx.total)
 
     // S340: FlexCharge reversal needs the originating flex_charge_transactions
@@ -2014,7 +3272,7 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
         `SELECT account_id FROM flex_charge_transactions WHERE pos_transaction_id = $1 AND amount > 0 ORDER BY created_at LIMIT 1`,
         [tx.id])
       if (!orig) {
-        throw new AppError(409, 'FlexCharge sale has no originating flex_charge_transactions row to reverse')
+        throw new AppError(409, 'This charge-account sale cannot be refunded here — its charge was not found on the account. Press Cancel and ask the owner to check the account.')
       }
       flexChargeAccountId = orig.account_id
     }
@@ -2034,15 +3292,36 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     // could pay out MORE than the sale — a physical drawer loss on cash/check,
     // or a negative FlexCharge balance on 'charge'. Refunds accumulate across
     // multiple partials; refund_amount is the cumulative total, not the last one.
-    await client.query('SELECT 1 FROM pos_transactions WHERE id=$1 FOR UPDATE', [tx.id])
+    // 10/3 (review): read the status again under the lock — a Void that
+    // committed while this refund waited has already told the clerk to hand
+    // the money back (and restocked), so a refund now would pay out twice.
+    const locked = (await client.query<{ status: string }>(
+      'SELECT status FROM pos_transactions WHERE id=$1 FOR UPDATE', [tx.id])).rows[0]
+    if (!locked) throw new AppError(404, SALE_GONE)
+    if (locked.status === 'voided') throw new AppError(400, 'That sale was voided, so there is nothing to refund — press Cancel.')
+    // 10/4 (fix round 2): a card refund Stripe sent back no longer counts as
+    // refunded (pos_refunds.reversed_at) — what is still owed to the guest is
+    // its open replacement, below.
     const priorRefunded = Number((await client.query<{ s: string }>(
-      `SELECT COALESCE(SUM(amount),0)::text AS s FROM pos_refunds WHERE transaction_id=$1`,
+      `SELECT COALESCE(SUM(amount),0)::text AS s FROM pos_refunds WHERE transaction_id=$1 AND reversed_at IS NULL`,
       [tx.id])).rows[0].s)
+    // 10/4 (decisions #38, fix round 2): while an early check-out refund to
+    // the card on this sale has not gone out yet (sending, or waiting for Try
+    // again), the register refunds nothing on the sale: handing that money
+    // back here as well would pay it twice when Try again sends it. It is
+    // finished from the stay's Check out window (Try again, or Give it back in
+    // cash instead), and only then can anything more be refunded here.
+    const { saleRefundsWaiting } = await import('../services/earlyCheckOut')
+    const waiting = await saleRefundsWaiting(client, tx.id)
+    if (waiting > 0.005) {
+      throw new AppError(409, `This sale has a $${waiting.toFixed(2)} refund to the card waiting for a guest who left early, so nothing was refunded here. `
+        + `Finish that first on the schedule: open the stay's Check out window and press Try again, or Give it back in cash instead.`)
+    }
     const remaining = Math.round((txTotalNum - priorRefunded) * 100) / 100
     if (refundAmt > remaining + 0.005) {
       throw new AppError(400, priorRefunded > 0
-        ? `Refund exceeds the remaining refundable amount ($${remaining.toFixed(2)}; $${priorRefunded.toFixed(2)} already refunded).`
-        : `Refund exceeds the sale total ($${txTotalNum.toFixed(2)}).`)
+        ? `That is more than is left to refund — $${remaining.toFixed(2)} at most ($${priorRefunded.toFixed(2)} was already refunded). Change the amount, then press Refund again.`
+        : `That is more than the sale — $${txTotalNum.toFixed(2)} at most. Change the amount, then press Refund again.`)
     }
     const cumulativeRefunded = Math.round((priorRefunded + refundAmt) * 100) / 100
     const isFullRefund = cumulativeRefunded >= txTotalNum - 0.005
@@ -2068,7 +3347,19 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     await client.query('COMMIT')
     txnOpen = false
 
-    res.json({ success: true, data: { refundAmount: refundAmt, refundMethod: resolvedMethod } })
+    // 10/3 (review, decisions #23): a refund never touches a reservation — the
+    // schedule is where stays change. Say so, so the clerk cancels it there
+    // when the guest is not staying. (A stay already checked out is over —
+    // nothing on the schedule is left to cancel.)
+    const live = await queryOne<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM unit_bookings b
+        WHERE b.status NOT IN ('cancelled','no_show','checked_out')
+          AND (b.pos_transaction_id = $1
+               OR b.id = (SELECT booking_id FROM pos_pay_links WHERE id = $2)
+               OR b.id = (SELECT booking_id FROM pos_open_tickets WHERE id = $3))`,
+      [tx.id, tx.pay_link_id ?? null, tx.open_ticket_id ?? null]).catch(() => null)
+    res.json({ success: true, data: { refundAmount: refundAmt, refundMethod: resolvedMethod,
+      reservationStillOnSchedule: Number(live?.n ?? 0) > 0 } })
   } catch (e) {
     if (txnOpen) await client.query('ROLLBACK').catch(() => {})
     next(e)
@@ -2077,14 +3368,90 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
   }
 })
 
+/**
+ * 10/3 (review) — WHICH SALES A VOID MAY TOUCH. A void says the sale never
+ * happened. It is refused where money really moved or something rides on the
+ * sale:
+ *   - 'card': a card (or card on file) was charged — voiding would leave the
+ *     money taken with no sale to pay the landlord for. Refund instead.
+ *   - 'pay_link': the sale paid a pay link — voiding would leave the link paid
+ *     (and any reservation on it confirmed) with no sale behind it.
+ *   - 'stay': the sale paid for a stay (a booking names it, or a line is a
+ *     stay) — voiding would leave the stay paid with no sale behind it. Refund
+ *     the money; cancel the stay on the schedule.
+ *   - 'charge': 10/3 (review) the sale went on the customer's charge account —
+ *     a void would leave the charge on their account (the statement run bills
+ *     it) with no sale behind it. Refund takes it off their account.
+ *   - 'ticket': 10/3 (review) the sale settled a delivery ticket — a void would
+ *     leave the ticket settled and the goods owed nowhere. Refund instead.
+ * One SQL expression (null when a void is allowed), read by the void itself
+ * and by History, which offers Void only where it would go through.
+ */
+const voidBlockedSql = (t: string) => `CASE
+  WHEN ${t}.payment_method IN ('card', 'card_on_file') THEN 'card'
+  WHEN ${t}.payment_method = 'charge' THEN 'charge'
+  WHEN ${t}.pay_link_id IS NOT NULL THEN 'pay_link'
+  WHEN EXISTS (SELECT 1 FROM unit_bookings vb WHERE vb.pos_transaction_id = ${t}.id)
+    OR EXISTS (SELECT 1 FROM pos_transaction_items vti JOIN pos_items vpi ON vpi.id = vti.item_id
+                WHERE vti.transaction_id = ${t}.id AND vpi.stay_unit IS NOT NULL) THEN 'stay'
+  WHEN ${t}.open_ticket_id IS NOT NULL THEN 'ticket'
+  ELSE NULL END`
+type VoidBlocked = 'card' | 'charge' | 'pay_link' | 'stay' | 'ticket'
+const VOID_BLOCKED_WORDS: Record<VoidBlocked, string> = {
+  card: 'This sale was paid by card, so it cannot be voided — the card was charged. Press Refund instead to give the money back.',
+  charge: 'This sale is on their charge account, so it cannot be voided. Press Refund instead; that takes it off their account.',
+  pay_link: 'This sale paid a pay link, so it cannot be voided — press Refund to give the money back. If it paid for a stay, cancel the stay on the schedule.',
+  stay: 'This sale paid for a stay, so it cannot be voided — press Refund to give the money back, and cancel the stay on the schedule.',
+  ticket: 'This sale settled a delivery ticket, so it cannot be voided — the ticket stays settled. Press Refund instead to give the money back.',
+}
+
+/**
+ * A void says the sale never happened: the sale is marked voided and, 10/3
+ * (review), what it took off the shelf goes back — each stock movement the
+ * sale made (pos_inventory_log 'sale' rows), by what it actually took (a shelf
+ * already at 0 took nothing). All in one transaction with the sale locked, so
+ * two presses void (and restock) once.
+ */
 posRouter.post('/transactions/:id/void', requirePerm('pos.void'), async (req, res, next) => {
   try {
     const { reason } = req.body
-    const tx = await queryOne<any>('SELECT * FROM pos_transactions WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
-    if (!tx) throw new AppError(404, 'Transaction not found')
-    if (tx.status !== 'completed') throw new AppError(400, 'Only completed transactions can be voided')
-    await query('UPDATE pos_transactions SET status=$1, void_reason=$2 WHERE id=$3',
-      ['voided', reason||null, tx.id])
+    const tx = /^[0-9a-f-]{36}$/i.test(String(req.params.id))
+      ? await queryOne<any>('SELECT * FROM pos_transactions WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)]) : null
+    if (!tx) throw new AppError(404, SALE_GONE)
+    await assertSaleInScope(req.user, tx.property_id)
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const now = (await client.query<{ status: string; why: string | null }>(
+        `SELECT t.status, ${voidBlockedSql('t')} AS why FROM pos_transactions t WHERE t.id = $1 FOR UPDATE OF t`, [tx.id])).rows[0]
+      if (!now) throw new AppError(404, SALE_GONE)
+      if (now.status !== 'completed') throw new AppError(400, `That sale was already ${now.status === 'voided' ? 'voided' : 'refunded'}, so it cannot be voided — press Cancel.`)
+      // 10/3 (review): never a card or charge-account sale, or one that paid a
+      // pay link, a stay or a delivery ticket (voidBlockedSql).
+      if (now.why) throw new AppError(409, VOID_BLOCKED_WORDS[now.why as VoidBlocked])
+      await client.query('UPDATE pos_transactions SET status=$1, void_reason=$2 WHERE id=$3',
+        ['voided', reason || null, tx.id])
+      const took = (await client.query<{ item_id: string; qty: string }>(
+        `SELECT item_id, SUM(stock_before - stock_after)::text AS qty FROM pos_inventory_log
+          WHERE reference_id = $1 AND landlord_id = $2 AND reason = 'sale'
+          GROUP BY item_id`, [tx.id, posLandlordId(req)])).rows
+      for (const t of took) {
+        const qty = Number(t.qty)
+        if (!(qty > 0)) continue
+        const item = (await client.query<{ stock_qty: string }>(
+          `SELECT stock_qty FROM pos_items WHERE id = $1 AND landlord_id = $2 FOR UPDATE`, [t.item_id, posLandlordId(req)])).rows[0]
+        if (!item) continue
+        const before = Number(item.stock_qty)
+        const after = before + qty
+        await client.query('UPDATE pos_items SET stock_qty = $1, updated_at = NOW() WHERE id = $2', [after, t.item_id])
+        await client.query(`INSERT INTO pos_inventory_log (item_id, landlord_id, change_qty, reason, notes, reference_id, stock_before, stock_after)
+          VALUES ($1, $2, $3, 'return', 'Sale voided', $4, $5, $6)`, [t.item_id, posLandlordId(req), qty, tx.id, before, after])
+      }
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -2093,16 +3460,23 @@ posRouter.post('/transactions/:id/void', requirePerm('pos.void'), async (req, re
 posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), async (req, res, next) => {
   try {
     // W-12 (S531): optional ?propertyId= — history is viewed per property.
-    const txProp = req.query.propertyId ? String(req.query.propertyId) : null
+    // 10/2: and only a property the caller is assigned to; with none named, a
+    // scoped cashier sees their own properties' sales.
+    const { propertyId: txProp, scoped } = await salesScope(req)
     const txParams: any[] = [posLandlordId(req)]
-    const txPropFilter = txProp ? `AND t.property_id = $${txParams.push(txProp)}` : ''
+    const txPropFilter = txProp ? `AND t.property_id = $${txParams.push(txProp)}`
+      : scoped ? `AND t.property_id = ANY($${txParams.push(scoped)}::uuid[])` : ''
     // S654 (Nic): a customer's purchase history — the receipt panel links here.
     const txCust = req.query.posCustomerId ? String(req.query.posCustomerId) : null
-    const txCustFilter = txCust ? `AND t.pos_customer_id = $${txParams.push(txCust)}` : ''
+    // 10/2: a resident's history is every sale naming them — including sales
+    // rung before their register record existed, which carry only their tenant id.
+    const txCustFilter = txCust ? (() => { const n = txParams.push(txCust)
+      return `AND (t.pos_customer_id = $${n} OR t.tenant_id = (SELECT pc2.tenant_id FROM pos_customers pc2 WHERE pc2.id = $${n} AND pc2.landlord_id = $1))` })() : ''
     const txns = await query<any>(`
       SELECT t.*,
         u.first_name || ' ' || u.last_name AS tenant_name,
-        NULLIF(TRIM(pc.first_name || ' ' || pc.last_name), '') AS customer_name,
+        CASE WHEN pc.tenant_id IS NOT NULL THEN NULLIF(TRIM(pu.first_name || ' ' || pu.last_name), '')
+             ELSE NULLIF(TRIM(pc.first_name || ' ' || pc.last_name), '') END AS customer_name,
         pc.email AS customer_email,
         pc.first_name AS customer_first_name, pc.last_name AS customer_last_name, pc.phone AS customer_phone,
         (SELECT COUNT(*) FROM pos_transaction_items WHERE transaction_id=t.id) as item_count,
@@ -2117,12 +3491,16 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
              WHEN t.payment_method = 'card' AND t.paid_online THEN 'pay_link'
              WHEN t.payment_method = 'card' THEN 'card_reader'
              ELSE t.payment_method END AS tender,
+        -- 10/3 (review): why Void is not offered on this sale (null: it may be voided).
+        ${voidBlockedSql('t')} AS void_blocked,
         (SELECT json_agg(json_build_object('name', i.item_name, 'qty', i.qty, 'price', i.unit_price, 'subtotal', i.subtotal) ORDER BY i.created_at)
            FROM pos_transaction_items i WHERE i.transaction_id = t.id) AS items
       FROM pos_transactions t
       LEFT JOIN tenants tn ON tn.id = t.tenant_id
       LEFT JOIN users u ON u.id = tn.user_id
       LEFT JOIN pos_customers pc ON pc.id = t.pos_customer_id
+      LEFT JOIN tenants ptn ON ptn.id = pc.tenant_id
+      LEFT JOIN users pu ON pu.id = ptn.user_id
       WHERE t.landlord_id=$1 ${txPropFilter} ${txCustFilter}
       ORDER BY t.created_at DESC LIMIT 100`, txParams)
     res.json({ success: true, data: txns })
@@ -2501,7 +3879,7 @@ async function ownTerminalIntent(req: any, paymentIntentId: string): Promise<{ l
   const intent = await retrieveTerminalPaymentIntent({ paymentIntentId })
   const landlordId = intent.metadata?.gam_landlord_id
   if (intent.metadata?.gam_purpose !== 'pos_terminal' || !landlordId || !ownsLandlord(req.user, landlordId)) {
-    throw new AppError(404, 'Card charge not found')
+    throw new AppError(404, 'That card charge is not one of this register\'s — press Charge again to start a new one.')
   }
   return { landlordId, propertyId: intent.metadata?.gam_property_id ?? null, intent }
 }
@@ -2518,15 +3896,25 @@ function assertReaderBelongsToLandlord(landlordId: string, stripeReaderId: strin
 // description?, posDraftRef? }.
 posRouter.post('/terminal/payment-intents', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const { propertyId, description, posDraftRef, items, discountAmount } = req.body
-    if (!propertyId) throw new AppError(400, 'propertyId is required')
+    const { propertyId, description, posDraftRef, discountAmount } = req.body
+    const items = lowerLineIds(req.body.items)   // 10/2 (review): ids as the database writes them
+    if (!propertyId) throw new AppError(400, 'A property must be selected — pick it at the top of the register; sales are per-property.')
+    // 10/2 (review): a card charge only at a property the caller works.
+    await assertPropertyInScope(req.user, propertyId)
     // S648 (Nic): the card reader charges the cart (plus the card fee when the
     // property passes it on), and the amount is the server's, computed from
     // the cart — not a number the register sends.
-    if (!Array.isArray(items) || items.length === 0) throw new AppError(400, 'items are required')
-    const quoted = await serverCartTotals(posLandlordId(req), items, 'card', discountAmount, undefined, propertyId)
+    if (!Array.isArray(items) || items.length === 0) throw new AppError(400, 'The cart is empty — add what they are buying, then press Charge again.')
+    assertCartNumbers(items, 'Charge')
+    // 10/2 (review): refused before the card is asked for, not after.
+    await assertWholeStays(posLandlordId(req), items, 'Charge')
+    // 10/2 (decisions #9): a reservation ticket's card charge is the
+    // reservation's own price — the same figure the sale will check it against.
+    const priced = await cartAsCharged(posLandlordId(req), propertyId, items, req.body.openTicketId, discountAmount, 'Charge', req.body.payLinkId,
+      { stay: req.body.stay, needSite: true })
+    const quoted = await serverCartTotals(posLandlordId(req), priced.items, 'card', discountAmount, undefined, propertyId)
     const amountCents = Math.round(quoted.total * 100)
-    if (amountCents <= 0) throw new AppError(400, 'Nothing to charge')
+    if (amountCents <= 0) throw new AppError(400, 'There is nothing to charge — the total is $0. Add what they are buying, then press Charge again.')
 
     // Same posture as reader registration — a cashier on landlord A can't
     // tag a charge to landlord B's property.
@@ -2580,23 +3968,29 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
   try {
     const paymentIntentId = req.params.id
     const { stripeReaderId } = req.body
-    if (!stripeReaderId) throw new AppError(400, 'stripeReaderId is required')
+    if (!stripeReaderId) throw new AppError(400, 'Pick the card reader first (Connect reader), then press Charge again.')
 
     const { landlordId, propertyId, intent } = await ownTerminalIntent(req, paymentIntentId)
     const ownerRow = await assertReaderBelongsToLandlord(landlordId, stripeReaderId)
-    if (!ownerRow) throw new AppError(404, 'That reader is not paired to the company this sale belongs to')
+    if (!ownerRow) throw new AppError(404, 'That reader is not paired to the company this sale belongs to — pick this register\'s reader (Connect reader), then press Charge again.')
     // S654 (Nic): "it'd be nice to see a little bit of a breakdown." The reader
     // shows the lines, tax, card fee and total before it asks for the card —
     // priced by the server from the same cart (a changed cart is refused),
     // never from figures the register typed.
-    const { items, discountAmount } = req.body
+    const { discountAmount } = req.body
+    const items = lowerLineIds(req.body.items)   // 10/2 (review): ids as the database writes them
     if (Array.isArray(items) && items.length) {
-      const quoted = await serverCartTotals(landlordId, items, 'card', discountAmount, undefined, propertyId)
+      // 10/2 (decisions #9): priced the way the charge was (a reservation's line
+      // at its own price, untaxed) — the cart names its ticket on that line.
+      const priced = await cartAsCharged(landlordId, propertyId, items, req.body.openTicketId, discountAmount, 'Charge', req.body.payLinkId,
+        { stay: req.body.stay, needSite: true })
+      const quoted = await serverCartTotals(landlordId, priced.items, 'card', discountAmount, undefined, propertyId)
       if (Math.round(quoted.total * 100) !== intent.amount) {
-        throw new AppError(409, 'The cart changed since this card charge was created — start the charge again.')
+        throw new AppError(409, 'The cart changed since this card charge was started — press Charge again.')
       }
-      const who = await personOnSale(landlordId, { tenantId: req.body.tenantId, posCustomerId: req.body.posCustomerId })
-      const shown = await showCartOnReader({ stripeReaderId, lines: registerReaderLines(items, quoted.surcharge),
+      // 10/2: the breakdown never fails over the person — no name instead.
+      const who = await nameForReader(landlordId, { tenantId: req.body.tenantId, posCustomerId: req.body.posCustomerId })
+      const shown = await showCartOnReader({ stripeReaderId, lines: registerReaderLines(priced.items, quoted.surcharge),
         taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents: intent.amount, who,
         owner: `register:${(req as any).user.userId}:${propertyId}` })
       // S654 (Nic): "it needs to be there the whole time … until the payment is
@@ -2633,29 +4027,46 @@ posRouter.post('/terminal/readers/:stripeReaderId/cart', requirePerm('pos.ring_s
   try {
     const stripeReaderId = String(req.params.stripeReaderId)
     const propertyId = typeof req.body?.propertyId === 'string' ? req.body.propertyId : ''
-    if (!propertyId) throw new AppError(400, 'A property must be selected — sales are per-property')
+    if (!propertyId) throw new AppError(400, 'A property must be selected — pick it at the top of the register; sales are per-property.')
     await assertPropertyInScope(req.user, propertyId)
     const landlordId = posLandlordId(req)
     await assertPropertyIsLandlords(landlordId, propertyId)
     if (!(await assertReaderBelongsToLandlord(landlordId, stripeReaderId))) {
-      throw new AppError(404, 'That reader is not paired to the company this register belongs to')
+      throw new AppError(404, 'That reader is not paired to the company this register belongs to — pick this register\'s reader (Connect reader).')
     }
-    const items = Array.isArray(req.body?.items) ? req.body.items.filter((it: any) => Number(it?.qty) > 0) : []
+    // 10/2 (review): ids as the database writes them.
+    const items = Array.isArray(req.body?.items) ? lowerLineIds(req.body.items).filter((it: any) => Number(it?.qty) > 0) : []
     const owner = `register:${req.user.userId}:${propertyId}`
     if (!items.length) {
       const cleared = await clearCartOnReader(stripeReaderId, owner)
       return res.json({ success: true, data: { shown: false, cleared } })
     }
-    for (const it of items) assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
-    await assertCashierPricing(req, items.map((it: any) => ({ itemId: it.id, price: it.price })), req.body?.discountAmount)
-    const quoted = await serverCartTotals(landlordId, items, 'card', req.body?.discountAmount, undefined, propertyId)
-    const who = await personOnSale(landlordId, { tenantId: req.body?.tenantId, posCustomerId: req.body?.posCustomerId })
+    assertCartNumbers(items, 'Charge')
+    {
+      const own = cashiersOwn(items.map((it: any) => ({ itemId: it.id, price: it.price, qty: it.qty })), req.body?.discountAmount,
+        canSetPrices(req.user) ? null : await termsOfOpenLinks(landlordId, propertyId))
+      await assertCashierPricing(req, own.lines, own.discount)
+    }
+    // 10/2 (decisions #9): a reservation's line shows at its own price, as it is charged.
+    const priced = await cartAsCharged(landlordId, propertyId, items, req.body?.openTicketId, req.body?.discountAmount, 'Charge', req.body?.payLinkId)
+    // 10/3 (review): a stay with no site and dates yet has no price — it stays
+    // off the customer's screen (and out of its total) until it is priced.
+    const showable = priced.items.filter((it: any) => !it?.[UNPRICED_STAY])
+    if (!showable.length) {
+      const cleared = await clearCartOnReader(stripeReaderId, owner)
+      return res.json({ success: true, data: { shown: false, cleared, stayNotPriced: true } })
+    }
+    const quoted = await serverCartTotals(landlordId, showable, 'card', req.body?.discountAmount, undefined, propertyId)
+    // 10/2 (the Scott Duffy ticket): putting the cart up never fails over the
+    // person. Somebody who cannot be named here shows no name; the sale itself
+    // still checks who it names.
+    const who = await nameForReader(landlordId, { tenantId: req.body?.tenantId, posCustomerId: req.body?.posCustomerId })
     const action = await readerAction(stripeReaderId).catch(() => null)
     if (action && action.status === 'in_progress' && action.type !== 'set_reader_display') {
       return res.json({ success: true, data: { shown: false, busy: action.type } })
     }
     const totalCents = Math.round(Number(quoted.total) * 100)
-    const shown = await showCartOnReader({ stripeReaderId, lines: registerReaderLines(items, quoted.surcharge),
+    const shown = await showCartOnReader({ stripeReaderId, lines: registerReaderLines(showable, quoted.surcharge),
       taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents, who, owner })
     res.json({ success: true, data: { shown: !!shown, totalCents } })
   } catch (e) { next(e) }
@@ -2700,7 +4111,7 @@ posRouter.post('/terminal/payment-intents/:id/clear-reader', requirePerm('pos.ri
     const { landlordId } = await ownTerminalIntent(req, req.params.id)
     const readerId = typeof req.body?.stripeReaderId === 'string' ? req.body.stripeReaderId : ''
     if (!readerId || !(await assertReaderBelongsToLandlord(landlordId, readerId))) {
-      throw new AppError(404, 'That reader is not paired to the company this sale belongs to')
+      throw new AppError(404, 'That reader is not paired to the company this sale belongs to — pick this register\'s reader (Connect reader).')
     }
     await cancelReaderAction(readerId)
     res.json({ success: true, data: { cleared: true } })
@@ -2714,7 +4125,7 @@ async function ownedReaderByStripeId(req: any, stripeReaderId: string): Promise<
     `SELECT landlord_id FROM pos_terminal_readers
       WHERE stripe_reader_id = $1 AND landlord_id = ANY($2::uuid[]) AND status = 'active'`,
     [stripeReaderId, landlordScopeIds(req.user)])
-  if (!reader) throw new AppError(404, 'Reader not found')
+  if (!reader) throw new AppError(404, 'That reader is not paired to this register — pick it again under Connect reader.')
   return reader
 }
 
@@ -2723,11 +4134,21 @@ posRouter.get('/terminal/readers/:stripeReaderId/save-card-answer', requirePerm(
     const stripeReaderId = String(req.params.stripeReaderId)
     const reader = await ownedReaderByStripeId(req, stripeReaderId)
     const tx = await queryOne<any>(
-      `SELECT id, pos_customer_id, stripe_payment_intent_id FROM pos_transactions WHERE id = $1 AND landlord_id = $2`,
+      `SELECT id, property_id, pos_customer_id, stripe_payment_intent_id FROM pos_transactions WHERE id = $1 AND landlord_id = $2`,
       [String(req.query.transactionId ?? ''), reader.landlord_id])
-    if (!tx || !tx.pos_customer_id || !tx.stripe_payment_intent_id) throw new AppError(404, 'Sale not found')
+    if (!tx || !tx.pos_customer_id || !tx.stripe_payment_intent_id) throw new AppError(404, SALE_GONE)
+    // 10/2: the answer can email the sale's receipt, keep a card on its
+    // customer and name their record — a sale at a property the caller works.
+    await assertSaleInScope(req.user, tx.property_id)
     const answer = await readSaveCardAnswer(stripeReaderId)
     if (!answer.answered) return res.json({ success: true, data: { answered: false } })
+    // The record as it was when the customer answered. A name and an email
+    // typed together on the reader are the same customer's: a nameless card
+    // record they name AND give a known email for is that known person, though
+    // the name lands a moment before the email is looked at.
+    const before: StandIn | null = answer.email
+      ? await standInNow(db, tx.pos_customer_id)
+      : null
     let saved = false, reason: string | null = answer.reason ?? null
     // A name typed on the reader replaces the placeholder a name-less tap left.
     let nameSet: string | null = null
@@ -2752,7 +4173,7 @@ posRouter.get('/terminal/readers/:stripeReaderId/save-card-answer', requirePerm(
     // An email typed on the reader is the customer's: kept when we had none, and the receipt goes out.
     let receiptSentTo: string | null = null
     if (answer.email) {
-      receiptSentTo = await emailReceiptForSale(tx.id, answer.email, [reader.landlord_id])
+      receiptSentTo = await emailReceiptForSale(tx.id, answer.email, [reader.landlord_id], { standIn: before })
     }
     res.json({ success: true, data: { answered: true, saved, reason, receiptSentTo, nameSet } })
   } catch (e) { next(e) }
@@ -2773,18 +4194,30 @@ posRouter.post('/terminal/readers/:stripeReaderId/cancel-action', requirePerm('p
 posRouter.post('/transactions/:id/email-receipt', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
   try {
     const email = String(req.body?.email ?? '').trim().toLowerCase()
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new AppError(400, 'Enter a valid email address')
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new AppError(400, 'That email does not look right — check it, then press Send again.')
+    // 10/2: only a sale at a property the caller is assigned to.
+    const sale = await queryOne<{ property_id: string | null }>(
+      `SELECT property_id FROM pos_transactions WHERE id = $1 AND landlord_id = ANY($2::uuid[])`,
+      [String(req.params.id), landlordScopeIds(req.user)])
+    if (!sale) throw new AppError(404, SALE_GONE)
+    await assertSaleInScope(req.user, sale.property_id)
     const sentTo = await emailReceiptForSale(String(req.params.id), email, landlordScopeIds(req.user))
     res.json({ success: true, data: { sentTo } })
   } catch (e) { next(e) }
 })
 
-async function emailReceiptForSale(transactionId: string, email: string, landlordIds: string[]): Promise<string> {
+async function emailReceiptForSale(transactionId: string, email: string, landlordIds: string[],
+                                   opts: { standIn?: StandIn | null } = {}): Promise<string> {
   {
     const tx = await queryOne<any>(
       `SELECT t.*, p.name AS property_name, p.street1, p.street2, p.city, p.state, p.zip, l.business_name,
-              pc.first_name AS c_first, pc.last_name AS c_last, pc.email AS c_email, pc.phone AS c_phone,
-              u.first_name AS t_first, u.last_name AS t_last, u.email AS t_email
+              pc.first_name AS c_first, pc.last_name AS c_last, pc.email AS c_email, pc.phone AS c_phone, pc.tenant_id AS c_tenant_id,
+              u.first_name AS t_first, u.last_name AS t_last,
+              -- 10/2 (review): the email on a resident's own account is printed
+              -- only while they live under this company's leases
+              -- (tenantLivesHereSql) — never for a looser tie, and never once
+              -- they have left (decisions #10).
+              CASE WHEN ${tenantLivesHereSql('tn.id', 't.landlord_id')} THEN u.email END AS t_email
          FROM pos_transactions t
          JOIN landlords l ON l.id = t.landlord_id
          LEFT JOIN properties p ON p.id = t.property_id
@@ -2793,7 +4226,7 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
          LEFT JOIN users u ON u.id = tn.user_id
         WHERE t.id = $1 AND t.landlord_id = ANY($2::uuid[])`,
       [transactionId, landlordIds])
-    if (!tx) throw new AppError(404, 'Sale not found')
+    if (!tx) throw new AppError(404, SALE_GONE)
     const items = await query<any>(
       `SELECT item_name, qty, unit_price, subtotal FROM pos_transaction_items WHERE transaction_id = $1 ORDER BY created_at`, [tx.id])
     const lines = items.map(l => ({ description: String(l.item_name), quantity: Number(l.qty), unitPrice: Number(l.unit_price), lineTotal: Number(l.subtotal) }))
@@ -2803,8 +4236,10 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
     const buffer = await renderPosReceiptPdf({
       business: { name: tx.property_name || tx.business_name || 'Register', email: null, phone: null,
                   street1: tx.street1 ?? null, street2: tx.street2 ?? null, city: tx.city ?? null, state: tx.state ?? null, zip: tx.zip ?? null },
+      // A resident's name is the one on their account (10/2: their sale also
+      // names their register record, whose copy of the name nobody edits).
       customer: (tx.c_first || tx.t_first) ? {
-        firstName: tx.c_first ?? tx.t_first, lastName: tx.c_last ?? tx.t_last, companyName: null,
+        firstName: tx.t_first ?? tx.c_first, lastName: tx.t_last ?? tx.c_last, companyName: null,
         email: tx.c_email ?? tx.t_email ?? email, phone: tx.c_phone ?? null, street1: null, city: null, state: null, zip: null,
       } : null,
       receiptNumber, createdAt: tx.created_at, status: String(tx.status), paymentMethod: String(tx.payment_method),
@@ -2816,24 +4251,36 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
     const { emailPosReceipt } = await import('../services/email')
     await emailPosReceipt(email, tx.property_name || tx.business_name || 'GAM', receiptNumber, Number(tx.total), buffer,
       { relatedEntityType: 'pos_transaction', relatedEntityId: tx.id } as any)
-    if (tx.pos_customer_id && !tx.c_email) {
-      // S654 (Nic): "people aren't going to have the same email if they're a
-      // different person." An address another live customer of this company
-      // already has means THIS record (made from a card) is that person: fold
-      // it into them, cards and purchases included.
-      const existing = await queryOne<{ id: string }>(
-        `SELECT id FROM pos_customers WHERE landlord_id = $1 AND lower(email) = lower($2) AND archived_at IS NULL AND id <> $3`,
-        [tx.landlord_id, email, tx.pos_customer_id])
-      if (existing) {
-        const client = await getClient()
-        try {
-          await client.query('BEGIN')
-          await mergePosCustomers(client, { landlordId: tx.landlord_id, loserId: tx.pos_customer_id, into: existing.id })
-          await client.query('COMMIT')
-        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e } finally { client.release() }
-      } else {
-        await query(`UPDATE pos_customers SET email = $1, updated_at = NOW() WHERE id = $2`, [email, tx.pos_customer_id])
-      }
+    // 10/2: never on a resident's record — their email is their account's. And
+    // the receipt has already gone out: what follows is bookkeeping, so a
+    // failure in it is logged, never reported as a receipt that did not send.
+    if (tx.pos_customer_id && !tx.c_email && !tx.c_tenant_id) {
+      const client = await getClient()
+      try {
+        await client.query('BEGIN')
+        // S654 (Nic): "people aren't going to have the same email if they're a
+        // different person." An address this company already has — a register
+        // customer's, or a resident's account email — means a card record
+        // nobody confirmed is that person: it folds into them, cards and
+        // purchases included. 10/2: by the same rule as linking a sale — only
+        // a stand-in, and not when its card is printed with a different last
+        // name. A person the clerk or the customer named is never merged into
+        // someone on an address alone. An address held by a closed record is
+        // left alone (it cannot be on two records).
+        let same: { customerId?: string; tenantId?: string } | null = null
+        let closed = false
+        try { same = await findSamePerson(client, tx.landlord_id, email, null) } catch { closed = true }
+        if (same?.customerId || same?.tenantId) {
+          const x = opts.standIn?.id === tx.pos_customer_id ? opts.standIn : await standInNow(client, tx.pos_customer_id)
+          if (x) await foldStandInInto(client, tx.landlord_id, x, same)
+        } else if (!closed) {
+          await client.query(`UPDATE pos_customers SET email = $1, updated_at = NOW() WHERE id = $2`, [email, tx.pos_customer_id])
+        }
+        await client.query('COMMIT')
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {})
+        logger.warn({ err: e, saleId: tx.id }, '[POS] receipt sent; the customer record was not updated')
+      } finally { client.release() }
     }
     return email
   }
@@ -2854,93 +4301,117 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
 // name.
 
 const PHONE_DIGITS = `regexp_replace(COALESCE($$X$$, ''), '\\D', '', 'g')`
+
+// 10/2 (Nic, front desk foolproof): each refusal says what to press next.
+const EMAIL_TAKEN_PICK = 'That email is already on another customer — type their name and pick them from the list instead, or leave the email blank.'
+const EMAIL_TAKEN_EDIT = 'That email is already on another customer — use a different email, or merge the two from the Customers tab.'
+const CUSTOMER_GONE = 'That customer was merged or closed — open the Customers tab again to see who is current.'
+const NEW_PERSON_WORDS: Record<string, string> = {
+  propertyId: 'Pick the property at the top of the register first, then press Add customer again.',
+  firstName: 'Type at least a first name, then press Add customer.',
+  lastName: 'That last name is too long — shorten it, then press Add customer again.',
+  email: 'That email does not look right — check it, or leave it blank, then press Add customer again.',
+  phone: 'That phone number is too long — check it, then press Add customer again.',
+  match: 'That pick has run out — type their name again and pick them from the list.',
+}
 function phoneDigits(col: string): string { return PHONE_DIGITS.replace('$$X$$', col) }
 
-// S654 (Nic): "is there a way if I had selected an existing customer to link to
-// the ticket? Which I don't see a way to do from the point of sale screen." The
-// register's people for any sale: this property's residents and the company's
-// register customers, one list. Another company's people never appear.
-posRouter.get('/people', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+// 10/2 (Nic): "it should be type their name, not a scroll down list... type
+// somebody's last name and have it pop up." The register's type-ahead: this
+// property's residents and this company's register customers by part of a
+// name, email or phone — and, settled 10/2, everyone else on GAM by part of a
+// name, or an email or phone typed whole, as a name and a masked hint only
+// (services/posPeople searchElsewhere). Two characters before anything is looked up; a search over
+// 120 characters is refused; looking elsewhere is limited per person.
+posRouter.get('/people', requirePerm('pos.ring_sale'), peopleQueryGuard, peopleSearchLimiter, crossCompanyLimiter, async (req: any, res, next) => {
   try {
     const propertyId = String(req.query.propertyId ?? '')
-    if (!/^[0-9a-f-]{36}$/i.test(propertyId)) throw new AppError(400, 'A property must be selected')
+    if (!/^[0-9a-f-]{36}$/i.test(propertyId)) throw new AppError(400, 'Pick the property at the top of the register first.')
     await assertPropertyInScope(req.user, propertyId)
     const landlordId = posLandlordId(req)
     await assertPropertyIsLandlords(landlordId, propertyId)
-    const residents = await query<any>(
-      `SELECT DISTINCT ON (t.id) t.id, uu.first_name, uu.last_name, uu.email, un.unit_number, l.status
-         FROM tenants t
-         JOIN users uu ON uu.id = t.user_id
-         JOIN lease_tenants lt ON lt.tenant_id = t.id
-         JOIN leases l ON l.id = lt.lease_id
-         JOIN units un ON un.id = l.unit_id
-        WHERE l.landlord_id = $1 AND un.property_id = $2
-        ORDER BY t.id, l.created_at DESC`, [landlordId, propertyId])
-    const customers = await query<any>(
-      `SELECT id, first_name, last_name, email, phone FROM pos_customers
-        WHERE landlord_id = $1 AND archived_at IS NULL`, [landlordId])
-    const people = [
-      ...residents.map((r: any) => ({ key: `t:${r.id}`, kind: 'resident', id: r.id,
-        name: `${r.first_name ?? ''} ${r.last_name ?? ''}`.trim() || 'Resident',
-        detail: r.unit_number ? `Site ${r.unit_number}` : null, email: r.email ?? null })),
-      ...customers.map((c: any) => ({ key: `c:${c.id}`, kind: 'customer', id: c.id,
-        name: `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim() || 'Customer',
-        detail: c.email ?? c.phone ?? null, email: c.email ?? null })),
-    ].sort((a, b) => a.name.localeCompare(b.name))
-    res.json({ success: true, data: people })
+    const people = await searchPeople({ landlordId, propertyId, userId: req.user.userId, q: req.query.q, allowElsewhere: !req.crossCompanyLimited })
+    // 10/2 (review): past the limit on looking elsewhere, the register says so
+    // instead of quietly showing fewer people.
+    res.json({ success: true, data: people, ...(req.crossCompanyLimited ? { elsewhereLimited: true } : {}) })
   } catch (e) { next(e) }
 })
 
 // S654 (Nic): "for cash people we can add them as a customer." A customer added
-// at the register needs a first name and nothing else; an email already on this
-// company's list returns that customer instead of a second one.
+// at the register needs a first name and nothing else. 10/2: an email or phone
+// this company already has picks that person instead — a register customer by
+// email or phone, a resident by their account email. Someone picked from
+// elsewhere on GAM (`match.pick`, the sealed pick the search handed out) gets a
+// record HERE holding their name and only what the clerk typed in full.
 posRouter.post('/customers', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
   try {
-    const b = z.object({
+    const b = parseForStaff(z.object({
       propertyId: z.string().uuid(),
-      firstName:  z.string().trim().min(1, 'A first name is needed').max(80),
+      firstName:  z.string().trim().max(80).optional().nullable(),
       lastName:   z.string().trim().max(80).optional().nullable(),
       email:      z.string().trim().max(200).optional().nullable(),
       phone:      z.string().trim().max(40).optional().nullable(),
-    }).parse(req.body)
+      match:      z.object({ pick: z.string().max(2000) }).optional(),
+    }), req.body, NEW_PERSON_WORDS, 'The customer could not be added — check what was typed, then press Add customer again.')
     await assertPropertyInScope(req.user, b.propertyId)
     const landlordId = posLandlordId(req)
     await assertPropertyIsLandlords(landlordId, b.propertyId)
-    const email = b.email ? b.email.toLowerCase() : null
-    if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new AppError(400, 'That email does not look right')
-    if (email) {
-      const existing = await queryOne<any>(
-        `SELECT id, first_name, last_name, email, phone, archived_at FROM pos_customers
-          WHERE landlord_id = $1 AND lower(email) = $2`, [landlordId, email])
-      if (existing && !existing.archived_at) return res.json({ success: true, data: { ...existing, existing: true } })
-      if (existing) throw new AppError(409, 'That email is on a customer record that was closed. Use a different email or leave it blank.')
-    }
+    if (!b.match && !b.firstName) throw new AppError(400, 'Type at least a first name, then press Add customer.')
+    const client = await getClient()
+    let made: { customerId: string; tenantId: string | null; existing: boolean }
+    try {
+      await client.query('BEGIN')
+      made = b.match
+        ? await customerFromElsewhere(client, landlordId, req.user.userId, b.match.pick)
+        : await addCustomer(client, landlordId, { firstName: b.firstName!, lastName: b.lastName, email: b.email, phone: b.phone })
+      await client.query('COMMIT')
+    } catch (e: any) {
+      await client.query('ROLLBACK').catch(() => {})
+      if (e?.code === '23505') throw new AppError(409, EMAIL_TAKEN_PICK)
+      throw e
+    } finally { client.release() }
+    // 10/2 (review): somebody picked from elsewhere who turns out to be tied to
+    // this company only loosely (a cancelled invite, say) comes back by name —
+    // their account's email and phone only while they live here.
     const row = await queryOne<any>(
-      `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone, created_from)
-       VALUES ($1, $2, $3, $4, $5, 'manual')
-       RETURNING id, first_name, last_name, email, phone`,
-      [landlordId, b.firstName, b.lastName ?? '', email, b.phone || null])
-    res.status(201).json({ success: true, data: row })
+      `SELECT c.id, c.tenant_id, COALESCE(u.first_name, c.first_name) AS first_name, COALESCE(u.last_name, c.last_name) AS last_name,
+              ${recordContactSql('c', 'u').email} AS email, ${recordContactSql('c', 'u').phone} AS phone
+         FROM pos_customers c LEFT JOIN tenants tn ON tn.id = c.tenant_id LEFT JOIN users u ON u.id = tn.user_id
+        WHERE c.id = $1`, [made.customerId])
+    const out = { ...row, kind: row.tenant_id ? 'resident' : 'customer', ...(made.existing ? { existing: true } : {}) }
+    res.status(made.existing ? 200 : 201).json({ success: true, data: out })
   } catch (e) { next(e) }
 })
 
+// The Customers tab. 10/2: a resident's register record is listed under the
+// name and email on their account, marked as a resident.
 posRouter.get('/customers', requirePerm('pos.ring_sale', 'pos.end_of_day'), async (req, res, next) => {
   try {
     const landlordId = posLandlordId(req)
+    // A resident's purchases include sales rung before their record existed.
+    const theirSale = `(t.pos_customer_id = c.id OR (c.tenant_id IS NOT NULL AND t.landlord_id = c.landlord_id AND t.tenant_id = c.tenant_id))`
     const rows = await query<any>(
-      `SELECT c.id, c.first_name, c.last_name, c.email, c.phone, c.created_from, c.created_at, c.notes,
+      `WITH c AS (
+         SELECT c.id, c.landlord_id, c.tenant_id, c.created_from, c.created_at, c.notes, c.stripe_customer_id,
+                COALESCE(u.first_name, c.first_name) AS first_name, COALESCE(u.last_name, c.last_name) AS last_name,
+                ${recordContactSql('c', 'u').email} AS email, ${recordContactSql('c', 'u').phone} AS phone
+           FROM pos_customers c
+           LEFT JOIN tenants tn ON tn.id = c.tenant_id
+           LEFT JOIN users u ON u.id = tn.user_id
+          WHERE c.landlord_id = $1 AND c.archived_at IS NULL)
+       SELECT c.id, c.first_name, c.last_name, c.email, c.phone, c.created_from, c.created_at, c.notes,
+              c.tenant_id, (c.tenant_id IS NOT NULL) AS is_resident,
               (c.stripe_customer_id IS NOT NULL) AS has_stripe_customer,
-              (SELECT COUNT(*)::int FROM pos_transactions t WHERE t.pos_customer_id = c.id) AS purchases,
-              (SELECT COALESCE(SUM(t.total), 0)::float FROM pos_transactions t WHERE t.pos_customer_id = c.id AND t.status <> 'voided') AS total_spent,
-              (SELECT MAX(t.created_at) FROM pos_transactions t WHERE t.pos_customer_id = c.id) AS last_purchase_at,
+              (SELECT COUNT(*)::int FROM pos_transactions t WHERE ${theirSale}) AS purchases,
+              (SELECT COALESCE(SUM(t.total), 0)::float FROM pos_transactions t WHERE ${theirSale} AND t.status <> 'voided') AS total_spent,
+              (SELECT MAX(t.created_at) FROM pos_transactions t WHERE ${theirSale}) AS last_purchase_at,
               (SELECT COALESCE(json_agg(json_build_object('brand', k.brand, 'last4', k.last4, 'saved', k.stripe_payment_method_id IS NOT NULL) ORDER BY k.last_seen_at DESC), '[]'::json)
                  FROM pos_customer_cards k WHERE k.pos_customer_id = c.id) AS cards,
-              (SELECT COALESCE(json_agg(d.id), '[]'::json) FROM pos_customers d
-                WHERE d.landlord_id = c.landlord_id AND d.id <> c.id AND d.archived_at IS NULL
+              (SELECT COALESCE(json_agg(d.id), '[]'::json) FROM c d
+                WHERE d.id <> c.id
                   AND ((c.email IS NOT NULL AND lower(d.email) = lower(c.email))
                     OR (${phoneDigits('c.phone')} <> '' AND ${phoneDigits('d.phone')} = ${phoneDigits('c.phone')}))) AS duplicate_ids
-         FROM pos_customers c
-        WHERE c.landlord_id = $1 AND c.archived_at IS NULL
+         FROM c
         ORDER BY c.last_name, c.first_name`, [landlordId])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
@@ -2948,12 +4419,25 @@ posRouter.get('/customers', requirePerm('pos.ring_sale', 'pos.end_of_day'), asyn
 
 posRouter.patch('/customers/:id', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const b = z.object({
+    const b = parseForStaff(z.object({
       firstName: z.string().trim().min(1).max(80).optional(),
       lastName:  z.string().trim().max(80).optional(),
       email:     z.string().trim().toLowerCase().email().nullable().optional(),
       phone:     z.string().trim().max(40).nullable().optional(),
-    }).parse(req.body)
+    }), req.body, {
+      firstName: 'A customer needs a first name — type one, then press Save.',
+      lastName: 'That last name is too long — shorten it, then press Save.',
+      email: 'That email does not look right — check it, or clear it, then press Save.',
+      phone: 'That phone number is too long — check it, then press Save.',
+    }, 'The customer could not be saved — check what was typed, then press Save again.')
+    // 10/2: a resident's name, email and phone are on their own account; the
+    // register does not keep a second copy anyone could edit.
+    if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, CUSTOMER_GONE)
+    const cur = await queryOne<{ tenant_id: string | null }>(
+      `SELECT tenant_id FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL`,
+      [req.params.id, posLandlordId(req)])
+    if (!cur) throw new AppError(404, CUSTOMER_GONE)
+    if (cur.tenant_id) throw new AppError(409, "This is a resident — their name, email and phone are on their own account, so there is nothing to change here. Press Cancel.")
     const row = await queryOne<any>(
       `UPDATE pos_customers SET
           first_name = COALESCE($1, first_name), last_name = COALESCE($2, last_name),
@@ -2965,14 +4449,19 @@ posRouter.patch('/customers/:id', requirePerm('pos.ring_sale'), async (req, res,
       [b.firstName ?? null, b.lastName ?? null, b.email ?? null, b.phone ?? null,
        'email' in b && b.email === null, 'phone' in b && b.phone === null,
        req.params.id, posLandlordId(req)])
-    if (!row) throw new AppError(404, 'Customer not found')
+    if (!row) throw new AppError(404, CUSTOMER_GONE)
     res.json({ success: true, data: row })
-  } catch (e) { next(e) }
+  } catch (e: any) {
+    if (e?.code === '23505') return next(new AppError(409, EMAIL_TAKEN_EDIT))
+    next(e)
+  }
 })
 
 posRouter.post('/customers/:id/merge', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const { into } = z.object({ into: z.string().uuid() }).parse(req.body)
+    const { into } = parseForStaff(z.object({ into: z.string().uuid() }), req.body, {},
+      'Pick the customer to merge into from the list, then press Merge again.')
+    if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, CUSTOMER_GONE)
     const landlordId = posLandlordId(req)
     const client = await getClient()
     try {
@@ -2988,99 +4477,135 @@ posRouter.post('/customers/:id/merge', requirePerm('pos.ring_sale'), async (req,
   } catch (e) { next(e) }
 })
 
-// Fix which customer a sale belongs to, after the fact.
-// S654 (Nic): "another way to add a customer name after the sale is completed …
-// I don't want to change it to a whole dropdown of a list. I want to just edit
-// the field as their first and last name and email and phone number." The
-// sale's customer is typed in: the record the sale already has is edited (a
-// name-less card customer gets their name); a sale with nobody gets a new
-// customer. An email or phone already on another customer of this company is
-// the same person — this record is folded into theirs, never duplicated.
-// A resident's details belong to their account and are not edited here.
-posRouter.put('/transactions/:id/customer-info', requirePerm('pos.ring_sale'), async (req, res, next) => {
+// 10/2 (Nic): "on the history, same thing... start typing in their name; if
+// they're an existing customer I can click them and link them to that
+// transaction. And then have it retroactively fill to any matching cards."
+//
+// Who a past sale was for — the one way to say it. Exactly one of: an existing
+// register customer, a resident, a new customer (typed), or someone found on
+// GAM outside this company (the sealed pick the search handed out), or
+// `posCustomerId: null` to say nobody. Only THIS sale is moved to them — never
+// a rename of whoever it named before (an "Edit customer" that typed Bob over
+// Jane used to rename Jane everywhere). Then the card rule
+// (services/posPeople linkSaleToPerson) carries every other sale on the same
+// card that nobody had confirmed, and a resident's sales take their tenant id.
+posRouter.patch('/transactions/:id/customer', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
   try {
-    const b = z.object({
-      firstName: z.string().trim().min(1, 'A first name is needed').max(80),
+    const person = z.object({
+      firstName: z.string().trim().min(1).max(80),
       lastName:  z.string().trim().max(80).optional().nullable(),
       email:     z.string().trim().max(200).optional().nullable(),
       phone:     z.string().trim().max(40).optional().nullable(),
-    }).parse(req.body)
-    const email = b.email ? b.email.toLowerCase() : null
-    if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new AppError(400, 'That email does not look right')
-    const phone = b.phone || null
-    const digits = phone ? phone.replace(/\D/g, '') : ''
+    })
+    const b = parseForStaff(z.object({
+      posCustomerId: z.string().uuid().nullable().optional(),
+      tenantId:      z.string().uuid().nullable().optional(),
+      addNew:        person.optional(),
+      match:         z.object({ pick: z.string().max(2000) }).optional(),
+    }), req.body, {
+      posCustomerId: NOT_ON_REGISTER,
+      tenantId: NOT_ON_REGISTER,
+      'addNew.firstName': NEW_PERSON_WORDS.firstName,
+      'addNew.lastName': NEW_PERSON_WORDS.lastName,
+      'addNew.email': NEW_PERSON_WORDS.email,
+      'addNew.phone': NEW_PERSON_WORDS.phone,
+      match: NEW_PERSON_WORDS.match,
+    }, 'Who this sale was for could not be saved — type their name and pick them from the list again.')
+    const picked = [b.posCustomerId, b.tenantId, b.addNew, b.match].filter((v) => v != null)
+    if (picked.length > 1) throw new AppError(400, 'A sale is for one person — remove the customer (×) and pick just one.')
+    let target: LinkTarget
+    if (b.posCustomerId) target = { kind: 'customer', posCustomerId: b.posCustomerId }
+    else if (b.tenantId) target = { kind: 'resident', tenantId: b.tenantId }
+    else if (b.addNew) target = { kind: 'new', person: b.addNew }
+    else if (b.match) target = { kind: 'elsewhere', pick: b.match.pick, userId: req.user.userId }
+    else if (b.posCustomerId === null || b.tenantId === null) target = { kind: 'clear' }
+    else throw new AppError(400, 'Type who this sale was for and pick them from the list.')
+
     const landlordId = posLandlordId(req)
+    const sale = await queryOne<any>(
+      `SELECT id, property_id, tenant_id, pos_customer_id, payment_method, stripe_payment_intent_id
+         FROM pos_transactions WHERE id = $1 AND landlord_id = $2`, [req.params.id, landlordId])
+    if (!sale) throw new AppError(404, SALE_GONE)
+    await assertSaleInScope(req.user, sale.property_id)
+    // A card sale that named nobody: which card was it? Read back from Stripe
+    // before the transaction opens (a network call has no business holding
+    // row locks). Best-effort — without it, only this sale moves.
+    let saleCard: CardIdentity | null = null
+    if (target.kind !== 'clear' && !sale.pos_customer_id && !sale.tenant_id && sale.stripe_payment_intent_id
+        && (sale.payment_method === 'card' || sale.payment_method === 'card_on_file')) {
+      saleCard = await readSaleCard(sale.stripe_payment_intent_id).catch((e) => {
+        logger.warn({ err: e, saleId: sale.id }, '[POS] could not read the card a sale was paid with')
+        return null
+      })
+    }
     const client = await getClient()
     try {
       await client.query('BEGIN')
-      const tx = (await client.query<any>(
-        `SELECT id, tenant_id, pos_customer_id FROM pos_transactions WHERE id = $1 AND landlord_id = $2 FOR UPDATE`,
-        [req.params.id, landlordId])).rows[0]
-      if (!tx) throw new AppError(404, 'Sale not found')
-      if (tx.tenant_id) throw new AppError(409, "This sale is a resident's — their name and email are on their account.")
-      // Somebody else of this company's with the same email or phone is this person.
-      const same = (email || digits.length >= 7) ? (await client.query<any>(
-        `SELECT id FROM pos_customers
-          WHERE landlord_id = $1 AND archived_at IS NULL AND id <> COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-            AND (($3::text IS NOT NULL AND lower(email) = $3)
-              OR ($4::text <> '' AND ${phoneDigits('phone')} = $4))
-          ORDER BY (lower(email) = $3) DESC NULLS LAST, created_at
-          LIMIT 1`, [landlordId, tx.pos_customer_id, email, digits.length >= 7 ? digits : ''])).rows[0] : null
-      let customerId: string
-      if (tx.pos_customer_id && same) {
-        await mergePosCustomers(client, { landlordId, loserId: tx.pos_customer_id, into: same.id })
-        customerId = same.id
-      } else if (tx.pos_customer_id) {
-        customerId = tx.pos_customer_id
-      } else if (same) {
-        customerId = same.id
-      } else {
-        customerId = (await client.query<{ id: string }>(
-          `INSERT INTO pos_customers (landlord_id, first_name, last_name, created_from) VALUES ($1, $2, '', 'manual') RETURNING id`,
-          [landlordId, b.firstName])).rows[0].id
-      }
-      const row = (await client.query<any>(
-        `UPDATE pos_customers SET first_name = $1, last_name = $2, email = $3, phone = $4, updated_at = NOW()
-          WHERE id = $5 RETURNING id, first_name, last_name, email, phone`,
-        [b.firstName, b.lastName ?? '', email, phone, customerId])).rows[0]
-      // The sale (and, after a fold, every sale of the folded record) is this customer's.
-      await client.query(`UPDATE pos_transactions SET pos_customer_id = $1 WHERE id = $2`, [customerId, tx.id])
+      const out = await linkSaleToPerson(client, { landlordId, saleId: sale.id, target, saleCard, userId: req.user.userId })
       await client.query('COMMIT')
-      res.json({ success: true, data: row })
+      res.json({ success: true, data: out })
     } catch (e: any) {
       await client.query('ROLLBACK').catch(() => {})
-      if (e?.code === '23505') throw new AppError(409, 'That email is already on another customer.')
+      if (e?.code === '23505') throw new AppError(409, EMAIL_TAKEN_PICK)
       throw e
     } finally { client.release() }
   } catch (e) { next(e) }
 })
 
-posRouter.patch('/transactions/:id/customer', requirePerm('pos.ring_sale'), async (req, res, next) => {
+// POST /api/pos/transactions/:id/customer/undo — put a link back.
+//
+// 10/2 (review): picking the wrong person can carry far more than the one sale
+// — a card record folded in with its other sales and a card kept on file, a
+// card put on their record. The message after a link (and after a sale whose
+// tapped card was folded into the person picked) carries an Undo; this puts
+// every one of those back exactly. Only the clerk who made it, at this company,
+// within half an hour, and only while the sale still names whom it was linked
+// to (services/posPeople undoLink).
+posRouter.post('/transactions/:id/customer/undo', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
   try {
-    const b = z.object({ posCustomerId: z.string().uuid().nullable().optional(), tenantId: z.string().uuid().nullable().optional() }).parse(req.body)
-    if (b.posCustomerId && b.tenantId) throw new AppError(400, 'A sale belongs to one person — a resident or a customer, not both')
+    const { undo } = parseForStaff(z.object({ undo: z.string().max(30_000) }), req.body, {},
+      'That can no longer be undone here — open the sale in History and pick the right person.')
     const landlordId = posLandlordId(req)
-    const tx = await queryOne<{ id: string }>(`SELECT id FROM pos_transactions WHERE id = $1 AND landlord_id = $2`, [req.params.id, landlordId])
-    if (!tx) throw new AppError(404, 'Sale not found')
-    if (b.posCustomerId) {
-      const c = await queryOne(`SELECT 1 FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL`, [b.posCustomerId, landlordId])
-      if (!c) throw new AppError(404, 'Customer not found')
-    }
-    if (b.tenantId) {
-      const t = await queryOne(
-        `SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id WHERE lt.tenant_id = $1 AND l.landlord_id = $2 LIMIT 1`,
-        [b.tenantId, landlordId])
-      if (!t) throw new AppError(404, 'That resident is not at one of this company\'s properties')
-    }
-    const row = await queryOne<any>(
-      `UPDATE pos_transactions SET pos_customer_id = $1, tenant_id = $2 WHERE id = $3
-       RETURNING id, pos_customer_id, tenant_id`, [b.posCustomerId ?? null, b.tenantId ?? null, tx.id])
-    const name = await queryOne<{ name: string | null }>(
-      `SELECT COALESCE(
-          (SELECT NULLIF(TRIM(pc.first_name || ' ' || pc.last_name), '') FROM pos_customers pc WHERE pc.id = $1),
-          (SELECT u.first_name || ' ' || u.last_name FROM tenants tn JOIN users u ON u.id = tn.user_id WHERE tn.id = $2)) AS name`,
-      [row.pos_customer_id, row.tenant_id])
-    res.json({ success: true, data: { ...row, customer_name: name?.name ?? null } })
+    const sale = /^[0-9a-f-]{36}$/i.test(String(req.params.id)) ? await queryOne<{ id: string; property_id: string | null }>(
+      `SELECT id, property_id FROM pos_transactions WHERE id = $1 AND landlord_id = $2`, [req.params.id, landlordId]) : null
+    if (!sale) throw new AppError(404, SALE_GONE)
+    await assertSaleInScope(req.user, sale.property_id)
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const out = await undoLink(client, { landlordId, userId: req.user.userId, saleId: sale.id, token: undo })
+      await client.query('COMMIT')
+      res.json({ success: true, data: out })
+    } catch (e: any) {
+      await client.query('ROLLBACK').catch(() => {})
+      if (e?.code === '23505') throw new AppError(409, 'That can no longer be undone here — one of those records has changed since. Open the sale in History and pick the right person.')
+      throw e
+    } finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+// POST /api/pos/customers/:id/let-go — a pick from elsewhere taken back off.
+//
+// 10/2 (review, "back out with one button and no side effects"): picking
+// someone from another company makes their record here at once. Taken back off
+// (× or Clear) before anything was written against it, the record goes again —
+// only a record made from a pick, only an empty one (services/posPeople
+// letGoOfPick). Best-effort by design: a record with something on it stays,
+// and the answer says so without an error.
+posRouter.post('/customers/:id/let-go', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const landlordId = posLandlordId(req)
+    const client = await getClient()
+    let letGo = false
+    try {
+      await client.query('BEGIN')
+      letGo = await letGoOfPick(client, landlordId, String(req.params.id))
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
+    res.json({ success: true, data: { letGo } })
   } catch (e) { next(e) }
 })
 
@@ -3094,6 +4619,37 @@ posRouter.patch('/transactions/:id/customer', requirePerm('pos.ring_sale'), asyn
 // session items through the existing /pos/transactions flow, then marks
 // the session 'completed' with completed_transaction_id link.
 
+/**
+ * 10/2 (review): who an open cart names — only this company's register
+ * customer, or a tenant tied to this company (tenantOfCompanySql). An id
+ * stored from anywhere else shows no name. A resident's register record goes
+ * by their account's name.
+ */
+const SESSION_PERSON_JOINS = `
+         LEFT JOIN pos_customers pcu ON pcu.id = s.pos_customer_id AND pcu.landlord_id = s.landlord_id
+         LEFT JOIN tenants       pct ON pct.id = pcu.tenant_id
+         LEFT JOIN users         pcuu ON pcuu.id = pct.user_id
+         LEFT JOIN tenants       t   ON t.id   = s.tenant_id AND ${tenantOfCompanySql('t.id', 's.landlord_id')}
+         LEFT JOIN users         tu  ON tu.id  = t.user_id`
+const SESSION_PERSON_NAME = `NULLIF(TRIM(COALESCE(
+                CASE WHEN pcu.id IS NOT NULL THEN COALESCE(pcuu.first_name, pcu.first_name, '') || ' ' || COALESCE(pcuu.last_name, pcu.last_name, '') END,
+                COALESCE(tu.first_name, '') || ' ' || COALESCE(tu.last_name, '')
+              )), '')`
+
+/**
+ * The person a cart is opened or changed with must be this company's
+ * (salePerson). On open, somebody who is not simply is not stored — the cart
+ * still opens (it is the register's background copy, and refusing it would
+ * strand every line after it). A change naming somebody else is refused.
+ */
+async function sessionPerson(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }): Promise<{ tenantId: string | null; posCustomerId: string | null }> {
+  await salePerson(landlordId, ids)   // refuses anybody who is not this company's
+  return {
+    tenantId: typeof ids.tenantId === 'string' && ids.tenantId ? ids.tenantId : null,
+    posCustomerId: typeof ids.posCustomerId === 'string' && ids.posCustomerId ? ids.posCustomerId : null,
+  }
+}
+
 // GET /pos/sessions?status=open[&property_id=...]
 posRouter.get('/sessions', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
@@ -3101,22 +4657,24 @@ posRouter.get('/sessions', requirePerm('pos.ring_sale'), async (req, res, next) 
     const propertyId = req.query.propertyId ? String(req.query.propertyId) : null
     const params: any[] = [posLandlordId(req), status]
     let propertyClause = ''
-    if (propertyId) { params.push(propertyId); propertyClause = ' AND s.property_id = $3' }
+    // 10/2 (review): a cashier sees the open carts of the properties they work.
+    if (propertyId) {
+      await assertPropertyInScope(req.user, propertyId)
+      params.push(propertyId); propertyClause = ' AND s.property_id = $3'
+    } else {
+      const scope = await getScopedPropertyIds(req.user)
+      if (scope) { params.push(scope); propertyClause = ' AND s.property_id = ANY($3::uuid[])' }
+    }
     const sessions = await query<any>(
       `SELECT s.*,
-              COALESCE(
-                pcu.first_name || ' ' || pcu.last_name,
-                tu.first_name  || ' ' || tu.last_name
-              ) AS customer_name,
+              ${SESSION_PERSON_NAME} AS customer_name,
               pr.name AS property_name,
               (SELECT COUNT(*)::int FROM pos_session_items WHERE session_id = s.id) AS item_count,
               -- S654 (Nic): the open-tab list says what is in each cart.
               (SELECT string_agg(x.item_name || CASE WHEN x.qty > 1 THEN ' ×' || x.qty::int ELSE '' END, ', ')
                  FROM (SELECT item_name, qty FROM pos_session_items WHERE session_id = s.id ORDER BY created_at LIMIT 3) x) AS preview
          FROM pos_sessions s
-         LEFT JOIN pos_customers pcu ON pcu.id = s.pos_customer_id
-         LEFT JOIN tenants       t   ON t.id   = s.tenant_id
-         LEFT JOIN users         tu  ON tu.id  = t.user_id
+         ${SESSION_PERSON_JOINS}
          LEFT JOIN properties    pr  ON pr.id  = s.property_id
         WHERE s.landlord_id = $1
           AND s.status      = $2${propertyClause}
@@ -3132,50 +4690,73 @@ posRouter.get('/sessions', requirePerm('pos.ring_sale'), async (req, res, next) 
 posRouter.post('/sessions', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const { propertyId, posCustomerId, tenantId, notes } = req.body || {}
-    if (!propertyId) throw new AppError(400, 'propertyId required')
-    if (posCustomerId && tenantId) throw new AppError(400, 'posCustomerId and tenantId are mutually exclusive')
+    if (!propertyId) throw new AppError(400, 'Pick the property at the top of the register first, then ring the sale again.')
+    if (posCustomerId && tenantId) throw new AppError(400, ONE_PERSON_CART)
 
     // Verify the property belongs to the calling landlord.
-    const prop = await queryOne<{ landlord_id: string }>(
+    const prop = /^[0-9a-f-]{36}$/i.test(String(propertyId)) ? await queryOne<{ landlord_id: string }>(
       `SELECT landlord_id FROM properties WHERE id = $1`,
       [propertyId],
-    )
+    ) : null
     if (!prop || prop.landlord_id !== posLandlordId(req)) {
-      throw new AppError(403, 'Property does not belong to this landlord')
+      throw new AppError(403, 'That property is not this register\'s — pick the property at the top of the register, then ring the sale again.')
     }
     // Property lock: scoped cashier may only open a session on their property.
     await assertPropertyInScope(req.user, propertyId)
+    // 10/2 (review): only this company's person is stored on the cart.
+    const who = (posCustomerId || tenantId)
+      ? await sessionPerson(posLandlordId(req), { tenantId, posCustomerId }).catch(() => ({ tenantId: null, posCustomerId: null }))
+      : { tenantId: null, posCustomerId: null }
 
     const row = await queryOne<any>(
       `INSERT INTO pos_sessions
          (property_id, landlord_id, opened_by_user_id, pos_customer_id, tenant_id, notes)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [propertyId, posLandlordId(req), req.user!.userId, posCustomerId || null, tenantId || null, notes || null],
+      [propertyId, posLandlordId(req), req.user!.userId, who.posCustomerId, who.tenantId, notes || null],
     )
     res.json({ success: true, data: row })
   } catch (e) { next(e) }
 })
 
+const SESSION_GONE = 'That open cart is not on this register any more — it was settled or discarded. Start the sale again.'
+const ONE_PERSON_CART = 'A cart is for one person — remove the customer (×), then pick just the one it is for.'
+const sessionClosed = (status: string) => `That open cart was already ${status === 'completed' ? 'settled' : 'discarded'} — start the sale again.`
+
+/**
+ * 10/2 (review): an open cart, of this company, at a property the caller
+ * works. Adding, changing or removing its lines and discarding it all go
+ * through here — a cashier assigned to one park never edits another park's
+ * carts by id.
+ */
+async function openSessionInScope(req: any, opts: { anyStatus?: boolean } = {}): Promise<{ id: string; status: string; property_id: string }> {
+  if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, SESSION_GONE)
+  const session = await queryOne<{ id: string; status: string; property_id: string }>(
+    `SELECT id, status, property_id FROM pos_sessions WHERE id = $1 AND landlord_id = $2`,
+    [req.params.id, posLandlordId(req)])
+  if (!session) throw new AppError(404, SESSION_GONE)
+  await assertPropertyInScope(req.user, session.property_id)
+  if (!opts.anyStatus && session.status !== 'open') throw new AppError(409, sessionClosed(session.status))
+  return session
+}
+
 // GET /pos/sessions/:id — full session + items.
 posRouter.get('/sessions/:id', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
+    if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, SESSION_GONE)
     const session = await queryOne<any>(
       `SELECT s.*,
-              COALESCE(
-                pcu.first_name || ' ' || pcu.last_name,
-                tu.first_name  || ' ' || tu.last_name
-              ) AS customer_name,
+              ${SESSION_PERSON_NAME} AS customer_name,
               pr.name AS property_name
          FROM pos_sessions s
-         LEFT JOIN pos_customers pcu ON pcu.id = s.pos_customer_id
-         LEFT JOIN tenants       t   ON t.id   = s.tenant_id
-         LEFT JOIN users         tu  ON tu.id  = t.user_id
+         ${SESSION_PERSON_JOINS}
          LEFT JOIN properties    pr  ON pr.id  = s.property_id
         WHERE s.id = $1 AND s.landlord_id = $2`,
       [req.params.id, posLandlordId(req)],
     )
-    if (!session) throw new AppError(404, 'Session not found')
+    if (!session) throw new AppError(404, SESSION_GONE)
+    // 10/2 (review): only a cart at a property the caller works.
+    await assertPropertyInScope(req.user, session.property_id)
     const items = await query<any>(
       `SELECT * FROM pos_session_items WHERE session_id = $1 ORDER BY created_at ASC`,
       [req.params.id],
@@ -3188,15 +4769,20 @@ posRouter.get('/sessions/:id', requirePerm('pos.ring_sale'), async (req, res, ne
 // Body: { posCustomerId?, tenantId?, discountAmount?, notes? }
 posRouter.patch('/sessions/:id', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
+    if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, SESSION_GONE)
     const session = await queryOne<any>(
-      `SELECT id, status FROM pos_sessions WHERE id = $1 AND landlord_id = $2`,
+      `SELECT id, status, property_id FROM pos_sessions WHERE id = $1 AND landlord_id = $2`,
       [req.params.id, posLandlordId(req)],
     )
-    if (!session) throw new AppError(404, 'Session not found')
-    if (session.status !== 'open') throw new AppError(409, `Session is ${session.status}`)
+    if (!session) throw new AppError(404, SESSION_GONE)
+    // 10/2 (review): only a cart at a property the caller works.
+    await assertPropertyInScope(req.user, session.property_id)
+    if (session.status !== 'open') throw new AppError(409, sessionClosed(session.status))
 
     const { posCustomerId, tenantId, discountAmount, notes } = req.body || {}
-    if (posCustomerId && tenantId) throw new AppError(400, 'posCustomerId and tenantId are mutually exclusive')
+    if (posCustomerId && tenantId) throw new AppError(400, ONE_PERSON_CART)
+    // 10/2 (review): a cart names only this company's person.
+    if (posCustomerId || tenantId) await sessionPerson(posLandlordId(req), { tenantId, posCustomerId })
 
     const sets: string[] = []
     const params: any[] = []
@@ -3204,12 +4790,12 @@ posRouter.patch('/sessions/:id', requirePerm('pos.ring_sale'), async (req, res, 
     if (tenantId !== undefined)      { params.push(tenantId || null);      sets.push(`tenant_id = $${params.length}`) }
     if (discountAmount !== undefined) {
       const d = Number(discountAmount)
-      if (!Number.isFinite(d) || d < 0) throw new AppError(400, 'discountAmount must be a non-negative number')
+      if (!Number.isFinite(d) || d < 0) throw new AppError(400, 'A discount cannot be below zero — fix it, then press Apply again.')
       await assertCashierPricing(req, [], d)
       params.push(d.toFixed(2)); sets.push(`discount_amount = $${params.length}`)
     }
     if (notes !== undefined) { params.push(notes); sets.push(`notes = $${params.length}`) }
-    if (sets.length === 0) throw new AppError(400, 'Nothing to update')
+    if (sets.length === 0) throw new AppError(400, 'Nothing on the cart changed — carry on with the sale.')
 
     params.push(req.params.id)
     const updated = await queryOne<any>(
@@ -3227,23 +4813,22 @@ posRouter.patch('/sessions/:id', requirePerm('pos.ring_sale'), async (req, res, 
 // Body: { itemId?, itemVariantId?, itemName, itemCategory?, qty, unitPrice, taxRate?, costPrice?, notes? }
 posRouter.post('/sessions/:id/items', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const session = await queryOne<any>(
-      `SELECT id, status FROM pos_sessions WHERE id = $1 AND landlord_id = $2`,
-      [req.params.id, posLandlordId(req)],
-    )
-    if (!session) throw new AppError(404, 'Session not found')
-    if (session.status !== 'open') throw new AppError(409, `Session is ${session.status}`)
+    const session = await openSessionInScope(req)
 
     const b = req.body || {}
+    // 10/2 (review): the item id as the database writes it (lowercase).
+    if (typeof b.itemId === 'string') b.itemId = b.itemId.trim().toLowerCase()
     const qty = Number(b.qty)
     const unitPrice = Number(b.unitPrice)
-    if (!b.itemName) throw new AppError(400, 'itemName required')
-    if (!Number.isFinite(qty) || qty <= 0) throw new AppError(400, 'qty must be positive')
-    if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new AppError(400, 'unitPrice must be non-negative')
+    const words = cartLineWords('Charge')
+    if (!b.itemName) throw new AppError(400, 'A line in the cart has no name — take it out, add it again, then carry on.')
+    if (!Number.isFinite(qty) || qty <= 0) throw new AppError(400, words['items.N.qty'])
+    if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new AppError(400, words['items.N.price'])
     assertNonNeg([b.taxRate, 'Tax rate'], [b.costPrice, 'Cost price'])
 
     assertCatalogItems([{ itemId: b.itemId }])
     await assertCashierPricing(req, [{ itemId: b.itemId, price: unitPrice }])
+    await assertItemsAreOurs(posLandlordId(req), [{ id: b.itemId }], 'Charge')
     const taxRate = Number(b.taxRate) || 0
     const costPrice = Number(b.costPrice) || 0
     const subtotal = Math.round(qty * unitPrice * 100) / 100
@@ -3269,24 +4854,19 @@ posRouter.post('/sessions/:id/items', requirePerm('pos.ring_sale'), async (req, 
 // PATCH /pos/sessions/:id/items/:itemId — update qty / price / notes.
 posRouter.patch('/sessions/:id/items/:itemId', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const session = await queryOne<any>(
-      `SELECT id, status FROM pos_sessions WHERE id = $1 AND landlord_id = $2`,
-      [req.params.id, posLandlordId(req)],
-    )
-    if (!session) throw new AppError(404, 'Session not found')
-    if (session.status !== 'open') throw new AppError(409, `Session is ${session.status}`)
+    const session = await openSessionInScope(req)
 
     const b = req.body || {}
     const sets: string[] = []
     const params: any[] = []
     if (b.qty !== undefined) {
       const q = Number(b.qty)
-      if (!Number.isFinite(q) || q <= 0) throw new AppError(400, 'qty must be positive')
+      if (!Number.isFinite(q) || q <= 0) throw new AppError(400, cartLineWords('Charge')['items.N.qty'])
       params.push(q); sets.push(`qty = $${params.length}`)
     }
     if (b.unitPrice !== undefined) {
       const u = Number(b.unitPrice)
-      if (!Number.isFinite(u) || u < 0) throw new AppError(400, 'unitPrice must be non-negative')
+      if (!Number.isFinite(u) || u < 0) throw new AppError(400, cartLineWords('Charge')['items.N.price'])
       const line = await queryOne<{ item_id: string | null }>(
         `SELECT item_id FROM pos_session_items WHERE id = $1 AND session_id = $2`,
         [req.params.itemId, req.params.id])
@@ -3294,7 +4874,7 @@ posRouter.patch('/sessions/:id/items/:itemId', requirePerm('pos.ring_sale'), asy
       params.push(u.toFixed(2)); sets.push(`unit_price = $${params.length}`)
     }
     if (b.notes !== undefined) { params.push(b.notes); sets.push(`notes = $${params.length}`) }
-    if (sets.length === 0) throw new AppError(400, 'Nothing to update')
+    if (sets.length === 0) throw new AppError(400, 'Nothing on that line changed — carry on with the sale.')
 
     params.push(req.params.itemId, req.params.id)
     const updated = await queryOne<any>(
@@ -3303,7 +4883,7 @@ posRouter.patch('/sessions/:id/items/:itemId', requirePerm('pos.ring_sale'), asy
         RETURNING *`,
       params,
     )
-    if (!updated) throw new AppError(404, 'Line item not found')
+    if (!updated) throw new AppError(404, 'That line is not in the open cart any more — add it again if they still want it.')
 
     // Refresh subtotal off the new qty * unit_price.
     await query(
@@ -3320,12 +4900,7 @@ posRouter.patch('/sessions/:id/items/:itemId', requirePerm('pos.ring_sale'), asy
 // DELETE /pos/sessions/:id/items/:itemId
 posRouter.delete('/sessions/:id/items/:itemId', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const session = await queryOne<any>(
-      `SELECT id, status FROM pos_sessions WHERE id = $1 AND landlord_id = $2`,
-      [req.params.id, posLandlordId(req)],
-    )
-    if (!session) throw new AppError(404, 'Session not found')
-    if (session.status !== 'open') throw new AppError(409, `Session is ${session.status}`)
+    const session = await openSessionInScope(req)
 
     await query(
       `DELETE FROM pos_session_items WHERE id = $1 AND session_id = $2`,
@@ -3340,6 +4915,7 @@ posRouter.delete('/sessions/:id/items/:itemId', requirePerm('pos.ring_sale'), as
 // Body: { reason? }
 posRouter.post('/sessions/:id/void', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
+    await openSessionInScope(req, { anyStatus: true })
     const updated = await queryOne<any>(
       `UPDATE pos_sessions
           SET status = 'voided',
@@ -3350,7 +4926,7 @@ posRouter.post('/sessions/:id/void', requirePerm('pos.ring_sale'), async (req, r
         RETURNING *`,
       [req.body?.reason || null, req.params.id, posLandlordId(req)],
     )
-    if (!updated) throw new AppError(404, 'Open session not found')
+    if (!updated) throw new AppError(404, SESSION_GONE)
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })
@@ -3362,17 +4938,24 @@ posRouter.post('/sessions/:id/void', requirePerm('pos.ring_sale'), async (req, r
 posRouter.post('/sessions/:id/complete', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const { transactionId } = req.body || {}
-    if (!transactionId) throw new AppError(400, 'transactionId required')
+    if (!transactionId) throw new AppError(400, SALE_GONE)
 
     // Verify the transaction belongs to the calling landlord — defense
     // against a malicious cashier marking someone else's session against
     // their transaction.
-    const tx = await queryOne<{ landlord_id: string }>(
-      `SELECT landlord_id FROM pos_transactions WHERE id = $1`,
+    const tx = /^[0-9a-f-]{36}$/i.test(String(transactionId)) ? await queryOne<{ landlord_id: string; property_id: string | null }>(
+      `SELECT landlord_id, property_id FROM pos_transactions WHERE id = $1`,
       [transactionId],
-    )
-    if (!tx || tx.landlord_id !== posLandlordId(req)) {
-      throw new AppError(403, 'Transaction not owned by this landlord')
+    ) : null
+    if (!tx || tx.landlord_id !== posLandlordId(req)) throw new AppError(404, SALE_GONE)
+    // 10/2 (review): only a cart at a property the caller works, closed by a
+    // sale of that same property.
+    const sess = await queryOne<{ property_id: string }>(
+      `SELECT property_id FROM pos_sessions WHERE id = $1 AND landlord_id = $2`, [req.params.id, posLandlordId(req)])
+    if (!sess) throw new AppError(404, SESSION_GONE)
+    await assertPropertyInScope(req.user, sess.property_id)
+    if (tx.property_id && tx.property_id !== sess.property_id) {
+      throw new AppError(409, 'That sale was rung at another property — this open cart stays open.')
     }
 
     const updated = await queryOne<any>(
@@ -3392,7 +4975,7 @@ posRouter.post('/sessions/:id/complete', requirePerm('pos.ring_sale'), async (re
         [req.params.id, transactionId],
       )
       if (existing) return res.json({ success: true, data: existing })
-      throw new AppError(409, 'Session is not open')
+      throw new AppError(409, 'That open cart was already settled or discarded — nothing more to do here.')
     }
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -3420,3 +5003,184 @@ async function recomputeSessionTotals(sessionId: string): Promise<void> {
     [sessionId],
   )
 }
+
+// ── HELD PAYMENTS (decisions #13) ────────────────────────────────────────
+//
+// A pay-link card payment that did not fit (paid twice, an old amount, more
+// than its reservation owed) is held by GAM (routes/posPayLinks
+// finalizePayLink). These are the register's own screens for it — the Pay
+// Links tab — like every other register control: the account owner presses
+// Refund this payment; nothing refunds on its own, and no agent reaches it.
+
+/** Only the account holder sees and refunds a held payment — the person the notice went to. */
+function isAccountOwner(user: any): boolean {
+  return user?.role === 'landlord'
+}
+
+const HELD_GONE = 'That held payment is not on this account any more — open Pay Links again to see what is still held.'
+
+/** 10/3 (review): how far back, and how many at once, a Pay Links load asks Stripe for a held payment's fee. */
+const HELD_FEE_LOOKUP_DAYS = 14
+const HELD_FEE_LOOKUPS_PER_LOAD = 5
+
+/**
+ * 10/3 (decisions #22): Stripe's processing fee on a payment — what Stripe
+ * keeps when it is refunded (the landlord's loss, from their next payout).
+ * Null when Stripe cannot say just now; never a reason to fail the call.
+ */
+async function stripeFeeOn(paymentIntentId: string, stripe?: any): Promise<number | null> {
+  try {
+    const client = stripe ?? (await import('../lib/stripe')).getStripe()
+    const pi: any = await client.paymentIntents.retrieve(paymentIntentId, { expand: ['latest_charge.balance_transaction'] })
+    const fee = pi?.latest_charge?.balance_transaction?.fee
+    return typeof fee === 'number' && fee >= 0 ? Math.round(fee) / 100 : null
+  } catch (e) {
+    logger.warn({ err: e, paymentIntentId }, '[pay-link] could not read Stripe\'s fee on a held payment')
+    return null
+  }
+}
+
+// GET /api/pos/held-payments — payments GAM is holding for this account:
+// paid twice, at an old amount, or for more than a reservation owed. The
+// account owner's; anyone else gets an empty list (ownerOnly), never an error.
+posRouter.get('/held-payments', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    if (!isAccountOwner(req.user)) return res.json({ success: true, data: [], ownerOnly: true })
+    const ids: string[] = landlordScopeIds(req.user)
+    // 10/3 (review, decisions #22): self-heal — a refunded payment whose kept fee
+    // is known (written at refund time, or recorded by hand when Stripe could
+    // not say) but has no payout line yet gets its one line now. recordHeldItem
+    // is keyed on the refund, so this can never write a second one.
+    if (ids.length) {
+      const missing = await query<{ landlord_id: string; stripe_refund_id: string; fee: string }>(
+        `SELECT h.landlord_id, h.stripe_refund_id, h.stripe_fee_kept::text AS fee
+           FROM pos_held_payments h
+          WHERE h.landlord_id = ANY($1::uuid[]) AND h.status = 'refunded'
+            AND h.stripe_refund_id IS NOT NULL AND h.stripe_fee_kept > 0
+            AND NOT EXISTS (SELECT 1 FROM held_payout_items i
+                             WHERE i.source_type = 'refund' AND i.source_id = h.stripe_refund_id)
+          LIMIT 20`, [ids])
+      for (const m of missing) {
+        await chargeKeptFeeToLandlord(m.landlord_id, m.stripe_refund_id, Number(m.fee))
+          .catch((e) => logger.error({ err: e, refundId: m.stripe_refund_id }, '[pay-link] could not write the kept-fee payout line'))
+      }
+    }
+    const rows = ids.length ? await query<any>(
+      `SELECT h.id, h.reason, h.amount, h.payer_name, h.status, h.created_at, h.refunded_at, h.property_id,
+              h.stripe_payment_intent_id, h.stripe_fee_kept,
+              p.name AS property_name, l.label AS link_label, l.customer_email
+         FROM pos_held_payments h
+         LEFT JOIN properties p ON p.id = h.property_id
+         LEFT JOIN pos_pay_links l ON l.id = h.pay_link_id
+        WHERE h.landlord_id = ANY($1::uuid[])
+          AND (h.status = 'held' OR h.refunded_at > NOW() - INTERVAL '7 days')
+        ORDER BY (h.status = 'held') DESC, h.created_at DESC
+        LIMIT 50`, [ids]) : []
+    // 10/3 (decisions #22): the Refund button says what Stripe keeps — its fee
+    // on the payment, read from Stripe for a held one that has none recorded
+    // yet. 10/3 (review): read side by side, a few per load, and only for
+    // payments held in the last HELD_FEE_LOOKUP_DAYS days — a load never waits
+    // on Stripe once per row, and a payment Stripe will not give a fee for is
+    // not asked about forever. (The refund reads it again either way, before
+    // and after — what Stripe keeps is never left unrecorded for want of a list load.)
+    const ask = rows.filter((r: any) => r.status === 'held' && r.stripe_fee_kept == null && r.stripe_payment_intent_id
+      && Date.now() - new Date(r.created_at).getTime() < HELD_FEE_LOOKUP_DAYS * 86_400_000).slice(0, HELD_FEE_LOOKUPS_PER_LOAD)
+    // One Stripe client for the load, shared by the lookups.
+    let stripe: any = null
+    if (ask.length) {
+      try { stripe = (await import('../lib/stripe')).getStripe() } catch (e) {
+        logger.warn({ err: e }, '[pay-link] could not reach Stripe to read the fees on held payments')
+      }
+    }
+    if (stripe) await Promise.all(ask.map(async (r: any) => {
+      const fee = await stripeFeeOn(r.stripe_payment_intent_id, stripe)
+      if (fee == null || fee > Number(r.amount)) return
+      await query(`UPDATE pos_held_payments SET stripe_fee_kept = $2 WHERE id = $1 AND status = 'held' AND stripe_fee_kept IS NULL AND $2 <= amount`, [r.id, fee])
+      r.stripe_fee_kept = fee
+    }))
+    res.json({ success: true, data: rows.map(({ stripe_payment_intent_id: _pi, ...r }: any) => r) })
+  } catch (e) { next(e) }
+})
+
+/** decisions #22: Stripe's kept fee on a refunded held payment, as one negative
+ *  line on the landlord's next payout (source 'refund', keyed on the refund). */
+async function chargeKeptFeeToLandlord(landlordId: string, refundId: string, kept: number,
+                                       runner?: { query: (sql: string, params: any[]) => Promise<any> }): Promise<void> {
+  const { recordHeldItem } = await import('../services/heldPayouts')
+  await recordHeldItem({
+    landlordId, sourceType: 'refund', sourceId: refundId, amount: -Math.abs(kept),
+    description: "Stripe's processing fee kept on a refunded pay-link payment",
+  } as any, runner as any)
+}
+
+// POST /api/pos/held-payments/:id/refund — decisions #13: "Refund this
+// payment", one click, the account owner only, never automatic. The whole
+// payment goes back to the card it came from, through Stripe; the held row is
+// marked refunded. Pressed twice, it refunds once (Stripe's idempotency key).
+// decisions #22: Stripe keeps its processing fee on a refunded payment — the
+// landlord's loss, never GAM's; the fee is recorded on the row
+// (stripe_fee_kept) for their next payout to carry as its own line.
+posRouter.post('/held-payments/:id/refund', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    if (!isAccountOwner(req.user)) {
+      throw new AppError(403, 'Only the account owner can refund a held payment — ask them to open the notice and press Refund this payment.')
+    }
+    const row = /^[0-9a-f-]{36}$/i.test(String(req.params.id))
+      ? await queryOne<any>(`SELECT * FROM pos_held_payments WHERE id = $1`, [req.params.id]) : null
+    if (!row || !ownsLandlord(req.user, row.landlord_id)) throw new AppError(404, HELD_GONE)
+    if (row.status === 'refunded') {
+      // decisions #22: a refund recorded before the fee line existed still gets
+      // its one line now (recordHeldItem writes it at most once).
+      if (row.stripe_fee_kept != null && Number(row.stripe_fee_kept) > 0 && row.stripe_refund_id) {
+        await chargeKeptFeeToLandlord(row.landlord_id, row.stripe_refund_id, Number(row.stripe_fee_kept))
+      }
+      return res.json({ success: true, data: { refunded: true, amount: Number(row.amount), already: true,
+        stripeFeeKept: row.stripe_fee_kept == null ? null : Number(row.stripe_fee_kept) } })
+    }
+    // What Stripe keeps — read before the refund, while the charge still says it.
+    const fee = await stripeFeeOn(row.stripe_payment_intent_id)
+    let refundId: string
+    try {
+      const { getStripe } = await import('../lib/stripe')
+      const refund = await getStripe().refunds.create(
+        { payment_intent: row.stripe_payment_intent_id,
+          metadata: { gam_purpose: 'pos_held_payment_refund', gam_held_payment_id: row.id, gam_landlord_id: row.landlord_id } },
+        { idempotencyKey: `pos-held-refund-${row.id}` })
+      refundId = refund.id
+    } catch (e) {
+      logger.error({ err: e, heldPaymentId: row.id }, '[pay-link] a held payment could not be refunded')
+      throw new AppError(502, 'The refund could not be started just now — nothing was refunded. Wait a moment, then press Refund this payment again.')
+    }
+    let kept = fee != null && fee <= Number(row.amount) ? fee : (row.stripe_fee_kept == null ? null : Number(row.stripe_fee_kept))
+    // 10/3 (review, decisions #22): Stripe could not say before the refund —
+    // ask again now. The charge's balance transaction keeps its fee after a
+    // refund, and without it the landlord's next payout could never carry
+    // what Stripe kept (GAM would absorb it). Still unknown: said loudly, so
+    // it is recorded by hand before that payout.
+    if (kept == null) {
+      const after = await stripeFeeOn(row.stripe_payment_intent_id)
+      if (after != null && after <= Number(row.amount)) kept = after
+      else logger.error({ heldPaymentId: row.id, paymentIntentId: row.stripe_payment_intent_id, refundId, landlordId: row.landlord_id },
+        '[pay-link] held payment refunded but Stripe\'s kept fee could not be read — set stripe_fee_kept on this pos_held_payments row by hand; the landlord\'s payout line is then written the next time the owner opens Pay Links (or call chargeKeptFeeToLandlord)')
+    }
+    // decisions #22 (Nic): Stripe's kept fee is the LANDLORD's loss, never GAM's
+    // — one negative line on their next payout, written in the same
+    // transaction as the refunded mark (recordHeldItem is at most once per refund).
+    const { getClient } = await import('../db')
+    const tx = await getClient()
+    try {
+      await tx.query('BEGIN')
+      await tx.query(
+        `UPDATE pos_held_payments SET status = 'refunded', refunded_at = NOW(), refunded_by = $2, stripe_refund_id = $3,
+                stripe_fee_kept = $4
+          WHERE id = $1 AND status = 'held'`, [row.id, req.user.userId, refundId, kept])
+      if (kept != null && kept > 0) await chargeKeptFeeToLandlord(row.landlord_id, refundId, kept, tx)
+      await tx.query('COMMIT')
+    } catch (e) {
+      await tx.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { tx.release() }
+    logger.info({ heldPaymentId: row.id, refundId, amount: row.amount, stripeFeeKept: kept }, '[pay-link] held payment refunded by the account owner')
+    res.json({ success: true, data: { refunded: true, amount: Number(row.amount), stripeFeeKept: kept } })
+  } catch (e) { next(e) }
+})

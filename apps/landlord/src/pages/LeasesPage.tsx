@@ -1,6 +1,6 @@
 import { useState, useEffect, Fragment } from 'react'
 import type React from 'react'
-import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { useQuery, useMutation, useQueryClient, type QueryClient } from 'react-query'
 import { useSearchParams, useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, ArrowRight } from 'lucide-react'
@@ -56,6 +56,12 @@ export function LeasesPage() {
   const [leavingLease, setLeavingLease] = useState<LeavingLease | null>(null)
   // S653: how much paid-ahead credit a month may use.
   const [drawLease, setDrawLease] = useState<any | null>(null)
+  // 10/4 (decisions #46.4): "They never moved in — end the lease".
+  const [neverMovedInLease, setNeverMovedInLease] = useState<any | null>(null)
+  // Fix pass 2 (review): why the window opened when it opened from Discard
+  // (a tenant signed since the list was read) — shown once, in the window;
+  // cleared when the window closes, so no other door shows it.
+  const [neverMovedInNote, setNeverMovedInNote] = useState<string | null>(null)
   // S581: money add-on / notice modal (recurring charge or rent change that
   // reaches billing on a landlord-set date).
   const [addonLease, setAddonLease] = useState<any | null>(null)
@@ -137,16 +143,31 @@ export function LeasesPage() {
     const where = [l.unitNumber, l.propertyName].filter(Boolean).join(' at ')
     if (!await appConfirm(
       `The unsigned draft lease${where ? ` for ${where}` : ''} will be canceled. `
-      + 'It stays on record, and nothing is sent to anyone.',
+      + 'It stays on record. A signing link already sent for it stops working, and nothing new is sent to anyone.',
       { title: 'Discard this draft?', confirmLabel: 'Discard draft', danger: true },
     )) return
     try {
       await apiPost(`/leases/${l.id}/discard`, {})
       toast('Draft discarded.')
-      leasesQc.invalidateQueries('leases')
-      leasesQc.invalidateQueries('landlord-dashboard')
+      refreshAfterLeaseClose(leasesQc)
     } catch (e: any) {
-      toast.error(e?.response?.data?.error || 'Could not discard that draft.')
+      // Fix pass 2: a tenant signed since this list was read — it is no
+      // longer an unsigned draft. Nothing was changed; the list reads again in
+      // place and "They never moved in — end the lease" opens, which shows
+      // exactly what would be zeroed before anything is.
+      if (e?.response?.status === 409 && e?.response?.data?.code === 'tenant_signed') {
+        leasesQc.invalidateQueries('leases')
+        setNeverMovedInNote(DISCARD_BECAME_SIGNED_NOTE)
+        setNeverMovedInLease(l)
+        return
+      }
+      // Fix pass 3: any other refusal (the landlord signed since the list was
+      // read — 409 'landlord_signed' — or it is no longer a draft) reads the
+      // list again in place, so the row redraws with the right button ("Void
+      // on the GoldSign page") instead of a Discard every press of which fails.
+      const status = e?.response?.status
+      if (status === 400 || status === 409) leasesQc.invalidateQueries('leases')
+      toast.error(e?.response?.data?.error || 'Could not discard that draft. Nothing changed. Try again.')
     }
   }
 
@@ -512,8 +533,12 @@ export function LeasesPage() {
                         >
                           <Eye size={12} /> Details
                         </button>
+                        {/* Fix pass 2: which button a waiting lease shows follows the
+                            server's own "who signed" test (tenantSignedAny /
+                            anyoneSigned — the one Discard uses), never
+                            signedByTenant, which is set only once EVERYONE signed. */}
                         {can('leases.terminate') && (l.status === 'pending' || l.status === 'draft')
-                          && !(l.supersedesLeaseId && l.signedByLandlord) && (
+                          && !(l.supersedesLeaseId && l.signedByLandlord) && !tenantSigned(l) && !anyoneSigned(l) && (
                           <button
                             className="btn btn-ghost btn-sm"
                             title="Discard this unsigned draft — it stays on record as canceled"
@@ -521,6 +546,35 @@ export function LeasesPage() {
                             style={{ padding: '3px 8px' }}
                           >
                             <X size={12} /> Discard
+                          </button>
+                        )}
+                        {/* Signed only by the landlord (S647: their signature issued
+                            it): the way out is voiding its document, which takes the
+                            lease and its bill back and tells the tenant. */}
+                        {can('esign.void') && (l.status === 'pending' || l.status === 'draft')
+                          && !(l.supersedesLeaseId && l.signedByLandlord) && !tenantSigned(l) && anyoneSigned(l) && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            title="You signed this lease and the tenant hasn’t yet. Void its document on the GoldSign page — that takes the lease and its bill back and tells the tenant."
+                            onClick={() => navigate('/esign')}
+                            style={{ padding: '3px 8px' }}
+                          >
+                            Void on the GoldSign page <ArrowRight size={12} />
+                          </button>
+                        )}
+                        {/* 10/4 (decisions #46.4): a lease a tenant signed can't be
+                            discarded or voided — if they never came, this zeroes their
+                            unpaid move-in bill and ends it, showing exactly what first
+                            (decisions #53: a later bill stays owed). */}
+                        {can('leases.terminate') && (l.status === 'pending' || l.status === 'draft')
+                          && !(l.supersedesLeaseId && l.signedByLandlord) && tenantSigned(l) && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            title="A tenant signed but they never moved in — zero their unpaid move-in bill and end the lease (shows exactly what first)"
+                            onClick={() => setNeverMovedInLease(l)}
+                            style={{ padding: '3px 8px' }}
+                          >
+                            <X size={12} /> They never moved in — end the lease
                           </button>
                         )}
                         {l.status === 'active' && (can('leases.bill_fee') || can('leases.create')) && (
@@ -537,7 +591,7 @@ export function LeasesPage() {
                             ] : []),
                           ]} />
                         )}
-                        {(can('leases.edit') || can('leases.deposit_return') || can('front_desk.mark_leaving') || can('leases.create')) && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
+                        {(can('leases.edit') || can('leases.deposit_return') || can('front_desk.mark_leaving') || can('leases.create') || can('leases.terminate')) && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
                           <RowMenu label={<><ArrowRight size={12} /> Change</>} items={[
                             // S655: a new lease from a date — month-to-month included.
                             // Never on a stay booked at the front desk (a guest's
@@ -571,6 +625,17 @@ export function LeasesPage() {
                             ] : []),
                             ...(can('leases.deposit_return') ? [
                               { label: 'Move out', hint: 'Move-out and deposit return', onClick: () => navigate(`/leases/${l.id}/deposit-return`) },
+                            ] : []),
+                            // 10/4 (decisions #46.4): the scheduler makes a lease
+                            // active on its start date whether or not anyone came.
+                            ...(can('leases.terminate') && l.status === 'active' ? [
+                              { label: 'They never moved in — end the lease', hint: 'Zero their unpaid move-in bill and end it — shows exactly what first', onClick: () => setNeverMovedInLease(l) },
+                            ] : []),
+                            // Step 9 final fix (fix pass 1): a lease that ended with a
+                            // bill nothing was ever paid on still owed (the server's
+                            // endedBillOpen) — zero what is left, never "nothing to do".
+                            ...(can('leases.terminate') && (l.status === 'expired' || l.status === 'terminated') && l.endedBillOpen === true ? [
+                              { label: 'They never moved in — zero the bill', hint: 'The lease ended with its bill still owed — shows exactly what would be zeroed first', onClick: () => setNeverMovedInLease(l) },
                             ] : []),
                             ...(can('leases.edit') && l.status === 'active' ? [
                               l.isHibernating
@@ -630,6 +695,10 @@ export function LeasesPage() {
       )}
       {drawLease && (
         <PrepaidDrawModal lease={drawLease} onClose={() => setDrawLease(null)} />
+      )}
+      {neverMovedInLease && (
+        <NeverMovedInModal lease={neverMovedInLease} note={neverMovedInNote}
+          onClose={() => { setNeverMovedInLease(null); setNeverMovedInNote(null) }} />
       )}
       {chargeLease && (
         <OneOffChargeModal
@@ -1498,6 +1567,304 @@ function PrepaidDrawModal({ lease, onClose }: { lease: any; onClose: () => void 
           <button className="btn btn-primary" disabled={!valid || save.isLoading} onClick={() => save.mutate(Math.round(n * 100) / 100)}>
             {save.isLoading ? 'Saving…' : 'Save'}
           </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── 10/4 (decisions #46.4, Nic): "If they never pay the deposit or never move
+// in, you would just zero it out and end the lease." ─────────────────────────
+// Staff say "they never moved in"; the window reads, fresh at the moment it
+// opens, exactly what would be zeroed (or why it can't be, with the real next
+// step), and the gold button does the one close: the unpaid MOVE-IN bill
+// zeroed and voided (decisions #53 — a later bill stays owed and is listed as
+// "Stays owed"), the lease ended. A 409 (what the lease owes changed, or money
+// arrived) reads it again in place; Cancel backs out with nothing sent.
+export type NeverMovedInPreview = {
+  applies: boolean
+  words: string | null
+  status: string | null
+  startDate: string | null
+  lines: Array<{ paymentId: string; label: string; amount: number; dueDate: string | null; utility: boolean }>
+  total: number
+  /**
+   * Step 9 final fix (fix pass 1): what stays owed — GAM's own fees (the
+   * declined-card fee, the returned-payment fee) and charges billed on purpose
+   * — never zeroed, with the server's plain words for them.
+   */
+  kept?: Array<{ paymentId: string; label: string; amount: number; why: 'gam_fee' | 'billed_charge' | 'later_bill'; dueDate?: string | null
+                  /** Fix pass 2 (review): the days a later month's rent covers. */
+                  periodStart?: string | null; periodEnd?: string | null }>
+  keptTotal?: number
+  keptWords?: string | null
+  /** The reservation canceled with the lease, in words (null when none). */
+  reservationWords?: string | null
+  /** The lease had already ended: only what is left on it is closed. */
+  alreadyEnded?: boolean
+  household?: { tenantNames: string[]; unitNumber: string | null; propertyName: string | null } | null
+}
+
+/**
+ * Fix pass 2: whether a tenant (anyone but the landlord) signed any document
+ * of this lease, and whether anyone did — the server's leaseSignedBySql, the
+ * one test Discard uses. A list from an older server without them falls back
+ * to the lease's own flags.
+ */
+export const tenantSigned = (l: any): boolean => (l.tenantSignedAny ?? l.signedByTenant) === true
+export const anyoneSigned = (l: any): boolean => (l.anyoneSigned ?? (l.signedByTenant || l.signedByLandlord)) === true
+
+/** "Oct 4, 2026" from a calendar day (YYYY-MM-DD) — never moved by a time zone. */
+const dueDay = (ymd: string) =>
+  new Date(`${String(ymd).slice(0, 10)}T12:00:00Z`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+
+/** A start date more than a month before today (a calendar day — never moved by a time zone). */
+function startedOverAMonthAgo(ymd: string | null): boolean {
+  if (!ymd) return false
+  const start = new Date(`${String(ymd).slice(0, 10)}T12:00:00Z`)
+  if (Number.isNaN(start.getTime())) return false
+  const monthLater = new Date(start)
+  monthLater.setUTCMonth(monthLater.getUTCMonth() + 1)
+  return monthLater.getTime() < Date.now()
+}
+
+/**
+ * What the window says first when Discard found a tenant had signed since the
+ * list was read (409 'tenant_signed'): why a different window opened, once.
+ */
+export const DISCARD_BECAME_SIGNED_NOTE =
+  'A tenant signed this lease since the list was read, so it can’t be discarded as an unsigned draft. Nothing was changed. ' +
+  'Ending it as never moved in is below — exactly what would be zeroed, before anything is.'
+
+/** What POST /leases/:id/never-moved-in answers (camelCased): what the close zeroed and what stays owed. */
+type NeverMovedInDone = {
+  zeroedTotal?: number
+  reservationCanceled?: boolean
+  kept?: Array<{ paymentId: string; label: string; amount: number; why: string; dueDate?: string | null }>
+  keptTotal?: number
+  keptWords?: string | null
+}
+
+/**
+ * Fix pass 3 (review): the refund sentence is true in every case — GAM's own
+ * fee (which stays owed) may have been paid, so never "Nothing was paid"
+ * while one is on the lease.
+ */
+const refundWords = (zeroedLines: number, keptLines: number): string =>
+  zeroedLines > 0 ? 'Nothing was paid toward what is zeroed, so nothing is refunded.'
+    : keptLines > 0 ? 'Nothing is refunded.'
+    : 'Nothing was paid, so nothing is refunded.'
+
+/** "Declined card fee $1.00 and Rent due Nov 1, 2026 $1,000.00" — what stays owed, by name. */
+const keptInWords = (kept: Array<{ label: string; amount: number; dueDate?: string | null }>): string => {
+  const items = kept.map(k => `${k.label}${k.dueDate ? ` due ${dueDay(k.dueDate)}` : ''} ${fmt(k.amount)}`)
+  return items.length <= 1 ? (items[0] ?? '') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
+}
+
+/** Why a line stays owed, beside it on the confirm (decisions #46.4, #53). */
+const KEPT_WHY_LABEL: Record<string, string> = {
+  later_bill: 'not on the move-in bill',
+  gam_fee: 'GAM’s own fee — ending the lease never takes it off',
+  billed_charge: 'billed on purpose',
+}
+
+/**
+ * The body of the never-moved-in confirm for ONE lease: what is zeroed (the
+ * move-in bill's lines), what stays owed, the reservation canceled with it,
+ * and what else happens. One copy for the Leases page's window and the
+ * Schedule's Cancel reservation confirm (final fix, fix pass 1 — decisions
+ * #53: "Cancel reservation on the Schedule opens the same confirm").
+ */
+export function NeverMovedInBody({ d, ended }: { d: NeverMovedInPreview; ended: boolean }) {
+  const kept = d.kept ?? []
+  const keptTotal = kept.reduce((t, k) => t + Math.round(k.amount * 100), 0) / 100
+  return (
+    <div data-testid="nmi-zeroed" style={{ fontSize: '.84rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+      {startedOverAMonthAgo(d.startDate) && (
+        <div data-testid="nmi-old-lease" role="note" style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'rgba(245,158,11,.08)', border: '1px solid rgba(245,158,11,.3)', color: 'var(--amber)', fontSize: '.8rem' }}>
+          This lease started on {dueDay(d.startDate!)} — only use this if nobody ever lived there. If they lived there, end it with a move-out instead.
+        </div>
+      )}
+      {d.lines.length > 0 ? (
+        <>
+          <div data-testid="nmi-lead" style={{ marginBottom: 8 }}>
+            {ended
+              ? 'The tenant never paid or moved in, so this zeroes their unpaid move-in bill:'
+              : 'The tenant never paid or moved in, so ending the lease zeroes their unpaid move-in bill:'}
+          </div>
+          {d.lines.map(l => (
+            <div key={l.paymentId} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '4px 0', borderBottom: '1px solid var(--border-0)' }}>
+              <span style={{ color: 'var(--text-1)' }}>
+                {l.label}{l.dueDate ? <span style={{ color: 'var(--text-3)' }}> · due {dueDay(l.dueDate)}</span> : null}
+                {l.utility ? <span style={{ color: 'var(--text-3)' }}> · goes back on hold for whoever the space is billed to next</span> : null}
+              </span>
+              <span style={{ fontFamily: 'var(--font-mono)' }}>{fmt(l.amount)}</span>
+            </div>
+          ))}
+          <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', fontWeight: 600, color: 'var(--text-0)' }}>
+            <span>No longer owed</span><span style={{ fontFamily: 'var(--font-mono)' }}>{fmt(d.total)}</span>
+          </div>
+        </>
+      ) : (
+        // Fix pass 3 (review): "Nothing is owed" only when nothing stays owed either.
+        <div data-testid="nmi-lead" style={{ marginBottom: 8 }}>{kept.length > 0 ? 'Nothing on this lease is zeroed.' : 'Nothing is owed on this lease.'}</div>
+      )}
+      {kept.length > 0 && (
+        // Decisions #53: every line that stays owed is listed as "Stays owed",
+        // by name, with why — a later month's rent, GAM's own fee, a charge
+        // billed on purpose. It stays on the household's balance.
+        <div data-testid="nmi-kept" role="note" style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8, background: 'var(--bg-2)', border: '1px solid var(--border-0)', color: 'var(--text-1)', fontSize: '.8rem' }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Stays owed — on the household’s balance</div>
+          {kept.map(k => (
+            <div key={k.paymentId} data-testid="nmi-kept-line" style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '2px 0' }}>
+              <span>
+                {k.label}
+                {k.periodStart && k.periodEnd && k.why === 'later_bill' ? <span data-testid="nmi-kept-period" style={{ color: 'var(--text-3)' }}> · for {dueDay(k.periodStart)} – {dueDay(k.periodEnd)}</span> : null}
+                {k.dueDate && k.why === 'later_bill' ? <span style={{ color: 'var(--text-3)' }}> · due {dueDay(k.dueDate)}</span> : null}
+                <span style={{ color: 'var(--text-3)' }}> · {KEPT_WHY_LABEL[k.why] ?? 'stays owed'}</span>
+              </span>
+              <span style={{ fontFamily: 'var(--font-mono)' }}>{fmt(k.amount)}</span>
+            </div>
+          ))}
+          {kept.length > 1 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', paddingTop: 4, fontWeight: 600 }}>
+              <span>Stays owed</span><span style={{ fontFamily: 'var(--font-mono)' }}>{fmt(keptTotal)}</span>
+            </div>
+          )}
+        </div>
+      )}
+      {d.reservationWords && (
+        <div data-testid="nmi-reservation" style={{ marginTop: 8 }}>{d.reservationWords}</div>
+      )}
+      <div style={{ marginTop: 6 }}>
+        {ended
+          ? `${d.lines.length > 0 ? 'The move-in bill is voided. ' : ''}The lease already ended, so nothing else about it changes. ${refundWords(d.lines.length, kept.length)}`
+          : `${d.lines.length > 0 ? 'The move-in bill is voided, the' : 'The'} lease ends today and the household is taken off it. Lease paperwork still waiting for signatures is canceled, so it can’t be signed later. ${refundWords(d.lines.length, kept.length)}`}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Final fix (fix pass 2, review): what reads again after a stay is canceled or
+ * a lease is closed as never moved in (or discarded). The real keys, each
+ * matched by its prefix: the Leases page ('leases'), the Schedule and its
+ * history, the Schedule's Reservations list ('bookings' — fix pass 1 of the
+ * #53 close: a stay canceled on the calendar showed its old status there for
+ * up to 30 seconds), the dashboard (DashboardPage's ['dashboard', propertyId, basis],
+ * kept with staleTime Infinity) and its to-dos ('landlord-todos'), and the
+ * Payments page's ledger ('payments-ledger'). `refetchInactive`: the app's
+ * client never refetches on mount (main.tsx), so a page visited a minute ago
+ * and not on screen now would otherwise open showing the lease still pending
+ * and the zeroed bill still owed.
+ */
+export const LEASE_CLOSE_REFRESH_KEYS = ['leases', 'schedule', 'schedule-history', 'bookings', 'dashboard', 'landlord-todos', 'payments-ledger'] as const
+export function refreshAfterLeaseClose(qc: QueryClient): void {
+  for (const k of LEASE_CLOSE_REFRESH_KEYS) qc.invalidateQueries(k, { refetchInactive: true })
+}
+
+export function NeverMovedInModal({ lease, note, onClose }: { lease: any; note?: string | null; onClose: () => void }) {
+  const qc = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+  const preview = useQuery<NeverMovedInPreview>(
+    ['never-moved-in', lease.id],
+    () => apiGet<NeverMovedInPreview>(`/leases/${lease.id}/never-moved-in`),
+    { staleTime: 0, cacheTime: 0, retry: false, refetchOnWindowFocus: false },
+  )
+  // The total the confirm showed goes with the press (the server checks it).
+  // What the toast says comes from the close's own answer (fix pass 3,
+  // review): what it zeroed and what stays owed as the close read them under
+  // its locks — a GAM fee added after the window opened is named too.
+  const end = useMutation(
+    (v: { total: number }) =>
+      apiPost<any>(`/leases/${lease.id}/never-moved-in`, { expectedTotal: v.total }),
+    {
+      onSuccess: (r: any, v) => {
+        refreshAfterLeaseClose(qc)
+        // apiPost hands back the whole answer ({ success, data }), camelCased.
+        const done: NeverMovedInDone = r?.data ?? {}
+        const zeroed = typeof done.zeroedTotal === 'number' ? done.zeroedTotal : v.total
+        const stillOwed = done.kept ?? []
+        const lead = ended ? 'Bill closed.' : done.reservationCanceled ? 'Lease ended and its reservation canceled.' : 'Lease ended.'
+        // Fix pass 2 (review): GAM's own fees (and charges billed on purpose)
+        // are never zeroed — the toast says they stay owed, by name. So does
+        // a later month's bill (decisions #53: only the move-in bill is zeroed).
+        const stays = (done.keptTotal ?? 0) > 0 && stillOwed.length > 0 ? ` Still owed on their balance: ${keptInWords(stillOwed)}.` : ''
+        toast(zeroed > 0
+          ? `${lead} The ${fmt(zeroed)} move-in bill they never paid is no longer owed.${stays}`
+          : stays ? `${lead} Nothing was zeroed.${stays}` : `${lead} Nothing was owed on it.`)
+        onClose()
+      },
+      onError: (e: any) => {
+        setError(e?.response?.data?.error || 'The lease could not be ended. Nothing changed. Try again.')
+        // Read it again in place — what it owes, or why it can't be ended now.
+        preview.refetch()
+      },
+    },
+  )
+  const d = preview.data
+  // Step 9 final fix (fix pass 1): a lease that already ended only has its
+  // bill closed — said so in the title, the words and the button.
+  const ended = d?.alreadyEnded === true || lease.status === 'terminated' || lease.status === 'expired'
+  const title = ended ? 'They never moved in — zero the bill' : 'They never moved in — end the lease'
+  const names = (d?.household?.tenantNames ?? []).filter(Boolean)
+  const people = names.length === 0 ? 'this lease'
+    : names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+  const space = [d?.household?.unitNumber ?? lease.unitNumber, d?.household?.propertyName ?? lease.propertyName].filter(Boolean).join(', ')
+  // Each error once: a refusal the fresh read now shows is not repeated above
+  // it, and when the fresh read itself failed (access removed, the lease
+  // gone, no network) its own error is the one message shown — never the
+  // press's error above it as well (fix pass 1).
+  const shownError = error && error !== d?.words && !preview.isError ? error : null
+  // Fix pass 3: while the close is running the window stays open (a click
+  // outside, × and Cancel do nothing), so a refusal or a 409 that comes back
+  // is shown — never set on a window that is already gone.
+  const close = () => { if (!end.isLoading) onClose() }
+  return (
+    <div className="modal-overlay" onClick={close}>
+      <div className="modal" role="dialog" aria-label={title} style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <span className="modal-title" style={{ marginBottom: 0 }}>{title}</span>
+          <button className="btn btn-ghost btn-sm" aria-label="Close" disabled={end.isLoading} onClick={close}><X size={14} /></button>
+        </div>
+        <div data-testid="nmi-who" style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 10 }}>
+          {people}{space ? <span style={{ color: 'var(--text-3)' }}> — {space}</span> : null}
+        </div>
+        {note && !shownError && (
+          <div data-testid="nmi-note" role="note" style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'rgba(245,158,11,.08)', border: '1px solid rgba(245,158,11,.3)', color: 'var(--amber)', fontSize: '.78rem' }}>{note}</div>
+        )}
+        {shownError && (
+          <div role="alert" style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'rgba(239,68,68,.08)', border: '1px solid rgba(239,68,68,.3)', color: 'var(--red)', fontSize: '.78rem' }}>{shownError}</div>
+        )}
+        {preview.isLoading ? (
+          <div style={{ fontSize: '.84rem', color: 'var(--text-3)', padding: '8px 0' }}>Reading what this lease owes…</div>
+        ) : preview.isError || !d ? (
+          // Fix pass 2 (review): the error once, with its next step — Read again.
+          <div role="alert" style={{ fontSize: '.84rem', color: 'var(--red)', padding: '8px 0' }}>
+            {(preview.error as any)?.response?.data?.error || 'What this lease owes could not be read, so nothing was changed. Press Read again.'}
+          </div>
+        ) : !d.applies ? (
+          <div data-testid="nmi-refusal" style={{ fontSize: '.84rem', color: 'var(--text-1)', lineHeight: 1.5, padding: '4px 0 8px' }}>{d.words}</div>
+        ) : (
+          <NeverMovedInBody d={d} ended={ended} />
+        )}
+        <div className="modal-footer" style={{ display: 'flex', gap: 8 }}>
+          {/* Fix pass 3 (review): Read again is the next step and the only
+              action while the read has failed, so it is the gold button. */}
+          {preview.isError && (
+            <button className="btn btn-primary" disabled={preview.isFetching} onClick={() => { setError(null); preview.refetch() }}>
+              {preview.isFetching ? 'Reading…' : 'Read again'}
+            </button>
+          )}
+          <button className="btn btn-ghost" style={{ marginLeft: 'auto' }} disabled={end.isLoading} onClick={close}>{d && !d.applies ? 'Close' : 'Cancel'}</button>
+          {d?.applies && (
+            <button className="btn btn-primary" disabled={end.isLoading || preview.isFetching}
+              onClick={() => { setError(null); end.mutate({ total: d.total }) }}>
+              {end.isLoading ? (ended ? 'Closing…' : 'Ending…')
+                : ended ? `Zero the bill — ${fmt(d.total)} no longer owed`
+                : d.total > 0 ? `End the lease — ${fmt(d.total)} no longer owed` : 'End the lease'}
+            </button>
+          )}
         </div>
       </div>
     </div>

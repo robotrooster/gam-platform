@@ -1,11 +1,32 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS } from '@gam/shared'
+import { useQuery, useMutation } from 'react-query'
+import { humanize, PAYMENT_STATUS_LABEL, type PaymentStatus } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
+import { PostPaymentForm } from '../components/RecordPaymentWindow'
+import {
+  money, tenantCreditHeadline, tenantCreditLines, toCents, localToday, dayWord, monthTitle, calendarDay, chargeTimeliness,
+  CREDIT_USE_RULE, type TenantCredit,
+} from '../lib/creditDesk'
+import '../styles/credit-desk.css'
+
+/**
+ * A charge's status color, one per status. Amber is owed (not paid yet, being
+ * paid); a voided charge is owed by nobody (decisions #48.5), so it is muted —
+ * never the amber an unpaid bill wears.
+ */
+const PAYMENT_STATUS_BADGE: Record<PaymentStatus, string> = {
+  pending: 'badge-amber',
+  processing: 'badge-amber',
+  settled: 'badge-green',
+  paid_via_deposit: 'badge-green',
+  failed: 'badge-red',
+  returned: 'badge-red',
+  voided: 'badge-muted',
+}
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 // S252: legacy per-tenant FlexChargePanel removed. The new schema
@@ -90,7 +111,8 @@ export function TenantDetailPage() {
             {(paymentsHidden ? [
               { label: 'Units With You', val: stats.unitsOccupied, color: 'var(--text-0)' },
             ] : [
-              { label: 'Tenant Since', val: stats.firstPayment ? new Date(stats.firstPayment).toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) : '--', color: 'var(--text-0)' },
+              // Their first bill's due date, read as a calendar month (never shifted a day by time zone).
+              { label: 'Tenant Since', val: calendarDay(stats.firstPayment) ? monthTitle(calendarDay(stats.firstPayment)!) : '--', color: 'var(--text-0)' },
               { label: 'Months With You', val: stats.tenantMonths + ' mo', color: 'var(--text-0)' },
               { label: 'Total Paid', val: fmt(stats.totalPaid), color: 'var(--gold)' },
               { label: 'On-Time Rate', val: stats.onTimeRate + '%', color: onTimeColor, sub: onTimeLabel },
@@ -166,7 +188,7 @@ export function TenantDetailPage() {
                   </div>
                   <div style={{ textAlign: 'right' }}>
                     <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.82rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rentAmount)}/mo</div>
-                    {u.startDate && <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginTop: 1 }}>{new Date(u.startDate).toLocaleDateString()} - {u.endDate ? new Date(u.endDate).toLocaleDateString() : 'Present'}</div>}
+                    {u.startDate && <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginTop: 1 }}>{dayWord(u.startDate, '')} - {u.endDate ? dayWord(u.endDate, '') : 'Present'}</div>}
                   </div>
                   <button className="btn btn-ghost btn-sm" onClick={() => navigate('/units/' + u.id)}>View</button>
                 </div>
@@ -176,7 +198,8 @@ export function TenantDetailPage() {
 
           <PhotosAndNoticesCard tenantId={id!} />
 
-          <PostPaymentCard tenantId={id!} hasUnit={!!currentUnit} paidAhead={Number(data.paidAhead ?? 0)} />
+          <CreditCard credit={data.credit ?? null} />
+          <PostPaymentCard tenantId={id!} hasUnit={!!currentUnit} name={`${tenant.firstName ?? ''} ${tenant.lastName ?? ''}`.trim() || 'this tenant'} />
           <OneOffChargesCard tenantId={id!} hasUnit={!!currentUnit} />
 
           {!paymentsHidden && (
@@ -190,11 +213,11 @@ export function TenantDetailPage() {
                 <tbody>
                   {payments?.map((p: any) => (
                     <tr key={p.id}>
-                      <td className="mono" style={{ fontSize: '.72rem' }}>{new Date(p.dueDate).toLocaleDateString()}</td>
+                      <td className="mono" style={{ fontSize: '.72rem' }}>{dayWord(p.dueDate, '')}</td>
                       <td style={{ fontSize: '.78rem' }}>{p.propertyName}</td>
                       <td className="mono">{p.unitNumber}</td>
                       <td className="mono">{fmt(p.amount)}</td>
-                      <td><span className={`badge ${p.status === 'settled' ? 'badge-green' : p.status === 'failed' ? 'badge-red' : 'badge-amber'}`}>{humanize(p.status)}</span></td>
+                      <td><span className={`badge ${PAYMENT_STATUS_BADGE[p.status as PaymentStatus] ?? 'badge-muted'}`}>{PAYMENT_STATUS_LABEL[p.status as PaymentStatus] ?? humanize(p.status)}</span></td>
                     </tr>
                   ))}
                 </tbody>
@@ -239,28 +262,14 @@ export function TenantDetailPage() {
 // due_date (day-sliced per the date-serialization rule); unpaid past-due rows
 // show days overdue against today.
 function PaymentTimelinessModal({ payments, tenantName, onClose }: { payments: any[]; tenantName: string; onClose: () => void }) {
-  const day = (d: any) => (d ? String(d).slice(0, 10) : null)
-  const daysBetween = (a: string, b: string) =>
-    Math.round((new Date(b + 'T12:00:00').getTime() - new Date(a + 'T12:00:00').getTime()) / 86400000)
-  const today = (() => { const n = new Date(); return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}-${String(n.getDate()).padStart(2,'0')}` })()
-
+  // The day it settled is read on this device's calendar (a payment at 6 pm in
+  // Phoenix is already "tomorrow" in UTC), the due day as the calendar day it
+  // is; a payment still clearing, or paid from the deposit, is never "overdue",
+  // and every status is said in words (lib/creditDesk chargeTimeliness).
+  const TONE_BADGE = { good: 'badge-green', warn: 'badge-amber', bad: 'badge-red', info: 'badge-blue', muted: 'badge-muted' } as const
   const rows = payments.map((p: any) => {
-    const due = day(p.dueDate)
-    const settled = day(p.settledAt)
-    let late = 0; let label = ''; let cls = 'badge-muted'
-    if (p.status === 'settled' && due && settled) {
-      late = Math.max(0, daysBetween(due, settled))
-      if (late === 0) { label = 'On time'; cls = 'badge-green' }
-      else { label = `${late} day${late === 1 ? '' : 's'} late`; cls = late <= 7 ? 'badge-amber' : 'badge-red' }
-    } else if (p.status === 'failed') {
-      label = 'Failed'; cls = 'badge-red'
-    } else if (due && due < today) {
-      late = daysBetween(due, today)
-      label = `${late} day${late === 1 ? '' : 's'} overdue`; cls = 'badge-red'
-    } else {
-      label = p.status; cls = 'badge-amber'
-    }
-    return { ...p, due, settled, late, label, cls }
+    const t = chargeTimeliness(p)
+    return { ...p, due: t.due, settled: t.settled, late: t.late, label: t.label, cls: TONE_BADGE[t.tone] }
   })
   const settledRows = rows.filter(r => r.status === 'settled' && r.due && r.settled)
   const onTime = settledRows.filter(r => r.late === 0).length
@@ -293,8 +302,8 @@ function PaymentTimelinessModal({ payments, tenantName, onClose }: { payments: a
             <tbody>
               {rows.map((r: any) => (
                 <tr key={r.id}>
-                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.due ? new Date(r.due + 'T12:00:00').toLocaleDateString() : '—'}</td>
-                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.settled ? new Date(r.settled + 'T12:00:00').toLocaleDateString() : '—'}</td>
+                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.due ? dayWord(r.due, '') : '—'}</td>
+                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.settled ? dayWord(r.settled, '') : '—'}</td>
                   <td className="mono">{r.amount != null ? `$${Number(r.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}` : '—'}</td>
                   <td style={{ fontSize: '.72rem', textTransform: 'uppercase', color: 'var(--text-3)' }}>{humanize(r.type)}</td>
                   <td><span className={`badge ${r.cls}`}>{r.label}</span></td>
@@ -417,7 +426,8 @@ function OneOffChargesCard({ tenantId, hasUnit }: { tenantId: string; hasUnit: b
 function AddChargeModal({ tenantId, onClose, onSaved }: {
   tenantId: string; onClose: () => void; onSaved: () => void
 }) {
-  const today = new Date().toISOString().slice(0, 10)
+  // This device's calendar day: a UTC day is tomorrow in Phoenix every evening.
+  const today = localToday()
   const [chargeType, setChargeType] = useState('violation')
   const [amount, setAmount] = useState('')
   const [reason, setReason] = useState('')
@@ -440,10 +450,12 @@ function AddChargeModal({ tenantId, onClose, onSaved }: {
   )
 
   const ready = Number(amount) > 0 && reason.trim().length >= 3
+  // Only its own buttons close it, and not while the charge is being added.
+  const close = () => { if (!save.isLoading) onClose() }
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+    <div className="modal-overlay">
+      <div className="modal" style={{ maxWidth: 420 }}>
         <div className="modal-title">Add a charge</div>
         <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.6 }}>
           For something that happened — not a term of the lease. The tenant sees the reason and
@@ -483,7 +495,7 @@ function AddChargeModal({ tenantId, onClose, onSaved }: {
             onClick={() => { setError(''); save.mutate() }}>
             {save.isLoading ? 'Adding…' : 'Add charge'}
           </button>
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-ghost" disabled={save.isLoading} onClick={close}>Cancel</button>
         </div>
       </div>
     </div>
@@ -491,90 +503,68 @@ function AddChargeModal({ tenantId, onClose, onSaved }: {
 }
 
 
+/**
+ * S655 (Nic, 10/2): "ALL the credit on their account, and what of it would pay
+ * their bills right now" — they differ (paid-ahead money stops at a monthly
+ * draw limit, credit pays only your own rent, utilities and fees, and credit
+ * tied to one lease pays only that lease). The balance itself is never netted;
+ * the credit is used when they (or the desk, for them) say so, and pays a bill
+ * by itself only when it covers that whole bill. Only a viewer who may see
+ * payments, or the desk that takes them, is sent these figures (tenants.ts).
+ */
+function CreditCard({ credit }: { credit: TenantCredit | null }) {
+  const headline = tenantCreditHeadline(credit)
+  if (!credit || !headline) return null
+  const lines = tenantCreditLines(credit)
+  // Part of it can pay their bills and part cannot: say why the rest cannot.
+  const someNotUsable = toCents(credit.usable) > 0 && toCents(credit.usable) < toCents(credit.total)
+  return (
+    <div className="card cd-credit-card" style={{ marginBottom: 16 }}>
+      <div className="card-title" style={{ marginBottom: 10 }}>Account credit</div>
+      <div className="cd-credit-lead">{headline}</div>
+      {lines.map(l => (
+        <div key={l.label} className="data-row">
+          <span className="data-key">{l.label}</span>
+          <span className="data-val mono">{money(l.amount)}</span>
+        </div>
+      ))}
+      <div className="cd-note" style={{ marginTop: 10 }}>
+        {CREDIT_USE_RULE}
+        {someNotUsable && ' The rest cannot pay these bills: paid-ahead money stops at its monthly limit, credit pays only your own rent, utilities and fees, and credit tied to one lease pays only that lease.'}
+      </div>
+    </div>
+  )
+}
+
 // S652 (Nic): "there's only a way to add a charge. There's no way to post a
 // payment." A check that arrived before its bill: settles what is open, and
-// the rest is paid ahead — drawn down by the next invoice before it goes out.
-function PostPaymentCard({ tenantId, hasUnit, paidAhead }: { tenantId: string; hasUnit: boolean; paidAhead: number }) {
+// the rest is kept as money paid ahead (decisions #29: the same form as Record
+// payment for anyone not on the Outstanding list).
+function PostPaymentCard({ tenantId, hasUnit, name }: { tenantId: string; hasUnit: boolean; name: string }) {
   // S655: posting a payment needs "Take payments". A worker without it used to
   // see the button and get "Insufficient permissions" after filling the form
-  // in — now the button is simply not there. The paid-ahead line still shows
-  // to anyone the server sends it to (those who may see payments).
+  // in — now the card is simply not there.
   const { can } = usePerms()
-  const canPost = can('take_payment')
-  const qc = useQueryClient()
   const [open, setOpen] = useState(false)
-  const [amount, setAmount] = useState('')
-  const [method, setMethod] = useState<string>('check')
-  const [reference, setReference] = useState('')
-  const [receivedAt, setReceivedAt] = useState(new Date().toISOString().slice(0, 10))
-  const [notes, setNotes] = useState('')
-  const [error, setError] = useState('')
-  const today = new Date().toISOString().slice(0, 10)
-  const save = useMutation(
-    () => apiPost<any>('/payments/post-payment', {
-      tenantId, method, amount: Number(amount), reference: reference.trim() || null,
-      notes: notes.trim() || null, receivedAt,
-    }),
-    {
-      onSuccess: (r: any) => {
-        const d = r?.data ?? r
-        toast(`Posted — ${fmt(d.applied)} to open charges, ${fmt(d.paidAhead)} paid ahead.`)
-        qc.invalidateQueries(['tenant-profile', tenantId])
-        setOpen(false); setAmount(''); setReference(''); setNotes('')
-      },
-      onError: (e: any) => setError(e?.response?.data?.error || e?.message || 'Could not post that payment'),
-    },
-  )
-  const ready = Number(amount) > 0 && (method === 'cash' || reference.trim().length > 0 || true)
-  if (!canPost && !(paidAhead > 0)) return null
+  if (!can('take_payment')) return null
   return (
     <div className="card" style={{ marginBottom: 16 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
         <div className="card-title" style={{ marginBottom: 0 }}>Payments</div>
-        {hasUnit && canPost && (
-          <button className="btn btn-primary btn-sm" onClick={() => { setError(''); setOpen(true) }}>
+        {hasUnit && (
+          <button className="btn btn-primary btn-sm" onClick={() => setOpen(true)}>
             <Plus size={13}/> Post a payment
           </button>
         )}
       </div>
-      {canPost && (
-        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
-          Cash, a check or a money order handed over. It settles whatever is open first; anything
-          beyond that is paid ahead and comes off their next invoice before it goes out.
-        </div>
-      )}
-      {paidAhead > 0 && (
-        <div style={{ marginTop: 10, padding: '8px 12px', borderRadius: 8, background: 'rgba(34,197,94,.08)', border: '1px solid rgba(34,197,94,.25)', fontSize: '.8rem', color: 'var(--text-0)' }}>
-          Paid ahead: <strong className="mono">{fmt(paidAhead)}</strong> — covers their next invoice.
-        </div>
-      )}
+      <div className="cd-note">
+        Cash, a check or a money order handed over. It pays whatever is open first; anything beyond that is kept on
+        their account as paid ahead. {CREDIT_USE_RULE}
+      </div>
       {open && (
-        <div className="modal-overlay" onClick={() => setOpen(false)}>
-          <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
-            <div className="modal-title">Post a payment</div>
-            <label style={{ fontSize:'.75rem', color:'var(--text-3)', marginBottom:4, display:'block' }}>Amount received</label>
-            <input className="form-input" type="number" min="0.01" step="0.01" value={amount} placeholder="450.00" onChange={e => setAmount(e.target.value)} autoFocus />
-            <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>How</label>
-            <select className="form-select" value={method} onChange={e => setMethod(e.target.value)}>
-              {MANUAL_PAYMENT_METHODS.map(m => <option key={m} value={m}>{MANUAL_PAYMENT_METHOD_LABELS[m]}</option>)}
-            </select>
-            {method !== 'cash' && (<>
-              <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>{method === 'check' ? 'Check number' : 'Money order number'}</label>
-              <input className="form-input" value={reference} maxLength={64} onChange={e => setReference(e.target.value)} />
-            </>)}
-            <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>Date received</label>
-            <input className="form-input" type="date" value={receivedAt} max={today} onChange={e => setReceivedAt(e.target.value)} />
-            <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>Note <span style={{ color:'var(--text-3)' }}>(yours; the tenant does not see it)</span></label>
-            <textarea className="form-input" rows={2} value={notes} maxLength={500} onChange={e => setNotes(e.target.value)} />
-            {error && <div style={{ marginTop: 12, fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
-            <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
-              <button className="btn btn-primary" disabled={!ready || save.isLoading} onClick={() => { setError(''); save.mutate() }}>
-                {save.isLoading ? 'Posting…' : 'Post payment'}
-              </button>
-              <button className="btn btn-ghost" onClick={() => setOpen(false)}>Cancel</button>
-            </div>
-          </div>
-        </div>
+        <PostPaymentForm tenantId={tenantId} name={name}
+          onClose={() => setOpen(false)}
+          onPosted={(m) => { setOpen(false); toast(m) }} />
       )}
     </div>
   )

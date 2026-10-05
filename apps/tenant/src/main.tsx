@@ -1,4 +1,6 @@
-import { isAuthRejection, sessionRenewalDue, fetchAuthMeWithRetry, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
+import { renewTenantSession } from './lib/sessionRenewal'
+import { utilityLine } from './lib/utilityLine'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -87,7 +89,8 @@ import { leaseReachedMe, pendingDocHome, showsSigningNotice, signingNoticeHeadin
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import { useForm } from 'react-hook-form'
 import axios from 'axios'
-import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, INSPECTION_ITEM_CONDITION_LABEL } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, INSPECTION_ITEM_CONDITION_LABEL, FLEXPAY_TERMS } from '@gam/shared'
+import { FLEXPAY_FIRST_PULL_DAY, FLEXPAY_LAST_PULL_DAY, offeredPullDay, ordinal, pullDayRangeText, flexPayBillCard, localToday, type TenantNotice, type FlexPayCycle } from './lib/flexpayCard'
 import { AgentChatWidget } from './components/AgentChatWidget'
 import { CameraCapture } from './components/CameraCapture'
 
@@ -218,13 +221,15 @@ function AuthProvider({children}:{children:React.ReactNode}) {
   // pass older than a day on load and whenever the app comes back into view
   // (the phone's return from the mail app), so a session ends only after seven
   // idle days. See sessionRenewalDue.
-  const renewSession = useCallback(async()=>{
-    const current = localStorage.getItem('gam_tenant_token')
-    if(!sessionRenewalDue(current)) return
-    // S654 (review): a sign-out (or another sign-in) while this was in flight wins.
-    try{ const r = await post<{token:string}>('/auth/refresh'); if (localStorage.getItem('gam_tenant_token') !== current) return; localStorage.setItem('gam_tenant_token', r.data.token); setToken(r.data.token) }
-    catch(e){ if (isAuthRejection(e)) logout() }
-  },[logout])
+  // Final sweep (10/3): a temporary lock answers the renewal with "locked", and
+  // that KEEPS the pass the app holds — never a sign-out. The whole routine
+  // (lock, blip, refusal, a sign-out mid-flight) lives in lib/sessionRenewal.
+  const renewSession = useCallback(()=>renewTenantSession({
+    readToken: ()=>localStorage.getItem('gam_tenant_token'),
+    requestRenewal: ()=>post<{token:string}>('/auth/refresh').then(r=>r.data.token),
+    storeToken: (tk)=>{ localStorage.setItem('gam_tenant_token', tk); setToken(tk) },
+    signOut: logout,
+  }),[logout])
   useEffect(()=>{
     if(!token){setLoading(false);return}
     fetchAuthMeWithRetry(() => get<AuthUser>('/auth/me')).then(u=>{ setUser(u); return renewSession() }).catch(e=>{ if (isAuthRejection(e)) logout() }).finally(()=>setLoading(false))
@@ -1171,8 +1176,9 @@ function MoveOutNotice({ me }: { me: any }) {
 }
 
 function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) {
-  const { data: balanceCtx } = useQuery<any>('balance-context',
-    () => get<any>('/payments/balance-context'))
+  // Read through readBalanceContext like every 'balance-context' query: the
+  // pay screen tells a read that started after a lost payment by its stamp.
+  const { data: balanceCtx } = useQuery<any>('balance-context', () => readBalanceContext())
   const charges: any[] = (balanceCtx?.serviceAgreements ?? []).flatMap((a: any) => a.rows ?? [])
   const owed = charges.reduce((s: number, c: any) => s + Number(c.amount || 0), 0)
   const where = me.utilityServiceAddress || me.utilityServiceSpace || 'your address'
@@ -1237,11 +1243,12 @@ function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) 
               {charges.map((c: any) => (
                 <tr key={c.id} style={{borderTop:'1px solid var(--b0)'}}>
                   <td style={{padding:'8px 0'}}>
+                    {/* decisions #17: the line names the utility — never "Utilities". */}
                     <div style={{fontWeight:600}}>
-                      {c.type === 'late_fee' ? 'Late fee' : 'Utilities'}
+                      {utilityLine(c).label}
                     </div>
-                    {c.notes && (
-                      <div style={{fontSize:'.72rem',color:'var(--t3)'}}>{c.notes}</div>
+                    {utilityLine(c).detail && (
+                      <div style={{fontSize:'.72rem',color:'var(--t3)'}}>{utilityLine(c).detail}</div>
                     )}
                   </td>
                   <td style={{textAlign:'right',whiteSpace:'nowrap'}}>
@@ -1521,6 +1528,7 @@ function HomePage() {
         <LeaseSigningTurnNotice me={me} nameTheHome={me?.pendingLeaseLocks === false} />
       )}
       <HomeAlerts />
+      {flexVis.flexpay && me?.flexpayEnrolled && <FlexPayBillNotice />}
 
       {/* S542: private platform questionnaire — landlord never sees it. */}
       <QuestionnairePrompt />
@@ -1771,6 +1779,7 @@ function PaymentHealthMonitor({ months, pct }: { months: { label: string; rate: 
 // real Pay Now flow + Stripe Financial Connections bank add via the
 // /api/payments/:id/pay destination charge backend.
 import { PaymentsPage as PaymentsPageImpl } from './pages/PaymentsPage'
+import { readBalanceContext } from './pages/payShared'
 
 // ── S639: THE CODE STEP MUST SURVIVE LEAVING THE PAGE ────────────────────────
 //
@@ -1820,40 +1829,33 @@ function PaymentsPage() {
 }
 
 
-// ── ACH VERIFY FORM ───────────────────────────────────────────────────────
-function AchVerifyForm({ onSuccess }: { onSuccess: () => void }) {
-  const [last4, setLast4] = useState('')
-  const [error, setError] = useState('')
-
-  // S554 (button-sweep bug #13): the "Bank Name" input was dropped — the
-  // verify-ach route never read bankName (no bank_name column; Stripe feeds
-  // the real display name). Only last4 is used.
-  const mut = useMutation(
-    () => fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/verify-ach', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') },
-      body: JSON.stringify({ last4 })
-    }).then(r => r.json()),
-    {
-      onSuccess: (data) => {
-        if (!data.success) { setError(data.error || 'Verification failed'); return }
-        onSuccess()
-      },
-      onError: () => setError('Verification failed. Please try again.')
-    }
-  )
-
+// ── FLEXPAY BILL CARD (S655) ──────────────────────────────────────────────
+// "Your October bill was paid on time by FlexPay. $X will be drawn from your
+// bank on Oct 20." Read from the tenant's own FlexPay notice (lib/flexpayCard),
+// shown while that draw is still ahead. (S655, Step 5: the mock "enter the last
+// four digits" bank verification that stood here is gone — POST
+// /tenants/verify-ach no longer exists. A bank is verified only by the
+// microdeposit flow on the Payments page; never by instant verification.)
+function FlexPayBillNotice() {
+  // The server's current cycle first (GET /tenants/flexpay `currentCycle`, the
+  // same query the FlexPay card reads); the tenant's own notice only while the
+  // server does not send it — an in-app notice can be turned off.
+  const { data: fp } = useQuery<any>('tenant-flexpay', () => get<any>('/tenants/flexpay'))
+  const { data: notices = [] } = useQuery<TenantNotice[]>('tenant-notifications-flexpay',
+    () => get<TenantNotice[]>('/notifications?limit=100').then((r: any) => Array.isArray(r) ? r : []))
+  const card = flexPayBillCard(notices, localToday(), (fp?.currentCycle ?? null) as FlexPayCycle | null)
+  if (!card) return null
   return (
-    <div style={{display:'flex',flexDirection:'column',gap:12,maxWidth:400}}>
-      {error && <div className="alert a-warn">{error}</div>}
-      <div className="fg">
-        <label className="fl">Last 4 digits of account number</label>
-        <input className="fi" value={last4} onChange={e=>setLast4(e.target.value.replace(/\D/g,'').slice(0,4))} placeholder="1234" maxLength={4} style={{maxWidth:120,fontFamily:'var(--font-m)'}} />
+    <div className="card" style={{ padding: '14px 16px', marginBottom: 16, borderLeft: '3px solid var(--gold)' }}>
+      <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
+        FlexPay
       </div>
-      <button className="btn btn-p" disabled={mut.isLoading || last4.length !== 4} onClick={()=>mut.mutate()}>
-        {mut.isLoading ? <span className="spinner"/> : '✓ Verify Bank Account'}
-      </button>
-      <p style={{fontSize:'.72rem',color:'var(--t3)'}}>This connects your bank account for automated rent collection via ACH.</p>
+      <div style={{ fontSize: '.88rem', color: 'var(--t1)', lineHeight: 1.5 }}>{card.headline}</div>
+      {card.stillDue && (
+        <div style={{ fontSize: '.8rem', color: 'var(--t2)', marginTop: 6, lineHeight: 1.5 }}>
+          {card.stillDue} <Link to="/payments" style={{ color: 'var(--gold)' }}>Pay it on the Payments page</Link>
+        </div>
+      )}
     </div>
   )
 }
@@ -2276,12 +2278,15 @@ function FlexPayInquireModal({ survey, onClose, onSuccess }: { survey?: boolean;
 }
 
 // FlexPay is a payment-scheduling subscription. Tenant picks a pull day
-// (1-28); fee is a FLAT $25/month (S562) — pull day is scheduling only. Day 28 cap covers all
+// (6-28: Nic 10/2, never the 1st-5th — FLEXPAY_FORBIDDEN_PULL_DAYS); fee is a
+// FLAT $25/month (S562) — pull day is scheduling only. Day 28 cap covers all
 // U.S. social security payout windows (SSDI 4th-Wed-of-month). S314:
-// click-accept of the Subscription Terms is required + persisted.
+// click-accept of the Subscription Terms is required + persisted. S655: the
+// terms summary is FLEXPAY_TERMS (shared) — the same sections the PDF, emails
+// and admin render, so none of them can drift from the code.
 
 function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
-  const [pullDay, setPullDay] = useState(15)
+  const [pullDay, setPullDay] = useState(offeredPullDay(15))
   const [tosAck, setTosAck] = useState(false)
   const [showFullTerms, setShowFullTerms] = useState(false)
   const [fullTermsText, setFullTermsText] = useState<string | null>(null)
@@ -2329,17 +2334,17 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
       <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:520}}>
         <div className="modal-t">⚡ Enroll in FlexPay</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
-          Pick the day of the month your rent gets pulled from your bank — match it to when your income lands. Your FlexPay fee is a flat <strong>$25/month</strong> no matter which day you choose.
+          Pick the day GAM collects from your bank each month — match it to when your income lands. Your FlexPay fee is a flat <strong>$25/month</strong> no matter which day you choose.
         </p>
 
         <div className="fg">
           <label className="fl">Pull day of month</label>
           <div style={{display:'flex',alignItems:'center',gap:12}}>
-            <input type="range" min={1} max={28} value={pullDay} onChange={e=>setPullDay(parseInt(e.target.value))}
+            <input type="range" aria-label="Pull day of month" min={FLEXPAY_FIRST_PULL_DAY} max={FLEXPAY_LAST_PULL_DAY} value={pullDay} onChange={e=>setPullDay(offeredPullDay(parseInt(e.target.value)))}
               style={{flex:1,accentColor:'var(--gold)'}} />
             <span style={{fontFamily:'var(--font-m)',fontSize:'1.2rem',fontWeight:800,color:'var(--t0)',minWidth:32,textAlign:'center'}}>{pullDay}</span>
           </div>
-          <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:4}}>Rent will be pulled on day {pullDay} of every month.</div>
+          <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:4}}>GAM collects on the {ordinal(pullDay)} of every month. Any day from the {pullDayRangeText()} — the 1st through the 5th aren&apos;t offered.</div>
         </div>
 
         <div style={{background:'var(--bg3)',borderRadius:10,padding:16,marginBottom:16,marginTop:16}}>
@@ -2358,12 +2363,11 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
           <p style={{marginBottom:8}}>
             <strong style={{color:'var(--t1)'}}>Subscription, not a loan.</strong> FlexPay is a payment-date coordination subscription. GAM does not advance funds on your behalf. You authorize a recurring ACH pull from your verified bank account on the pull day you choose; your monthly fee is a flat $25 regardless of that day.
           </p>
-          <p style={{marginBottom:8}}>
-            <strong style={{color:'var(--t1)'}}>Failed pulls retry.</strong> ACH is all-or-nothing (banks reject the whole pull on insufficient funds). If your scheduled pull fails, GAM retries on a later day. Your FlexPay fee stays a flat $25 — it does not change on a retry. Stripe's actual ACH-return fee (about $4) is passed through to you at cost, with no GAM markup.
-          </p>
-          <p style={{marginBottom:0}}>
-            <strong style={{color:'var(--t1)'}}>Doesn't change your lease.</strong> FlexPay schedules when your ACH pull runs; it does not change the rent amount you owe or any landlord remedy (late fees, default notices) under your lease. A later pull day does not waive late-fee accrual against your rent due date.
-          </p>
+          {FLEXPAY_TERMS.map((t, i) => (
+            <p key={t.key} style={{marginBottom: i === FLEXPAY_TERMS.length - 1 ? 0 : 8}}>
+              <strong style={{color:'var(--t1)'}}>{t.title}.</strong> {t.body}
+            </p>
+          ))}
           <div style={{marginTop:10}}>
             <button
               type="button"
@@ -2413,7 +2417,9 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
 function FlexPayChangeDayModal({
   currentDay, onClose, onSuccess,
 }: { currentDay: number; onClose: () => void; onSuccess: () => void }) {
-  const [pullDay, setPullDay] = useState(currentDay || 15)
+  // S655 (Nic 10/2): the 1st-5th are not offered; a day stored before that
+  // rule starts the picker at the nearest offered day.
+  const [pullDay, setPullDay] = useState(offeredPullDay(currentDay || 15))
   const [error, setError] = useState('')
   const fee = 25  // S562: FlexPay is a flat $25/month (pull day is scheduling only)
 
@@ -2437,12 +2443,12 @@ function FlexPayChangeDayModal({
       <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:480}}>
         <div className="modal-t">⚡ Change FlexPay pull day</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
-          Pick a new day of the month. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your FlexPay fee stays a flat $25/month.
+          Pick a new day of the month, any day from the {pullDayRangeText()}. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your FlexPay fee stays a flat $25/month.
         </p>
         <div className="fg">
           <label className="fl">Pull day of month</label>
           <div style={{display:'flex',alignItems:'center',gap:12}}>
-            <input type="range" min={1} max={28} value={pullDay} onChange={e=>setPullDay(parseInt(e.target.value))}
+            <input type="range" aria-label="Pull day of month" min={FLEXPAY_FIRST_PULL_DAY} max={FLEXPAY_LAST_PULL_DAY} value={pullDay} onChange={e=>setPullDay(offeredPullDay(parseInt(e.target.value)))}
               style={{flex:1,accentColor:'var(--gold)'}} />
             <span style={{fontFamily:'var(--font-m)',fontSize:'1.2rem',fontWeight:800,color:'var(--t0)',minWidth:32,textAlign:'center'}}>{pullDay}</span>
           </div>
@@ -3009,7 +3015,9 @@ function ServicesPage() {
     {
       id: 'flexpay',
       name: 'FlexPay',
-      desc: 'Pick the day of the month your rent gets pulled from your bank — match it to when your income lands. Your landlord gets paid on the lease grace-period day no matter what; you pay later.',
+      // S655 (decisions #35.8): a payment-date coordination subscription —
+      // never described as advancing, fronting or lending money.
+      desc: 'FlexPay pays your monthly bill to your landlord on time, and GAM collects it from your bank on the day you choose — matched to when your income lands. A payment-date subscription: not a loan, no interest, no penalties.',
       price: '$25/month',
       enrolled: me?.flexpayEnrolled,
       // S581: paused because the tenant now holds more than one lease.
@@ -3039,7 +3047,7 @@ function ServicesPage() {
               : 'You’re in line — we’ll reach out when it’s your turn')
         : fpInquiry?.status === 'declined' ? null
         : fpApproved
-          ? (!me?.achVerified ? '⚠ Approved — verify your bank account to enroll' : '✓ Approved — pick your pull date 1–28')
+          ? (!me?.achVerified ? '⚠ Approved — verify your bank account to enroll' : `✓ Approved — pick your pull day (the ${pullDayRangeText()})`)
           : 'For SSI/SSDI recipients — tap to request access',
       locked: fpLaunched && fpApproved && !me?.achVerified,
       ctaLabel: !fpLaunched ? 'Take the survey' : fpApproved ? 'Enroll' : 'I’m interested',
@@ -3083,6 +3091,7 @@ function ServicesPage() {
       <div className="alert a-blue" style={{marginBottom:24}}>
         ℹ️ None of these services are required as a condition of your tenancy. Subscribe only if they benefit you.
       </div>
+      {flexVis.flexpay && me?.flexpayEnrolled && <FlexPayBillNotice />}
       <div className="grid3">
         {visibleServices.map(s => (
           <div key={s.id} className={`service-card${s.enrolled?' enrolled':''}`}>
@@ -3124,20 +3133,19 @@ function ServicesPage() {
         />
       )}
 
-      {/* ── ACH Verification ─────────────────────────────────────── */}
+      {/* ── Bank account (S655) ─────────────────────────────────────
+          FlexPay and FlexDeposit need a verified bank. A bank is added and
+          verified in ONE place — the Payments page (microdeposits only, never
+          instant verification). The old "type the last four digits" form here
+          posted to a route that no longer exists. */}
       {!me?.achVerified && (
         <div className="card" style={{marginTop:24}}>
-          <h3 style={{marginBottom:4}}>🏦 Bank Account Verification</h3>
-          <p style={{fontSize:'.82rem',color:'var(--t3)',marginBottom:16}}>
-            {me?.depositFullyFunded
-              ? 'Verify your bank account to enable FlexPay / FlexDeposit.'
-              : 'Your security deposit must be fully funded before you can verify your bank account.'}
+          <h3 style={{marginBottom:4}}>🏦 Bank account</h3>
+          <p style={{fontSize:'.82rem',color:'var(--t3)',marginBottom:16,lineHeight:1.5}}>
+            FlexPay and FlexDeposit need a verified bank account. Add your bank on the Payments page —
+            we send a small deposit to it, and you confirm that deposit there.
           </p>
-          {!me?.depositFullyFunded ? (
-            <div className="alert a-warn">⚠ Complete your security deposit payment first.</div>
-          ) : (
-            <AchVerifyForm onSuccess={()=>qc2.refetch()} />
-          )}
+          <Link to="/payments" className="btn btn-p btn-sm" style={{textDecoration:'none'}}>Add a bank on the Payments page</Link>
         </div>
       )}
 

@@ -12,7 +12,9 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease } from '../test/dbHelpers'
+import {
+  cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant, seedAllocationRule,
+} from '../test/dbHelpers'
 import { todayIn } from '../lib/timezone'
 import { payAnnualDepositInterest, outstandingDepositInterest, landlordHeldInterestAdvisory } from './depositInterestPayout'
 
@@ -277,5 +279,149 @@ describe('S642 landlord-held deposits are flagged, never paid', () => {
     const rows = await landlordHeldInterestAdvisory([mine.landlordId])
     expect(rows).toHaveLength(1)
     expect(rows[0].landlordId).toBe(mine.landlordId)
+  })
+})
+
+// ── S655 (money plan Step 7): INTEREST IS GAM-FUNDED CREDIT ────────────────
+//
+// Only deposits GAM holds in escrow accrue, so the interest is GAM's money,
+// paid to the tenant as account credit. Like every credit it pays a bill by
+// itself only when it covers the whole bill (Nic, 10/2). Unlike a credit the
+// landlord gives, the rent it pays IS the landlord's income the day it is used,
+// and GAM pays the landlord their share with the weekly batch — no fee.
+describe('S655 deposit interest is GAM-funded credit', () => {
+  async function household(opts: { interestPerMonth: number; rent: number }) {
+    const c = await getClient()
+    try {
+      await c.query('BEGIN')
+      const { landlordId, userId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      await seedAllocationRule(c, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const leaseId = await seedLease(c, { unitId, landlordId, status: 'active', rentAmount: opts.rent })
+      const tenantId = await seedTenant(c)
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      const sd = await c.query<{ id: string }>(
+        `INSERT INTO security_deposits
+           (tenant_id, lease_id, unit_id, total_amount, collected_amount,
+            status, held_by, portability_status, custody_fee_active)
+         VALUES ($1,$2,$3,500,500,'funded','gam_escrow','none',FALSE) RETURNING id`,
+        [tenantId, leaseId, unitId])
+      for (let i = 0; i < 12; i++) {
+        await c.query(
+          `INSERT INTO security_deposit_interest_accruals
+             (security_deposit_id, lease_id, accrual_month, state_code, effective_year,
+              annual_rate_pct, principal_amount, days_held, days_in_month, interest_amount)
+           VALUES ($1,$2, (date_trunc('month', CURRENT_DATE) - ($3 || ' months')::interval)::date,
+                   'AZ', 2026, 5, 500, 30, 30, $4)`,
+          [sd.rows[0].id, leaseId, 12 - i, opts.interestPerMonth])
+      }
+      const rent = await c.query<{ id: string }>(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,'rent',$5,'pending',CURRENT_DATE - 2,'RENT') RETURNING id`,
+        [unitId, leaseId, tenantId, landlordId, opts.rent.toFixed(2)])
+      await c.query('COMMIT')
+      return { landlordId, tenantId, leaseId, rentId: rent.rows[0].id }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('interest is GAM-funded credit: a whole bill it covers is paid, counted as the landlord\'s money, and paid out with no fee', async () => {
+    // $40 a month for a year = $480 of interest against a $460 bill.
+    const f = await household({ interestPerMonth: 40, rent: 460 })
+    const r = await payAnnualDepositInterest()
+    expect(r.paid).toBe(1)
+
+    const row = (await db.query<{ status: string; platform_held: boolean; notes: string | null }>(
+      `SELECT status, platform_held, notes FROM payments WHERE id = $1`, [f.rentId])).rows[0]
+    expect(row.status).toBe('settled')
+    expect(row.notes).toMatch(/Paid with account credit/)
+    // GAM holds this money for the landlord: the weekly batch pays it.
+    expect(row.platform_held).toBe(true)
+    const vm = (await db.query<{ issued: number; interest: number; held: number; money: number }>(
+      `SELECT issued_credit_amount::float AS issued, deposit_interest_credit::float AS interest,
+              gam_held_part::float AS held, money_part::float AS money
+         FROM v_payment_money WHERE payment_id = $1`, [f.rentId])).rows[0]
+    // Not a credit the landlord gave (that is never income): GAM-funded.
+    expect(vm).toEqual({ issued: 0, interest: 460, held: 460, money: 0 })
+    const share = await db.query<{ a: string }>(
+      `SELECT amount::text AS a FROM user_balance_ledger
+        WHERE reference_id = $1 AND reference_type = 'payment' AND type = 'allocation_owner_share'`, [f.rentId])
+    expect(Number(share.rows[0].a)).toBe(460)
+    // No second processing fee on money that never went through a bank or card.
+    const spread = await db.query(
+      `SELECT 1 FROM platform_revenue_ledger WHERE reference_id = $1 AND type = 'banking_spread'`, [f.rentId])
+    expect(spread.rows).toHaveLength(0)
+
+    const credit = (await db.query<{ remaining: string; category: string }>(
+      `SELECT amount_remaining::text AS remaining, category FROM tenant_credits WHERE tenant_id = $1`, [f.tenantId])).rows[0]
+    expect(credit.category).toBe('deposit_interest')
+    expect(Number(credit.remaining)).toBe(20)
+  })
+
+  it('interest smaller than the bill pays nothing by itself and waits for the tenant', async () => {
+    const f = await household({ interestPerMonth: 2, rent: 460 })   // $24 against $460
+    await payAnnualDepositInterest()
+    expect((await db.query<{ status: string }>(`SELECT status FROM payments WHERE id = $1`, [f.rentId])).rows[0].status).toBe('pending')
+    expect((await db.query(`SELECT 1 FROM credit_uses`)).rows).toHaveLength(0)
+    const credit = (await db.query<{ remaining: string }>(
+      `SELECT amount_remaining::text AS remaining FROM tenant_credits WHERE tenant_id = $1`, [f.tenantId])).rows[0]
+    expect(Number(credit.remaining)).toBe(24)
+  })
+
+  // Fix round 1: a renewal moves the deposit record onto the new lease, but the
+  // months before it accrued under the lease that has since ended. Tied to
+  // that lease, the interest could pay only its (finished) bills and would sit
+  // on the account forever. It is credited on the lease the deposit is on now.
+  it('interest accrued before a renewal pays the renewal\'s bill', async () => {
+    const c = await getClient()
+    let f: { tenantId: string; oldLeaseId: string; newLeaseId: string; rentId: string }
+    try {
+      await c.query('BEGIN')
+      const { landlordId, userId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      await seedAllocationRule(c, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      const oldLeaseId = await seedLease(c, { unitId, landlordId, status: 'expired', rentAmount: 460, startDate: '2025-01-01' })
+      await seedLeaseTenant(c, { leaseId: oldLeaseId, tenantId, role: 'primary' })
+      const newLeaseId = await seedLease(c, { unitId, landlordId, status: 'active', rentAmount: 460, startDate: '2026-01-01' })
+      await c.query(`UPDATE leases SET supersedes_lease_id = $2 WHERE id = $1`, [newLeaseId, oldLeaseId])
+      await seedLeaseTenant(c, { leaseId: newLeaseId, tenantId, role: 'primary' })
+      // The renewal moved the deposit record onto the new lease.
+      const sd = await c.query<{ id: string }>(
+        `INSERT INTO security_deposits
+           (tenant_id, lease_id, unit_id, total_amount, collected_amount,
+            status, held_by, portability_status, custody_fee_active)
+         VALUES ($1,$2,$3,500,500,'funded','gam_escrow','none',FALSE) RETURNING id`,
+        [tenantId, newLeaseId, unitId])
+      // A year of interest: the older months under the lease that ended, the
+      // rest under the renewal — $480 in all against a $460 bill.
+      for (let i = 0; i < 12; i++) {
+        await c.query(
+          `INSERT INTO security_deposit_interest_accruals
+             (security_deposit_id, lease_id, accrual_month, state_code, effective_year,
+              annual_rate_pct, principal_amount, days_held, days_in_month, interest_amount)
+           VALUES ($1,$2, (date_trunc('month', CURRENT_DATE) - ($3 || ' months')::interval)::date,
+                   'AZ', 2026, 5, 500, 30, 30, 40)`,
+          [sd.rows[0].id, i < 8 ? oldLeaseId : newLeaseId, 12 - i])
+      }
+      const rent = await c.query<{ id: string }>(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,'rent',460,'pending',CURRENT_DATE - 2,'RENT') RETURNING id`,
+        [unitId, newLeaseId, tenantId, landlordId])
+      await c.query('COMMIT')
+      f = { tenantId, oldLeaseId, newLeaseId, rentId: rent.rows[0].id }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const r = await payAnnualDepositInterest()
+    expect(r.paid).toBe(1)
+    // One credit for the whole year, on the lease the household is on.
+    const credits = (await db.query<{ lease_id: string; original: string; remaining: string }>(
+      `SELECT lease_id, amount_original::text AS original, amount_remaining::text AS remaining
+         FROM tenant_credits WHERE tenant_id = $1`, [f.tenantId])).rows
+    expect(credits).toEqual([{ lease_id: f.newLeaseId, original: '480.00', remaining: '20.00' }])
+    // And it paid the renewal's bill.
+    expect((await db.query<{ status: string }>(`SELECT status FROM payments WHERE id = $1`, [f.rentId])).rows[0].status)
+      .toBe('settled')
   })
 })

@@ -10,8 +10,10 @@
 import { describe, it, expect, beforeEach, afterAll } from 'vitest'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
-import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType, draftAllPendingLeases } from './householdLeaseDraft'
+import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType, draftAllPendingLeases, householdTooBigForOneLease } from './householdLeaseDraft'
 import { createDocumentRecord } from '../routes/esign'
+import { ROSTER_MAX_HOUSEHOLD } from '@gam/shared'
+import { tooManyForOneLease, autoDraftLeasesForUnit } from './leaseOnboarding'
 
 beforeEach(async () => { await cleanupAllSchema() })
 afterAll(async () => { await db.end() })
@@ -424,5 +426,126 @@ describe('draftAllPendingLeases — the hourly backstop', () => {
     const { rows } = await db.query<any>(
       `SELECT resolved_at FROM pending_lease_drafts WHERE unit_id=$1`, [c.unitId])
     expect(rows[0].resolved_at).toBeNull()   // still queued for the next sweep
+  })
+})
+
+// Final sweep (10/3): a whole-unit household bigger than one lease holds.
+//
+// Templates seat primary and co_tenant_1..3; createDocumentRecord refuses any
+// other seat. draftHouseholdLease handed a fifth resident co_tenant_4, failed
+// inside its transaction and said "send it manually" (a dead end), and the
+// template-default retry pointed at a "Lease could not be drafted automatically"
+// notice that is never sent for this case: the drafter sends "Too many people
+// for one lease".
+describe('a household too big for one lease', () => {
+  async function moreResidents(n: number) {
+    const out: Array<{ userId: string; name: string; email: string; phone: null }> = []
+    for (let i = 0; i < n; i++) {
+      const email = `extra-${i}-${Math.random().toString(36).slice(2, 8)}@mailer-test.co`
+      const { rows: [u] } = await db.query<any>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name)
+         VALUES ($1,'x','tenant','Extra',$2) RETURNING id`, [email, `Person${i}`])
+      await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [u.id])
+      out.push({ userId: u.id, name: `Extra Person${i}`, email, phone: null })
+    }
+    return out
+  }
+  const unitNumberOf = async (unitId: string) =>
+    (await db.query<any>(`SELECT unit_number FROM units WHERE id=$1`, [unitId])).rows[0].unit_number as string
+  const docsOn = async (unitId: string) =>
+    (await db.query<any>(`SELECT COUNT(*)::int AS n FROM lease_documents WHERE unit_id=$1`, [unitId])).rows[0].n
+  async function inviteToUnit(landlordId: string, unitId: string, people: number) {
+    const { rows: [u] } = await db.query<any>(`SELECT property_id FROM units WHERE id=$1`, [unitId])
+    for (let i = 0; i < people; i++) {
+      const c = await db.connect()
+      try {
+        await c.query('BEGIN')
+        const tenantId = await seedTenant(c)
+        await c.query(
+          `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, property_id)
+           VALUES ($1,$2,'not_uploaded',$3,$4)`, [landlordId, tenantId, unitId, u.property_id])
+        await c.query('COMMIT')
+      } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    }
+  }
+
+  it('draftHouseholdLease refuses one over the limit up front, in the shared words, and drafts nothing', async () => {
+    const c = await seedCtx('rv_spot')
+    await seedTemplate(c.landlordId, 'rv_spot')
+    const residents = [...resident(c), ...(await moreResidents(ROSTER_MAX_HOUSEHOLD))]
+    const res = await draftHouseholdLease({ landlordId: c.landlordId, unitId: c.unitId, residents })
+    expect(res.drafted).toBe(false)
+    if (!res.drafted) {
+      expect(res.reason).toBe(tooManyForOneLease(await unitNumberOf(c.unitId), ROSTER_MAX_HOUSEHOLD + 1))
+      expect(res.reason).not.toMatch(/manually|by hand|co_tenant/)
+    }
+    expect(await docsOn(c.unitId)).toBe(0)
+  })
+
+  it('exactly the limit still drafts, seated primary and co_tenant_1..3', async () => {
+    const c = await seedCtx('rv_spot')
+    await seedTemplate(c.landlordId, 'rv_spot')
+    const residents = [...resident(c), ...(await moreResidents(ROSTER_MAX_HOUSEHOLD - 1))]
+    const res = await draftHouseholdLease({ landlordId: c.landlordId, unitId: c.unitId, residents })
+    expect(res.drafted).toBe(true)
+    if (res.drafted) {
+      const { rows } = await db.query<any>(
+        `SELECT role FROM lease_document_signers WHERE document_id=$1 AND role <> 'landlord' ORDER BY order_index`, [res.documentId])
+      expect(rows.map(r => r.role)).toEqual(['primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3'])
+    }
+  })
+
+  // The person who set the default template may not be the property's signing
+  // contact, who is the one the "Too many people for one lease" notice goes to.
+  // So the reason carries the how-to itself instead of pointing at that notice.
+  it('the template-default retry says how to fix a household too big for one lease, in its own words', async () => {
+    const c = await seedCtx('rv_spot')
+    await inviteToUnit(c.landlordId, c.unitId, ROSTER_MAX_HOUSEHOLD + 1)
+    await seedTemplate(c.landlordId, 'rv_spot')
+
+    const res = await draftPendingForUnitType({ landlordId: c.landlordId, unitType: 'rv_spot' })
+    expect(res.drafted).toBe(0)
+    expect(res.skippedUnits).toHaveLength(1)
+    const reason = res.skippedUnits[0].reason
+    expect(reason).toBe(
+      `${tooManyForOneLease(await unitNumberOf(c.unitId), ROSTER_MAX_HOUSEHOLD + 1)} `
+      + 'To move someone, cancel their invite in Tenant Onboarding (Pending Pool), then invite them to the other unit. '
+      + 'The lease for the rest then drafts on its own within the hour.')
+    expect(reason).not.toMatch(/could not be drafted automatically|notification/)
+    // The drafter still sends its own notice to the signing contact.
+    const { rows } = await db.query<any>(
+      `SELECT title FROM notifications WHERE user_id=$1 AND type='lease_draft_blocked'`, [c.userId])
+    expect(rows.map(r => r.title)).toEqual(['Too many people for one lease'])
+    expect(await docsOn(c.unitId)).toBe(0)
+
+    // Same words as the drafter puts on the invite screen for this unit (its
+    // quiet answer), so the two cannot drift apart.
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const quiet = await autoDraftLeasesForUnit(client as any, c.unitId, createDocumentRecord, undefined, { quiet: true })
+      expect(quiet.draftedDocumentIds).toEqual([])
+      expect(quiet.blocked).toEqual([reason])
+    } finally { await client.query('ROLLBACK'); client.release() }
+  })
+
+  // The check the retry uses to pick that reason reads the household the way the
+  // drafter does: whole-unit, open invites only, none drafted yet.
+  it('householdTooBigForOneLease: over the limit on a whole unit only, counting open invites', async () => {
+    const c = await seedCtx('rv_spot')
+    await inviteToUnit(c.landlordId, c.unitId, ROSTER_MAX_HOUSEHOLD)
+    expect(await householdTooBigForOneLease(c.unitId)).toBeNull()             // at the limit
+    await inviteToUnit(c.landlordId, c.unitId, 1)
+    expect(await householdTooBigForOneLease(c.unitId))
+      .toEqual({ unitNumber: await unitNumberOf(c.unitId), people: ROSTER_MAX_HOUSEHOLD + 1 })
+    // A canceled invite is not on the lease.
+    await db.query(
+      `UPDATE pending_tenant_intents SET cancelled_at = NOW()
+        WHERE id = (SELECT id FROM pending_tenant_intents WHERE unit_id=$1 ORDER BY created_at DESC LIMIT 1)`, [c.unitId])
+    expect(await householdTooBigForOneLease(c.unitId)).toBeNull()
+    // By-room: everyone gets their own lease, so there is no "too many for one".
+    await inviteToUnit(c.landlordId, c.unitId, 2)
+    await db.query(`UPDATE units SET occupancy_mode='by_room', bedrooms=4 WHERE id=$1`, [c.unitId])
+    expect(await householdTooBigForOneLease(c.unitId)).toBeNull()
   })
 })

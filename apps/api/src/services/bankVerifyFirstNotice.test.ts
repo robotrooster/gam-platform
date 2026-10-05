@@ -9,16 +9,51 @@
  * These cover the EMAIL's two tenses. The wiring that fires the first one lives
  * in routes/stripe.ts at confirm time, because that response is the first
  * moment the arrival date and the hosted link exist.
+ *
+ * S655 (item L, keep the old bank): the last block drives that wiring for a
+ * tenant who already has a verified bank and adds a second one — the notice
+ * still goes out, and it names the NEW bank.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
-const { resendSendMock } = vi.hoisted(() => ({
+const { resendSendMock, stripeFake } = vi.hoisted(() => ({
   resendSendMock: vi.fn(async () => ({ data: { id: `m_${Math.random().toString(36).slice(2)}` }, error: null }) as any),
+  stripeFake: {
+    paymentMethods: {
+      retrieve: async (id: string) => ({
+        id, customer: null, type: 'us_bank_account',
+        us_bank_account: { last4: '8080', routing_number: '221000000', bank_name: 'New Bank' },
+      }),
+      list: async () => ({ data: [] }),
+      detach: async (id: string) => ({ id }),
+    },
+    setupIntents: {
+      retrieve: async (id: string) => ({
+        id, status: 'requires_action', customer: 'cus_first_notice', payment_method: 'pm_new',
+        next_action: {
+          type: 'verify_with_microdeposits',
+          verify_with_microdeposits: {
+            arrival_date: 1759500000, microdeposit_type: 'descriptor_code',
+            hosted_verification_url: 'https://payments.stripe.com/microdeposit/new',
+          },
+        },
+      }),
+      list: async () => ({ data: [] }),
+    },
+    customers: { update: async (id: string) => ({ id }), retrieve: async (id: string) => ({ id }) },
+  },
 }))
 vi.mock('resend', () => ({ Resend: class { emails = { send: resendSendMock } } }))
+vi.mock('../lib/stripe', () => ({ getStripe: () => stripeFake, createTenantAchSetup: vi.fn() }))
 
-import { cleanupAllSchema } from '../test/dbHelpers'
+import express from 'express'
+import request from 'supertest'
+import jwt from 'jsonwebtoken'
+import { db } from '../db'
+import { cleanupAllSchema, seedTenant } from '../test/dbHelpers'
 import { emailVerifyBankReminder } from './email'
+import { stripeRouter } from '../routes/stripe'
+import { errorHandler } from '../middleware/errorHandler'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -73,5 +108,45 @@ describe('the deposit-is-coming notice', () => {
       { ...base, kind: 'sent', verificationKind: 'amounts' })
     expect(sent().html).toContain('two small deposits')
     expect(sent().html).toContain('will receive')
+  })
+})
+
+describe('the notice for a second bank (S655: the old bank is kept)', () => {
+  it('still goes out when a verified bank is already on file, and names the new bank', async () => {
+    process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_first_notice'
+    const c = await db.connect()
+    let tenantId = ''; let userId = ''
+    try {
+      tenantId = await seedTenant(c, { email: 'second-bank@mailer-test.co' })
+      userId = (await c.query(`SELECT user_id FROM tenants WHERE id=$1`, [tenantId])).rows[0].user_id
+      await c.query(
+        `UPDATE tenants SET stripe_customer_id = 'cus_first_notice', ach_verified = TRUE, bank_last4 = '1111'
+          WHERE id = $1`, [tenantId])
+    } finally { c.release() }
+
+    const app = express()
+    app.use(express.json())
+    app.use('/api/stripe', stripeRouter)
+    app.use(errorHandler)
+    const token = jwt.sign({ userId, role: 'tenant', email: 'second-bank@mailer-test.co', profileId: tenantId },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(app).post('/api/stripe/tenant/confirm-setup')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ setupIntentId: 'seti_new', paymentMethodId: 'pm_new' })
+    expect(res.status).toBe(200)
+    expect(res.body.verified).toBe(false)
+
+    // Fire-and-forget at the route: wait for it to land.
+    for (let i = 0; i < 50 && resendSendMock.mock.calls.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    expect(resendSendMock).toHaveBeenCalledTimes(1)
+    expect(sent().subject).toContain('on its way')
+    expect(sent().html).toContain('8080')            // the bank being verified
+    expect(sent().html).not.toContain('1111')        // not the one already on file
+    expect(sent().html).toContain('payments.stripe.com/microdeposit/new')
+
+    const { rows: [t] } = await db.query<any>(`SELECT ach_verified, bank_last4 FROM tenants WHERE id=$1`, [tenantId])
+    expect(t).toEqual({ ach_verified: true, bank_last4: '1111' })
   })
 })

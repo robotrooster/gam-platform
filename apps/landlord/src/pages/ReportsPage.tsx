@@ -1,16 +1,41 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
-import { humanize, EXPENSE_CATEGORY_LABEL, UNIT_TYPE_LABEL } from '@gam/shared'
+import {
+  humanize, UNIT_TYPE_LABEL, UNIT_STATUS_LABEL, MAINTENANCE_STATUS_LABEL, PAYMENT_STATUS_LABEL,
+  type IncomeBasis, type PaymentStatus,
+} from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X, Printer, Download } from 'lucide-react'
 // S633: tax + statement documents belong to ONE company; the picker renders
 // nothing for an account that owns a single one.
-import { EntityPicker } from '../components/EntityPicker'
+import { EntityPicker, useEntities } from '../components/EntityPicker'
+// S655 (money plan, Step 15): ONE "Money received" / "Money billed" switch
+// above the tabs; every query on this page carries it.
+import { IncomeBasisToggle, BasisPrintNote } from '../components/IncomeBasisToggle'
+import {
+  useIncomeBasis, withBasis, basisLabel, perMonthTitle, incomeCardView,
+  activeCategories, categoryColumns, categoryLabel, expenseLines, expenseCategoryLabel,
+  groupCharges, partsText, noChargeRemainder, sumAmounts, INCOME_LINES_ORDER, incomeLineLabel,
+  billedOutcome, besideNotInTotal, usDay, chargeDay, chargeKey, reportErrorText, latestOnly,
+  showsBillOutcome, resultIsStale, paidAheadOnHand, PAID_AHEAD_COUNTED_NOTE, arrivalDay, lastTwelveMonths,
+  taxYearBeside,
+  type CategoryRow, type ChargeRow, type BesideItem,
+} from '../lib/incomeBasis'
+import '../styles/reports-basis.css'
 
-const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
-const fmt0 = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {maximumFractionDigits:0})}` : '—'
+const fmt = (n: any) => n != null && isFinite(Number(n))
+  ? `${Number(n) < 0 ? '−' : ''}$${Math.abs(Number(n)).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
+const fmt0 = (n: any) => n != null && isFinite(Number(n))
+  ? `${Number(n) < 0 ? '−' : ''}$${Math.abs(Number(n)).toLocaleString('en-US', {maximumFractionDigits:0})}` : '—'
+
+/** S655: payments.status as words — the shared label map (PAYMENT_STATUS_LABEL). */
+const statusWords = (s: string) =>
+  PAYMENT_STATUS_LABEL[s as PaymentStatus]
+  ?? UNIT_STATUS_LABEL[s as keyof typeof UNIT_STATUS_LABEL]
+  ?? MAINTENANCE_STATUS_LABEL[s as keyof typeof MAINTENANCE_STATUS_LABEL]
+  ?? humanize(s)
 
 // "2026-06" → "June 2026"
 function monthLabel(ym: string): string {
@@ -81,8 +106,8 @@ function PrintStyles() {
   )
 }
 
-const ToolbarBtn = ({ onClick, icon, label }: { onClick: () => void; icon: JSX.Element; label: string }) => (
-  <button className="btn btn-ghost btn-sm no-print" onClick={onClick} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+const ToolbarBtn = ({ onClick, icon, label, disabled }: { onClick: () => void; icon: JSX.Element; label: string; disabled?: boolean }) => (
+  <button className="btn btn-primary btn-sm no-print" onClick={onClick} disabled={disabled} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
     {icon}{label}
   </button>
 )
@@ -125,9 +150,9 @@ function PeriodPicker({ year, setYear, month, setMonth, allowAll }: {
 // ── OVERVIEW CHARTS (MTD bar + YTD cumulative area) ───────────
 // Hand-rolled SVG so there's no charting dependency and it inherits the
 // gold/dark theme. Both render inline — no download or print needed.
-function CollectionsCharts({ ytdMonthly, mtd, ytd }: {
+function CollectionsCharts({ ytdMonthly, mtd, ytd, basis }: {
   ytdMonthly: { month: string; collected: number }[]
-  mtd: number; ytd: number
+  mtd: number; ytd: number; basis: IncomeBasis
 }) {
   const now = new Date()
   const year = now.getFullYear()
@@ -140,35 +165,35 @@ function CollectionsCharts({ ytdMonthly, mtd, ytd }: {
     cum += v
     series.push({ m, label: MONTHS_SHORT[m - 1], collected: v, cumulative: cum })
   }
-  const hasData = series.some(s => s.collected > 0)
+  const hasData = series.some(s => s.collected !== 0)
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 16 }}>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(300px, 100%), 1fr))', gap: 16 }}>
       <div className="card">
         <div className="card-header">
-          <span className="card-title">Collected by Month — {year}</span>
-          <span style={{ fontSize: '.7rem', color: 'var(--gold)' }}>MTD {fmt(mtd)}</span>
+          <span className="card-title">{perMonthTitle(basis)} — {year}</span>
+          <span style={{ fontSize: '.7rem', color: 'var(--gold)' }}>This month {fmt(mtd)}</span>
         </div>
         <div style={{ padding: '12px 12px 6px' }}>
-          {hasData ? <BarChart series={series} current={upto} /> : <EmptyChart />}
+          {hasData ? <BarChart series={series} current={upto} /> : <EmptyChart basis={basis} />}
         </div>
       </div>
       <div className="card">
         <div className="card-header">
-          <span className="card-title">Cumulative YTD — {year}</span>
-          <span style={{ fontSize: '.7rem', color: 'var(--gold)' }}>YTD {fmt(ytd)}</span>
+          <span className="card-title">Year to date, added up — {year}</span>
+          <span style={{ fontSize: '.7rem', color: 'var(--gold)' }}>This year {fmt(ytd)}</span>
         </div>
         <div style={{ padding: '12px 12px 6px' }}>
-          {hasData ? <AreaChart series={series} /> : <EmptyChart />}
+          {hasData ? <AreaChart series={series} /> : <EmptyChart basis={basis} />}
         </div>
       </div>
     </div>
   )
 }
 
-const EmptyChart = () => (
+const EmptyChart = ({ basis }: { basis: IncomeBasis }) => (
   <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-3)', fontSize: '.8rem' }}>
-    No collections recorded yet this year.
+    {basis === 'billed' ? 'Nothing billed yet this year.' : 'No money received yet this year.'}
   </div>
 )
 
@@ -244,6 +269,9 @@ const TABS: { key: Tab; label: string; perm: string }[] = [
 export function ReportsPage() {
   const [tab, setTab] = useState<Tab>('overview')
   const { can } = usePerms()
+  // S655: "Money received" (the default) or "Money billed" — one switch above
+  // the tabs, remembered in this browser, carried by every query below.
+  const [basis, setBasis] = useIncomeBasis()
 
   // Staff see only report tabs they're granted; owners see all. Snap the
   // active tab to the first visible one if the current tab is hidden.
@@ -260,73 +288,120 @@ export function ReportsPage() {
       <div className="page-header">
         <div><h1 className="page-title">Reports</h1><p className="page-subtitle">Financial, tax, and occupancy summaries</p></div>
       </div>
-      <div className="no-print" style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border-0)', marginBottom: 18 }}>
+      <IncomeBasisToggle basis={basis} onChange={setBasis} />
+      <BasisPrintNote basis={basis} />
+      <div className="no-print" style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border-0)', marginBottom: 18, overflowX: 'auto' }}>
         {visibleTabs.map(t => (
           <button key={t.key} className={`tab-btn ${tab === t.key ? 'active' : ''}`} onClick={() => setTab(t.key)}>{t.label}</button>
         ))}
       </div>
-      {tab === 'overview'  && can('reports.tab.overview')  && <OverviewTab />}
-      {tab === 'property'  && can('reports.tab.property')  && <ByPropertyTab />}
-      {tab === 'annual'    && can('reports.tab.annual')    && <AnnualTaxTab />}
-      {tab === 'statement' && can('reports.tab.statement') && <OwnerStatementTab />}
-      {tab === 'custom'    && can('reports.tab.custom')    && <CustomReportTab />}
+      {tab === 'overview'  && can('reports.tab.overview')  && <OverviewTab basis={basis} />}
+      {tab === 'property'  && can('reports.tab.property')  && <ByPropertyTab basis={basis} />}
+      {tab === 'annual'    && can('reports.tab.annual')    && <AnnualTaxTab basis={basis} />}
+      {tab === 'statement' && can('reports.tab.statement') && <OwnerStatementTab basis={basis} />}
+      {tab === 'custom'    && can('reports.tab.custom')    && <CustomReportTab basis={basis} />}
     </div>
   )
 }
 
+/**
+ * A company document (tax summary, owner statement) asks which company when
+ * the account owns several. One company is picked for you; a team login,
+ * whose company the server derives, is never held waiting for a choice it
+ * cannot make (the old `enabled: !!companyId` left it on an empty page).
+ */
+function useCompanyReady(companyId: string): { ready: boolean; mustChoose: boolean } {
+  const { data: entities, isFetched, isError } = useEntities()
+  const settled = isFetched || isError
+  const count = entities?.length ?? 0
+  return { ready: !!companyId || (settled && count < 2), mustChoose: settled && count >= 2 && !companyId }
+}
+
+const ChooseCompany = ({ what }: { what: string }) => (
+  <div className="card" style={{ padding: 18, color: 'var(--text-2)', fontSize: '.84rem' }}>
+    Choose a company above to see its {what}.
+  </div>
+)
+
+/**
+ * A report that could not load says why, once, in the server's own words —
+ * with "try again" only when trying again can help (lib reportErrorText).
+ */
+function ReportError({ error, what }: { error: unknown; what: string }) {
+  return <div className="alert alert-warn" style={{ margin: 12, fontSize: '.82rem' }}>{reportErrorText(error, what)}</div>
+}
+
 // ── OVERVIEW (S69 + S512 #20 drill-in) ────────────────────────
-function OverviewTab() {
-  const { data: report, isLoading } = useQuery<any>('reports', () => apiGet('/reports/summary'))
+function OverviewTab({ basis }: { basis: IncomeBasis }) {
+  const { data: report, isLoading, error } = useQuery<any>(['reports', basis], () => apiGet(withBasis('/reports/summary', basis)))
   const [openMonth, setOpenMonth] = useState<string | null>(null)
   const navigate = useNavigate()
+  // S655 (§2): the income card, the same one the dashboard shows. Money
+  // received: what arrived this month, money paid ahead inside it, money still
+  // clearing beside it. Money billed: this month's bills and what became of them.
+  const card = incomeCardView(report?.incomeCard, basis, 'this month', fmt)
+  const word = basisLabel(basis)
 
   return (
     <>
-      {isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (
-        <div style={{display:'grid',gap:16}}>
-          <div className="kpi-grid" style={{gridTemplateColumns:'repeat(4, 1fr)'}}>
-            <div className="kpi-card"><div className="kpi-label">Collected MTD</div><div className="kpi-value green">{fmt0(report?.collectedMtd)}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Collected YTD</div><div className="kpi-value" style={{color:'var(--gold)'}}>{fmt0(report?.ytdCollected)}</div></div>
+      {error ? <ReportError error={error} what="the summary" /> : isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (
+        <div className="rb-stack" style={{gap:16}}>
+          <div className="rb-kpis">
+            <div className="kpi-card">
+              <div className="kpi-label">{card.label}</div>
+              <div className="kpi-value green">{fmt0(card.amount)}</div>
+              <div className="kpi-sub rb-kpi-notes">{card.notes.map(n => <span key={n}>{n}</span>)}</div>
+            </div>
+            <div className="kpi-card"><div className="kpi-label">{word} this year</div><div className="kpi-value" style={{color:'var(--gold)'}}>{fmt0(report?.ytdCollected)}</div></div>
             {/* S527 W-38: click through to the who-owes-what list (same target as the dashboard KPI). */}
-            <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/balances')}><div className="kpi-label">Outstanding Balance</div><div className="kpi-value" style={{color:'var(--amber)'}}>{fmt0(report?.outstanding)}</div></div>
+            {/* Decision #25: a grand total of what everyone owes is for owners and
+                property managers only; when the server leaves it out, so does the card. */}
+            {report?.outstanding != null && (
+              <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/balances')}><div className="kpi-label">Outstanding Balance</div><div className="kpi-value" style={{color:'var(--amber)'}}>{fmt0(report.outstanding)}</div></div>
+            )}
             <div className="kpi-card"><div className="kpi-label">Occupancy Rate</div><div className="kpi-value">{report?.occupancyRate != null ? `${report.occupancyRate}%` : '—'}</div></div>
           </div>
-          <CollectionsCharts ytdMonthly={report?.ytdMonthly ?? []} mtd={Number(report?.collectedMtd || 0)} ytd={Number(report?.ytdCollected || 0)} />
+          <CollectionsCharts basis={basis} ytdMonthly={report?.ytdMonthly ?? []} mtd={Number(card.amount || 0)} ytd={Number(report?.ytdCollected || 0)} />
           <div className="card">
             <div className="card-header"><span className="card-title">Monthly Breakdown</span></div>
             <div style={{padding:'4px 0 16px'}}>
-              <div style={{fontSize:'.72rem',color:'var(--text-3)',padding:'0 0 10px'}}>Click a month to open its profit &amp; loss and payment-date breakdown.</div>
-              <table className="data-table">
-                <thead><tr><th>Month</th><th>Collected</th><th>Disbursed</th><th>Fees</th><th>Net</th><th></th></tr></thead>
-                <tbody>
-                  {report?.monthly?.length ? report.monthly.map((m: any) => (
-                    <tr key={m.month}
-                        onClick={() => setOpenMonth(m.month)}
-                        style={{cursor:'pointer'}}
-                        title={`Open ${monthLabel(m.month)} P&L`}>
-                      <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{m.month}</td>
-                      <td className="mono" style={{color:'var(--green)'}}>{fmt(m.collected)}</td>
-                      <td className="mono">{fmt(m.disbursed)}</td>
-                      <td className="mono" style={{color:'var(--text-3)'}}>{fmt(m.fees)}</td>
-                      <td className="mono" style={{color:'var(--text-0)',fontWeight:600}}>{fmt(m.net)}</td>
-                      <td style={{color:'var(--text-3)',textAlign:'right'}}>›</td>
-                    </tr>
-                  )) : (
-                    <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No report data yet.</td></tr>
-                  )}
-                </tbody>
-              </table>
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',padding:'0 0 10px'}}>Click a month to open its profit &amp; loss and the money behind it.</div>
+              <div className="data-table-wrap">
+                <table className="data-table">
+                  {/* "Net" IS the net of the P&L the row opens (the month's income less
+                      GAM's platform fee, maintenance, lot rent and entered expenses).
+                      "Payout fees" are the payout run's own fees, shown for reference. */}
+                  <thead><tr><th>Month</th><th>{word}</th><th>Disbursed</th><th>Payout fees</th><th>Net</th><th></th></tr></thead>
+                  <tbody>
+                    {report?.monthly?.length ? report.monthly.map((m: any) => (
+                      <tr key={m.month}
+                          onClick={() => setOpenMonth(m.month)}
+                          style={{cursor:'pointer'}}
+                          title={`Open ${monthLabel(m.month)} P&L`}>
+                        <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{monthLabel(m.month)}</td>
+                        <td className="mono" style={{color:'var(--green)'}}>{fmt(m.collected)}</td>
+                        <td className="mono">{fmt(m.disbursed)}</td>
+                        <td className="mono" style={{color:'var(--text-3)'}}>{fmt(m.fees)}</td>
+                        <td className="mono" style={{color: m.net != null && m.net < 0 ? 'var(--red, #e06666)' : 'var(--text-0)',fontWeight:600}}>{fmt(m.net)}</td>
+                        <td style={{color:'var(--text-3)',textAlign:'right'}}>›</td>
+                      </tr>
+                    )) : (
+                      <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No report data yet.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>
       )}
-      {openMonth && <MonthlyPLModal month={openMonth} onClose={() => setOpenMonth(null)} />}
+      {openMonth && <MonthlyPLModal month={openMonth} basis={basis} onClose={() => setOpenMonth(null)} />}
     </>
   )
 }
 
 // ── BY PROPERTY (per-property P&L) ────────────────────────────
-function ByPropertyTab() {
+function ByPropertyTab({ basis }: { basis: IncomeBasis }) {
   const now = new Date()
   const [year, setYear]   = useState(now.getFullYear())
   // ── S637: DEFAULT TO THIS MONTH, LIKE EVERY OTHER REPORT ────────────
@@ -348,28 +423,37 @@ function ByPropertyTab() {
   const [openProp, setOpenProp] = useState<{ id: string; name: string } | null>(null)
   const { can } = usePerms()
   const qs = `year=${year}${month ? `&month=${month}` : ''}`
-  const { data, isLoading } = useQuery<any>(['property-pl', year, month], () => apiGet(`/reports/property-pl?${qs}`))
+  const { data, isLoading, error } = useQuery<any>(['property-pl', year, month, basis],
+    () => apiGet(withBasis(`/reports/property-pl?${qs}`, basis)))
   const props: any[] = data?.properties ?? []
+  const word = basisLabel(basis)
 
+  // S655: each row is income − platform fee − maintenance − lot rent − your
+  // expenses = net (the drill-in's net, line for line). Lot rent and entered
+  // expenses had no column, so a row with either did not add up on screen.
+  const otherCosts = (p: any) => Number(p.lotRent || 0) + Number(p.enteredExpenses || 0)
+  const income = (p: any) => Number(p.incomeTotal ?? p.rentCollected ?? 0)
   const totals = props.reduce((t, p) => ({
-    rent: t.rent + Number(p.rentCollected || 0),
+    income: t.income + income(p),
     maint: t.maint + Number(p.maintCost || 0),
     plat: t.plat + Number(p.platformFees || 0),
+    other: t.other + otherCosts(p),
     net: t.net + Number(p.netIncome || 0),
-  }), { rent: 0, maint: 0, plat: 0, net: 0 })
+  }), { income: 0, maint: 0, plat: 0, other: 0, net: 0 })
 
   const periodLabel = month ? `${MONTHS[month - 1]} ${year}` : `Full year ${year}`
 
   const exportCsv = () => downloadCsv(
-    `property-pl-${year}${month ? `-${String(month).padStart(2,'0')}` : ''}.csv`,
-    ['Property', 'Occupied', 'Total units', 'Occupancy %', 'Rent collected', 'Maintenance', 'Platform fee', 'Net income'],
+    `property-pl-${basis}-${year}${month ? `-${String(month).padStart(2,'0')}` : ''}.csv`,
+    ['Property', 'Occupied', 'Total units', 'Occupancy %', word, 'Maintenance', 'Platform fee', 'Lot rent and your expenses', 'Net income'],
     props.map(p => [p.name, p.occupiedUnits, p.totalUnits, p.occupancyRate,
-      Number(p.rentCollected||0).toFixed(2), Number(p.maintCost||0).toFixed(2),
-      Number(p.platformFees||0).toFixed(2), Number(p.netIncome||0).toFixed(2)]),
+      income(p).toFixed(2), Number(p.maintCost||0).toFixed(2),
+      Number(p.platformFees||0).toFixed(2), otherCosts(p).toFixed(2), Number(p.netIncome||0).toFixed(2)]),
   )
+  const minus = (n: number) => n > 0 ? `−${fmt(n)}` : fmt(n)
 
   return (
-    <div style={{ display: 'grid', gap: 14 }}>
+    <div className="rb-stack">
       <div className="no-print" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <PeriodPicker year={year} setYear={setYear} month={month} setMonth={setMonth} allowAll />
         {can('reports.export') && (
@@ -382,51 +466,56 @@ function ByPropertyTab() {
       <div className="card">
         <div className="card-header">
           <span className="card-title">Per-Property P&amp;L — {periodLabel}</span>
-          <span className="no-print" style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Click a property for unit, payment &amp; maintenance detail.</span>
+          <span className="no-print" style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Click a property for income by category, expenses and net.</span>
         </div>
         <div style={{ padding: '4px 0 12px' }}>
-          {isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
-            <table className="data-table">
-              <thead><tr>
-                <th>Property</th><th style={{textAlign:'center'}}>Occ / Total</th><th style={{textAlign:'center'}}>Occ %</th>
-                <th>Collected</th><th>Maint.</th><th>Platform Fee</th><th>Net</th><th></th>
-              </tr></thead>
-              <tbody>
-                {props.length ? props.map((p: any) => (
-                  <tr key={p.id} onClick={() => setOpenProp({ id: p.id, name: p.name })}
-                      style={{ cursor: 'pointer' }} title={`Open ${p.name} detail`}>
-                    <td style={{ color: 'var(--text-0)', fontWeight: 600 }}>{p.name}</td>
-                    <td className="mono" style={{ textAlign: 'center' }}>{p.occupiedUnits}/{p.totalUnits}</td>
-                    <td className="mono" style={{ textAlign: 'center' }}>{p.occupancyRate}%</td>
-                    <td className="mono" style={{ color: 'var(--green)' }}>{fmt(p.rentCollected)}</td>
-                    <td className="mono" style={{ color: Number(p.maintCost) > 0 ? 'var(--red)' : 'var(--text-3)' }}>{Number(p.maintCost) > 0 ? '−' : ''}{fmt(p.maintCost)}</td>
-                    <td className="mono" style={{ color: Number(p.platformFees) > 0 ? 'var(--red)' : 'var(--text-3)' }}>{Number(p.platformFees) > 0 ? '−' : ''}{fmt(p.platformFees)}</td>
-                    <td className="mono" style={{ color: Number(p.netIncome) >= 0 ? 'var(--gold)' : 'var(--red)', fontWeight: 600 }}>{fmt(p.netIncome)}</td>
-                    <td style={{ color: 'var(--text-3)', textAlign: 'right' }}>›</td>
-                  </tr>
-                )) : (
-                  <tr><td colSpan={8} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>No properties yet.</td></tr>
+          {error ? <ReportError error={error} what="the property report" /> : isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
+            <div className="data-table-wrap">
+              <table className="data-table">
+                <thead><tr>
+                  <th>Property</th><th style={{textAlign:'center'}}>Occ / Total</th><th style={{textAlign:'center'}}>Occ %</th>
+                  <th className="rb-num">{word}</th><th className="rb-num">Maint.</th><th className="rb-num">Platform Fee</th>
+                  <th className="rb-num">Lot rent &amp; your expenses</th><th className="rb-num">Net</th><th></th>
+                </tr></thead>
+                <tbody>
+                  {props.length ? props.map((p: any) => (
+                    <tr key={p.id} onClick={() => setOpenProp({ id: p.id, name: p.name })}
+                        style={{ cursor: 'pointer' }} title={`Open ${p.name} detail`}>
+                      <td style={{ color: 'var(--text-0)', fontWeight: 600 }}>{p.name}</td>
+                      <td className="mono" style={{ textAlign: 'center' }}>{p.occupiedUnits}/{p.totalUnits}</td>
+                      <td className="mono" style={{ textAlign: 'center' }}>{p.occupancyRate}%</td>
+                      <td className="rb-num" style={{ color: 'var(--green)' }}>{fmt(income(p))}</td>
+                      <td className="rb-num" style={{ color: Number(p.maintCost) > 0 ? 'var(--red)' : 'var(--text-3)' }}>{minus(Number(p.maintCost || 0))}</td>
+                      <td className="rb-num" style={{ color: Number(p.platformFees) > 0 ? 'var(--red)' : 'var(--text-3)' }}>{minus(Number(p.platformFees || 0))}</td>
+                      <td className="rb-num" style={{ color: otherCosts(p) > 0 ? 'var(--red)' : 'var(--text-3)' }}>{minus(otherCosts(p))}</td>
+                      <td className="rb-num" style={{ color: Number(p.netIncome) >= 0 ? 'var(--gold)' : 'var(--red)', fontWeight: 600 }}>{fmt(p.netIncome)}</td>
+                      <td style={{ color: 'var(--text-3)', textAlign: 'right' }}>›</td>
+                    </tr>
+                  )) : (
+                    <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>No properties yet.</td></tr>
+                  )}
+                </tbody>
+                {props.length > 0 && (
+                  <tfoot>
+                    <tr style={{ borderTop: '2px solid var(--border-1)' }}>
+                      <td style={{ fontWeight: 700, color: 'var(--text-0)' }}>Total</td>
+                      <td></td><td></td>
+                      <td className="rb-num" style={{ color: 'var(--green)', fontWeight: 700 }}>{fmt(totals.income)}</td>
+                      <td className="rb-num" style={{ color: totals.maint > 0 ? 'var(--red)' : 'var(--text-3)', fontWeight: 700 }}>{minus(totals.maint)}</td>
+                      <td className="rb-num" style={{ color: totals.plat > 0 ? 'var(--red)' : 'var(--text-3)', fontWeight: 700 }}>{minus(totals.plat)}</td>
+                      <td className="rb-num" style={{ color: totals.other > 0 ? 'var(--red)' : 'var(--text-3)', fontWeight: 700 }}>{minus(totals.other)}</td>
+                      <td className="rb-num" style={{ color: totals.net >= 0 ? 'var(--gold)' : 'var(--red)', fontWeight: 700 }}>{fmt(totals.net)}</td>
+                      <td></td>
+                    </tr>
+                  </tfoot>
                 )}
-              </tbody>
-              {props.length > 0 && (
-                <tfoot>
-                  <tr style={{ borderTop: '2px solid var(--border-1)' }}>
-                    <td style={{ fontWeight: 700, color: 'var(--text-0)' }}>Total</td>
-                    <td></td><td></td>
-                    <td className="mono" style={{ color: 'var(--green)', fontWeight: 700 }}>{fmt(totals.rent)}</td>
-                    <td className="mono" style={{ color: totals.maint > 0 ? 'var(--red)' : 'var(--text-3)', fontWeight: 700 }}>{totals.maint > 0 ? '−' : ''}{fmt(totals.maint)}</td>
-                    <td className="mono" style={{ color: totals.plat > 0 ? 'var(--red)' : 'var(--text-3)', fontWeight: 700 }}>{totals.plat > 0 ? '−' : ''}{fmt(totals.plat)}</td>
-                    <td className="mono" style={{ color: totals.net >= 0 ? 'var(--gold)' : 'var(--red)', fontWeight: 700 }}>{fmt(totals.net)}</td>
-                    <td></td>
-                  </tr>
-                </tfoot>
-              )}
-            </table>
+              </table>
+            </div>
           )}
         </div>
       </div>
       <SiteDowntimeCard year={year} month={month} periodLabel={periodLabel} />
-      {openProp && <PropertyDetailModal propertyId={openProp.id} name={openProp.name} year={year} month={month} onClose={() => setOpenProp(null)} />}
+      {openProp && <PropertyDetailModal propertyId={openProp.id} name={openProp.name} year={year} month={month} basis={basis} onClose={() => setOpenProp(null)} />}
     </div>
   )
 }
@@ -447,7 +536,7 @@ function SiteDowntimeCard({ year, month, periodLabel }: { year: number; month: n
         <span className="card-title">Site downtime — {periodLabel}</span>
         <span className="no-print" style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Outages that ended in this period. Out now is as of today.</span>
       </div>
-      <div style={{ padding: '4px 0 12px' }}>
+      <div style={{ padding: '4px 0 12px' }} className="data-table-wrap">
         <table className="data-table">
           <thead><tr>
             <th>Property</th><th>Kind of space</th>
@@ -477,12 +566,20 @@ function SiteDowntimeCard({ year, month, periodLabel }: { year: number; month: n
 }
 
 // ── PROPERTY DETAIL DRILL-IN MODAL ────────────────────────────
-function PropertyDetailModal({ propertyId, name, year, month, onClose }: {
-  propertyId: string; name: string; year: number; month: number | null; onClose: () => void
+// S655, decision #4 (Nic): "here's the total collected... I want to see how
+// much electric was billed back, property-wide... the distinction between lot
+// rent collected, late fees, trailer payments, etc." The drill-in LEADS with
+// the breakdown: income by category (billed vs collected, under the switch),
+// then expenses as line items, then net. The rent roll, payments and
+// maintenance lists come after, collapsed ("way too long").
+function PropertyDetailModal({ propertyId, name, year, month, basis, onClose }: {
+  propertyId: string; name: string; year: number; month: number | null; basis: IncomeBasis; onClose: () => void
 }) {
   const qs = `propertyId=${propertyId}&year=${year}${month ? `&month=${month}` : ''}`
-  const { data, isLoading } = useQuery<any>(['property-detail', propertyId, year, month], () => apiGet(`/reports/property-detail?${qs}`))
+  const { data, isLoading, error } = useQuery<any>(['property-detail', propertyId, year, month, basis],
+    () => apiGet(withBasis(`/reports/property-detail?${qs}`, basis)))
   const periodLabel = month ? `${MONTHS[month - 1]} ${year}` : `Full year ${year}`
+  const word = basisLabel(basis)
 
   // Zero-filled 12-month trend for the mini bar chart; highlight selected month.
   const byMonth = new Map<string, number>((data?.monthlyTrend ?? []).map((t: any) => [t.month, t.collected]))
@@ -490,116 +587,245 @@ function PropertyDetailModal({ propertyId, name, year, month, onClose }: {
     m: i + 1, label: MONTHS_SHORT[i],
     collected: byMonth.get(`${year}-${String(i + 1).padStart(2, '0')}`) ?? 0,
   }))
-  const hasTrend = trend.some(t => t.collected > 0)
-  const s = data?.summary
+  const hasTrend = trend.some(t => t.collected !== 0)
   const units: any[] = data?.units ?? []
   const payments: any[] = data?.payments ?? []
   const maintenance: any[] = data?.maintenance ?? []
+  const expenses = data?.expenses
+  const breakdown = data?.breakdown
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ width: 760, maxWidth: '94vw', maxHeight: '88vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+      <div className="modal rb-modal" onClick={e => e.stopPropagation()}>
         <div className="modal-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div>
-            <div className="modal-title">{name}</div>
+            <div className="modal-title" style={{ marginBottom: 2 }}>{name}</div>
             <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
-              {data?.property ? `${data.property.city}, ${data.property.state} · ${data.property.occupiedUnits}/${data.property.totalUnits} occupied (${data.property.occupancyRate}%)` : periodLabel}
+              {periodLabel}
+              {data?.property ? ` · ${data.property.city}, ${data.property.state} · ${data.property.occupiedUnits}/${data.property.totalUnits} occupied (${data.property.occupancyRate}%)` : ''}
             </div>
           </div>
-          <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }}><X size={15} /></button>
+          <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }} aria-label="Close"><X size={15} /></button>
         </div>
 
-        <div style={{ overflowY: 'auto', minHeight: 0, padding: '4px 2px 8px' }}>
-          {isLoading || !data ? (
+        <div className="rb-modal-body">
+          {error ? <ReportError error={error} what="this property" /> : isLoading || !data ? (
             <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
           ) : (
             <>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 14 }}>
-                <PLStat label={`Collected (${periodLabel})`} value={s.collected} color="var(--green)" />
-                <PLStat label="Platform fee" value={s.platformFee} color="var(--red)" negative />
-                <PLStat label="Maintenance" value={s.maintCost} color="var(--red)" negative />
-                <PLStat label="Net" value={s.net} color={s.net >= 0 ? 'var(--gold)' : 'var(--red, #e06666)'} bold />
+              {/* 1. Income by category, billed vs collected, under the switch. */}
+              <CategoryBreakdownCard
+                basis={basis}
+                title={`Income by category — ${periodLabel}`}
+                categories={breakdown?.categories ?? []}
+                lines={breakdown?.lines ?? []}
+                total={Number(breakdown?.total ?? 0)}
+              />
+
+              {/* 2. Expenses as line items. */}
+              <div className="card" style={{ marginBottom: 14 }}>
+                <div className="card-header"><span className="card-title">Expenses — {periodLabel}</span></div>
+                {expenseLines(expenses).map(l => <PnLLine key={l.key} label={l.label} value={l.amount} kind="expense" />)}
+                <PnLLine label="Total expenses" value={Number(expenses?.total || 0)} kind="total-out" />
+              </div>
+
+              {/* 3. Net. */}
+              <div className="card" style={{ marginBottom: 14 }}>
+                <PnLLine label={`${word} (income)`} value={Number(breakdown?.total || 0)} kind="total-in" />
+                <PnLLine label="Expenses" value={Number(expenses?.total || 0)} kind="total-out" />
+                <PnLLine label="Net" value={Number(data.net || 0)} kind="net" />
+                {Number(data.summary?.depositsHeld) > 0 && (
+                  <div className="rb-small-note">
+                    Deposits received in this period (held for tenants, never income): {fmt(data.summary.depositsHeld)}
+                  </div>
+                )}
               </div>
 
               {hasTrend && (
                 <div className="card" style={{ marginBottom: 14 }}>
-                  <div className="card-header"><span className="card-title">Collected by Month — {year}</span></div>
+                  <div className="card-header"><span className="card-title">{perMonthTitle(basis)} — {year}</span></div>
                   <div style={{ padding: '10px 12px 4px' }}><BarChart series={trend} current={month ?? -1} /></div>
                 </div>
               )}
 
-              <div className="card" style={{ marginBottom: 14 }}>
-                <div className="card-header"><span className="card-title">Units ({units.length})</span></div>
-                <div style={{ padding: '4px 0 8px' }}>
+              {/* The lists, after the breakdown and collapsed. */}
+              <details className="rb-collapse">
+                <summary>Rent roll ({units.length} {units.length === 1 ? 'unit' : 'units'})</summary>
+                <div className="rb-collapse-body data-table-wrap">
                   <table className="data-table">
-                    <thead><tr><th>Unit</th><th>Bed/Bath</th><th>Status</th><th>Rent</th><th>Tenant</th></tr></thead>
+                    <thead><tr><th>Unit</th><th>Bed/Bath</th><th>Status</th><th className="rb-num">Rent</th><th>Tenant</th></tr></thead>
                     <tbody>
                       {units.length ? units.map(u => (
                         <tr key={u.id}>
                           <td style={{ color: 'var(--text-0)', fontWeight: 600 }}>#{u.unitNumber}</td>
                           <td className="mono" style={{ color: 'var(--text-3)' }}>{u.bedrooms}/{u.bathrooms}</td>
                           <td><StatusPill status={u.status} /></td>
-                          <td className="mono">{fmt(u.rent)}</td>
+                          <td className="rb-num">{fmt(u.rent)}</td>
                           <td style={{ color: u.isOccupied ? 'var(--text-2)' : 'var(--text-3)' }}>{u.tenantName || (u.isOccupied ? 'Occupied' : 'Vacant')}</td>
                         </tr>
                       )) : <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 20 }}>No units.</td></tr>}
                     </tbody>
                   </table>
                 </div>
-              </div>
+              </details>
 
-              <div className="card" style={{ marginBottom: 14 }}>
-                <div className="card-header"><span className="card-title">Payments ({payments.length})</span></div>
-                <div style={{ padding: '4px 0 8px' }}>
-                  <table className="data-table">
-                    <thead><tr><th>Due</th><th>Unit</th><th>Tenant</th><th>Type</th><th>Status</th><th>Amount</th></tr></thead>
-                    <tbody>
-                      {payments.length ? payments.map(p => (
-                        <tr key={p.id}>
-                          <td className="mono" style={{ color: 'var(--text-3)' }}>{(p.dueDate || '').slice(0, 10)}</td>
-                          <td className="mono">{p.unitNumber ? `#${p.unitNumber}` : '—'}</td>
-                          <td style={{ color: 'var(--text-2)' }}>{p.tenantName || '—'}</td>
-                          <td style={{ color: 'var(--text-3)' }}>{humanize(p.type)}</td>
-                          <td><StatusPill status={p.status} /></td>
-                          <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(p.amount)}</td>
-                        </tr>
-                      )) : <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 20 }}>No payments in {periodLabel}.</td></tr>}
-                    </tbody>
-                  </table>
+              <details className="rb-collapse">
+                <summary>{basis === 'billed' ? 'Bills' : 'Payments'} behind the total ({payments.length})</summary>
+                <div className="rb-collapse-body data-table-wrap">
+                  <ChargesTable rows={payments} basis={basis} emptyText={`Nothing in ${periodLabel}.`} />
                 </div>
-              </div>
+              </details>
 
-              <div className="card">
-                <div className="card-header"><span className="card-title">Maintenance ({maintenance.length})</span></div>
-                <div style={{ padding: '4px 0 8px' }}>
+              <details className="rb-collapse">
+                <summary>Maintenance ({maintenance.length})</summary>
+                <div className="rb-collapse-body data-table-wrap">
                   <table className="data-table">
-                    <thead><tr><th>Unit</th><th>Description</th><th>Cost</th></tr></thead>
+                    <thead><tr><th>Unit</th><th>Description</th><th className="rb-num">Cost</th></tr></thead>
                     <tbody>
                       {maintenance.length ? maintenance.map(m => (
                         <tr key={m.id}>
                           <td className="mono">{m.unitNumber ? `#${m.unitNumber}` : '—'}</td>
                           <td style={{ color: 'var(--text-2)' }}>{m.title || '—'}</td>
-                          <td className="mono">{fmt(m.actualCost)}</td>
+                          <td className="rb-num">{fmt(m.actualCost)}</td>
                         </tr>
                       )) : <tr><td colSpan={3} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 20 }}>No maintenance in {periodLabel}.</td></tr>}
                     </tbody>
                   </table>
                 </div>
-              </div>
+              </details>
             </>
           )}
         </div>
 
         <div className="modal-footer" style={{ marginTop: 12, flexShrink: 0 }}>
-          <button className="btn btn-primary" onClick={onClose}>Close</button>
+          <button className="btn btn-ghost" onClick={onClose}>Close</button>
         </div>
       </div>
     </div>
   )
 }
 
+/**
+ * Decision #4: income by category, billed vs collected. Money received: what
+ * was billed in the period and what arrived in it; the total is what arrived,
+ * plus money with no category (money paid ahead, deposit deductions, ...).
+ * Money billed: each bill and what became of it; the total is what was billed.
+ */
+function CategoryBreakdownCard({ basis, title, categories, lines, total }: {
+  basis: IncomeBasis; title: string
+  categories: CategoryRow[]; lines: Array<{ line: string; label: string; amount: number }>; total: number
+}) {
+  const rows = activeCategories(categories)
+  const cols = categoryColumns(basis)
+  // The column that adds up to the total under the switch.
+  const totalKey = basis === 'billed' ? 'billed' : 'collected'
+  const colSum = (k: string) => sumAmounts(rows.map(r => ({ amount: Number((r as any)[k] || 0) })))
+  return (
+    <div className="card" style={{ marginBottom: 14 }}>
+      <div className="card-header"><span className="card-title">{title}</span></div>
+      {rows.length === 0 && lines.length === 0 ? (
+        <div style={{ padding: 16, color: 'var(--text-3)', fontSize: '.82rem', textAlign: 'center' }}>
+          {basis === 'billed' ? 'Nothing was billed in this period.' : 'No money arrived in this period.'}
+        </div>
+      ) : (
+        <div className="data-table-wrap">
+          <table className="data-table rb-cat-table">
+            <thead><tr>
+              <th>Category</th>
+              {cols.map(c => <th key={c.key} className="rb-num">{c.label}</th>)}
+            </tr></thead>
+            <tbody>
+              {/* data-label: on a phone each row stacks, every figure named. */}
+              {rows.map(r => (
+                <tr key={r.category}>
+                  <td className="rb-cat-name">{categoryLabel(r)}</td>
+                  {cols.map(c => (
+                    <td key={c.key} data-label={c.label} className="rb-num" style={c.key === totalKey ? { color: 'var(--text-0)', fontWeight: 600 } : undefined}>
+                      {fmt((r as any)[c.key])}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+              {lines.map(l => (
+                <tr key={l.line} className="rb-cat-lines">
+                  <td>{l.label}</td>
+                  {cols.map(c => (
+                    <td key={c.key} data-label={c.label} className={`rb-num${c.key === totalKey ? '' : ' rb-cat-blank'}`}>{c.key === totalKey ? fmt(l.amount) : '—'}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr>
+                <td>Total</td>
+                {cols.map(c => (
+                  <td key={c.key} data-label={c.label} className="rb-num">
+                    {c.key === totalKey ? fmt(total) : fmt(colSum(c.key))}
+                  </td>
+                ))}
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The charges behind a total. Money received: each charge's own new money on
+ * the day it arrived. Money billed: each bill due in the period, with what
+ * became of it.
+ */
+function ChargesTable({ rows, basis, emptyText }: { rows: any[]; basis: IncomeBasis; emptyText: string }) {
+  return (
+    <table className="data-table">
+      <thead><tr>
+        <th>{basis === 'billed' ? 'Due' : 'Day'}</th><th>Unit</th><th>Tenant</th><th>For</th><th>Status</th>
+        <th className="rb-num">{basis === 'billed' ? 'Billed' : 'Received'}</th>
+      </tr></thead>
+      <tbody>
+        {rows.length ? rows.map(p => (
+          <tr key={chargeKey(p)}>
+            {/* The day the entry counted (the property's calendar): a dispute of
+                an earlier payment sits on the day the money was taken back. */}
+            <td className="mono rb-nowrap" style={{ color: 'var(--text-3)' }}>
+              {usDay(chargeDay(p, basis))}
+              {basis === 'received' && Number(p.amount) < 0 && (
+                <div className="rb-taken-back">money taken back</div>
+              )}
+            </td>
+            <td className="mono">{p.unitNumber ? `#${p.unitNumber}` : '—'}</td>
+            <td style={{ color: 'var(--text-2)' }}>{p.tenantName || '—'}</td>
+            <td style={{ color: 'var(--text-3)' }}>{p.categoryLabel || humanize(p.type)}</td>
+            <td>
+              <StatusPill status={p.status} />
+              {basis === 'billed' && partsText(p.parts, fmt) && (
+                <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{partsText(p.parts, fmt)}</div>
+              )}
+            </td>
+            <td className="rb-num" style={{ color: 'var(--text-0)' }}>
+              {fmt(p.amount)}
+              {Number(p.creditGiven) > 0 && (
+                <div style={{ fontSize: '.66rem', color: 'var(--text-3)' }}>credit you gave {fmt(p.creditGiven)}</div>
+              )}
+            </td>
+          </tr>
+        )) : <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 20 }}>{emptyText}</td></tr>}
+      </tbody>
+    </table>
+  )
+}
+
 // ── ANNUAL & TAX (tax-summary + work-trade 1099) ──────────────
-function AnnualTaxTab() {
+// S655: the total IS the year's P&L under the switch, the deductions are the
+// P&L's expenses line for line, and the net is its net. The money paid ahead
+// and not used is shown next to the total, named by the server: "Paid ahead
+// for next year's bills" once the year is over, "Paid ahead, not used yet"
+// while the year is still running. Under Money received it counted on the day
+// it arrived ($0 again when it pays them), so it is never called "not in" the
+// total; under Money billed it is outside the total.
+function AnnualTaxTab({ basis }: { basis: IncomeBasis }) {
   const now = new Date()
   const [year, setYear] = useState(now.getFullYear())
   const { can } = usePerms()
@@ -608,64 +834,107 @@ function AnnualTaxTab() {
   // into one return is wrong on its face. Single-company accounts see no picker.
   const [companyId, setCompanyId] = useState<string>('')
   const q = companyId ? `&landlordId=${companyId}` : ''
-  const { data: tax, isLoading } = useQuery<any>(['tax-summary', year, companyId],
-    () => apiGet(`/reports/tax-summary?year=${year}${q}`), { enabled: !!companyId })
+  const { ready, mustChoose } = useCompanyReady(companyId)
+  const { data: tax, isLoading, error } = useQuery<any>(['tax-summary', year, companyId, basis],
+    () => apiGet(withBasis(`/reports/tax-summary?year=${year}${q}`, basis)), { enabled: ready })
   const { data: wt } = useQuery<any>(['wt-1099', year, companyId],
-    () => apiGet(`/reports/work-trade-1099?year=${year}${q}`), { enabled: !!companyId })
+    () => apiGet(`/reports/work-trade-1099?year=${year}${q}`), { enabled: ready })
 
   const monthly: any[] = tax?.monthlyBreakdown ?? []
   const eligible: any[] = wt?.eligible ?? []
+  const word = basisLabel(basis)
+  const incomeLines: Array<{ line: string; label: string; amount: number }> = tax?.income?.lines ?? []
+  const d = tax?.deductions
+  const deductions = expenseLines(d ? {
+    platformFee: Number(d.platformFees || 0), maintenance: Number(d.maintExpenses || 0),
+    lotRent: Number(d.lotRent || 0), enteredExpenses: Number(d.enteredExpenses || 0),
+  } : null)
+  const paidAheadNext = Number(tax?.paidAheadNextYear?.amount || 0)
+  // Money received: the paid-ahead money on hand at year end counted on the
+  // day it arrived, so it sits on its own line — never in the "not in them"
+  // box (§0.0, Todd). Money billed: it and work trade are both outside.
+  const yearBeside = taxYearBeside(tax?.paidAheadNextYear, d?.workTradeValue, basis)
 
   return (
-    <div style={{ display: 'grid', gap: 14 }}>
+    <div className="rb-stack">
       <div className="no-print">
         <EntityPicker value={companyId} onChange={setCompanyId}
           note="A tax statement belongs to one company — each LLC files its own return." />
       </div>
-      <div className="no-print" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+      <div className="no-print" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <PeriodPicker year={year} setYear={setYear} month={null} />
         {can('reports.export') && (
           <ToolbarBtn onClick={() => window.print()} icon={<Printer size={14} />} label="Print" />
         )}
       </div>
 
-      {isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
+      {mustChoose ? <ChooseCompany what="tax summary" /> : error ? <ReportError error={error} what="the tax summary" /> : (isLoading || !tax) ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
         <>
-          <div className="kpi-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
-            <div className="kpi-card"><div className="kpi-label">Gross Rent {year}</div><div className="kpi-value green">{fmt0(tax?.income?.totalRent)}</div></div>
+          <div className="rb-kpis">
+            <div className="kpi-card">
+              <div className="kpi-label">{word} {year}</div>
+              <div className="kpi-value green">{fmt0(tax?.income?.totalRent)}</div>
+              {paidAheadNext > 0 && (
+                <div className="kpi-sub">
+                  {tax?.paidAheadNextYear?.label || 'Paid ahead, not used yet'} {fmt0(paidAheadNext)}
+                  {basis === 'billed' ? ' — not in this total' : ' — counted when it arrived'}
+                </div>
+              )}
+            </div>
             <div className="kpi-card"><div className="kpi-label">Net Income</div><div className="kpi-value" style={{ color: 'var(--gold)' }}>{fmt0(tax?.netIncome)}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Deposits Held</div><div className="kpi-value">{fmt0(tax?.deposits?.totalHeld)}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Settled Payments</div><div className="kpi-value">{tax?.income?.paymentCount ?? 0}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Deposits Held</div><div className="kpi-value">{fmt0(tax?.deposits?.totalHeld)}</div><div className="kpi-sub">tenants' money, never income</div></div>
+            <div className="kpi-card"><div className="kpi-label">{basis === 'billed' ? 'Bills counted' : 'Payments counted'}</div><div className="kpi-value">{tax?.income?.paymentCount ?? 0}</div></div>
           </div>
 
           <div className="card">
-            <div className="card-header"><span className="card-title">Deductions (estimated)</span></div>
-            <div style={{ padding: '6px 6px 12px' }}>
-              <PnLLine label="GAM platform fees" value={Number(tax?.deductions?.platformFees || 0)} kind="expense" />
-              <PnLLine label="Maintenance expenses" value={Number(tax?.deductions?.maintExpenses || 0)} kind="expense" />
-              {Number(tax?.deductions?.workTradeValue || 0) > 0 &&
-                <PnLLine label="Work-trade value (bartered)" value={Number(tax?.deductions?.workTradeValue || 0)} kind="expense" />}
-              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', padding: '8px 4px 0' }}>
+            <div className="card-header"><span className="card-title">Income, deductions and net — {year}</span></div>
+            <div style={{ padding: '2px 6px 12px' }}>
+              <div className="rb-heading">Income ({word})</div>
+              {incomeLines.map(l => <PnLLine key={l.line} label={l.label} value={l.amount} kind="income" />)}
+              <PnLLine label="Total income" value={Number(tax?.income?.totalRent || 0)} kind="total-in" />
+              <PaidAheadOnHand item={yearBeside.onHand} />
+              <div className="rb-heading">Deductions (estimated)</div>
+              {deductions.map(l => <PnLLine key={l.key} label={l.label} value={l.amount} kind="expense" />)}
+              <PnLLine label="Total deductions" value={sumAmounts(deductions)} kind="total-out" />
+              <PnLLine label="Net income" value={Number(tax?.netIncome || 0)} kind="net" />
+              {yearBeside.notIn.length > 0 && (
+                <div className="rb-beside">
+                  <div className="rb-beside-title">Beside the totals, not in them</div>
+                  {yearBeside.notIn.map(i => (
+                    <div key={i.key} className="rb-beside-row"><span>{i.label}</span><span className="rb-line-amount">{fmt(i.amount)}</span></div>
+                  ))}
+                </div>
+              )}
+              <div className="rb-small-note">
                 Estimates for planning only — not tax advice. GAM does not file on your behalf. Confirm with your tax professional.
               </div>
             </div>
           </div>
 
           <div className="card">
-            <div className="card-header"><span className="card-title">Monthly Collected — {year}</span></div>
-            <div style={{ padding: '4px 0 12px' }}>
+            <div className="card-header"><span className="card-title">{perMonthTitle(basis)} — {year}</span></div>
+            <div style={{ padding: '4px 0 12px' }} className="data-table-wrap">
               <table className="data-table">
-                <thead><tr><th>Month</th><th>Collected</th><th style={{textAlign:'center'}}>Paid</th><th style={{textAlign:'center'}}>Failed</th></tr></thead>
+                <thead><tr><th>Month</th><th className="rb-num">{word}</th><th style={{textAlign:'center'}}>{basis === 'billed' ? 'Bills' : 'Payments'}</th><th style={{textAlign:'center'}}>Failed</th></tr></thead>
                 <tbody>
                   {monthly.length ? monthly.map((m: any) => (
                     <tr key={m.month}>
                       <td style={{ color: 'var(--text-1)' }}>{MONTHS[(Number(m.month) || 1) - 1]}</td>
-                      <td className="mono" style={{ color: 'var(--green)' }}>{fmt(m.collected)}</td>
+                      <td className="rb-num" style={{ color: 'var(--green)' }}>{fmt(m.collected)}</td>
                       <td className="mono" style={{ textAlign: 'center' }}>{m.paid}</td>
                       <td className="mono" style={{ textAlign: 'center', color: Number(m.failed) > 0 ? 'var(--red)' : 'var(--text-3)' }}>{m.failed}</td>
                     </tr>
-                  )) : <tr><td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No payments in {year}.</td></tr>}
+                  )) : <tr><td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>Nothing in {year}.</td></tr>}
                 </tbody>
+                {monthly.length > 0 && (
+                  <tfoot>
+                    <tr style={{ borderTop: '2px solid var(--border-1)' }}>
+                      <td style={{ fontWeight: 700, color: 'var(--text-0)' }}>Year</td>
+                      <td className="rb-num" style={{ fontWeight: 700, color: 'var(--green)' }}>{fmt(sumAmounts(monthly.map((m: any) => ({ amount: Number(m.collected || 0) }))))}</td>
+                      <td></td><td></td>
+                    </tr>
+                  </tfoot>
+                )}
               </table>
             </div>
           </div>
@@ -679,19 +948,21 @@ function AnnualTaxTab() {
               <div style={{ fontSize: '.68rem', color: 'var(--text-3)', padding: '0 4px 8px' }}>
                 Tenants whose bartered work-trade value reaches the $600 1099-NEC reporting threshold. Informational — GAM does not issue 1099s.
               </div>
-              <table className="data-table">
-                <thead><tr><th>Tenant</th><th>Property / Unit</th><th>Email</th><th>Value</th></tr></thead>
-                <tbody>
-                  {eligible.length ? eligible.map((a: any) => (
-                    <tr key={a.id}>
-                      <td style={{ color: 'var(--text-0)' }}>{[a.tenantFirst, a.tenantLast].filter(Boolean).join(' ') || '—'}</td>
-                      <td style={{ color: 'var(--text-2)' }}>{a.propertyName}{a.unitNumber ? ` · #${a.unitNumber}` : ''}</td>
-                      <td style={{ color: 'var(--text-3)' }}>{a.tenantEmail || '—'}</td>
-                      <td className="mono" style={{ color: 'var(--gold)', fontWeight: 600 }}>{fmt(a.creditValue)}</td>
-                    </tr>
-                  )) : <tr><td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No 1099-eligible work trade in {year}.</td></tr>}
-                </tbody>
-              </table>
+              <div className="data-table-wrap">
+                <table className="data-table">
+                  <thead><tr><th>Tenant</th><th>Property / Unit</th><th>Email</th><th className="rb-num">Value</th></tr></thead>
+                  <tbody>
+                    {eligible.length ? eligible.map((a: any) => (
+                      <tr key={a.id}>
+                        <td style={{ color: 'var(--text-0)' }}>{[a.tenantFirst, a.tenantLast].filter(Boolean).join(' ') || '—'}</td>
+                        <td style={{ color: 'var(--text-2)' }}>{a.propertyName}{a.unitNumber ? ` · #${a.unitNumber}` : ''}</td>
+                        <td style={{ color: 'var(--text-3)' }}>{a.tenantEmail || '—'}</td>
+                        <td className="rb-num" style={{ color: 'var(--gold)', fontWeight: 600 }}>{fmt(a.creditValue)}</td>
+                      </tr>
+                    )) : <tr><td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No 1099-eligible work trade in {year}.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </>
@@ -701,7 +972,7 @@ function AnnualTaxTab() {
 }
 
 // ── OWNER STATEMENT (monthly-statement) ───────────────────────
-function OwnerStatementTab() {
+function OwnerStatementTab({ basis }: { basis: IncomeBasis }) {
   const now = new Date()
   const [year, setYear]   = useState(now.getFullYear())
   const [month, setMonth] = useState<number | null>(now.getMonth() + 1)
@@ -709,28 +980,32 @@ function OwnerStatementTab() {
   // S633: an owner statement is one company's statement — it prints that
   // company's name at the top.
   const [companyId, setCompanyId] = useState<string>('')
-  const { data, isLoading } = useQuery<any>(['monthly-statement', year, month, companyId],
-    () => apiGet(`/reports/monthly-statement?year=${year}&month=${month}` + (companyId ? `&landlordId=${companyId}` : '')),
-    { enabled: !!companyId })
+  const { ready, mustChoose } = useCompanyReady(companyId)
+  const { data, isLoading, error } = useQuery<any>(['monthly-statement', year, month, companyId, basis],
+    () => apiGet(withBasis(`/reports/monthly-statement?year=${year}&month=${month}` + (companyId ? `&landlordId=${companyId}` : ''), basis)),
+    { enabled: ready })
 
   const s = data?.summary
   const payments: any[] = data?.payments ?? []
   const maintenance: any[] = data?.maintenance ?? []
   const landlord = data?.landlord
   const ym = `${year}-${String(month).padStart(2, '0')}`
+  const remainder = noChargeRemainder(Number(s?.totalIncome || 0), Number(data?.rowsTotal || 0))
 
   const exportPaymentsCsv = () => downloadCsv(
-    `owner-statement-payments-${ym}.csv`,
-    ['Date due', 'Property', 'Unit', 'Tenant', 'Type', 'Status', 'Amount'],
+    `owner-statement-${basis}-${ym}.csv`,
+    ['Counted on', 'Date due', 'Money arrived', 'Property', 'Unit', 'Tenant', 'For', 'Status',
+     basis === 'billed' ? 'Billed' : 'Received', ...(basis === 'billed' ? ['What became of it'] : [])],
     payments.map(p => [
-      (p.dueDate || '').slice(0, 10), p.propertyName, p.unitNumber,
+      chargeDay(p, basis), (p.dueDate || '').slice(0, 10), arrivalDay(p, basis), p.propertyName, p.unitNumber,
       [p.tenantFirst, p.tenantLast].filter(Boolean).join(' '),
-      p.type, p.status, Number(p.amount || 0).toFixed(2),
+      p.categoryLabel || humanize(p.type), statusWords(p.status), Number(p.amount || 0).toFixed(2),
+      ...(basis === 'billed' ? [partsText(p.parts, fmt)] : []),
     ]),
   )
 
   return (
-    <div style={{ display: 'grid', gap: 14 }}>
+    <div className="rb-stack">
       <div className="no-print">
         <EntityPicker value={companyId} onChange={setCompanyId}
           note="An owner statement is one company's statement — it prints that company's name." />
@@ -745,7 +1020,7 @@ function OwnerStatementTab() {
         )}
       </div>
 
-      {isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
+      {mustChoose ? <ChooseCompany what="owner statement" /> : error ? <ReportError error={error} what="the owner statement" /> : (isLoading || !data) ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
         <>
           <div className="card">
             <div style={{ padding: '14px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap' }}>
@@ -758,49 +1033,42 @@ function OwnerStatementTab() {
               <div style={{ textAlign: 'right' }}>
                 <div style={{ fontSize: '.72rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>Period</div>
                 <div style={{ fontSize: '.9rem', color: 'var(--gold)', fontWeight: 600 }}>{monthLabel(ym)}</div>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{basisLabel(basis)}</div>
               </div>
             </div>
           </div>
 
-          <PnLStatement s={s} periodLabel={monthLabel(ym)} />
+          <PnLStatement s={s} lines={data?.lines ?? []} beside={data?.beside ?? []} periodLabel={monthLabel(ym)} basis={basis} />
 
           <div className="card">
             <div className="card-header">
-              <span className="card-title">Payments</span>
+              <span className="card-title">{basis === 'billed' ? 'Bills behind the total' : 'Payments behind the total'}</span>
               <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
-                {s?.settledPayments ?? 0} settled · {s?.latePayments ?? 0} late · {s?.failedPayments ?? 0} failed
+                {s?.settledPayments ?? 0} paid · {s?.latePayments ?? 0} late · {s?.failedPayments ?? 0} failed
               </span>
             </div>
-            <div style={{ padding: '4px 0 12px' }}>
-              <table className="data-table">
-                <thead><tr><th>Due</th><th>Property / Unit</th><th>Tenant</th><th>Type</th><th>Status</th><th>Amount</th></tr></thead>
-                <tbody>
-                  {payments.length ? payments.map((p: any) => (
-                    <tr key={p.id}>
-                      <td className="mono" style={{ color: 'var(--text-3)' }}>{(p.dueDate || '').slice(0, 10)}</td>
-                      <td style={{ color: 'var(--text-1)' }}>{p.propertyName}{p.unitNumber ? ` · #${p.unitNumber}` : ''}</td>
-                      <td style={{ color: 'var(--text-2)' }}>{[p.tenantFirst, p.tenantLast].filter(Boolean).join(' ') || '—'}</td>
-                      <td style={{ color: 'var(--text-3)' }}>{humanize(p.type)}</td>
-                      <td><StatusPill status={p.status} /></td>
-                      <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(p.amount)}</td>
-                    </tr>
-                  )) : <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No payments in {monthLabel(ym)}.</td></tr>}
-                </tbody>
-              </table>
+            <div style={{ padding: '4px 0 12px' }} className="data-table-wrap">
+              <ChargesTable rows={payments} basis={basis} emptyText={`Nothing in ${monthLabel(ym)}.`} />
+              {payments.length > 0 && (
+                <div className="rb-small-note">
+                  These add up to {fmt(data?.rowsTotal)}.
+                  {Math.abs(remainder) >= 0.01 && ` The other ${fmt(remainder)} of the total has no single charge behind it (money paid ahead, register sales and stays, other income, move-out lines).`}
+                </div>
+              )}
             </div>
           </div>
 
           <div className="card">
             <div className="card-header"><span className="card-title">Maintenance</span></div>
-            <div style={{ padding: '4px 0 12px' }}>
+            <div style={{ padding: '4px 0 12px' }} className="data-table-wrap">
               <table className="data-table">
-                <thead><tr><th>Property / Unit</th><th>Description</th><th>Cost</th></tr></thead>
+                <thead><tr><th>Property / Unit</th><th>Description</th><th className="rb-num">Cost</th></tr></thead>
                 <tbody>
                   {maintenance.length ? maintenance.map((m: any) => (
                     <tr key={m.id}>
                       <td style={{ color: 'var(--text-1)' }}>{m.propertyName}{m.unitNumber ? ` · #${m.unitNumber}` : ''}</td>
                       <td style={{ color: 'var(--text-2)' }}>{m.title || m.description || '—'}</td>
-                      <td className="mono">{fmt(m.actualCost)}</td>
+                      <td className="rb-num">{fmt(m.actualCost)}</td>
                     </tr>
                   )) : <tr><td colSpan={3} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>No maintenance in {monthLabel(ym)}.</td></tr>}
                 </tbody>
@@ -815,34 +1083,41 @@ function OwnerStatementTab() {
 
 function StatusPill({ status }: { status: string }) {
   const map: Record<string, string> = {
-    settled: 'var(--green)', late: 'var(--amber)', failed: 'var(--red)',
-    pending: 'var(--text-3)', partial: 'var(--amber)',
+    settled: 'var(--green)', late: 'var(--amber)', failed: 'var(--red)', returned: 'var(--red)',
+    pending: 'var(--text-3)', partial: 'var(--amber)', processing: 'var(--amber)', paid_via_deposit: 'var(--green)',
   }
   const c = map[status] || 'var(--text-3)'
-  return <span style={{ fontSize: '.7rem', color: c, fontWeight: 600, textTransform: 'capitalize' }}>{humanize(status)}</span>
+  return <span style={{ fontSize: '.7rem', color: c, fontWeight: 600 }}>{statusWords(status)}</span>
 }
 
 // ══════════════════════════════════════════════════════════════
-// MONTHLY P&L DRILL-IN MODAL (unchanged from S512 #20)
+// MONTHLY P&L DRILL-IN MODAL (S512 #20; S655 under the switch)
 // ══════════════════════════════════════════════════════════════
-interface PaymentRow {
-  id: string
-  settledAt: string
-  amount: number
+interface PaymentRow extends ChargeRow {
   type: string
   method: string
+  status: string
+  categoryLabel: string | null
+  creditGiven?: number
   tenantName: string | null
   unitNumber: string | null
   propertyName: string | null
 }
 interface MonthlyPL {
   period: { year: number; month: number; start: string; end: string }
-  gross: { rent: number; fees?: number; utilities?: number; homeSale?: number; other: number; total: number }
+  gross: { rent: number; other: number; total: number }
+  /** Every income line, labeled; they add up to gross.total. */
+  lines: Array<{ line: string; label: string; amount: number }>
+  /** Shown beside the total, never in it. */
+  beside: Array<{ key: string; label: string; amount: number }>
+  /** Money billed: what became of the bills (adds up to the total). */
+  parts: Array<{ part: string; label: string; amount: number }>
   depositsHeld?: number
   expenses: { platformFee: number; maintenance: number; lotRent?: number; enteredExpenses?: number; total: number }
   net: number
   paymentCount: number
   payments: PaymentRow[]
+  rowsTotal: number
 }
 
 const dayLabel = (iso: string) =>
@@ -850,7 +1125,7 @@ const dayLabel = (iso: string) =>
 const timeLabel = (iso: string) =>
   new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
 
-function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void }) {
+function MonthlyPLModal({ month, basis, onClose }: { month: string; basis: IncomeBasis; onClose: () => void }) {
   const [year, mo] = month.split('-').map(Number)
   // ── S637: A P&L BELONGS TO ONE COMPANY ──────────────────────────────
   //
@@ -865,97 +1140,112 @@ function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void
   // carries the picker; this one was missed.
   const [companyId, setCompanyId] = useState<string>('')
   const { data, isLoading, error } = useQuery<MonthlyPL>(
-    ['monthly-pl', month, companyId],
-    () => apiGet(`/reports/monthly-pl?year=${year}&month=${mo}`
-      + (companyId ? `&landlordId=${companyId}` : '')),
+    ['monthly-pl', month, companyId, basis],
+    () => apiGet(withBasis(`/reports/monthly-pl?year=${year}&month=${mo}`
+      + (companyId ? `&landlordId=${companyId}` : ''), basis)),
   )
 
-  // Group settled payments by their actual payment date.
-  const byDate: Array<{ date: string; rows: PaymentRow[]; total: number }> = []
-  if (data?.payments) {
-    const map = new Map<string, PaymentRow[]>()
-    for (const p of data.payments) {
-      const key = (p.settledAt || '').slice(0, 10)
-      if (!map.has(key)) map.set(key, [])
-      map.get(key)!.push(p)
-    }
-    for (const [date, rows] of Array.from(map.entries()).sort(([a], [b]) => b.localeCompare(a))) {
-      byDate.push({ date, rows, total: rows.reduce((s, r) => s + r.amount, 0) })
-    }
-  }
+  // Money received: grouped by the day the money arrived. Money billed: by the
+  // day each bill was due.
+  const groups = data?.payments ? groupCharges(data.payments, basis) : []
+  const remainder = data ? noChargeRemainder(data.gross.total, data.rowsTotal) : 0
+  // Money billed with its parts listed (paid / clearing / covered by money paid
+  // ahead / still owed — inside the total): "collected so far" is made of those
+  // parts, so it is not listed again as "beside the total, not in it".
+  const outcomeShown = !!data && showsBillOutcome(basis, data.parts.length)
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ width: 720, maxWidth: '94vw', maxHeight: '88vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+      <div className="modal rb-modal" style={{ width: 720 }} onClick={e => e.stopPropagation()}>
         <div className="modal-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div className="modal-title">{monthLabel(month)} — Profit &amp; Loss</div>
-          <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }}><X size={15} /></button>
+          <div>
+            <div className="modal-title" style={{ marginBottom: 2 }}>{monthLabel(month)} — Profit &amp; Loss</div>
+            <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>{basisLabel(basis)}</div>
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }} aria-label="Close"><X size={15} /></button>
         </div>
 
-        <div style={{ overflowY: 'auto', minHeight: 0, padding: '4px 2px 8px' }}>
+        <div className="rb-modal-body">
           <EntityPicker value={companyId} onChange={setCompanyId}
             note="A profit and loss statement belongs to one company." />
           {/* S637: a failure used to render as "Loading…" forever, because this
               branch tested `!data` and an errored query has no data. That hid
               the actual reason — here, a 400 naming exactly what was wrong. */}
           {error ? (
-            <div className="alert alert-warning" style={{ margin: 12, fontSize: '.82rem' }}>
-              {(error as any)?.response?.data?.error || 'Could not load this statement.'}
+            <div className="alert alert-warn" style={{ margin: 12, fontSize: '.82rem' }}>
+              {reportErrorText(error, 'this statement')}
             </div>
           ) : isLoading || !data ? (
             <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
           ) : (
             <>
               {/* P&L summary */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginBottom: 16 }}>
-                <PLStat label="Gross income" value={data.gross.total} color="var(--green)" />
+              <div className="rb-stats">
+                <PLStat label={`${basisLabel(basis)}`} value={data.gross.total} color="var(--green)" />
                 <PLStat label="Expenses" value={data.expenses.total} color="var(--text-2)" negative />
                 <PLStat label="Net" value={data.net} color={data.net >= 0 ? 'var(--gold)' : 'var(--red, #e06666)'} bold />
               </div>
 
               <div className="card" style={{ marginBottom: 16 }}>
                 <div className="card-header"><span className="card-title">Breakdown</span></div>
-                <div style={{ padding: '6px 0' }}>
-                  <PnLLine label="Rent collected" value={data.gross.rent} kind="income" />
-                  {!!data.gross.fees && data.gross.fees > 0 && <PnLLine label="Fees" value={data.gross.fees} kind="income" />}
-                  {!!data.gross.utilities && data.gross.utilities > 0 && <PnLLine label="Utilities" value={data.gross.utilities} kind="income" />}
-                  {!!data.gross.homeSale && data.gross.homeSale > 0 && <PnLLine label="Home-sale payments" value={data.gross.homeSale} kind="income" />}
-                  <PnLLine label="GAM platform fee" value={data.expenses.platformFee} kind="expense" />
-                  {data.expenses.maintenance > 0 && <PnLLine label="Maintenance" value={data.expenses.maintenance} kind="expense" />}
-                  {!!data.expenses.lotRent && data.expenses.lotRent > 0 && <PnLLine label="Lot rent" value={data.expenses.lotRent} kind="expense" />}
-                  {!!data.expenses.enteredExpenses && data.expenses.enteredExpenses > 0 && <PnLLine label="Your expenses" value={data.expenses.enteredExpenses} kind="expense" />}
-                  <PnLLine label="Net to owner" value={data.net} kind="net" />
-                  {!!data.depositsHeld && data.depositsHeld > 0 && (
-                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)', padding: '4px 14px' }}>
-                      + {fmt(data.depositsHeld)} deposits collected (held, not income)
+                <div style={{ padding: '0 0 6px' }}>
+                  <PnLHeading>Income</PnLHeading>
+                  {data.lines.map(l => <PnLLine key={l.line} label={l.label} value={l.amount} kind="income" />)}
+                  <PnLLine label="Total income" value={data.gross.total} kind="total-in" />
+                  <PaidAheadOnHand item={paidAheadOnHand(data.beside, basis)} />
+                  {outcomeShown && (
+                    <div className="rb-beside">
+                      <div className="rb-beside-title">What became of the bills</div>
+                      {data.parts.map(p => (
+                        <div key={p.part} className="rb-beside-row"><span>{p.label}</span><span className="rb-line-amount">{fmt(p.amount)}</span></div>
+                      ))}
                     </div>
                   )}
+                  <PnLHeading>Expenses</PnLHeading>
+                  {expenseLines(data.expenses).map(l => <PnLLine key={l.key} label={l.label} value={l.amount} kind="expense" />)}
+                  <PnLLine label="Total expenses" value={data.expenses.total} kind="total-out" />
+                  <PnLLine label="Net to owner" value={data.net} kind="net" />
+                  {/* Money billed: still clearing and still owed are inside the total
+                      (listed above under what became of the bills), never beside it —
+                      and nor is collected so far once those parts are listed. Money
+                      received: paid-ahead money on hand already counted (above). */}
+                  <BesideFigures items={besideNotInTotal(data.beside, basis, { outcomeShown })} />
                 </div>
               </div>
 
-              {/* Actual-payment-date breakdown */}
+              {/* The charges behind the total. */}
               <div className="card">
-                <div className="card-header"><span className="card-title">Payments by date ({data.paymentCount})</span></div>
+                <div className="card-header">
+                  <span className="card-title">
+                    {basis === 'billed' ? `Bills by due date (${data.paymentCount})` : `Payments by the day the money arrived (${data.paymentCount})`}
+                  </span>
+                </div>
                 <div style={{ padding: '6px 0' }}>
-                  {byDate.length === 0 ? (
+                  {groups.length === 0 ? (
                     <div style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24, fontSize: '.8rem' }}>
-                      No settled payments recorded in {monthLabel(month)}.
+                      {basis === 'billed' ? `No bills due in ${monthLabel(month)}.` : `No payments arrived in ${monthLabel(month)}.`}
                     </div>
-                  ) : byDate.map(group => (
-                    <div key={group.date} style={{ marginBottom: 8 }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', padding: '6px 4px', borderBottom: '1px solid var(--border-0)' }}>
-                        <span style={{ fontSize: '.74rem', fontWeight: 700, color: 'var(--text-1)' }}>{dayLabel(group.date + 'T12:00:00')}</span>
+                  ) : groups.map(group => (
+                    <div key={group.date || 'none'} style={{ marginBottom: 8 }}>
+                      <div className="rb-group-head">
+                        <span style={{ fontSize: '.74rem', fontWeight: 700, color: 'var(--text-1)' }}>
+                          {group.date ? dayLabel(group.date + 'T12:00:00') : 'No date'}
+                        </span>
                         <span className="mono" style={{ fontSize: '.74rem', color: 'var(--green)' }}>{fmt(group.total)}</span>
                       </div>
                       {group.rows.map(r => (
-                        <div key={r.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8, padding: '5px 4px', fontSize: '.74rem' }}>
-                          <span style={{ color: 'var(--text-2)', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        <div key={chargeKey(r)} className="rb-group-row">
+                          <span className="rb-group-who">
                             {r.tenantName || 'Tenant'}
-                            <span style={{ color: 'var(--text-3)' }}>
+                            <span className="rb-group-detail">
                               {r.unitNumber ? ` · ${r.propertyName ? r.propertyName + ' ' : ''}#${r.unitNumber}` : ''}
-                              {` · ${humanize(r.type)}`}
-                              {` · ${humanize(r.method)}`}
-                              {` · ${timeLabel(r.settledAt)}`}
+                              {` · ${r.categoryLabel || humanize(r.type)}`}
+                              {basis === 'received'
+                                ? (Number(r.amount) < 0
+                                    ? ' · money taken back (a dispute or bank return)'
+                                    : `${r.method && r.method !== '—' ? ` · ${r.method}` : ''}${r.settledAt ? ` · ${timeLabel(r.settledAt)}` : ''}`)
+                                : (partsText(r.parts, fmt) ? ` · ${partsText(r.parts, fmt)}` : '')}
+                              {Number(r.creditGiven) > 0 ? ` · credit you gave ${fmt(r.creditGiven)}` : ''}
                             </span>
                           </span>
                           <span className="mono" style={{ color: 'var(--text-0)', whiteSpace: 'nowrap' }}>{fmt(r.amount)}</span>
@@ -963,6 +1253,12 @@ function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void
                       ))}
                     </div>
                   ))}
+                  {groups.length > 0 && Math.abs(remainder) >= 0.01 && (
+                    <div className="rb-small-note">
+                      These add up to {fmt(data.rowsTotal)}. The other {fmt(remainder)} of the total has no single charge
+                      behind it (money paid ahead, register sales and stays, other income, move-out lines) — see the breakdown above.
+                    </div>
+                  )}
                 </div>
               </div>
             </>
@@ -970,7 +1266,7 @@ function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void
         </div>
 
         <div className="modal-footer" style={{ marginTop: 12, flexShrink: 0 }}>
-          <button className="btn btn-primary" onClick={onClose}>Close</button>
+          <button className="btn btn-ghost" onClick={onClose}>Close</button>
         </div>
       </div>
     </div>
@@ -979,64 +1275,108 @@ function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void
 
 function PLStat({ label, value, color, negative, bold }: { label: string; value: number; color: string; negative?: boolean; bold?: boolean }) {
   return (
-    <div className="kpi-card" style={{ padding: 12 }}>
+    <div className="kpi-card">
       <div className="kpi-label">{label}</div>
-      <div className="mono" style={{ fontSize: '1.05rem', fontWeight: bold ? 700 : 600, color }}>
+      <div className={`rb-stat-value${bold ? ' bold' : ''}`} style={{ color }}>
         {negative && value > 0 ? '−' : ''}{fmt(value)}
       </div>
     </div>
   )
 }
 
+/**
+ * Money received: the paid-ahead money not used yet. It counted on the day it
+ * arrived ("Paid ahead for later bills"), so it is shown apart from the "not
+ * in it" box, with words that say so (§0.0, Todd).
+ */
+function PaidAheadOnHand({ item }: { item: BesideItem | null }) {
+  if (!item) return null
+  return (
+    <div className="rb-counted">
+      <div className="rb-beside-row"><span>{item.label}</span><span className="rb-line-amount">{fmt(item.amount)}</span></div>
+      <div className="rb-counted-note">{PAID_AHEAD_COUNTED_NOTE}</div>
+    </div>
+  )
+}
+
+/** Figures shown BESIDE a total, never inside it (still clearing, credits you gave, ...). */
+function BesideFigures({ items }: { items: Array<{ key: string; label: string; amount: number }> | null | undefined }) {
+  if (!items?.length) return null
+  return (
+    <div className="rb-beside">
+      <div className="rb-beside-title">Beside the total, not in it</div>
+      {items.map(i => (
+        <div key={i.key} className="rb-beside-row"><span>{i.label}</span><span className="rb-line-amount">{fmt(i.amount)}</span></div>
+      ))}
+    </div>
+  )
+}
+
 // ── P&L statement block (income green, expenses RED, net gold) ─
 function PnLHeading({ children }: { children: string }) {
-  return <div style={{ fontSize: '.66rem', textTransform: 'uppercase', letterSpacing: '.08em', color: 'var(--text-3)', fontWeight: 600, padding: '12px 4px 2px' }}>{children}</div>
+  return <div className="rb-heading">{children}</div>
 }
 
 type PnLKind = 'income' | 'expense' | 'total-in' | 'total-out' | 'net'
 function PnLLine({ label, value, kind }: { label: string; value: number; kind: PnLKind }) {
   const isExpense = kind === 'expense' || kind === 'total-out'
-  const isTotal   = kind === 'total-in' || kind === 'total-out' || kind === 'net'
-  const color = kind === 'net' ? (value >= 0 ? 'var(--gold)' : 'var(--red)')
-    : (kind === 'income' || kind === 'total-in') ? 'var(--green)'
-    : 'var(--red)'
+  const cls = kind === 'net' ? 'net' : (kind === 'total-in' || kind === 'total-out') ? 'total' : ''
+  // An income line that takes money off (credits given, returned) shows as a
+  // red negative; an expense shows as a red deduction.
+  const tone = kind === 'net' ? (value >= 0 ? 'rb-amt-net' : 'rb-amt-neg')
+    : isExpense ? 'rb-amt-out'
+    : value < 0 ? 'rb-amt-neg' : 'rb-amt-in'
   return (
-    <div style={{
-      display: 'flex', justifyContent: 'space-between', alignItems: 'baseline',
-      padding: kind === 'net' ? '8px 6px 2px' : '5px 6px',
-      fontSize: kind === 'net' ? '.96rem' : '.82rem',
-      borderTop: kind === 'net' ? '2px solid var(--border-1)' : isTotal ? '1px solid var(--border-0)' : undefined,
-      marginTop: kind === 'net' ? 6 : 0,
-    }}>
-      <span style={{ color: isTotal ? 'var(--text-0)' : 'var(--text-2)', fontWeight: isTotal ? 700 : 400 }}>{label}</span>
-      <span className="mono" style={{ color, fontWeight: isTotal ? 700 : 600 }}>
-        {isExpense ? '−' : ''}{fmt(Math.abs(value))}
+    <div className={`rb-line ${cls}`}>
+      <span className="rb-line-label">{label}</span>
+      <span className={`rb-line-amount ${tone}`}>
+        {isExpense ? (value ? `−${fmt(Math.abs(value))}` : fmt(0)) : fmt(value)}
       </span>
     </div>
   )
 }
 
-function PnLStatement({ s, periodLabel }: { s: any; periodLabel: string }) {
+/**
+ * The owner statement's P&L. Every income line (rent, fees, utilities, paid
+ * ahead, register sales, credits given, returned, ...) is listed, so the lines
+ * add up to the total income; every expense (platform fee, maintenance, lot
+ * rent, your expenses) is listed, so they add up to the total expenses.
+ */
+function PnLStatement({ s, lines, beside, periodLabel, basis }: {
+  s: any; lines: Array<{ line: string; label: string; amount: number }>
+  beside: BesideItem[]; periodLabel: string; basis: IncomeBasis
+}) {
+  const outcome = billedOutcome(beside, basis)
+  const expenses = expenseLines(s ? {
+    platformFee: Number(s.totalPlatformFees || 0), maintenance: Number(s.totalMaintCost || 0),
+    lotRent: Number(s.lotRent || 0), enteredExpenses: Number(s.enteredExpenses || 0),
+  } : null)
+  if (s && Number(s.pmFee)) expenses.push({ key: 'pmFee', label: 'Management fee', amount: Number(s.pmFee) })
   return (
     <div className="card">
       <div className="card-header"><span className="card-title">Profit &amp; Loss — {periodLabel}</span></div>
       <div style={{ padding: '2px 8px 14px' }}>
-        <PnLHeading>Income</PnLHeading>
-        <PnLLine label="Rent collected" value={Number(s?.rentCollected || 0)} kind="income" />
-        {Number(s?.otherIncome) > 0 && <PnLLine label="Other income (fees, utilities, late fees)" value={Number(s.otherIncome)} kind="income" />}
+        <PnLHeading>{`Income (${basisLabel(basis)})`}</PnLHeading>
+        {lines.map(l => <PnLLine key={l.line} label={l.label} value={l.amount} kind="income" />)}
         <PnLLine label="Total income" value={Number(s?.totalIncome || 0)} kind="total-in" />
+        <PaidAheadOnHand item={paidAheadOnHand(beside, basis)} />
+        {/* Money billed: what became of the bills — collected so far, still
+            clearing, still owed — adds up to the total income above. */}
+        {outcome.length > 0 && (
+          <div className="rb-beside">
+            <div className="rb-beside-title">What became of the bills</div>
+            {outcome.map(i => (
+              <div key={i.key} className="rb-beside-row"><span>{i.label}</span><span className="rb-line-amount">{fmt(i.amount)}</span></div>
+            ))}
+          </div>
+        )}
 
         <PnLHeading>Expenses</PnLHeading>
-        <PnLLine label="GAM platform fee" value={Number(s?.totalPlatformFees || 0)} kind="expense" />
-        <PnLLine label="Maintenance" value={Number(s?.totalMaintCost || 0)} kind="expense" />
+        {expenses.map(l => <PnLLine key={l.key} label={l.label} value={l.amount} kind="expense" />)}
         <PnLLine label="Total expenses" value={Number(s?.totalExpenses || 0)} kind="total-out" />
 
         <PnLLine label="Net to Owner" value={Number(s?.netToOwner || 0)} kind="net" />
-        {Number(s?.depositsCollected) > 0 && (
-          <div style={{ fontSize: '.68rem', color: 'var(--text-3)', padding: '8px 6px 0' }}>
-            Deposits collected (held in custody, not income): {fmt(s.depositsCollected)}
-          </div>
-        )}
+        <BesideFigures items={besideNotInTotal(beside, basis, { outcomeShown: outcome.length > 0 })} />
       </div>
     </div>
   )
@@ -1057,8 +1397,10 @@ interface EngineRow {
   period: string | null
   propertyName: string | null
   unitNumber: string | null
-  income:   { rent: number; fees: number; utilities: number; homeSale: number; other: number; total: number }
-  expenses: { maintenance: number; entered: number; platformFee: number; total: number; byCategory: Record<string, number> }
+  /** S655: `lines` has every income line on its own (they add up to total). */
+  income:   { rent: number; fees: number; utilities: number; homeSale: number; other: number; total: number; lines?: Record<string, number> }
+  /** S655: lotRent — what an investor-operator owes the park, by billing month (the P&L's own). */
+  expenses: { maintenance: number; entered: number; platformFee: number; lotRent?: number; total: number; byCategory: Record<string, number> }
   net: number
   occupiedUnits: number
   derived: { netPerUnit: number | null; costPerUnit: number | null; incomePerUnit: number | null; costPerDay: number; netPerDay: number }
@@ -1066,7 +1408,11 @@ interface EngineRow {
 interface EngineResult {
   rows: EngineRow[]
   totals: EngineRow
-  meta: { start: string; end: string; level: RLevel; bucket: RBucket; platformFeeIncluded: boolean; report?: string; note?: string }
+  meta: {
+    start: string; end: string; level: RLevel; bucket: RBucket; platformFeeIncluded: boolean; lotRentIncluded?: boolean; report?: string; note?: string
+    /** S655: the switch the figures were counted under. */
+    basis?: { basis: IncomeBasis; label: string; note: string }
+  }
 }
 
 const money = (n: number | null | undefined) =>
@@ -1075,14 +1421,12 @@ const money = (n: number | null | undefined) =>
 /** Default range: the last 12 complete months, matching the T-12 convention
  *  (a half-finished current month makes income look worse than it is). */
 function defaultRange(): { start: string; end: string } {
-  const now = new Date()
-  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 0))
-  const start = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() - 11, 1))
-  const iso = (d: Date) => d.toISOString().slice(0, 10)
-  return { start: iso(start), end: iso(end) }
+  // The viewer's calendar, not UTC's: on the last evening of a month in
+  // Arizona, UTC is already next month and would call this one complete.
+  return lastTwelveMonths()
 }
 
-function CustomReportTab() {
+function CustomReportTab({ basis }: { basis: IncomeBasis }) {
   const dflt = defaultRange()
   const [start, setStart]   = useState(dflt.start)
   const [end, setEnd]       = useState(dflt.end)
@@ -1092,49 +1436,73 @@ function CustomReportTab() {
   const [error, setError]   = useState<string | null>(null)
   const [result, setResult] = useState<EngineResult | null>(null)
   const [title, setTitle]   = useState('Custom report')
+  // S655: the last report run, so flipping the switch re-runs it in place
+  // under the new basis instead of leaving figures counted the other way —
+  // after a failed run too (the flip is a fresh try). Each run is numbered and
+  // only the newest may land: an older run under the other basis answering
+  // last would otherwise sit under a switch that says the opposite.
+  const lastRun = useRef<{ path: string; label: string } | null>(null)
+  const [runs] = useState(latestOnly)
 
-  const run = async (path: string, label: string) => {
+  const run = async (path: string, label: string, b: IncomeBasis = basis) => {
+    lastRun.current = { path, label }
+    const me = runs.start()
     setRunning(true); setError(null)
     try {
-      const res = await apiGet<EngineResult>(path)
-      const data = (res as any)?.data ?? res
-      setResult(data)
+      const answer = await apiGet<EngineResult>(withBasis(path, b))
+      if (!runs.isLatest(me)) return
+      setResult(answer)
       setTitle(label)
     } catch (e: any) {
-      setError(e?.response?.data?.error?.message || e?.response?.data?.error || e?.message || 'Could not run that report')
+      if (!runs.isLatest(me)) return
+      setError(reportErrorText(e, 'that report'))
       setResult(null)
-    } finally { setRunning(false) }
+    } finally {
+      if (runs.isLatest(me)) setRunning(false)
+    }
   }
+  useEffect(() => {
+    if (lastRun.current) run(lastRun.current.path, lastRun.current.label, basis)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [basis])
 
   const runCustom = () => {
     if (start > end) { setError('Start date must be on or before the end date.'); return }
     run(`/reports/query?start=${start}&end=${end}&level=${level}&bucket=${bucket}`, 'Custom report')
   }
   const runT12 = () => run('/reports/t12', 'Trailing 12 months (T-12)')
+  // S655: a result on screen that was counted under the other basis (the
+  // switch flipped and its re-run is still out), or any run in flight, is
+  // dimmed with a plain line saying what is coming — never left at full
+  // strength under a switch that says the opposite.
+  const stale = !!result && resultIsStale(result.meta.basis?.basis, basis, running)
+  // S655: lot rent is a P&L expense; its column shows whenever there is any.
+  const hasLotRent = !!result && (Number(result.totals.expenses.lotRent ?? 0) !== 0
+    || result.rows.some(r => Number(r.expenses.lotRent ?? 0) !== 0))
 
   const exportCsv = () => {
     if (!result) return
     const header = [
       'Period', 'Property', 'Unit',
       'Rent', 'Fees', 'Utilities', 'Home sale', 'Other income', 'Total income',
-      'Maintenance', 'Expenses', 'Platform fee', 'Total expenses',
+      'Maintenance', 'Expenses', 'Platform fee', 'Lot rent', 'Total expenses',
       'Net', 'Occupied units', 'Net / unit', 'Cost / unit',
     ]
     const body = result.rows.map(r => [
       r.period ?? 'Total', r.propertyName ?? '', r.unitNumber ?? '',
       r.income.rent, r.income.fees, r.income.utilities, r.income.homeSale, r.income.other, r.income.total,
-      r.expenses.maintenance, r.expenses.entered, r.expenses.platformFee, r.expenses.total,
+      r.expenses.maintenance, r.expenses.entered, r.expenses.platformFee, r.expenses.lotRent ?? 0, r.expenses.total,
       r.net, r.occupiedUnits, r.derived.netPerUnit ?? '', r.derived.costPerUnit ?? '',
     ])
     const t = result.totals
     body.push([
       'TOTAL', '', '',
       t.income.rent, t.income.fees, t.income.utilities, t.income.homeSale, t.income.other, t.income.total,
-      t.expenses.maintenance, t.expenses.entered, t.expenses.platformFee, t.expenses.total,
+      t.expenses.maintenance, t.expenses.entered, t.expenses.platformFee, t.expenses.lotRent ?? 0, t.expenses.total,
       t.net, t.occupiedUnits, t.derived.netPerUnit ?? '', t.derived.costPerUnit ?? '',
     ])
     const name = (result.meta.report === 'T-12' ? 't12' : 'report')
-      + `_${result.meta.start}_to_${result.meta.end}.csv`
+      + `_${result.meta.basis?.basis ?? basis}_${result.meta.start}_to_${result.meta.end}.csv`
     downloadCsv(name, header, body)
   }
 
@@ -1183,7 +1551,7 @@ function CustomReportTab() {
             Cost per unit
           </button>
           {result && (
-            <button className="btn btn-primary" onClick={exportCsv}>Export CSV</button>
+            <button className="btn btn-primary" onClick={exportCsv} disabled={stale}>Export CSV</button>
           )}
         </div>
         <div style={{ marginTop: 10, fontSize: '.75rem', color: 'var(--text-2)' }}>
@@ -1192,10 +1560,19 @@ function CustomReportTab() {
         </div>
       </div>
 
-      {error && <div className="alert a-warn" style={{ marginBottom: 14 }}>{error}</div>}
+      {error && <div className="alert alert-warn" style={{ marginBottom: 14 }}>{error}</div>}
 
+      {stale && (
+        <div className="no-print" role="status" style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 10 }}>
+          {result?.meta.basis && result.meta.basis.basis !== basis
+            ? `Recounting under ${basisLabel(basis)}… The figures below are still ${result.meta.basis.label} until it finishes.`
+            : 'Running the report… The figures below are the last run until it finishes.'}
+        </div>
+      )}
+
+      <div style={{ opacity: stale ? 0.45 : 1, transition: 'opacity .15s' }} aria-busy={stale || undefined}>
       {result && result.meta.report === 'T-12' && (
-        <T12Statement result={result} propertyName={null} />
+        <T12Statement result={result} propertyName={null} stale={stale} />
       )}
 
       {result && result.meta.report !== 'T-12' && (
@@ -1206,13 +1583,15 @@ function CustomReportTab() {
               {result.meta.start} → {result.meta.end}
             </div>
           </div>
-          {result.meta.note && (
-            <div style={{ fontSize: '.75rem', color: 'var(--text-2)', marginTop: 6 }}>{result.meta.note}</div>
+          {(result.meta.note || result.meta.basis) && (
+            <div style={{ fontSize: '.75rem', color: 'var(--text-2)', marginTop: 6 }}>
+              {result.meta.note || `${result.meta.basis!.label}: ${result.meta.basis!.note}`}
+            </div>
           )}
           {!result.meta.platformFeeIncluded && (
-            <div className="alert a-warn" style={{ marginTop: 10, fontSize: '.75rem' }}>
-              The GAM platform fee is billed monthly, so it can't be split across individual days.
-              It is not included in this day-by-day view — switch to month-by-month to see it.
+            <div className="alert alert-warn" style={{ marginTop: 10, fontSize: '.75rem' }}>
+              The GAM platform fee and lot rent are billed by the month, so they can't be split across
+              individual days. They are not included in this day-by-day view — switch to month-by-month to see them.
             </div>
           )}
 
@@ -1228,10 +1607,11 @@ function CustomReportTab() {
                     {result.meta.bucket !== 'total' && <th>Period</th>}
                     {result.meta.level !== 'portfolio' && <th>Property</th>}
                     {result.meta.level === 'unit' && <th>Unit</th>}
-                    <th style={{ textAlign: 'right' }}>Income</th>
+                    <th style={{ textAlign: 'right' }}>{result.meta.basis?.label ?? basisLabel(basis)}</th>
                     <th style={{ textAlign: 'right' }}>Repairs</th>
                     <th style={{ textAlign: 'right' }}>Expenses</th>
                     <th style={{ textAlign: 'right' }}>Platform fee</th>
+                    {hasLotRent && <th style={{ textAlign: 'right' }}>Lot rent</th>}
                     <th style={{ textAlign: 'right' }}>Net</th>
                     <th style={{ textAlign: 'right' }}>Net / unit</th>
                   </tr>
@@ -1246,7 +1626,8 @@ function CustomReportTab() {
                       <td style={{ textAlign: 'right' }}>{money(r.expenses.maintenance)}</td>
                       <td style={{ textAlign: 'right' }}>{money(r.expenses.entered)}</td>
                       <td style={{ textAlign: 'right' }}>{money(r.expenses.platformFee)}</td>
-                      <td style={{ textAlign: 'right', color: r.net < 0 ? 'var(--danger)' : undefined }}>{money(r.net)}</td>
+                      {hasLotRent && <td style={{ textAlign: 'right' }}>{money(r.expenses.lotRent ?? 0)}</td>}
+                      <td style={{ textAlign: 'right', color: r.net < 0 ? 'var(--red)' : undefined }}>{money(r.net)}</td>
                       <td style={{ textAlign: 'right' }}>{money(r.derived.netPerUnit)}</td>
                     </tr>
                   ))}
@@ -1260,6 +1641,7 @@ function CustomReportTab() {
                     <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.maintenance)}</td>
                     <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.entered)}</td>
                     <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.platformFee)}</td>
+                    {hasLotRent && <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.lotRent ?? 0)}</td>}
                     <td style={{ textAlign: 'right' }}>{money(result.totals.net)}</td>
                     <td style={{ textAlign: 'right' }}>{money(result.totals.derived.netPerUnit)}</td>
                   </tr>
@@ -1269,6 +1651,7 @@ function CustomReportTab() {
           )}
         </div>
       )}
+      </div>
     </div>
   )
 }
@@ -1278,7 +1661,7 @@ function CustomReportTab() {
 // shape an agent, buyer, appraiser, or lender expects. The engine returns one
 // row per (month × property), so this transposes it and lets the existing print
 // styling (PrintStyles strips the app chrome) produce a clean PDF via print.
-function T12Statement({ result, propertyName }: { result: EngineResult; propertyName: string | null }) {
+function T12Statement({ result, propertyName, stale }: { result: EngineResult; propertyName: string | null; stale?: boolean }) {
   const months = [...new Set(result.rows.map(r => r.period).filter(Boolean))].sort() as string[]
 
   // Sum a measure for one month across whatever properties are in scope.
@@ -1290,19 +1673,38 @@ function T12Statement({ result, propertyName }: { result: EngineResult; property
     result.rows.flatMap(r => Object.keys(r.expenses.byCategory)),
   )].sort()
 
+  // S655: every income line on its own (home payments, balances collected,
+  // money paid ahead, register sales and stays, other income, and what comes
+  // off: returned, credits given, ...), so the lines add up to the total.
+  const FIRST = new Set(['rent', 'fees', 'lateFees', 'utilities'])
+  const otherLines = INCOME_LINES_ORDER.filter(k => !FIRST.has(k)
+    && result.rows.some(r => Number(r.income.lines?.[k] ?? 0) !== 0))
+  const hasLines = result.rows.some(r => r.income.lines)
   const lines: { label: string; get: (m: string) => number; strong?: boolean; indent?: boolean }[] = [
     { label: 'Rent',                 get: m => at(m, r => r.income.rent), indent: true },
-    { label: 'Fees',                 get: m => at(m, r => r.income.fees), indent: true },
+    { label: 'Fees and late fees',   get: m => at(m, r => r.income.fees), indent: true },
     { label: 'Utilities reimbursed', get: m => at(m, r => r.income.utilities), indent: true },
-    { label: 'Other income',         get: m => at(m, r => r.income.homeSale + r.income.other), indent: true },
+    ...(hasLines
+      ? otherLines.map(k => ({
+          label: incomeLineLabel(k),
+          get: (m: string) => at(m, r => Number(r.income.lines?.[k] ?? 0)),
+          indent: true,
+        }))
+      : [{ label: 'Other income', get: (m: string) => at(m, r => r.income.homeSale + r.income.other), indent: true }]),
     { label: 'Total income',         get: m => at(m, r => r.income.total), strong: true },
     { label: 'Repairs & maintenance', get: m => at(m, r => r.expenses.maintenance), indent: true },
     ...categories.map(c => ({
-      label: EXPENSE_CATEGORY_LABEL[c as keyof typeof EXPENSE_CATEGORY_LABEL] ?? c,
+      // The API camelizes this breakdown's keys ('property_tax' arrives as
+      // 'propertyTax'); the label lookup takes either, never a raw key.
+      label: expenseCategoryLabel(c),
       get: (m: string) => at(m, r => r.expenses.byCategory[c] ?? 0),
       indent: true,
     })),
     { label: 'Platform fee',   get: m => at(m, r => r.expenses.platformFee), indent: true },
+    // S655: lot rent, as the P&L subtracts it — printed only when there is any.
+    ...(result.rows.some(r => Number(r.expenses.lotRent ?? 0) !== 0)
+      ? [{ label: 'Lot rent', get: (m: string) => at(m, r => Number(r.expenses.lotRent ?? 0)), indent: true }]
+      : []),
     { label: 'Total expenses', get: m => at(m, r => r.expenses.total), strong: true },
     { label: 'Net operating income', get: m => at(m, r => r.net), strong: true },
   ]
@@ -1352,7 +1754,8 @@ function T12Statement({ result, propertyName }: { result: EngineResult; property
             </div>
           </div>
         </div>
-        <ToolbarBtn onClick={() => window.print()} icon={<Printer size={14} />} label="Print / Save PDF" />
+        {/* Not while a re-run under the other basis is out: the PDF would carry the old figures. */}
+        <ToolbarBtn onClick={() => window.print()} icon={<Printer size={14} />} label="Print / Save PDF" disabled={stale} />
       </div>
 
       <div style={{ overflowX: 'auto', marginTop: 14, position: 'relative' }}>
@@ -1388,8 +1791,10 @@ function T12Statement({ result, propertyName }: { result: EngineResult; property
       {/* Basis of preparation — a T-12 handed to a buyer or lender has to say
           what is in it and what is not, or the reader assumes the worst. */}
       <div style={{ marginTop: 14, fontSize: '.72rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
-        <strong>Basis of preparation.</strong> Twelve complete months; the current partial month is
-        excluded. Income is counted on the date payment settled. Security deposits are excluded —
+        <strong>Basis of preparation.</strong>{' '}
+        {result.meta.note
+          || `Twelve complete months; the current partial month is excluded.${result.meta.basis ? ` ${result.meta.basis.label}: ${result.meta.basis.note}` : ''}`}
+        {' '}Security deposits are excluded —
         they are tenant funds held, not income. Repairs are included only where an actual cost was
         recorded; estimates are excluded. Costs not tied to a specific unit are shown at the
         property. Prepared from the operator's own records and unaudited.

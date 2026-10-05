@@ -486,10 +486,19 @@ async function terminateInTx(
       RETURNING unit_id`,
     [leaseId],
   )
+  // Final sweep (10/3): an add-a-roommate spot nobody signed ('pending_add')
+  // never joined this lease, so it is void (as voiding its addendum leaves it,
+  // lib/leaseDocCascade.ts), not 'removed' / lease_ended like the people who
+  // were on it.
+  await client.query(
+    `UPDATE lease_tenants SET status = 'void', updated_at = NOW()
+      WHERE lease_id = $1 AND status = 'pending_add'`,
+    [leaseId],
+  )
   await client.query(
     `UPDATE lease_tenants
         SET status = 'removed', removed_at = NOW(), removed_reason = 'lease_ended', updated_at = NOW()
-      WHERE lease_id = $1 AND status IN ('active','pending_add','pending_remove')`,
+      WHERE lease_id = $1 AND status IN ('active','pending_remove')`,
     [leaseId],
   )
   if (lease.rows[0]) {
