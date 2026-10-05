@@ -15,6 +15,7 @@ import { logger } from '../lib/logger'
 import { todayIn, monthStartOf } from '../lib/timezone'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
+import { replyToProperty } from '../services/replyRouting'
 
 export const leasesRouter = Router()
 leasesRouter.use(requireAuth)
@@ -1516,7 +1517,7 @@ leasesRouter.get('/:id/deposit-return', async (req, res, next) => {
 leasesRouter.post('/:id/request-background-check', requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
     const lease = await queryOne<any>(`
-      SELECT l.id, l.landlord_id, l.lease_source, b.guest_email, b.guest_name, p.name AS property_name
+      SELECT l.id, l.landlord_id, l.lease_source, b.guest_email, b.guest_name, u.property_id, p.name AS property_name
         FROM leases l
         JOIN unit_bookings b ON b.id = l.source_booking_id
         JOIN units u ON u.id = l.unit_id
@@ -1528,7 +1529,8 @@ leasesRouter.post('/:id/request-background-check', requirePerm('tenants.run_back
     const { emailBackgroundCheckScreeningRequest } = await import('../services/email')
     await emailBackgroundCheckScreeningRequest(
       lease.guest_email, lease.guest_name, lease.property_name,
-      undefined, { landlordId: lease.landlord_id })
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      undefined, { landlordId: lease.landlord_id, replyTo: replyToProperty(lease.property_id) })
     logger.info({ leaseId: lease.id }, '[leases] screening request emailed to long-stay guest')
     res.json({ success: true, data: { sentTo: lease.guest_email } })
   } catch (e) { next(e) }
@@ -1581,6 +1583,8 @@ leasesRouter.post('/:id/non-renewal', requirePerm('leases.edit'), async (req, re
         sendEmail: true,
         emailTo: r.email,
         emailSubject: `Lease Non-Renewal Notice — Unit ${lease.unit_number}`,
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        replyTo: replyToProperty(lease.property_id),
       })
     }
 
@@ -1721,7 +1725,7 @@ leasesRouter.delete('/:id/seasonal', requirePerm('leases.edit'), async (req, res
 leasesRouter.post('/:id/offer-renewal', requirePerm('leases.edit'), async (req, res, next) => {
   try {
     const lease = await queryOne<any>(`
-      SELECT l.id, l.landlord_id, l.status, l.end_date, u.unit_number, p.name AS property_name
+      SELECT l.id, l.landlord_id, l.status, l.end_date, u.unit_number, u.property_id, p.name AS property_name
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -1754,6 +1758,8 @@ leasesRouter.post('/:id/offer-renewal', requirePerm('leases.edit'), async (req, 
         sendEmail: true,
         emailTo: r.email,
         emailSubject: `Your landlord is offering to renew — Unit ${lease.unit_number}`,
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        replyTo: replyToProperty(lease.property_id),
       })
     }
     res.json({ success: true, data: { leaseId: lease.id, offeredAt: new Date().toISOString(), notified: (roster as any[]).length } })

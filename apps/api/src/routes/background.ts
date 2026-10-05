@@ -26,6 +26,7 @@ import Stripe from 'stripe'
 import { logger } from '../lib/logger'
 import { stripeSecretKeyOrNull } from '../lib/stripe'
 import { emailScreeningApplyLink } from '../services/email'
+import { propertyIdForUnit } from '../services/replyRouting'
 import { archiveProviderPayload } from '../services/backgroundReportArchive'
 // S640: shared with the status poller — see services/applicationPool.ts.
 import { isPoolEligible, upsertPoolEntry } from '../services/applicationPool'
@@ -1148,8 +1149,10 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
     const tu = await queryOne<any>('SELECT email, first_name, last_name FROM users WHERE id=$1', [check.user_id])
     if (tu?.email) {
       const u = check.unit_id
-        ? await queryOne<any>('SELECT u.unit_number, p.name FROM units u JOIN properties p ON p.id=u.property_id WHERE u.id=$1', [check.unit_id])
+        ? await queryOne<any>('SELECT u.unit_number, p.name, p.id AS property_id FROM units u JOIN properties p ON p.id=u.property_id WHERE u.id=$1', [check.unit_id])
         : null
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      const replyPropertyId: string | null = u?.property_id ?? check.property_id ?? null
       try {
         await emailBackgroundDecision(
           tu.email, tu.first_name || 'there',
@@ -1160,7 +1163,10 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
           // (POST /:id/adverse-action), never in a GAM-authored message.
           decision === 'denied' ? undefined : (notes || undefined),
           undefined,
-          { landlordId: check.landlord_id, backgroundCheckId: check.id }
+          {
+            landlordId: check.landlord_id, backgroundCheckId: check.id,
+            replyTo: replyPropertyId ? { kind: 'property', propertyId: replyPropertyId } : undefined,
+          }
         )
       } catch (e) { logger.error({ err: e }, '[EMAIL]') }
     }
@@ -1232,12 +1238,17 @@ backgroundRouter.post('/:id/adverse-action', requireAuth, requirePerm('tenants.r
 
     const cra = check.provider_name ? getProvider(check.provider_name).craDisclosure() : null
     const body = text.trim()
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    const replyPropertyId: string | null = check.property_id ?? await propertyIdForUnit(check.unit_id).catch(() => null)
 
     const messageId = await emailAdverseActionNotice({
       to: tu.email,
       applicantFirstName: tu.first_name || check.first_name || 'Applicant',
       noticeText: body,
-      ctx: { landlordId: check.landlord_id, backgroundCheckId: check.id },
+      ctx: {
+        landlordId: check.landlord_id, backgroundCheckId: check.id,
+        replyTo: replyPropertyId ? { kind: 'property', propertyId: replyPropertyId } : undefined,
+      },
     })
 
     try {
@@ -1799,7 +1810,11 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
           message || null,
           monthlyRent != null ? Number(monthlyRent) : null,
           undefined,
-          { landlordId, matchRequestId: match!.id }
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          {
+            landlordId, matchRequestId: match!.id,
+            replyTo: unit?.property_id ? { kind: 'property', propertyId: unit.property_id } : undefined,
+          }
         )
       }
     } catch (e) { logger.error({ err: e }, '[EMAIL]') }

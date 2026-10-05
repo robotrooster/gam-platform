@@ -416,7 +416,8 @@ businessCustomersRouter.post('/:id/portal-link', requireAuth, async (req, res, n
         to: customer.email,
         businessName: biz?.name ?? 'your service provider',
         portalUrl: link.url,
-        ctx: { businessId, customerId: customer.id },
+        // 10/5: replies reach the business, not GAM (services/replyRouting).
+        ctx: { businessId, customerId: customer.id, replyTo: { kind: 'business', businessId } },
       })
       emailed = true
     }

@@ -331,7 +331,7 @@ export async function emailNewBackgroundCheck(landlordEmail: string, landlordNam
 // S547: the guest's stay link — their key to the tokened stay page on the
 // property's site (amenity booking, stay details). Sent at booking and via
 // the "resend my stay link" box.
-export async function emailGuestStayLink(guestEmail: string, guestName: string | null, propertyName: string, stayUrl: string, ctx?: { landlordId?: string }) {
+export async function emailGuestStayLink(guestEmail: string, guestName: string | null, propertyName: string, stayUrl: string, ctx?: { landlordId?: string; replyTo?: ReplyTo }) {
   await send(guestEmail, `Your stay at ${propertyName}`,
     base(h('Your stay link') +
       p(`Hi ${guestName || 'there'},`) +
@@ -340,7 +340,7 @@ export async function emailGuestStayLink(guestEmail: string, guestName: string |
       btn('Open my stay', stayUrl) +
       `<p style="color:#888;font-size:12px">${stayUrl}</p>`
     ),
-    { category: 'guest_stay_link', landlordId: ctx?.landlordId ?? null }
+    { category: 'guest_stay_link', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo }
   )
 }
 
@@ -353,7 +353,7 @@ export async function emailGuestStayLink(guestEmail: string, guestName: string |
  */
 export async function emailBookingSiteChanged(
   guestEmail: string, guestName: string | null, propertyName: string,
-  fromSite: string, toSite: string, ctx?: { landlordId?: string },
+  fromSite: string, toSite: string, ctx?: { landlordId?: string; replyTo?: ReplyTo },
 ) {
   await send(guestEmail, `Your site at ${propertyName} is now ${toSite}`,
     base(h('Your site has changed') +
@@ -364,14 +364,14 @@ export async function emailBookingSiteChanged(
       p('Your dates have not changed and nothing else about your reservation is different.') +
       p('If that site does not suit you, just reply to this email or give us a ring and we will sort it out.')
     ),
-    { category: 'booking_site_changed', landlordId: ctx?.landlordId ?? null }
+    { category: 'booking_site_changed', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo }
   )
 }
 
 // S547 (Nic): landlord-INITIATED screening request for a long-stay guest.
 // Sent only when the landlord explicitly chooses to screen — the system
 // never auto-sends a background check to a prospect.
-export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = 'http://localhost:3002/background', ctx?: { landlordId?: string }) {
+export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = 'http://localhost:3002/background', ctx?: { landlordId?: string; replyTo?: ReplyTo }) {
   await send(guestEmail, `${propertyName} — screening needed for your extended stay`,
     base(h('One more step for your extended stay') +
       p(`Hi ${guestName || 'there'},`) +
@@ -379,11 +379,11 @@ export async function emailBackgroundCheckScreeningRequest(guestEmail: string, g
       p('Sign in to your GAM account (or create one with this email address) and complete the screening from your portal — it takes a few minutes.') +
       btn('Complete screening', portalUrl)
     ),
-    { category: 'background_screening_request', landlordId: ctx?.landlordId ?? null }
+    { category: 'background_screening_request', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo }
   )
 }
 
-export async function emailBackgroundDecision(tenantEmail: string, tenantName: string, decision: 'approved' | 'denied', propertyName: string, unitNumber: string, notes?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; backgroundCheckId?: string }) {
+export async function emailBackgroundDecision(tenantEmail: string, tenantName: string, decision: 'approved' | 'denied', propertyName: string, unitNumber: string, notes?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; backgroundCheckId?: string; replyTo?: ReplyTo }) {
   const approved = decision === 'approved'
   await send(tenantEmail,
     approved ? 'Your application has been approved! 🎉' : 'Update on your rental application',
@@ -403,13 +403,14 @@ export async function emailBackgroundDecision(tenantEmail: string, tenantName: s
       relatedEntityType: ctx?.backgroundCheckId ? 'background_check' : null,
       relatedEntityId: ctx?.backgroundCheckId ?? null,
       metadata: { decision },
+      replyTo: ctx?.replyTo,
     }
   )
 }
 
 // ── POOL EMAILS ───────────────────────────────────────────────
 
-export async function emailPoolMatchInterest(tenantEmail: string, tenantName: string, landlordName: string, propertyName: string, unitNumber: string, message: string|null, monthlyRent: number | null = null, portalUrl = 'http://localhost:3002/notifications', ctx?: { landlordId?: string; matchRequestId?: string }) {
+export async function emailPoolMatchInterest(tenantEmail: string, tenantName: string, landlordName: string, propertyName: string, unitNumber: string, message: string|null, monthlyRent: number | null = null, portalUrl = 'http://localhost:3002/notifications', ctx?: { landlordId?: string; matchRequestId?: string; replyTo?: ReplyTo }) {
   await send(tenantEmail, `A landlord is interested in you — ${propertyName}`,
     base(
       h('You Have a Match!') +
@@ -424,6 +425,7 @@ export async function emailPoolMatchInterest(tenantEmail: string, tenantName: st
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.matchRequestId ? 'pool_match_request' : null,
       relatedEntityId: ctx?.matchRequestId ?? null,
+      replyTo: ctx?.replyTo,
     }
   )
 }
@@ -448,7 +450,7 @@ export async function emailPoolTenantInterested(landlordEmail: string, landlordN
 
 // ── E-SIGN EMAILS ─────────────────────────────────────────────
 
-export async function emailSigningRequest(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string; needsSetup?: boolean }) {
+export async function emailSigningRequest(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string; needsSetup?: boolean; replyTo?: ReplyTo }) {
   // S647: a resident who has never set up their account gets ONE email that
   // does both — set a password, then land on the lease (services/
   // tenantLeaseLink). Saying so plainly is the point: "accept" and "sign" used
@@ -476,6 +478,7 @@ export async function emailSigningRequest(to: string, signerName: string, docume
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
+      replyTo: ctx?.replyTo,
     },
     // ── S637: SIGNING MAIL COMES FROM A REPLYABLE ADDRESS ──────────────────
     //
@@ -498,7 +501,7 @@ export async function emailSigningRequest(to: string, signerName: string, docume
   )
 }
 
-export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; documentId?: string }, pdfBytes?: Buffer) {
+export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo }, pdfBytes?: Buffer) {
   // S637: no leading emoji in a transactional subject — it is a spam signal
   // and this one goes out at the moment a lease becomes legally binding.
   await send(to, `Document fully signed: ${documentTitle}`,
@@ -531,6 +534,7 @@ export async function emailSigningCompleted(to: string, signerName: string, docu
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
+      replyTo: ctx?.replyTo,
     },
     'noreply',
     pdfBytes ? [{ filename: 'signed-lease.pdf', content: pdfBytes }] : undefined,
@@ -539,7 +543,7 @@ export async function emailSigningCompleted(to: string, signerName: string, docu
 
 // ── ESIGN REMINDER + AUTO-VOID EMAILS (S29) ───────────────
 
-export async function emailSigningReminder(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string; needsSetup?: boolean; documentCount?: number }) {
+export async function emailSigningReminder(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string; needsSetup?: boolean; documentCount?: number; replyTo?: ReplyTo }) {
   // S652: one reminder per packet. documentCount > 1 means this covers the
   // whole packet; the link opens the first document and walks through the rest.
   const n = ctx?.documentCount ?? 1
@@ -568,44 +572,13 @@ export async function emailSigningReminder(to: string, signerName: string, docum
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
+      replyTo: ctx?.replyTo,
     },
     'support',   // S637: same reasoning as the request above.
   )
 }
 
-// S234: tenant decline-with-reason. Fires to the landlord (and any
-// other landlord-side recipients passed in `to`) when a signer hits
-// the Decline button on the sign page. The doc is voided as a side
-// effect of decline; the landlord can optionally re-send a new doc.
-export async function emailDocumentDeclined(to: string, recipientName: string, signerName: string, signerRole: string, documentTitle: string, unitLabel: string, reason: string | null, ctx?: { landlordId?: string; documentId?: string }) {
-  const reasonBlock = reason && reason.trim()
-    ? `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #dc4c4c">
-         <div style="font-size:.72rem;font-weight:700;color:#dc4c4c;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Reason given</div>
-         <div style="color:#eef1f8;line-height:1.45">${escapeHtml(reason.trim())}</div>
-       </div>`
-    : p('<em style="color:#b8c4d8">No reason provided.</em>')
-  await send(to, `Document declined: ${documentTitle}`,
-    base(
-      h('A Signer Declined Your Document') +
-      p(`Hi ${recipientName},`) +
-      p(`<strong>${escapeHtml(signerName)}</strong> (${escapeHtml(signerRole)}) declined to sign the following document:`) +
-      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
-        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${escapeHtml(documentTitle)}</div>
-        <div style="font-size:.82rem;color:#b8c4d8">${escapeHtml(unitLabel)}</div>
-      </div>` +
-      reasonBlock +
-      p('The document has been voided. If the issue is resolvable, prepare a new document and re-send it for signing.')
-    ),
-    {
-      category: 'esign_document_declined',
-      landlordId: ctx?.landlordId ?? null,
-      relatedEntityType: ctx?.documentId ? 'document' : null,
-      relatedEntityId: ctx?.documentId ?? null,
-    }
-  )
-}
-
-export async function emailDocumentAutoVoided(to: string, recipientName: string, documentTitle: string, unitLabel: string, ctx?: { landlordId?: string; documentId?: string }) {
+export async function emailDocumentAutoVoided(to: string, recipientName: string, documentTitle: string, unitLabel: string, ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo }) {
   await send(to, `Document auto-voided: ${documentTitle}`,
     base(
       h('Document Has Been Auto-Voided') +
@@ -622,6 +595,7 @@ export async function emailDocumentAutoVoided(to: string, recipientName: string,
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
+      replyTo: ctx?.replyTo,
     }
   )
 }
@@ -669,7 +643,7 @@ function newLeaseBox(unitLabel: string, startDate: string, rent: number | string
  */
 export async function emailNewLeaseSigningRequest(to: string, signerName: string, unitLabel: string, landlordName: string, signingUrl: string, ctx: {
   startDate: string; rent: number | string; landlordId?: string; documentId?: string; needsSetup?: boolean
-  started?: boolean
+  started?: boolean; replyTo?: ReplyTo
 }) {
   const setup = !!ctx.needsSetup
   await send(to, `Your new lease is ready to sign — ${unitLabel}`,
@@ -695,6 +669,7 @@ export async function emailNewLeaseSigningRequest(to: string, signerName: string
       landlordId: ctx.landlordId ?? null,
       relatedEntityType: ctx.documentId ? 'document' : null,
       relatedEntityId: ctx.documentId ?? null,
+      replyTo: ctx.replyTo,
     },
     'support',
   )
@@ -706,7 +681,7 @@ export async function emailNewLeaseSigningRequest(to: string, signerName: string
  */
 export async function emailNewLeaseSigningReminder(to: string, signerName: string, unitLabel: string, landlordName: string, signingUrl: string, ctx: {
   startDate: string; rent: number | string
-  landlordId?: string; documentId?: string; needsSetup?: boolean
+  landlordId?: string; documentId?: string; needsSetup?: boolean; replyTo?: ReplyTo
 }) {
   const when = newLeaseDate(ctx.startDate)
   await send(to, `Reminder: your new lease starts ${when}`,
@@ -724,6 +699,7 @@ export async function emailNewLeaseSigningReminder(to: string, signerName: strin
       landlordId: ctx.landlordId ?? null,
       relatedEntityType: ctx.documentId ? 'document' : null,
       relatedEntityId: ctx.documentId ?? null,
+      replyTo: ctx.replyTo,
     },
     'support',
   )
@@ -890,7 +866,7 @@ export async function emailNewLeaseTenantUnsigned(to: string, recipientName: str
  * saying the earlier link is dead. That also happens to be the honest message,
  * since resending always invalidates the previous token.
  */
-export async function emailInvitation(to: string, inviterName: string, role: LandlordAssignableRole, acceptUrl: string, ctx?: { landlordId?: string; invitationId?: string; resend?: boolean }) {
+export async function emailInvitation(to: string, inviterName: string, role: LandlordAssignableRole, acceptUrl: string, ctx?: { landlordId?: string; invitationId?: string; resend?: boolean; replyTo?: ReplyTo }) {
   const roleLabel = LANDLORD_ASSIGNABLE_ROLE_LABEL[role]
   const isResend = ctx?.resend === true
 
@@ -916,6 +892,7 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
       relatedEntityType: ctx?.invitationId ? 'invitation' : null,
       relatedEntityId: ctx?.invitationId ?? null,
       metadata: { role, resend: isResend },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -926,7 +903,7 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
 // self-service portal by email; we mail them their portal link. The
 // token in the URL is the bearer credential — this is the magic-link
 // "login": no password to manage.
-export async function emailCustomerPortalLink(to: string, businessName: string, portalUrl: string) {
+export async function emailCustomerPortalLink(to: string, businessName: string, portalUrl: string, ctx?: { replyTo?: ReplyTo }) {
   await send(to, `Your ${businessName} customer portal link`,
     base(
       h('Your portal link') +
@@ -934,7 +911,7 @@ export async function emailCustomerPortalLink(to: string, businessName: string, 
       btn('Open my portal', portalUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you didn't request this, you can safely ignore this email.</div>`
     ),
-    { category: 'customer_portal' },
+    { category: 'customer_portal', replyTo: ctx?.replyTo },
     'support',
   )
 }
@@ -955,7 +932,7 @@ export async function emailLandlordCoOwnerInvitation(
   inviterName: string,
   entityName: string,
   acceptUrl: string,
-  ctx?: { landlordId?: string; invitationId?: string },
+  ctx?: { landlordId?: string; invitationId?: string; replyTo?: ReplyTo },
 ) {
   await send(to, `${inviterName} added you as an owner of ${entityName} on GAM`,
     base(
@@ -974,6 +951,7 @@ export async function emailLandlordCoOwnerInvitation(
       relatedEntityType: ctx?.invitationId ? 'landlord_member_invitation' : null,
       relatedEntityId: ctx?.invitationId ?? null,
       metadata: { entity_name: entityName },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1059,7 +1037,7 @@ export async function emailPmInvitation(
   companyName: string,
   role: 'owner' | 'manager' | 'staff',
   acceptUrl: string,
-  ctx?: { pmCompanyId?: string; invitationId?: string }
+  ctx?: { pmCompanyId?: string; invitationId?: string; replyTo?: ReplyTo }
 ) {
   const roleLabel = role === 'owner' ? 'Owner' : role === 'manager' ? 'Manager' : 'Staff'
   await send(to, `${inviterName} invited you to join ${companyName} on GAM`,
@@ -1080,6 +1058,7 @@ export async function emailPmInvitation(
       relatedEntityType: ctx?.invitationId ? 'pm_invitation' : null,
       relatedEntityId: ctx?.invitationId ?? null,
       metadata: { role, pm_company_id: ctx?.pmCompanyId, company_name: companyName },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1104,7 +1083,7 @@ export async function emailBusinessInvitation(
   businessName: string,
   staffRole: 'manager' | 'dispatcher' | 'driver' | 'office',
   acceptUrl: string,
-  ctx?: { businessId?: string; invitationId?: string }
+  ctx?: { businessId?: string; invitationId?: string; replyTo?: ReplyTo }
 ) {
   const roleLabel = BUSINESS_STAFF_ROLE_LABEL_MAP[staffRole] ?? staffRole
   await send(to, `${inviterName} invited you to join ${businessName} on GAM`,
@@ -1125,6 +1104,7 @@ export async function emailBusinessInvitation(
       relatedEntityType: ctx?.invitationId ? 'business_user_invitation' : null,
       relatedEntityId: ctx?.invitationId ?? null,
       metadata: { staff_role: staffRole, business_id: ctx?.businessId, business_name: businessName },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1146,7 +1126,7 @@ export async function emailPmPropertyInvitation(args: {
   propertyName: string
   proposedScope: 'manage' | 'view'
   acceptUrl: string
-  ctx?: { pmCompanyId?: string; invitationId?: string; landlordId?: string | null }
+  ctx?: { pmCompanyId?: string; invitationId?: string; landlordId?: string | null; replyTo?: ReplyTo }
 }) {
   const scopeLabel = args.proposedScope === 'manage' ? 'manage' : 'connect to'
   const subject = args.direction === 'owner_to_pm'
@@ -1182,42 +1162,9 @@ export async function emailPmPropertyInvitation(args: {
         pm_company_name: args.pmCompanyName,
         property_name: args.propertyName,
       },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
-  )
-}
-
-// ── S163: tenant nudges landlord to finish Connect onboarding ─────────────
-//
-// The tenant clicked the "Notify my landlord" CTA on the LandlordBankingBanner
-// after seeing online rent payment was unavailable. Soft, polite copy — the
-// tenant is the customer here too and we don't want them to feel awkward.
-export async function emailLandlordBankingNudge(args: {
-  to: string
-  landlordName: string
-  tenantName: string
-  propertyName: string
-  unitNumber: string
-  bankingUrl: string
-  ctx?: { landlordId?: string | null; tenantId?: string | null }
-}) {
-  await send(args.to,
-    `${args.tenantName} is waiting on your GAM banking setup`,
-    base(
-      h(`${args.tenantName} wants to pay rent through GAM`) +
-      p(`Hi ${args.landlordName},`) +
-      p(`<strong style="color:#eef1f8">${args.tenantName}</strong> at <strong style="color:#eef1f8">${args.propertyName}, Unit ${args.unitNumber}</strong> tried to pay rent online but couldn't — your Stripe Connect onboarding isn't finished yet, so GAM can't route their payment to your bank.`) +
-      p('Finish onboarding (a few minutes via the embedded Stripe form) and your tenant can start paying rent online immediately.') +
-      btn('Complete Banking Setup', args.bankingUrl) +
-      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">This is an automated nudge from your tenant. They'll only see the option to send it once every 24 hours.</div>`
-    ),
-    {
-      category: 'landlord_banking_nudge',
-      landlordId: args.ctx?.landlordId ?? null,
-      relatedEntityType: 'tenant_landlord_nudge',
-      relatedEntityId: args.ctx?.tenantId ?? null,
-      metadata: { property_name: args.propertyName, unit_number: args.unitNumber },
-    }
   )
 }
 
@@ -1275,7 +1222,7 @@ export async function emailTenantAchSetup(args: {
 // adverse_action_notices row for delivery audit.
 export async function emailAdverseActionNotice({
   to, applicantFirstName, noticeText, ctx,
-}: { to: string; applicantFirstName: string; noticeText: string; ctx?: { landlordId?: string; backgroundCheckId?: string } }): Promise<string | null> {
+}: { to: string; applicantFirstName: string; noticeText: string; ctx?: { landlordId?: string; backgroundCheckId?: string; replyTo?: ReplyTo } }): Promise<string | null> {
   const html = base(
     h('Notice of Adverse Action') +
     p(`Hi ${applicantFirstName},`) +
@@ -1291,6 +1238,7 @@ export async function emailAdverseActionNotice({
     landlordId: ctx?.landlordId ?? null,
     relatedEntityType: ctx?.backgroundCheckId ? 'background_check' : null,
     relatedEntityId: ctx?.backgroundCheckId ?? null,
+    replyTo: ctx?.replyTo,
   }, 'support')
 }
 
@@ -1324,7 +1272,7 @@ export async function sendSubleaseInvite({
   propertyName: string; unitNumber: string
   subMonthlyAmount: number
   startDate: string; endDate: string | null
-  ctx?: { masterLeaseId?: string; sublessorTenantId?: string }
+  ctx?: { masterLeaseId?: string; sublessorTenantId?: string; replyTo?: ReplyTo }
 }) {
   const appUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
   const acceptUrl = `${appUrl}/sublease-invite/${token}`
@@ -1357,6 +1305,7 @@ export async function sendSubleaseInvite({
         sublessor_tenant_id: ctx?.sublessorTenantId ?? null,
         sub_monthly_amount: subMonthlyAmount,
       },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1377,7 +1326,7 @@ export async function sendPosCustomerOnboarding({
   customerName:  string
   merchantName:  string
   token:         string
-  ctx?: { landlordId?: string; posCustomerId?: string }
+  ctx?: { landlordId?: string; posCustomerId?: string; replyTo?: ReplyTo }
 }) {
   const appUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
   const acceptUrl = `${appUrl}/pos-customer-onboard/${token}`
@@ -1405,6 +1354,7 @@ export async function sendPosCustomerOnboarding({
       relatedEntityType: ctx?.posCustomerId ? 'pos_customer' : null,
       relatedEntityId: ctx?.posCustomerId ?? null,
       metadata: {},
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1510,7 +1460,7 @@ export async function emailTenantOnboarded(
   propertyAddress: string,
   unitLabel: string,
   activationUrl: string,
-  ctx?: { landlordId?: string; tenantId?: string }
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo }
 ) {
   // S654: names, address and unit come from a landlord's CSV, so every one is
   // escaped before it goes into the HTML (and kept to one line in the subject).
@@ -1536,6 +1486,7 @@ export async function emailTenantOnboarded(
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,
       metadata: { unit_label: unitLabel },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1566,7 +1517,7 @@ export async function emailTenantInvite(
   unitLabel: string | null,
   activationUrl: string,
   screeningRequired: boolean,
-  ctx?: { landlordId?: string; tenantId?: string },
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo },
 ) {
   const place = unitLabel ? `${propertyName} — ${unitLabel}` : propertyName
   const next = screeningRequired
@@ -1591,6 +1542,7 @@ export async function emailTenantInvite(
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,
       metadata: { unit_label: unitLabel, screening_required: screeningRequired },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1614,7 +1566,7 @@ export async function emailUtilityServiceInvite(
   providerName: string,
   serviceAddress: string,
   activationUrl: string,
-  ctx?: { landlordId?: string; tenantId?: string }
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo }
 ) {
   await send(to, `Set up online billing for ${serviceAddress}`,
     base(
@@ -1636,6 +1588,7 @@ export async function emailUtilityServiceInvite(
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,
       metadata: { service_address: serviceAddress },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1650,7 +1603,7 @@ export async function emailTenantInviteReminder(
   unitLabel: string,
   activationUrl: string,
   daysLeft: number,
-  ctx?: { landlordId?: string; tenantId?: string }
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo }
 ) {
   const window = daysLeft <= 1 ? 'tomorrow' : `in ${daysLeft} days`
   await send(to, `Reminder: activate your GAM tenant account for ${unitLabel}`,
@@ -1668,6 +1621,7 @@ export async function emailTenantInviteReminder(
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,
       metadata: { unit_label: unitLabel, days_left: daysLeft },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1915,7 +1869,7 @@ export async function emailPayLink(args: {
   amount: number
   cardFee: number
   url: string
-  ctx?: { landlordId?: string; payLinkId?: string }
+  ctx?: { landlordId?: string; payLinkId?: string; replyTo?: ReplyTo }
 }) {
   const money = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
   await send(args.to,
@@ -1934,6 +1888,7 @@ export async function emailPayLink(args: {
       landlordId: args.ctx?.landlordId ?? null,
       relatedEntityType: 'pos_pay_link',
       relatedEntityId: args.ctx?.payLinkId ?? null,
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -1946,7 +1901,7 @@ export async function emailBusinessInvoiceSent(args: {
   totalAmount: number
   dueDate: string                // YYYY-MM-DD
   payUrl: string | null
-  ctx?: { businessId?: string; invoiceId?: string }
+  ctx?: { businessId?: string; invoiceId?: string; replyTo?: ReplyTo }
 }) {
   const formattedAmount = `$${args.totalAmount.toLocaleString('en-US', {
     minimumFractionDigits: 2, maximumFractionDigits: 2,
@@ -1973,6 +1928,7 @@ export async function emailBusinessInvoiceSent(args: {
       relatedEntityType: 'business_invoice',
       relatedEntityId: args.ctx?.invoiceId ?? null,
       metadata: { business_id: args.ctx?.businessId, invoice_number: args.invoiceNumber },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -1991,7 +1947,7 @@ export async function emailBusinessAppointmentConfirmed(args: {
   scheduledFor: Date              // converted to local-string in body
   durationMinutes: number
   notes: string | null
-  ctx?: { businessId?: string; appointmentId?: string }
+  ctx?: { businessId?: string; appointmentId?: string; replyTo?: ReplyTo }
 }) {
   const when = args.scheduledFor.toLocaleString([], {
     weekday: 'long', month: 'long', day: 'numeric',
@@ -2020,6 +1976,7 @@ export async function emailBusinessAppointmentConfirmed(args: {
       relatedEntityType: 'appointment',
       relatedEntityId: args.ctx?.appointmentId ?? null,
       metadata: { business_id: args.ctx?.businessId, service_type: args.serviceType },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -2037,7 +1994,7 @@ export async function emailBusinessAppointmentReminder(args: {
   serviceType: string
   scheduledFor: Date
   durationMinutes: number
-  ctx?: { businessId?: string; appointmentId?: string }
+  ctx?: { businessId?: string; appointmentId?: string; replyTo?: ReplyTo }
 }) {
   const when = args.scheduledFor.toLocaleString([], {
     weekday: 'long', month: 'long', day: 'numeric',
@@ -2061,6 +2018,7 @@ export async function emailBusinessAppointmentReminder(args: {
       relatedEntityType: 'appointment',
       relatedEntityId: args.ctx?.appointmentId ?? null,
       metadata: { business_id: args.ctx?.businessId, service_type: args.serviceType },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -2085,7 +2043,7 @@ export async function emailBusinessQuoteSent(args: {
   totalAmount: number
   expiresAt: Date | null
   notes: string | null
-  ctx?: { businessId?: string; quoteId?: string }
+  ctx?: { businessId?: string; quoteId?: string; replyTo?: ReplyTo }
 }) {
   const fmt = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
   const greet = args.customerName
@@ -2159,6 +2117,7 @@ export async function emailBusinessQuoteSent(args: {
       relatedEntityType: 'business_quote',
       relatedEntityId: args.ctx?.quoteId ?? null,
       metadata: { business_id: args.ctx?.businessId, quote_number: args.quoteNumber },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -2176,7 +2135,7 @@ export async function emailBusinessCardUpdateRequest(args: {
   updateUrl: string
   expiresAt: Date
   reasonHint: 'auto_charge_failed' | 'expired' | 'manual'
-  ctx?: { businessId?: string; customerId?: string; invoiceId?: string | null }
+  ctx?: { businessId?: string; customerId?: string; invoiceId?: string | null; replyTo?: ReplyTo }
 }) {
   const greet = args.customerName
     ? p(`Hi <strong style="color:#eef1f8">${args.customerName}</strong>,`)
@@ -2210,6 +2169,7 @@ export async function emailBusinessCardUpdateRequest(args: {
         invoice_id: args.ctx?.invoiceId,
         reason: args.reasonHint,
       },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -2222,7 +2182,7 @@ export async function emailBusinessCustomerPortalLink(args: {
   to: string
   businessName: string
   portalUrl: string
-  ctx?: { businessId?: string; customerId?: string }
+  ctx?: { businessId?: string; customerId?: string; replyTo?: ReplyTo }
 }) {
   await send(args.to,
     `Your account with ${args.businessName}`,
@@ -2238,6 +2198,7 @@ export async function emailBusinessCustomerPortalLink(args: {
       relatedEntityType: 'business_customer',
       relatedEntityId: args.ctx?.customerId ?? null,
       metadata: { business_id: args.ctx?.businessId },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -2256,7 +2217,7 @@ export async function emailBookingSiteAssignment(args: {
   unitNumber: string
   checkIn: string
   checkInTime?: string | null
-  ctx?: { landlordId?: string; bookingId?: string }
+  ctx?: { landlordId?: string; bookingId?: string; replyTo?: ReplyTo }
 }) {
   const greet = args.guestName
     ? p(`Hi <strong style="color:#eef1f8">${args.guestName}</strong>,`)
@@ -2278,6 +2239,7 @@ export async function emailBookingSiteAssignment(args: {
       landlordId: args.ctx?.landlordId ?? null,
       relatedEntityType: args.ctx?.bookingId ? 'unit_booking' : null,
       relatedEntityId: args.ctx?.bookingId ?? null,
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -2292,7 +2254,7 @@ export async function emailBookingGuestAccess(args: {
   checkOut: string
   stayUrl: string
   expiresAt: Date
-  ctx?: { landlordId?: string; bookingId?: string }
+  ctx?: { landlordId?: string; bookingId?: string; replyTo?: ReplyTo }
 }) {
   const greet = args.guestName
     ? p(`Hi <strong style="color:#eef1f8">${args.guestName}</strong>,`)
@@ -2323,6 +2285,7 @@ export async function emailBookingGuestAccess(args: {
       landlordId: args.ctx?.landlordId ?? null,
       relatedEntityType: args.ctx?.bookingId ? 'unit_booking' : null,
       relatedEntityId: args.ctx?.bookingId ?? null,
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -2351,25 +2314,6 @@ export async function emailPosReceipt(
 }
 
 // ── S553: sales-call scheduling (Portfolio Strategist funnel) ─────────
-export async function sendSalesCallConfirmation({ to, name, when, mode }: {
-  to: string; name: string; when: string; mode: 'video' | 'phone'
-}) {
-  const first = escapeHtml(name.trim().split(/\s+/)[0] || 'there')
-  await send(to, `Your GAM call is booked — ${when}`,
-    base(
-      h(`You're on the calendar`) +
-      p(`Hi ${first} — your call with a GAM Portfolio Strategist is confirmed:`) +
-      `<div style="background:#0a0f14;border-radius:8px;padding:16px;margin:12px 0">
-        <div style="font-weight:700;color:#c9a227;margin-bottom:4px">${when}</div>
-        <div style="color:#b8c4d8;font-size:.82rem">${mode === 'video' ? 'Video call — your Strategist will email you the meeting link before the call.' : 'Phone call — your Strategist will call the number you provided.'}</div>
-      </div>` +
-      p(`We'll walk through your portfolio, show you the platform live, and lay out exact pricing for your setup. If you need to reschedule, just reply to this email.`)
-    ),
-    { category: 'sales_call_confirmation', landlordId: null },
-    'support',
-  )
-}
-
 export async function sendSalesCallReminder({ to, name, when, mode }: {
   to: string; name: string; when: string; mode: 'video' | 'phone'
 }) {
@@ -2680,7 +2624,7 @@ export async function emailPaymentReceipt(
     billLabel?: string | null
     portalUrl?: string
   },
-  ctx?: { landlordId?: string; tenantId?: string; paymentId?: string },
+  ctx?: { landlordId?: string; tenantId?: string; paymentId?: string; replyTo?: ReplyTo },
 ): Promise<string | null> {
   const money = (n: number) =>
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
@@ -2740,6 +2684,7 @@ export async function emailPaymentReceipt(
       relatedEntityType: ctx?.paymentId ? 'payment' : null,
       relatedEntityId: ctx?.paymentId ?? null,
       metadata: { amount: Math.max(0, args.amount), credit_applied: credit, credit_banked: banked, credit_only: creditOnly },
+      replyTo: ctx?.replyTo,
     },
     // A receipt is something people reply to when a figure looks wrong.
     'support',
@@ -2776,7 +2721,7 @@ export async function emailBalanceDue(
     portalUrl?: string
     landlordName?: string
   },
-  ctx?: { landlordId?: string; tenantId?: string },
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo },
 ): Promise<string | null> {
   const money = (n: number) =>
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
@@ -2813,6 +2758,7 @@ export async function emailBalanceDue(
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,
       metadata: { total: args.total, credit_available: credit },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -2938,7 +2884,7 @@ export async function emailInvoiceReady(
     /** S654: the bill changed after it was announced — say so, so the earlier email is not the one they pay. */
     updated?: boolean
   },
-  ctx?: { landlordId?: string; tenantId?: string; invoiceId?: string },
+  ctx?: { landlordId?: string; tenantId?: string; invoiceId?: string; replyTo?: ReplyTo },
 ): Promise<string | null> {
   const money = (n: number) =>
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
@@ -2997,6 +2943,7 @@ export async function emailInvoiceReady(
       relatedEntityType: ctx?.invoiceId ? 'invoice' : (ctx?.tenantId ? 'tenant' : null),
       relatedEntityId: ctx?.invoiceId ?? ctx?.tenantId ?? null,
       metadata: { total: Math.max(0, args.total), credit_available: credit },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )

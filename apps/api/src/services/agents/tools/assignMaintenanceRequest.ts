@@ -132,7 +132,7 @@ export const assignMaintenanceRequest: AgentTool = {
       [requestId, actor.userId, `Assigned to ${name}`]
     )
 
-    const unit = await queryOne<any>(`SELECT unit_number FROM units WHERE id = $1`, [request.unit_id]).catch(() => null)
+    const unit = await queryOne<any>(`SELECT unit_number, property_id FROM units WHERE id = $1`, [request.unit_id]).catch(() => null)
     const unitLabel = unit?.unit_number ? ` (unit ${unit.unit_number})` : ''
 
     // Notify the assigned worker (best-effort, respects their prefs).
@@ -149,6 +149,8 @@ export const assignMaintenanceRequest: AgentTool = {
         emailTo: worker.email || undefined,
         emailSubject: `New work order assigned — ${request.title}`,
         emailHtml: `<p>You’ve been assigned a <b>${request.priority}</b> maintenance request${unitLabel}:</p><p><b>${request.title}</b></p><p>${request.description || ''}</p>`,
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        replyTo: unit?.property_id ? { kind: 'property', propertyId: unit.property_id } : undefined,
       })
     } catch (e) {
       logger.error({ err: e }, '[agent] maintenance assign — notify worker')
@@ -164,7 +166,7 @@ export const assignMaintenanceRequest: AgentTool = {
         if (tenant) {
           await notifyMaintenanceUpdated({
             tenantUserId: tenant.id, tenantEmail: tenant.email, tenantPhone: tenant.phone,
-            unitNumber: unit?.unit_number, requestTitle: request.title, newStatus: 'assigned',
+            unitNumber: unit?.unit_number, propertyId: unit?.property_id, requestTitle: request.title, newStatus: 'assigned',
             scheduledAt: undefined, notes: undefined,
           })
         }

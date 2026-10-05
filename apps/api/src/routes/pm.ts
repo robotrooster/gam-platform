@@ -493,8 +493,9 @@ pmRouter.post('/companies/:id/invitations', async (req: any, res, next) => {
       throw e
     }
 
+    // 10/5: replies reach the person who sent this invite (services/replyRouting).
     emailPmInvitation(emailNorm, inviterName, company.name, body.role, buildPmAcceptUrl(token),
-      { pmCompanyId: req.params.id, invitationId: inv.id })
+      { pmCompanyId: req.params.id, invitationId: inv.id, replyTo: { kind: 'person', userId: req.user!.userId } })
       .catch(e => logger.error({ err: e }, '[EMAIL pm_invitation send failed]'))
 
     res.status(201).json({ success: true, data: inv })
@@ -538,8 +539,9 @@ pmRouter.post('/companies/:id/invitations/:invId/resend', async (req: any, res, 
       [newToken, newExpires, inv.id]
     )
 
+    // 10/5: replies reach the person who re-sent this invite (services/replyRouting).
     emailPmInvitation(inv.email, inviterName, company!.name, inv.role, buildPmAcceptUrl(newToken),
-      { pmCompanyId: req.params.id, invitationId: inv.id })
+      { pmCompanyId: req.params.id, invitationId: inv.id, replyTo: { kind: 'person', userId: req.user!.userId } })
       .catch(e => logger.error({ err: e }, '[EMAIL pm_invitation resend failed]'))
 
     res.json({ success: true, data: updated })
@@ -886,7 +888,8 @@ pmRouter.post('/companies/:id/property-invitations', async (req: any, res, next)
             propertyName: ctxRow.property_name,
             proposedScope: body.proposed_scope,
             acceptUrl: buildPropertyInviteAcceptUrl(token),
-            ctx: { pmCompanyId: req.params.id, invitationId, landlordId: body.landlord_id },
+            // 10/5: replies reach the person who sent this invite (services/replyRouting).
+            ctx: { pmCompanyId: req.params.id, invitationId, landlordId: body.landlord_id, replyTo: { kind: 'person', userId: req.user!.userId } },
           })
         } catch (mailErr) {
           logger.error({ err: mailErr }, '[PM PROPERTY INVITE EMAIL FAILED]')

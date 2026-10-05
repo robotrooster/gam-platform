@@ -65,11 +65,11 @@ export const rejectMaintenanceRequest: AgentTool = {
       const tenant = request.tenant_id
         ? await queryOne<any>(`SELECT u.id, u.email, u.phone FROM users u JOIN tenants t ON t.user_id = u.id WHERE t.id = $1`, [request.tenant_id])
         : null
-      const unit = await queryOne<any>(`SELECT unit_number FROM units WHERE id = $1`, [request.unit_id]).catch(() => null)
+      const unit = await queryOne<any>(`SELECT unit_number, property_id FROM units WHERE id = $1`, [request.unit_id]).catch(() => null)
       if (tenant) {
         await notifyMaintenanceUpdated({
           tenantUserId: tenant.id, tenantEmail: tenant.email, tenantPhone: tenant.phone,
-          unitNumber: unit?.unit_number, requestTitle: request.title, newStatus: 'cancelled',
+          unitNumber: unit?.unit_number, propertyId: unit?.property_id, requestTitle: request.title, newStatus: 'cancelled',
           scheduledAt: undefined, notes: reason || undefined,
         })
       }

@@ -183,7 +183,10 @@ publicCustomerPortalRouter.post('/portal-login/:slug', async (req, res, next) =>
           ORDER BY created_at DESC LIMIT 1`, [biz.id, email])
       if (cust?.email) {
         const { url } = await getOrCreateCustomerPortalToken({ businessId: biz.id, customerId: cust.id })
-        await emailCustomerPortalLink(cust.email, biz.name, url).catch(() => { /* logged in email.send */ })
+        // A sign-in link the customer asked for: its replies stay with GAM
+        // support like every sign-in email (services/replyRouting).
+        await emailCustomerPortalLink(cust.email, biz.name, url)
+          .catch(() => { /* logged in email.send */ })
       }
     }
     res.json({ success: true, data: { sent: true } })

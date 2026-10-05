@@ -52,7 +52,6 @@ import {
 const {
   emailSigningRequestMock,
   emailSigningCompletedMock,
-  emailDocumentDeclinedMock,
   createNotificationMock,
   createAdminNotificationMock,
   generateMoveInInvoiceMock,
@@ -61,7 +60,6 @@ const {
 } = vi.hoisted(() => ({
   emailSigningRequestMock:    vi.fn(async () => 'msg'),
   emailSigningCompletedMock:  vi.fn(async () => 'msg'),
-  emailDocumentDeclinedMock:  vi.fn(async () => 'msg'),
   createNotificationMock:     vi.fn(async () => ({ id: 'n_mock' })),
   createAdminNotificationMock: vi.fn(async () => {}),
   // S334: completion handler dependencies. generateMoveInInvoice is
@@ -84,7 +82,6 @@ vi.mock('../services/email', async (importOriginal) => {
     ...actual,
     emailSigningRequest:    emailSigningRequestMock,
     emailSigningCompleted:  emailSigningCompletedMock,
-    emailDocumentDeclined:  emailDocumentDeclinedMock,
   }
 })
 vi.mock('../services/notifications', async (importOriginal) => {
@@ -125,7 +122,6 @@ beforeEach(async () => {
   await cleanupAllSchema()
   emailSigningRequestMock.mockClear()
   emailSigningCompletedMock.mockClear()
-  emailDocumentDeclinedMock.mockClear()
   createNotificationMock.mockClear()
   createAdminNotificationMock.mockClear()
   generateMoveInInvoiceMock.mockClear()
@@ -1223,7 +1219,6 @@ describe('POST /sign/:documentId/decline', () => {
       `SELECT status FROM lease_documents WHERE id = $1`, [documentId],
     )
     expect(doc.rows[0].status).toBe('sent')
-    expect(emailDocumentDeclinedMock).not.toHaveBeenCalled()
   })
 
   it('is refused for the landlord too (410)', async () => {

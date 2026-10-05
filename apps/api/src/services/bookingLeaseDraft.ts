@@ -213,7 +213,8 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
             await emailBackgroundCheckScreeningRequest(
               booking.guest_email, booking.guest_name, prop?.name || 'the property',
               `${(process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com').replace(/\/$/, '')}/background-check?${qs.toString()}`,
-              { landlordId: booking.landlord_id })
+              // 10/5: replies reach the people who run this property (services/replyRouting).
+              { landlordId: booking.landlord_id, replyTo: prop?.id ? { kind: 'property', propertyId: prop.id } : undefined })
             screeningEmailed = true
             logger.info({ bookingId, leaseId, nights },
               '[booking-lease-draft] screening request emailed automatically to long-stay guest')

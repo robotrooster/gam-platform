@@ -23,6 +23,7 @@ import crypto from 'crypto'
 import type { PoolClient } from 'pg'
 import { getClient, query, queryOne } from '../../db'
 import { emailTenantOnboarded } from '../../services/email'
+import { replyToProperty } from '../../services/replyRouting'
 import { AppError } from '../../middleware/errorHandler'
 import { assertLateFeeDecisionForUnit } from '../../services/lateFeePolicy'
 import { reasonSentence } from '../../services/leaseOnboarding'
@@ -229,8 +230,8 @@ export async function resolveIntent(
   //    portfolio. Without a hit we can't build the lease. S550: NO LIMIT 1 —
   //    the landlord may own two same-named properties ("Oak Park" ×2), each
   //    with an "RV 01"; the street number on the lease picks between them.
-  const unitCandidates = await query<{ id: string; property_name: string; street1: string; city: string; state: string; zip: string; unit_number: string }>(
-    `SELECT u.id, u.unit_number, p.name AS property_name, p.street1, p.city, p.state, p.zip
+  const unitCandidates = await query<{ id: string; property_id: string; property_name: string; street1: string; city: string; state: string; zip: string; unit_number: string }>(
+    `SELECT u.id, u.unit_number, u.property_id, p.name AS property_name, p.street1, p.city, p.state, p.zip
      FROM units u JOIN properties p ON p.id = u.property_id
      WHERE p.landlord_id = $1
        AND LOWER(p.name) = LOWER($2)
@@ -550,7 +551,8 @@ export async function resolveIntent(
         await emailTenantOnboarded(
           sendTo, firstName, landlordName, propertyAddress, unitLabel,
           portalLink('tenant', `accept-invite?token=${inviteToken}`),
-          { landlordId, tenantId }
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          { landlordId, tenantId, replyTo: replyToProperty(unit.property_id) }
         )
         inviteSent = true
       } else {

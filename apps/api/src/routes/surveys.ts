@@ -291,6 +291,8 @@ surveysRouter.post('/:id/send', requireSurveyPerm, async (req, res, next) => {
         sendEmail: true,
         emailTo: r.email,
         emailSubject: `Survey: ${survey.title}`,
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        replyTo: { kind: 'property', propertyId: survey.property_id },
       })
     }
     res.json({ success: true, data: { recipients: recipients.length } })

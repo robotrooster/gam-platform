@@ -31,6 +31,7 @@ import { computeCartTotals } from '../services/posTax'
 import { insertPosSale } from '../services/posSale'
 import { recordSaleTowardStay } from '../services/stayPayments'
 import { logger } from '../lib/logger'
+import { replyToProperty } from '../services/replyRouting'
 import {
   personOnSale, residentRecord, applyCardToPerson, withSavepoint, searchPeople, peopleQueryGuard, peopleSearchLimiter, crossCompanyLimiter,
   parseForStaff, cartLineWords, NOT_ON_REGISTER, PICK_GONE, lowerLineIds, assertItemsAreOurs, customerFromElsewhere,
@@ -1146,7 +1147,8 @@ async function writePayLink(req: any, body: z.infer<typeof createSchema>, prop: 
     await emailPayLink({
       to: link.customer_email, name: link.customer_name, propertyName: prop.name,
       label: link.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(token),
-      ctx: { landlordId: prop.landlord_id, payLinkId: link.id },
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      ctx: { landlordId: prop.landlord_id, payLinkId: link.id, replyTo: replyToProperty(link.property_id) },
     }).catch((e: unknown) => logger.error({ err: e, payLinkId: link.id }, '[pay-link] email failed'))
   }
   return { ...link, url: payLinkUrl(token), card_fee: customerFee, charged }
@@ -1212,7 +1214,8 @@ export async function createBookingDepositLink(opts: {
   await emailPayLink({
     to: link.customer_email, name: link.customer_name, propertyName: propName,
     label: link.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(link.token),
-    ctx: { landlordId: opts.landlordId, payLinkId: link.id },
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    ctx: { landlordId: opts.landlordId, payLinkId: link.id, replyTo: replyToProperty(link.property_id) },
   }).catch((e: unknown) => logger.error({ err: e, payLinkId: link.id }, '[deposit-link] email failed'))
   return { id: link.id, url: payLinkUrl(link.token) }
 }
@@ -1264,7 +1267,8 @@ export async function createStayBalanceLink(opts: {
   await emailPayLink({
     to: link.customer_email, name: link.customer_name, propertyName: propName,
     label: opts.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(link.token),
-    ctx: { landlordId: opts.landlordId, payLinkId: link.id },
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    ctx: { landlordId: opts.landlordId, payLinkId: link.id, replyTo: replyToProperty(link.property_id) },
   }).catch((e: unknown) => logger.error({ err: e, payLinkId: link.id }, '[stay-balance] email failed'))
   return { id: link.id }
 }
@@ -1676,7 +1680,8 @@ posPayLinksRouter.post('/:id/resend', requirePerm('pos.ring_sale'), async (req, 
     await emailPayLink({
       to: link.customer_email, name: link.customer_name, propertyName: prop.name,
       label: link.label, amount: total, cardFee: customerFee, url: payLinkUrl(link.token),
-      ctx: { landlordId: link.landlord_id, payLinkId: link.id },
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      ctx: { landlordId: link.landlord_id, payLinkId: link.id, replyTo: replyToProperty(link.property_id) },
     })
     await query(`UPDATE pos_pay_links SET expires_at = NOW() + INTERVAL '14 days', updated_at = NOW() WHERE id = $1`, [link.id])
     res.json({ success: true })

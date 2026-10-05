@@ -19,6 +19,7 @@ import { query, queryOne } from '../db'
 import { logger } from '../lib/logger'
 import { emailSigningRequest, emailSigningCompleted } from './email'
 import { createNotification } from './notifications'
+import { replyToProperty } from './replyRouting'
 
 type Doc = { id: string; title: string; status: string; sort_order: number; landlord_id: string; unit_id: string | null }
 type SignerRow = { id: string; document_id: string; user_id: string; role: string; name: string; email: string; send_to: string; token: string | null; order_index: number; status: string; invite_sent: boolean | null }
@@ -42,10 +43,10 @@ async function packetDocs(groupId: string): Promise<Doc[]> {
       ORDER BY d.package_sort_order, d.created_at`, [groupId])
 }
 
-async function packetLabel(docs: Doc[]): Promise<{ unitLabel: string; landlordName: string; title: string }> {
+async function packetLabel(docs: Doc[]): Promise<{ unitLabel: string; landlordName: string; title: string; propertyId: string | null }> {
   const lease = docs.find(d => /^Lease/.test(d.title)) ?? docs[0]
   const ctx = await queryOne<any>(
-    `SELECT u.unit_number, p.name AS property_name,
+    `SELECT u.unit_number, u.property_id, p.name AS property_name,
             TRIM(COALESCE(NULLIF(p.lease_signing_name, ''), CONCAT_WS(' ', lu.first_name, lu.last_name))) AS landlord_name
        FROM lease_documents d
        LEFT JOIN units u ON u.id = d.unit_id
@@ -58,6 +59,7 @@ async function packetLabel(docs: Doc[]): Promise<{ unitLabel: string; landlordNa
     unitLabel,
     landlordName: ctx?.landlord_name ?? '',
     title: `Lease packet — ${docs.length} document${docs.length === 1 ? '' : 's'}`,
+    propertyId: ctx?.property_id ?? null,
   }
 }
 
@@ -95,7 +97,7 @@ export async function advancePacket(groupId: string): Promise<{ invited: string 
 
   // The first document (in packet order) that needs them is the way in.
   const first = docs.map(d => mine.find(s => s.document_id === d.id)).find(Boolean)!
-  const { unitLabel, landlordName, title } = await packetLabel(docs)
+  const { unitLabel, landlordName, title, propertyId } = await packetLabel(docs)
   const firstDoc = docs.find(d => d.id === first.document_id)!
 
   let url: string
@@ -113,7 +115,10 @@ export async function advancePacket(groupId: string): Promise<{ invited: string 
   }
 
   await emailSigningRequest(first.send_to, first.name, `${title} (${docs.map(d => d.title.replace(/ — .*$/, '')).join(', ')})`,
-    unitLabel, landlordName, url, { landlordId: firstDoc.landlord_id, documentId: firstDoc.id, needsSetup })
+    unitLabel, landlordName, url, { landlordId: firstDoc.landlord_id, documentId: firstDoc.id, needsSetup,
+      // 10/5: replies reach the people who run this property (services/replyRouting);
+      // the landlord's own copy stays GAM's.
+      replyTo: first.role === 'landlord' ? undefined : replyToProperty(propertyId) })
   await createNotification({
     userId: first.user_id,
     type: 'esign_request',
@@ -140,7 +145,7 @@ export async function announcePacketIfComplete(groupId: string, portalHomeFor: (
     `SELECT COUNT(*)::text AS n FROM notifications
       WHERE type = 'esign_completed' AND data->>'packageGroupId' = $1`, [groupId])
   if (Number(already?.n ?? 0) > 0) return false
-  const { unitLabel, title } = await packetLabel(docs)
+  const { unitLabel, title, propertyId } = await packetLabel(docs)
   const signers = await query<SignerRow>(
     `SELECT DISTINCT ON (s.user_id) s.*, ${SEND_TO}
        FROM lease_document_signers s
@@ -148,7 +153,9 @@ export async function announcePacketIfComplete(groupId: string, portalHomeFor: (
       WHERE s.document_id = ANY($1::uuid[]) ORDER BY s.user_id, s.order_index`, [docs.map(d => d.id)])
   for (const s of signers) {
     await emailSigningCompleted(s.send_to, s.name, title, unitLabel, undefined, portalHomeFor(s.role),
-      { landlordId: docs[0].landlord_id, documentId: docs[0].id })
+      { landlordId: docs[0].landlord_id, documentId: docs[0].id,
+        // 10/5: a resident's reply reaches the property (services/replyRouting); the landlord's stays GAM's.
+        replyTo: s.role === 'landlord' ? undefined : replyToProperty(propertyId) })
     await createNotification({
       userId: s.user_id,
       type: 'esign_completed',

@@ -350,7 +350,8 @@ describe('PATCH /password keeps the tenant signed in and signs out every other d
 
     const old = await request(buildApp()).get('/api/auth/me').set('Authorization', `Bearer ${otherDevice}`)
     expect(old.status).toBe(401)
-    expect(old.body.error).toMatch(/password was changed/i)
+    // 10/5: requireAuth refuses the old pass on every route now, in its own words.
+    expect(old.body.error).toMatch(/sign in again/i)
     const oldRefresh = await request(buildApp()).post('/api/auth/refresh').set('Authorization', `Bearer ${otherDevice}`)
     expect(oldRefresh.status).toBe(401)
   })

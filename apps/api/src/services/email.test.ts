@@ -10,7 +10,7 @@
  *   - attachments[] only present when passed
  *   - sender selection: noreply (default) vs support
  *   - logger.error swallow + email_send_log write on failures
- *   - escapeHtml: indirect via emailDocumentDeclined / emailAdverseActionNotice
+ *   - escapeHtml: indirect via emailAdverseActionNotice
  *
  * Senders pinned (each at one rep test):
  *   bg check (new + decision both branches), pool (match + interested),
@@ -251,28 +251,6 @@ describe('e-sign emails', () => {
     expect(call.html).not.toContain('localhost')
   })
 
-  it('emailDocumentDeclined: HTML-escapes signer name + reason (prevents XSS)', async () => {
-    await email.emailDocumentDeclined(
-      'l@mailer-test.co', 'Landlord', '<script>Bad</script>', 'tenant',
-      'Lease', 'Unit A1', '<img src=x onerror=alert(1)>')
-    const call = (resendSendMock.mock.calls[0] as any[])[0]
-    expect(call.html).not.toContain('<script>Bad</script>')
-    expect(call.html).toContain('&lt;script&gt;Bad&lt;/script&gt;')
-    // The <img> tag is neutralized as escaped text — the angle brackets are
-    // escaped so the browser won't parse it as an element. The onerror=
-    // substring still appears as literal text inside the escaped output, but
-    // it can't execute because the surrounding `<` was turned into `&lt;`.
-    expect(call.html).not.toContain('<img src=x')
-    expect(call.html).toContain('&lt;img src=x onerror=alert(1)&gt;')
-  })
-
-  it('emailDocumentDeclined: empty reason → "No reason provided"', async () => {
-    await email.emailDocumentDeclined(
-      'l@mailer-test.co', 'Landlord', 'Tenant', 'tenant', 'Lease', 'A1', null)
-    const call = (resendSendMock.mock.calls[0] as any[])[0]
-    expect(call.html).toContain('No reason provided')
-  })
-
   it('emailDocumentAutoVoided: subject + category', async () => {
     await email.emailDocumentAutoVoided(
       'l@mailer-test.co', 'Landlord', 'Lease 2026', 'Unit A1')
@@ -365,19 +343,6 @@ describe('emailAdverseActionNotice', () => {
 })
 
 // ═════════════════════════ Misc senders ═════════════════════════
-
-describe('emailLandlordBankingNudge', () => {
-  it('default sender (noreply); category=landlord_banking_nudge', async () => {
-    await email.emailLandlordBankingNudge({
-      to: 'l@mailer-test.co', landlordName: 'L', tenantName: 'T',
-      propertyName: 'Sunset', unitNumber: 'A1',
-      bankingUrl: 'https://banking/x',
-    })
-    const log = await logRowFor('l@mailer-test.co')
-    expect(log.category).toBe('landlord_banking_nudge')
-    expect(log.related_entity_type).toBe('tenant_landlord_nudge')
-  })
-})
 
 describe('late payment sender', () => {
   it('sendLatePaymentNotice: subject contains daysLate; category=late_payment_notice; metadata captures amount', async () => {

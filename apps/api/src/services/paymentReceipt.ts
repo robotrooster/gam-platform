@@ -32,6 +32,7 @@
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { emailPaymentReceipt } from './email'
+import { replyToProperty } from './replyRouting'
 import { chargeLabel, chargeDetail, chargeLabelColumnsSql } from './invoiceNotice'
 
 const TENANT_APP_URL = process.env.TENANT_APP_URL || 'http://localhost:3002'
@@ -147,7 +148,7 @@ export async function sendPaymentReceipt(opts: ReceiptOpts): Promise<string | nu
   if (!opts.paymentIds.length) return null
   try {
     const rows = await query<any>(
-      `SELECT p.id, p.type, p.amount::float AS amount, p.notes, p.entry_description,
+      `SELECT p.id, p.type, p.amount::float AS amount, p.notes, p.entry_description, p.revenue_owner,
               ${chargeLabelColumnsSql('p')},
               to_char(p.due_date,'Mon FMDD, YYYY') AS due_date,
               to_char(COALESCE(inv.due_date, p.due_date),'FMMonth') AS due_month_label,
@@ -157,7 +158,7 @@ export async function sendPaymentReceipt(opts: ReceiptOpts): Promise<string | nu
                 WHERE cu.payment_id = p.id AND cu.status IN ('held','applied'))::float AS credit_used,
               u.email, TRIM(CONCAT_WS(' ', u.first_name, u.last_name)) AS tenant_name,
               u.first_name,
-              un.unit_number, pr.name AS property_name
+              un.unit_number, un.property_id, pr.name AS property_name
          FROM payments p
          LEFT JOIN invoices inv ON inv.id = p.invoice_id
          JOIN tenants t ON t.id = p.tenant_id
@@ -195,6 +196,10 @@ export async function sendPaymentReceipt(opts: ReceiptOpts): Promise<string | nu
       landlordId: first.landlord_id,
       tenantId: payer.tenant_id,
       paymentId: first.id,
+      // 10/5: replies reach the people who run this property (services/replyRouting)
+      // — unless the receipt covers a GAM product (FlexPay and the like), whose
+      // questions are GAM's.
+      replyTo: rows.every((r: any) => r.revenue_owner === 'landlord') ? replyToProperty(first.property_id) : undefined,
     })
   } catch (e) {
     logger.error({ err: e, paymentIds: opts.paymentIds }, '[receipt] could not send payment receipt')

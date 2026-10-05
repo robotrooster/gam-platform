@@ -6,6 +6,7 @@ import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { logger } from '../lib/logger'
+import { replyToProperty } from '../services/replyRouting'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { portalLink } from '../lib/portalUrls'
 import { accountTiedElsewhere, NOT_A_RESIDENT_ACCOUNT } from '../jobs/leaseParser/resolveIntent'
@@ -291,7 +292,8 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
           providerName,
           body.serviceAddress || body.label,
           portalLink('tenant', `accept-invite?token=${inviteToken}`),
-          { landlordId, tenantId })
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          { landlordId, tenantId, replyTo: replyToProperty(property.id) })
       } catch (err) {
         // S654: never the link itself: it is a password-setting key.
         logger.error({ err, tenantId }, '[utility-service-invite] email failed — agreement created')

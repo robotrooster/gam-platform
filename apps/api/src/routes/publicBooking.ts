@@ -427,8 +427,8 @@ publicBookingRouter.post('/booking/:slug/book', async (req, res, next) => {
 
       // Best-effort confirmation emails (never block the booking).
       for (const recipient of [
-        { to: body.email, name: `${body.firstName.trim()} ${body.lastName.trim()}`.trim() || null, notes: body.notes?.trim() || null },
-        ...(biz.email ? [{ to: biz.email, name: `${body.firstName} ${body.lastName} (customer)`, notes: `Booked via public page. Customer: ${body.email} / ${body.phone}` }] : []),
+        { to: body.email, name: `${body.firstName.trim()} ${body.lastName.trim()}`.trim() || null, notes: body.notes?.trim() || null, isCustomer: true },
+        ...(biz.email ? [{ to: biz.email, name: `${body.firstName} ${body.lastName} (customer)`, notes: `Booked via public page. Customer: ${body.email} / ${body.phone}`, isCustomer: false }] : []),
       ]) {
         try {
           const { emailBusinessAppointmentConfirmed } = await import('../services/email')
@@ -436,7 +436,8 @@ publicBookingRouter.post('/booking/:slug/book', async (req, res, next) => {
             to: recipient.to, customerName: recipient.name, businessName: biz.name,
             serviceType: service.name, scheduledFor: slotStart,
             durationMinutes: service.duration_minutes, notes: recipient.notes,
-            ctx: { businessId: biz.id, appointmentId: appt.id },
+            // 10/5: the customer's copy answers to the business; the business's own copy stays default (services/replyRouting).
+            ctx: { businessId: biz.id, appointmentId: appt.id, replyTo: recipient.isCustomer ? { kind: 'business', businessId: biz.id } : undefined },
           })
         } catch (e) {
           logger.error({ err: e, appointmentId: appt.id }, '[public-booking] email failed')

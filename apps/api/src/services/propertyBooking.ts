@@ -334,8 +334,10 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
       const { issueBookingGuestToken } = await import('./bookingGuestTokens')
       const issued = await issueBookingGuestToken({ bookingId, landlordId: prop.landlord_id, delivery: 'email' })
       const { emailGuestStayLink } = await import('./email')
+      // 10/5: replies reach the people who run this property (services/replyRouting).
       await emailGuestStayLink(opts.guestEmail, opts.guestName, prop.name,
-        storefrontUrl(prop.booking_slug, `/stay/${issued.token}`), { landlordId: prop.landlord_id })
+        storefrontUrl(prop.booking_slug, `/stay/${issued.token}`),
+        { landlordId: prop.landlord_id, replyTo: { kind: 'property', propertyId: prop.id } })
     })().catch(err => logger.error({ err, bookingId }, '[propertyBooking] guest stay-link email failed'))
 
     if (mockCheckout) {
@@ -518,6 +520,8 @@ async function emailClaimLink(w: any, token: string): Promise<void> {
     html,
     notificationType: 'waitlist_claim_link',
     landlordId: w.landlord_id,
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    replyTo: { kind: 'property', propertyId: w.property_id },
   })
 }
 

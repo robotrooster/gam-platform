@@ -149,7 +149,8 @@ export async function sendGeneratedInvoice(
         totalAmount:   Number(inv.total_amount),
         dueDate:       dueIso,
         payUrl:        hostedUrl,
-        ctx: { businessId, invoiceId: inv.id },
+        // 10/5: replies reach the business, not GAM (services/replyRouting).
+        ctx: { businessId, invoiceId: inv.id, replyTo: { kind: 'business', businessId } },
       })
       return 'email_sent'
     } catch (e) {

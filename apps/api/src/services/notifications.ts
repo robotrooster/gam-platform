@@ -1,6 +1,6 @@
 import { query, queryOne } from '../db'
 import { sendNotificationEmail } from './email'
-import type { ReplyTo } from './replyRouting'
+import { replyToProperty, type ReplyTo } from './replyRouting'
 import { logger } from '../lib/logger'
 import { isCriticalNotificationType } from '@gam/shared'
 import { portalLink } from '../lib/portalUrls'
@@ -96,6 +96,23 @@ export async function createNotification(p: {
   } catch (e) { logger.error({ err: e }, '[NOTIFY]') }
 }
 
+/**
+ * 10/5: the property a resident's notice is about, so a reply reaches the
+ * people who run it (services/replyRouting). `sql` returns one property_id for
+ * the given params. Nothing found, or a failed lookup, leaves GAM support as
+ * the reply address — the notice itself always goes out.
+ */
+async function residentReplyTo(sql: string, params: unknown[]): Promise<ReplyTo | undefined> {
+  if (params.some(p => p == null || p === '')) return undefined
+  try {
+    const row = await queryOne<{ property_id: string | null }>(sql, params)
+    return replyToProperty(row?.property_id)
+  } catch (e) {
+    logger.warn({ err: e }, '[NOTIFY] reply-to property lookup failed — GAM support keeps the reply')
+    return undefined
+  }
+}
+
 // S642 (Nic): `amount` is the TOTAL that arrived in the payment event, not the
 // lease's base rent. `breakdown` is set whenever that total covers more than
 // one charge, so the card can say where the money went — a landlord reading
@@ -159,6 +176,7 @@ export async function notifyAchRetryScheduled(o: {
   reason: string | null;                   // plain-words reason (ACH_RETURN_CONFIG.plain); null = unreadable
   retryDate: string;                       // ISO date string (YYYY-MM-DD)
   retryAttempt: 1 | 2;                     // which retry this is
+  propertyId?: string | null;              // the tenant's reply reaches this property's people; omitted = GAM support
 }) {
   const shared = {
     tenantName: o.tenantName, unitNumber: o.unitNumber, propertyName: o.propertyName,
@@ -183,7 +201,9 @@ export async function notifyAchRetryScheduled(o: {
       `<p>Your <b>${amt}</b> payment for ${o.propertyName} Unit ${o.unitNumber} didn't go through${because}.</p>` +
       `<p>We'll try your bank again on <b>${day}</b>. Please make sure the money is in the account before then.</p>` +
       `<p style="font-size:.85rem;color:#4a5568">${retryFootnote(o.retryAttempt)}</p>`
-    )
+    ),
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    replyTo: replyToProperty(o.propertyId),
   })
 
   // Landlord side: shorter info-only copy, one per contact
@@ -296,6 +316,14 @@ export async function notifyAchRetriesExhausted(o: {
       ? `The rest, <b>${amt}</b>, is still owed. You can pay it now with a bank account or a card.`
       : `The <b>${amt}</b> is still owed. Please pay it now with a different bank account or a card.`
   const plain = (html: string) => html.replace(/<[^>]+>/g, '')
+  // 10/5: replies reach the people who run this property (services/replyRouting).
+  const replyTo = await residentReplyTo(
+    `SELECT COALESCE(un.property_id, lu.property_id) AS property_id
+       FROM payments p
+       LEFT JOIN units  un ON un.id = p.unit_id
+       LEFT JOIN leases l  ON l.id = p.lease_id
+       LEFT JOIN units  lu ON lu.id = l.unit_id
+      WHERE p.id = $1 AND p.revenue_owner = 'landlord'`, [o.paymentId])
 
   await createNotification({
     userId: o.tenantUserId,
@@ -310,7 +338,8 @@ export async function notifyAchRetriesExhausted(o: {
       `Your Payment Didn't Go Through`,
       `<p>${tenantLead}</p><p>${tenantNext}</p>`,
       { label: 'Pay now', url: payUrl },
-    )
+    ),
+    replyTo,
   })
 
   // Landlord side: one per contact. Same total, same reason, no pay link.
@@ -369,6 +398,7 @@ export async function notifyAutopayFailed(o: {
   disarming: boolean;
   kind?: AutopayFailureKind;
   payUrl?: string | null;
+  propertyId?: string | null;              // the tenant's reply reaches this property's people; omitted = GAM support
 }) {
   const kind = o.kind ?? 'payment_method'
   const title = o.disarming ? 'Autopay has been turned off' : 'Your scheduled rent payment didn’t go through'
@@ -395,6 +425,8 @@ export async function notifyAutopayFailed(o: {
     emailHtml: emailIt
       ? emailTemplate(title, body, { label: 'Pay now', url: o.payUrl || portalLink('tenant', 'payments') })
       : undefined,
+    // 10/5: replies reach the people who run this property (services/replyRouting); a problem on our end stays with GAM.
+    replyTo: kind === 'payment_method' ? replyToProperty(o.propertyId) : undefined,
   })
 }
 
@@ -598,10 +630,11 @@ export async function notifyConnectPayoutFailed(o: {
   })
 }
 
-export async function notifyMaintenanceUpdated(o: { tenantUserId:string; tenantEmail:string; tenantPhone?:string; unitNumber:string; requestTitle:string; newStatus:string; scheduledAt?:string; notes?:string }) {
+export async function notifyMaintenanceUpdated(o: { tenantUserId:string; tenantEmail:string; tenantPhone?:string; unitNumber:string; requestTitle:string; newStatus:string; scheduledAt?:string; notes?:string; propertyId?:string|null }) {
   const labels: Record<string,string> = { assigned:'assigned', in_progress:'in progress', completed:'completed ✅', cancelled:'cancelled' }
   const label = labels[o.newStatus]||o.newStatus
-  await createNotification({ userId:o.tenantUserId, type:'maintenance_updated', title:`Maintenance ${o.newStatus==='completed'?'Completed':'Updated'} — ${o.requestTitle}`, body:`Your request "${o.requestTitle}" is now ${label}.${o.scheduledAt?` Scheduled: ${new Date(o.scheduledAt).toLocaleDateString()}.`:''}`, data:o, sendEmail:true, emailTo:o.tenantEmail, emailSubject:`🔧 Maintenance ${o.newStatus==='completed'?'Complete':'Update'}`, emailHtml:emailTemplate(`Maintenance ${o.newStatus==='completed'?'Completed':'Update'}`, `Your request <b>"${o.requestTitle}"</b> is now <b>${label}</b>.${o.scheduledAt?`<br>Scheduled: ${new Date(o.scheduledAt).toLocaleString()}`:''}${o.notes?`<br>Notes: ${o.notes}`:''}`) })
+  // 10/5: replies reach the people who run this property (services/replyRouting).
+  await createNotification({ userId:o.tenantUserId, type:'maintenance_updated', title:`Maintenance ${o.newStatus==='completed'?'Completed':'Updated'} — ${o.requestTitle}`, body:`Your request "${o.requestTitle}" is now ${label}.${o.scheduledAt?` Scheduled: ${new Date(o.scheduledAt).toLocaleDateString()}.`:''}`, data:o, sendEmail:true, emailTo:o.tenantEmail, emailSubject:`🔧 Maintenance ${o.newStatus==='completed'?'Complete':'Update'}`, emailHtml:emailTemplate(`Maintenance ${o.newStatus==='completed'?'Completed':'Update'}`, `Your request <b>"${o.requestTitle}"</b> is now <b>${label}</b>.${o.scheduledAt?`<br>Scheduled: ${new Date(o.scheduledAt).toLocaleString()}`:''}${o.notes?`<br>Notes: ${o.notes}`:''}`), replyTo:replyToProperty(o.propertyId) })
 }
 
 // S68: collapsed pre-S18 split (lease_expiring_60 / lease_expiring_30) into
@@ -677,6 +710,9 @@ export async function notifyInspectionReadyForTenant(o: {
   propertyName?: string; unitNumber?: string
 }) {
   const typeLabel = o.inspectionType === 'move_in' ? 'Move-in' : o.inspectionType === 'move_out' ? 'Move-out' : 'Periodic'
+  // 10/5: replies reach the people who run this property (services/replyRouting).
+  const replyTo = await residentReplyTo(
+    `SELECT u.property_id FROM unit_inspections i JOIN units u ON u.id = i.unit_id WHERE i.id = $1`, [o.inspectionId])
   await createNotification({
     userId: o.tenantUserId,
     type: 'inspection_ready',
@@ -687,6 +723,7 @@ export async function notifyInspectionReadyForTenant(o: {
     emailTo: o.tenantEmail,
     emailSubject: `📋 ${typeLabel} Inspection Ready — Sign Now`,
     emailHtml: emailTemplate(`${typeLabel} Inspection Ready`, `Your landlord has completed the ${typeLabel.toLowerCase()} checklist${o.unitNumber ? ` for <b>Unit ${o.unitNumber}</b>` : ''}. Review and sign it in your tenant portal so it can be finalized.`),
+    replyTo,
   })
 }
 
@@ -725,6 +762,9 @@ export async function notifyInspectionFinalized(o: {
 
   // Tenant ping (if applicable)
   if (o.tenantUserId && o.tenantEmail) {
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    const replyTo = await residentReplyTo(
+      `SELECT u.property_id FROM unit_inspections i JOIN units u ON u.id = i.unit_id WHERE i.id = $1`, [o.inspectionId])
     await createNotification({
       userId: o.tenantUserId,
       type: 'inspection_finalized',
@@ -735,6 +775,7 @@ export async function notifyInspectionFinalized(o: {
       emailTo: o.tenantEmail,
       emailSubject: `${typeLabel} Inspection Finalized`,
       emailHtml: emailTemplate(`${typeLabel} Inspection Finalized`, `Your ${typeLabel.toLowerCase()} inspection has been finalized.${outcomeBlurb} The credit-ledger events have been recorded.`),
+      replyTo,
     })
   }
 
@@ -762,6 +803,9 @@ export async function notifyInspectionScheduledReminder(o: {
   const typeLabel = o.inspectionType === 'move_in' ? 'Move-in' : o.inspectionType === 'move_out' ? 'Move-out' : 'Periodic'
   const timestr = new Date(o.scheduledFor).toLocaleString()
   if (o.tenantUserId && o.tenantEmail) {
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    const replyTo = await residentReplyTo(
+      `SELECT u.property_id FROM unit_inspections i JOIN units u ON u.id = i.unit_id WHERE i.id = $1`, [o.inspectionId])
     await createNotification({
       userId: o.tenantUserId,
       type: 'inspection_scheduled_reminder',
@@ -772,6 +816,7 @@ export async function notifyInspectionScheduledReminder(o: {
       emailTo: o.tenantEmail,
       emailSubject: `🔔 Inspection Tomorrow`,
       emailHtml: emailTemplate(`Inspection Tomorrow`, `Your ${typeLabel.toLowerCase()} inspection is scheduled for <b>${timestr}</b>${o.unitNumber ? ` (Unit ${o.unitNumber})` : ''}.`),
+      replyTo,
     })
   }
   await createNotification({
@@ -797,6 +842,9 @@ export async function notifyEntryRequestNew(o: {
 }) {
   const start = new Date(o.windowStart).toLocaleString()
   const subUrgent = o.noticeWindowHours < 24
+  // 10/5: replies reach the people who run this property (services/replyRouting).
+  const replyTo = await residentReplyTo(
+    `SELECT u.property_id FROM unit_entry_requests r JOIN units u ON u.id = r.unit_id WHERE r.id = $1`, [o.requestId])
   await createNotification({
     userId: o.tenantUserId,
     type: 'entry_request_new',
@@ -807,6 +855,7 @@ export async function notifyEntryRequestNew(o: {
     emailTo: o.tenantEmail,
     emailSubject: `${subUrgent ? '⚠️' : '🚪'} Entry Request — Respond Promptly`,
     emailHtml: emailTemplate(`Entry Request`, `Your landlord requests entry for <b>${o.reasonCategory}</b>: "${o.reason}".<br>Proposed window starts <b>${start}</b> (${o.noticeWindowHours}h notice).<br>Granting access promptly credits your record; denying does not penalize you.`),
+    replyTo,
   })
 }
 
@@ -837,6 +886,11 @@ export async function notifyEntryRecorded(o: {
 }) {
   if (!o.tenantUserId || !o.tenantEmail) return
   const t = new Date(o.enteredAt).toLocaleString()
+  // 10/5: replies reach the people who run this property (services/replyRouting); a breach says "Contact GAM", so it stays with GAM.
+  const replyTo = o.outcome === 'compliant'
+    ? await residentReplyTo(
+        `SELECT u.property_id FROM unit_entry_requests r JOIN units u ON u.id = r.unit_id WHERE r.id = $1`, [o.requestId])
+    : undefined
   await createNotification({
     userId: o.tenantUserId,
     type: 'entry_recorded',
@@ -847,6 +901,7 @@ export async function notifyEntryRecorded(o: {
     emailTo: o.tenantEmail,
     emailSubject: `Entry Recorded`,
     emailHtml: emailTemplate(`Entry Recorded`, `Your landlord entered the unit at <b>${t}</b>.${o.outcome === 'breach' ? '<br><br>This was outside the agreed-upon window. Contact GAM if there is a concern.' : ''}`),
+    replyTo,
   })
 }
 
@@ -910,6 +965,10 @@ export async function notifySubleaseDecision(o: {
   unitNumber: string; propertyName: string; landlordNote?: string | null
 }) {
   const verb = o.decision === 'approved' ? '✅ Approved' : '✗ Denied'
+  // 10/5: replies reach the people who run this property (services/replyRouting).
+  const replyTo = await residentReplyTo(
+    `SELECT u.property_id FROM subleases s JOIN leases l ON l.id = s.master_lease_id JOIN units u ON u.id = l.unit_id WHERE s.id = $1`,
+    [o.subleaseId])
   await createNotification({
     userId: o.sublessorUserId,
     type: o.decision === 'approved' ? 'sublease_approved' : 'sublease_denied',
@@ -923,6 +982,7 @@ export async function notifySubleaseDecision(o: {
       `Sublease ${verb}`,
       `Your landlord has <b>${o.decision}</b> your sublease request for Unit ${o.unitNumber} at ${o.propertyName}.${o.landlordNote ? `<br><br>Note from landlord: ${o.landlordNote}` : ''}`
     ),
+    replyTo,
   })
 }
 
@@ -936,6 +996,16 @@ export async function notifySubleaseTerminated(o: {
     o.triggeredBy === 'sublessor_terminated' ? 'the sublessor' :
     o.triggeredBy === 'sublessee_terminated' ? 'the sublessee' :
     'the landlord'
+  // 10/5: a resident's reply reaches the people who run this property (services/replyRouting); the landlord's copy matches no row and stays with GAM.
+  const replyTo = await residentReplyTo(
+    `SELECT u.property_id
+       FROM subleases s
+       JOIN leases  l    ON l.id = s.master_lease_id
+       JOIN units   u    ON u.id = l.unit_id
+       LEFT JOIN tenants t_or ON t_or.id = s.sublessor_tenant_id
+       LEFT JOIN tenants t_ee ON t_ee.id = s.sublessee_tenant_id
+      WHERE s.id = $1 AND $2::uuid IN (t_or.user_id, t_ee.user_id)`,
+    [o.subleaseId, o.recipientUserId])
   await createNotification({
     userId: o.recipientUserId,
     type: 'sublease_terminated',
@@ -949,16 +1019,12 @@ export async function notifySubleaseTerminated(o: {
       `Sublease Terminated`,
       `The sublease for Unit ${o.unitNumber} at ${o.propertyName} was terminated by <b>${triggerLabel}</b>.<br><br>Reason: ${o.reason}`
     ),
+    replyTo,
   })
 }
 
 export async function notifyTenantInviteAccepted(o: { landlordUserId:string; landlordId:string; landlordEmail:string; tenantName:string; tenantEmail:string; unitNumber:string; propertyName:string }) {
   await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'tenant_invite_accepted', title:`Tenant Activated — Unit ${o.unitNumber}`, body:`${o.tenantName} accepted their invite for Unit ${o.unitNumber}.`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`✅ Tenant Activated — Unit ${o.unitNumber}`, emailHtml:emailTemplate('Tenant Joined', `<b>${o.tenantName}</b> activated their account for Unit ${o.unitNumber} at ${o.propertyName}.`) })
-}
-
-export async function notifyWorkTradeHours(o: { tenantUserId:string; tenantEmail:string; tenantPhone?:string; unitNumber:string; hoursCommitted:number; hoursWorked:number; daysLeft:number }) {
-  const short = o.hoursCommitted - o.hoursWorked
-  await createNotification({ userId:o.tenantUserId, type:'work_trade_reminder', title:`Work Trade: ${short}hrs remaining`, body:`${o.hoursWorked}/${o.hoursCommitted} hours logged. ${short} hours left with ${o.daysLeft} days remaining.`, data:o, sendEmail:true, emailTo:o.tenantEmail, emailSubject:`⚡ Work Trade Reminder — ${short} hours remaining`, emailHtml:emailTemplate('Work Trade Reminder', `<b>${short} hours remaining</b> this month.<br>Logged: ${o.hoursWorked} / ${o.hoursCommitted}<br>Days left: ${o.daysLeft}`) })
 }
 
 export async function sendBulkNotification(o: { landlordId:string; propertyId?:string; title:string; body:string; sendEmail?:boolean }) {
@@ -985,7 +1051,8 @@ export async function sendBulkNotification(o: { landlordId:string; propertyId?:s
       vuo.primary_email    AS email,
       vuo.primary_phone    AS phone,
       un.unit_number,
-      p.name               AS property_name
+      p.name               AS property_name,
+      p.id                 AS property_id
     FROM units un
     JOIN properties p ON p.id = un.property_id
     JOIN v_unit_occupancy vuo ON vuo.unit_id = un.id
@@ -996,7 +1063,8 @@ export async function sendBulkNotification(o: { landlordId:string; propertyId?:s
   `, params)
   let sent = 0
   for (const t of tenants) {
-    await createNotification({ userId:t.user_id, landlordId: o.landlordId, type:'bulk_message', title:o.title, body:`Unit ${t.unit_number}: ${o.body}`, data:{unitNumber:t.unit_number}, sendEmail:o.sendEmail, emailTo:t.email, emailSubject:o.title, emailHtml:emailTemplate(o.title, o.body) })
+    // 10/5: replies reach the people who run this tenant's property (services/replyRouting).
+    await createNotification({ userId:t.user_id, landlordId: o.landlordId, type:'bulk_message', title:o.title, body:`Unit ${t.unit_number}: ${o.body}`, data:{unitNumber:t.unit_number}, sendEmail:o.sendEmail, emailTo:t.email, emailSubject:o.title, emailHtml:emailTemplate(o.title, o.body), replyTo:replyToProperty(t.property_id) })
     sent++
   }
   return { sent }
@@ -1115,6 +1183,8 @@ export async function routeMaintenanceNotification(requestId: string) {
         sendEmail: true, emailTo: member.email,
         emailSubject: `${isEmergency ? '🚨 EMERGENCY: ' : ''}Maintenance Request — Unit ${req.unit_number}`,
         emailHtml: `New ${req.priority} request from ${tenantName}: "${req.title}"${overThreshold ? '<br><b>APPROVAL REQUIRED before proceeding.</b>' : ''}`,
+        // 10/5: a worker's reply reaches the people who run this property (services/replyRouting).
+        replyTo: replyToProperty(req.property_id),
       })
     }
 
@@ -1236,6 +1306,7 @@ export async function notifyReservationDecision(o: {
   tenantUserId: string; tenantEmail: string;
   areaName: string; propertyName: string; approved: boolean;
   startsAt: string | Date; endsAt: string | Date; decisionNote?: string | null
+  propertyId?: string | null   // the resident's reply reaches this property's people; omitted = GAM support
 }) {
   const when = fmtWindow(o.startsAt, o.endsAt)
   const verb = o.approved ? 'approved' : 'declined'
@@ -1249,6 +1320,8 @@ export async function notifyReservationDecision(o: {
     emailSubject: `Reservation ${verb} — ${o.areaName}`,
     emailHtml: emailTemplate(`Reservation ${verb}`,
       `Your reservation for <b>${o.areaName}</b> at ${o.propertyName} was <b>${verb}</b>.<br>${when}${note}`),
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    replyTo: replyToProperty(o.propertyId),
   })
 }
 
@@ -1299,6 +1372,8 @@ export async function notifyAmenityUnavailable(o: {
       sendEmail: true, emailTo: r.email,
       emailSubject: `${headline} — ${when}`,
       emailHtml: emailTemplate(headline, `${sentence}<br><b>${when}</b>`),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: replyToProperty(o.propertyId),
     })
   }
   return recipients.length
@@ -1331,6 +1406,8 @@ export async function notifyAmenityEventReleased(o: {
       sendEmail: true, emailTo: r.email,
       emailSubject: `${o.areaName} open again — ${when}`,
       emailHtml: emailTemplate(`${o.areaName} open again`, `The private event at <b>${o.areaName}</b> was cancelled — the space is open as usual.<br><b>${when}</b>`),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: replyToProperty(o.propertyId),
     })
   }
   return recipients.length
@@ -1390,6 +1467,8 @@ export async function notifyServiceInterruption(o: {
       sendEmail: true, emailTo: r.email,
       emailSubject: `${headline}`,
       emailHtml: emailTemplate(headline, `${detail ? detail + '<br><br>' : ''}<b>${when}</b>`),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: replyToProperty(o.propertyId),
     })
   }
   return recipients.length
@@ -1410,6 +1489,8 @@ export async function notifyServiceRestored(o: {
       sendEmail: true, emailTo: r.email,
       emailSubject: `✅ ${o.utilityLabel} restored`,
       emailHtml: emailTemplate(`${o.utilityLabel} restored`, `<b>${o.utilityLabel}</b> service has been restored. Thank you for your patience.`),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: replyToProperty(o.propertyId),
     })
   }
   return recipients.length

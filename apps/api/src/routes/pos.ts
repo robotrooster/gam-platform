@@ -13,6 +13,7 @@ import { holdForTheCart, createConnectionToken, registerReader, listReaders, arc
 import crypto from 'crypto'
 import { DateTime } from 'luxon'
 import { logger } from '../lib/logger'
+import { replyToProperty } from '../services/replyRouting'
 import { resolveLandlordTarget, ownsLandlord, landlordScopeIds } from '../lib/landlordScope'
 import { cardIdentityFromIntent, findOrCreateCustomerForCard, startSaveCardPrompt, readSaveCardAnswer, saveCardForCustomer, mergePosCustomers, readSaleCard, type CardIdentity, type CardCustomer } from '../services/posCustomerCards'
 import {
@@ -4250,7 +4251,8 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
     } as any)
     const { emailPosReceipt } = await import('../services/email')
     await emailPosReceipt(email, tx.property_name || tx.business_name || 'GAM', receiptNumber, Number(tx.total), buffer,
-      { relatedEntityType: 'pos_transaction', relatedEntityId: tx.id } as any)
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      { relatedEntityType: 'pos_transaction', relatedEntityId: tx.id, replyTo: replyToProperty(tx.property_id) } as any)
     // 10/2: never on a resident's record — their email is their account's. And
     // the receipt has already gone out: what follows is bookkeeping, so a
     // failure in it is logged, never reported as a receipt that did not send.

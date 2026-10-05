@@ -1146,7 +1146,8 @@ describe('clawBackRemittanceCredit', () => {
 describe('every credit write goes through the ledger', () => {
   it('the whole path passes with the C0 guards on (direct balance writes refused)', async () => {
     const h = await house()
-    const sql = fs.readFileSync(path.join(__dirname, '..', 'db', 'contract', '20261003109000_credit_ledger_guards.sql'), 'utf8')
+    // 10/4: C0 moved from contract/ into migrations/.
+    const sql = fs.readFileSync(path.join(__dirname, '..', 'db', 'migrations', '20261003109000_credit_ledger_guards.sql'), 'utf8')
     const c = await db.connect()
     try {
       await c.query('BEGIN')

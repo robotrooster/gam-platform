@@ -992,6 +992,22 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
+    id: 'set_office_email',
+    audience: 'landlord', method: 'PATCH',
+    path: '/api/properties/:propertyId/office-email',
+    pathParams: ['propertyId'],
+    description:
+      'Set a property\u2019s office email: where residents\u2019, guests\u2019 and applicants\u2019 replies to our emails go, ' +
+      'and the contact on its booking site. Send an empty string to clear it (replies then go to whoever runs the ' +
+      'property). Read the address back before sending.',
+    params: {
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine.' },
+      officeEmail: { type: 'string', description: 'The email address, or "" to clear it.' },
+    },
+    required: ['propertyId', 'officeEmail'],
+    confirmFirst: true,
+  },
+  {
     id: 'set_broken_meter_billing',
     audience: 'landlord', method: 'PATCH',
     path: '/api/properties/:propertyId/broken-meter-estimate',

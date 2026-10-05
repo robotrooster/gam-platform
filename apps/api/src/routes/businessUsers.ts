@@ -141,7 +141,8 @@ businessUsersRouter.post('/invite', requireAuth, async (req, res, next) => {
         bizRow?.name ?? 'a GAM business',
         body.staffRole,
         acceptUrl,
-        { businessId, invitationId: inv.id })
+        // 10/5: replies reach the person who sent the invitation (services/replyRouting).
+        { businessId, invitationId: inv.id, replyTo: { kind: 'person', userId: req.user!.userId } })
         .catch((e) => {
           // fire-and-forget — async rejection from the mailer falls
           // here. Logged for ops visibility; doesn't fail the API.

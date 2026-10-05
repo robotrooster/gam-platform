@@ -67,6 +67,7 @@ import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { todayIn, dateIn } from '../lib/timezone'
 import { lockHousehold } from './moneyPredicates'
+import { replyToProperty } from './replyRouting'
 import {
   planRefund, runCardPart, givePartBackInCash, findSentRefund, livePartSql, money,
   DEPOSIT_PART_TOO_OLD, DEPOSIT_PART_DISPUTED, DEPOSIT_PART_TAKEN_BACK, type MoneySource,
@@ -486,6 +487,8 @@ export async function tellTenantDepositRefund(draftId: string): Promise<void> {
       // Fix pass 4: tapping it opens the tenant's Payments page, where the refund row is.
       actionUrl: TENANT_REFUND_PAGE,
       ...(dr.email ? { sendEmail: true, emailTo: dr.email, emailSubject: 'Your deposit refund' } : {}),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: replyToProperty(dr.property_id),
     })
   } catch (err) {
     logger.error({ err, draftId }, '[deposit-refund] could not send the tenant their move-out statement')
@@ -498,9 +501,9 @@ export const TENANT_REFUND_PAGE = '/payments'
 async function tenantOf(draftId: string) {
   return queryOne<{
     lease_id: string; tenant_user_id: string | null; email: string | null; unit_number: string | null
-    property_name: string | null; refund: number; from_landlord: number; landlord_id: string
+    property_id: string | null; property_name: string | null; refund: number; from_landlord: number; landlord_id: string
   }>(
-    `SELECT dr.lease_id, t.user_id AS tenant_user_id, u.email, un.unit_number, pr.name AS property_name,
+    `SELECT dr.lease_id, t.user_id AS tenant_user_id, u.email, un.unit_number, un.property_id, pr.name AS property_name,
             dr.refund_amount::float AS refund, COALESCE(dr.refund_from_landlord, 0)::float AS from_landlord, dr.landlord_id
        FROM deposit_returns dr
        JOIN leases l ON l.id = dr.lease_id
@@ -547,6 +550,8 @@ async function tellTenantPartNowInCash(replacedPartId: string): Promise<void> {
       data: { depositReturnId: p.deposit_return_id, leaseId: dr.lease_id, nowInCash: replacedPartId, amount: p.amount },
       actionUrl: TENANT_REFUND_PAGE,
       ...(dr.email ? { sendEmail: true, emailTo: dr.email, emailSubject: 'Your deposit refund' } : {}),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: replyToProperty(dr.property_id),
     })
   } catch (err) {
     logger.error({ err, partId: replacedPartId }, '[deposit-refund] could not tell the tenant a part was given back in cash')

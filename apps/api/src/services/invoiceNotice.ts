@@ -23,6 +23,7 @@ import {
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { emailInvoiceReady } from './email'
+import { replyToProperty } from './replyRouting'
 import { portalLink } from '../lib/portalUrls'
 import { signEmailFactorToken } from '../routes/emailOtp'
 import { creditBeside, openBalanceSql, openAmountSql } from './openBalances'
@@ -75,6 +76,7 @@ interface PendingInvoice {
   work_trade_credit_amount: string
   work_trade_agreement_id: string | null
   unit_number: string | null
+  property_id: string
   property_name: string | null
   tenant_user_id: string | null
   tenant_email: string | null
@@ -303,7 +305,7 @@ export async function sendPendingInvoiceNotices(
            i.total_amount::text,
            i.work_trade_credit_amount::text,
            i.work_trade_agreement_id,
-           u.unit_number, p.name AS property_name,
+           u.unit_number, u.property_id, p.name AS property_name,
            tu.id         AS tenant_user_id,
            tu.email      AS tenant_email,
            tu.first_name AS tenant_first_name,
@@ -408,7 +410,11 @@ export async function sendPendingInvoiceNotices(
         portalUrl: payNowLink(inv),
         landlordName: inv.landlord_name || undefined,
         updated: !!opts.updated,
-      }, { landlordId: inv.landlord_id, tenantId: inv.tenant_id ?? undefined, invoiceId: inv.id })
+      }, {
+        landlordId: inv.landlord_id, tenantId: inv.tenant_id ?? undefined, invoiceId: inv.id,
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        replyTo: replyToProperty(inv.property_id),
+      })
 
       await query(`UPDATE invoices SET sent_at = NOW() WHERE id = $1`, [inv.id])
       result.sent++

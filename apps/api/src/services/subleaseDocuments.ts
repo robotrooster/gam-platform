@@ -30,6 +30,7 @@ import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
+import { replyToProperty } from './replyRouting'
 
 const UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'subleases')
 
@@ -47,6 +48,7 @@ interface SubleaseContext {
   unit_id:           string
   unit_number:       string
   property_name:     string
+  property_id:       string
   property_template_url: string | null
   landlord_name:     string
   sublessor_tenant_id:   string
@@ -69,7 +71,7 @@ async function loadSubleaseContext(subleaseId: string): Promise<SubleaseContext>
   const row = await queryOne<SubleaseContext>(`
     SELECT s.id, s.master_lease_id, l.landlord_id, l.unit_id,
            u.unit_number,
-           p.name AS property_name,
+           p.name AS property_name, p.id AS property_id,
            p.sublease_agreement_template_url AS property_template_url,
            lu.first_name || ' ' || lu.last_name AS landlord_name,
            s.sublessor_tenant_id, t_or.user_id AS sublessor_user_id,
@@ -325,7 +327,8 @@ export async function generateSubleaseDocument(args: {
       `Unit ${ctx.unit_number} — ${ctx.property_name}`,
       ctx.landlord_name,
       signingUrl,
-      { landlordId: ctx.landlord_id, documentId: doc.id },
+      // 10/5: the sublessor's reply reaches the people who run this property (services/replyRouting).
+      { landlordId: ctx.landlord_id, documentId: doc.id, replyTo: replyToProperty(ctx.property_id) },
     )
   } catch (e) {
     logger.error({ err: e }, '[SUBLEASE-DOC] signer email failed:')

@@ -148,6 +148,8 @@ export const createAndSendSurvey: AgentTool = {
           body: `Please share your input: "${title}"`,
           actionUrl: '/communication?tab=surveys',
           sendEmail: true, emailTo: rec.email, emailSubject: `Survey: ${title}`,
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          replyTo: { kind: 'property', propertyId: r.property.id },
         })
         delivered++
       } catch { /* keep going; the survey exists either way */ }

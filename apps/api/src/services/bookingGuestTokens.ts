@@ -149,8 +149,8 @@ export async function sendBookingGuestAccessEmail(args: {
     return false
   }
 
-  const unit = await queryOne<{ property_name: string | null; unit_number: string | null }>(
-    `SELECT p.name AS property_name, u.unit_number
+  const unit = await queryOne<{ property_name: string | null; unit_number: string | null; property_id: string }>(
+    `SELECT p.name AS property_name, u.unit_number, p.id AS property_id
        FROM units u JOIN properties p ON p.id = u.property_id
       WHERE u.id = $1`,
     [booking.unit_id]
@@ -173,7 +173,11 @@ export async function sendBookingGuestAccessEmail(args: {
     checkOut: booking.check_out,
     stayUrl: issued.url,
     expiresAt: issued.expiresAt,
-    ctx: { landlordId: args.landlordId, bookingId: args.bookingId },
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    ctx: {
+      landlordId: args.landlordId, bookingId: args.bookingId,
+      replyTo: unit?.property_id ? { kind: 'property', propertyId: unit.property_id } : undefined,
+    },
   })
   return true
 }

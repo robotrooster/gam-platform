@@ -716,7 +716,8 @@ businessPosRouter.post('/transactions/:id/email-receipt', requireAuth, async (re
 
     const { emailPosReceipt } = await import('../services/email')
     await emailPosReceipt(to, txn.biz_name, txn.receipt_number, Number(txn.total_amount), buffer,
-      { relatedEntityType: 'business_pos_transaction', relatedEntityId: txn.id })
+      // 10/5: replies reach the business, not GAM (services/replyRouting).
+      { relatedEntityType: 'business_pos_transaction', relatedEntityId: txn.id, replyTo: { kind: 'business', businessId } })
     res.json({ success: true, data: { sentTo: to } })
   } catch (e) { next(e) }
 })

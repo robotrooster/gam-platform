@@ -109,6 +109,9 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       // Optional so every existing caller keeps landing on the caller's own
       // entity; supplied by the entity picker on the Add Property form.
       landlordId: z.string().uuid().optional(),
+      // 10/5: where residents' and guests' replies go (services/replyRouting).
+      // Optional — until set, replies go to whoever runs the property.
+      officeEmail: z.string().trim().toLowerCase().email().max(200).nullable().optional().or(z.literal('')),
       // 16a: allocation rule required on every property creation.
       // S116: three independent fee toggles replace bankingFeePayer.
       // Legacy callers passing bankingFeePayer auto-mirror into ACH+card.
@@ -276,6 +279,10 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
        timezone,
        (body.firstBillingCycle ?? nextMonthIso(timezone)).slice(0, 7) + '-01'])
     const prop = propRes.rows[0]
+    if (body.officeEmail) {
+      await client.query(`UPDATE properties SET office_email = $2 WHERE id = $1`, [prop.id, body.officeEmail])
+      prop.office_email = body.officeEmail
+    }
 
     // S579: open the property's onboarding window. While it's open the landlord
     // can grandfather sitting tenants past the background check (per occupied
@@ -1199,6 +1206,30 @@ propertiesRouter.patch('/:id/processing-fee-payers', requirePerm('properties.edi
       `SELECT register_card_fee_payer, booking_card_fee_payer FROM properties WHERE id = $1`, [req.params.id])
     res.json({ success: true, data: { propertyId: req.params.id, choice,
       registerCardFeePayer: row!.register_card_fee_payer, bookingCardFeePayer: row!.booking_card_fee_payer } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/office-email — 10/5 (Nic): the property's office
+// email is where its residents', guests' and applicants' replies go (services/
+// replyRouting). Blank clears it; until a property has one, replies go to
+// whoever runs the property — never to GAM. It is also the public contact on
+// the booking site.
+propertiesRouter.patch('/:id/office-email', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const raw = req.body?.officeEmail
+    if (raw !== null && typeof raw !== 'string') throw new AppError(400, 'Send officeEmail as text (blank clears it).')
+    const officeEmail = raw === null ? null : (raw.trim().toLowerCase() || null)
+    if (officeEmail && (officeEmail.length > 200 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(officeEmail))) {
+      throw new AppError(400, 'That office email is not a valid email address.')
+    }
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, req.params.id)
+    const row = await queryOne<{ office_email: string | null }>(
+      `UPDATE properties SET office_email = $2, updated_at = NOW() WHERE id = $1 RETURNING office_email`,
+      [req.params.id, officeEmail])
+    res.json({ success: true, data: { propertyId: req.params.id, officeEmail: row!.office_email } })
   } catch (e) { next(e) }
 })
 

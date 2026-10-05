@@ -32,6 +32,7 @@
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { createNotification } from '../services/notifications'
+import { replyToProperty } from '../services/replyRouting'
 import { emailNewLeaseTenantUnsigned } from '../services/email'
 import { portalLink } from '../lib/portalUrls'
 import { NEW_LEASE_UNSIGNED_ALERT_DAYS } from '@gam/shared'
@@ -79,7 +80,7 @@ export async function runRenewalPings(): Promise<RenewalPingResult> {
     SELECT l.id AS lease_id, l.landlord_id,
            (l.end_date - CURRENT_DATE)::int AS days_left,
            to_char(l.end_date, 'FMMonth FMDD, YYYY') AS end_date_label,
-           un.unit_number, p.name AS property_name,
+           un.unit_number, un.property_id, p.name AS property_name,
            tu.id AS user_id, tu.email, tu.first_name
       FROM leases l
       JOIN units un ON un.id = l.unit_id
@@ -116,6 +117,8 @@ export async function runRenewalPings(): Promise<RenewalPingResult> {
         sendEmail: true,
         emailTo: r.email,
         emailSubject: `Your lease ends ${r.end_date_label} — are you staying?`,
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        replyTo: replyToProperty(r.property_id),
       })
       pingedLeases.add(r.lease_id)
     } catch (e) {

@@ -2314,6 +2314,7 @@ export function SchedulePage() {
                     <label className="form-label">Office email</label>
                     <input className="input" type="email" value={bpCfg.officeEmail ?? ''} placeholder="office@yourpark.com"
                       onChange={e => setBpCfg((c: any) => ({ ...c, officeEmail: e.target.value }))} />
+                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>Replies from residents and guests to our emails come here too.</div>
                   </div>
                 </div>
                 <label className="form-label">Office hours</label>

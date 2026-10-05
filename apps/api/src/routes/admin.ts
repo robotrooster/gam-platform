@@ -22,6 +22,7 @@ import { PASSWORD_MIN_LEN, PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_
 import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
 import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } from '../services/email'
+import { replyToProperty } from '../services/replyRouting'
 import { getNexusDashboard, recomputeNexusTally, setStateRegistration } from '../services/nexusMonitor'
 import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 
@@ -1432,7 +1433,7 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
     if (type === 'tenant_invite' || type === 'tenant_invite_reminder') {
       const t = await queryOne<any>(
         `SELECT u.id AS user_id, u.email, u.first_name, u.email_verified,
-                un.unit_number, p.name AS property_name, p.street1, p.city, p.state, p.zip,
+                un.unit_number, p.id AS property_id, p.name AS property_name, p.street1, p.city, p.state, p.zip,
                 p.landlord_id, (llu.first_name || ' ' || llu.last_name) AS landlord_name
            FROM tenants t
            JOIN users u ON u.id = t.user_id
@@ -1470,7 +1471,8 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
       const unitLabel = t.property_name ? `${t.property_name} — Unit ${t.unit_number}` : 'your unit'
       await emailTenantOnboarded(
         t.email, t.first_name, t.landlord_name || 'Your landlord', propertyAddress, unitLabel, activationUrl,
-        { landlordId: t.landlord_id, tenantId: targetId })
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        { landlordId: t.landlord_id, tenantId: targetId, replyTo: replyToProperty(t.property_id) })
 
       await logAdminAction({
         adminUserId: req.user!.userId, actionType: 'resend_tenant_invite',

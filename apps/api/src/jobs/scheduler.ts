@@ -9,6 +9,7 @@ import {
 import { documentDateToIso, NEW_LEASE_TENANT_REMINDER_DAYS } from '@gam/shared'
 import { runLateBalanceDigest } from './lateBalanceDigest'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
+import { replyToProperty } from '../services/replyRouting'
 import { portalLink } from '../lib/portalUrls'
 import { query, queryOne, getClient } from '../db'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
@@ -688,7 +689,10 @@ async function remindByPacket(rows: any[], tag: string): Promise<number> {
         : await tenantLeaseLink({ userId: r.user_id, documentId: r.doc_id, signerToken: r.token, sendTo: r.send_to })
       const title = g.length > 1 ? `your ${g.length} documents for ${unitLabel}` : r.title
       await emailSigningReminder(r.send_to, r.name, title, unitLabel, r.landlord_name, url,
-        { landlordId: r.landlord_id, documentId: r.doc_id, needsSetup, documentCount: g.length })
+        { landlordId: r.landlord_id, documentId: r.doc_id, needsSetup, documentCount: g.length,
+          // 10/5: a resident's reply reaches the people who run this property
+          // (services/replyRouting); the landlord's own reminder stays GAM's.
+          replyTo: r.role === 'landlord' ? undefined : replyToProperty(r.property_id) })
       await query(
         `UPDATE lease_document_signers
             SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1
@@ -717,7 +721,7 @@ export async function processEsignTimeouts() {
       SELECT s.id, s.email, s.name, s.role, s.token, s.user_id,
              CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS send_to,
              d.id as doc_id, d.title, d.landlord_id, d.package_group_id, d.package_sort_order,
-             u.unit_number, p.name as property_name,
+             u.unit_number, u.property_id, p.name as property_name,
              lu.first_name || ' ' || lu.last_name as landlord_name
       FROM lease_document_signers s
       LEFT JOIN users su ON su.id = s.user_id
@@ -795,7 +799,7 @@ export async function processEsignTimeouts() {
     // the moment the rule started existing. Harmless once past.
     const expired = await query<any>(`
       SELECT d.id, d.title, d.document_type, d.landlord_id,
-             u.unit_number, p.name as property_name
+             u.unit_number, u.property_id, p.name as property_name
       FROM lease_documents d
       LEFT JOIN units u ON u.id = d.unit_id
       LEFT JOIN properties p ON p.id = u.property_id
@@ -896,7 +900,9 @@ export async function processEsignTimeouts() {
                 userId: s.user_id, documentId: d.id, signerToken: s.token, sendTo: s.send_to })
               await emailSigningRequest(s.send_to, s.name, d.title, unitLabel,
                 ll?.name || 'Your landlord', link.url,
-                { landlordId: d.landlord_id, documentId: d.id, needsSetup: link.needsSetup })
+                { landlordId: d.landlord_id, documentId: d.id, needsSetup: link.needsSetup,
+                  // 10/5: replies reach the people who run this property (services/replyRouting).
+                  replyTo: replyToProperty(d.property_id) })
               await query(
                 `UPDATE lease_document_signers
                     SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1`, [s.id])
@@ -920,16 +926,19 @@ export async function processEsignTimeouts() {
         // S654: each signer at the address on their own account (the landlord's
         // row keeps its own), never a signer row's possibly stale one.
         const recipients = await query<any>(`
-          SELECT CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS email, s.name
+          SELECT CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS email, s.name, s.role
             FROM lease_document_signers s LEFT JOIN users su ON su.id = s.user_id
            WHERE s.document_id=$1
           UNION ALL
-          SELECT lu.email, (lu.first_name || ' ' || lu.last_name) as name
+          SELECT lu.email, (lu.first_name || ' ' || lu.last_name) as name, 'landlord' AS role
           FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id=$2
         `, [d.id, d.landlord_id])
         for (const rcp of recipients as any[]) {
           try {
-            await emailDocumentAutoVoided(rcp.email, rcp.name, d.title, unitLabel, { landlordId: d.landlord_id, documentId: d.id })
+            // 10/5: a resident's reply ("contact the landlord") reaches the property
+            // (services/replyRouting); the landlord side's copies stay GAM's.
+            await emailDocumentAutoVoided(rcp.email, rcp.name, d.title, unitLabel, { landlordId: d.landlord_id, documentId: d.id,
+              replyTo: rcp.role === 'landlord' ? undefined : replyToProperty(d.property_id) })
           } catch(e) {
             logger.error({ err: e, recipient_email: rcp.email }, '[ESIGN-TIMEOUTS] auto-void email failed')
           }
@@ -1605,7 +1614,7 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
     const rows = await query<any>(`
       SELECT s.id, s.name, s.token, s.user_id,
              COALESCE(su.email, s.email) AS send_to,
-             d.id AS doc_id, d.landlord_id, u.unit_number, p.name AS property_name, d.title,
+             d.id AS doc_id, d.landlord_id, u.unit_number, u.property_id, p.name AS property_name, d.title,
              to_char(nl.start_date, 'YYYY-MM-DD') AS start_date, nl.rent_amount::text AS rent,
              lu.first_name || ' ' || lu.last_name AS landlord_name
         FROM lease_document_signers s
@@ -1643,7 +1652,9 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
         const link = await tenantLeaseLink({ userId: r.user_id, documentId: r.doc_id, signerToken: r.token, sendTo: r.send_to })
         await emailNewLeaseSigningReminder(r.send_to, r.name, unitLabel, r.landlord_name, link.url,
           { startDate: r.start_date, rent: r.rent, needsSetup: link.needsSetup,
-            landlordId: r.landlord_id, documentId: r.doc_id })
+            landlordId: r.landlord_id, documentId: r.doc_id,
+            // 10/5: replies reach the people who run this property (services/replyRouting).
+            replyTo: replyToProperty(r.property_id) })
         await query(`UPDATE lease_document_signers
                         SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1
                       WHERE id = $1`, [r.id])
@@ -1796,7 +1807,7 @@ export async function revealTodaysSites() {
     const due = await query<any>(`
       SELECT b.id, b.guest_name, b.guest_email, b.landlord_id,
              to_char(b.check_in, 'YYYY-MM-DD') AS check_in_date,
-             u.unit_number, u.check_in_time, p.name AS property_name
+             u.unit_number, u.check_in_time, u.property_id, p.name AS property_name
         FROM unit_bookings b
         JOIN units u ON u.id = b.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -1818,7 +1829,8 @@ export async function revealTodaysSites() {
           // the WHERE above) — the UTC date ran a day ahead after 5 pm Phoenix.
           checkIn: b.check_in_date,
           checkInTime: b.check_in_time,
-          ctx: { landlordId: b.landlord_id, bookingId: b.id },
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          ctx: { landlordId: b.landlord_id, bookingId: b.id, replyTo: replyToProperty(b.property_id) },
         })
         await query(`UPDATE unit_bookings SET site_reveal_sent_at = NOW() WHERE id = $1`, [b.id])
         logger.info(`[site-reveal] booking=${b.id} site=${b.unit_number}`)
@@ -2019,6 +2031,8 @@ export async function processTenantEvents() {
           body: eventReleasedNotice({ areaName: r.area_name, how: unpaidHow, endsAt }),
           data: { reservationId: r.id },
           sendEmail: true, emailTo: r.tenant_email,
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          replyTo: replyToProperty(r.property_id),
         })
         // An event the property had been told about (its deposit was paid, then
         // a dispute or bank return took it back) is open again — the property

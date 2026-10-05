@@ -2031,7 +2031,12 @@ async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Pro
       const reasonPlain = (returnCode && ACH_RETURN_CONFIG[returnCode]?.plain) || null
       if (willRetry) {
         const retryDate = addDaysTo(todayIn(pctx.property_tz), 3)
+        // 10/5: the tenant's reply reaches the property — for the landlord's
+        // own charges; a GAM product's retry stays with GAM support.
+        const landlordOwned = (await queryOne<{ ok: boolean }>(
+          `SELECT revenue_owner = 'landlord' AS ok FROM payments WHERE id = $1`, [updatedRow.id]))?.ok === true
         await notifyAchRetryScheduled({
+          propertyId:      landlordOwned ? pctx.property_id : null,
           tenantUserId:    pctx.tenant_user_id,
           tenantEmail:     pctx.tenant_email,
           tenantName:      pctx.tenant_name,

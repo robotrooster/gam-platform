@@ -796,6 +796,8 @@ async function notifyRetryCanceledByShortening(a: {
           + `<ul>${list.map(x => `<li>${x}</li>`).join('')}</ul>`
           + `<p>We won't try your bank again on our own, so please pay it now with a bank account or a card.</p>`
           + `<p><a href="${payUrl}" style="display:inline-block;background:#c9a227;color:#060809;font-weight:700;padding:10px 20px;border-radius:8px;text-decoration:none">Pay now</a></p>`,
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        replyTo: { kind: 'property', propertyId: pctx.property_id },
       })
     } catch (e) {
       logger.error({ err: e, intent, leaseId: a.leaseId }, '[booking-lease-sync] could not tell the tenant their retry was canceled')
@@ -820,8 +822,8 @@ async function notifyLongerStay(a: {
       logger.warn({ leaseId: a.leaseId }, '[booking-lease-sync] longer stay — no tenant account to tell')
       return
     }
-    const ctx = await queryOne<{ tenant_user_id: string; tenant_email: string | null; unit_number: string; property_name: string }>(
-      `SELECT t.user_id AS tenant_user_id, tu.email AS tenant_email, un.unit_number, pr.name AS property_name
+    const ctx = await queryOne<{ tenant_user_id: string; tenant_email: string | null; unit_number: string; property_name: string; property_id: string }>(
+      `SELECT t.user_id AS tenant_user_id, tu.email AS tenant_email, un.unit_number, pr.name AS property_name, pr.id AS property_id
          FROM tenants t
          JOIN users tu ON tu.id = t.user_id
          JOIN leases l ON l.id = $1
@@ -879,6 +881,8 @@ async function notifyLongerStay(a: {
         + (payUrl
           ? `<p><a href="${payUrl}" style="display:inline-block;background:#c9a227;color:#060809;font-weight:700;padding:10px 20px;border-radius:8px;text-decoration:none">Pay now</a></p>`
           : ''),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: { kind: 'property', propertyId: ctx.property_id },
     })
   } catch (e) {
     logger.error({ err: e, leaseId: a.leaseId }, '[booking-lease-sync] could not tell the tenant about the longer stay')

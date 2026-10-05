@@ -1203,6 +1203,8 @@ inspectionsRouter.post('/:id/flag-suspicious', requirePerm('inspections.manage')
           sendEmail: true, emailTo: t.email,
           emailSubject: `In-person inspection scheduled for ${scheduledFor}`,
           emailHtml: tenantBody,
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          replyTo: { kind: 'property', propertyId: unit.property_id },
         })
       }
     } catch (e) {

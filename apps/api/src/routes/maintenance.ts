@@ -363,12 +363,13 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
     try {
       if (effectiveStatus && effectiveStatus !== request.status && effectiveStatus !== 'awaiting_approval') {
         const tenant = await queryOne<any>(`SELECT u.id, u.email, u.phone FROM users u JOIN tenants t ON t.user_id=u.id WHERE t.id=$1`, [request.tenant_id])
-        const unit = await queryOne<any>(`SELECT unit_number FROM units WHERE id=$1`, [request.unit_id])
+        const unit = await queryOne<any>(`SELECT unit_number, property_id FROM units WHERE id=$1`, [request.unit_id])
         if (tenant) await notifyMaintenanceUpdated({
           tenantUserId: tenant.id,
           tenantEmail: tenant.email,
           tenantPhone: tenant.phone,
           unitNumber: unit?.unit_number,
+          propertyId: unit?.property_id,  // 10/5: the tenant's reply reaches the property
           requestTitle: request.title,
           newStatus: effectiveStatus,
           scheduledAt: scheduledAt,
@@ -493,12 +494,13 @@ maintenanceRouter.post('/:id/approve', requirePerm('maintenance.approve'), async
     // Notify tenant — their request is moving forward
     try {
       const tenant = await queryOne<any>(`SELECT u.id, u.email, u.phone FROM users u JOIN tenants t ON t.user_id=u.id WHERE t.id=$1`, [request.tenant_id])
-      const unit = await queryOne<any>(`SELECT unit_number FROM units WHERE id=$1`, [request.unit_id])
+      const unit = await queryOne<any>(`SELECT unit_number, property_id FROM units WHERE id=$1`, [request.unit_id])
       if (tenant) await notifyMaintenanceUpdated({
         tenantUserId: tenant.id,
         tenantEmail: tenant.email,
         tenantPhone: tenant.phone,
         unitNumber: unit?.unit_number,
+        propertyId: unit?.property_id,  // 10/5: the tenant's reply reaches the property
         requestTitle: request.title,
         newStatus: nextStatus,
         scheduledAt: undefined,

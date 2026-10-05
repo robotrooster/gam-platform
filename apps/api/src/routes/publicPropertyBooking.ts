@@ -246,8 +246,10 @@ publicPropertyBookingRouter.post('/property/:slug/stay-link', publicWriteLimiter
       const { issueBookingGuestToken } = await import('../services/bookingGuestTokens')
       const issued = await issueBookingGuestToken({ bookingId: s.id, landlordId: prop.landlord_id, delivery: 'email' })
       const { emailGuestStayLink } = await import('../services/email')
+      // 10/5: replies reach the people who run this property (services/replyRouting).
       await emailGuestStayLink(b.email, s.guest_name, prop.name,
-        storefrontStayUrl(req.params.slug, issued.token), { landlordId: prop.landlord_id })
+        storefrontStayUrl(req.params.slug, issued.token),
+        { landlordId: prop.landlord_id, replyTo: { kind: 'property', propertyId: prop.id } })
         .catch(() => {})
     }
     res.json({ success: true, data: { sent: true } })

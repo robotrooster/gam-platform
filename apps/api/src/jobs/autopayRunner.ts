@@ -84,6 +84,7 @@ import { getStripe } from '../lib/stripe'
 import { chargeLeaseBalance, quoteLeaseCharge, CreditChangedError, payAllRunCreditWaiting, creditWaitingSentence } from '../services/rentCharge'
 import { createNotification, notifyAutopayFailed, type AutopayFailureKind } from '../services/notifications'
 import { createAdminNotification } from '../services/adminNotifications'
+import { propertyIdForLease } from '../services/replyRouting'
 import { logger } from '../lib/logger'
 import { registerEngine } from './timezoneCronManager'
 import { formatCurrency } from '@gam/shared'
@@ -629,7 +630,9 @@ async function handleFailure(
       } catch (err) {
         logger.error({ err, leaseId: c.lease_id }, '[autopay] pay link failed')
       }
-      await notifyAutopayFailed({ tenantUserId: t.user_id, tenantEmail: t.email, disarming, kind, payUrl })
+      // 10/5: a reply about rent owed reaches the property (services/replyRouting).
+      const propertyId = kind === 'payment_method' ? await propertyIdForLease(c.lease_id).catch(() => null) : null
+      await notifyAutopayFailed({ tenantUserId: t.user_id, tenantEmail: t.email, disarming, kind, payUrl, propertyId })
     }
   } catch (err) {
     logger.error({ err, leaseId: c.lease_id }, '[autopay] tenant failure notice failed')

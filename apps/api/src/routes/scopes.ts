@@ -496,7 +496,9 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
       await client.query('COMMIT')
 
       const inviterName = await getInviterName(landlordId)
-      emailInvitation(body.email, inviterName, role, buildAcceptUrl(token), { landlordId, invitationId: invitation.id })
+      // 10/5: replies reach the person who sent this invite (services/replyRouting).
+      emailInvitation(body.email, inviterName, role, buildAcceptUrl(token),
+        { landlordId, invitationId: invitation.id, replyTo: { kind: 'person', userId: req.user!.userId } })
         .catch(e => logger.error({ err: e }, '[EMAIL] invite failed'))
 
       res.status(201).json({ success: true, data: invitation })
@@ -657,7 +659,9 @@ scopesRouter.post('/invitations/:id/resend', requirePerm('team.invite'), async (
       await client.query('COMMIT')
 
       const inviterName = await getInviterName(landlordId)
-      emailInvitation(inv.email, inviterName, inv.role, buildAcceptUrl(token), { landlordId, invitationId: inv.id, resend: true })
+      // 10/5: replies reach the person who re-sent this invite (services/replyRouting).
+      emailInvitation(inv.email, inviterName, inv.role, buildAcceptUrl(token),
+        { landlordId, invitationId: inv.id, resend: true, replyTo: { kind: 'person', userId: req.user!.userId } })
         .catch(e => logger.error({ err: e }, '[EMAIL] resend failed'))
 
       res.json({ success: true, data: upd.rows[0] })

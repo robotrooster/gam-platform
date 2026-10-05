@@ -21,6 +21,7 @@ import { DateTime } from 'luxon'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
+import { replyToProperty } from './replyRouting'
 
 export interface MoveOutNoticeLease {
   id: string
@@ -208,6 +209,8 @@ export async function recordMoveOutNotice(opts: {
         sendEmail: true,
         emailTo: r.email,
         emailSubject: `Move-out on ${when} — ${lease.property_name}`,
+        // 10/5: "tell the office" — the reply reaches the people who run this property (services/replyRouting).
+        replyTo: replyToProperty(lease.property_id),
       })
     }
   } catch (err) {
@@ -267,6 +270,8 @@ export async function cancelMoveOutNotice(opts: { leaseId: string; byUserId: str
         sendEmail: true,
         emailTo: r.email,
         emailSubject: `Staying on — ${lease.property_name}`,
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        replyTo: replyToProperty(lease.property_id),
       })
     }
   } catch (err) {

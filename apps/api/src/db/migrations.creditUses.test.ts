@@ -1300,7 +1300,8 @@ describe('S655 test cleanup knows the new tables', () => {
 // ─── contract step C0 ───────────────────────────────────────────────────────
 
 describe('S655 contract step C0', () => {
-  const C0 = fs.readFileSync(path.join(__dirname, 'contract', '20261003109000_credit_ledger_guards.sql'), 'utf8')
+  // 10/4: C0 moved from contract/ into migrations/.
+  const C0 = fs.readFileSync(path.join(__dirname, 'migrations', '20261003109000_credit_ledger_guards.sql'), 'utf8')
 
   it('C0: a direct write to amount_remaining is refused; the ledger and the backfill pass', async () => {
     // DDL is transactional: applied and checked inside one transaction, then

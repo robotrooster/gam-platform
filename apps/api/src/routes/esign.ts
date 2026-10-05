@@ -52,6 +52,7 @@ import { suggestUnitPrefill } from '../services/leasePrefill'
 import { detectPropertyFromPdf } from '../services/templatePropertyDetect'
 import { createAdminNotification } from '../services/adminNotifications'
 import { emailSigningRequest, emailSigningCompleted, emailSigningReminder } from '../services/email'
+import { replyToProperty, type ReplyTo } from '../services/replyRouting'
 import { portalUrl } from '../lib/portalUrls'
 import { createNotification } from '../services/notifications'
 import crypto from 'crypto'
@@ -296,6 +297,21 @@ async function signerDeliveryAddress(s: { role: string; email: string; user_id: 
   if (s.role === 'landlord') return s.email
   const u = await queryOne<{ email: string }>('SELECT email FROM users WHERE id = $1', [s.user_id])
   return u?.email ?? s.email
+}
+
+// 10/5: replies reach the people who run this property (services/replyRouting) —
+// a resident's, co-signer's or witness's copy; the landlord's own copy stays GAM's.
+async function signerReplyTo(
+  signer: { role: string; user_id?: string | null }, propertyId: string | null | undefined,
+): Promise<ReplyTo | undefined> {
+  if (signer.role === 'landlord') return undefined
+  // A landlord-side login signing in a generic role (seller, party_N, custom)
+  // is still the landlord side: its replies stay with GAM support.
+  if (signer.user_id) {
+    const u = await queryOne<{ role: string }>(`SELECT role FROM users WHERE id = $1`, [signer.user_id]).catch(() => null)
+    if (u && u.role !== 'tenant' && u.role !== 'contact') return undefined
+  }
+  return replyToProperty(propertyId)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -5407,7 +5423,7 @@ esignRouter.post('/documents/:id/remind', requireAuth, requirePerm('esign.send')
   try {
     const doc = await queryOne<any>(`
       SELECT d.id, d.title, d.status, d.landlord_id, d.voided_at,
-             u.unit_number, p.name AS property_name,
+             u.unit_number, u.property_id, p.name AS property_name,
              COALESCE(NULLIF(la.business_name,''), lu.first_name||' '||lu.last_name) AS landlord_name
         FROM lease_documents d
         LEFT JOIN units u ON u.id = d.unit_id
@@ -5452,7 +5468,8 @@ esignRouter.post('/documents/:id/remind', requireAuth, requirePerm('esign.send')
     }
 
     await emailSigningReminder(sendTo, signer.name, doc.title, unitLabel,
-      doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
+      doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id, needsSetup,
+        replyTo: await signerReplyTo(signer, doc.property_id) })
 
     await query(
       `UPDATE lease_document_signers
@@ -5465,7 +5482,7 @@ esignRouter.post('/documents/:id/remind', requireAuth, requirePerm('esign.send')
 esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), async (req, res, next) => {
   try {
     const doc = await queryOne<any>(`
-      SELECT d.*, u.unit_number, p.name as property_name, p.timezone AS property_timezone,
+      SELECT d.*, u.unit_number, u.property_id, p.name as property_name, p.timezone AS property_timezone,
              lu.first_name || ' ' || lu.last_name as landlord_name
       FROM lease_documents d
       LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
@@ -5706,7 +5723,8 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
     // they are reached only at the address on their own account.
     const firstSignerAddress = await signerDeliveryAddress(firstSigner)
 
-    await emailSigningRequest(firstSignerAddress, firstSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id })
+    await emailSigningRequest(firstSignerAddress, firstSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl,
+      { landlordId: doc.landlord_id, documentId: doc.id, replyTo: await signerReplyTo(firstSigner, doc.property_id) })
     await createNotification({
       userId: firstSigner.user_id,
       type: 'esign_request',
@@ -6354,7 +6372,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     }
 
     const docRes = await client.query(`
-      SELECT d.*, u.unit_number, u.unit_type, p.name as property_name, p.timezone AS property_timezone,
+      SELECT d.*, u.unit_number, u.unit_type, u.property_id, p.name as property_name, p.timezone AS property_timezone,
         lu.first_name || ' ' || lu.last_name as landlord_name, lu.email as landlord_email
       FROM lease_documents d
       LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
@@ -7020,7 +7038,8 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         // S654: the executed copy rides along, so it goes only to the address on
         // each signer's own account (the landlord's row keeps its own).
         await emailSigningCompleted(await signerDeliveryAddress(s), s.name, doc.title, unitLabel, undefined, portalHome,
-          { landlordId: doc.landlord_id, documentId: doc.id }, executedBytes ?? undefined)
+          { landlordId: doc.landlord_id, documentId: doc.id, replyTo: await signerReplyTo(s, doc.property_id) },
+          executedBytes ?? undefined)
         await createNotification({
           userId: s.user_id,
           type: 'esign_completed',
@@ -7083,9 +7102,11 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
             { startDate: newLeaseTerms.start_date, rent: newLeaseTerms.rent_amount,
               // Signed on or after its start date: it is their lease already.
               started: newLeaseTerms.start_date <= todayIn(newLeaseTerms.tz),
-              landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
+              landlordId: doc.landlord_id, documentId: doc.id, needsSetup,
+              replyTo: await signerReplyTo(nextSigner, doc.property_id) })
         } else {
-          await emailSigningRequest(nextSignerAddress, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl, { landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
+          await emailSigningRequest(nextSignerAddress, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl,
+            { landlordId: doc.landlord_id, documentId: doc.id, needsSetup, replyTo: await signerReplyTo(nextSigner, doc.property_id) })
         }
         await createNotification({
           userId: nextSigner.user_id,

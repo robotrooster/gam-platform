@@ -22,6 +22,7 @@ import { syncLeaseWithBookingDates } from '../services/bookingLeaseBilling'
 import { bookedDayBeforeEarlyCheckOut, checkOutChangeRefusal, onCheckOutUndone, afterPatchEarlyCheckOut, refundNeedsRetrySql, healLeaseEnds } from '../services/earlyCheckOut'
 import { scheduleStayPrice } from '../services/registerStay'
 import { assertLateFeeDecision } from '../services/lateFeePolicy'
+import { replyToProperty } from '../services/replyRouting'
 import {
   sendBookingGuestAccessEmail,
   issueBookingGuestToken,
@@ -2440,7 +2441,7 @@ unitsRouter.post('/:id/bookings/:bookingId/guest-access', requirePerm('guest_acc
     if (body.sendEmail && booking.guest_email) {
       const { emailBookingGuestAccess } = await import('../services/email')
       const ctx = await queryOne<any>(
-        `SELECT b.guest_name, b.check_in, b.check_out, p.name AS property_name, u.unit_number
+        `SELECT b.guest_name, b.check_in, b.check_out, p.name AS property_name, u.unit_number, u.property_id
            FROM unit_bookings b
            LEFT JOIN units u ON u.id = b.unit_id
            LEFT JOIN properties p ON p.id = u.property_id
@@ -2454,7 +2455,8 @@ unitsRouter.post('/:id/bookings/:bookingId/guest-access', requirePerm('guest_acc
         checkOut: ctx?.check_out,
         stayUrl: issued.url,
         expiresAt: issued.expiresAt,
-        ctx: { landlordId: booking.landlord_id, bookingId: booking.id },
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        ctx: { landlordId: booking.landlord_id, bookingId: booking.id, replyTo: replyToProperty(ctx?.property_id) },
       })
       emailed = true
     }

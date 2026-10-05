@@ -189,6 +189,9 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     requiresBookingAcknowledgment: property?.requiresBookingAcknowledgment ?? false,
     // S652 (Nic): required when a property is created — the floor every bill's due month sits on.
     firstBillingCycle: property?.firstBillingCycle ? String(property.firstBillingCycle).slice(0, 7) : nextMonthYm(),
+    // 10/5: where this property's residents' and guests' replies go. Asked when
+    // the property is set up; edited later on the property's page.
+    officeEmail: property?.officeEmail || '',
     // S526: weekly-lease jurisdictions — auto-drafts a lease at 7+ day stays
     // instead of 30+ (see services/bookingLeaseDraft.ts).
     weeklyLeaseMode: property?.weeklyLeaseMode ?? false,
@@ -421,8 +424,11 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     // 16a: convert string inputs to numbers/null for allocation rule
     const ar = form.allocationRule
     const num = (s: string) => s === '' ? null : parseFloat(s)
+    const { officeEmail, ...rest } = form
     const payload = {
-      ...form,
+      ...rest,
+      // Only a new property sends it; an existing one is edited on its page.
+      ...(property ? {} : { officeEmail: officeEmail.trim() || null }),
       allocationRule: {
         achFeePayer:       ar.achFeePayer,
         cardFeePayer:      ar.achFeePayer,
@@ -632,6 +638,14 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 <input type="month" className="input" value={form.firstBillingCycle} onChange={e => setForm(f => ({ ...f, firstBillingCycle: e.target.value }))} style={{ width: 180 }} />
                 <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>GAM sends the first bill for this month and nothing earlier. Existing residents you add mid-month get their first bill here; what happened before stays outside GAM.</div>
                 {errors.firstBillingCycle && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.firstBillingCycle}</div>}
+              </div>
+            )}
+            {!property && (
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Office email</label>
+                <input type="email" className="input" value={form.officeEmail} placeholder="office@yourproperty.com"
+                  onChange={e => setForm(f => ({ ...f, officeEmail: e.target.value }))} style={{ width: 280 }} />
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>When residents, guests or applicants reply to an email from us, it comes here. Leave it blank and replies go to whoever runs this property.</div>
               </div>
             )}
             <label style={{

@@ -51,6 +51,7 @@ import { applyScreeningWaive, isExistingTenancyInvite, getOnboardingWindow } fro
 import { allocateInvoiceNumber } from './invoiceNumbers'
 import { emailTenantOnboarded, emailTenantInvite } from './email'
 import { createNotification } from './notifications'
+import { replyToProperty } from './replyRouting'
 import { resolveDefaultTemplateForUnit } from './templateResolve'
 import { NOT_A_RESIDENT_ACCOUNT, accountTiedElsewhere } from '../jobs/leaseParser/resolveIntent'
 
@@ -494,12 +495,14 @@ async function sendFallbackInvites(unit: any, landlordId: string, invited: Invit
           RETURNING id`, [token, p.userId, PLACEHOLDER_PASSWORD])
       if (!set) continue
       const url = portalLink('tenant', `accept-invite?token=${token}`)
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      const replyTo = replyToProperty(unit.property_id)
       if (kind === 'invite') {
         await emailTenantInvite(p.email, p.firstName, landlordName, unit.property_name, `Unit ${unit.unit_number}`, url, false,
-          { landlordId, tenantId: p.tenantId })
+          { landlordId, tenantId: p.tenantId, replyTo })
       } else {
         await emailTenantOnboarded(p.email, p.firstName, landlordName, propertyAddress, unitLabel, url,
-          { landlordId, tenantId: p.tenantId })
+          { landlordId, tenantId: p.tenantId, replyTo })
       }
       p.notified = 'email'
     } catch (err) {

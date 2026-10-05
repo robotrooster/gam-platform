@@ -463,7 +463,8 @@ businessInvoicesRouter.post('/:id/send', requireAuth, async (req, res, next) => 
           totalAmount:   Number(inv.total_amount),
           dueDate:       dueIso,
           payUrl:        hostedUrl,
-          ctx: { businessId, invoiceId: inv.id },
+          // 10/5: replies reach the business, not GAM (services/replyRouting).
+          ctx: { businessId, invoiceId: inv.id, replyTo: { kind: 'business', businessId } },
         })
       } catch {/* logged at email-service layer */}
     }

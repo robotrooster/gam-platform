@@ -62,7 +62,8 @@ export async function sendAppointmentReminders(): Promise<ReminderRunResult> {
         serviceType: r.service_type,
         scheduledFor: new Date(r.scheduled_for),
         durationMinutes: r.duration_minutes,
-        ctx: { businessId: r.business_id, appointmentId: r.id },
+        // 10/5: replies reach the business, not GAM (services/replyRouting).
+        ctx: { businessId: r.business_id, appointmentId: r.id, replyTo: { kind: 'business', businessId: r.business_id } },
       })
       // Stamp only after a successful send so a failure retries next run.
       await query(

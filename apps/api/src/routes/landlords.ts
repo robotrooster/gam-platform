@@ -14,6 +14,7 @@ import { rentCollectedFrom, incomeCardFrom } from '../lib/rentCollected'
 import { parseIncomeBasis, basisMeta, incomeEvents, byMonth, breakdownFrom } from '../services/incomeBasis'
 import { todayIn as todayInZone } from '../lib/timezone'
 import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue, emailSigningRequest } from '../services/email'
+import { replyToProperty } from '../services/replyRouting'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { createNotification } from '../services/notifications'
 import { applyScreeningWaive, listOnboardingWindowsForLandlord, openOnboardingWindow, approvedCheckForAccountSql, screeningWaivedByAccountSql } from '../services/onboardingWindow'
@@ -298,7 +299,8 @@ landlordsRouter.post('/pos-customers/:id/send-onboarding', requireAuth, requireL
         customerName:  customer.first_name + ' ' + customer.last_name,
         merchantName:  customer.landlord_name,
         token:         inv!.token,
-        ctx:           { landlordId: customer.landlord_id, posCustomerId: customer.id },
+        // 10/5: replies reach the staff member who sent this invite (services/replyRouting).
+        ctx:           { landlordId: customer.landlord_id, posCustomerId: customer.id, replyTo: { kind: 'person', userId: req.user!.userId } },
       })
     } catch (e) {
       logger.error({ err: e }, '[POS-CUSTOMER-ONBOARDING] email send failed:')
@@ -2570,7 +2572,8 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
         // S654: to the address on the account.
         await emailTenantOnboarded(
           existingUser?.email ?? emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl!,
-          { landlordId, tenantId }
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          { landlordId, tenantId, replyTo: replyToProperty(unit.property_id) }
         )
       }
     } catch (emailErr) {
@@ -5596,6 +5599,8 @@ landlordsRouter.post('/me/pm-property-invitations', requirePerm('pm_invitations.
               pmCompanyId: body.pmCompanyId,
               invitationId,
               landlordId: pmInviteLandlordId,
+              // 10/5: replies reach the person who sent this invite (services/replyRouting).
+              replyTo: { kind: 'person', userId: req.user!.userId },
             },
           })
         } catch (mailErr) {
@@ -5781,7 +5786,8 @@ async function createCoOwnerInvitation(landlordId: string, email: string, invite
     // "added you as an owner of a property on GAM on GAM".
     email.trim(), inviterName, entity.business_name || 'a property',
     `${base}/accept-owner-invite/${token}`,
-    { landlordId, invitationId: row!.id },
+    // 10/5: replies reach the partner who sent this invite (services/replyRouting).
+    { landlordId, invitationId: row!.id, replyTo: { kind: 'person', userId: invitedByUserId } },
   ).catch(() => { /* the invite row stands; it can be resent */ })
   return row!
 }
@@ -6218,6 +6224,7 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
           // change above, S654).
           const sig = await queryOne<any>(
             `SELECT s.token, s.name, s.email, d.title, d.landlord_id, un.unit_number, p.name AS property_name,
+                    un.property_id,
                     COALESCE(NULLIF(la.business_name,''), lu.first_name||' '||lu.last_name) AS landlord_name
                FROM lease_document_signers s
                JOIN lease_documents d ON d.id = s.document_id
@@ -6239,7 +6246,8 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
           const unitLabel = sig.unit_number ? `Unit ${sig.unit_number} — ${sig.property_name}` : sig.title
           try {
             await emailSigningRequest(accountEmail, sig.name, sig.title, unitLabel, sig.landlord_name, link.url,
-              { landlordId: sig.landlord_id, documentId: openDoc.id, needsSetup: link.needsSetup })
+              // 10/5: replies reach the people who run this property (services/replyRouting).
+              { landlordId: sig.landlord_id, documentId: openDoc.id, needsSetup: link.needsSetup, replyTo: replyToProperty(sig.property_id) })
             sent = true
           } catch (e) {
             logger.error({ err: e, to: accountEmail }, '[INVITE] lease email resend failed')
@@ -6254,7 +6262,7 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
         // change here: their live link (checked above) is re-sent, so the
         // first company's email keeps working.
         const ctx = await queryOne<any>(
-          `SELECT p.name AS property_name, un.unit_number,
+          `SELECT p.id AS property_id, p.name AS property_name, un.unit_number,
                   COALESCE(NULLIF(la.business_name, ''),
                            NULLIF(TRIM(lu.first_name || ' ' || lu.last_name), ''),
                            'Your landlord') AS landlord_name
@@ -6307,7 +6315,8 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
               ctx?.unit_number ? `Unit ${ctx.unit_number}` : null,
               portalLink('tenant', `accept-invite?token=${inviteToken}`),
               !intent.unit_id,
-              { landlordId: intent.landlord_id, tenantId: intent.tenant_id },
+              // 10/5: replies reach the people who run this property (services/replyRouting).
+              { landlordId: intent.landlord_id, tenantId: intent.tenant_id, replyTo: replyToProperty(ctx?.property_id) },
             )
             sent = true
           } catch (e) {
@@ -6417,6 +6426,7 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
       const unitLabel = at.property_name
         ? (at.unit_number ? `${at.property_name} — ${at.unit_number}` : at.property_name)
         : rows[0].landlord_name
+      // 10/5: replies reach the people who run this property (services/replyRouting).
       const id = await emailBalanceDue(rows[0].email, {
         tenantName: rows[0].first_name || rows[0].tenant_name || 'there',
         unitLabel,
@@ -6429,7 +6439,7 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
         // tenant's own inbox skips the emailed code (password still required).
         portalUrl: payNowLink({ tenant_user_id: rows[0].tenant_user_id, tenant_email: rows[0].email }),
         landlordName: rows[0].landlord_name,
-      }, { landlordId: rows[0].landlord_id, tenantId })
+      }, { landlordId: rows[0].landlord_id, tenantId, replyTo: replyToProperty(at.property_id) })
 
       res.json({ success: true, data: {
         sent: !!id, to: rows[0].email, total, creditAvailable, lines: rows.length,

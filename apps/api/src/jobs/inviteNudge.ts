@@ -12,6 +12,7 @@
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { emailTenantInviteReminder } from '../services/email'
+import { replyToProperty } from '../services/replyRouting'
 // S655: portalLink, never a localhost fallback (the S641 rule every other
 // tenant link already follows).
 import { portalLink } from '../lib/portalUrls'
@@ -28,7 +29,7 @@ export async function nudgeExpiringInvites(): Promise<InviteNudgeResult> {
     SELECT pti.id,
            u.email, u.first_name AS tenant_first, u.tenant_invite_token,
            EXTRACT(DAY FROM (u.tenant_invite_expires_at - NOW()))::int AS days_left,
-           un.unit_number, p.name AS property_name,
+           un.unit_number, p.id AS property_id, p.name AS property_name,
            lu.first_name AS ll_first, lu.last_name AS ll_last,
            pti.landlord_id, pti.tenant_id
       FROM pending_tenant_intents pti
@@ -71,7 +72,8 @@ export async function nudgeExpiringInvites(): Promise<InviteNudgeResult> {
       const daysLeft = Math.max(1, Number(r.days_left) || 1)
       await emailTenantInviteReminder(
         r.email, r.tenant_first || 'there', landlordName, unitLabel, activationUrl, daysLeft,
-        { landlordId: r.landlord_id, tenantId: r.tenant_id })
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        { landlordId: r.landlord_id, tenantId: r.tenant_id, replyTo: replyToProperty(r.property_id) })
       await query(`UPDATE pending_tenant_intents SET invite_last_nudged_at = NOW(), updated_at = NOW() WHERE id = $1`, [r.id])
       nudged++
     } catch (e) {

@@ -47,6 +47,7 @@ import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { isFeatureEnabled } from '../services/systemFeatures'
 import { appendEvent } from '../services/creditLedger'
+import { replyToProperty } from '../services/replyRouting'
 import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
 
@@ -256,10 +257,12 @@ subleasesRouter.post('/', async (req, res, next) => {
       try {
         const inviteCtx = await queryOne<{
           unit_number: string
+          property_id: string
           property_name: string
           sublessor_name: string
         }>(
           `SELECT u.unit_number,
+                  u.property_id,
                   p.name AS property_name,
                   tu.first_name || ' ' || tu.last_name AS sublessor_name
              FROM leases l
@@ -284,6 +287,8 @@ subleasesRouter.post('/', async (req, res, next) => {
             ctx: {
               masterLeaseId:     body.masterLeaseId,
               sublessorTenantId,
+              // 10/5: replies reach the people who run this property (services/replyRouting).
+              replyTo:           replyToProperty(inviteCtx.property_id),
             },
           })
         }

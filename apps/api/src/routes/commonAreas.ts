@@ -356,13 +356,13 @@ commonAreasRouter.post('/reservations/:rid/decide', requirePerm('amenities.revie
       `SELECT us.id AS user_id, us.email FROM tenants t JOIN users us ON us.id = t.user_id WHERE t.id = $1`,
       [r.reserved_by_tenant_id])
     const meta = await queryOne<any>(
-      `SELECT ca.name AS area_name, p.name AS property_name
+      `SELECT ca.name AS area_name, p.name AS property_name, p.id AS property_id
          FROM common_areas ca JOIN properties p ON p.id = ca.property_id WHERE ca.id = $1`,
       [r.common_area_id])
     if (tenantUser?.email && meta) {
       await notifyReservationDecision({
         tenantUserId: tenantUser.user_id, tenantEmail: tenantUser.email,
-        areaName: meta.area_name, propertyName: meta.property_name, approved: b.approve,
+        areaName: meta.area_name, propertyName: meta.property_name, propertyId: meta.property_id, approved: b.approve,
         startsAt: r.starts_at, endsAt: r.ends_at, decisionNote: note,
       })
     }

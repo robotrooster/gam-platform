@@ -9,6 +9,7 @@ import { requireAuth, requirePerm, userHasPerm, forgetSessionCutoff } from '../m
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { emailTenantInvite } from '../services/email'
+import { replyToProperty } from '../services/replyRouting'
 import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
@@ -2307,7 +2308,8 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
       if (acceptUrl) {
         // S654: to the address on the account, never the one typed.
         await emailTenantInvite(user!.email, firstName, landlordName, propertyName, null, acceptUrl, true,
-          { landlordId: inviteLandlordId, tenantId })
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          { landlordId: inviteLandlordId, tenantId, replyTo: replyToProperty(inviterPropertyId) })
         notified = 'email'
       } else {
         // S616/S654: already on GAM. Tell them in the account they have.

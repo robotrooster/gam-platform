@@ -307,8 +307,10 @@ export async function notifyDisplacedHolds(
           + (o.linkKept ? ` Their pay link still works — it now pays for site ${o.toUnitNumber}; nothing to resend.` : ''),
       }).catch(() => {})
       if (o.guestEmail) {
+        // 10/5: replies reach the people who run this property (services/replyRouting).
         await emailBookingSiteChanged(
-          o.guestEmail, o.guestName, propName, o.fromUnitNumber, o.toUnitNumber!, { landlordId },
+          o.guestEmail, o.guestName, propName, o.fromUnitNumber, o.toUnitNumber!,
+          { landlordId, replyTo: { kind: 'property', propertyId } },
         ).catch(() => {})
       }
     } else {
