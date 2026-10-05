@@ -199,7 +199,7 @@ export function OnboardingPage() {
   )
 
   const completeMut = useMutation(
-    () => apiPost('/landlords/complete-onboarding', { signature, agreedAt: new Date().toISOString(), coverFees }),
+    () => apiPost('/landlords/complete-onboarding', { signature, agreedAt: new Date().toISOString(), coverFees, propertyId: targetPropertyId }),
     { onSuccess: async () => {
       await refresh?.()
       // S604: same reason as addPropertyMut — everything downstream of the

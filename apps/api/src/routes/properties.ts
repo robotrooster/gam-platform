@@ -134,10 +134,9 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
         placementFeeValue: z.number().nullable().optional(),
         maintenanceMarkupPercent: z.number().nullable().optional(),
         ownerBankAccountId: z.string().uuid().nullable().optional(),
-      // S513 (#2): fee payers are no longer required on create. card_fee_payer
-      // is hard-locked to 'tenant' and ach_fee_payer inherits the landlord's
-      // onboarding election (landlords.default_ach_fee_payer) when omitted, so
-      // a caller need not supply either. allocationRule itself is optional —
+      // S513 (#2): fee payers are not required on create — a property with no
+      // answer passes the fees on (10/5: the choice is the property's own,
+      // never inherited from its company). allocationRule itself is optional —
       // this also fixes onboarding step-1, which posts a property with no
       // allocationRule and previously 400'd on the old required-payer refine.
       }).default({}),
@@ -337,22 +336,15 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
 
     // Allocation rule INSERT — 1:1 with property.
     // 10/5 (Nic): ONE card-and-bank fee choice per property for everyone who
-    // pays there (PROCESSING_FEE_CHOICES). It starts from the company's
-    // onboarding election (landlords.default_ach_fee_payer), overridable by an
-    // explicit achFeePayer / cardFeePayer in the request; the database copies
-    // it to card and to the property's counter and booking-site columns.
-    // 10/5: read from the property's company. It read req.user.profileId,
-    // which names no company for a landlord since S633, so every new property
-    // ignored the election.
-    const dfltRes = await client.query<{ default_ach_fee_payer: string }>(
-      `SELECT default_ach_fee_payer FROM landlords WHERE id=$1`,
-      [prop.landlord_id]
-    )
-    const landlordAchDefault = dfltRes.rows[0]?.default_ach_fee_payer ?? 'tenant'
+    // pays there (PROCESSING_FEE_CHOICES). It is the PROPERTY's own answer —
+    // never a company default ("There's things at the company level, there's
+    // things at the property level and there's things at the unit level").
+    // No answer = pass them on. The database copies it to card and to the
+    // property's counter and booking-site columns.
     if (ar.achFeePayer && ar.cardFeePayer && ar.achFeePayer !== ar.cardFeePayer) {
       throw new AppError(400, 'Card and bank payment fees are one choice: pass them on, or cover them.')
     }
-    const achFeePayer       = ar.achFeePayer ?? ar.cardFeePayer ?? ar.bankingFeePayer ?? landlordAchDefault
+    const achFeePayer       = ar.achFeePayer ?? ar.cardFeePayer ?? ar.bankingFeePayer ?? 'tenant'
     const cardFeePayer      = achFeePayer
     const platformFeePayer  = 'landlord'   // S607 lock — never from the request
     await client.query(`

@@ -1320,14 +1320,16 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
 // their own onboarding (legal agreement signature). Not delegable.
 landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async (req, res, next) => {
   try {
-    const { signature, agreedAt, coverFees, coverTenantAch } = req.body
+    const { signature, agreedAt, coverFees, coverTenantAch, propertyId } = req.body
     if (!signature) return res.status(400).json({ success: false, error: 'Signature required' })
 
-    // 10/5 (Nic): card and bank payment fees are ONE choice per property, for
-    // everyone who pays there — pass them on (default) or cover them. A page
-    // cached from before still sends coverTenantAch; it means the same thing now.
+    // 10/5 (Nic): card and bank payment fees are ONE choice per PROPERTY, for
+    // everyone who pays there — pass them on (default) or cover them. It is the
+    // property's own answer, never a company default: onboarding answers it for
+    // the property being set up. A page cached from before still sends
+    // coverTenantAch; it means the same thing now.
     const covers = coverFees === true || (coverFees === undefined && coverTenantAch === true)
-    const achPayer: 'landlord' | 'tenant' = covers ? 'landlord' : 'tenant'
+    const feePayer: 'landlord' | 'tenant' = covers ? 'landlord' : 'tenant'
     // S633: onboarding is completed FOR a company — the signature is that
     // company's agreement. Named explicitly, or the account's only one.
     const settingsLandlordId = await landlordForRequest(req, 'company')
@@ -1336,25 +1338,32 @@ landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async
       UPDATE landlords SET
         onboarding_complete = TRUE,
         agreement_signed_at = NOW(),
-        agreement_signature = $1,
-        default_ach_fee_payer = $3
+        agreement_signature = $1
       WHERE id = $2`,
-      [signature, settingsLandlordId, achPayer]
+      [signature, settingsLandlordId]
     )
 
-    // Apply the election to the property they just onboarded (it is created
-    // before this step) — card and bank alike; the database carries it to the
-    // property's counter and booking-site setting (migration 20261005120000).
-    await query(`
-      UPDATE property_allocation_rules SET
-        ach_fee_payer = $1,
-        card_fee_payer = $1
-      WHERE property_id IN (SELECT id FROM properties WHERE landlord_id = $2)`,
-      [achPayer, settingsLandlordId]
-    )
-
-    // Also update user profile phone/business if provided
-    const landlord = await queryOne<any>('SELECT * FROM landlords WHERE id=$1', [settingsLandlordId])
+    // The property being onboarded: the one the page names (it must be this
+    // company's), or the company's only property. Nothing else is touched —
+    // a company's other properties keep their own answers.
+    const named = typeof propertyId === 'string' && propertyId ? propertyId : null
+    let target: { id: string } | null = null
+    if (named) {
+      target = await queryOne<{ id: string }>(
+        `SELECT id FROM properties WHERE id = $1 AND landlord_id = $2`, [named, settingsLandlordId])
+      if (!target) throw new AppError(404, 'Property not found')
+    } else {
+      const only = await query<{ id: string }>(
+        `SELECT id FROM properties WHERE landlord_id = $1 LIMIT 2`, [settingsLandlordId])
+      target = only.length === 1 ? only[0] : null
+    }
+    if (target) {
+      // Card and bank alike; the database carries it to the property's counter
+      // and booking-site setting (migration 20261005120000).
+      await query(
+        `UPDATE property_allocation_rules SET ach_fee_payer = $1, card_fee_payer = $1 WHERE property_id = $2`,
+        [feePayer, target.id])
+    }
 
     res.json({ success: true, data: { onboardingComplete: true } })
   } catch (e) { next(e) }

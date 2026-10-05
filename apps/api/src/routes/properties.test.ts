@@ -105,21 +105,20 @@ describe('POST /api/properties — create', () => {
     expect(ar.rows[0].platform_fee_payer).toBe('landlord')
   })
 
-  // 10/5: the company's onboarding choice reaches a new property. It was read
-  // from the session's profileId, which names no company for a landlord since
-  // S633, so every new property started "passed on" whatever was chosen.
-  it('a new property with no fee answer takes its company\u2019s onboarding choice', async () => {
+  // 10/5 (Nic): the fee choice is the PROPERTY's own — never a company
+  // default. A property with no answer passes the fees on, whatever another
+  // property of the same company chose.
+  it('a new property with no fee answer passes the fees on — no company default', async () => {
     const f = await seedPropsFixture()
     await db.query(`UPDATE landlords SET default_ach_fee_payer = 'landlord' WHERE id = $1`, [f.landlordId])
-    // A session as login mints it today: no company in profileId.
     const modern = jwt.sign({ userId: f.landlordUserId, role: 'landlord', email: 'll@t.dev', profileId: null,
       landlordIds: [f.landlordId], permissions: {} }, process.env.JWT_SECRET!, { expiresIn: '1h' })
     const res = await request(buildApp()).post('/api/properties')
       .set('Authorization', `Bearer ${modern}`)
-      .send({ name: 'Inherits', street1: '2 main st', city: 'Phoenix', state: 'AZ', zip: '85001', type: 'residential', allocationRule: {} })
+      .send({ name: 'Own Answer', street1: '2 main st', city: 'Phoenix', state: 'AZ', zip: '85001', type: 'residential', allocationRule: {} })
     expect(res.status, JSON.stringify(res.body)).toBe(201)
     const ar = (await db.query(`SELECT ach_fee_payer, card_fee_payer FROM property_allocation_rules WHERE property_id=$1`, [res.body.data.id])).rows[0]
-    expect(ar).toEqual({ ach_fee_payer: 'landlord', card_fee_payer: 'landlord' })
+    expect(ar).toEqual({ ach_fee_payer: 'tenant', card_fee_payer: 'tenant' })
   })
 
   it('S574: a new property auto-publishes a public website (slug + enabled)', async () => {
