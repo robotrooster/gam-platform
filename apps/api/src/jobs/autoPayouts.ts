@@ -127,6 +127,16 @@ function addDays(date: Date, n: number): Date {
 // day (no backward compensation), exactly as before. Supersedes S640's
 // Thursday. Evaluated per Stripe Connect account (the candidates below).
 const EARLY_MONTH_LAST_DAY = 10
+
+// 10/5 (Nic), ONE TIME: "I want to make sure that one still happens... I don't
+// want to mess with Mountain View's scheduled disbursement." Under the old
+// Thursday schedule Mountain View's payout was due Thursday Oct 8; the new
+// schedule would hold what Stripe releases on Oct 7 until Friday. On these UTC
+// run days, these Stripe accounts are also paid (and not held back by the
+// spacing rule). A past date does nothing, so an entry expires on its own.
+export const ONE_TIME_RUNS: Record<string, readonly string[]> = {
+  '2026-10-08': ['acct_1UBh8jDngULWfeVL'],   // Mountain View RV Park Ranch LLC
+}
 const TUESDAY = 2
 const FRIDAY = 5
 
@@ -345,6 +355,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
   // paid three days ago both still go.
   const sweepDay = isMonthEndSweepDay(now)
   const isPayoutDay = weeklyDay || sweepDay
+  const oneTime = new Set<string>(ONE_TIME_RUNS[today] ?? [])
 
   // S580: retry any platform→Connect passthrough intent stuck in `pending` (its
   // RESERVE committed but the Transfer never confirmed — e.g. Stripe was down).
@@ -494,7 +505,8 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
     // below still measures the roll — that reporting is worth keeping — but it
     // no longer decides who gets paid.
     ...(isPayoutDay ? userRows.map((r): UserCandidate => ({ kind: 'user', ...r }))
-                    : userRows.filter(r => catchUp.has(r.stripe_connect_account_id)).map((r): UserCandidate => ({ kind: 'user', ...r }))),
+                    : userRows.filter(r => catchUp.has(r.stripe_connect_account_id) || oneTime.has(r.stripe_connect_account_id))
+                              .map((r): UserCandidate => ({ kind: 'user', ...r }))),
     ...(weeklyDay ? pmRows.map((r): PmCandidate => ({ kind: 'pm_company', ...r })) : []),
     ...(weeklyDay ? bizRows.map((r): BusinessCandidate => ({ kind: 'business', ...r })) : []),
   ]
@@ -503,7 +515,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
   for (const cand of candidates) {
     try {
       const isCatchUp = !isPayoutDay && cand.kind === 'user' && catchUp.has(cand.stripe_connect_account_id)
-      const fired = await processOneCandidate(cand, today, sweepDay, isCatchUp)
+      const fired = await processOneCandidate(cand, today, sweepDay, isCatchUp, oneTime.has(cand.stripe_connect_account_id))
       if (fired === 'fired')                      result.payoutsFired++
       else if (fired === 'zero_balance')          result.skippedZeroBalance++
       else if (fired === 'below_minimum')         result.skippedBelowMinimum++
@@ -528,7 +540,7 @@ type OneCandidateOutcome =
   'fired' | 'zero_balance' | 'already_paid_this_week' | 'below_minimum' | 'failed'
 
 async function processOneCandidate(
-  cand: Candidate, today: string, monthEndSweep = false, catchUpRun = false,
+  cand: Candidate, today: string, monthEndSweep = false, catchUpRun = false, oneTimeRun = false,
 ): Promise<OneCandidateOutcome> {
   // 1. Pre-skip: already paid TODAY? Stripe's idempotency_key is the
   //    authoritative guard; this avoids a wasted balance.retrieve round-trip.
@@ -566,7 +578,7 @@ async function processOneCandidate(
     // S641: the month-end sweep is exempt. Its whole job is that nothing rolls
     // into next month, and a landlord paid on the weekly run two days earlier
     // is exactly the case where a residual would be left behind.
-    if (!monthEndSweep
+    if (!monthEndSweep && !oneTimeRun
         && daysSinceLastPayout !== null
         && daysSinceLastPayout < MIN_DAYS_BETWEEN_PAYOUTS) {
       return 'already_paid_this_week'

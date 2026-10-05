@@ -687,3 +687,24 @@ describe('processAutoPayouts — one payout per Stripe account', () => {
     expect((firePayoutMock.mock.calls as any[]).map(c => c[0].connectAccountId)).toEqual(['acct_b'])
   })
 })
+
+// 10/5 (Nic), one time: Mountain View's Thursday Oct 8 payout still happens
+// under the new Tuesday/Friday schedule — and only Mountain View's.
+describe('processAutoPayouts — the one-time Oct 8 run', () => {
+  const thu = new Date('2026-10-08T01:00:00Z')
+  it('is not a regular payout day', () => {
+    expect(shouldRunToday(thu)).toBe(false)
+  })
+
+  it('pays Mountain View’s account that day, even right after a Tuesday payout, and nobody else', async () => {
+    firePayoutMock.mockImplementation((async (a: any) => ({ id: `po_${a.connectAccountId}` })) as any)
+    const mv = await seedEntityAnchoredLandlord('acct_1UBh8jDngULWfeVL')
+    await seedEntityAnchoredLandlord('acct_someone_else')
+    await db.query(
+      `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, fee_charged, stripe_account_id, created_at)
+       VALUES ($1, 'auto_friday', 50, 'settled', 'po_tuesday', 0, 'acct_1UBh8jDngULWfeVL', NOW() - interval '2 days')`, [mv])
+    const res = await processAutoPayouts(thu)
+    expect(res.payoutsFired).toBe(1)
+    expect((firePayoutMock.mock.calls as any[]).map(c => c[0].connectAccountId)).toEqual(['acct_1UBh8jDngULWfeVL'])
+  })
+})
