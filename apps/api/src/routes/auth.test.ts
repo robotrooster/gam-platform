@@ -572,7 +572,8 @@ describe('POST /api/auth/refresh', () => {
     await db.query(`UPDATE users SET sessions_valid_from = NOW() WHERE id = $1`, [userId])
     const r = await request(buildApp()).post('/api/auth/refresh').set('Authorization', `Bearer ${pass}`).send({})
     expect(r.status).toBe(401)
-    expect(r.body.error).toBe('Your password was changed. Please sign in again.')
+    // 10/5: requireAuth now refuses the revoked pass before /refresh runs.
+    expect(r.body.error).toMatch(/sign in again/)
   })
 
   it('a lock never shields a worker whose access was pulled: still 403', async () => {

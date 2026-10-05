@@ -457,7 +457,9 @@ describe('executeRentAllocation — ACH', () => {
 })
 
 describe('executeRentAllocation — card', () => {
-  it('uses card_fee_payer (not ach_fee_payer) for splittable', async () => {
+  // 10/5: card and bank fees are one choice per property, so the engine's
+  // per-method read always sees the same answer; this pins the card side of it.
+  it('a property that covers the fees: a card payment\u2019s fee comes out of the splittable', async () => {
     await withRollback(async (client) => {
       const { userId: ownerUserId, landlordId } = await seedLandlord(client)
       const tenantId = await seedTenant(client)
@@ -465,11 +467,9 @@ describe('executeRentAllocation — card', () => {
         landlordId, ownerUserId, managedByUserId: ownerUserId,
       })
       const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-      // ACH is 'tenant', card is 'landlord'. Verify the engine reads the
-      // right toggle based on payment method passed in.
       await seedAllocationRule(client, {
         propertyId,
-        achFeePayer: 'tenant',
+        achFeePayer: 'landlord',
         cardFeePayer: 'landlord',
       })
       const paymentId = await seedPaidRent(client, {

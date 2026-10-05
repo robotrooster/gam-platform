@@ -393,9 +393,10 @@ describe('late payment sender', () => {
     expect(log.metadata).toEqual({ days_late: 5, amount: 1200 })
   })
 
-  // S652 (Nic): the morning email is ONE per landlord with every overdue
-  // balance in it — "I don't need 15 emails."
-  it('sendLatePaymentDigest: one email, every balance in it, category=late_payment_notice', async () => {
+  // S652 (Nic): the morning email is ONE per landlord — "I don't need 15 emails."
+  // 10/5 (Nic): and it says only HOW MANY — no names, no amounts — with a link
+  // into the portal.
+  it('sendLatePaymentDigest: one email with the count only and a link to Outstanding Balances', async () => {
     await email.sendLatePaymentDigest({
       landlordEmail: 'l@mailer-test.co', landlordName: 'L',
       items: [
@@ -405,20 +406,20 @@ describe('late payment sender', () => {
     })
     expect(resendSendMock).toHaveBeenCalledTimes(1)
     const call = (resendSendMock.mock.calls[0] as any[])[0]
-    // S654: the lines are whole balances (rent, utilities, fees), not rent.
-    expect(call.subject).toBe('2 overdue balances — Sunset')
-    expect(call.html).toContain('Overdue Balances — This Morning')
-    expect(call.html).toContain('T One')
-    expect(call.html).toContain('T Two')
-    expect(call.html).toContain('1,650.50')
+    expect(call.subject).toBe('2 tenants have an overdue balance')
+    expect(call.html).toContain('2 tenants have a balance five or more days past due')
+    expect(call.html).toContain('/balances')
+    for (const hidden of ['T One', 'T Two', 'A1', 'B2', 'Sunset', '1,200', '450.50', '1,650.50', '$']) {
+      expect(call.html).not.toContain(hidden)
+    }
     const log = await logRowFor('l@mailer-test.co')
     expect(log.category).toBe('late_payment_notice')
     expect(log.metadata).toEqual({ count: 2, total: 1650.5, payment_ids: ['p2', 'p1'] })
   })
 
   // S654: one line per person (tenant ids in the log), and the total in cents —
-  // Oak Park's log carried a raw float sum.
-  it('sendLatePaymentDigest: per-person lines log tenant ids and a cents total', async () => {
+  // Oak Park's log carried a raw float sum. One person reads "1 tenant has".
+  it('sendLatePaymentDigest: the log keeps tenant ids and a cents total; one person reads in the singular', async () => {
     await email.sendLatePaymentDigest({
       landlordEmail: 'l@mailer-test.co', landlordName: 'L',
       items: [
@@ -429,11 +430,18 @@ describe('late payment sender', () => {
       ],
     })
     const call = (resendSendMock.mock.calls[0] as any[])[0]
-    expect(call.subject).toBe('4 overdue balances — Oak Park')
-    expect(call.html).toContain('RV 34, RV 35')
-    expect(call.html).toContain('1,386.92')
+    expect(call.subject).toBe('4 tenants have an overdue balance')
+    expect(call.html).not.toContain('RV 34')
     const log = await logRowFor('l@mailer-test.co')
     expect(log.metadata).toEqual({ count: 4, total: 1386.92, tenant_ids: ['t1', 't2', 't3', 't4'] })
+
+    resendSendMock.mockClear()
+    resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_singular' }, error: null } as any)
+    await email.sendLatePaymentDigest({
+      landlordEmail: 'one@mailer-test.co', landlordName: 'L',
+      items: [{ tenantName: 'Solo', unitNumber: 'X', propertyName: 'P', daysLate: 9, amount: 10, tenantId: 't9' }],
+    })
+    expect(((resendSendMock.mock.calls[0] as any[])[0]).subject).toBe('1 tenant has an overdue balance')
   })
 })
 

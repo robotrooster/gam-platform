@@ -249,7 +249,7 @@ describe('POST /api/landlords/complete-onboarding', () => {
     expect(ll.rows[0].default_ach_fee_payer).toBe('tenant')
   })
 
-  it('coverTenantAch=true → default landlord + applies to existing properties; card stays tenant (S513 #2)', async () => {
+  it('coverTenantAch=true (a page from before) → default landlord + covers card and bank at the property (10/5)', async () => {
     const f = await seedLFixture()
     const client = await db.connect()
     let propertyId = ''
@@ -274,8 +274,12 @@ describe('POST /api/landlords/complete-onboarding', () => {
 
     const ar = await db.query<{ ach_fee_payer: string; card_fee_payer: string }>(
       `SELECT ach_fee_payer, card_fee_payer FROM property_allocation_rules WHERE property_id=$1`, [propertyId])
-    expect(ar.rows[0].ach_fee_payer).toBe('landlord')  // election applied to the portfolio
-    expect(ar.rows[0].card_fee_payer).toBe('tenant')   // card never covered
+    // 10/5: one choice for card and bank, and the property's counter and
+    // booking site follow it.
+    expect(ar.rows[0].ach_fee_payer).toBe('landlord')
+    expect(ar.rows[0].card_fee_payer).toBe('landlord')
+    const pr = await db.query(`SELECT register_card_fee_payer, booking_card_fee_payer FROM properties WHERE id=$1`, [propertyId])
+    expect(pr.rows[0]).toEqual({ register_card_fee_payer: 'landlord', booking_card_fee_payer: 'landlord' })
   })
 })
 

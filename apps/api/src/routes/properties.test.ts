@@ -96,11 +96,30 @@ describe('POST /api/properties — create', () => {
          FROM property_allocation_rules WHERE property_id=$1`,
       [res.body.data.id])
     expect(ar.rows.length).toBe(1)
-    // bankingFeePayer ('landlord') mirrors into ACH. card is hard-locked to
-    // 'tenant' (S513 #2) regardless of the legacy banking value.
+    // bankingFeePayer ('landlord') is the property's one card-and-bank choice
+    // (10/5): both covered, and the counter and booking site follow.
     expect(ar.rows[0].ach_fee_payer).toBe('landlord')
-    expect(ar.rows[0].card_fee_payer).toBe('tenant')
+    expect(ar.rows[0].card_fee_payer).toBe('landlord')
+    const pr = await db.query(`SELECT register_card_fee_payer, booking_card_fee_payer FROM properties WHERE id=$1`, [res.body.data.id])
+    expect(pr.rows[0]).toEqual({ register_card_fee_payer: 'landlord', booking_card_fee_payer: 'landlord' })
     expect(ar.rows[0].platform_fee_payer).toBe('landlord')
+  })
+
+  // 10/5: the company's onboarding choice reaches a new property. It was read
+  // from the session's profileId, which names no company for a landlord since
+  // S633, so every new property started "passed on" whatever was chosen.
+  it('a new property with no fee answer takes its company\u2019s onboarding choice', async () => {
+    const f = await seedPropsFixture()
+    await db.query(`UPDATE landlords SET default_ach_fee_payer = 'landlord' WHERE id = $1`, [f.landlordId])
+    // A session as login mints it today: no company in profileId.
+    const modern = jwt.sign({ userId: f.landlordUserId, role: 'landlord', email: 'll@t.dev', profileId: null,
+      landlordIds: [f.landlordId], permissions: {} }, process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(buildApp()).post('/api/properties')
+      .set('Authorization', `Bearer ${modern}`)
+      .send({ name: 'Inherits', street1: '2 main st', city: 'Phoenix', state: 'AZ', zip: '85001', type: 'residential', allocationRule: {} })
+    expect(res.status, JSON.stringify(res.body)).toBe(201)
+    const ar = (await db.query(`SELECT ach_fee_payer, card_fee_payer FROM property_allocation_rules WHERE property_id=$1`, [res.body.data.id])).rows[0]
+    expect(ar).toEqual({ ach_fee_payer: 'landlord', card_fee_payer: 'landlord' })
   })
 
   it('S574: a new property auto-publishes a public website (slug + enabled)', async () => {

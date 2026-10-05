@@ -1250,7 +1250,8 @@ describe('a long stay on a lease', () => {
   it('a card rent payment whose fee the landlord covered: the cost line says how much more the refund costs than they were paid', async () => {
     const f = await seed()
     const { b } = await longStay(f)
-    await query(`INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer) VALUES ($1, 'tenant', 'landlord')`, [f.propertyId])
+    // 10/5: one choice per property — covering covers card and bank alike.
+    await query(`INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer) VALUES ($1, 'landlord', 'landlord')`, [f.propertyId])
     const out = await decide(f, b, { choice: null })
     const unused = out.body.data.quote.choices.find((c: any) => c.choice === 'refund_unused')
     const covered = processingFeeFor({ amount: 1500, paymentMethod: 'card' })

@@ -5034,10 +5034,30 @@ export function processingFeeFor(opts: {
   return round2(opts.amount * pct + PROCESSING_FEES.CARD_FLAT)
 }
 
-// S648 (Nic): "landlord can choose to absorb the processing cost... or they
-// just price accordingly." GAM's card fee is on every card payment; per
-// property the landlord picks who pays it at the register (incl. pay links)
-// and on the booking site. Rent is never covered by this: tenants pay it.
+// 10/5 (Nic): "The only thing the landlord chooses is if they absorb the cost
+// or if they pass it through to the tenant or customer. That is it. ... that
+// setting is at the property level. So they cannot absorb it for some people
+// and pass it through to other people." ONE choice per property covers card
+// AND bank fees for everyone who pays there: rent, the front counter, pay links
+// and the booking site. GAM's payment partners set the amounts; the landlord
+// never does. The database keeps the four stored columns as one setting
+// (migration 20261005120000).
+export const PROCESSING_FEE_CHOICES = ['pass_on', 'cover'] as const
+export type ProcessingFeeChoice = typeof PROCESSING_FEE_CHOICES[number]
+export const PROCESSING_FEE_CHOICE_LABEL: Record<ProcessingFeeChoice, string> = {
+  pass_on: 'Pass them on',
+  cover:   'Cover them',
+}
+export const PROCESSING_FEE_CHOICE_HINT: Record<ProcessingFeeChoice, string> = {
+  pass_on: 'Whoever pays by card or bank adds the fee',
+  cover:   'Taken out of your payout',
+}
+/** The stored rent-side payer ('tenant' | 'landlord') for a choice, and back. */
+export const feeChoiceFromPayer = (payer: string | null | undefined): ProcessingFeeChoice =>
+  payer === 'landlord' ? 'cover' : 'pass_on'
+
+// S648: the stored counter/booking-site payer. Since 10/5 it always equals the
+// property's one choice above ('customer' = pass on, 'landlord' = cover).
 export const CARD_FEE_PAYERS = ['customer', 'landlord'] as const
 export type CardFeePayer = typeof CARD_FEE_PAYERS[number]
 export const CARD_FEE_PAYER_LABEL: Record<CardFeePayer, string> = {

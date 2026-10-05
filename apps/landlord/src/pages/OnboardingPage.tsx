@@ -10,7 +10,8 @@ import {
 } from 'lucide-react'
 import {
   ACCOUNT_TYPE_VALUES, ACCOUNT_HOLDER_TYPE_VALUES,
-  AccountType, AccountHolderType, cardFeeLabel,
+  AccountType, AccountHolderType,
+  PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT,
   UNIT_TYPES, UNIT_TYPE_LABEL,
 } from '@gam/shared'
 
@@ -61,7 +62,7 @@ export function OnboardingPage() {
   const [showAddBank, setShowAddBank] = useState(false)
   // S513 (#2): landlord's onboarding ACH fee election. Default false = tenant
   // pays ACH (the launch default). Card is always the tenant's — not a choice.
-  const [coverTenantAch, setCoverTenantAch] = useState(false)
+  const [coverFees, setCoverFees] = useState(false)
 
   // Profile form
   const [profile, setProfile] = useState({ businessName: '', ein: '', phone: '', street1: '', city: '', state: '', zip: '' })
@@ -198,7 +199,7 @@ export function OnboardingPage() {
   )
 
   const completeMut = useMutation(
-    () => apiPost('/landlords/complete-onboarding', { signature, agreedAt: new Date().toISOString(), coverTenantAch }),
+    () => apiPost('/landlords/complete-onboarding', { signature, agreedAt: new Date().toISOString(), coverFees }),
     { onSuccess: async () => {
       await refresh?.()
       // S604: same reason as addPropertyMut — everything downstream of the
@@ -612,35 +613,29 @@ export function OnboardingPage() {
                   </div>
                 )}
 
-                {/* S513 (#2): ACH fee election. Card is always the tenant's.
-                    Kept OUTSIDE the payouts-ready branch on purpose — it is a
-                    pricing decision, answerable whether or not Stripe is done. */}
+                {/* 10/5 (Nic): ONE choice per property for card and bank fees,
+                    for everyone who pays there. Kept OUTSIDE the payouts-ready
+                    branch on purpose — it is a pricing decision, answerable
+                    whether or not payout setup is done. */}
                 <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 12, padding: 18, marginTop: 8 }}>
-                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Who pays the ACH processing fee?</div>
+                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Card and bank payment fees</div>
                   <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
-                    ACH bank payments cost a flat $6.00. By default your tenants pay this fee. You can
-                    choose to cover it for them — applied across your properties (change per-property later in Settings).
+                    Do you want to pass them on, or cover them? It applies to everyone who pays at your property —
+                    rent, the front counter, pay links and the booking site. You can change it on the property's page any time.
                   </div>
                   <div style={{ display: 'flex', gap: 10 }}>
-                    {[
-                      { v: false, title: 'Tenant pays ACH', sub: 'Standard — fee added on top of rent' },
-                      { v: true,  title: "I'll cover ACH",   sub: 'Deducted from your payouts' },
-                    ].map(opt => {
-                      const selected = coverTenantAch === opt.v
+                    {PROCESSING_FEE_CHOICES.map(v => {
+                      const selected = (coverFees ? 'cover' : 'pass_on') === v
                       return (
-                        <button key={String(opt.v)} type="button" onClick={() => setCoverTenantAch(opt.v)}
+                        <button key={v} type="button" onClick={() => setCoverFees(v === 'cover')}
                           style={{ flex: 1, textAlign: 'left', padding: '12px 14px', borderRadius: 10, cursor: 'pointer',
                             background: selected ? 'rgba(201,162,39,.1)' : 'var(--bg-1)',
                             border: selected ? '1.5px solid var(--gold)' : '1px solid var(--border-0)' }}>
-                          <div style={{ fontSize: '.82rem', fontWeight: 700, color: selected ? 'var(--gold)' : 'var(--text-0)' }}>{opt.title}</div>
-                          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 2 }}>{opt.sub}</div>
+                          <div style={{ fontSize: '.82rem', fontWeight: 700, color: selected ? 'var(--gold)' : 'var(--text-0)' }}>{PROCESSING_FEE_CHOICE_LABEL[v]}</div>
+                          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 2 }}>{PROCESSING_FEE_CHOICE_HINT[v]}</div>
                         </button>
                       )
                     })}
-                  </div>
-                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 12, display: 'flex', alignItems: 'flex-start', gap: 6 }}>
-                    <CreditCard size={12} style={{ flexShrink: 0, marginTop: 2 }} />
-                    Card payments ({cardFeeLabel()}) are always paid by the tenant — landlords never cover card fees.
                   </div>
                 </div>
               </div>

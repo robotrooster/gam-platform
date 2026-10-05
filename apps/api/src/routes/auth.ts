@@ -6,7 +6,7 @@ import { db, query, queryOne } from '../db'
 import { UserRole, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN, SIGN_IN_PORTAL_VALUES, type SignInPortal, FALLBACK_TIMEZONE } from '@gam/shared'
 import { signSessionToken, renewSessionToken, sessionPolicyFor } from '../lib/sessionToken'
 import { createFoundingLandlordEntity, claimInvitationsOnProvenAddress } from '../services/coOwnerInvites'
-import { requireAuth } from '../middleware/auth'
+import { requireAuth, forgetSessionCutoff } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp,
          sendEmailChangeConfirmation, sendEmailChangeNotice } from '../services/email'
@@ -1329,6 +1329,7 @@ authRouter.post('/reset-password', async (req, res, next) => {
         WHERE id = $2`,
       [hash, user.id],
     )
+    forgetSessionCutoff(user.id)
     // S655: the same proof of the address accepts a waiting co-owner invitation.
     await claimOnProvenAddress(user.id, user.email_verified !== true)
     res.json({ success: true, data: { message: 'Password updated. Please sign in with your new password.' } })

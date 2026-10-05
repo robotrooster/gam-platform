@@ -5,7 +5,7 @@ import fs from 'fs'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requirePerm, userHasPerm } from '../middleware/auth'
+import { requireAuth, requirePerm, userHasPerm, forgetSessionCutoff } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { emailTenantInvite } from '../services/email'
@@ -238,6 +238,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       tenant = (await client.query('SELECT id FROM tenants WHERE user_id=$1', [user.id])).rows[0] ?? null
 
       await client.query('COMMIT')
+      forgetSessionCutoff(user.id)
     } catch (e) {
       // The token is still on the user, so the link the tenant already has in
       // their inbox keeps working. That is the whole point.
@@ -2951,6 +2952,7 @@ tenantsRouter.patch('/password', requireAuth, async (req, res, next) => {
     await query(
       'UPDATE users SET password_hash=$1, sessions_valid_from=to_timestamp($3::double precision) WHERE id=$2',
       [hash, req.user!.userId, changedAtSecond])
+    forgetSessionCutoff(req.user!.userId)
     if (req.user!.role !== 'tenant' || user.role !== 'tenant') {
       return res.json({ success: true })
     }

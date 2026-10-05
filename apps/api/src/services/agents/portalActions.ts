@@ -981,17 +981,14 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     path: '/api/properties/:propertyId/processing-fee-payers',
     pathParams: ['propertyId'],
     description:
-      'Choose, for one property, who pays the card processing fee when someone pays by card at the ' +
-      'register (counter card sales and emailed or QR pay links) and on the booking site (stay deposits). ' +
-      'Each is either "customer" (the fee is added on top, the default) or "landlord" (the customer pays ' +
-      'just the price and the fee comes out of the payout). Rent is not affected. Send only the setting(s) ' +
-      'the landlord named, and read the choice back before sending.',
+      'Choose, for one property, whether card and bank payment fees are passed on or covered. ONE ' +
+      'choice for everyone who pays there: rent, the counter, pay links and the booking site. "pass_on" ' +
+      'adds the fee on top; "cover" takes it out of the payout. Read the choice back before sending.',
     params: {
       propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine.' },
-      register: { type: 'string', description: 'Who pays the card fee at the register and on pay links: "customer" or "landlord".' },
-      booking: { type: 'string', description: 'Who pays the card fee on stay deposits: "customer" or "landlord".' },
+      choice: { type: 'string', description: '"pass_on" or "cover".' },
     },
-    required: ['propertyId'],
+    required: ['propertyId', 'choice'],
     confirmFirst: true,
   },
   {
@@ -1124,15 +1121,13 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     audience: 'landlord', method: 'PATCH', path: '/api/properties/:propertyId/allocation-rule',
     pathParams: ['propertyId'],
     description:
-      'Set who covers the payment-processing fees at a property, and which bank account its payouts ' +
-      'land in. Use for "we will eat the ACH fee at Oak Street".\n' +
-      'Each payer is either landlord or tenant. Two things are NOT open: the card fee stays with the ' +
-      'tenant, and the platform fee is always the landlord\u2019s. If they ask to move either, say so ' +
-      'plainly rather than sending it and reporting a change that did not happen. Cash, check and ' +
-      'money order carry no fee at all, so there is nothing to set for them.',
+      'Set which bank account a property pays out to, or whether its card and bank fees are passed ' +
+      'on or covered. Use for "we will eat the fees at Oak Street". The fees are ONE choice for card ' +
+      'and bank alike (achFeePayer sets both). The platform fee is always the landlord\u2019s; if they ' +
+      'ask to move it, say so plainly. Cash, check and money order carry no fee.',
     params: {
       propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
-      achFeePayer: { type: 'string', description: 'landlord or tenant — who covers the bank-transfer fee.' },
+      achFeePayer: { type: 'string', description: 'landlord (cover the card and bank fees) or tenant (pass them on).' },
       ownerBankAccountId: { type: 'string', description: 'The bank account this property pays out to, from a lookup. It must belong to the owner and be active.' },
     },
     required: ['propertyId'],

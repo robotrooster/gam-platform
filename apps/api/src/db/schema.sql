@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict cfDFtxOHLMrYOiKIekj52AunDdKhlQ8gSeiIjCWcRibxdxprswDd4zXTLeZkeJA
+\restrict k2AYefMRSq6OPenY0ZBpEJA0tPpVWkmPeIBprK057dais2vbXZpmN6yQTOCasm2
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -1038,6 +1038,69 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: one_fee_choice_across(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.one_fee_choice_across() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_TABLE_NAME = 'property_allocation_rules' THEN
+    UPDATE public.properties
+       SET register_card_fee_payer = CASE WHEN NEW.ach_fee_payer = 'landlord' THEN 'landlord' ELSE 'customer' END
+     WHERE id = NEW.property_id
+       AND register_card_fee_payer IS DISTINCT FROM
+           (CASE WHEN NEW.ach_fee_payer = 'landlord' THEN 'landlord' ELSE 'customer' END);
+  ELSE
+    UPDATE public.property_allocation_rules
+       SET ach_fee_payer = CASE WHEN NEW.register_card_fee_payer = 'landlord' THEN 'landlord' ELSE 'tenant' END
+     WHERE property_id = NEW.id
+       AND ach_fee_payer IS DISTINCT FROM
+           (CASE WHEN NEW.register_card_fee_payer = 'landlord' THEN 'landlord' ELSE 'tenant' END);
+  END IF;
+  RETURN NULL;
+END $$;
+
+
+--
+-- Name: one_fee_choice_property_row(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.one_fee_choice_property_row() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.booking_card_fee_payer := NEW.register_card_fee_payer;
+  ELSIF NEW.register_card_fee_payer IS DISTINCT FROM OLD.register_card_fee_payer THEN
+    NEW.booking_card_fee_payer := NEW.register_card_fee_payer;
+  ELSIF NEW.booking_card_fee_payer IS DISTINCT FROM OLD.booking_card_fee_payer THEN
+    NEW.register_card_fee_payer := NEW.booking_card_fee_payer;
+  END IF;
+  RETURN NEW;
+END $$;
+
+
+--
+-- Name: one_fee_choice_rule_row(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.one_fee_choice_rule_row() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.card_fee_payer := NEW.ach_fee_payer;
+  ELSIF NEW.ach_fee_payer IS DISTINCT FROM OLD.ach_fee_payer THEN
+    NEW.card_fee_payer := NEW.ach_fee_payer;
+  ELSIF NEW.card_fee_payer IS DISTINCT FROM OLD.card_fee_payer THEN
+    NEW.ach_fee_payer := NEW.card_fee_payer;
+  END IF;
+  RETURN NEW;
+END $$;
 
 
 --
@@ -23463,6 +23526,34 @@ CREATE TRIGGER trg_occupy_unit_on_active_lease AFTER INSERT OR UPDATE OF status,
 
 
 --
+-- Name: properties trg_one_fee_choice_property_row; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_one_fee_choice_property_row BEFORE INSERT OR UPDATE OF register_card_fee_payer, booking_card_fee_payer ON public.properties FOR EACH ROW EXECUTE FUNCTION public.one_fee_choice_property_row();
+
+
+--
+-- Name: properties trg_one_fee_choice_property_to_rule; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_one_fee_choice_property_to_rule AFTER UPDATE OF register_card_fee_payer, booking_card_fee_payer ON public.properties FOR EACH ROW EXECUTE FUNCTION public.one_fee_choice_across();
+
+
+--
+-- Name: property_allocation_rules trg_one_fee_choice_rule_row; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_one_fee_choice_rule_row BEFORE INSERT OR UPDATE OF ach_fee_payer, card_fee_payer ON public.property_allocation_rules FOR EACH ROW EXECUTE FUNCTION public.one_fee_choice_rule_row();
+
+
+--
+-- Name: property_allocation_rules trg_one_fee_choice_rule_to_property; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_one_fee_choice_rule_to_property AFTER INSERT OR UPDATE OF ach_fee_payer, card_fee_payer ON public.property_allocation_rules FOR EACH ROW EXECUTE FUNCTION public.one_fee_choice_across();
+
+
+--
 -- Name: utility_meter_units trg_one_meter_per_unit_utility; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -30928,5 +31019,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict cfDFtxOHLMrYOiKIekj52AunDdKhlQ8gSeiIjCWcRibxdxprswDd4zXTLeZkeJA
+\unrestrict k2AYefMRSq6OPenY0ZBpEJA0tPpVWkmPeIBprK057dais2vbXZpmN6yQTOCasm2
 

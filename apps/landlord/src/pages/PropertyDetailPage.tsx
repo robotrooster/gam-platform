@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
-import { humanize, dueDayLabel, CARD_FEE_PAYERS, CARD_FEE_PAYER_LABEL, type CardFeePayer } from '@gam/shared'
+import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, type ProcessingFeeChoice } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { toast } from '../components/dialogs'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
@@ -733,34 +733,30 @@ function PropertyAlerts({ propertyId, onGoTab }: { propertyId: string; onGoTab: 
 //    same time, or they just want the prorated amount."
 // One answer per property, so everyone moving in there is treated alike. A
 // landlord can still set one tenant's own due day on that tenant's lease.
-// S648 (Nic): "landlord can choose to absorb the processing cost... or they
-// just price accordingly." GAM's card fee is on every card payment; this picks
-// who pays it at the register and on the booking site. Rent isn't affected.
+// 10/5 (Nic): "The only thing the landlord chooses is if they absorb the cost
+// or if they pass it through ... they cannot absorb it for some people and pass
+// it through to other people." ONE choice per property, card and bank alike, for
+// rent, the front counter, pay links and the booking site.
 function CardFeePayerCard({ property, onSaved }: { property: any; onSaved: () => void }) {
   const save = useMutation(
-    (b: { register?: CardFeePayer; booking?: CardFeePayer }) => apiPatch(`/properties/${property.id}/processing-fee-payers`, b),
-    { onSuccess: onSaved, onError: () => toast.error('Could not save the card fee setting') })
-  const rows: Array<{ key: 'register' | 'booking'; label: string; value: CardFeePayer }> = [
-    { key: 'register', label: 'Front counter and pay links', value: property.registerCardFeePayer || 'customer' },
-    { key: 'booking', label: 'Booking site deposits', value: property.bookingCardFeePayer || 'customer' },
-  ]
+    (choice: ProcessingFeeChoice) => apiPatch(`/properties/${property.id}/processing-fee-payers`, { choice }),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the payment fee setting') })
+  const current = feeChoiceFromPayer(property.registerCardFeePayer)
   return (
     <div className="card" style={{ padding: 14, marginBottom: 20 }}>
-      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Card fees</div>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Card and bank payment fees</div>
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 10 }}>
-        Every card payment has a processing fee of 3.5% + $0.55. Add it to what the customer pays, or absorb it
-        and price your items and stays to cover it — it then comes out of your payout. Tenants paying rent by card
-        always pay it.
+        Do you want to pass them on, or cover them? This applies to everyone who pays at this property —
+        rent, the front counter, pay links and the booking site.
       </div>
-      {rows.map(r => (
-        <div key={r.key} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 8 }}>
-          <span style={{ fontSize: '.8rem', color: 'var(--text-1)', minWidth: 200 }}>{r.label}</span>
-          {CARD_FEE_PAYERS.map(v => (
-            <button key={v} className={`btn btn-sm ${r.value === v ? 'btn-primary' : 'btn-ghost'}`} disabled={save.isLoading}
-              onClick={() => r.value !== v && save.mutate({ [r.key]: v })}>{CARD_FEE_PAYER_LABEL[v]}</button>
-          ))}
-        </div>
-      ))}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {PROCESSING_FEE_CHOICES.map(v => (
+          <button key={v} className={`btn btn-sm ${current === v ? 'btn-primary' : 'btn-ghost'}`} disabled={save.isLoading}
+            title={PROCESSING_FEE_CHOICE_HINT[v]}
+            onClick={() => current !== v && save.mutate(v)}>{PROCESSING_FEE_CHOICE_LABEL[v]}</button>
+        ))}
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>{PROCESSING_FEE_CHOICE_HINT[current]}.</div>
     </div>
   )
 }

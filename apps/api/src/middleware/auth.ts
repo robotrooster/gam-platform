@@ -83,6 +83,19 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     if ((payload as any).posLimited && !isPosLimitedRequestAllowed(req.method, req.originalUrl)) {
       return res.status(403).json({ success: false, error: 'This action requires a full sign-in, not a register passcode.' })
     }
+    // 10/5 — a pass minted before the account's sessions_valid_from is dead on
+    // EVERY route, not only at /auth/me and /auth/refresh. A password reset, a
+    // retired account and a reset applicant all stamp that column; before this,
+    // the old pass kept working on every other endpoint until it expired or the
+    // portal happened to reload. Whole-second compare: iat is whole seconds and
+    // the invite activation stamps the column and mints the new pass in the
+    // same request (see assertPassPostdatesPasswordChange in routes/auth.ts).
+    if (payload.userId && typeof payload.iat === 'number') {
+      const cutoffMs = await sessionCutoffMs(payload.userId)
+      if (cutoffMs !== null && payload.iat < Math.floor(cutoffMs / 1000)) {
+        return res.status(401).json({ success: false, error: 'Your session has ended. Please sign in again.' })
+      }
+    }
     req.user = payload
     // S629 (CRITICAL) — ENTITY MEMBERSHIP IS REFRESHED FROM THE DATABASE.
     //
@@ -410,6 +423,35 @@ export function _clearMembershipCache(): void { membershipCache.clear() }
  * the pre-commit rows.
  */
 export function forgetMembership(userId: string): void { membershipCache.delete(userId) }
+
+/**
+ * 10/5: users.sessions_valid_from, read fresh and cached briefly (same bound as
+ * company membership). Every place that stamps the column calls
+ * forgetSessionCutoff after its commit, so the cache never hides a reset; the
+ * TTL only covers a write that forgets to. A failed read lets the request
+ * through — the route behind it needs the same database and fails on its own;
+ * a 401 here would sign every user out on a database blip.
+ */
+const CUTOFF_TTL_MS = 15_000
+const cutoffCache = new Map<string, { ms: number | null; at: number }>()
+export function forgetSessionCutoff(userId: string): void { cutoffCache.delete(userId) }
+export function _clearSessionCutoffCache(): void { cutoffCache.clear() }
+
+async function sessionCutoffMs(userId: string): Promise<number | null> {
+  const now = Date.now()
+  const hit = cutoffCache.get(userId)
+  if (hit && now - hit.at < CUTOFF_TTL_MS) return hit.ms
+  try {
+    const row = await queryOne<{ sessions_valid_from: Date | null }>(
+      `SELECT sessions_valid_from FROM users WHERE id = $1`, [userId])
+    const ms = row?.sessions_valid_from ? new Date(row.sessions_valid_from).getTime() : null
+    cutoffCache.set(userId, { ms, at: now })
+    if (cutoffCache.size > 5000) cutoffCache.clear()
+    return ms
+  } catch {
+    return null
+  }
+}
 
 async function currentLandlordIds(payload: AuthPayload): Promise<string[]> {
   const key = payload.userId

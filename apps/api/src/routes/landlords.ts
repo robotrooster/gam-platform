@@ -1320,12 +1320,14 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
 // their own onboarding (legal agreement signature). Not delegable.
 landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async (req, res, next) => {
   try {
-    const { signature, agreedAt, coverTenantAch } = req.body
+    const { signature, agreedAt, coverFees, coverTenantAch } = req.body
     if (!signature) return res.status(400).json({ success: false, error: 'Signature required' })
 
-    // S513 fee-payer election (walkthrough #2). The landlord may elect to
-    // cover its tenants' ACH fees; card is ALWAYS the tenant's. Default tenant.
-    const achPayer: 'landlord' | 'tenant' = coverTenantAch === true ? 'landlord' : 'tenant'
+    // 10/5 (Nic): card and bank payment fees are ONE choice per property, for
+    // everyone who pays there — pass them on (default) or cover them. A page
+    // cached from before still sends coverTenantAch; it means the same thing now.
+    const covers = coverFees === true || (coverFees === undefined && coverTenantAch === true)
+    const achPayer: 'landlord' | 'tenant' = covers ? 'landlord' : 'tenant'
     // S633: onboarding is completed FOR a company — the signature is that
     // company's agreement. Named explicitly, or the account's only one.
     const settingsLandlordId = await landlordForRequest(req, 'company')
@@ -1340,15 +1342,13 @@ landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async
       [signature, settingsLandlordId, achPayer]
     )
 
-    // Apply the election across the landlord's existing properties so it takes
-    // effect on the portfolio they just onboarded (the first property is created
-    // before this step). card_fee_payer is force-healed to 'tenant' — the
-    // landlord never covers card (S512 lock); this also repairs any legacy
-    // 'landlord' card rows.
+    // Apply the election to the property they just onboarded (it is created
+    // before this step) — card and bank alike; the database carries it to the
+    // property's counter and booking-site setting (migration 20261005120000).
     await query(`
       UPDATE property_allocation_rules SET
         ach_fee_payer = $1,
-        card_fee_payer = 'tenant'
+        card_fee_payer = $1
       WHERE property_id IN (SELECT id FROM properties WHERE landlord_id = $2)`,
       [achPayer, settingsLandlordId]
     )

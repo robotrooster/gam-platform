@@ -1143,14 +1143,28 @@ describe('POST /api/payments/pay-balance', () => {
     expect(sent()).toEqual([1000])
   })
 
-  it('S562: card is always tenant-borne → charge = bill + fee even when ACH is landlord', async () => {
+  // 10/5 (Nic): card and bank fees are ONE choice per property (supersedes the
+  // S512/S562 "card is always the tenant's"). A property that covers the fees
+  // covers card too: the card charge is the bill only.
+  it('10/5: a property that covers the fees covers card too → card charge = the bill only', async () => {
     const f = await seed()
     await setupTenantForPay(f, { connectReady: true })
-    await setFeePayer(f.aPropId, 'landlord', 'tenant')
+    await setFeePayer(f.aPropId, 'landlord', 'landlord')
     await bill(f)
     const res = await pay(f, { amount: 1000, paymentMethodId: 'pm_x', paymentMethodType: 'card' })
     expect(res.status).toBe(200)
-    expect(sent()).toEqual([1005])
+    expect(sent()).toEqual([1000])
+  })
+
+  it('10/5: the two payers can never be stored apart — setting the bank fee to covered covers card', async () => {
+    const f = await seed()
+    await setFeePayer(f.aPropId, 'landlord', 'tenant')
+    const { rows: [r] } = await db.query(
+      `SELECT ach_fee_payer, card_fee_payer FROM property_allocation_rules WHERE property_id=$1`, [f.aPropId])
+    expect(r).toEqual({ ach_fee_payer: 'landlord', card_fee_payer: 'landlord' })
+    const { rows: [p] } = await db.query(
+      `SELECT register_card_fee_payer, booking_card_fee_payer FROM properties WHERE id=$1`, [f.aPropId])
+    expect(p).toEqual({ register_card_fee_payer: 'landlord', booking_card_fee_payer: 'landlord' })
   })
 
   it('S562: tenant-payer platform-fee passthrough is added to the charge', async () => {
@@ -1655,12 +1669,13 @@ describe('GET /payments/balance-context — per-method price breakdown', () => {
   })
 
   // Review fix pass 2: each way to pay is priced as /pay-balance charges it.
-  it('a bank fee the landlord covers shows as none, and a waiting tenant-payer platform fee is on top of bank and card, never cash', async () => {
+  // 10/5: covering is one choice — bank AND card show no processing fee.
+  it('fees the landlord covers show as none on bank and card, and a waiting tenant-payer platform fee is on top of both, never cash', async () => {
     const f = await seed()
     await db.query(
       `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer)
-       VALUES ($1,'landlord','tenant')
-       ON CONFLICT (property_id) DO UPDATE SET ach_fee_payer='landlord', card_fee_payer='tenant'`, [f.aPropId])
+       VALUES ($1,'landlord','landlord')
+       ON CONFLICT (property_id) DO UPDATE SET ach_fee_payer='landlord', card_fee_payer='landlord'`, [f.aPropId])
     await db.query(
       `INSERT INTO platform_fee_accruals
          (landlord_id, property_id, accrual_month, rate_per_unit, min_per_connect_account, total_amount, payer)
@@ -1673,9 +1688,7 @@ describe('GET /payments/balance-context — per-method price breakdown', () => {
     expect(res.status).toBe(200)
     const by = Object.fromEntries(res.body.data.leases[0].methodCosts.map((m: any) => [m.method, m]))
     expect(by.ach).toMatchObject({ fee: 20, total: 470 })
-    const card = processingFeeFor({ amount: 450, paymentMethod: 'card' })
-    expect(by.card.fee).toBeCloseTo(card + 20, 2)
-    expect(by.card.total).toBeCloseTo(450 + card + 20, 2)
+    expect(by.card).toMatchObject({ fee: 20, total: 470 })
     expect(by.manual).toMatchObject({ fee: 0, total: 450 })
 
     // The bank figure shown is the bank figure the quote reads back.

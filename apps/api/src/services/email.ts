@@ -2,6 +2,7 @@ import { Resend } from 'resend'
 import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL, FLEXPAY_TERMS } from '@gam/shared'
 import { query } from '../db'
 import { logger } from '../lib/logger'
+import { portalLink } from '../lib/portalUrls'
 import { buildDemoBookingIcs } from './demoCalendar'
 // S651: read before every send — see the comment at the send decision below.
 import { suppressionFor } from './emailSuppressions'
@@ -1407,29 +1408,24 @@ export async function sendLatePaymentDigest({ landlordEmail, landlordName, items
   ctx?: { landlordId?: string }
 }) {
   if (!items.length) return
+  // 10/5 (Nic): "ONLY how many tenants have outstanding balances: no names, no
+  // amounts. We want to drive traffic into the portal." The email carries the
+  // count and a link to Outstanding Balances; who owes what is read there. The
+  // send log still records the ids and the total, for us, not for the email.
+  const n = items.length
   const sorted = [...items].sort((a, b) => b.daysLate - a.daysLate)
   // S654: summed in cents — a raw float sum is not a dollar figure.
   const total = Math.round(sorted.reduce((s, i) => s + Math.round(i.amount * 100), 0)) / 100
   const paymentIds = sorted.map(i => i.paymentId).filter(Boolean)
   const tenantIds = sorted.map(i => i.tenantId).filter(Boolean)
-  const properties = [...new Set(sorted.map(i => i.propertyName))]
-  const where = properties.length === 1 ? properties[0] : `${properties.length} properties`
-  const td = (v: string, extra = '') => `<td style="padding:7px 8px;border-bottom:1px solid #1f2733;font-size:.82rem;color:#eef1f8;${extra}">${v}</td>`
-  const rows = sorted.map(i =>
-    `<tr>${td(escapeHtml(i.tenantName))}${td(escapeHtml(i.unitNumber))}${properties.length > 1 ? td(escapeHtml(i.propertyName)) : ''}${td(`$${i.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, 'text-align:right;font-variant-numeric:tabular-nums')}${td(`${i.daysLate}`, 'text-align:right')}</tr>`).join('')
-  const th = (v: string, extra = '') => `<th style="padding:6px 8px;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:#b8c4d8;border-bottom:1px solid #2a3442;${extra}">${v}</th>`
+  const who = n === 1 ? '1 tenant has' : `${n} tenants have`
   await send(landlordEmail,
-    `${sorted.length} overdue balance${sorted.length === 1 ? '' : 's'} — ${where}`,
+    `${who} an overdue balance`,
     base(
-      `<div style="margin-bottom:14px;padding:10px 14px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;color:#f59e0b;font-size:.85rem">⚠️ ${sorted.length} overdue balance${sorted.length === 1 ? '' : 's'} — $${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} outstanding</div>` +
-      h('Overdue Balances — This Morning') +
-      p(`Hi ${landlordName},`) +
-      p(`These balances are five or more days past due. This is the only email about them today.`) +
-      `<table style="width:100%;border-collapse:collapse;margin:12px 0;background:#0a0f14;border-radius:8px">
-        <thead><tr>${th('Tenant')}${th('Unit')}${properties.length > 1 ? th('Property') : ''}${th('Owed', 'text-align:right')}${th('Days late', 'text-align:right')}</tr></thead>
-        <tbody>${rows}</tbody>
-      </table>` +
-      `<div style="margin-top:14px;font-size:.75rem;color:#4a5568">If you wish to file for eviction, activate Eviction Mode in your dashboard first — this hard-blocks all ACH. Check your local laws before accepting any payment during an eviction process.</div>`
+      h('Overdue balances this morning') +
+      p(`Hi ${escapeHtml(landlordName)},`) +
+      p(`${who} a balance five or more days past due. See who in your portal.`) +
+      btnWithLink('Open Outstanding Balances', portalLink('landlord', 'balances'))
     ),
     {
       category: 'late_payment_notice',
@@ -1437,7 +1433,7 @@ export async function sendLatePaymentDigest({ landlordEmail, landlordName, items
       relatedEntityType: null,
       relatedEntityId: null,
       metadata: {
-        count: sorted.length, total,
+        count: n, total,
         ...(tenantIds.length ? { tenant_ids: tenantIds } : {}),
         ...(paymentIds.length ? { payment_ids: paymentIds } : {}),
       },

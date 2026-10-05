@@ -29,6 +29,8 @@ import { MAINTENANCE_CATEGORIES,
   type FeeType,
   RENT_DUE_MODES,
   CARD_FEE_PAYERS,
+  PROCESSING_FEE_CHOICES,
+  type ProcessingFeeChoice,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
@@ -334,18 +336,24 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     }
 
     // Allocation rule INSERT — 1:1 with property.
-    // S116: three independent fee toggles. S513 (walkthrough #2): card_fee_payer
-    // is hard-locked to 'tenant' — the landlord NEVER covers card (S512). ACH
-    // defaults to the landlord's onboarding election
-    // (landlords.default_ach_fee_payer), overridable per-property by an explicit
-    // achFeePayer in the request. Legacy bankingFeePayer still mirrors into ACH.
+    // 10/5 (Nic): ONE card-and-bank fee choice per property for everyone who
+    // pays there (PROCESSING_FEE_CHOICES). It starts from the company's
+    // onboarding election (landlords.default_ach_fee_payer), overridable by an
+    // explicit achFeePayer / cardFeePayer in the request; the database copies
+    // it to card and to the property's counter and booking-site columns.
+    // 10/5: read from the property's company. It read req.user.profileId,
+    // which names no company for a landlord since S633, so every new property
+    // ignored the election.
     const dfltRes = await client.query<{ default_ach_fee_payer: string }>(
       `SELECT default_ach_fee_payer FROM landlords WHERE id=$1`,
-      [req.user!.profileId]
+      [prop.landlord_id]
     )
     const landlordAchDefault = dfltRes.rows[0]?.default_ach_fee_payer ?? 'tenant'
-    const achFeePayer       = ar.achFeePayer ?? ar.bankingFeePayer ?? landlordAchDefault
-    const cardFeePayer      = 'tenant'
+    if (ar.achFeePayer && ar.cardFeePayer && ar.achFeePayer !== ar.cardFeePayer) {
+      throw new AppError(400, 'Card and bank payment fees are one choice: pass them on, or cover them.')
+    }
+    const achFeePayer       = ar.achFeePayer ?? ar.cardFeePayer ?? ar.bankingFeePayer ?? landlordAchDefault
+    const cardFeePayer      = achFeePayer
     const platformFeePayer  = 'landlord'   // S607 lock — never from the request
     await client.query(`
       INSERT INTO property_allocation_rules
@@ -1156,27 +1164,48 @@ propertiesRouter.patch('/:id/move-in-collection', requirePerm('properties.edit')
   } catch (e) { next(e) }
 })
 
-// PATCH /api/properties/:id/processing-fee-payers — S648 (Nic): "landlord can
-// choose to absorb the processing cost... or they just price accordingly."
-// Who pays GAM's card fee at this property's register (counter card sales and
-// pay links) and on its booking site. Rent is not part of this.
+// PATCH /api/properties/:id/processing-fee-payers — 10/5 (Nic): "The only
+// thing the landlord chooses is if they absorb the cost or if they pass it
+// through ... they cannot absorb it for some people and pass it through to
+// other people." ONE choice per property: card and bank fees, for rent, the
+// front counter, pay links and the booking site alike. Body { choice:
+// 'pass_on' | 'cover' }. A page cached from before sends { register } or
+// { booking }; either one is taken as the choice for everything.
 propertiesRouter.patch('/:id/processing-fee-payers', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const payer = z.enum(CARD_FEE_PAYERS)
-    const body = z.object({ register: payer.optional(), booking: payer.optional() })
-      .refine(b => b.register || b.booking, 'Say which setting to change').parse(req.body)
+    const body = z.object({
+      choice: z.enum(PROCESSING_FEE_CHOICES).optional(),
+      register: payer.optional(), booking: payer.optional(),
+    }).refine(b => b.choice || b.register || b.booking, 'Say whether to pass the fees on or cover them').parse(req.body)
+    const legacy = body.register ?? body.booking
+    if (body.register && body.booking && body.register !== body.booking) {
+      throw new AppError(400, 'Card and bank payment fees are one choice: pass them on, or cover them.')
+    }
+    const choice: ProcessingFeeChoice = body.choice ?? (legacy === 'landlord' ? 'cover' : 'pass_on')
     const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
     if (!prop) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      // Both tables, one transaction. The database keeps them equal either way
+      // (migration 20261005120000); writing both says so plainly.
+      await client.query(
+        `UPDATE properties
+            SET register_card_fee_payer = $2, booking_card_fee_payer = $2, updated_at = NOW()
+          WHERE id = $1`, [req.params.id, choice === 'cover' ? 'landlord' : 'customer'])
+      await client.query(
+        `UPDATE property_allocation_rules SET ach_fee_payer = $2, card_fee_payer = $2 WHERE property_id = $1`,
+        [req.params.id, choice === 'cover' ? 'landlord' : 'tenant'])
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
     const row = await queryOne<{ register_card_fee_payer: string; booking_card_fee_payer: string }>(
-      `UPDATE properties
-          SET register_card_fee_payer = COALESCE($2, register_card_fee_payer),
-              booking_card_fee_payer  = COALESCE($3, booking_card_fee_payer),
-              updated_at = NOW()
-        WHERE id = $1
-        RETURNING register_card_fee_payer, booking_card_fee_payer`,
-      [req.params.id, body.register ?? null, body.booking ?? null])
-    res.json({ success: true, data: { propertyId: req.params.id,
+      `SELECT register_card_fee_payer, booking_card_fee_payer FROM properties WHERE id = $1`, [req.params.id])
+    res.json({ success: true, data: { propertyId: req.params.id, choice,
       registerCardFeePayer: row!.register_card_fee_payer, bookingCardFeePayer: row!.booking_card_fee_payer } })
   } catch (e) { next(e) }
 })
@@ -1835,15 +1864,16 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
       params.push(body.ownerBankAccountId)
       sets.push(`owner_bank_account_id = $${params.length}`)
     }
-    if (body.achFeePayer !== undefined) {
-      params.push(body.achFeePayer)
-      sets.push(`ach_fee_payer = $${params.length}`)
+    // 10/5 (Nic): card and bank fees are ONE choice per property. Either field
+    // sets both (and the database carries it to the counter and booking site);
+    // the two sent with different answers is refused rather than guessed.
+    if (body.achFeePayer !== undefined && body.cardFeePayer !== undefined && body.achFeePayer !== body.cardFeePayer) {
+      throw new AppError(400, 'Card and bank payment fees are one choice: pass them on, or cover them.')
     }
-    if (body.cardFeePayer !== undefined) {
-      // S513 lock: card is always the tenant's — the landlord can never elect to
-      // cover card. Accept the field for backward compat but force 'tenant'.
-      params.push('tenant')
-      sets.push(`card_fee_payer = $${params.length}`)
+    const feePayer = body.achFeePayer ?? body.cardFeePayer
+    if (feePayer !== undefined) {
+      params.push(feePayer)
+      sets.push(`ach_fee_payer = $${params.length}`, `card_fee_payer = $${params.length}`)
     }
     // S607 lock (Nic): platformFeePayer is deliberately NOT patchable — the
     // platform fee is always the landlord's, so GAM's volume discounts can
