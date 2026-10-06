@@ -296,18 +296,6 @@ async function reservePlatformHeldBatch(
     const transferAmount = Math.round((owed - netted - gamTaken) * 100) / 100
     const fullyNetted = transferAmount <= 0
 
-    // S620: record where this landlord's GAM balance stands after the netting,
-    // trip or no trip. Nic: "we should flag those properties when that happens
-    // and see how close it was to happening. Maybe we raise the limit per
-    // property... if the fees are not worth the extra money movement."
-    // A property that peaks at $80 and never crosses is the useful signal, and
-    // it only exists if the near-misses are written down too.
-    void markBalance(landlordRow.landlord_id).then((b) => {
-      if (b.overThreshold) {
-        logger.warn({ landlordId: landlordRow.landlord_id, owed: b.owed, threshold: b.threshold },
-          '[gam-account] still over threshold after netting — a direct debit is the only route left')
-      }
-    }).catch(() => {})
 
     // Create the durable intent. For a fully-netted batch there is no Stripe
     // Transfer to make, so it's born already 'transferred' — and dated here,
@@ -374,6 +362,22 @@ async function reservePlatformHeldBatch(
     )
 
     await client.query('COMMIT')
+    // S620: record where this landlord's GAM balance stands after the netting,
+    // trip or no trip. Nic: "we should flag those properties when that happens
+    // and see how close it was to happening. Maybe we raise the limit per
+    // property... if the fees are not worth the extra money movement."
+    // A property that peaks at $80 and never crosses is the useful signal, and
+    // it only exists if the near-misses are written down too.
+    // 10/5: AFTER the commit. Read on its own connection before it, it saw the
+    // balance the netting had just paid off — Mountain View's $175.50, netted
+    // in full, was recorded as a peak over the $100 line with a warning that a
+    // direct debit was the only route left.
+    void markBalance(landlordRow.landlord_id).then((b) => {
+      if (b.overThreshold) {
+        logger.warn({ landlordId: landlordRow.landlord_id, owed: b.owed, threshold: b.threshold },
+          '[gam-account] still over threshold after netting — a direct debit is the only route left')
+      }
+    }).catch(() => {})
     return {
       intentId,
       landlordId: landlordRow.landlord_id,

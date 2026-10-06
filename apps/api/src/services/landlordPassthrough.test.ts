@@ -410,6 +410,24 @@ describe('reconcilePlatformHeldPayments', () => {
     expect(rev).toMatchObject({ recovery_status: 'recovered', status: 'resolved', outcome: 'landlord_clawback', late_fee_owner: 'landlord' })
   })
 
+  it('10/5: GAM\u2019s fees netted out of the payout are recorded as paid off — never as a balance still over the line', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)
+    await db.query(
+      `INSERT INTO landlord_gam_charges (landlord_id, kind, amount, source_type, source_id, notes)
+       VALUES ($1, 'subscription', 175.50, 'platform_fee_accrual', gen_random_uuid(), 'October fee')`, [ctx.landlordId])
+    transferMock.mockResolvedValueOnce({ id: 'tr_net_gam' } as any)
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res.amount).toBe(774.5)
+    // The mark is written after the payout commits, so it sees the fee paid.
+    let mark: any = null
+    for (let i = 0; i < 50 && !mark; i++) {
+      mark = (await db.query(`SELECT peak_owed::text AS owed FROM landlord_gam_balance_marks WHERE landlord_id = $1`, [ctx.landlordId])).rows[0]
+      if (!mark) await new Promise(r => setTimeout(r, 20))
+    }
+    expect(mark?.owed).toBe('0.00')
+  })
+
   it('S561: a receivable LARGER than the batch is NOT partially netted — full transfer fires, receivable carries', async () => {
     const ctx = await seedCtx()
     await seedOwnerShareLedger(ctx, 950)
