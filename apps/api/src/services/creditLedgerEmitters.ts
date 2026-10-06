@@ -213,30 +213,25 @@ export async function emitPaymentSettledEvent(
      *  landlord-attested with the check number as evidence; default Stripe. */
     attestationSource?: CreditAttestationSource
     attestationEvidence?: Record<string, unknown>
+    /**
+     * 10/6 (Nic): the bill has a late fee on it (charged, not deleted —
+     * services/settleHooks). The mark is LATE, whatever day it reads as, and
+     * the onboarding month's positive-only rule does not apply: "Late fees are
+     * not automatically on time because of the onboarding month." The caller
+     * passes settledAt as the day GAM recorded the payment.
+     */
+    lateFeeOnBill?: boolean
+    /** 10/6: the day the record says the money moved (a bank deposit's date), when the mark counts from a later day. */
+    moneyPaidAt?: Date | null
   },
 ): Promise<void> {
-  const facts = await billFacts(client, args.paymentId, args.propertyTz)
-  if (facts && facts.type !== 'rent' && facts.type !== 'utility') return
-  const dueDay = calendarDay(args.dueDate)
-  const writtenOn = facts?.writtenOn ?? null
-  const countsFrom = lateCountsFrom(dueDay, writtenOn, dayAtProperty(args.propertyTz, args.settledAt))
-  const billedLate = countsFrom !== dueDay
-  const eventType = classifyPaymentTier({
-    dueDate: countsFrom,
-    settledAt: args.settledAt,
-    graceDays: args.graceDays ?? DEFAULT_GRACE_DAYS,
-    propertyTz: args.propertyTz,
+  const rated = await ratePaymentMark(client, {
+    paymentId: args.paymentId, dueDate: args.dueDate, settledAt: args.settledAt,
+    graceDays: args.graceDays, propertyTz: args.propertyTz, lateFeeOnBill: args.lateFeeOnBill === true,
   })
-
+  if (!rated) return
+  const { eventType, dueDay, billedOn } = rated
   const positive = isPositivePaymentTier(eventType)
-
-  // S652 (Nic): "don't count the onboarding month for anything negative, only
-  // positive." A household moved onto GAM mid-tenancy gets its first bill on
-  // GAM's terms, not theirs — paying it on time is a good mark, paying it late
-  // is nothing. The onboarding month is the month of the first rent charge on
-  // an existing-tenancy lease.
-  if (!positive && await isOnboardingMonthCharge(client, args.paymentId)) return
-
   const visibility = positive ? 'visible_to_current_landlord' : 'visible_to_gam_network'
 
   await appendEvent(
@@ -251,9 +246,16 @@ export async function emitPaymentSettledEvent(
         // S654: the due date is a calendar day, recorded as one.
         due_date: dueDay,
         // The bill was written after its due date: lateness counted from this day.
-        ...(billedLate ? { billed_on: writtenOn } : {}),
+        ...(billedOn ? { billed_on: billedOn } : {}),
         paid_at: args.settledAt.toISOString(),
         grace_days: args.graceDays ?? DEFAULT_GRACE_DAYS,
+        // 10/6 (Nic): a late fee is on this bill — late, from the day GAM
+        // recorded it; the day the money moved is kept beside it.
+        ...(args.lateFeeOnBill ? {
+          late_fee_on_bill: true,
+          ...(args.moneyPaidAt && args.moneyPaidAt.getTime() !== args.settledAt.getTime()
+            ? { money_paid_at: args.moneyPaidAt.toISOString() } : {}),
+        } : {}),
       },
       occurredAt: args.settledAt,
       attestationSource: args.attestationSource ?? 'stripe_attested',
@@ -264,6 +266,225 @@ export async function emitPaymentSettledEvent(
     },
     client,
   )
+}
+
+/**
+ * The mark a settled rent or utility row earns (null: none — not rent or
+ * utility, or late in the onboarding month on a bill with no late fee).
+ *
+ * Lateness counts from the later of the due date and the day GAM wrote the
+ * bill (billFacts / lateCountsFrom). S652 (Nic): "don't count the onboarding
+ * month for anything negative, only positive" — a household moved onto GAM
+ * mid-tenancy gets its first bill on GAM's terms, not theirs: paying it on
+ * time is a good mark, paying it late is nothing. 10/6 (Nic): except when the
+ * bill has a late fee on it — "Late fees are not automatically on time because
+ * of the onboarding month" — then the mark is late (at least late_minor),
+ * onboarding month or not.
+ */
+async function ratePaymentMark(
+  client: PoolClient,
+  a: { paymentId: string; dueDate: Date | string; settledAt: Date; graceDays: number | null; propertyTz?: string | null; lateFeeOnBill: boolean },
+): Promise<{ eventType: CreditEventType; dueDay: string; billedOn: string | null } | null> {
+  const facts = await billFacts(client, a.paymentId, a.propertyTz)
+  if (facts && facts.type !== 'rent' && facts.type !== 'utility') return null
+  const dueDay = calendarDay(a.dueDate)
+  const writtenOn = facts?.writtenOn ?? null
+  const countsFrom = lateCountsFrom(dueDay, writtenOn, dayAtProperty(a.propertyTz, a.settledAt))
+  let eventType = classifyPaymentTier({
+    dueDate: countsFrom,
+    settledAt: a.settledAt,
+    graceDays: a.graceDays ?? DEFAULT_GRACE_DAYS,
+    propertyTz: a.propertyTz,
+  })
+  if (a.lateFeeOnBill) {
+    if (isPositivePaymentTier(eventType)) eventType = 'payment_received_late_minor'
+  } else if (!isPositivePaymentTier(eventType) && await isOnboardingMonthCharge(client, a.paymentId)) {
+    return null
+  }
+  return { eventType, dueDay, billedOn: countsFrom !== dueDay ? writtenOn : null }
+}
+
+/**
+ * 10/6 (Nic) — the landlord deleted the late fee(s) on an onboarding bill
+ * ("the late fee is only available to be completely deleted during the
+ * onboarding month"): once NO late fee is left on the bill, each live mark
+ * its rent and utility carry because a late fee was on it (event_data
+ * late_fee_on_bill — late, counted from the day GAM recorded the payment) is
+ * replaced by the mark the payment earns from the day the money moved (the
+ * row's settled day: a bank deposit's date), by the emitter's own rule
+ * without the late fee. Through the ledger's correction mechanism only — a
+ * replacement mark is appended (corrects_event_id) and the old one superseded
+ * ('data_entry_error_corrected'); a late payment in the onboarding month earns
+ * no mark at all, so its old mark is withdrawn (it points at itself,
+ * 'attestation_invalidated'). Never an edit or delete of an event in place.
+ * Inside the caller's transaction; returns the credit subjects changed (the
+ * caller recomputes their scores after its commit).
+ */
+export async function reRateMarksWithoutLateFee(client: PoolClient, invoiceId: string): Promise<string[]> {
+  const still = await client.query(
+    `SELECT 1 FROM payments WHERE invoice_id = $1 AND type = 'late_fee' AND amount > 0 AND status <> 'voided' LIMIT 1`,
+    [invoiceId])
+  if ((still.rowCount ?? 0) > 0) return []
+  const { rows } = await client.query<{
+    id: string; event_data: Record<string, unknown>; occurred_at: Date
+    attestation_source: CreditAttestationSource; attestation_evidence: Record<string, unknown>
+    dimension_tags: string[]; subject_id: string; tenant_id: string
+    payment_id: string; due_date: string; settled_at: Date | null; grace: number | null; timezone: string | null
+  }>(
+    `SELECT e.id, e.event_data, e.occurred_at, e.attestation_source, e.attestation_evidence, e.dimension_tags,
+            e.subject_id, s.subject_ref_id AS tenant_id,
+            p.id AS payment_id, p.due_date::text AS due_date, p.settled_at, l.late_fee_grace_days AS grace, pr.timezone
+       FROM credit_events e
+       JOIN credit_subjects s ON s.id = e.subject_id AND s.subject_type = 'tenant'
+       JOIN payments p ON p.id::text = e.event_data->>'payment_id'
+       LEFT JOIN leases l ON l.id = p.lease_id
+       LEFT JOIN units u ON u.id = p.unit_id
+       LEFT JOIN properties pr ON pr.id = u.property_id
+      WHERE p.invoice_id = $1 AND p.type IN ('rent', 'utility') AND p.status = 'settled'
+        AND e.superseded_by IS NULL
+        AND e.event_type LIKE 'payment_received_%'
+        AND e.event_data->>'late_fee_on_bill' = 'true'
+      ORDER BY e.recorded_at, e.id
+        FOR UPDATE OF e`,
+    [invoiceId])
+  const subjects = new Set<string>()
+  for (const e of rows) {
+    const graceRaw = Number(e.event_data.grace_days)
+    const graceDays = Number.isFinite(graceRaw) ? graceRaw : (e.grace ?? DEFAULT_GRACE_DAYS)
+    const moneyRaw = e.event_data.money_paid_at
+    const paidAt = e.settled_at ? new Date(e.settled_at)
+      : typeof moneyRaw === 'string' && !Number.isNaN(Date.parse(moneyRaw)) ? new Date(moneyRaw) : e.occurred_at
+    const rated = await ratePaymentMark(client, {
+      paymentId: e.payment_id, dueDate: e.due_date, settledAt: paidAt, graceDays, propertyTz: e.timezone, lateFeeOnBill: false,
+    })
+    subjects.add(e.subject_id)
+    if (!rated) {
+      await supersedeEvent(client, e.id, e.id, 'attestation_invalidated')
+      continue
+    }
+    const { late_fee_on_bill: _was, money_paid_at: _moved, billed_on: _billed, ...rest } = e.event_data
+    const corrected = await appendEvent(
+      {
+        subjectType: 'tenant',
+        subjectRefId: e.tenant_id,
+        eventType: rated.eventType,
+        eventData: {
+          ...rest,
+          due_date: rated.dueDay,
+          ...(rated.billedOn ? { billed_on: rated.billedOn } : {}),
+          paid_at: paidAt.toISOString(),
+          grace_days: graceDays,
+          corrects_event_id: e.id,
+          late_fee_deleted: true,
+        },
+        occurredAt: paidAt,
+        attestationSource: e.attestation_source,
+        attestationEvidence: e.attestation_evidence,
+        dimensionTags: e.dimension_tags as CreditScoreDimension[],
+        networkVisibility: isPositivePaymentTier(rated.eventType) ? 'visible_to_current_landlord' : 'visible_to_gam_network',
+      },
+      client,
+    )
+    await supersedeEvent(client, e.id, corrected.eventId, 'data_entry_error_corrected')
+  }
+  return [...subjects]
+}
+
+/** What correctMarkForLateFeeOnBill did to one row's payment mark. */
+export interface LateFeeMarkCorrection {
+  paymentId: string
+  action: 'corrected' | 'written' | 'unchanged' | 'skipped'
+  was: CreditEventType | null
+  now: CreditEventType | null
+  subjectId: string | null
+  eventId: string | null
+}
+
+/**
+ * 10/6 (Nic) — for a settled rent or utility row whose bill has a late fee on
+ * it, put its payment mark where the rule puts it (settleHooks: LATE, counted
+ * from the day GAM recorded the payment, onboarding month or not), for a mark
+ * written before the rule (scripts/oct6_fix_reversed_late_fees). The live mark
+ * is replaced through the correction mechanism (a corrected mark appended,
+ * the old one superseded 'data_entry_error_corrected'); a row that has no mark
+ * at all (the onboarding month's positive-only rule wrote none) gets one. A
+ * mark already written under the rule (late_fee_on_bill) is left alone — run
+ * twice, the second run changes nothing. A row whose marks were all
+ * withdrawn or corrected away by someone else is skipped.
+ */
+export async function correctMarkForLateFeeOnBill(
+  client: PoolClient, a: { paymentId: string; recordedAt: Date },
+): Promise<LateFeeMarkCorrection> {
+  const out = (action: LateFeeMarkCorrection['action'], o: Partial<LateFeeMarkCorrection> = {}): LateFeeMarkCorrection =>
+    ({ paymentId: a.paymentId, action, was: null, now: null, subjectId: null, eventId: null, ...o })
+  const p = (await client.query<{
+    id: string; type: string; tenant_id: string | null; amount: string; due_date: string; settled_at: Date | null
+    status: string; grace: number | null; timezone: string | null; reversal_id: string | null
+  }>(
+    `SELECT p.id, p.type, p.tenant_id, p.amount::text AS amount, p.due_date::text AS due_date, p.settled_at, p.status,
+            l.late_fee_grace_days AS grace, pr.timezone, p.reversal_id
+       FROM payments p
+       LEFT JOIN leases l ON l.id = p.lease_id
+       LEFT JOIN units u ON u.id = p.unit_id
+       LEFT JOIN properties pr ON pr.id = u.property_id
+      WHERE p.id = $1`, [a.paymentId])).rows[0]
+  if (!p || p.status !== 'settled' || !p.tenant_id || !p.due_date || p.reversal_id
+      || (p.type !== 'rent' && p.type !== 'utility')) return out('skipped')
+  const events = (await client.query<{
+    id: string; event_type: CreditEventType; event_data: Record<string, unknown>; superseded_by: string | null
+    attestation_source: CreditAttestationSource; attestation_evidence: Record<string, unknown>
+    dimension_tags: string[]; subject_id: string
+  }>(
+    `SELECT e.id, e.event_type, e.event_data, e.superseded_by, e.attestation_source, e.attestation_evidence,
+            e.dimension_tags, e.subject_id
+       FROM credit_events e
+      WHERE e.event_type LIKE 'payment_received_%' AND e.event_data->>'payment_id' = $1
+      ORDER BY e.recorded_at, e.id
+        FOR UPDATE OF e`, [a.paymentId])).rows
+  const live = events.filter(e => !e.superseded_by)
+  if (live.length === 0 && events.length > 0) return out('skipped')
+  const current = live[live.length - 1] ?? null
+  if (current && current.event_data.late_fee_on_bill === true) {
+    return out('unchanged', { was: current.event_type, now: current.event_type, subjectId: current.subject_id, eventId: current.id })
+  }
+  const moneyPaidAt = p.settled_at ? new Date(p.settled_at) : a.recordedAt
+  const settledAt = moneyPaidAt < a.recordedAt ? a.recordedAt : moneyPaidAt
+  const graceRaw = Number(current?.event_data.grace_days)
+  const graceDays = Number.isFinite(graceRaw) ? graceRaw : (p.grace ?? DEFAULT_GRACE_DAYS)
+  const rated = await ratePaymentMark(client, {
+    paymentId: p.id, dueDate: p.due_date, settledAt, graceDays, propertyTz: p.timezone, lateFeeOnBill: true,
+  })
+  if (!rated) return out('skipped')
+  const appended = await appendEvent(
+    {
+      subjectType: 'tenant',
+      subjectRefId: p.tenant_id,
+      eventType: rated.eventType,
+      eventData: {
+        ...(current ? (({ billed_on: _b, ...rest }) => rest)(current.event_data) : {}),
+        payment_id: p.id,
+        payment_type: p.type,
+        amount: p.amount,
+        due_date: rated.dueDay,
+        ...(rated.billedOn ? { billed_on: rated.billedOn } : {}),
+        paid_at: settledAt.toISOString(),
+        grace_days: graceDays,
+        late_fee_on_bill: true,
+        ...(moneyPaidAt.getTime() !== settledAt.getTime() ? { money_paid_at: moneyPaidAt.toISOString() } : {}),
+        ...(current ? { corrects_event_id: current.id } : {}),
+      },
+      occurredAt: settledAt,
+      attestationSource: current?.attestation_source ?? 'landlord_self_reported_with_evidence',
+      attestationEvidence: current?.attestation_evidence ?? {},
+      dimensionTags: (current?.dimension_tags as CreditScoreDimension[] | undefined) ?? ['payment_reliability'],
+      networkVisibility: 'visible_to_gam_network',
+    },
+    client,
+  )
+  if (current) await supersedeEvent(client, current.id, appended.eventId, 'data_entry_error_corrected')
+  return out(current ? 'corrected' : 'written', {
+    was: current?.event_type ?? null, now: rated.eventType, subjectId: appended.subjectId, eventId: appended.eventId,
+  })
 }
 
 /** On time or within grace: a good mark the current landlord sees. Anything later is adverse. */
@@ -336,6 +557,8 @@ export async function correctLateMarksForBillsWrittenLate(
         WHERE e.superseded_by IS NULL
           AND e.event_type = ANY($1::text[])
           AND NOT (e.event_data ? 'billed_on')
+          -- 10/6: a mark late because a late fee is on its bill is late by rule, not by its dates.
+          AND NOT (e.event_data ? 'late_fee_on_bill')
           AND p.type IN ('rent', 'utility')
         ORDER BY e.recorded_at, e.id
         FOR UPDATE OF e`,

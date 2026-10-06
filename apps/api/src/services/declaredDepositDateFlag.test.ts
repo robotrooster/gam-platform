@@ -8,7 +8,7 @@
  *
  *   - The tenant's date counts only when the bank posted the deposit that day
  *     or the NEXT BUSINESS DAY after it (a weekend or a bank holiday rolls
- *     forward): their date governs, late fees after it come off.
+ *     forward): their date governs, late fees after it are credited (10/6).
  *   - Posted later than that: the bank's date governs (late fees up to it
  *     stand), the deposit still pays the bill, the report is flagged (both
  *     dates kept) and counts as a strike; the landlord sees "Said they
@@ -92,8 +92,9 @@ async function lateFee(s: Stack, day: string, amount = 10, settled = false): Pro
      VALUES ($1,$2,$3,$4,$5,'late_fee',$6,$7,$8::date,'LATEFEE', CASE WHEN $7 = 'settled' THEN NOW() ELSE NULL END) RETURNING id`,
     [s.invoiceId, s.unitId, s.leaseId, s.tenantId, s.landlordId, amount, settled ? 'settled' : 'pending', day])).rows[0].id
 }
+/** A late fee: what was charged, its status, and (10/6) how much a late-fee credit nets out of it. */
 const fee = async (id: string) => (await db.query(
-  `SELECT amount::float AS amount, status FROM payments WHERE id = $1`, [id])).rows[0]
+  `SELECT amount::float AS amount, status, issued_credit_amount::float AS credited FROM payments WHERE id = $1`, [id])).rows[0]
 const report = async (id: string) => (await db.query(
   `SELECT status, to_char(bank_posted_date,'YYYY-MM-DD') AS bank_posted_date, false_date_flagged_at, resolution_note
      FROM tenant_declared_deposits WHERE id = $1`, [id])).rows[0]
@@ -150,18 +151,18 @@ describe('the bank posted it when the tenant said (or the next business day)', (
     expect(await declarationStrikes(s.tenantId)).toBe(0)
   })
 
-  it('posted the next business day: the late fee charged after the tenant’s date comes off', async () => {
+  it('posted the next business day: the late fee charged after the tenant’s date is credited', async () => {
     const s = await buildStack({ declared: '2026-10-01', posted: '2026-10-02' })
     const after = await lateFee(s, '2026-10-02')
     const r = await confirm(s)
     expect(r.effectivePaidDate).toBe('2026-10-01')
     expect(r.lateFeesUnbilled).toBe(10)
-    expect(await fee(after)).toMatchObject({ amount: 0, status: 'settled' })
+    expect(await fee(after)).toMatchObject({ amount: 10, status: 'settled', credited: 10 })
     expect(await settledOn(s.rentId)).toBe('2026-10-01')
     expect(r.declaredDateFlag).toBeNull()
   })
 
-  it('Friday → Monday is honest: the weekend’s late fees come off', async () => {
+  it('Friday → Monday is honest: the weekend’s late fees are credited', async () => {
     const s = await buildStack({ declared: '2026-10-02', posted: '2026-10-05' })
     const sat = await lateFee(s, '2026-10-03')
     const sun = await lateFee(s, '2026-10-04')
@@ -169,7 +170,7 @@ describe('the bank posted it when the tenant said (or the next business day)', (
     const r = await confirm(s)
     expect(r.effectivePaidDate).toBe('2026-10-02')
     expect(r.lateFeesUnbilled).toBe(30)
-    for (const id of [sat, sun, mon]) expect((await fee(id)).amount).toBe(0)
+    for (const id of [sat, sun, mon]) expect(await fee(id)).toMatchObject({ amount: 10, credited: 10 })
     expect((await report(s.declarationId)).false_date_flagged_at).toBeNull()
   })
 
@@ -193,7 +194,7 @@ describe('the bank posted it later than that — the stated date was false', () 
     expect(await settledOn(s.rentId)).toBe('2026-10-06')
     expect(await fee(before1)).toMatchObject({ amount: 10, status: 'pending' })
     expect(await fee(before2)).toMatchObject({ amount: 10, status: 'pending' })
-    expect((await fee(afterBank)).amount).toBe(0)
+    expect(await fee(afterBank)).toMatchObject({ amount: 10, credited: 10 })
     expect(r.lateFeesUnbilled).toBe(10)
     expect(r.declaredDateFlag).toEqual({ declaredDate: '2026-10-01', bankPostedDate: '2026-10-06' })
   })

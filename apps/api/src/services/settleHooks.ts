@@ -64,14 +64,6 @@ export interface AfterRowsSettledContext {
    * which is when its rest is paid.
    */
   partPaidIds?: readonly string[]
-  /**
-   * 10/6 (Nic): rows whose on-time or late mark counts from another day than
-   * the day they settled — a landlord's recorded bank deposit that took off a
-   * late fee the tenant never reported: the mark counts from the day the
-   * landlord recorded it, not the day of the deposit
-   * (services/manualPaymentSettle). The row's settled day is unchanged.
-   */
-  markSettledAt?: ReadonlyMap<string, Date>
 }
 
 export interface AfterRowsSettledResult {
@@ -105,7 +97,9 @@ const PAYMENT_MARK_TYPES: readonly string[] = CREDIT_EVENT_TYPES.filter(t => t.s
  *      or return) are skipped: a re-payment is not a fresh on-time signal. A
  *      row that already carries a mark is skipped too (a replay), whatever
  *      became of that mark since: a mark an admin later corrected stays
- *      corrected.
+ *      corrected. 10/6 (Nic): a row whose bill has a late fee on it is
+ *      marked LATE, from the day this runs (the day GAM recorded it), onboarding
+ *      month or not.
  *   3. the receipt, queued for afterCommit().
  * Ids that are not settled (or do not exist) are ignored and logged. The rows
  * are locked, so two replays of one settle cannot both find no mark.
@@ -149,32 +143,65 @@ export async function afterRowsSettled(
   const partPaid = new Set(ctx.partPaidIds ?? [])
   const markable = fresh.filter(r => r.tenant_id && r.due_date && (r.type === 'rent' || r.type === 'utility')
     && !partPaid.has(r.id))
+  // Each of the row's marks is followed to the end of its correction chain
+  // (superseded_by). The row is marked unless every chain ends in a mark
+  // withdrawn as no longer vouched for (it points at itself,
+  // 'attestation_invalidated' — an undone bank match): then the line paid
+  // again earns its own mark. A chain ending in a live mark, or in one an
+  // admin corrected away, still counts (a corrected mark stays corrected).
   const marked = new Set(markable.length === 0 ? [] : (await client.query<{ payment_id: string }>(
-    `SELECT DISTINCT e.event_data->>'payment_id' AS payment_id
-       FROM credit_events e
-      WHERE e.event_type = ANY($1::text[])
-        AND e.event_data->>'payment_id' = ANY($2::text[])
-        -- A mark withdrawn by an undone bank match (it points at itself) no
-        -- longer counts: the line paid again earns its own mark.
-        -- (NULL-safe: a live mark has superseded_by NULL and must still count.)
-        AND NOT (e.superseded_by IS NOT DISTINCT FROM e.id
-                 AND e.superseded_reason IS NOT DISTINCT FROM 'attestation_invalidated')`,
+    `WITH RECURSIVE chain AS (
+       SELECT e.id AS cur, e.superseded_by, e.superseded_reason, e.event_data->>'payment_id' AS payment_id, 0 AS hops
+         FROM credit_events e
+        WHERE e.event_type = ANY($1::text[])
+          AND e.event_data->>'payment_id' = ANY($2::text[])
+       UNION ALL
+       SELECT n.id, n.superseded_by, n.superseded_reason, c.payment_id, c.hops + 1
+         FROM chain c JOIN credit_events n ON n.id = c.superseded_by
+        WHERE c.superseded_by IS NOT NULL AND c.superseded_by <> c.cur AND c.hops < 20
+     )
+     SELECT DISTINCT payment_id FROM chain
+      WHERE superseded_by IS NULL
+         OR (superseded_by = cur AND superseded_reason IS DISTINCT FROM 'attestation_invalidated')`,
     [PAYMENT_MARK_TYPES, markable.map(r => r.id)])).rows.map(r => r.payment_id))
   const alreadyMarked = markable.filter(r => marked.has(r.id)).map(r => r.id)
   if (alreadyMarked.length > 0) {
     logger.warn({ alreadyMarked }, '[afterRowsSettled] rows already carry their payment mark; not marked again')
   }
 
+  // 10/6 (Nic): "the late payment still shows on their payment history" — no
+  // exceptions. A bill with a late fee on it (charged and not deleted: one
+  // credited because the money turns out to have been in the bank still
+  // counts) gets a LATE mark for its rent and utility, counted from the day
+  // the payment was recorded or confirmed in GAM, never from an earlier date
+  // the record carries (a bank deposit's date) — whether or not the tenant
+  // reported it first, onboarding month or not (creditLedgerEmitters). Only the
+  // landlord deleting the late fee, in the onboarding month, lifts it
+  // (services/lateFeeDelete → reRateMarksWithoutLateFee).
+  const toMark = markable.filter(r => !marked.has(r.id))
+  const withLateFee = new Set(toMark.length === 0 ? [] : (await client.query<{ id: string }>(
+    `SELECT p.id FROM payments p
+      WHERE p.id = ANY($1::uuid[]) AND p.invoice_id IS NOT NULL
+        AND EXISTS (SELECT 1 FROM payments f
+                     WHERE f.invoice_id = p.invoice_id AND f.type = 'late_fee'
+                       AND f.amount > 0 AND f.status <> 'voided')`,
+    [toMark.map(r => r.id)])).rows.map(r => r.id))
+  const recordedAt = new Date()
+
   let eventsEmitted = 0
   for (const r of markable) {
     if (marked.has(r.id) || !r.tenant_id || !r.due_date || (r.type !== 'rent' && r.type !== 'utility')) continue
+    const settledAt = r.settled_at ? new Date(r.settled_at) : recordedAt
+    const lateFeeOnBill = withLateFee.has(r.id)
     await emitPaymentSettledEvent(client, {
       tenantId:              r.tenant_id,
       paymentId:             r.id,
       paymentType:           r.type,
       amount:                r.amount,
       dueDate:               r.due_date,
-      settledAt:             ctx.markSettledAt?.get(r.id) ?? (r.settled_at ? new Date(r.settled_at) : new Date()),
+      settledAt:             lateFeeOnBill && settledAt < recordedAt ? recordedAt : settledAt,
+      lateFeeOnBill,
+      moneyPaidAt:           lateFeeOnBill ? settledAt : null,
       graceDays:             r.late_fee_grace_days,
       // Only a Stripe settle vouches with its intent; a row an old, failed
       // intent once touched must not cite it when the desk or credit paid it.

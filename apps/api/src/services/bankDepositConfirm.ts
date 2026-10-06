@@ -11,7 +11,7 @@
 // past, so it settles on the date the money actually moved — the tenant's own
 // declared date when a bank row corroborates it, otherwise the bank's posting.
 // Late fees that accrued after that date were charged for an absence that was
-// not real, and are undone. 10/5 (Nic): the declared date corroborates only
+// not real, and are credited (10/6). 10/5 (Nic): the declared date corroborates only
 // when the bank posted the deposit that day or the next business day after it;
 // later than that the bank's date governs and the report is flagged for false
 // information (a strike — services/declaredDepositTrust).
@@ -19,8 +19,11 @@
 // WHAT IS NOT ERASED. GAM does not delete money records (standing retention
 // rule). A late fee the tenant has ALREADY PAID cannot be un-charged, so it
 // comes back as a `late_fee_refund` credit — visible, attributable, reversible.
-// Only an unpaid tick is zeroed, and even then the row survives with a note
-// saying why. Nobody should ever have to guess where a charge went.
+// 10/6 (Nic): an unpaid tick is never zeroed either — it stays as charged and
+// a late-fee credit is applied to it (services/lateFeeCredit), so the bill nets
+// out and the payment still counts late on the tenant's history ("they get a
+// credit against their bill and the late payment still shows on their payment
+// history"). Nobody should ever have to guess where a charge went.
 //
 // S655 (money plan §3, the bank-deposit row; Step 9):
 //   - ONE HOUSEHOLD. A deposit pays one person's bills with this company
@@ -57,7 +60,7 @@ import { backdateLateFees, effectivePaidDateFor, declaredDateIsFalse, type LateF
 import {
   daysApart, methodContradicts, coversText, declarationReaches, declarationReachesSql,
 } from './bankDepositMatch'
-import { bankDateUsedText, declaredDateFlagText } from '@gam/shared'
+import { bankDateUsedText, declaredDateFlagText, lateFeeCreditedTenantText, monthDayLabel, LATE_FEE_NOT_CREDITED_STILL_OWED_TEXT } from '@gam/shared'
 import { tellLandlordAtStrikeLimit } from './declaredDepositTrust'
 import {
   lockHousehold, lockPaymentRowsById, isBankPayableRow, bankPayableRowSql, allocationOrderSql,
@@ -68,6 +71,7 @@ import { createPaidAhead, createIssuedCredit, runWholeBillCheckAfterCommit, void
 import { supersedeEvent } from './creditLedger'
 import { createNotification } from './notifications'
 import { logger } from '../lib/logger'
+import { creditLateFee, withdrawLateFeeCredit, type CreditedLateFee } from './lateFeeCredit'
 import type { ManualPaymentMethod } from '@gam/shared'
 import { activateBillingForMoneyMoved } from './billingActivation'
 
@@ -128,8 +132,18 @@ export interface DepositSettleUndo {
   version: 1
   /** Each settled row as it was before (status, retry schedule, intent). */
   rows: Array<{ paymentId: string; priorStatus: string; priorNextRetryAt: string | null; priorIntentId: string | null; money: number }>
-  /** Late fees zeroed because the rent was paid before they accrued. */
+  /**
+   * Late fees zeroed because the rent was paid before they accrued — matches
+   * made before 10/6 only (a fee is never zeroed now); Undo still puts them back.
+   */
   lateFeesZeroed: Array<{ paymentId: string; priorAmount: number; priorStatus: string; priorNotes: string | null }>
+  /**
+   * 10/6 (Nic): late fees credited because the rent was paid before they
+   * accrued — the fee stayed, a late-fee credit was applied to it. Undo takes
+   * the credit back off and withdraws it, and the fee is owed again as it was.
+   * Absent on matches made before 10/6.
+   */
+  lateFeesCredited?: CreditedLateFee[]
   /**
    * Every late-fee refund credit created for fees the tenant had already paid —
    * one per invoice the deposit paid lines on (Step 9 review: keeping only the
@@ -257,8 +271,19 @@ async function lateFeeCutoffDate(
 /**
  * Undo the late fees an invoice accrued after the rent was really paid.
  *
- * Returns what was unbilled and what was refunded — two different acts, kept
+ * Returns what was credited and what was refunded — two different acts, kept
  * apart deliberately. See depositBackdate.ts.
+ *
+ * 10/6 (Nic): "they get a credit against their bill and the late payment
+ * still shows on their payment history." An unpaid fee that was never owed is
+ * NEVER zeroed: it stays as charged and a late-fee credit is applied to it
+ * (services/lateFeeCredit.creditLateFee), so the bill nets out while the fee —
+ * and with it the late mark on the tenant's history (services/settleHooks) —
+ * stays. The one exception is the landlord's own choice in the onboarding
+ * month (`deleteOnboarding`, the box on Record payment / Post a payment): on
+ * the onboarding bill the fee is deleted outright instead, with no credit
+ * (services/lateFeeDelete). A fee the tenant already paid comes back as a
+ * late-fee refund credit, as before.
  *
  * S655:
  *   - A tick was never owed only if, on its date, the WHOLE invoice was paid.
@@ -274,7 +299,7 @@ async function lateFeeCutoffDate(
  *     match refund the fees that line's own lateness had earned, while the
  *     same facts recorded in the other order kept them.
  *   - A late fee whose money is on its way (a card or bank payment clearing) is
- *     never zeroed; nor one reopened after a dispute.
+ *     never credited; nor one reopened after a dispute.
  *   - The refund for fees already paid is a credit the landlord gives
  *     (createIssuedCredit): it settles nothing here.
  */
@@ -285,20 +310,38 @@ export async function reverseLateFees(
   o: {
     settlingIds: readonly string[]; tenantId: string; landlordId: string; leaseId: string | null; createdBy: string | null
     /**
-     * 10/5 (Nic): false — zero the unpaid fees only; the fees already paid
+     * 10/5 (Nic): false — credit the unpaid fees only; the fees already paid
      * are refunded by a later call once the bill is paid (a landlord's
      * recorded bank deposit: services/manualPaymentSettle, which decides
      * whether the deposit pays the bill in full only after the unpaid fees
      * are off it). Default true.
      */
     refundPaid?: boolean
+    /**
+     * 10/6 (Nic): "the late fee is only available to be completely deleted
+     * during the onboarding month." The landlord ticked the box (the caller
+     * checked who may — lateFeeDelete.canDeleteLateFees): when THIS bill is the
+     * onboarding bill, an unpaid fee that was never owed is deleted outright,
+     * with no credit. A fee that cannot be deleted (money recorded against it)
+     * is credited instead, and why is returned in deleteRefusals.
+     */
+    deleteOnboarding?: { deletedBy: string | null; via: 'record_payment' | 'post_payment' } | null
   },
 ): Promise<{
-  unbilled: number; refunded: number; zeroed: DepositSettleUndo['lateFeesZeroed']; refundCreditId: string | null
+  /** Dollars of unpaid late fees taken off the bill by a late-fee credit. */
+  unbilled: number
+  refunded: number
+  /** 10/6: the unpaid late fees credited, as they were before (for an exact Undo). */
+  credited: CreditedLateFee[]
+  /** 10/6: unpaid late fees deleted from the onboarding bill (the box), what each was, and its bill. */
+  deleted: Array<{ paymentId: string; amount: number; invoiceId: string }>
+  /** 10/6: the box was ticked but a fee could not be deleted — why, in plain words (credited, or still owed). */
+  deleteRefusals: string[]
+  refundCreditId: string | null
   /** 10/6: the late fees already paid that this refunded (empty when refundPaid is false). */
   refundedIds: string[]
 }> {
-  const none = { unbilled: 0, refunded: 0, zeroed: [], refundCreditId: null, refundedIds: [] }
+  const none = { unbilled: 0, refunded: 0, credited: [], deleted: [], deleteRefusals: [], refundCreditId: null, refundedIds: [] }
   const cutoff = await lateFeeCutoffDate(client, invoiceId, effectivePaidDate, o.settlingIds)
   if (cutoff === null) return none
 
@@ -313,6 +356,9 @@ export async function reverseLateFees(
         AND p.status IN ('pending','settled','paid_via_deposit')
         AND p.reversal_id IS NULL
         AND p.amount > 0
+        -- 10/6: a fee already credited (or carrying a late-fee credit) is done.
+        AND NOT EXISTS (SELECT 1 FROM credit_uses u WHERE u.payment_id = p.id AND u.source = 'late_fee_credit'
+                           AND u.status = 'applied')
       ORDER BY p.id
         FOR UPDATE`,
     [invoiceId])
@@ -325,37 +371,58 @@ export async function reverseLateFees(
   }))
   const out = backdateLateFees(ticks, cutoff)
 
-  const zeroed: DepositSettleUndo['lateFeesZeroed'] = []
+  const { isOnboardingBill, deleteLateFee } = await import('./lateFeeDelete')
+  const deleteHere = o.deleteOnboarding && await isOnboardingBill(client, invoiceId) ? o.deleteOnboarding : null
+
+  const credited: CreditedLateFee[] = []
+  const deleted: Array<{ paymentId: string; amount: number; invoiceId: string }> = []
+  const deleteRefusals = new Set<string>()
+  // Credit the tenant had already spent on a fee that was never owed comes back with the refund.
+  let creditSpentCents = 0
   for (const t of out.reversedTicks) {
     if (t.settled) continue   // already paid — refunded as a credit below
-    const prior = live.find(r => r.id === t.paymentId)!
-    // Zeroed, not deleted. The row and its history stay, with the reason on it.
-    const z = await client.query(
-      `UPDATE payments
-          SET amount = 0, status = 'settled', settled_at = NOW(),
-              notes = COALESCE(notes || ' — ', '') ||
-                      'Reversed: rent was paid ' || $2::text || ', before this fee accrued'
-        WHERE id = $1 AND status = 'pending' AND stripe_payment_intent_id IS NULL`,
-      [t.paymentId, effectivePaidDate])
-    if ((z.rowCount ?? 0) === 1) {
-      zeroed.push({ paymentId: t.paymentId, priorAmount: Number(prior.amount), priorStatus: prior.status, priorNotes: prior.notes })
+    let refused: string | null = null
+    if (deleteHere) {
+      const d = await deleteLateFee(client, t.paymentId, {
+        deletedBy: deleteHere.deletedBy, via: deleteHere.via, neverOwedSince: effectivePaidDate,
+      })
+      if (d.deleted) { deleted.push({ paymentId: t.paymentId, amount: t.amount, invoiceId }); continue }
+      refused = d.message
     }
+    const c = await creditLateFee(client, t.paymentId, {
+      paidOn: effectivePaidDate, tenantId: o.tenantId, createdBy: o.createdBy,
+    })
+    if (!c) {
+      logger.warn({ paymentId: t.paymentId, invoiceId },
+        '[deposit-confirm] a late fee that was never owed could not be credited (not on a lease and space, or credit is set aside on it); it stays owed')
+      // 10/6: the box was ticked and the fee could be neither deleted nor
+      // credited — say it stays owed, never that it "stays credited".
+      if (deleteHere) deleteRefusals.add(LATE_FEE_NOT_CREDITED_STILL_OWED_TEXT)
+      continue
+    }
+    if (refused) deleteRefusals.add(refused)
+    creditSpentCents += toCents(c.alreadyPaidByCredit)
+    const { alreadyPaidByCredit: _spent, ...rec } = c
+    credited.push(rec)
   }
 
   let refundCreditId: string | null = null
-  if (out.refundAmount > 0 && o.refundPaid !== false) {
+  const refundCents = (o.refundPaid !== false ? toCents(out.refundAmount) : 0) + creditSpentCents
+  if (refundCents > 0) {
     refundCreditId = await createIssuedCredit(client, {
       landlordId: o.landlordId, tenantId: o.tenantId, leaseId: o.leaseId,
-      amount: out.refundAmount, category: 'late_fee_refund',
-      reason: `Late fees refunded — the bank shows rent was paid on ${effectivePaidDate}`,
+      amount: toDollars(refundCents), category: 'late_fee_refund',
+      reason: `Late fees refunded — the bank shows rent was paid on ${monthDayLabel(effectivePaidDate)}`,
       createdBy: o.createdBy,
     })
   }
 
   return {
-    unbilled: toDollars(zeroed.reduce((s, z) => s + toCents(z.priorAmount), 0)),
-    refunded: o.refundPaid === false ? 0 : out.refundAmount,
-    zeroed,
+    unbilled: toDollars(credited.reduce((s, z) => s + toCents(z.amount), 0)),
+    refunded: toDollars(refundCents),
+    credited,
+    deleted,
+    deleteRefusals: [...deleteRefusals],
     refundCreditId,
     refundedIds: o.refundPaid === false ? [] : out.reversedTicks.filter(t => t.settled).map(t => t.paymentId),
   }
@@ -598,12 +665,13 @@ export async function confirmDepositMatch(
     }
 
     // Late fees first: a fee that accrued after the money moved was never
-    // owed, so it is zeroed before anything is settled (and drops out of what
-    // this deposit pays — what it would have taken becomes paid-ahead money).
+    // owed, so it is credited before anything is settled (10/6, Nic: it stays
+    // on the bill, a credit nets it out) and drops out of what this deposit
+    // pays — what it would have taken becomes paid-ahead money.
     const settlingIds = charges.map(c => c.id)
     let unbilled = 0
     let refunded = 0
-    const zeroed: DepositSettleUndo['lateFeesZeroed'] = []
+    const credited: CreditedLateFee[] = []
     const refundCredits: string[] = []
     const invoices = [...new Set(charges.map(c => c.invoice_id).filter((x): x is string => !!x))].sort()
     for (const invoiceId of invoices) {
@@ -614,11 +682,11 @@ export async function confirmDepositMatch(
       })
       unbilled += r.unbilled
       refunded += r.refunded
-      zeroed.push(...r.zeroed)
+      credited.push(...r.credited)
       if (r.refundCreditId) refundCredits.push(r.refundCreditId)
     }
-    const zeroedIds = new Set(zeroed.map(z => z.paymentId))
-    const toSettle = charges.filter(c => !zeroedIds.has(c.id))
+    const creditedIds = new Set(credited.map(z => z.paymentId))
+    const toSettle = charges.filter(c => !creditedIds.has(c.id))
 
     // Never more than the deposit.
     const linesCents = toSettle.reduce((s, c) => s + toCents(c.money_part), 0)
@@ -750,7 +818,8 @@ export async function confirmDepositMatch(
     const undo: DepositSettleUndo = {
       version: 1,
       rows: undoRows,
-      lateFeesZeroed: zeroed,
+      lateFeesZeroed: [],
+      lateFeesCredited: credited,
       lateFeeRefundCreditIds: refundCredits,
       paidAheadCreditId,
       receiptId,
@@ -807,6 +876,7 @@ export async function confirmDepositMatch(
     // A failed email must not roll back a settled rent payment.
     void notifyBothSides({
       tenantId: householdTenant, landlordId: txn.landlord_id, effectivePaidDate, unbilled, refunded,
+      lateFeeCount: credited.length + (refunded > 0 ? 1 : 0),
       amount: toDollars(depositCents), paidAhead: toDollars(excessCents), coverage,
       auto: input.auto === true, postedDate: txn.posted_date, declaredDateFlag,
     }).catch(e => logger.error({ err: e }, '[deposit-confirm] notify failed'))
@@ -921,6 +991,8 @@ async function noteEscrowDepositMatchUndone(bankTransactionId: string, reopenedI
 async function notifyBothSides(o: {
   tenantId: string; landlordId: string; effectivePaidDate: string
   unbilled: number; refunded: number; amount: number; paidAhead: number; coverage: string | null
+  /** How many late fees were credited or refunded (wording only). */
+  lateFeeCount?: number
   /** S655 (Step 12): settled by itself on amount — both sides are told, the landlord with Undo. */
   auto?: boolean; postedDate?: string
   /** 10/5 (Nic): the tenant's date was not borne out by the bank — the bank's date was used. */
@@ -935,8 +1007,10 @@ async function notifyBothSides(o: {
   const tenantUser = (await queryOne<{ user_id: string }>(
     `SELECT user_id FROM tenants WHERE id=$1`, [o.tenantId]))?.user_id
   if (tenantUser) {
+    // 10/6 (Nic): the late fee is credited (or given back as credit), and the
+    // payment still counts late on their history — "No exceptions".
     const lateLine = reversed > 0
-      ? ` Your late ${reversed === o.refunded ? 'fee has been refunded' : 'fees have been removed'} — $${reversed.toFixed(2)} — because your deposit shows you paid on ${o.effectivePaidDate}.`
+      ? ` ${lateFeeCreditedTenantText({ depositedOn: o.effectivePaidDate, credited: o.unbilled, refunded: o.refunded, count: o.lateFeeCount })}`
       : ''
     const dateLine = o.declaredDateFlag
       ? ` ${bankDateUsedText(o.declaredDateFlag.declaredDate, o.declaredDateFlag.bankPostedDate)}`
@@ -956,7 +1030,7 @@ async function notifyBothSides(o: {
     `SELECT user_id AS owner_user_id FROM landlords WHERE id=$1`, [o.landlordId]))?.owner_user_id
   if (landlordUser) {
     const lateLine = reversed > 0
-      ? ` $${reversed.toFixed(2)} in late fees was reversed — the deposit is dated ${o.effectivePaidDate}.`
+      ? ` $${reversed.toFixed(2)} in late fees charged after ${o.effectivePaidDate} was credited. It still counts as a late payment on their history.`
       : ''
     // 10/5 (Nic): the flag, in the same words as on the report and the payment.
     const flagLine = o.declaredDateFlag
@@ -1077,14 +1151,15 @@ export interface UndoDepositResult {
  * Undo a bank deposit's match — one a person confirmed, one the feed made by
  * itself, or a deposit slip's — exactly: every bill line it paid is owed again
  * as it was (a bank retry it replaced is not put back: that pull was canceled,
- * so the tenant pays again), the late fees it zeroed come back, the late-fee
+ * so the tenant pays again), the late fees it credited (or, before 10/6,
+ * zeroed) are owed again — each late-fee credit taken back and withdrawn — the late-fee
  * refund credits it gave and the paid-ahead money it made are withdrawn, the
  * receipt is closed, the bank allocations are marked reversed, the on-time
  * marks it wrote are withdrawn, the tenant's report goes back to waiting, and
  * the bank row goes back to review — never to be acted on by itself again.
  *
  * REFUSED IF ANYTHING CHANGED SINCE: a line paid again, disputed or changed; a
- * zeroed fee no longer zero; a credit it made already used (or set aside for a
+ * zeroed fee no longer zero, a credited fee changed or its credit used elsewhere; a credit it made already used (or set aside for a
  * payment); the receipt already closed. The reason is said plainly and nothing
  * is changed.
  */
@@ -1144,21 +1219,27 @@ export async function undoDepositMatch(input: {
     await lockHousehold(client, receipt.tenant_id, txn.landlord_id)
     const rowIds = snap.rows.map(r => r.paymentId)
     const feeIds = (snap.lateFeesZeroed ?? []).map(z => z.paymentId)
-    await lockPaymentRowsById(client, [...rowIds, ...feeIds])
+    const credited = snap.lateFeesCredited ?? []
+    const creditedIds = credited.map(z => z.paymentId)
+    await lockPaymentRowsById(client, [...rowIds, ...feeIds, ...creditedIds])
 
-    // 10/6 (Nic): a late fee this match zeroed that the landlord then deleted
-    // (onboarding month only, at their choice — services/lateFeeDelete) is put
-    // back first, exactly as it was deleted (same id, every column), so the
-    // checks and the restore below treat it like any other zeroed fee and give
-    // it back its amount. A delete never touched a payment-history mark: the
-    // marks this match wrote are withdrawn below, as for any undo. Inside this
-    // transaction: a refusal below takes it back out.
-    if (feeIds.length > 0) {
+    // 10/6 (Nic): a late fee this match zeroed or credited that the landlord
+    // then deleted (onboarding month only, at their choice —
+    // services/lateFeeDelete; a credited fee's credit was taken back and
+    // withdrawn with it) is put back first, exactly as it was deleted (same
+    // id, every column), so the checks and the restore below treat it like any
+    // other fee this match took off. The marks this match wrote (and any mark
+    // a delete re-rated from them) are withdrawn below, as for any undo.
+    // Inside this transaction: a refusal below takes it back out.
+    let restoredIds = new Set<string>()
+    if (feeIds.length + creditedIds.length > 0) {
       const invoiceIds = (await client.query<{ invoice_id: string }>(
         `SELECT DISTINCT invoice_id::text AS invoice_id FROM payments
-          WHERE id = ANY($1::uuid[]) AND invoice_id IS NOT NULL ORDER BY 1`, [[...rowIds, ...feeIds]])).rows.map(r => r.invoice_id)
+          WHERE id = ANY($1::uuid[]) AND invoice_id IS NOT NULL ORDER BY 1`, [[...rowIds, ...feeIds, ...creditedIds]])).rows.map(r => r.invoice_id)
       const { restoreDeletedLateFees } = await import('./lateFeeDelete')
-      await restoreDeletedLateFees(client, { paymentIds: feeIds, invoiceIds, restoredBy: input.undoneBy })
+      restoredIds = new Set(await restoreDeletedLateFees(client, {
+        paymentIds: [...feeIds, ...creditedIds], invoiceIds, restoredBy: input.undoneBy,
+      }))
     }
 
     // ── Has anything changed since? ──────────────────────────────────────────
@@ -1184,6 +1265,32 @@ export async function undoDepositMatch(input: {
         `SELECT id, amount::text AS amount, status FROM payments WHERE id = ANY($1::uuid[])`, [feeIds])).rows
       if (fees.length !== feeIds.length || fees.some(f => toCents(f.amount) !== 0 || f.status !== 'settled')) {
         throw changed('A late fee this deposit took off has changed since.')
+      }
+    }
+    // 10/6: each credited fee is still as the match left it — charged, paid by
+    // its own late-fee credit and nothing else — or was deleted (put back just
+    // above, its credit already taken back and withdrawn).
+    if (creditedIds.length > 0) {
+      const fees = new Map((await client.query<{ id: string; amount: string; status: string; issued: string }>(
+        `SELECT id, amount::text AS amount, status, issued_credit_amount::text AS issued
+           FROM payments WHERE id = ANY($1::uuid[])`, [creditedIds])).rows.map(f => [f.id, f]))
+      for (const c of credited) {
+        const f = fees.get(c.paymentId)
+        if (!f || f.status !== 'settled') throw changed('A late fee this deposit credited has changed since.')
+        if (restoredIds.has(c.paymentId)) continue
+        const use = (await client.query<{ status: string; credit_status: string; other_uses: number }>(
+          `SELECT u.status, tc.status AS credit_status,
+                  (SELECT COUNT(*)::int FROM credit_uses o WHERE o.tenant_credit_id = u.tenant_credit_id
+                      AND o.id <> u.id AND o.status IN ('held','applied')) AS other_uses
+             FROM credit_uses u JOIN tenant_credits tc ON tc.id = u.tenant_credit_id
+            WHERE u.id = $1 AND u.payment_id = $2 FOR UPDATE OF u, tc`, [c.useId, c.paymentId])).rows[0]
+        // Its own late-fee credit, plus any credit that was already on it
+        // before the match (that stays applied — priorIssued).
+        if (!use || use.status !== 'applied' || toCents(f.issued) !== toCents(c.priorIssued ?? 0) + toCents(c.amount)) {
+          throw changed('A late fee this deposit credited has changed since.')
+        }
+        if (use.credit_status !== 'active') throw changed('A late-fee credit from this match was voided since.')
+        if (use.other_uses > 0) throw changed('A late-fee credit from this match was used on another bill since.')
       }
     }
     const refundIds = snap.lateFeeRefundCreditIds ?? []
@@ -1263,6 +1370,21 @@ export async function undoDepositMatch(input: {
         [z.paymentId, toDollars(toCents(z.priorAmount)).toFixed(2), z.priorStatus === 'settled' ? 'pending' : z.priorStatus, z.priorNotes])
     }
     const withdrawn: string[] = []
+    // 10/6: each credited fee — its late-fee credit taken back off it and
+    // withdrawn (a deleted one's went with the delete), then the fee is owed
+    // again exactly as it was before the match.
+    for (const c of credited) {
+      if (!restoredIds.has(c.paymentId)) {
+        const w = await withdrawLateFeeCredit(client, c.paymentId)
+        withdrawn.push(...w.creditIds)
+      }
+      const u = await client.query(
+        `UPDATE payments SET status = $2, settled_at = NULL, notes = $3
+          WHERE id = $1 AND status = 'settled' AND issued_credit_amount = $4::numeric`,
+        [c.paymentId, c.priorStatus === 'failed' ? 'failed' : 'pending', c.priorNotes,
+         toDollars(toCents(c.priorIssued ?? 0)).toFixed(2)])
+      if ((u.rowCount ?? 0) !== 1) throw changed('A late fee this deposit credited has changed since.')
+    }
     for (const id of refundIds) {
       await client.query(
         `UPDATE tenant_credits SET status = 'void', voided_at = NOW(), updated_at = NOW() WHERE id = $1 AND status = 'active'`, [id])
@@ -1300,12 +1422,20 @@ export async function undoDepositMatch(input: {
       [snap.receiptId, `Undone ${day}: this bank deposit was taken back off the bills it paid`])
     // The on-time marks this settle wrote were never earned by this money:
     // withdrawn (a mark pointing at itself is withdrawn; the score skips it).
-    for (const id of snap.creditEventIds ?? []) {
-      const e = (await client.query<{ subject_id: string; superseded_by: string | null }>(
-        `SELECT subject_id, superseded_by FROM credit_events WHERE id = $1 FOR UPDATE`, [id])).rows[0]
-      if (!e || e.superseded_by) continue
-      await supersedeEvent(client, id, id, 'attestation_invalidated')
-      subjects.add(e.subject_id)
+    // 10/6: a mark a later late-fee delete replaced (re-rated from the
+    // deposit's date — creditLedgerEmitters.reRateMarksWithoutLateFee) is
+    // followed to the mark that replaced it, and that one is withdrawn.
+    for (const first of snap.creditEventIds ?? []) {
+      let id = first
+      for (let hop = 0; hop < 10; hop++) {
+        const e = (await client.query<{ subject_id: string; superseded_by: string | null }>(
+          `SELECT subject_id, superseded_by FROM credit_events WHERE id = $1 FOR UPDATE`, [id])).rows[0]
+        if (!e || e.superseded_by === id) break
+        if (e.superseded_by) { id = e.superseded_by; continue }
+        await supersedeEvent(client, id, id, 'attestation_invalidated')
+        subjects.add(e.subject_id)
+        break
+      }
     }
     if (snap.declarationId) {
       await client.query(
@@ -1326,7 +1456,7 @@ export async function undoDepositMatch(input: {
     tenantToTell = { tenantId: receipt.tenant_id, amount: toDollars(toCents(txn.amount)), postedDate: txn.posted_date }
     result = {
       kind: 'tenant_deposit', reopenedChargeIds: reopenedIds,
-      lateFeesRestored: (snap.lateFeesZeroed ?? []).length, creditsWithdrawn: withdrawn,
+      lateFeesRestored: (snap.lateFeesZeroed ?? []).length + credited.length, creditsWithdrawn: withdrawn,
       declarationId: snap.declarationId ?? null,
     }
   } catch (e) {

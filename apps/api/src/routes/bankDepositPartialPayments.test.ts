@@ -489,7 +489,8 @@ describe('Accept partial payments (per property, default off)', () => {
 // office logs a resident's bank deposit days later, from the bank's receipt;
 // a late fee charged for a day after the money was in the bank was never
 // owed. Paid in full, it comes off exactly as a tenant's corroborated report
-// takes it off; paid in part, every late fee stays.
+// takes it off — 10/6 (Nic): credited, never zeroed, and the payment still
+// counts late; paid in part, every late fee stays owed.
 describe('a bank deposit dated before a late fee', () => {
   /** A $600 rent bill due ten days ago, with a $25 late fee charged five days after the due date. */
   async function lateBill(opts: { partial?: boolean; feeSettled?: boolean } = {}) {
@@ -504,6 +505,10 @@ describe('a bank deposit dated before a late fee', () => {
       [s.landlordId, s.tenantId, s.unitId, s.leaseId, b.invoiceId, opts.feeSettled ? 'settled' : 'pending', feeDay])).rows[0].id
     return { s, b, dueDay, feeDay, feeId }
   }
+  /** 10/6: what a late-fee credit nets out of this row. */
+  const creditedOn = async (id: string) => Number((await db.query<{ c: string }>(
+    `SELECT COALESCE(SUM(amount), 0)::text AS c FROM credit_uses
+      WHERE payment_id = $1 AND source = 'late_fee_credit' AND status = 'applied'`, [id])).rows[0].c)
   const quote = (s: Stack, anchor: string, depositedOn?: string) => request(app())
     .get(`/api/payments/${anchor}/record-manual/quote${depositedOn ? `?depositedOn=${depositedOn}` : ''}`)
     .set('Authorization', `Bearer ${s.token}`)
@@ -520,22 +525,22 @@ describe('a bank deposit dated before a late fee', () => {
     expect(await row(feeId)).toMatchObject({ amount: 25, status: 'pending' })
   })
 
-  it('paid in full: the late fee charged after the deposit comes off (zeroed, kept, with the reason)', async () => {
+  it('paid in full: the late fee charged after the deposit is credited (kept as charged, a credit against it, with the reason)', async () => {
     const { s, b, dueDay, feeId } = await lateBill()
     const res = await record(s, b.ids[0], { method: 'bank_deposit', amountTendered: 600, reference: 'DEP-BACK', depositedOn: dueDay })
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     expect(res.body.data.lateFeesUnbilled).toBe(25)
     expect(res.body.data.lateFeesRefunded).toBe(0)
     const fee = await row(feeId)
-    expect(fee).toMatchObject({ amount: 0, status: 'settled' })
-    expect(fee.notes).toContain(`Reversed: rent was paid ${dueDay}, before this fee accrued`)
+    expect(fee).toMatchObject({ amount: 25, status: 'settled' })
+    expect(fee.notes).toContain(`Late fee credited: rent was paid ${dueDay}, before this fee was charged`)
+    expect(await creditedOn(feeId)).toBe(25)
     expect(await row(b.ids[0])).toMatchObject({ status: 'settled', manual_method: 'bank_deposit' })
-    // 10/6 (Nic): the tenant never reported this deposit and the fee had
-    // already posted, so the landlord had to find it — the fee is still
-    // zeroed, but the bill counts from the day it was recorded (late), not the
-    // deposit's day (routes/lateFeeDelete.test.ts has the reported case).
+    // 10/6 (Nic): a late fee is on the bill — the payment counts LATE, from
+    // the day it was recorded, not the deposit's day (routes/lateFeeDelete.test.ts
+    // has the rest of the rule).
     expect((await marksOn([b.ids[0]])).map(m => m.event_type)).toEqual([expect.stringMatching(/^payment_received_late_/)])
-    expect(res.body.data.unreportedDepositCountsLate).toBe(true)
+    expect(res.body.data.lateFeeCountsLate).toBe(true)
   })
 
   it('a late fee the tenant already paid comes back as a late-fee refund credit', async () => {
@@ -608,7 +613,8 @@ describe('a bank deposit dated before a late fee', () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     expect(res.body.data.partial).toBe(true)
     expect(res.body.data.lateFeesUnbilled).toBe(25)
-    expect(await row(septFee)).toMatchObject({ amount: 0, status: 'settled' })
+    expect(await row(septFee)).toMatchObject({ amount: 25, status: 'settled' })
+    expect(await creditedOn(septFee)).toBe(25)
     expect(await row(sept.ids[0])).toMatchObject({ status: 'settled' })
     expect(await row(octFee)).toMatchObject({ amount: 25, status: 'pending' })
     // October: $300 paid, $300 rest open, and its $25 fee still owed.
@@ -633,13 +639,15 @@ describe('a bank deposit dated before a late fee', () => {
     expect((await quote(s, b.ids[0], todayIn('Pacific/Kiritimati'))).status).toBe(200)
   })
 
-  it('"Post a payment" takes the same date the same way: paid in full, the fee comes off', async () => {
+  it('"Post a payment" takes the same date the same way: paid in full, the fee is credited', async () => {
     const { s, dueDay, feeId } = await lateBill()
     const posted = await request(app()).post('/api/payments/post-payment').set('Authorization', `Bearer ${s.token}`)
       .send({ tenantId: s.tenantId, method: 'bank_deposit', amount: 600, reference: 'D-POST', receivedAt: dueDay })
     expect(posted.status, JSON.stringify(posted.body)).toBe(200)
     expect(posted.body.data.lateFeesUnbilled).toBe(25)
     expect(posted.body.data.paidAhead).toBe(0)
-    expect(await row(feeId)).toMatchObject({ amount: 0, status: 'settled' })
+    expect(await row(feeId)).toMatchObject({ amount: 25, status: 'settled' })
+    expect(await creditedOn(feeId)).toBe(25)
+    expect(posted.body.data.lateFeeCountsLate).toBe(true)
   })
 })

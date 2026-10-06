@@ -138,7 +138,9 @@ describe('confirming a deposit', () => {
     expect(d.bank_transaction_id).toBe(s.txnId)
   })
 
-  it('removes late fees charged after the rent was really paid', async () => {
+  // 10/6 (Nic): "they get a credit against their bill and the late payment
+  // still shows on their payment history" — the fee stays, a credit nets it out.
+  it('credits late fees charged after the rent was really paid — the fees stay, the bill nets out, the payment counts late', async () => {
     const s = await buildStack({ postedDate: '2026-09-07', declaredDate: '2026-09-04' })
     await addLateFee(s, '2026-09-06', 5)     // after the 4th — never owed
     await addLateFee(s, '2026-09-07', 5)     // after the 4th — never owed
@@ -150,13 +152,35 @@ describe('confirming a deposit', () => {
     expect(r.lateFeesUnbilled).toBe(10)
 
     const fees = (await db.query(
-      `SELECT amount::float AS amount, status, notes FROM payments
-        WHERE invoice_id=$1 AND type='late_fee'`, [s.invoiceId])).rows
-    expect(fees).toHaveLength(2)                       // nothing deleted
+      `SELECT p.id, p.amount::float AS amount, p.status, p.notes, p.issued_credit_amount::float AS credited,
+              vm.money_part::float AS money
+         FROM payments p JOIN v_payment_money vm ON vm.payment_id = p.id
+        WHERE p.invoice_id=$1 AND p.type='late_fee'`, [s.invoiceId])).rows
+    expect(fees).toHaveLength(2)                       // nothing deleted, nothing zeroed
     for (const f of fees) {
-      expect(f.amount).toBe(0)
-      expect(f.notes).toContain('Reversed')
+      expect(f).toMatchObject({ amount: 5, status: 'settled', credited: 5, money: 0 })
+      expect(f.notes).toContain('Late fee credited: rent was paid 2026-09-04')
     }
+    const credits = (await db.query(
+      `SELECT tc.amount_original::float AS amount, tc.amount_remaining::float AS left, tc.category, tc.status,
+              u.source, u.status AS use_status, u.payment_id
+         FROM tenant_credits tc JOIN credit_uses u ON u.tenant_credit_id = tc.id
+        WHERE tc.tenant_id = $1 ORDER BY u.payment_id`, [s.tenantId])).rows
+    expect(credits).toHaveLength(2)
+    for (const c of credits) {
+      expect(c).toMatchObject({ amount: 5, left: 0, category: 'late_fee_refund', status: 'active', source: 'late_fee_credit', use_status: 'applied' })
+    }
+    expect(credits.map(c => c.payment_id).sort()).toEqual(fees.map(f => f.id).sort())
+    // The whole bill nets to zero.
+    expect((await db.query(`SELECT status FROM invoices WHERE id=$1`, [s.invoiceId])).rows[0].status).toBe('settled')
+    // A late fee is on the bill: the rent counts LATE, from the day it was confirmed — reported first or not.
+    const mark = (await db.query(
+      `SELECT event_type, event_data FROM credit_events
+        WHERE event_type LIKE 'payment_received_%' AND event_data->>'payment_id' = $1 AND superseded_by IS NULL`, [s.rentId])).rows
+    expect(mark).toHaveLength(1)
+    expect(mark[0].event_type).toMatch(/^payment_received_late_(minor|major|severe)$/)
+    expect(mark[0].event_data).toMatchObject({ late_fee_on_bill: true })
+    expect(String(mark[0].event_data.paid_at).slice(0, 10)).toBe(new Date().toISOString().slice(0, 10))
   })
 
   it('keeps a late fee that was genuinely earned before payment', async () => {
@@ -190,7 +214,8 @@ describe('confirming a deposit', () => {
          FROM tenant_credits WHERE tenant_id=$1`, [s.tenantId])).rows[0]
     expect(credit.amount).toBe(5)
     expect(credit.category).toBe('late_fee_refund')
-    expect(credit.reason).toContain('2026-09-04')
+    // 10/6: the day in plain words, never the stored ISO date.
+    expect(credit.reason).toBe('Late fees refunded — the bank shows rent was paid on Sep 4')
   })
 
   it('charges nothing for cash (S654), and marks the bank row matched', async () => {
@@ -534,14 +559,15 @@ describe('S655: a deposit is new money for one household, never more than it pay
 
   it('writes down everything it changed, so the match can be undone exactly', async () => {
     const s = await buildStack({ postedDate: '2026-09-07', declaredDate: '2026-09-04', deposit: 260 })
-    await addLateFee(s, '2026-09-06', 5)                   // never owed: zeroed
+    await addLateFee(s, '2026-09-06', 5)                   // never owed: credited
     const r = await confirmDepositMatch({
       bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'check', declarationId: s.declarationId })
     const undo = (await db.query(`SELECT auto_settle_undo FROM bank_transactions WHERE id=$1`, [s.txnId])).rows[0].auto_settle_undo
     expect(undo).toMatchObject({
       version: 1,
       rows: [{ paymentId: s.rentId, priorStatus: 'pending', money: 250 }],
-      lateFeesZeroed: [{ priorAmount: 5, priorStatus: 'pending' }],
+      lateFeesZeroed: [],
+      lateFeesCredited: [{ amount: 5, priorStatus: 'pending' }],
       receiptId: r.receiptId,
       paidAheadCreditId: r.paidAheadCreditId,
       declarationId: s.declarationId,
@@ -553,8 +579,9 @@ describe('S655: a deposit is new money for one household, never more than it pay
 
 // ── Step 9 review fixes ──────────────────────────────────────────────────────
 
+/** Each late fee on the bill: its day, what was charged, and how much of it a late-fee credit nets out (10/6). */
 const lateFees = async (invoiceId: string) => (await db.query(
-  `SELECT to_char(due_date,'YYYY-MM-DD') AS tick, amount::float AS amount
+  `SELECT to_char(due_date,'YYYY-MM-DD') AS tick, amount::float AS amount, issued_credit_amount::float AS credited
      FROM payments WHERE invoice_id=$1 AND type='late_fee' ORDER BY due_date`, [invoiceId])).rows
 
 describe('Step 9 review: late fees follow the day each line was really paid', () => {
@@ -571,7 +598,8 @@ describe('Step 9 review: late fees follow the day each line was really paid', ()
       bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'check', declarationId: s.declarationId })
     expect(r.lateFeesUnbilled).toBe(5)
     expect(await lateFees(s.invoiceId)).toEqual([
-      { tick: '2026-09-06', amount: 5 }, { tick: '2026-09-08', amount: 5 }, { tick: '2026-09-12', amount: 0 },
+      { tick: '2026-09-06', amount: 5, credited: 0 }, { tick: '2026-09-08', amount: 5, credited: 0 },
+      { tick: '2026-09-12', amount: 5, credited: 5 },
     ])
   })
 
@@ -587,7 +615,8 @@ describe('Step 9 review: late fees follow the day each line was really paid', ()
     // The water is taken at the desk only now — after every one of those fees, so each was earned.
     await db.query(`UPDATE payments SET status='settled', settled_at=NOW(), manual_method='cash' WHERE id=$1`, [water])
     expect(await lateFees(s.invoiceId)).toEqual([
-      { tick: '2026-09-06', amount: 5 }, { tick: '2026-09-08', amount: 5 }, { tick: '2026-09-12', amount: 5 },
+      { tick: '2026-09-06', amount: 5, credited: 0 }, { tick: '2026-09-08', amount: 5, credited: 0 },
+      { tick: '2026-09-12', amount: 5, credited: 0 },
     ])
   })
 
@@ -604,7 +633,7 @@ describe('Step 9 review: late fees follow the day each line was really paid', ()
     const r = await confirmDepositMatch({
       bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'check', declarationId: s.declarationId })
     expect(r.lateFeesUnbilled).toBe(5)
-    expect(await lateFees(s.invoiceId)).toEqual([{ tick: '2026-09-08', amount: 5 }, { tick: '2026-09-12', amount: 0 }])
+    expect(await lateFees(s.invoiceId)).toEqual([{ tick: '2026-09-08', amount: 5, credited: 0 }, { tick: '2026-09-12', amount: 5, credited: 5 }])
     expect((await rentRow(water)).status).toBe('processing')
   })
 
@@ -618,7 +647,7 @@ describe('Step 9 review: late fees follow the day each line was really paid', ()
     const r = await confirmDepositMatch({
       bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'check', declarationId: s.declarationId })
     expect(r.lateFeesUnbilled).toBe(0)
-    expect(await lateFees(s.invoiceId)).toEqual([{ tick: '2026-09-06', amount: 5 }])
+    expect(await lateFees(s.invoiceId)).toEqual([{ tick: '2026-09-06', amount: 5, credited: 0 }])
   })
 
   it('a deposit paying lines on two bills keeps every late-fee refund credit in the undo record', async () => {
@@ -728,10 +757,10 @@ describe('Step 9 review: a deposit over a bank payment waiting to retry', () => 
 // ── S655 Step 12 (K-C): Undo ─────────────────────────────────────────────────
 
 describe('Step 12: undoing a deposit match', () => {
-  /** A $260 deposit for $250 rent, reported on the 4th: a $5 fee zeroed, a paid $5 fee refunded, $10 paid ahead. */
+  /** A $260 deposit for $250 rent, reported on the 4th: a $5 fee credited, a paid $5 fee refunded, $10 paid ahead. */
   async function matched() {
     const s = await buildStack({ postedDate: '2026-09-07', declaredDate: '2026-09-04', deposit: 260 })
-    await addLateFee(s, '2026-09-06', 5)                   // unpaid, never owed: zeroed
+    await addLateFee(s, '2026-09-06', 5)                   // unpaid, never owed: credited
     await addLateFee(s, '2026-09-05', 5, true)             // paid, never owed: refunded as a credit
     const r = await confirmDepositMatch({
       bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'check', declarationId: s.declarationId })
@@ -749,9 +778,20 @@ describe('Step 12: undoing a deposit match', () => {
 
     expect(await rentRow(s.rentId)).toMatchObject({ status: 'pending', settled_on: null, manual_method: null })
     const fees = (await db.query(
-      `SELECT to_char(due_date,'YYYY-MM-DD') AS tick, amount::float AS amount, status FROM payments
-        WHERE invoice_id=$1 AND type='late_fee' ORDER BY due_date`, [s.invoiceId])).rows
-    expect(fees).toEqual([{ tick: '2026-09-05', amount: 5, status: 'settled' }, { tick: '2026-09-06', amount: 5, status: 'pending' }])
+      `SELECT to_char(due_date,'YYYY-MM-DD') AS tick, amount::float AS amount, status, issued_credit_amount::float AS credited
+         FROM payments WHERE invoice_id=$1 AND type='late_fee' ORDER BY due_date`, [s.invoiceId])).rows
+    expect(fees).toEqual([
+      { tick: '2026-09-05', amount: 5, status: 'settled', credited: 0 },
+      { tick: '2026-09-06', amount: 5, status: 'pending', credited: 0 },
+    ])
+    // 10/6: the late-fee credit is taken back off the fee exactly — its use
+    // released (kept), the credit withdrawn — and counted among the withdrawn.
+    const [lfc] = r.undo.lateFeesCredited!
+    const use = (await db.query(`SELECT status, release_reason FROM credit_uses WHERE id = $1`, [lfc.useId])).rows[0]
+    expect(use).toEqual({ status: 'released', release_reason: 'late_fee_credit_withdrawn' })
+    expect((await db.query(`SELECT status, amount_remaining::float AS left FROM tenant_credits WHERE id = $1`, [lfc.creditId])).rows[0])
+      .toEqual({ status: 'void', left: 5 })
+    expect(res.creditsWithdrawn).toContain(lfc.creditId)
     const refund = (await db.query(`SELECT status FROM tenant_credits WHERE id = ANY($1::uuid[])`, [r.undo.lateFeeRefundCreditIds])).rows
     expect(refund).toEqual([{ status: 'void' }])
     const ahead = (await db.query(`SELECT voided_at IS NOT NULL AS voided, amount_remaining::float AS left FROM lease_prepaid_credits WHERE id=$1`,
@@ -773,6 +813,17 @@ describe('Step 12: undoing a deposit match', () => {
     // The landlord can match it again, to the right charges this time.
     const again = await confirmDepositMatch({ bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'check' })
     expect(again.settledChargeIds).toEqual([s.rentId])
+  })
+
+  it('10/6: Undo is refused once the late-fee credit from this match was voided — the fee stays credited', async () => {
+    const { s, r } = await matched()
+    const [lfc] = r.undo.lateFeesCredited!
+    await db.query(`UPDATE tenant_credits SET status = 'void', voided_at = NOW() WHERE id = $1`, [lfc.creditId])
+    await expect(undoDepositMatch({ bankTransactionId: s.txnId, landlordId: s.landlordId, undoneBy: null }))
+      .rejects.toThrow('A late-fee credit from this match was voided since. Nothing was undone — the match stays as it is.')
+    expect((await db.query(`SELECT status, issued_credit_amount::float AS c FROM payments WHERE id = $1`, [lfc.paymentId])).rows[0])
+      .toEqual({ status: 'settled', c: 5 })
+    expect((await db.query(`SELECT status FROM credit_uses WHERE id = $1`, [lfc.useId])).rows[0].status).toBe('applied')
   })
 
   it('Undo is refused after a later change', async () => {

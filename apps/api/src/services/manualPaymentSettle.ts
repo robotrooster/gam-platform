@@ -58,7 +58,7 @@
 
 import type { PoolClient } from 'pg'
 import type { ManualPaymentMethod } from '@gam/shared'
-import { sortForAllocation, MANUAL_PAYMENT_METHOD_WORD, unreportedDepositLateTenantText } from '@gam/shared'
+import { sortForAllocation, MANUAL_PAYMENT_METHOD_WORD, lateFeeCreditedTenantText } from '@gam/shared'
 import type { ReportClosedByRecording } from '../jobs/declaredDepositExpiry'
 import { AppError } from '../middleware/errorHandler'
 import { lockHousehold, payableRowSql } from './moneyPredicates'
@@ -72,6 +72,7 @@ import { reconcileSettledDepositPayment, type DepositRecordRaised } from './leas
 import { logger } from '../lib/logger'
 import { activateBillingForMoneyMoved } from './billingActivation'
 import { PART_PAYMENT_REST_NOTE } from './creditLedgerEmitters'
+import type { CreditedLateFee } from './lateFeeCredit'
 
 /**
  * What became of cash handed over beyond the bill (and the old balance).
@@ -164,17 +165,20 @@ export interface ManualSettleInput {
    * not after today — the caller checks). When the deposit pays the bill in
    * full, late fees charged for days after it come off exactly as a tenant's
    * corroborated report takes them off (bankDepositConfirm.reverseLateFees):
-   * unpaid ones are zeroed, ones already paid come back as a late-fee refund
-   * credit. A bill paid only in part keeps its late fees.
+   * 10/6 (Nic) — unpaid ones are CREDITED (the fee stays, a late-fee credit
+   * nets it out, and the payment still counts late), ones already paid come
+   * back as a late-fee refund credit. A bill paid only in part keeps its late
+   * fees, owed.
    */
   depositedOn?: string | null
   /**
-   * 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's
-   * discretion." The box on Record payment / Post a payment ("Delete the late
-   * fee completely (onboarding month)", off by default): an unpaid late fee
-   * this bank deposit takes off an ONBOARDING bill is deleted outright
-   * (services/lateFeeDelete) instead of left at $0. Any other bill's fee is
-   * zeroed as always. The caller has checked who may (canDeleteLateFees).
+   * 10/6 (Nic): "the late fee is only available to be completely deleted
+   * during the onboarding month." The box on Record payment / Post a payment
+   * ("Delete the late fee completely (onboarding month)", off by default): an
+   * unpaid late fee this bank deposit takes off an ONBOARDING bill is deleted
+   * outright, with no credit (services/lateFeeDelete), and nothing shows on
+   * the tenant's record. Any other bill's fee is credited. The caller has
+   * checked who may (canDeleteLateFees).
    */
   deleteOnboardingLateFees?: boolean
 }
@@ -214,8 +218,9 @@ export interface ManualSettleResult {
   partPaidIds: string[]
   /**
    * 10/5 (Nic): late fees taken off because a bank deposit dated before them
-   * paid the bill in full — zeroed (unpaid) and refunded as credit (already
-   * paid). Zero when nothing came off.
+   * paid the bill in full — 10/6: credited (unpaid; `unbilled` is what the
+   * late-fee credits netted out) and refunded as credit (already paid). Zero
+   * when nothing came off.
    */
   lateFeesReversed: { unbilled: number; refunded: number; refundCreditIds: string[] }
   /** 10/6 (Nic): late fees deleted outright from onboarding bills (the box), and what they were. */
@@ -223,16 +228,23 @@ export interface ManualSettleResult {
   /**
    * 10/6 (Nic): the box was ticked but a late fee could not be deleted (most
    * often money is recorded against it) — each reason in plain words, once.
-   * That fee stays at $0.00. Empty when nothing was refused.
+   * That fee was credited instead (or, when it could not be, is still owed —
+   * the reason says which). Empty when nothing was refused.
    */
   lateFeeDeleteRefusals: string[]
   /**
-   * 10/6 (Nic): a late fee came off a bill (not the onboarding month's) that
-   * the tenant never reported depositing before the fee posted — the landlord
-   * had to find it — so the bill's payment still counts LATE, from the day it
-   * was recorded. The tenant is told so.
+   * 10/6 (Nic): a bill a late fee came off of (credited, refunded, or deleted
+   * by the box) still has a late fee on it afterwards, so that bill's payment
+   * counts LATE on the tenant's history, from the day it was recorded — no
+   * exceptions (services/settleHooks). Read from what is left, not from what
+   * was done. Both sides are told so.
    */
-  unreportedDepositCountsLate: boolean
+  lateFeeCountsLate: boolean
+  /**
+   * 10/6: the box deleted a late fee from a bill that still has another late
+   * fee on it — "nothing shows on their record" would be false there.
+   */
+  lateFeeDeletedStillLate: boolean
   /** Call once after COMMIT: the receipt email and canceling replaced bank retries. Never throws. */
   afterCommit: () => Promise<void>
 }
@@ -617,7 +629,8 @@ async function settleOneRow(client: PoolClient, input: ManualSettleInput): Promi
     lateFeesReversed: { unbilled: 0, refunded: 0, refundCreditIds: [] },
     lateFeesDeleted: { count: 0, amount: 0 },
     lateFeeDeleteRefusals: [],
-    unreportedDepositCountsLate: false,
+    lateFeeCountsLate: false,
+    lateFeeDeletedStillLate: false,
     afterCommit: async () => {
       if (done) return
       done = true
@@ -635,56 +648,78 @@ async function settleOneRow(client: PoolClient, input: ManualSettleInput): Promi
  * the money was already in the bank was never owed. The unpaid ones on each
  * bill of the household's current balance come off here, BEFORE the money is
  * placed — the same reversal a tenant's corroborated report gets
- * (bankDepositConfirm.reverseLateFees), with the fees already paid left for
- * the caller to refund once the bill is paid. Inside a savepoint
- * (`bank_deposit_backdate`): the caller releases it when the deposit pays the
- * bill in full, and rolls back to it when it does not (a bill paid in part
- * keeps its late fees).
+ * (bankDepositConfirm.reverseLateFees): 10/6 (Nic), each is CREDITED (the fee
+ * stays, a late-fee credit nets it out), or, on the onboarding bill when the
+ * landlord ticked the box (`deleteOnboarding`), deleted outright. The fees
+ * already paid are left for the caller to refund once the bill is paid.
+ * Inside a savepoint (`bank_deposit_backdate`): the caller releases it when
+ * the deposit pays the bill in full, and rolls back to it when it does not (a
+ * bill paid in part keeps its late fees, owed).
  *
  * The desk window's quote shows the bill the same way (GET
  * /payments/:id/record-manual/quote?depositedOn=), inside a transaction it
  * rolls back.
  */
-export async function zeroLateFeesAfterDeposit(
+export async function creditLateFeesAfterDeposit(
   client: PoolClient, q: DeskQuote, depositedOn: string,
-  o: { createdBy: string | null; onlyInvoices?: ReadonlySet<string> },
-): Promise<{ unbilled: number; zeroedIds: string[]; zeroed: ZeroedLateFee[] }> {
+  o: {
+    createdBy: string | null; onlyInvoices?: ReadonlySet<string>
+    deleteOnboarding?: { deletedBy: string | null; via: 'record_payment' | 'post_payment' } | null
+  },
+): Promise<{
+  /** Dollars of unpaid late fees credited. */
+  unbilled: number
+  /** Every unpaid late fee taken off the bill — credited or deleted. */
+  offIds: string[]
+  credited: CreditedLateFee[]
+  deleted: Array<{ paymentId: string; amount: number; invoiceId: string }>
+  deleteRefusals: string[]
+  /** Credit the tenant had spent on a fee that was never owed, given back (rare). */
+  refunded: number
+  refundCreditIds: string[]
+}> {
   const { reverseLateFees } = await import('./bankDepositConfirm')
   const settlingIds = q.rows.map(r => r.id)
   const invoices = deskInvoices(q).filter(i => !o.onlyInvoices || o.onlyInvoices.has(i))
   let unbilled = 0
-  const zeroedIds: string[] = []
-  const zeroed: ZeroedLateFee[] = []
+  let refunded = 0
+  const credited: CreditedLateFee[] = []
+  const deleted: Array<{ paymentId: string; amount: number; invoiceId: string }> = []
+  const deleteRefusals = new Set<string>()
+  const refundCreditIds: string[] = []
   for (const invoiceId of invoices) {
     const head = q.rows.find(r => r.invoiceId === invoiceId)!
     const r = await reverseLateFees(client, invoiceId, depositedOn, {
       settlingIds, tenantId: q.tenantId, landlordId: q.landlordId, leaseId: head.leaseId,
-      createdBy: o.createdBy, refundPaid: false,
+      createdBy: o.createdBy, refundPaid: false, deleteOnboarding: o.deleteOnboarding ?? null,
     })
     unbilled += toCents(r.unbilled)
-    zeroedIds.push(...r.zeroed.map(z => z.paymentId))
-    zeroed.push(...r.zeroed)
+    refunded += toCents(r.refunded)
+    credited.push(...r.credited)
+    deleted.push(...r.deleted)
+    for (const m of r.deleteRefusals) deleteRefusals.add(m)
+    if (r.refundCreditId) refundCreditIds.push(r.refundCreditId)
   }
-  return { unbilled: toDollars(unbilled), zeroedIds, zeroed }
+  return {
+    unbilled: toDollars(unbilled), offIds: [...credited.map(c => c.paymentId), ...deleted.map(d => d.paymentId)],
+    credited, deleted, deleteRefusals: [...deleteRefusals], refunded: toDollars(refunded), refundCreditIds,
+  }
 }
-
-/** A late fee a bank deposit's date zeroed, as it was before (bankDepositConfirm.reverseLateFees). */
-export interface ZeroedLateFee { paymentId: string; priorAmount: number; priorStatus: string; priorNotes: string | null }
 
 /**
  * 10/6 (Nic): what the window shows for a bank deposit dated back — the late
- * fees that come off when it pays each bill in full (zeroLateFeesAfterDeposit),
- * bill by bill, and how much of that is on an ONBOARDING bill (where the
- * landlord may tick "Delete the late fee completely"). Inside the caller's
- * transaction, which the caller rolls back: a look changes nothing.
+ * fees that come off when it pays each bill in full (creditLateFeesAfterDeposit:
+ * credited), bill by bill, and how much of that is on an ONBOARDING bill
+ * (where the landlord may tick "Delete the late fee completely"). Inside the
+ * caller's transaction, which the caller rolls back: a look changes nothing.
  */
 export async function backdatedLateFeesPreview(
   client: PoolClient, q0: DeskQuote, depositedOn: string,
-): Promise<{ zeroedIds: string[]; unbilled: number; byBill: Map<string, number>; onboardingOff: number }> {
-  const z = await zeroLateFeesAfterDeposit(client, q0, depositedOn, { createdBy: null })
+): Promise<{ offIds: string[]; unbilled: number; byBill: Map<string, number>; onboardingOff: number }> {
+  const z = await creditLateFeesAfterDeposit(client, q0, depositedOn, { createdBy: null })
   const byBill = new Map<string, number>()
   for (const r of q0.rows) {
-    if (!r.invoiceId || !z.zeroedIds.includes(r.id)) continue
+    if (!r.invoiceId || !z.offIds.includes(r.id)) continue
     byBill.set(r.invoiceId, Math.round(((byBill.get(r.invoiceId) ?? 0) + r.amount) * 100) / 100)
   }
   const { isOnboardingBill } = await import('./lateFeeDelete')
@@ -692,7 +727,7 @@ export async function backdatedLateFeesPreview(
   for (const [invoiceId, amount] of byBill) {
     if (await isOnboardingBill(client, invoiceId)) onboardingOff += toCents(amount)
   }
-  return { zeroedIds: z.zeroedIds, unbilled: z.unbilled, byBill, onboardingOff: toDollars(onboardingOff) }
+  return { offIds: z.offIds, unbilled: z.unbilled, byBill, onboardingOff: toDollars(onboardingOff) }
 }
 
 /** The bills (invoices) the desk's current balance is made of, in a fixed order. */
@@ -788,22 +823,33 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
 
   // 10/5 (Nic): a bank deposit dated before late fees were charged — the
   // unpaid ones come off first on each bill the deposit pays in full
-  // (zeroLateFeesAfterDeposit). Judged bill by bill, on the bill as it stands
+  // (creditLateFeesAfterDeposit — 10/6: credited, or deleted from the
+  // onboarding bill when the box is ticked). Judged bill by bill, on the bill as it stands
   // without them, with the credit choice the desk made: a bill the money pays
   // only in part (or does not reach) has its fees put back, and they stay
   // owed. Putting a bill's fees back can leave less money for a later bill,
   // so the bills are judged again until none changes.
   const backdatedTo = method === 'bank_deposit' && input.depositedOn ? input.depositedOn : null
-  let backdateZeroed = 0
-  // 10/6: the unpaid late fees the deposit's date took off, as they were before.
-  let backdateZeroedFees: ZeroedLateFee[] = []
+  let backdateCreditedCents = 0
+  // 10/6 (Nic): the unpaid late fees the deposit's date took off — credited
+  // (as they were before, for the record), or deleted from the onboarding
+  // bill when the landlord ticked the box — and why a ticked box could not.
+  let backdateCredited: CreditedLateFee[] = []
+  let backdateDeleted: Array<{ paymentId: string; amount: number; invoiceId: string }> = []
+  let backdateDeleteRefusals: string[] = []
+  let backdateSpentBack = 0
+  const backdateRefundCredits: string[] = []
+  const deleteOnboarding = input.deleteOnboardingLateFees
+    ? { deletedBy: input.takenBy ?? null, via: input.lateFeeDeleteVia ?? 'record_payment' } as const : null
   if (backdatedTo && q.rows.length > 0) {
     const choseCredit = !input.neverUseCredit && input.creditToUse != null && toCents(input.creditToUse) > 0
     const keep = new Set(deskInvoices(q))
     while (keep.size > 0) {
       await client.query('SAVEPOINT bank_deposit_backdate')
-      const z = await zeroLateFeesAfterDeposit(client, q, backdatedTo, { createdBy: input.takenBy ?? null, onlyInvoices: keep })
-      if (z.zeroedIds.length === 0) {
+      const z = await creditLateFeesAfterDeposit(client, q, backdatedTo, {
+        createdBy: input.takenBy ?? null, onlyInvoices: keep, deleteOnboarding,
+      })
+      if (z.offIds.length === 0) {
         await client.query('RELEASE SAVEPOINT bank_deposit_backdate')
         break
       }
@@ -814,8 +860,12 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
       const short = [...keep].filter(i => !paidInFull.has(i))
       if (short.length === 0) {
         q = withoutFees
-        backdateZeroed = toCents(z.unbilled)
-        backdateZeroedFees = z.zeroed
+        backdateCreditedCents = toCents(z.unbilled)
+        backdateCredited = z.credited
+        backdateDeleted = z.deleted
+        backdateDeleteRefusals = z.deleteRefusals
+        backdateSpentBack = toCents(z.refunded)
+        backdateRefundCredits.push(...z.refundCreditIds)
         await client.query('RELEASE SAVEPOINT bank_deposit_backdate')
         break
       }
@@ -1130,8 +1180,9 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
     // when all of it is kept as credit and no bill settles.
     await activateBillingForMoneyMoved(client, [landlordId])
     // 10/6 (Nic): a bank deposit the landlord records closes the tenant's own
-    // report of it now (the sweep's rule, jobs/declaredDepositExpiry) — the
-    // late-fee rule below needs to know whether the tenant reported it.
+    // report of it now (the sweep's rule, jobs/declaredDepositExpiry), and the
+    // tenant is told after the commit. Whether they reported it first changes
+    // nothing about a late fee: "No exceptions" (Nic, 10/6).
     if (method === 'bank_deposit') {
       const { closeReportForRecordedBankDeposit } = await import('../jobs/declaredDepositExpiry')
       reportClosed = await closeReportForRecordedBankDeposit(client, receiptId)
@@ -1199,10 +1250,10 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
 
   // 10/5 (Nic): on each bill the deposit paid in full, late fees the tenant
   // had already paid for days after the deposit come back as a late-fee
-  // refund credit (the unpaid ones came off before the money was placed). A
-  // bill paid only in part, or not reached, keeps every late fee.
-  let backdateRefunded = 0
-  const backdateRefundCredits: string[] = []
+  // refund credit (the unpaid ones were credited or deleted before the money
+  // was placed). A bill paid only in part, or not reached, keeps every late
+  // fee.
+  let backdateRefunded = backdateSpentBack
   const refundedFeeIds: string[] = []
   if (backdatedTo) {
     const { reverseLateFees } = await import('./bankDepositConfirm')
@@ -1213,79 +1264,41 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
       const r = await reverseLateFees(client, invoiceId, backdatedTo, {
         settlingIds: settledIds, tenantId, landlordId, leaseId: head.leaseId, createdBy: input.takenBy ?? null,
       })
-      backdateZeroed += toCents(r.unbilled)
+      backdateCreditedCents += toCents(r.unbilled)
       backdateRefunded += toCents(r.refunded)
       if (r.refundCreditId) backdateRefundCredits.push(r.refundCreditId)
-      backdateZeroedFees.push(...r.zeroed)
+      backdateCredited.push(...r.credited)
       refundedFeeIds.push(...r.refundedIds)
     }
   }
+  const deletedCount = backdateDeleted.length
+  const deletedCents = backdateDeleted.reduce((s, d) => s + toCents(d.amount), 0)
 
-  // ── 10/6 (Nic): whose work it was that the late fee came off ─────────────
-  //
-  //   "any late fees that should not be charged after onboarding that happen
-  //    just get zero not delete. this is just for onboarding" — "the reason is
-  //    if the tenant forgets to log the payment and gets a late fee it counts
-  //    as late because of recording not that payment was late. The landlord
-  //    has to spend their time going to remove the late fee. It needs to just
-  //    zero it out, but still count against their on-time payment history
-  //    because of that waste of time. They need to do it the right way to get
-  //    the on-time payment history."
-  //
-  // Bill by bill, for each bill a late fee came off (zeroed, or refunded when
-  // already paid):
-  //   - THE ONBOARDING BILL (lateFeeDelete.isOnboardingBill): the fee is left
-  //     at $0 — or, when the landlord ticked "Delete the late fee completely",
-  //     deleted outright (never by itself: "only deleted during onboarding at
-  //     landlord's discretion"). Its mark is the onboarding month's, positive
-  //     only, from the deposit's date (creditLedgerEmitters).
-  //   - ANY OTHER BILL: the tenant reported this deposit themselves before the
-  //     fee posted (the report this recording just closed, dated within the
-  //     bank match's reach of this deposit — a report the week-long wait had
-  //     already expired counts too) — the right way:
-  //     the mark counts from the deposit's date. Otherwise the fee had already
-  //     posted and the landlord had to find the deposit: the fee is still
-  //     zeroed, but the mark counts from TODAY, the day it was recorded, and
-  //     the tenant is told why. (A deposit recorded before any fee posted
-  //     takes nothing off and counts from its date, as always.)
-  let deletedCount = 0
-  let deletedCents = 0
-  // 10/6 (Nic): a ticked box that could not delete a fee is said to the
-  // landlord in plain words (the fee stays at $0.00), never dropped.
-  const deleteRefusals = new Set<string>()
-  const markSettledAt = new Map<string, Date>()
-  if (backdatedTo && (backdateZeroedFees.length > 0 || refundedFeeIds.length > 0)) {
-    const { isOnboardingBill, deleteZeroedLateFee } = await import('./lateFeeDelete')
-    const feeIds = [...new Set([...backdateZeroedFees.map(z => z.paymentId), ...refundedFeeIds])]
-    const fees = (await client.query<{ id: string; invoice_id: string | null; created_at: Date }>(
-      `SELECT id, invoice_id, created_at FROM payments WHERE id = ANY($1::uuid[]) ORDER BY id`, [feeIds])).rows
-    const byInvoice = new Map<string, typeof fees>()
-    for (const f of fees) if (f.invoice_id) byInvoice.set(f.invoice_id, [...(byInvoice.get(f.invoice_id) ?? []), f])
-    const recordedAt = new Date()
-    for (const invoiceId of [...byInvoice.keys()].sort()) {
-      const onBill = byInvoice.get(invoiceId)!
-      if (await isOnboardingBill(client, invoiceId)) {
-        if (!input.deleteOnboardingLateFees) continue
-        for (const z of backdateZeroedFees.filter(x => onBill.some(f => f.id === x.paymentId))) {
-          const d = await deleteZeroedLateFee(client, z.paymentId, {
-            deletedBy: input.takenBy ?? null, via: input.lateFeeDeleteVia ?? 'record_payment',
-            beforeZeroing: { amount: z.priorAmount, status: z.priorStatus, notes: z.priorNotes },
-          })
-          if (d.deleted) { deletedCount++; deletedCents += toCents(z.priorAmount) }
-          else if (d.message) deleteRefusals.add(d.message)
-        }
-        continue
-      }
-      const firstPosted = Math.min(...onBill.map(f => new Date(f.created_at).getTime()))
-      // The right way: the tenant reported THIS deposit (not another month's
-      // report this receipt happened to close) before the fee posted.
-      if (reportClosed && reportClosed.forThisDeposit && reportClosed.reportedAt.getTime() < firstPosted) continue
-      const marked = (await client.query<{ id: string }>(
-        `SELECT id FROM payments WHERE id = ANY($1::uuid[]) AND invoice_id = $2 AND type IN ('rent', 'utility') ORDER BY id`,
-        [settledIds, invoiceId])).rows
-      for (const r of marked) markSettledAt.set(r.id, recordedAt)
-    }
-  }
+  // 10/6 (Nic): "they get a credit against their bill and the late payment
+  // still shows on their payment history" — "No exceptions", whether or not
+  // the tenant reported the deposit first. A late fee credited or refunded
+  // here stays on its bill, so that bill's rent and utility are marked LATE
+  // from today, the day this was recorded (afterRowsSettled reads the fee on
+  // the bill). Only the onboarding box deleted it outright — then the bill has
+  // no late fee and its mark counts from the deposit's date, the onboarding
+  // month's positive-only rule applying as always.
+  // Judged on what is actually left (review fix): a bill whose late fee was
+  // credited or refunded keeps it, so it counts late; a bill whose late fee
+  // the box deleted counts late only if ANOTHER late fee is still on it (one
+  // charged before the deposit, or one they had already paid) — the same test
+  // settleHooks marks by (amount > 0, not voided).
+  const feeBills = new Set(backdateDeleted.map(d => d.invoiceId))
+  const keptFeeIds = [...backdateCredited.map(c => c.paymentId), ...refundedFeeIds]
+  const keptBills = keptFeeIds.length === 0 ? [] : (await client.query<{ invoice_id: string }>(
+    `SELECT DISTINCT invoice_id::text AS invoice_id FROM payments
+      WHERE id = ANY($1::uuid[]) AND invoice_id IS NOT NULL ORDER BY 1`, [keptFeeIds])).rows.map(r => r.invoice_id)
+  for (const b of keptBills) feeBills.add(b)
+  const stillLateBills = new Set(feeBills.size === 0 ? [] : (await client.query<{ invoice_id: string }>(
+    `SELECT DISTINCT f.invoice_id::text AS invoice_id FROM payments f
+      WHERE f.invoice_id = ANY($1::uuid[]) AND f.type = 'late_fee' AND f.amount > 0 AND f.status <> 'voided'
+      ORDER BY 1`, [[...feeBills]])).rows.map(r => r.invoice_id))
+  const lateFeeCountsLate = stillLateBills.size > 0
+  const lateFeeDeletedStillLate = backdateDeleted.some(d => stillLateBills.has(d.invoiceId))
 
   const partPaidIds = partSplits.map(sp => sp.row.id).sort()
   const after = await afterRowsSettled(client, settledIds, {
@@ -1294,7 +1307,6 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
     // 10/5 (Nic): a bill's on-time or late mark is for the day it is paid in
     // full — a slice paid in part carries none; its rest earns the mark.
     partPaidIds,
-    markSettledAt,
     receipt: input.sendReceipt === false ? null : {
       method: kept === 0 ? 'your account credit'
         : changeGiven > 0 ? `${methodWord(method)} (change given ${money(changeGiven)})`
@@ -1307,14 +1319,6 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
       stillOwedPaymentIds: stillOwedRows.map(r => r.id),
     },
   })
-
-  // The marks counted from the recording's day: said to both sides only when
-  // one of them is in fact late (a mark inside the grace days is not).
-  const unreportedDepositCountsLate = markSettledAt.size > 0 && ((await client.query(
-    `SELECT 1 FROM credit_events
-      WHERE event_type IN ('payment_received_late_minor', 'payment_received_late_major', 'payment_received_late_severe')
-        AND superseded_by IS NULL AND event_data->>'payment_id' = ANY($1::text[])
-      LIMIT 1`, [[...markSettledAt.keys()]])).rowCount ?? 0) > 0
 
   let done = false
   return {
@@ -1331,11 +1335,12 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
     stillOwedRows,
     partPaidIds,
     lateFeesReversed: {
-      unbilled: toDollars(backdateZeroed), refunded: toDollars(backdateRefunded), refundCreditIds: backdateRefundCredits,
+      unbilled: toDollars(backdateCreditedCents), refunded: toDollars(backdateRefunded), refundCreditIds: backdateRefundCredits,
     },
     lateFeesDeleted: { count: deletedCount, amount: toDollars(deletedCents) },
-    lateFeeDeleteRefusals: [...deleteRefusals],
-    unreportedDepositCountsLate,
+    lateFeeDeleteRefusals: backdateDeleteRefusals,
+    lateFeeCountsLate,
+    lateFeeDeletedStillLate,
     afterCommit: async () => {
       if (done) return
       done = true
@@ -1348,9 +1353,9 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
           recordedOn: reportClosed.recordedOn, reportAmount: reportClosed.reportAmount, declaredDate: reportClosed.declaredDate,
         }).catch(e => logger.error({ err: e }, '[manual-settle] report-recorded notice failed'))
       }
-      if (backdatedTo && backdateZeroed + backdateRefunded > 0) {
-        await tellTenantLateFeesOff(tenantId, backdatedTo, toDollars(backdateZeroed), toDollars(backdateRefunded),
-          unreportedDepositCountsLate)
+      if (backdatedTo && backdateCreditedCents + backdateRefunded > 0) {
+        await tellTenantLateFeesCredited(tenantId, backdatedTo, toDollars(backdateCreditedCents), toDollars(backdateRefunded),
+          backdateCredited.length + refundedFeeIds.length)
           .catch(e => logger.error({ err: e }, '[manual-settle] late-fee notice failed'))
         // A refund credit that covers a whole bill pays it (its own transaction).
         if (backdateRefundCredits.length > 0) {
@@ -1364,38 +1369,24 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
 }
 
 /**
- * 10/5 (Nic): the tenant hears why a late fee came off — the bank deposit's
- * date. 10/6 (Nic): when they never reported the deposit and the payment
- * still counts late, they are told that, and how to have deposits count on
- * time. Never throws past the caller's catch.
+ * 10/6 (Nic): the tenant hears that a late fee was credited (or given back as
+ * credit when they had already paid it), and that the payment still counts
+ * late on their payment history ("No exceptions"). A fee the landlord deleted
+ * in the onboarding month is not mentioned: nothing shows on their record.
+ * Never throws past the caller's catch.
  */
-async function tellTenantLateFeesOff(
-  tenantId: string, depositedOn: string, unbilled: number, refunded: number, countsLate = false,
+async function tellTenantLateFeesCredited(
+  tenantId: string, depositedOn: string, credited: number, refunded: number, count: number,
 ): Promise<void> {
   const { queryOne } = await import('../db')
   const { createNotification } = await import('./notifications')
   const u = (await queryOne<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id = $1`, [tenantId]))?.user_id
   if (!u) return
-  const total = unbilled + refunded
-  if (countsLate) {
-    await createNotification({
-      userId: u,
-      type: 'payment_recorded',
-      title: 'A late fee came off your bill',
-      body: unreportedDepositLateTenantText(depositedOn) +
-        (refunded > 0 ? ` $${refunded.toFixed(2)} in late fees you had already paid was refunded to your account as credit.` : ''),
-      actionUrl: '/payments',
-    })
-    return
-  }
   await createNotification({
     userId: u,
     type: 'payment_recorded',
-    title: 'A late fee came off your bill',
-    body: `Your bank deposit was recorded as made on ${depositedOn}, so $${total.toFixed(2)} in late fees charged after that day ` +
-      (refunded > 0 && unbilled === 0 ? 'was refunded to your account as credit.'
-        : refunded > 0 ? `came off — $${refunded.toFixed(2)} of it you had already paid, refunded to your account as credit.`
-        : 'came off your bill.'),
+    title: 'Your late fee was credited',
+    body: lateFeeCreditedTenantText({ depositedOn, credited, refunded, count }),
     actionUrl: '/payments',
   })
 }

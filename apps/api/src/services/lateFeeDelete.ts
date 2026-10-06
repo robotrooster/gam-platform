@@ -1,22 +1,28 @@
 // 10/6 (Nic) — deleting a late fee outright, onboarding month only, at the
 // landlord's discretion.
 //
-//   "I want to completely remove the late fees from the database to preserve
-//    these people's payment history at a hundred percent" — then: "any late
-//    fees that should not be charged after onboarding that happen just get
-//    zero not delete. this is just for onboarding" — and: "the late fee is
-//    only deleted during onboarding at landlord's discretion."
+//   "Late fees are not automatically on time because of the onboarding month.
+//    That's the landlord's discretion. This landlord does not want to give
+//    grace past the grace period for late fees for tenants that are screwing
+//    stuff up. So the late fee is only available to be completely deleted
+//    during the onboarding month. Other than that, they get a credit against
+//    their bill and the late payment still shows on their payment history."
 //
-// So a late fee is NEVER deleted by itself. It is zeroed first, exactly as
-// today (bankDepositConfirm.reverseLateFees: a fee charged for days after the
-// money was already in the bank was never owed), and only then, when a
-// landlord chooses to, deleted:
+// A late fee a bank deposit's date shows was never owed is CREDITED by itself
+// (services/lateFeeCredit, from bankDepositConfirm.reverseLateFees): the fee
+// stays, a credit nets it out, and the payment still counts late. It is
+// deleted only when the landlord chooses to, and only on the onboarding bill:
 //   - the box on Record payment / Post a payment ("Delete the late fee
-//     completely (onboarding month)", off by default), for a fee that
-//     recording takes off an onboarding bill;
+//     completely (onboarding month)", off by default): the never-owed fee is
+//     deleted outright as the deposit is recorded, with no credit at all;
 //   - "Delete this late fee" on its line in the landlord's Payments history,
-//     for a fee a reversal already zeroed on an onboarding bill (that covers
-//     the ones zeroed before this shipped — there is no cleanup script).
+//     for an onboarding fee already credited (or zeroed by the code before
+//     10/6): the fee AND the credit applied to it go — the credit is taken
+//     back off it and withdrawn (services/lateFeeCredit.withdrawLateFeeCredit).
+//
+// Once no late fee is left on the bill, its rent's late mark is replaced by
+// the mark from the deposit's date (creditLedgerEmitters.
+// reRateMarksWithoutLateFee) — nothing shows on their record.
 //
 // THE ONBOARDING BILL is judged by the bill the fee belongs to: the rent on
 // the same invoice, by the one onboarding-month rule
@@ -27,40 +33,42 @@
 // may issue a discretionary credit such as waiving a late fee (routes/
 // tenantCredits: canManageLandlordResource(…, ['property_manager'])). Front-desk
 // staff who take payments may not (S641, Nic: "She cannot just issue random
-// credits that a landlord would issue for, you know, waiving a late fee.").
+// credits that a landlord would issue for, you know, waiving a late fee."),
+// and neither may GAM staff — it is the landlord's choice.
 //
 // WHAT GOES: the payments row, and with it everything that exists only because
 // of it — the invoice's late-fee subtotal, its status and the unit's
-// delinquency are rolled up again by the payments triggers, exactly as
-// zeroing does. Nothing that records money may point at it: a receipt, a bank
-// match, credit, a dispute or return, any instrument row (every foreign key to
-// payments.id in db/schema.sql). If one does, the delete is refused in plain
-// words, the fee stays zeroed, and why is logged.
+// delinquency are rolled up again by the payments triggers. Nothing else that
+// records money may point at it: a receipt, a bank match, other credit, a
+// dispute or return, any instrument row (every foreign key to payments.id in
+// db/schema.sql). If one does, the delete is refused in plain words, the fee
+// stays credited, and why is logged.
 //
 // WHAT IS KEPT: the full row as it was, in audit_log (action
 // 'late_fee_deleted', on the INVOICE, so the late-fee engine and Undo find it
-// by an indexed lookup), and an audit line in the API log (who, when, the
-// row). The engine never charges that day again (deletedLateFeeDates), and an
-// Undo of the bank match that zeroed it puts it back exactly, same id
-// (restoreDeletedLateFees). A delete never touches a payment-history mark: the
-// rent's own mark is what it was (the onboarding month is positive-only).
+// by an indexed lookup), with the credit taken back off it; the credit use
+// itself (released, kept forever) and the withdrawn credit; and an audit line
+// in the API log (who, when, the row). The engine never charges that day again
+// (deletedLateFeeDates), and an Undo of the bank match that credited it puts
+// it back exactly, same id (restoreDeletedLateFees).
 
 import type { PoolClient } from 'pg'
 import type { AuthPayload } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
-import { isOnboardingMonthCharge } from './creditLedgerEmitters'
+import { isOnboardingMonthCharge, reRateMarksWithoutLateFee } from './creditLedgerEmitters'
+import { isCreditedLateFee, withdrawLateFeeCredit } from './lateFeeCredit'
 import { logger } from '../lib/logger'
 
 type Q = Pick<PoolClient, 'query'>
 
-/** The note reverseLateFees writes on a late fee it zeroed (bankDepositConfirm). */
+/** The note reverseLateFees wrote on a late fee it zeroed, before 10/6 (a fee is credited now: lateFeeCredit.CREDITED_LATE_FEE_NOTE). */
 export const REVERSED_LATE_FEE_NOTE = 'Reversed: rent was paid '
 
 /** Besides the owner: the team roles that may delete a late fee (never GAM admin — canDeleteLateFees). */
 export const LATE_FEE_DELETE_TEAM_ROLES: readonly string[] = ['property_manager']
 
 export const LATE_FEE_DELETE_NOT_ALLOWED =
-  'Only the owner or a property manager can delete a late fee. Leave the box unchecked and the late fee still comes off — it shows $0.00.'
+  'Only the owner or a property manager can delete a late fee. Leave the box unchecked and the late fee is credited instead — it still counts as a late payment on their history.'
 
 /**
  * May this person delete a late fee of this landlord's? The landlord's own
@@ -100,7 +108,8 @@ const MONEY_REFERENCES: ReadonlyArray<{ what: string; sql: string }> = [
   { what: 'a receipt applied to it', sql: `SELECT 1 FROM remittance_applications WHERE payment_id = $1` },
   { what: 'a bank deposit paid it', sql: `SELECT 1 FROM bank_deposit_allocations WHERE payment_id = $1` },
   { what: 'a bank deposit is matched to it', sql: `SELECT 1 FROM bank_transactions WHERE matched_payment_id = $1` },
-  { what: 'account credit is on it', sql: `SELECT 1 FROM credit_uses WHERE payment_id = $1 AND status <> 'released'` },
+  // Its own late-fee credit is not in the way: it is taken back with the fee.
+  { what: 'account credit is on it', sql: `SELECT 1 FROM credit_uses WHERE payment_id = $1 AND status <> 'released' AND source <> 'late_fee_credit'` },
   { what: 'paid-ahead money paid it', sql: `SELECT 1 FROM lease_prepaid_credit_draws WHERE payment_id = $1` },
   { what: 'paid-ahead money came from it', sql: `SELECT 1 FROM lease_prepaid_credits WHERE source_payment_id = $1` },
   { what: 'a dispute or bank return is on it', sql: `SELECT 1 FROM payment_reversals WHERE payment_id = $1` },
@@ -140,29 +149,43 @@ interface FeeRow {
   stripe_payment_intent_id: string | null; row: Record<string, unknown>
 }
 
-export type LateFeeDeleteRefusal = 'not_found' | 'not_late_fee' | 'not_zeroed' | 'not_onboarding' | 'money'
+export type LateFeeDeleteRefusal = 'not_found' | 'not_late_fee' | 'not_credited' | 'not_onboarding' | 'money'
 
 export const LATE_FEE_DELETE_REFUSAL_TEXT: Record<LateFeeDeleteRefusal, string> = {
   not_found: 'That late fee is no longer there.',
   not_late_fee: 'Only a late fee can be deleted this way.',
-  not_zeroed: 'Only a late fee that already came off (it shows $0.00) can be deleted.',
-  not_onboarding: 'A late fee can be deleted only on the onboarding month\'s bill. This one stays at $0.00 — it no longer counts toward what they owe.',
-  money: 'Money is recorded against this late fee, so it can\'t be deleted. It stays at $0.00 — it no longer counts toward what they owe.',
+  not_credited: 'Only a late fee that was credited because the rent was already in the bank can be deleted.',
+  not_onboarding: 'A late fee can be deleted only on the onboarding month\'s bill. This one stays credited — it no longer counts toward what they owe, and it still counts as a late payment on their history.',
+  money: 'Money is recorded against this late fee, so it can\'t be deleted. It stays credited — it no longer counts toward what they owe, and it still counts as a late payment on their history.',
 }
 
-/** Why this late fee may not be deleted (null: it may), with what records money against it. */
-async function refusalFor(client: Q, fee: FeeRow | undefined): Promise<{ code: LateFeeDeleteRefusal; money?: string[] } | null> {
+/** Which kind of never-owed late fee this is (null: none a landlord may delete). */
+type DeletableKind = 'credited' | 'zeroed' | 'never_owed'
+
+async function kindOf(client: Q, fee: FeeRow, neverOwed: boolean): Promise<DeletableKind | null> {
+  // Credited by a reversal (10/6): charged, netted out by its own late-fee credit.
+  if (await isCreditedLateFee(client, fee)) return 'credited'
+  // Zeroed by a reversal before 10/6: $0, settled by the reversal, with its note.
+  if (Number(fee.amount) === 0 && fee.status === 'settled' && (fee.notes ?? '').includes(REVERSED_LATE_FEE_NOTE)) return 'zeroed'
+  // The box: a fee the deposit being recorded shows was never owed, still unpaid.
+  if (neverOwed && Number(fee.amount) > 0 && !fee.stripe_payment_intent_id
+      && (fee.status === 'pending' || fee.status === 'failed')) return 'never_owed'
+  return null
+}
+
+/** Why this late fee may not be deleted (or, when it may, which kind it is), with what records money against it. */
+async function refusalFor(
+  client: Q, fee: FeeRow | undefined, neverOwed = false,
+): Promise<{ code: LateFeeDeleteRefusal; money?: string[] } | { kind: DeletableKind }> {
   if (!fee) return { code: 'not_found' }
   if (fee.type !== 'late_fee') return { code: 'not_late_fee' }
-  // Zeroed by a reversal: $0, settled by the reversal, with its note.
-  if (Number(fee.amount) !== 0 || fee.status !== 'settled' || !(fee.notes ?? '').includes(REVERSED_LATE_FEE_NOTE)) {
-    return { code: 'not_zeroed' }
-  }
+  const kind = await kindOf(client, fee, neverOwed)
+  if (!kind) return { code: 'not_credited' }
   if (!(await isOnboardingBill(client, fee.invoice_id))) return { code: 'not_onboarding' }
   const money = await moneyReferences(client, fee.id)
   if (fee.stripe_payment_intent_id) money.unshift('a card or bank payment was made on it')
   if (money.length > 0) return { code: 'money', money }
-  return null
+  return { kind }
 }
 
 const FEE_SELECT = `
@@ -170,16 +193,15 @@ const FEE_SELECT = `
          p.stripe_payment_intent_id, to_jsonb(p) AS row
     FROM payments p`
 
-/** The zeroed late fees among these that may be deleted (for the Payments history line). Read-only. */
+/** The credited (or, from before 10/6, zeroed) late fees among these that may be deleted — for the Payments history line. Read-only. */
 export async function deletableLateFeeIds(client: Q, paymentIds: readonly string[]): Promise<Set<string>> {
   const ids = [...new Set(paymentIds)]
   if (ids.length === 0) return new Set()
   const rows = (await client.query<FeeRow>(
-    `${FEE_SELECT} WHERE p.id = ANY($1::uuid[]) AND p.type = 'late_fee' AND p.amount = 0 AND p.status = 'settled'
-       AND p.notes LIKE '%' || $2 || '%'
-     ORDER BY p.id`, [ids, REVERSED_LATE_FEE_NOTE])).rows
+    `${FEE_SELECT} WHERE p.id = ANY($1::uuid[]) AND p.type = 'late_fee' AND p.status = 'settled'
+     ORDER BY p.id`, [ids])).rows
   const ok = new Set<string>()
-  for (const r of rows) if (!(await refusalFor(client, r))) ok.add(r.id)
+  for (const r of rows) if ('kind' in (await refusalFor(client, r))) ok.add(r.id)
   return ok
 }
 
@@ -192,49 +214,91 @@ export interface LateFeeDeleteResult {
   invoiceId: string | null
   tenantId: string | null
   landlordId: string | null
+  /** The late-fee credit taken back off it and withdrawn with it (dollars; 0 when it had none). */
+  creditWithdrawn: number
+  /**
+   * Credit subjects whose payment marks were re-rated because no late fee is
+   * left on the bill (creditLedgerEmitters.reRateMarksWithoutLateFee) — the
+   * caller recomputes their scores after its commit.
+   */
+  reRatedSubjects: string[]
+  /**
+   * Another late fee is still on the bill after this one went (charged and
+   * not voided — the test settleHooks marks by), so its payment still counts
+   * late: "nothing shows on their record" would be false.
+   */
+  lateFeeLeftOnBill: boolean
 }
 
 /**
- * Delete a late fee a reversal already zeroed, on an onboarding bill, inside
- * the caller's transaction (the caller holds the household lock and has
- * checked who may: canDeleteLateFees). Refused in plain words otherwise —
- * nothing changes then; a refusal for money recorded against it is logged.
+ * Delete a never-owed late fee on an onboarding bill, inside the caller's
+ * transaction (the caller holds the household lock and has checked who may:
+ * canDeleteLateFees). Three kinds may go: one a reversal credited (its credit
+ * is taken back and withdrawn first), one zeroed before 10/6, and — with
+ * `neverOwedSince`, from the reversal itself (the box) — an unpaid fee the
+ * deposit being recorded shows was never owed. Refused in plain words
+ * otherwise — nothing changes then; a refusal for money recorded against it is
+ * logged. When no late fee is left on the bill, its payment marks are re-rated
+ * from the deposit's date.
  */
-export async function deleteZeroedLateFee(
+export async function deleteLateFee(
   client: PoolClient,
   paymentId: string,
   o: {
     deletedBy: string | null
     /** Where the landlord chose it: the Record payment / Post a payment box, or the history line. */
     via: 'record_payment' | 'post_payment' | 'history_line'
-    /** The fee as it was before this recording zeroed it (the box), for the record. */
-    beforeZeroing?: { amount: number; status: string; notes: string | null } | null
+    /** The box: the day the deposit being recorded was made (the fee is unpaid and was never owed). */
+    neverOwedSince?: string | null
   },
 ): Promise<LateFeeDeleteResult> {
   const fee = (await client.query<FeeRow>(`${FEE_SELECT} WHERE p.id = $1 FOR UPDATE OF p`, [paymentId])).rows[0]
-  const refusal = await refusalFor(client, fee)
-  const base = { invoiceId: fee?.invoice_id ?? null, tenantId: fee?.tenant_id ?? null, landlordId: fee?.landlord_id ?? null }
-  if (refusal) {
-    if (refusal.code === 'money') {
-      logger.warn({ paymentId, deletedBy: o.deletedBy, via: o.via, money: refusal.money },
-        '[late-fee-delete] refused: money is recorded against this late fee; it stays zeroed')
-    }
-    return { ...base, deleted: false, refusal: refusal.code, message: LATE_FEE_DELETE_REFUSAL_TEXT[refusal.code] }
+  const verdict = await refusalFor(client, fee, !!o.neverOwedSince)
+  const base = {
+    invoiceId: fee?.invoice_id ?? null, tenantId: fee?.tenant_id ?? null, landlordId: fee?.landlord_id ?? null,
+    creditWithdrawn: 0, reRatedSubjects: [] as string[], lateFeeLeftOnBill: false,
   }
+  if (!('kind' in verdict)) {
+    if (verdict.code === 'money') {
+      logger.warn({ paymentId, deletedBy: o.deletedBy, via: o.via, money: verdict.money },
+        '[late-fee-delete] refused: money is recorded against this late fee; it stays credited')
+    }
+    return { ...base, deleted: false, refusal: verdict.code, message: LATE_FEE_DELETE_REFUSAL_TEXT[verdict.code] }
+  }
+  // Its own late-fee credit comes off first (released and withdrawn — both
+  // kept), so the row as kept in the audit log is the fee as charged, unpaid
+  // by any credit, and an Undo that puts it back finds it that way.
+  const withdrawn = verdict.kind === 'credited'
+    ? await withdrawLateFeeCredit(client, paymentId)
+    : { useIds: [] as string[], creditIds: [] as string[], amount: 0 }
+  const row = verdict.kind === 'credited'
+    ? (await client.query<{ row: Record<string, unknown> }>(`SELECT to_jsonb(p) AS row FROM payments p WHERE p.id = $1`, [paymentId])).rows[0].row
+    : fee!.row
   const at = new Date().toISOString()
+  const record = {
+    paymentId, via: o.via, deletedAt: at, kind: verdict.kind,
+    neverOwedSince: o.neverOwedSince ?? null,
+    creditWithdrawn: verdict.kind === 'credited'
+      ? { amount: withdrawn.amount, useIds: withdrawn.useIds, creditIds: withdrawn.creditIds } : null,
+  }
   await client.query(
     `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
      VALUES ($1, $2, 'invoice', $3, $4::jsonb, $5::jsonb)`,
-    [o.deletedBy, LATE_FEE_DELETED_ACTION, fee!.invoice_id, JSON.stringify(fee!.row),
-     JSON.stringify({ paymentId, via: o.via, deletedAt: at, beforeZeroing: o.beforeZeroing ?? null })])
+    [o.deletedBy, LATE_FEE_DELETED_ACTION, fee!.invoice_id, JSON.stringify(row), JSON.stringify(record)])
   const d = await client.query(`DELETE FROM payments WHERE id = $1`, [paymentId])
   if ((d.rowCount ?? 0) !== 1) {
     // Locked above; cannot happen. Never leave an audit line for a row still there.
     throw new Error(`late fee ${paymentId} could not be deleted`)
   }
-  logger.info({ audit: LATE_FEE_DELETED_ACTION, paymentId, deletedBy: o.deletedBy, deletedAt: at, via: o.via, row: fee!.row,
-    beforeZeroing: o.beforeZeroing ?? null }, '[late-fee-delete] onboarding late fee deleted at the landlord\'s choice')
-  return { ...base, deleted: true, refusal: null, message: null }
+  logger.info({ audit: LATE_FEE_DELETED_ACTION, paymentId, deletedBy: o.deletedBy, deletedAt: at, via: o.via, row, record },
+    '[late-fee-delete] onboarding late fee deleted at the landlord\'s choice')
+  const reRatedSubjects = fee!.invoice_id ? await reRateMarksWithoutLateFee(client, fee!.invoice_id) : []
+  const lateFeeLeftOnBill = !!fee!.invoice_id && ((await client.query<{ x: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM payments f WHERE f.invoice_id = $1 AND f.type = 'late_fee'
+                       AND f.amount > 0 AND f.status <> 'voided') AS x`, [fee!.invoice_id])).rows[0]?.x ?? false)
+  return {
+    ...base, deleted: true, refusal: null, message: null, creditWithdrawn: withdrawn.amount, reRatedSubjects, lateFeeLeftOnBill,
+  }
 }
 
 /**
@@ -260,9 +324,10 @@ export async function deletedLateFeeDates(client: Q, invoiceId: string, invoiceD
 /**
  * Put deleted late fees back exactly as they were deleted (same id, every
  * column), inside the caller's transaction — an Undo of the bank match that
- * zeroed them (bankDepositConfirm.undoDepositMatch), which then restores
- * their amount as it does for any zeroed fee. Only fees not already there.
- * Returns the ids put back.
+ * zeroed or credited them (bankDepositConfirm.undoDepositMatch), which then
+ * makes each owed again as it does for any fee the match took off (a credited
+ * fee's credit was already taken back and withdrawn by the delete). Only fees
+ * not already there. Returns the ids put back.
  */
 export async function restoreDeletedLateFees(
   client: PoolClient,

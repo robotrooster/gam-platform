@@ -18,7 +18,7 @@
  */
 import {
   ACH_RETURN_CONFIG, PAYMENT_REVERSAL_TYPE_VALUES, PAYMENT_STATUS_LABEL, MANUAL_PAYMENT_METHOD_WORD,
-  bankReceiptPhotoProblem, DEPOSIT_REFERENCE_LABEL, monthDayLabel, UNREPORTED_DEPOSIT_LATE_LANDLORD_TEXT,
+  bankReceiptPhotoProblem, DEPOSIT_REFERENCE_LABEL, LATE_FEE_CREDITED_LANDLORD_TEXT, LATE_FEE_DELETED_LANDLORD_TEXT, LATE_FEE_DELETED_STILL_LATE_LANDLORD_TEXT,
   type ManualPaymentMethod, type PaymentReversalType, type PaymentStatus,
 } from '@gam/shared'
 
@@ -641,19 +641,31 @@ export function depositPhotoProblem(file: { type: string; size: number } | null 
 }
 
 /**
- * 10/5 (Nic): a bank deposit dated before late fees were charged — said in
- * the window ("the deposit was made before …") and after it is recorded.
- * Null when nothing comes off.
+ * 10/6 (Nic): what became of the late fees a bank deposit dated back took off,
+ * said after it is recorded. "They get a credit against their bill and the
+ * late payment still shows on their payment history" — credited (and, for a
+ * fee they had already paid, given back as credit) — unless the landlord
+ * deleted it in the onboarding month ("nothing shows on their record").
+ * Null when no late fee came off.
  */
-export function lateFeesOffText(depositedOn: string, unbilled: number, refunded = 0): string | null {
-  const total = toCents(unbilled) + toCents(refunded)
-  if (total <= 0) return null
-  const day = monthDayLabel(depositedOn)
-  if (toCents(refunded) > 0) {
-    return `${money(toDollars(total))} in late fees charged after ${day} came off — ` +
-      `${money(refunded)} of it they had already paid, given back as credit.`
+export function lateFeeOutcomeText(r: {
+  lateFeesUnbilled?: number; lateFeesRefunded?: number; lateFeesDeleted?: number; lateFeeCountsLate?: boolean
+  /** The server read the bill afterwards: another late fee is still on a bill the box deleted one from. */
+  lateFeeDeletedStillLate?: boolean
+}): string | null {
+  const said: string[] = []
+  // "Nothing shows on their record" only when no late fee is left on that
+  // bill — the server reads what is left, never what was done.
+  if (Number(r.lateFeesDeleted ?? 0) > 0) {
+    said.push(r.lateFeeDeletedStillLate ? LATE_FEE_DELETED_STILL_LATE_LANDLORD_TEXT : LATE_FEE_DELETED_LANDLORD_TEXT)
   }
-  return `${money(toDollars(total))} in late fees charged after ${day} came off — the money was in the bank that day.`
+  const credited = toCents(r.lateFeesUnbilled)
+  const refunded = toCents(r.lateFeesRefunded)
+  if (credited > 0 || refunded > 0) {
+    said.push(LATE_FEE_CREDITED_LANDLORD_TEXT
+      + (refunded > 0 ? ` ${money(toDollars(refunded))} they had already paid was given back as credit.` : ''))
+  }
+  return said.length > 0 ? said.join(' ') : null
 }
 
 /** "October rent" — a bill's month and what it is, for "stays owed on …". */
@@ -924,9 +936,9 @@ export function recordedMessage(name: string, r: {
   stillOwed?: number; stillOwedNames?: string[]
   /** 10/5 (Nic): a bank deposit dated back — late fees charged after that day that came off. */
   depositedOn?: string | null; lateFeesUnbilled?: number; lateFeesRefunded?: number
-  /** 10/6 (Nic): the tenant never reported that deposit — the late fee came off, the payment still counts late. */
-  unreportedDepositCountsLate?: boolean
-  /** 10/6 (Nic): the onboarding box was ticked but a late fee could not be deleted — why (it stays at $0.00). */
+  /** 10/6 (Nic): late fees deleted from the onboarding bill (the box), and whether a late fee left on a bill still counts late. */
+  lateFeesDeleted?: number; lateFeeCountsLate?: boolean; lateFeeDeletedStillLate?: boolean
+  /** 10/6 (Nic): the onboarding box was ticked but a late fee could not be deleted — why (credited instead, or still owed). */
   lateFeeDeleteRefusals?: string[]
 }): string {
   const parts: string[] = []
@@ -938,9 +950,7 @@ export function recordedMessage(name: string, r: {
   if (toCents(r.changeGiven) > 0) parts.push(`give ${money(r.changeGiven)} change`)
   else if (toCents(r.surplus) > 0 && r.creditId) parts.push(`${money(r.surplus)} kept on their account as credit`)
   if (toCents(r.stillOwed) > 0) return `${parts.join(' — ')} — ${stillOwedText(toCents(r.stillOwed), r.stillOwedNames ?? [])}`
-  const feesOff = r.depositedOn ? lateFeesOffText(r.depositedOn, r.lateFeesUnbilled ?? 0, r.lateFeesRefunded ?? 0) : null
-  // 10/6 (Nic): said in one line when the tenant never reported the deposit.
-  const said = feesOff && r.unreportedDepositCountsLate ? UNREPORTED_DEPOSIT_LATE_LANDLORD_TEXT : feesOff
+  const said = r.depositedOn ? lateFeeOutcomeText(r) : null
   const refused = lateFeeDeleteRefusalText(r.lateFeeDeleteRefusals)
   return parts.join(' — ') + '.' + (said ? ` ${said}` : '') + (refused ? ` ${refused}` : '')
 }

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict otK3V75WLVw9aD2CEftol5uzt4XRw0mdwIWrJSQIZDxYjCq0YlKUaecXHbAhhe3
+\restrict bbRe2bx8c9pGhpaSTPrgvJYUFpwM6DXTSBhzAkLdCf8NRBYVZ1pRVL2ipA5LV4Y
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -272,18 +272,30 @@ BEGIN
     END IF;
     IF NOT (   (OLD.status = 'held'    AND NEW.status IN ('applied','released'))
             OR (OLD.status = 'applied' AND NEW.status = 'reversed')
-            OR (OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'stay_shortened')) THEN
+            OR (OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'stay_shortened')
+            OR (OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'late_fee_credit_withdrawn')) THEN
       RAISE EXCEPTION 'A credit use cannot go from % to %', OLD.status, NEW.status USING ERRCODE = '23514';
     END IF;
     -- Spent credit given back because a shortened stay no longer has the nights
     -- it paid (decisions #30 / #35.3): only credit the landlord issued, on rent.
     -- Deposit interest and paid-ahead money are the guest's money: what a
     -- shortened stay no longer owes of them is banked as money paid ahead.
-    IF OLD.status = 'applied' AND NEW.status = 'released'
+    IF OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'stay_shortened'
        AND (NEW.tenant_credit_id IS NULL OR NEW.payment_id IS NULL
             OR (SELECT tc.category FROM tenant_credits tc WHERE tc.id = NEW.tenant_credit_id) = 'deposit_interest'
             OR (SELECT p.type FROM payments p WHERE p.id = NEW.payment_id) IS DISTINCT FROM 'rent') THEN
       RAISE EXCEPTION 'Only credit the landlord issued, spent on rent, comes back when a stay is shortened'
+        USING ERRCODE = '23514';
+    END IF;
+    -- 10/6 (Nic): a late-fee credit taken back — only the credit GAM wrote to
+    -- net out a never-owed late fee (category late_fee_refund, source
+    -- late_fee_credit, on a late_fee row): an Undo of the bank match that
+    -- credited it, or the landlord deleting that fee in the onboarding month.
+    IF OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'late_fee_credit_withdrawn'
+       AND (NEW.tenant_credit_id IS NULL OR NEW.payment_id IS NULL OR NEW.source <> 'late_fee_credit'
+            OR (SELECT tc.category FROM tenant_credits tc WHERE tc.id = NEW.tenant_credit_id) IS DISTINCT FROM 'late_fee_refund'
+            OR (SELECT p.type FROM payments p WHERE p.id = NEW.payment_id) IS DISTINCT FROM 'late_fee') THEN
+      RAISE EXCEPTION 'Only a late-fee credit on its own late fee is taken back this way'
         USING ERRCODE = '23514';
     END IF;
     -- Undoing a spend keeps the day it was spent.
@@ -480,7 +492,7 @@ BEGIN
   -- payout counts the given-back credit as money, and the credit is counted
   -- once, as the guest's saved credit. The caller only notes the change on
   -- the row and its invoice (services/bookingLeaseBilling).
-  IF TG_OP = 'UPDATE' AND OLD.status = 'applied' AND NEW.status = 'released' THEN
+  IF TG_OP = 'UPDATE' AND OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'stay_shortened' THEN
     UPDATE payments SET amount = amount - NEW.amount WHERE id = NEW.payment_id;
   END IF;
   RETURN NEW;
@@ -4163,9 +4175,9 @@ CREATE TABLE public.credit_uses (
     CONSTRAINT credit_uses_one_target CHECK (((num_nonnulls(payment_id, deposit_return_id, payment_reversal_id, refund_part_id, paid_ahead_choice_id) = 1) OR ((status = 'released'::text) AND (num_nonnulls(payment_id, deposit_return_id, payment_reversal_id, refund_part_id, paid_ahead_choice_id) = 0)))),
     CONSTRAINT credit_uses_refund_is_paid_ahead CHECK (((refund_part_id IS NULL) OR ((prepaid_credit_id IS NOT NULL) AND (source = 'refund'::text)))),
     CONSTRAINT credit_uses_reversed_is_paid_ahead CHECK (((status <> 'reversed'::text) OR ((prepaid_credit_id IS NOT NULL) AND (payment_id IS NOT NULL)))),
-    CONSTRAINT credit_uses_source_check CHECK ((source = ANY (ARRAY['portal'::text, 'autopay'::text, 'front_desk_reader'::text, 'desk'::text, 'landlord_agent'::text, 'whole_bill'::text, 'move_out'::text, 'reversal'::text, 'backfill'::text, 'refund'::text, 'paid_ahead_choice'::text]))),
+    CONSTRAINT credit_uses_source_check CHECK ((source = ANY (ARRAY['portal'::text, 'autopay'::text, 'front_desk_reader'::text, 'desk'::text, 'landlord_agent'::text, 'whole_bill'::text, 'move_out'::text, 'reversal'::text, 'backfill'::text, 'refund'::text, 'paid_ahead_choice'::text, 'late_fee_credit'::text]))),
     CONSTRAINT credit_uses_status_check CHECK ((status = ANY (ARRAY['held'::text, 'applied'::text, 'released'::text, 'reversed'::text]))),
-    CONSTRAINT credit_uses_status_stamps CHECK ((((status = 'held'::text) AND (applied_at IS NULL) AND (released_at IS NULL) AND (release_reason IS NULL)) OR ((status = 'applied'::text) AND (applied_at IS NOT NULL) AND (released_at IS NULL) AND (release_reason IS NULL)) OR ((status = 'released'::text) AND (applied_at IS NULL) AND (released_at IS NOT NULL) AND (release_reason = ANY (ARRAY['payment_failed'::text, 'payment_canceled'::text, 'superseded'::text]))) OR ((status = 'released'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'stay_shortened'::text)) OR ((status = 'reversed'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'funding_reversed'::text))))
+    CONSTRAINT credit_uses_status_stamps CHECK ((((status = 'held'::text) AND (applied_at IS NULL) AND (released_at IS NULL) AND (release_reason IS NULL)) OR ((status = 'applied'::text) AND (applied_at IS NOT NULL) AND (released_at IS NULL) AND (release_reason IS NULL)) OR ((status = 'released'::text) AND (applied_at IS NULL) AND (released_at IS NOT NULL) AND (release_reason = ANY (ARRAY['payment_failed'::text, 'payment_canceled'::text, 'superseded'::text]))) OR ((status = 'released'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'stay_shortened'::text)) OR ((status = 'released'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'late_fee_credit_withdrawn'::text)) OR ((status = 'reversed'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'funding_reversed'::text))))
 );
 
 
@@ -31199,5 +31211,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict otK3V75WLVw9aD2CEftol5uzt4XRw0mdwIWrJSQIZDxYjCq0YlKUaecXHbAhhe3
+\unrestrict bbRe2bx8c9pGhpaSTPrgvJYUFpwM6DXTSBhzAkLdCf8NRBYVZ1pRVL2ipA5LV4Y
 

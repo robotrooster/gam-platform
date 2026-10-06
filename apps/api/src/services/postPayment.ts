@@ -47,7 +47,7 @@ export interface PostPaymentInput {
    * late fees charged after it come off (services/manualPaymentSettle).
    */
   depositedOn?: string | null
-  /** 10/6 (Nic): the onboarding box — delete, not zero, a late fee this takes off an onboarding bill. Caller checked who may. */
+  /** 10/6 (Nic): the onboarding box — delete, not credit, a late fee this takes off an onboarding bill. Caller checked who may. */
   deleteOnboardingLateFees?: boolean
   postedBy: string
 }
@@ -61,15 +61,17 @@ export interface PostPaymentResult {
   settledPaymentIds: string[]
   leaseId: string
   creditId: string | null
-  /** 10/5: late fees charged after a bank deposit's date that came off (unbilled, and refunded as credit). */
+  /** 10/5: late fees charged after a bank deposit's date that came off — 10/6: credited (unbilled), and refunded as credit. */
   lateFeesUnbilled: number
   lateFeesRefunded: number
   /** 10/6 (Nic): late fees deleted from an onboarding bill (the box). */
   lateFeesDeleted: number
-  /** 10/6 (Nic): the box was ticked but a late fee could not be deleted — why, in plain words (it stays at $0.00). */
+  /** 10/6 (Nic): the box was ticked but a late fee could not be deleted — why, in plain words (credited instead, or still owed). */
   lateFeeDeleteRefusals: string[]
-  /** 10/6 (Nic): a late fee came off a deposit the tenant never reported — it still counts late. */
-  unreportedDepositCountsLate: boolean
+  /** 10/6 (Nic): a bill a late fee came off of still has a late fee on it — the payment still counts late on their history. */
+  lateFeeCountsLate: boolean
+  /** 10/6: the box deleted a late fee from a bill that still has another one on it (still late). */
+  lateFeeDeletedStillLate: boolean
   /** 10/5: a part payment (the property takes them) — what is still owed after it; 0 when paid in full. */
   stillOwed: number
   stillOwedRows: StillOwedRow[]
@@ -149,7 +151,8 @@ export async function postTenantPayment(client: PoolClient, input: PostPaymentIn
       lateFeesRefunded: r.lateFeesReversed.refunded,
       lateFeesDeleted: r.lateFeesDeleted.count,
       lateFeeDeleteRefusals: r.lateFeeDeleteRefusals,
-      unreportedDepositCountsLate: r.unreportedDepositCountsLate,
+      lateFeeCountsLate: r.lateFeeCountsLate,
+      lateFeeDeletedStillLate: r.lateFeeDeletedStillLate,
       afterCommit: async () => {
         await r.afterCommit()
         if (r.creditId) await runWholeBillCheckAfterCommit({ tenantId: input.tenantId, landlordId: lease.landlord_id })
@@ -178,7 +181,7 @@ export async function postTenantPayment(client: PoolClient, input: PostPaymentIn
   return {
     remittanceId, applied: 0, paidAhead: toDollars(amount), settledPaymentIds: [], leaseId: lease.id, creditId,
     stillOwed: 0, stillOwedRows: [], lateFeesUnbilled: 0, lateFeesRefunded: 0,
-    lateFeesDeleted: 0, lateFeeDeleteRefusals: [], unreportedDepositCountsLate: false,
+    lateFeesDeleted: 0, lateFeeDeleteRefusals: [], lateFeeCountsLate: false, lateFeeDeletedStillLate: false,
     afterCommit: async () => {
       await runWholeBillCheckAfterCommit({ tenantId: input.tenantId, landlordId: lease.landlord_id })
     },

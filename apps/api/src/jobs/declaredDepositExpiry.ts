@@ -252,12 +252,11 @@ export interface ReportClosedByRecording {
  * 10/6 (Nic): a BANK DEPOSIT the landlord records closes the tenant's report
  * of it at once, inside the recording's own transaction — the same rule the
  * sweep above applies (recordedReceiptMatchSql; a bank deposit closes a report
- * whether or not GAM reads the bank), done there and then because the
- * recording has to know whether the tenant reported this deposit themselves
- * (services/manualPaymentSettle: a deposit the tenant reported before the late
- * fee posted counts from its own date; one they did not, from the day it was
- * recorded). Null when there is none. The caller tells the tenant after its
- * commit (tellTenantReportRecorded).
+ * whether or not GAM reads the bank), done there and then so the report is
+ * never left waiting beside the recorded payment. Whether the tenant reported
+ * it first changes nothing about a late fee on the bill — 10/6 (Nic): "No
+ * exceptions" (services/manualPaymentSettle). Null when there is none. The
+ * caller tells the tenant after its commit (tellTenantReportRecorded).
  *
  * WHICH report: the report FOR THIS DEPOSIT first — its date within the
  * bank-feed match's reach of the deposit's date (declarationReachesSql), the

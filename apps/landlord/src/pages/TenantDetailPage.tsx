@@ -79,20 +79,21 @@ export function TenantDetailPage() {
   const { tenant, units, payments, maintenance, stats } = data
   /**
    * 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's
-   * discretion." A late fee that already came off ($0.00) on the onboarding
+   * discretion." A late fee that was credited (or, before 10/6, zeroed) on the onboarding
    * month's bill: the server marks the line (canDeleteLateFee) only for the
    * owner or a property manager, and refuses anything else in plain words.
    */
   const deleteLateFee = async (p: any) => {
     const ok = await appConfirm(
-      `The ${dayWord(p.dueDate, '')} late fee already came off their bill. Deleting it removes it from their record completely — ` +
+      `The ${dayWord(p.dueDate, '')} late fee was credited, and the payment still counts as late on their history. ` +
+      'Deleting the late fee removes it and its credit from their record completely, so the payment counts from the day the money was deposited — ' +
       'only for the onboarding month.',
       { title: 'Delete this late fee', confirmLabel: 'Delete this late fee' })
     if (!ok) return
     setDeletingFee(p.id)
     try {
       const r: any = await apiPost(`/payments/${p.id}/delete-late-fee`, {})
-      toast(r?.data?.message ?? 'The late fee is gone from their record.')
+      toast(r?.data?.message ?? 'The late fee was deleted — nothing shows on their record.')
       refetch()
     } catch (e) {
       toast.error(serverMessage(e, 'The late fee could not be deleted. Nothing changed — try again.'))

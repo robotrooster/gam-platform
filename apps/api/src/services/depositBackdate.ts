@@ -58,9 +58,10 @@ export interface BackdateOutcome {
  * absence.
  *
  * The two totals are kept apart because they are different acts. An unpaid tick
- * is simply removed from what the tenant owes. A tick they ALREADY PAID cannot
- * be un-charged, so it comes back as a `late_fee_refund` credit — GAM does not
- * erase money that moved, it corrects it in the open.
+ * is netted out of what the tenant owes by a late-fee credit applied to it
+ * (10/6, Nic: the fee stays on the bill — services/lateFeeCredit). A tick they
+ * ALREADY PAID cannot be un-charged, so it comes back as a `late_fee_refund`
+ * credit — GAM does not erase money that moved, it corrects it in the open.
  */
 export function backdateLateFees(
   ticks: LateFeeTick[], effectivePaidDate: string,

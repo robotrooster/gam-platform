@@ -28,7 +28,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import {
   humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, MANUAL_PAYMENT_METHOD_WORD,
-  DELETE_ONBOARDING_LATE_FEE_LABEL, DELETE_ONBOARDING_LATE_FEE_HINT, UNREPORTED_DEPOSIT_LATE_LANDLORD_TEXT,
+  DELETE_ONBOARDING_LATE_FEE_LABEL, DELETE_ONBOARDING_LATE_FEE_HINT,
   type ManualPaymentMethod,
 } from '@gam/shared'
 import { api, apiGet, apiPost } from '../lib/api'
@@ -40,7 +40,7 @@ import {
   postConfirmQuestion, numberRequired, deskFigures, sameFigures, figuresMovedMessage, CREDIT_USE_RULE,
   chargeMonthsRange, readChargesById, CHARGE_PAGE_SIZE, withReaderTaken, readerFinishedMessage,
   deskOnItsWay, nextAwaitingRereadAt, awaitingOpensAtWord,
-  AMOUNT_FIELD_LABEL, NUMBER_FIELD_LABEL, numberMissingMessage, depositPhotoProblem, billName, stillOwedText, lateFeesOffText, lateFeesBackOnShortBills,
+  AMOUNT_FIELD_LABEL, NUMBER_FIELD_LABEL, numberMissingMessage, depositPhotoProblem, billName, stillOwedText, lateFeeOutcomeText, lateFeesBackOnShortBills,
   onboardingLateFeeBoxApplies,
   type CreditChoice, type DeskFigures, type DeskQuote, type DeskQuoteRow, type ReaderQuote, type ReaderSpace,
 } from '../lib/creditDesk'
@@ -200,9 +200,9 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   const anyReaderBusy = Object.values(readerBusy).some(Boolean)
   const [mode, setMode] = useState<ManualPaymentMethod | 'reader' | null>(null)
   // 10/5: the day the resident put the money in the bank — logged after the
-  // fact, the payment counts from that day (its on-time or late mark), and
-  // paid in full, late fees charged after it come off — so the bill is read
-  // as of that day (?depositedOn=).
+  // fact, and paid in full, late fees charged after it are credited (10/6,
+  // Nic: the payment then still counts late) — so the bill is read as of that
+  // day (?depositedOn=).
   const deskToday = localToday()
   const [depositedOn, setDepositedOn] = useState(deskToday)
   const backdatedTo = mode === 'bank_deposit' && /^\d{4}-\d{2}-\d{2}$/.test(depositedOn) && depositedOn < deskToday
@@ -678,8 +678,9 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                 {/* 10/5 (Nic): late fees go by the day the money went into the bank. */}
                 {method === 'bank_deposit' && backdatedTo && toCents(quote?.lateFeesOffIfPaidInFull) > 0 && (
                   <div className="cd-note" role="status">
-                    Deposited before {money(quote!.lateFeesOffIfPaidInFull!)} in late fees were charged: they are left
-                    off this bill, and come off each bill this deposit pays in full. A bill it pays only in part keeps its late fees.
+                    Deposited before {money(quote!.lateFeesOffIfPaidInFull!)} in late fees were charged: each bill this deposit
+                    pays in full gets them credited, and the payment still counts as late on their history. A bill it pays only in
+                    part keeps its late fees.
                   </div>
                 )}
                 {onboardingBox && (
@@ -1350,12 +1351,11 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
           .map((x: any) => billName(String(x.dueDate ?? ''), humanize(String(x.type ?? ''))))
         parts.push(stillOwedText(toCents(d.stillOwed), names).replace(/\.$/, ''))
       }
-      // 10/5 (Nic): a bank deposit dated back — late fees charged after it came off.
-      const feesOff = method === 'bank_deposit' && receivedAt
-        ? lateFeesOffText(receivedAt, Number(d.lateFeesUnbilled ?? 0), Number(d.lateFeesRefunded ?? 0)) : null
-      // 10/6 (Nic): a deposit the tenant never reported still counts late — said in one line.
-      if (feesOff) parts.push((d.unreportedDepositCountsLate ? UNREPORTED_DEPOSIT_LATE_LANDLORD_TEXT : feesOff).replace(/\.$/, ''))
-      // 10/6 (Nic): the box was ticked but a late fee could not be deleted — said plainly (it stays at $0.00).
+      // 10/6 (Nic): a bank deposit dated back — the late fees charged after it
+      // were credited (still late on their history) or, ticked in the
+      // onboarding month, deleted. Said after the figures.
+      const feesOff = method === 'bank_deposit' && receivedAt ? lateFeeOutcomeText(d) : null
+      // 10/6 (Nic): the box was ticked but a late fee could not be deleted — said plainly (it was credited instead).
       const refused = lateFeeDeleteRefusalText(d.lateFeeDeleteRefusals)
       // 10/5 (Nic): the photo of the bank's receipt goes on the payment just posted.
       const photoNote = method === 'bank_deposit' ? await sendDepositPhoto(d.remittanceId, photo) : null
@@ -1365,7 +1365,7 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
       // A payment posted by hand is cash for the bank deposit too.
       qc.invalidateQueries('undeposited-cash')
       qc.invalidateQueries('deposit-slips')
-      onPosted(parts.join(' — ') + '.' + (refused ? ` ${refused}` : '') + (photoNote ? ` ${photoNote}` : ''))
+      onPosted(parts.join(' — ') + '.' + (feesOff ? ` ${feesOff}` : '') + (refused ? ` ${refused}` : '') + (photoNote ? ` ${photoNote}` : ''))
     } catch (e) {
       setConfirming(false)
       setMsg({ kind: 'error', text: serverMessage(e, 'That payment could not be posted. Nothing was recorded — try again.') })

@@ -5613,6 +5613,10 @@ export function paidByLabel(
     case 'prior_arrangement': return 'Prior arrangement'
     case 'ach':               return 'Bank (ACH)'
     case 'card':              return channel === 'in_person' ? 'Card · in person' : 'Card · online'
+    // 10/6 (Nic): "they get a credit against their bill" — a late fee netted
+    // out by its own late-fee credit, and a line paid by account credit alone.
+    case 'late_fee_credit':   return 'Late fee credited'
+    case 'credit':            return 'Account credit'
     default:                  return null
   }
 }
@@ -5709,29 +5713,64 @@ export function bankDateUsedText(declaredDate: string, bankPostedDate: string): 
     + `so your payment counts from ${monthDayLabel(bankPostedDate)}, and any late fees up to then stay.`
 }
 /**
- * 10/6 (Nic): "if the tenant forgets to log the payment and gets a late fee it
- * counts as late because of recording not that payment was late. The landlord
- * has to spend their time going to remove the late fee. It needs to just zero
- * it out, but still count against their on-time payment history because of
- * that waste of time." What the tenant is told when the landlord found an
- * unreported deposit and took the late fee off, but the payment still counts
- * late (services/manualPaymentSettle).
+ * 10/6 (Nic): "Late fees are not automatically on time because of the
+ * onboarding month. That's the landlord's discretion. ... So the late fee is
+ * only available to be completely deleted during the onboarding month. Other
+ * than that, they get a credit against their bill and the late payment still
+ * shows on their payment history." — and, of a tenant who reported their
+ * deposit first: "No exceptions".
+ *
+ * What the tenant is told when a bank deposit dated before a late fee shows
+ * the fee was never owed: the fee is credited (or, when they had already paid
+ * it, given back as credit), and the payment still counts late
+ * (services/manualPaymentSettle, services/bankDepositConfirm).
+ *   credited — dollars of unpaid late fees credited;
+ *   refunded — dollars of late fees they had already paid, given back as credit;
+ *   count    — how many late fees that was (wording only).
  */
-export function unreportedDepositLateTenantText(depositedOn: string): string {
-  return `Your landlord found your deposit from ${monthDayLabel(depositedOn)} and took off the late fee. `
-    + 'Because it wasn\'t reported in GAM, it still counts as a late payment on your payment history. '
-    + 'Report your bank deposits in the portal to have them count on time.'
+export function lateFeeCreditedTenantText(o: {
+  depositedOn: string; credited: number; refunded?: number; count?: number
+}): string {
+  const credited = Math.round(Number(o.credited || 0) * 100) / 100
+  const refunded = Math.round(Number(o.refunded || 0) * 100) / 100
+  const many = (o.count ?? 1) > 1
+  const fee = (amt: number) => many ? `$${amt.toFixed(2).replace(/\.00$/, '')} in late fees` : `$${amt.toFixed(2).replace(/\.00$/, '')} late fee`
+  const what = credited > 0 && refunded > 0
+    ? `credited the ${fee(credited)} and gave back the $${refunded.toFixed(2).replace(/\.00$/, '')} you had already paid as credit on your account`
+    : refunded > 0
+      ? `gave back the ${fee(refunded)} you had already paid as credit on your account`
+      : `credited the ${fee(credited)}`
+  return `Your landlord found your payment from ${monthDayLabel(o.depositedOn)} and ${what}. `
+    + 'Because it wasn\'t recorded before the late fee posted, it still counts as a late payment on your payment history.'
 }
-/** 10/6 (Nic): the same, in one line on the landlord's Record payment result. */
-export const UNREPORTED_DEPOSIT_LATE_LANDLORD_TEXT =
-  'The late fee came off. They didn\'t report this deposit, so it still counts as late on their payment history.'
+/** 10/6 (Nic): the landlord's Record payment / Post a payment result, when a late fee was credited. */
+export const LATE_FEE_CREDITED_LANDLORD_TEXT =
+  'The late fee was credited. It still counts as a late payment on their history.'
+/** 10/6 (Nic): the same, when the landlord deleted the late fee (onboarding month only) and no late fee is left on that bill. */
+export const LATE_FEE_DELETED_LANDLORD_TEXT =
+  'The late fee was deleted — nothing shows on their record.'
 /**
- * 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's
- * discretion." The box on Record payment / Post a payment (off by default) and
- * the line under it.
+ * 10/6 (Nic): the landlord deleted the late fee, but another late fee stays on
+ * the same bill (one charged before the deposit, or one they had already paid),
+ * so the payment still counts late.
+ */
+export const LATE_FEE_DELETED_STILL_LATE_LANDLORD_TEXT =
+  'The late fee was deleted, but another late fee is still on that bill, so it still counts as a late payment on their history.'
+/**
+ * 10/6 (Nic): the box was ticked, but a late fee could be neither deleted nor
+ * credited (credit is set aside on it for a payment in progress) — it is
+ * still owed.
+ */
+export const LATE_FEE_NOT_CREDITED_STILL_OWED_TEXT =
+  'A late fee couldn\'t be deleted or credited because credit is set aside on it for a payment in progress, so it is still owed. Look at it again once that payment finishes.'
+/**
+ * 10/6 (Nic): "the late fee is only available to be completely deleted during
+ * the onboarding month." The box on Record payment / Post a payment (off by
+ * default) and the line under it.
  */
 export const DELETE_ONBOARDING_LATE_FEE_LABEL = 'Delete the late fee completely (onboarding month)'
-export const DELETE_ONBOARDING_LATE_FEE_HINT = 'Leaves no late fee on their record. Only for the onboarding month.'
+export const DELETE_ONBOARDING_LATE_FEE_HINT =
+  'Leaves no late fee on their record. Unchecked, the late fee is credited and still counts as a late payment.'
 export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> = {
   cash: 'Cash',
   // S607 (Nic): a cashier's check is a CHECK. Deliberately NOT its own value —

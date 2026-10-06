@@ -1890,7 +1890,13 @@ tenantsRouter.get('/payments', async (req, res, next) => {
     const payments = await query<any>(`
       SELECT p.*, u.unit_number, pr.name AS property_name,
              -- S654: how it was paid, for the history's "Paid by" column.
-             COALESCE(p.manual_method, rm.payment_method) AS paid_by
+             -- 10/6 (Nic): a late fee netted out by its late-fee credit reads
+             -- "Late fee credited"; a line paid by credit alone, "Account credit".
+             COALESCE(p.manual_method, rm.payment_method,
+               CASE WHEN EXISTS (SELECT 1 FROM credit_uses cu WHERE cu.payment_id = p.id
+                                   AND cu.source = 'late_fee_credit' AND cu.status = 'applied') THEN 'late_fee_credit'
+                    WHEN p.status = 'settled' AND p.amount > 0 AND p.issued_credit_amount >= p.amount THEN 'credit'
+               END) AS paid_by
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
@@ -2580,10 +2586,10 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
       LIMIT 36`, [req.params.id, scope, propScope])
 
     // 10/6 (Nic): "Delete this late fee" on the line of a late fee a reversal
-    // zeroed on the onboarding month's bill — said per line, and only to a
-    // viewer who may delete one (the owner or a property manager:
-    // services/lateFeeDelete). Everyone else gets no flag at all.
-    const zeroedFees = payments.filter((p: any) => p.type === 'late_fee' && Number(p.amount) === 0 && p.status === 'settled')
+    // credited (or, before 10/6, zeroed) on the onboarding month's bill — said
+    // per line, and only to a viewer who may delete one (the owner or a
+    // property manager: services/lateFeeDelete). Everyone else gets no flag.
+    const zeroedFees = payments.filter((p: any) => p.type === 'late_fee' && p.status === 'settled')
     if (scoped && zeroedFees.length > 0) {
       const { canDeleteLateFees, deletableLateFeeIds } = await import('../services/lateFeeDelete')
       const owners = await query<{ id: string; landlord_id: string }>(

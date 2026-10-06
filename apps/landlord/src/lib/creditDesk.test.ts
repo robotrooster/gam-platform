@@ -13,7 +13,7 @@ import { describe, it, expect } from 'vitest'
 import {
   money, parseAmount, monthTitle, monthWord, dayWord, daysLateText,
   creditBesideText, monthsOwedText, sliceByProperty, serverTotals, folderTotal, deskBalanceSentence,
-  creditChoiceNeeded, creditToUseFor, deskOwedCents, oldBalanceOwedCents, postAnchor, planTender, recordedMessage, lateFeeDeleteRefusalText,
+  creditChoiceNeeded, creditToUseFor, deskOwedCents, oldBalanceOwedCents, postAnchor, planTender, recordedMessage, lateFeeDeleteRefusalText, lateFeeOutcomeText,
   serverMessage, serverStatus, readerChoiceParams, readerQuoteQuery, readerReady, readerLeases, withReaderTaken, readerFinishedMessage,
   postConfirmQuestion, numberRequired, tenantCreditLines, tenantCreditHeadline,
   readShowLineItems, writeShowLineItems, ledgerMatches, stillOweLine,
@@ -420,13 +420,30 @@ describe('the desk window self-heals', () => {
     expect(recordedMessage('Todd', { amountSettled: 0, creditUsed: 460 })).toBe("Paid Todd's bill with their credit.")
   })
   it('10/6: a ticked onboarding box the server could not carry out is said plainly, once', () => {
-    const money = 'Money is recorded against this late fee, so it can\'t be deleted. It stays at $0.00 — it no longer counts toward what they owe.'
+    const money = 'Money is recorded against this late fee, so it can\'t be deleted. It stays credited — it no longer counts toward what they owe, and it still counts as a late payment on their history.'
     expect(recordedMessage('Rae Tull', {
-      amountSettled: 600, depositedOn: '2026-10-01', lateFeesUnbilled: 25, lateFeeDeleteRefusals: [money, money],
-    })).toMatch(new RegExp(`came off.* ${money.replace(/[.$()]/g, '\\$&')}$`))
+      amountSettled: 600, depositedOn: '2026-10-01', lateFeesUnbilled: 25, lateFeeCountsLate: true, lateFeeDeleteRefusals: [money, money],
+    })).toBe(`Recorded $600.00 from Rae Tull. The late fee was credited. It still counts as a late payment on their history. ${money}`)
     expect(recordedMessage('Rae Tull', { amountSettled: 600, lateFeeDeleteRefusals: [] })).toBe('Recorded $600.00 from Rae Tull.')
     expect(lateFeeDeleteRefusalText(undefined)).toBeNull()
     expect(lateFeeDeleteRefusalText([money, ' ', 3])).toBe(money)
+  })
+  it('10/6 (Nic): a late fee is credited and still counts late — or, deleted in the onboarding month, nothing shows', () => {
+    expect(lateFeeOutcomeText({})).toBeNull()
+    expect(lateFeeOutcomeText({ lateFeesUnbilled: 25, lateFeeCountsLate: true }))
+      .toBe('The late fee was credited. It still counts as a late payment on their history.')
+    expect(lateFeeOutcomeText({ lateFeesRefunded: 25, lateFeeCountsLate: true }))
+      .toBe('The late fee was credited. It still counts as a late payment on their history. $25.00 they had already paid was given back as credit.')
+    expect(lateFeeOutcomeText({ lateFeesDeleted: 1 })).toBe('The late fee was deleted — nothing shows on their record.')
+    // Review fix: what is said follows what is left on the bill, not what was done.
+    expect(lateFeeOutcomeText({ lateFeesDeleted: 1, lateFeeCountsLate: true, lateFeeDeletedStillLate: true }))
+      .toBe('The late fee was deleted, but another late fee is still on that bill, so it still counts as a late payment on their history.')
+    expect(lateFeeOutcomeText({ lateFeesDeleted: 1, lateFeesRefunded: 25, lateFeeCountsLate: true, lateFeeDeletedStillLate: true }))
+      .not.toMatch(/nothing shows/)
+    // A late fee left owed (none credited) is never called credited.
+    expect(lateFeeOutcomeText({ lateFeeCountsLate: true })).toBeNull()
+    // Only a bank deposit dated back says anything about late fees.
+    expect(recordedMessage('Rae Tull', { amountSettled: 600, lateFeesUnbilled: 25, lateFeeCountsLate: true })).toBe('Recorded $600.00 from Rae Tull.')
   })
 })
 

@@ -22,6 +22,10 @@ export const CREDIT_USE_SOURCES = [
   // lease after the landlord's choice — kept by the landlord, or left as the
   // tenant's account credit (credit_uses.paid_ahead_choice_id → paid_ahead_choices).
   'paid_ahead_choice',
+  // 10/6 (Nic): the credit GAM writes to net out a late fee a bank deposit's
+  // date shows was never owed — the fee stays as charged and this pays it
+  // ("they get a credit against their bill"). services/lateFeeCredit.
+  'late_fee_credit',
 ] as const
 export type CreditUseSource = typeof CREDIT_USE_SOURCES[number]
 export const CREDIT_USE_SOURCE_LABEL: Record<CreditUseSource, string> = {
@@ -36,6 +40,7 @@ export const CREDIT_USE_SOURCE_LABEL: Record<CreditUseSource, string> = {
   backfill:          'Recorded from history',
   refund:            'Refunded at an early check-out',
   paid_ahead_choice: 'Landlord chose after the lease ended',
+  late_fee_credit:   'Late fee credited',
 }
 
 /** Sources that may set credit aside while a Stripe charge clears (credit_uses_held_rides_a_charge). */
@@ -55,16 +60,19 @@ export const CREDIT_USE_LIVE_STATUSES = ['held', 'applied'] as const satisfies r
 
 /**
  * Why a use stopped being live. Mirrors credit_uses_status_stamps (M4):
- * released ∈ payment_failed | payment_canceled | superseded;
+ * released ∈ payment_failed | payment_canceled | superseded (a held use);
+ * late_fee_credit_withdrawn (10/6: a late-fee credit taken back off its late
+ * fee — an undone bank match, or the fee deleted in the onboarding month);
  * reversed = funding_reversed.
  */
-export const CREDIT_USE_RELEASE_REASONS = ['payment_failed', 'payment_canceled', 'superseded', 'funding_reversed'] as const
+export const CREDIT_USE_RELEASE_REASONS = ['payment_failed', 'payment_canceled', 'superseded', 'funding_reversed', 'late_fee_credit_withdrawn'] as const
 export type CreditUseReleaseReason = typeof CREDIT_USE_RELEASE_REASONS[number]
 export const CREDIT_USE_RELEASE_REASON_LABEL: Record<CreditUseReleaseReason, string> = {
   payment_failed:   'The payment failed',
   payment_canceled: 'The payment was canceled',
   superseded:       'Replaced by a newer payment',
   funding_reversed: 'The money behind the credit was returned or disputed',
+  late_fee_credit_withdrawn: 'The late-fee credit was taken back',
 }
 /** The reasons a HELD use may be released for (everything but funding_reversed). */
 export const CREDIT_USE_HELD_RELEASE_REASONS = ['payment_failed', 'payment_canceled', 'superseded'] as const satisfies readonly CreditUseReleaseReason[]
