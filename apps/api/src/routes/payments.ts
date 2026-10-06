@@ -1,10 +1,13 @@
 import { Router } from 'express'
+import fs from 'fs'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
+import { resolveUploadPath } from '../lib/uploadPaths'
+import { bankReceiptPhotoDir, takeBankReceiptPhoto, landlordsOwnUser } from '../lib/bankReceiptPhotos'
 import { AchReturnCode, ACH_RETURN_CONFIG, PLATFORM_FEES,
          MANUAL_PAYMENT_METHODS,
          PRIOR_ARRANGEMENT_METHOD } from '@gam/shared'
@@ -20,7 +23,7 @@ import { releaseUnconfirmedCardCharges, releaseUnconfirmedChargeDetailed, CARD_R
          confirmedOnScreen, heldForCardholder } from '../jobs/paymentReconcile'
 import { getClient } from '../db'
 import { payableRowSql, lockHousehold } from '../services/moneyPredicates'
-import { settleManualRentPayment, deskQuote, DESK_SURPLUS_HANDLING, DESK_SURPLUS_HANDLING_LABEL } from '../services/manualPaymentSettle'
+import { settleManualRentPayment, deskQuote, zeroLateFeesAfterDeposit, DESK_SURPLUS_HANDLING, DESK_SURPLUS_HANDLING_LABEL } from '../services/manualPaymentSettle'
 import { runWholeBillCheckAfterCommit, supersedeScheduledRetry, cancelSupersededIntents,
          usablePaidAheadSql, disputeClaimJoinSql } from '../services/creditUse'
 import { logger } from '../lib/logger'
@@ -28,6 +31,80 @@ import { todayIn } from '../lib/timezone'
 
 export const paymentsRouter = Router()
 paymentsRouter.use(requireAuth)
+
+// ─── 10/5 (Nic): the photo of a bank's deposit receipt ───────────────────────
+//
+// "maybe ... add a picture of the receipt" — for a payment recorded as a BANK
+// DEPOSIT only (the resident's cash put straight into the landlord's bank).
+// Stored like expense receipts (routes/expenses.ts): one directory, an
+// unguessable file name, and one authed serve route that authorizes PER ROW —
+// the receipt the file belongs to must be the caller's company's, at a
+// property the caller works at. Only the landlord's own people ever see it:
+// never a GAM admin from here, never the tenant, never a static URL.
+// Registered before the '/:id/...' routes so nothing reads 'deposit-photos'
+// as a payment id.
+const depositPhotoDir = bankReceiptPhotoDir('bank-deposit-receipts')
+const takeDepositPhoto = takeBankReceiptPhoto(depositPhotoDir)
+
+/** The bank-deposit receipt a photo belongs to, with where it was taken. */
+async function bankDepositReceipt(where: 'id' | 'photo', key: string) {
+  return queryOne<{ id: string; landlord_id: string; payment_method: string | null; status: string; property_id: string | null }>(
+    `SELECT r.id, r.landlord_id, r.payment_method, r.status,
+            COALESCE(u.property_id,
+                     (SELECT pu.property_id FROM remittance_applications ra
+                        JOIN payments pp ON pp.id = ra.payment_id JOIN units pu ON pu.id = pp.unit_id
+                       WHERE ra.remittance_id = r.id ORDER BY pp.due_date, pp.id LIMIT 1)) AS property_id
+       FROM tenant_remittances r
+       LEFT JOIN leases l ON l.id = r.lease_id
+       LEFT JOIN units u  ON u.id = l.unit_id
+      WHERE ${where === 'id' ? 'r.id = $1::uuid' : 'r.deposit_photo_url = $1'}`, [key])
+}
+
+// POST /api/payments/remittances/:id/deposit-photo — attach (or replace) the
+// photo of the bank's receipt on a recorded bank deposit. multipart, field 'photo'.
+paymentsRouter.post('/remittances/:id/deposit-photo', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, 'Payment not found')
+    const rem = await bankDepositReceipt('id', req.params.id)
+    if (!rem || !landlordsOwnUser(req.user, rem.landlord_id)) throw new AppError(404, 'Payment not found')
+    await assertChargeInStaffScope(req.user, rem.property_id)
+    if (rem.payment_method !== 'bank_deposit' || rem.status !== 'settled') {
+      throw new AppError(409, 'A photo of the bank\'s receipt goes only on a payment recorded as a bank deposit.')
+    }
+    next()
+  } catch (e) { next(e) }
+}, takeDepositPhoto, async (req: any, res, next) => {
+  try {
+    if (!req.file) throw new AppError(400, 'Choose a photo of the bank\'s receipt.')
+    const url = '/api/payments/deposit-photos/' + req.file.filename
+    const row = await queryOne<{ id: string; deposit_photo_url: string }>(
+      `UPDATE tenant_remittances
+          SET deposit_photo_url = $2, deposit_photo_name = $3, deposit_photo_mime = $4, deposit_photo_size = $5,
+              deposit_photo_uploaded_by = $6, deposit_photo_uploaded_at = NOW(), updated_at = NOW()
+        WHERE id = $1 AND payment_method = 'bank_deposit'
+       RETURNING id, deposit_photo_url`,
+      [req.params.id, url, String(req.file.originalname || 'receipt').slice(0, 200), req.file.mimetype, req.file.size,
+       req.user!.userId])
+    if (!row) throw new AppError(404, 'Payment not found')
+    res.json({ success: true, data: { receiptId: row.id, depositPhotoUrl: row.deposit_photo_url } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/payments/deposit-photos/:filename — the photo, to the landlord's own people only.
+paymentsRouter.get('/deposit-photos/:filename', async (req: any, res, next) => {
+  try {
+    const url = '/api/payments/deposit-photos/' + req.params.filename
+    const rem = await bankDepositReceipt('photo', url)
+    // Someone else's photo reads as missing, never as "forbidden".
+    if (!rem || !landlordsOwnUser(req.user, rem.landlord_id)) throw new AppError(404, 'Not found')
+    await assertChargeInStaffScope(req.user, rem.property_id)
+    const fp = resolveUploadPath(depositPhotoDir, req.params.filename)
+    if (!fp) throw new AppError(400, 'Invalid filename')
+    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.sendFile(fp)
+  } catch (e) { next(e) }
+})
 
 /**
  * S655 (10/3): a staffer assigned to one property takes money only on charges
@@ -1605,7 +1682,8 @@ const postPaymentSchema = z.object({
   tenantId:   z.string().uuid(),
   method:     z.enum(MANUAL_PAYMENT_METHODS),
   amount:     z.number().positive(),
-  reference:  z.string().max(64).optional().nullable(),
+  // A check or money-order number, or (10/5) a bank deposit's reference number.
+  reference:  z.string().max(120).optional().nullable(),
   notes:      z.string().max(500).optional().nullable(),
   receivedAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
 })
@@ -1615,6 +1693,19 @@ paymentsRouter.post('/post-payment', requirePerm('take_payment'), async (req: an
     const body = postPaymentSchema.parse(req.body)
     const landlordIds = landlordScopeIds(req.user!)
     if (!landlordIds.length) throw new AppError(403, 'Landlord scope required')
+    // 10/5 (Nic): a bank deposit's date cannot be after today where the
+    // resident's space is (the lease postTenantPayment posts to).
+    if (body.method === 'bank_deposit' && body.receivedAt) {
+      const where = await queryOne<{ property_id: string | null }>(
+        `SELECT u.property_id
+           FROM leases l JOIN lease_tenants lt ON lt.lease_id = l.id
+           LEFT JOIN units u ON u.id = l.unit_id
+          WHERE lt.tenant_id = $1 AND lt.status = 'active' AND l.status IN ('active', 'pending')
+            AND l.landlord_id = ANY($2::uuid[])
+          ORDER BY l.status = 'active' DESC, l.start_date DESC, l.id LIMIT 1`,
+        [body.tenantId, landlordIds])
+      depositedOnAsSettledAt(body.method, body.receivedAt, await propertyToday(where?.property_id))
+    }
     // decisions.md #48.4: an expired card hold on the household is released
     // before the payment is posted against its bill (before BEGIN — the
     // release takes the household lock on its own connection).
@@ -1627,6 +1718,8 @@ paymentsRouter.post('/post-payment', requirePerm('take_payment'), async (req: an
       // S654: noon UTC is the same calendar day in every US zone, so the date
       // the desk typed survives whatever clock the host runs on.
       receivedAt: body.receivedAt ? new Date(body.receivedAt + 'T12:00:00Z') : null,
+      // 10/5 (Nic): a bank deposit dated back takes off the late fees charged after it, paid in full.
+      depositedOn: body.method === 'bank_deposit' ? (body.receivedAt ?? null) : null,
       postedBy: req.user!.userId,
     })
     // A staffer assigned to one property posts only for a resident there.
@@ -1665,8 +1758,10 @@ const recordManualSchema = z.object({
   // tenants are through portal if electronic." record-manual writes down money
   // that moved somewhere GAM was not; a card on the counter goes through the
   // reader (POST /:id/reader/charge), which is a card payment like any other.
-  method:    z.enum(MANUAL_PAYMENT_METHODS),   // 'cash' | 'check' | 'money_order'
-  reference: z.string().max(120).optional(),   // check # / money-order # for the audit trail
+  // 'cash' | 'check' | 'money_order' | 'bank_deposit' (10/5, Nic: residents who
+  // pay by depositing cash at the landlord's bank; the reference is required).
+  method:    z.enum(MANUAL_PAYMENT_METHODS),
+  reference: z.string().max(120).optional(),   // check # / money-order # / bank deposit reference, for the audit trail
   // S655 (Step 8): what was handed over is REQUIRED — the receipt records it,
   // pay-in-full is measured against it, and any surplus comes from it. A check
   // or money order is identified by its amount as much as its number.
@@ -1686,7 +1781,40 @@ const recordManualSchema = z.object({
   // S652 (Nic): one person, several leases, one balance. Always the household
   // now; kept so an older screen's flag is accepted.
   settleHousehold:  z.boolean().optional(),
+  // 10/5 (Nic): a bank deposit is logged after the fact, from the bank's
+  // receipt — the day the resident put the money in the bank (YYYY-MM-DD, not
+  // after today). The payment counts from that day (its on-time or late mark),
+  // never from the day the office typed it in. Bank deposits only; absent = today.
+  depositedOn:      z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 })
+
+/** 10/5: the property's own calendar day today (its timezone; America/Phoenix when unknown). */
+async function propertyToday(propertyId: string | null | undefined): Promise<string> {
+  const tz = propertyId
+    ? (await queryOne<{ timezone: string | null }>(`SELECT timezone FROM properties WHERE id = $1`, [propertyId]))?.timezone
+    : null
+  return todayIn(tz)
+}
+
+/**
+ * 10/5: a typed deposit date as the moment the payment counts from (noon UTC:
+ * the same calendar day in every US zone). `today` is the PROPERTY's calendar
+ * day (propertyToday) — never UTC's, which is already tomorrow on a US
+ * evening and would let tomorrow's date through.
+ */
+function depositedOnAsSettledAt(method: string, depositedOn: string | undefined, today: string): Date | null {
+  if (depositedOn == null) return null
+  if (method !== 'bank_deposit') throw new AppError(422, 'A deposit date is taken only for a bank deposit.')
+  const at = new Date(depositedOn + 'T12:00:00Z')
+  if (Number.isNaN(at.getTime()) || at.toISOString().slice(0, 10) !== depositedOn) {
+    throw new AppError(422, 'Enter the date deposited as a real date, from the bank\'s receipt.')
+  }
+  if (depositedOn > today) {
+    throw new AppError(422, 'The date deposited cannot be after today.')
+  }
+  // Today's noon may not have come yet: a deposit made today counts from now.
+  return at.getTime() > Date.now() ? null : at
+}
 
 paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (req: any, res, next) => {
   const client = await getClient()
@@ -1703,6 +1831,9 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     if (!pre) throw new AppError(404, 'Payment not found')
     if (!canManageLandlordResource(req.user, pre.landlord_id)) throw new AppError(403, 'Forbidden')
     await assertChargeInStaffScope(req.user, pre.property_id)
+    // 10/5 (Nic): a bank deposit's date cannot be after today where the property is.
+    const depositedAt = body.depositedOn == null ? null
+      : depositedOnAsSettledAt(body.method, body.depositedOn, await propertyToday(pre.property_id))
     if (pre.tenant_id) await releaseExpiredCardHolds(pre.tenant_id, 'record-manual', [pre.landlord_id])
     await client.query('BEGIN')
 
@@ -1780,7 +1911,7 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     const result = await settleManualRentPayment(client, {
       payment: pmt,
       method: body.method,
-      settledAt: null,
+      settledAt: depositedAt,
       reference: body.reference ?? null,
       settleHousehold: true,
       amountTendered: body.amountTendered,
@@ -1790,6 +1921,8 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       confirmWrittenAmount: body.confirmWrittenAmount === true,
       takenBy: req.user!.userId,
       source: 'desk',
+      // 10/5 (Nic): paid in full, late fees charged after the deposit come off.
+      depositedOn: body.method === 'bank_deposit' ? (body.depositedOn ?? null) : null,
     })
 
     await client.query('COMMIT')
@@ -1820,6 +1953,15 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
         surplusHandling: result.surplus > 0 ? (result.creditId ? 'credit' : 'change') : null,
         creditId:     result.creditId,
         receiptId:    result.receiptId,
+        // 10/5 (Nic): a part payment (the property takes them) — what is still
+        // owed after it, and on which bills. 0 / [] when paid in full.
+        partial:      result.stillOwed > 0,
+        stillOwed:    result.stillOwed,
+        stillOwedRows: result.stillOwedRows,
+        // 10/5 (Nic): late fees charged after a bank deposit's date that came
+        // off because it paid the bill in full (unbilled, and refunded as credit).
+        lateFeesUnbilled: result.lateFeesReversed.unbilled,
+        lateFeesRefunded: result.lateFeesReversed.refunded,
       },
     })
   } catch (e) {
@@ -1855,7 +1997,36 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
     await releaseExpiredCardHolds(pmt.tenant_id, 'record-manual/quote', [pmt.landlord_id])
     // The charge itself may have been one the hold kept: read where it stands now.
     pmt.status = (await client.query<{ status: string }>(`SELECT status FROM payments WHERE id = $1`, [pmt.id])).rows[0]?.status ?? pmt.status
-    const q = await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id })
+    // 10/5 (Nic): a bank deposit dated back (?depositedOn=YYYY-MM-DD): the
+    // bill as the record will take it when the deposit pays it in full —
+    // late fees charged after that day off (manualPaymentSettle
+    // zeroLateFeesAfterDeposit), inside a transaction that is rolled back.
+    const depositedOn = typeof req.query.depositedOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.depositedOn)
+      ? req.query.depositedOn : null
+    if (depositedOn) depositedOnAsSettledAt('bank_deposit', depositedOn, await propertyToday(pmt.property_id))
+    let lateFeesOffIfPaidInFull = 0
+    // 10/5: the same, bill by bill — a bill a part payment pays only in part
+    // keeps its own late fees (manualPaymentSettle judges each bill).
+    const lateFeesOffByBill = new Map<string, number>()
+    let q: Awaited<ReturnType<typeof deskQuote>>
+    if (depositedOn) {
+      await client.query('BEGIN')
+      try {
+        await lockHousehold(client, pmt.tenant_id, pmt.landlord_id)
+        const q0 = await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, lock: true })
+        const z = await zeroLateFeesAfterDeposit(client, q0, depositedOn, { createdBy: null })
+        lateFeesOffIfPaidInFull = z.unbilled
+        for (const r of q0.rows) {
+          if (!r.invoiceId || !z.zeroedIds.includes(r.id)) continue
+          lateFeesOffByBill.set(r.invoiceId, Math.round(((lateFeesOffByBill.get(r.invoiceId) ?? 0) + r.amount) * 100) / 100)
+        }
+        q = z.zeroedIds.length > 0 ? await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, lock: true }) : q0
+      } finally {
+        await client.query('ROLLBACK').catch(() => {})
+      }
+    } else {
+      q = await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id })
+    }
     // decisions.md #48.4: a card payment still waiting on its card's bank
     // (inside its 30 minutes) has charged nothing yet. Its rows are held, so
     // they stay inside `clearing` (the desk window shows that amount today);
@@ -1872,8 +2043,11 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
         WHERE p.id = ANY($1::uuid[])`, [ids]) : { rows: [] as any[] }
     const byId = new Map(labels.rows.map((r: any) => [r.id, r]))
     const show = (rs: typeof q.rows) => rs.map(r => ({
-      id: r.id, leaseId: r.leaseId, type: r.type, entryDescription: r.entryDescription,
+      id: r.id, leaseId: r.leaseId, invoiceId: r.invoiceId, type: r.type, entryDescription: r.entryDescription,
       amount: r.amount, dueDate: r.dueDate, creditAlreadyApplied: r.appliedCredit,
+      // What "Use" would spend on this charge — so the window can say which
+      // bill a part payment leaves owed.
+      creditIfUsed: r.creditIfUsed,
       notes: byId.get(r.id)?.notes ?? null, unitNumber: byId.get(r.id)?.unit_number ?? null,
       propertyName: byId.get(r.id)?.property_name ?? null,
     }))
@@ -1909,6 +2083,13 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
       fullBalance: q.fullBalance,
       scheduledRetries: q.scheduledRetries.map(r => ({ nextRetryAt: r.nextRetryAt })),
       surplusOptions: DESK_SURPLUS_HANDLING.map(v => ({ value: v, label: DESK_SURPLUS_HANDLING_LABEL[v] })),
+      // 10/5 (Nic): the property takes part payments — less than the bill may
+      // be recorded (oldest bills first; what is left stays owed, late fees and all).
+      partialPaymentsAllowed: q.partialAllowed,
+      // 10/5 (Nic): with ?depositedOn=, the late fees charged after that day
+      // that come off when the deposit pays this bill in full (0: none).
+      lateFeesOffIfPaidInFull,
+      lateFeesOffByBill: [...lateFeesOffByBill].map(([invoiceId, amount]) => ({ invoiceId, amount })),
     } })
   } catch (e) { next(e) } finally { client.release() }
 })

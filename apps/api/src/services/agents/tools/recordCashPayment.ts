@@ -22,7 +22,14 @@
  * can reset an eviction timeline, so this confirms the tenant, the bill and the
  * amount before it writes, and refuses to guess between two households.
  */
-import { MANUAL_PAYMENT_METHODS } from '@gam/shared'
+import { MANUAL_PAYMENT_METHODS, type PaymentType } from '@gam/shared'
+
+/** 10/5: what a bill left owed after a part payment is called, in words. */
+const BILL_WORD: Record<PaymentType, string> = {
+  rent: 'rent', fee: 'fee', deposit: 'deposit', utility: 'utility bill', float_fee: 'FlexPay fee',
+  late_fee: 'late fee', platform_fee: 'platform fee', home_payment: 'home payment',
+}
+const billWord = (t: string) => BILL_WORD[t as PaymentType] ?? 'bill'
 import { getClient } from '../../../db'
 import { lockHousehold, bankPayableRowSql } from '../../moneyPredicates'
 import { settleManualRentPayment, deskQuote, DESK_SURPLUS_HANDLING } from '../../manualPaymentSettle'
@@ -63,7 +70,7 @@ export const recordCashPayment: AgentTool = {
       tenant: { type: 'string', description: 'The tenant’s name or unit, in the landlord’s words.' },
       method: { type: 'string', description: `One of: ${MANUAL_PAYMENT_METHODS.join(', ')}` },
       amount: { type: 'number', description: 'The amount handed over, in dollars.' },
-      reference: { type: 'string', description: 'Check or money-order number, if there is one.' },
+      reference: { type: 'string', description: 'Check or money-order number, if there is one. A bank_deposit needs the reference number on the bank\u2019s receipt.' },
       credit: { type: 'string', description: 'Only when asked: "use" to use the account credit, "save" to keep it.' },
       creditAvailable: { type: 'number', description: 'With credit: the creditAvailable figure you read to the landlord.' },
       surplus: { type: 'string', description: 'Cash over the bill only: "change" if they handed it back, "credit" if they kept it on the account.' },
@@ -225,9 +232,21 @@ export const recordCashPayment: AgentTool = {
         towardOldBalance: r.towardOldBalance,
         changeGiven: r.changeGiven, keptAsCredit: r.creditId ? r.surplus : 0,
         stillOpenOnline: q.payOnlineTotal,
+        // 10/5 (Nic): at a property that takes part payments, money short of
+        // the bill is recorded as a part payment — what stays owed, and where.
+        stillOwed: r.stillOwed,
+        stillOwedRows: r.stillOwedRows.map(x => ({ bill: billWord(x.type), dueDate: x.dueDate, amount: x.amount })),
         note:
-          'Recorded. Tell them what it paid, any credit used, and any change or credit — GAM has not moved any ' +
-          'money, since they are holding it. There is no fee for it.' +
+          'Recorded. Tell them what it paid, any credit used, and any change or credit — ' +
+          (method === 'bank_deposit'
+            ? 'the money is already in their bank, so GAM has not moved any. '
+            : 'GAM has not moved any money, since they are holding it. ') +
+          'There is no fee for it.' +
+          (r.stillOwed > 0
+            ? ` This was a part payment: $${r.stillOwed.toFixed(2)} stays owed` +
+              (r.stillOwedRows.length ? ` (${r.stillOwedRows.map(x => `$${x.amount.toFixed(2)} on the ${billWord(x.type)} due ${x.dueDate}`).join('; ')})` : '') +
+              ' — late fees still apply. Tell them that too.'
+            : '') +
           (q.payOnlineTotal > 0 ? ` $${q.payOnlineTotal.toFixed(2)} of GAM charges on the bill stays open; the tenant pays that online.` : ''),
       }
     } catch (e) {

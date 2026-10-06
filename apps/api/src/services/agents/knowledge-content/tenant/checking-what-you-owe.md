@@ -23,7 +23,7 @@ Sign in to your tenant portal and open your payments area. There you can see:
 
 If you paid your landlord off-platform — cash, check, or money order — it shows as unpaid here until that payment is recorded. Once it is, your balance updates to reflect it. There is no fee for a recorded off-platform payment.
 
-If you deposited the money straight into your landlord's bank account, tell us with **"I paid at the bank"** on your payments screen — report it after you've been. When your landlord's bank is connected to GAM, we apply it automatically when the deposit shows up, dated to the day you paid. If it isn't connected, your landlord checks their own bank and marks your bill paid. Let them know you paid and keep your deposit slip. The report doesn't expire.
+If you deposited the money straight into your landlord's bank account, tell us with **"I paid at the bank"** on your payments screen — report it after you've been. When your landlord's bank is connected to GAM, we apply it automatically when the deposit shows up, dated to the day you paid when the bank shows it that day or the next business day (otherwise the bank's date is used). If it isn't connected, your landlord checks their own bank and marks your bill paid. Let them know you paid and keep your deposit slip. The report doesn't expire.
 
 ## If your records don't match
 

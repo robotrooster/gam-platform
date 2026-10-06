@@ -18,10 +18,12 @@
 //
 // This is also the honest incentive for a tenant to use the button at all: it
 // buys them the earlier date. It cannot be gamed, because a claim with no
-// matching deposit is never confirmed and never earns anything — and the window
-// on the match is narrow enough that a declared date cannot wander far from the
-// posting that proves it.
+// matching deposit is never confirmed and never earns anything — and (10/5,
+// Nic) a declared date earns nothing unless the bank posted the deposit that
+// day or the next business day after it. Later than that the bank's date
+// governs and the report is flagged for false information (effectivePaidDateFor).
 
+import { declaredDateHolds } from '@gam/shared'
 import { round2 } from './workTradeCredit'
 
 /** One late-fee row already on the ledger. `tickDate` is `payments.due_date`. */
@@ -87,10 +89,30 @@ export function backdateLateFees(
  * GUARD: a declared date AFTER the bank posted the money is not evidence of
  * anything, it is a data-entry error or a probe. The posted date is used
  * instead, so a tenant can never claim a date the bank contradicts.
+ *
+ * 10/5 (Nic): "if they say they paid on time and it was actually late we need
+ * to make sure that they get the late fee and then they get flagged for false
+ * information." The declared date counts only when the bank posted the deposit
+ * that day or the NEXT BUSINESS DAY after it (a weekend or a bank holiday rolls
+ * forward — @gam/shared declaredDateHolds). Posted later than that, the bank's
+ * date decides: nothing is backdated, the late fees up to the bank's date
+ * stand, and the report is flagged (declaredDateIsFalse).
  */
 export function effectivePaidDateFor(
   declaredDate: string | null | undefined, bankPostedDate: string,
 ): string {
   if (!declaredDate) return bankPostedDate
-  return declaredDate <= bankPostedDate ? declaredDate : bankPostedDate
+  if (declaredDate > bankPostedDate) return bankPostedDate
+  return declaredDateHolds(declaredDate, bankPostedDate) ? declaredDate : bankPostedDate
+}
+
+/**
+ * 10/5 (Nic): the tenant's date is false information — the bank posted the
+ * deposit later than the next business day after it. A date later than the
+ * bank's claims nothing and is never flagged.
+ */
+export function declaredDateIsFalse(
+  declaredDate: string | null | undefined, bankPostedDate: string,
+): boolean {
+  return !!declaredDate && !declaredDateHolds(declaredDate, bankPostedDate)
 }

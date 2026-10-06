@@ -317,3 +317,27 @@ describe('moving around the ledger', () => {
     expect(host.querySelectorAll('tr.cd-ledger-items')).toHaveLength(3)
   })
 })
+
+// 10/5 (Nic): "if they say they paid on time and it was actually late ... they
+// get flagged for false information." The payment made from a reported bank
+// deposit the bank showed on a later day says so, plainly, on its row.
+describe('a payment from a bank deposit the tenant dated earlier than the bank', () => {
+  it('shows the flag with both dates, and the tenant’s photo of the bank receipt', async () => {
+    server.month = month([payment({
+      method: 'cash', methodLabel: 'Cash',
+      depositDateFlag: { said: '2026-10-01', bank: '2026-10-06' },
+      tenantReceiptPhotoUrl: '/api/declared-deposits/receipt-photos/r.jpg',
+    })])
+    await render()
+    await until(() => text().includes('Glenda Moss'), 'the ledger')
+    expect(text()).toContain('Said they deposited Oct 1 — the bank shows Oct 6.')
+    expect([...host.querySelectorAll('button')].some(b => b.textContent === 'Tenant\'s photo of the bank receipt')).toBe(true)
+  })
+
+  it('a payment whose date held shows no flag', async () => {
+    server.month = month([payment({ method: 'cash', methodLabel: 'Cash', depositDateFlag: null })])
+    await render()
+    await until(() => text().includes('Glenda Moss'), 'the ledger')
+    expect(text()).not.toContain('Said they deposited')
+  })
+})

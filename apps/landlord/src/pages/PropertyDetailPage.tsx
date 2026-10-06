@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
-import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, type ProcessingFeeChoice } from '@gam/shared'
+import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, PARTIAL_PAYMENTS_LAW_NOTE, type ProcessingFeeChoice } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { toast } from '../components/dialogs'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
@@ -220,6 +220,7 @@ export function PropertyDetailPage() {
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <MoveInCollectionCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <CardFeePayerCard property={property} onSaved={() => { qc.invalidateQueries(['property', id]); qc.invalidateQueries('properties') }} />
+      <PartialPaymentsCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <PropertyFeeScheduleSection propertyId={property.id}
         unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
       <PropertyOfficeEmailSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
@@ -759,6 +760,33 @@ function CardFeePayerCard({ property, onSaved }: { property: any; onSaved: () =>
         ))}
       </div>
       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>{PROCESSING_FEE_CHOICE_HINT[current]}.</div>
+    </div>
+  )
+}
+
+// 10/5 (Nic): "Maybe that's something we set at the property level settings and
+// let his property be set to take partial payments because there's really no way
+// to stop somebody from going into the bank and making a partial." Default off.
+// Payments RECORDED here (cash, check, money order, bank deposit) may then be
+// less than the bill; online payments still pay in full.
+export function PartialPaymentsCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (accept: boolean) => apiPatch(`/properties/${property.id}/partial-payments`, { accept }),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the partial payments setting') })
+  const on = !!property.acceptPartialPayments
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, color: 'var(--text-0)', marginBottom: 4, cursor: 'pointer' }}>
+        <input type="checkbox" checked={on} disabled={save.isLoading}
+          onChange={e => save.mutate(e.target.checked)} />
+        Accept partial payments
+      </label>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+        {on
+          ? 'A payment you record here — cash, check, money order or bank deposit — can be less than what is owed. It pays the oldest bills first; what is left stays owed, and late fees still apply to it. Tenants paying online still pay in full.'
+          : 'Off: a payment you record here has to cover everything owed. Turn it on if tenants can pay part of their rent — for example by depositing less than the bill at your bank.'}
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>{PARTIAL_PAYMENTS_LAW_NOTE}</div>
     </div>
   )
 }

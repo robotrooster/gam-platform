@@ -202,10 +202,12 @@ bankFeedRouter.get('/deposits/unmatched', requireLandlord, async (req: any, res,
 bankFeedRouter.post('/deposits/:id/confirm', requireLandlord, async (req: any, res, next) => {
   try {
     const { z } = await import('zod')
-    const { MANUAL_PAYMENT_METHODS } = await import('@gam/shared')
+    // 10/5: the form the money took when it went into the bank (cash, a check,
+    // a money order) — a recorded "bank deposit" is not one of them.
+    const { DEPOSITABLE_PAYMENT_METHODS } = await import('@gam/shared')
     const body = z.object({
       chargeIds: z.array(z.string().uuid()).min(1).max(20),
-      method: z.enum(MANUAL_PAYMENT_METHODS),
+      method: z.enum(DEPOSITABLE_PAYMENT_METHODS),
       declarationId: z.string().uuid().nullish(),
     }).parse(req.body)
 

@@ -320,6 +320,43 @@ describe('Step 12: a deposit nobody reported settles a tenant’s whole bill by 
     expect(await rentStatus(p.lots[0].rentId)).toBe('pending')
   })
 
+  // 10/5 (Nic): a bank deposit the office recorded from the bank's receipt is
+  // never cash on hand, so nothing else competes for its bank line. Two months
+  // behind with part payments on: the recorded $250 paid September, so the
+  // household owes exactly $250 (October) — the bank's own line for that same
+  // $250 must not "pay" October too.
+  it('the bank line for a bank deposit the office already recorded never pays another bill by itself', async () => {
+    const p = await buildPark(1)
+    const lot = p.lots[0]
+    await db.query(`UPDATE properties SET accept_partial_payments = TRUE WHERE id = $1`, [p.propertyId])
+    const sep = (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',250,'pending',CURRENT_DATE - 30,'RENT') RETURNING id`,
+      [lot.unitId, lot.leaseId, lot.tenantId, p.landlordId])).rows[0].id
+    await db.query(`UPDATE payments SET created_at = now() - interval '31 days' WHERE id = $1`, [sep])
+    const { settleManualRentPayment } = await import('./manualPaymentSettle')
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const r = await settleManualRentPayment(client, {
+        payment: { id: sep, landlord_id: p.landlordId, tenant_id: lot.tenantId, unit_id: lot.unitId,
+          lease_id: lot.leaseId, due_date: null as any },
+        method: 'bank_deposit', settledAt: null, reference: 'BR-1001', settleHousehold: true,
+        amountTendered: 250, sendReceipt: false,
+      } as any)
+      await client.query('COMMIT')
+      expect(r.stillOwed).toBe(250)
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+    expect(await rentStatus(sep)).toBe('settled')
+    expect(await rentStatus(lot.rentId)).toBe('pending')
+
+    const t = await deposit(p, 250, 'BRANCH DEPOSIT')
+    expect(await autoSettleByAmount(p.landlordId)).toBe(0)
+    expect((await reconcileDeposits(p.landlordId)).autoSettled).toBe(0)
+    expect(await rentStatus(lot.rentId)).toBe('pending')
+    expect((await txnStatus(t)).status).toBe('needs_review')
+  })
+
   it('a deposit made before the bill existed never pays it by itself', async () => {
     const p = await buildPark(1)
     const t = await deposit(p, 250, 'BRANCH DEPOSIT')

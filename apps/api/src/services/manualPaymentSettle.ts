@@ -58,7 +58,7 @@
 
 import type { PoolClient } from 'pg'
 import type { ManualPaymentMethod } from '@gam/shared'
-import { sortForAllocation } from '@gam/shared'
+import { sortForAllocation, MANUAL_PAYMENT_METHOD_WORD } from '@gam/shared'
 import { AppError } from '../middleware/errorHandler'
 import { lockHousehold, payableRowSql } from './moneyPredicates'
 import {
@@ -70,6 +70,7 @@ import { afterRowsSettled } from './settleHooks'
 import { reconcileSettledDepositPayment, type DepositRecordRaised } from './leaseFeesSync'
 import { logger } from '../lib/logger'
 import { activateBillingForMoneyMoved } from './billingActivation'
+import { PART_PAYMENT_REST_NOTE } from './creditLedgerEmitters'
 
 /**
  * What became of cash handed over beyond the bill (and the old balance).
@@ -86,7 +87,27 @@ export const DESK_SURPLUS_HANDLING_LABEL: Record<DeskSurplusHandling, string> = 
 const toCents = (v: number | string | null | undefined): number => Math.round(Number(v ?? 0) * 100)
 const toDollars = (c: number): number => Math.round(c) / 100
 const money = (c: number): string => `$${toDollars(c).toFixed(2)}`
-const methodWord = (m: ManualPaymentMethod) => (m === 'money_order' ? 'money order' : m)
+const methodWord = (m: ManualPaymentMethod) => MANUAL_PAYMENT_METHOD_WORD[m]
+
+// 10/5 (Nic): the note on the rest of a bill a part payment did not cover
+// (creditLedgerEmitters, which reads it to count the rest from its bill).
+export { PART_PAYMENT_REST_NOTE }
+
+/**
+ * 10/5 (Nic): the kinds of charge a part payment may leave partly paid. Rent
+ * only: its rest row is exempt from the one-rent-row-a-month indexes
+ * (is_remainder), and its late fees are based on the month's whole rent
+ * however it is split (jobs/lateFees). A late fee or a lease fee cannot be
+ * split (their one-row-per-day indexes), a utility bill follows its one
+ * payment row (utility_bills.payment_id), and a security deposit raises its
+ * deposit record from the row — so money that cannot pay one of those in full
+ * passes it by and pays the next bill.
+ */
+export const PART_PAYABLE_TYPES: readonly string[] = ['rent']
+
+/** 10/5 (Nic): a bank deposit is told apart by the reference on the bank's receipt. */
+export const BANK_DEPOSIT_REFERENCE_REQUIRED =
+  'Enter the deposit reference number from the bank\'s receipt — it tells this deposit apart from anyone else\'s for the same amount.'
 
 export interface ManualSettleInput {
   /** The charge the desk opened the window on (any open charge of the household). Caller has locked it. */
@@ -135,6 +156,15 @@ export interface ManualSettleInput {
   creditLeaseId?: string | null
   /** Email the resident a receipt after commit (default true in household scope). */
   sendReceipt?: boolean
+  /**
+   * 10/5 (Nic): a BANK DEPOSIT's date, from the bank's receipt (YYYY-MM-DD,
+   * not after today — the caller checks). When the deposit pays the bill in
+   * full, late fees charged for days after it come off exactly as a tenant's
+   * corroborated report takes them off (bankDepositConfirm.reverseLateFees):
+   * unpaid ones are zeroed, ones already paid come back as a late-fee refund
+   * credit. A bill paid only in part keeps its late fees.
+   */
+  depositedOn?: string | null
 }
 
 export interface ManualSettleResult {
@@ -161,8 +191,35 @@ export interface ManualSettleResult {
    * it so Undo puts the record back exactly.
    */
   depositRecords: DepositRecordRaised[]
+  /**
+   * 10/5 (Nic): a part payment — what is still owed on the bill the desk took
+   * (0 when it was paid in full), and the open rows that owe it: the rest of a
+   * rent bill paid in part, and any bill the money did not reach.
+   */
+  stillOwed: number
+  stillOwedRows: StillOwedRow[]
+  /** Rows this settle paid in part (each has a rest row among stillOwedRows). */
+  partPaidIds: string[]
+  /**
+   * 10/5 (Nic): late fees taken off because a bank deposit dated before them
+   * paid the bill in full — zeroed (unpaid) and refunded as credit (already
+   * paid). Zero when nothing came off.
+   */
+  lateFeesReversed: { unbilled: number; refunded: number; refundCreditIds: string[] }
   /** Call once after COMMIT: the receipt email and canceling replaced bank retries. Never throws. */
   afterCommit: () => Promise<void>
+}
+
+/** An open charge a part payment left owed. */
+export interface StillOwedRow {
+  id: string
+  type: string
+  entryDescription: string
+  dueDate: string
+  /** Money still owed on it. */
+  amount: number
+  /** The row it is the rest of (paid in part now); null for a bill the money did not reach. */
+  restOf: string | null
 }
 
 // ─── The desk quote ─────────────────────────────────────────────────────────
@@ -180,6 +237,8 @@ export interface DeskRow {
   createdAt: string
   /** Credit already spent on it (money owes the rest). */
   appliedCredit: number
+  /** Credit the desk's "Use" would spend on it (the credit plan's lines for this row). */
+  creditIfUsed: number
   unitId: string | null
 }
 
@@ -220,13 +279,19 @@ export interface DeskQuote {
   creditPlan: CreditPlanLine[]
   scheduledRetries: ScheduledRetry[]
   retryRowIds: string[]
+  /**
+   * 10/5 (Nic): whether money RECORDED here may be less than this bill —
+   * every property the bill's charges sit on has "Accept partial payments"
+   * on. Off (the default): pay in full.
+   */
+  partialAllowed: boolean
 }
 
 function toDeskRow(r: QuoteRow, unitId: string | null): DeskRow {
   return {
     id: r.id, leaseId: r.leaseId, invoiceId: r.invoiceId, landlordId: r.landlordId,
     type: r.type, entryDescription: r.entryDescription, revenueOwner: r.revenueOwner,
-    amount: r.amount, dueDate: r.dueDate, createdAt: r.createdAt, appliedCredit: r.appliedOnRow, unitId,
+    amount: r.amount, dueDate: r.dueDate, createdAt: r.createdAt, appliedCredit: r.appliedOnRow, creditIfUsed: 0, unitId,
   }
 }
 
@@ -323,6 +388,23 @@ export async function deskQuote(
     setAside += want - take
     if (take > 0) creditPlan.push(take === want ? l : { ...l, amount: toDollars(take) })
   }
+  const planned = new Map<string, number>()
+  for (const l of creditPlan) planned.set(l.paymentId, (planned.get(l.paymentId) ?? 0) + toCents(l.amount))
+  for (const r of rows) r.creditIfUsed = toDollars(planned.get(r.id) ?? 0)
+  // 10/5 (Nic): "Maybe that's something we set at the property level settings
+  // and let his property be set to take partial payments." Every property this
+  // bill's charges sit on must allow it (a household can span two).
+  let partialAllowed = false
+  if (rows.length > 0) {
+    const pa = await client.query<{ ok: boolean | null }>(
+      `SELECT bool_and(COALESCE(pr.accept_partial_payments, FALSE)) AS ok
+         FROM payments p
+         LEFT JOIN leases l      ON l.id = p.lease_id
+         LEFT JOIN units u       ON u.id = COALESCE(p.unit_id, l.unit_id)
+         LEFT JOIN properties pr ON pr.id = u.property_id
+        WHERE p.id = ANY($1::uuid[])`, [rows.map(r => r.id)])
+    partialAllowed = pa.rows[0]?.ok === true
+  }
   const sum = (xs: DeskRow[]) => xs.reduce((s, r) => s + toCents(r.amount), 0)
   const applied = rows.reduce((s, r) => s + toCents(r.appliedCredit), 0)
   const usable = creditPlan.reduce((s, l) => s + toCents(l.amount), 0)
@@ -350,6 +432,7 @@ export async function deskQuote(
     creditPlan,
     scheduledRetries: q.leases.flatMap(l => l.scheduledRetries),
     retryRowIds: allRows.filter(r => all.some(x => x.id === r.id && (x.retryScheduled || x.heldOnRow > 0))).map(r => r.id),
+    partialAllowed,
   }
 }
 
@@ -503,12 +586,117 @@ async function settleOneRow(client: PoolClient, input: ManualSettleInput): Promi
     amountSettled: toDollars(settled.rows.reduce((s, r) => s + toCents(r.amount), 0)),
     creditUsed: 0, surplus: 0, changeGiven: 0, towardOldBalance: 0,
     creditId: null, receiptId: null, depositRecords,
+    stillOwed: 0, stillOwedRows: [], partPaidIds: [],
+    lateFeesReversed: { unbilled: 0, refunded: 0, refundCreditIds: [] },
     afterCommit: async () => {
       if (done) return
       done = true
       await cancelSupersededIntents(superseded.cancelAfterCommit)
     },
   }
+}
+
+/**
+ * 10/5 (Nic) — a bank deposit dated before late fees were charged.
+ *
+ * "late fees go by when the tenant actually made the deposit" (S624,
+ * services/depositBackdate.ts). The office logs a resident's bank deposit
+ * after the fact, from the bank's receipt; a late fee charged for a day after
+ * the money was already in the bank was never owed. The unpaid ones on each
+ * bill of the household's current balance come off here, BEFORE the money is
+ * placed — the same reversal a tenant's corroborated report gets
+ * (bankDepositConfirm.reverseLateFees), with the fees already paid left for
+ * the caller to refund once the bill is paid. Inside a savepoint
+ * (`bank_deposit_backdate`): the caller releases it when the deposit pays the
+ * bill in full, and rolls back to it when it does not (a bill paid in part
+ * keeps its late fees).
+ *
+ * The desk window's quote shows the bill the same way (GET
+ * /payments/:id/record-manual/quote?depositedOn=), inside a transaction it
+ * rolls back.
+ */
+export async function zeroLateFeesAfterDeposit(
+  client: PoolClient, q: DeskQuote, depositedOn: string,
+  o: { createdBy: string | null; onlyInvoices?: ReadonlySet<string> },
+): Promise<{ unbilled: number; zeroedIds: string[] }> {
+  const { reverseLateFees } = await import('./bankDepositConfirm')
+  const settlingIds = q.rows.map(r => r.id)
+  const invoices = deskInvoices(q).filter(i => !o.onlyInvoices || o.onlyInvoices.has(i))
+  let unbilled = 0
+  const zeroedIds: string[] = []
+  for (const invoiceId of invoices) {
+    const head = q.rows.find(r => r.invoiceId === invoiceId)!
+    const r = await reverseLateFees(client, invoiceId, depositedOn, {
+      settlingIds, tenantId: q.tenantId, landlordId: q.landlordId, leaseId: head.leaseId,
+      createdBy: o.createdBy, refundPaid: false,
+    })
+    unbilled += toCents(r.unbilled)
+    zeroedIds.push(...r.zeroed.map(z => z.paymentId))
+  }
+  return { unbilled: toDollars(unbilled), zeroedIds }
+}
+
+/** The bills (invoices) the desk's current balance is made of, in a fixed order. */
+function deskInvoices(q: DeskQuote): string[] {
+  return [...new Set(q.rows.map(r => r.invoiceId).filter((x): x is string => !!x))].sort()
+}
+
+/** What money owes on each row once the credit the desk chose is spent (the settle's own arithmetic). */
+function owedOnRows(q: DeskQuote, useCredit: boolean): Map<string, number> {
+  const planned = new Map<string, number>()
+  if (useCredit) for (const l of q.creditPlan) planned.set(l.paymentId, (planned.get(l.paymentId) ?? 0) + toCents(l.amount))
+  return new Map(q.rows.map(r => [r.id, Math.max(0, toCents(r.amount) - toCents(r.appliedCredit) - (planned.get(r.id) ?? 0))]))
+}
+
+/**
+ * 10/5 (Nic): how a part payment walks the bills — oldest first, each row in
+ * full; a rent row it cannot cover in full is paid in part (PART_PAYABLE_TYPES)
+ * and the money stops there; any other row it cannot cover is passed by and
+ * stays open whole. The settle places the money this way, and the bank-deposit
+ * backdate judges each bill by it.
+ */
+function splitPartPayment(rows: readonly DeskRow[], owedOn: ReadonlyMap<string, number>, tendered: number): {
+  paid: { paymentId: string; cents: number }[]
+  partSplits: { row: DeskRow; take: number; owedOnRow: number }[]
+  notReached: DeskRow[]
+  left: number
+} {
+  let left = tendered
+  const paid: { paymentId: string; cents: number }[] = []
+  const partSplits: { row: DeskRow; take: number; owedOnRow: number }[] = []
+  const notReached: DeskRow[] = []
+  for (const r of rows) {
+    const m = owedOn.get(r.id) ?? 0
+    if (m === 0) continue
+    if (left >= m) {
+      paid.push({ paymentId: r.id, cents: m })
+      left -= m
+    } else if (left > 0 && PART_PAYABLE_TYPES.includes(r.type)) {
+      paid.push({ paymentId: r.id, cents: left })
+      partSplits.push({ row: r, take: left, owedOnRow: m })
+      left = 0
+    } else {
+      notReached.push(r)
+    }
+  }
+  return { paid, partSplits, notReached, left }
+}
+
+/**
+ * 10/5 (Nic): the bills this money pays IN FULL — every bill when it covers
+ * the whole balance, otherwise each bill none of whose rows the part payment
+ * leaves owed (paid in part or not reached). "A bill paid in full gets the
+ * reversal; a bill paid only in part keeps its late fees" — judged bill by
+ * bill, never for the household as a whole.
+ */
+function invoicesPaidInFull(q: DeskQuote, tendered: number, useCredit: boolean): Set<string> {
+  const owedOn = owedOnRows(q, useCredit)
+  const all = deskInvoices(q)
+  const owed = [...owedOn.values()].reduce((s, m) => s + m, 0)
+  if (tendered >= owed) return new Set(all)
+  const s = splitPartPayment(q.rows, owedOn, tendered)
+  const short = new Set([...s.partSplits.map(x => x.row.invoiceId), ...s.notReached.map(r => r.invoiceId)])
+  return new Set(all.filter(i => !short.has(i)))
 }
 
 async function settleHousehold(client: PoolClient, input: ManualSettleInput): Promise<ManualSettleResult> {
@@ -523,6 +711,11 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   }
   const tendered = toCents(input.amountTendered)
   if (tendered < 0) throw new AppError(422, 'The amount handed over cannot be below zero.')
+  // 10/5 (Nic): "a reference number to the bank deposit in case somebody else
+  // happens to deposit the same amount" — required, like a check's number.
+  if (method === 'bank_deposit' && !(input.reference ?? '').trim()) {
+    throw new AppError(422, BANK_DEPOSIT_REFERENCE_REQUIRED)
+  }
 
   await lockHousehold(client, tenantId, landlordId)
   // Paying at the desk over a scheduled bank retry replaces that retry: its
@@ -532,7 +725,43 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   if (before.retryRowIds.length > 0) {
     cancelAfterCommit = (await supersedeScheduledRetry(client, before.retryRowIds)).cancelAfterCommit
   }
-  const q = before.retryRowIds.length > 0 ? await deskQuote(client, { tenantId, landlordId, lock: true }) : before
+  let q = before.retryRowIds.length > 0 ? await deskQuote(client, { tenantId, landlordId, lock: true }) : before
+
+  // 10/5 (Nic): a bank deposit dated before late fees were charged — the
+  // unpaid ones come off first on each bill the deposit pays in full
+  // (zeroLateFeesAfterDeposit). Judged bill by bill, on the bill as it stands
+  // without them, with the credit choice the desk made: a bill the money pays
+  // only in part (or does not reach) has its fees put back, and they stay
+  // owed. Putting a bill's fees back can leave less money for a later bill,
+  // so the bills are judged again until none changes.
+  const backdatedTo = method === 'bank_deposit' && input.depositedOn ? input.depositedOn : null
+  let backdateZeroed = 0
+  if (backdatedTo && q.rows.length > 0) {
+    const choseCredit = !input.neverUseCredit && input.creditToUse != null && toCents(input.creditToUse) > 0
+    const keep = new Set(deskInvoices(q))
+    while (keep.size > 0) {
+      await client.query('SAVEPOINT bank_deposit_backdate')
+      const z = await zeroLateFeesAfterDeposit(client, q, backdatedTo, { createdBy: input.takenBy ?? null, onlyInvoices: keep })
+      if (z.zeroedIds.length === 0) {
+        await client.query('RELEASE SAVEPOINT bank_deposit_backdate')
+        break
+      }
+      const withoutFees = await deskQuote(client, { tenantId, landlordId, lock: true })
+      // A property that takes no part payments: paid in full, or refused
+      // below as short anyway — the refusal then names the bill without those fees.
+      const paidInFull = withoutFees.partialAllowed ? invoicesPaidInFull(withoutFees, tendered, choseCredit) : keep
+      const short = [...keep].filter(i => !paidInFull.has(i))
+      if (short.length === 0) {
+        q = withoutFees
+        backdateZeroed = toCents(z.unbilled)
+        await client.query('RELEASE SAVEPOINT bank_deposit_backdate')
+        break
+      }
+      await client.query('ROLLBACK TO SAVEPOINT bank_deposit_backdate')
+      await client.query('RELEASE SAVEPOINT bank_deposit_backdate')
+      for (const i of short) keep.delete(i)
+    }
+  }
 
   if (q.rows.length === 0 && q.carried.length === 0) {
     if (q.paused.length > 0) {
@@ -567,20 +796,51 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   const planned = new Map<string, number>()
   if (useCredit) for (const l of q.creditPlan) planned.set(l.paymentId, (planned.get(l.paymentId) ?? 0) + toCents(l.amount))
   const creditUsed = useCredit ? usable : 0
-  const lines: { paymentId: string; cents: number }[] = []
+  let lines: { paymentId: string; cents: number }[] = []
   let owed = 0
+  const owedOn = new Map<string, number>()
   for (const r of q.rows) {
     const m = Math.max(0, toCents(r.amount) - toCents(r.appliedCredit) - (planned.get(r.id) ?? 0))
+    owedOn.set(r.id, m)
     owed += m
     if (m > 0) lines.push({ paymentId: r.id, cents: m })
   }
   // Rent is pay-in-full platform-wide — a partial can reset a landlord's
-  // eviction clock (standing directive).
-  if (tendered < owed) {
+  // eviction clock (standing directive) — unless the property takes part
+  // payments (10/5, Nic: "there's really no way to stop somebody from going
+  // into the bank and making a partial ... We need that to log that and still
+  // be able to charge late fees to the people that didn't pay in full.").
+  const partial = tendered < owed
+  if (partial && !q.partialAllowed) {
     throw new AppError(422,
       `That is ${money(owed - tendered)} short — ${money(tendered)} against ${money(owed)} owed. Rent is paid in full.`)
   }
-  const over = tendered - owed
+  // ── A part payment (10/5): the money pays the oldest bills first, each in
+  // full. A rent bill it cannot cover in full is paid in part: what it pays
+  // settles, and the rest stays open on its own row of the same bill, so late
+  // fees keep applying to it as the lease says. Any other bill it cannot cover
+  // in full is passed by (PART_PAYABLE_TYPES) and stays open whole. Money left
+  // after that (rare: only when every bill left is one that cannot be paid in
+  // part) is kept like any money kept — the old balance first, then credit.
+  let partSplits: { row: DeskRow; take: number; owedOnRow: number }[] = []
+  let notReached: DeskRow[] = []
+  let over: number
+  if (partial) {
+    if (tendered === 0) {
+      throw new AppError(422, 'Enter the amount they paid — with nothing paid there is nothing to record.')
+    }
+    if (input.towardOldBalance != null && toCents(input.towardOldBalance) > 0) {
+      throw new AppError(422,
+        `This is less than the ${money(owed)} bill, so none of it goes to the old balance — the bill is paid first. Leave the old-balance amount out.`)
+    }
+    const split = splitPartPayment(q.rows, owedOn, tendered)
+    lines = split.paid
+    partSplits = split.partSplits
+    notReached = split.notReached
+    over = split.left
+  } else {
+    over = tendered - owed
+  }
   const carriedOwed = q.carried.reduce((s, r) => s + toCents(r.amount) - toCents(r.appliedCredit), 0)
   const isCash = method === 'cash'
 
@@ -592,10 +852,12 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   // open old balance it could have paid. Cash handed back as change was never
   // over, so it goes there only when the desk says how much (or when nothing
   // else is owed — the old balance is then the only thing it can be for).
-  const keepsMoney = !isCash || input.surplusHandling === 'credit'
+  // A part payment keeps whatever it could not place: nobody is handed change
+  // on a payment that is short.
+  const keepsMoney = partial || !isCash || input.surplusHandling === 'credit'
   const oldFirst = Math.min(over, carriedOwed)
   let towardOld: number
-  if (input.towardOldBalance != null) {
+  if (input.towardOldBalance != null && !partial) {
     towardOld = toCents(input.towardOldBalance)
     if (towardOld < 0) throw new AppError(422, 'The old-balance amount cannot be below zero.')
     if (towardOld > oldFirst) {
@@ -625,7 +887,7 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   // S637 (Nic): "it needs to be manually clicked by the person taking the
   // cash. That way no mistakes could happen." Refused, never guessed. Keeping
   // it is said as what it does: the old balance first, then credit.
-  if (surplus > 0 && isCash && input.surplusHandling !== 'change' && input.surplusHandling !== 'credit') {
+  if (surplus > 0 && isCash && !partial && input.surplusHandling !== 'change' && input.surplusHandling !== 'credit') {
     const keepOld = Math.min(over, carriedOwed)
     const keep = keepOld > 0
       ? `"Keep it — no change on hand" (${money(keepOld)} pays the old balance first` +
@@ -635,6 +897,10 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
       `That is ${money(surplus)} over the ${money(owed + towardOld)} being paid. Choose "Give ${money(surplus)} change" or ${keep}.`)
   }
   const keepAsCredit = surplus > 0 && keepsMoney
+  if (keepAsCredit && creditUsed > 0 && partial) {
+    throw new AppError(422,
+      `Credit is being used on this bill and ${money(surplus)} of this payment would be kept as credit beside it. Save the credit instead.`)
+  }
   if (keepAsCredit && creditUsed > 0) {
     const afterOld = towardOld > 0 ? ` left after ${money(towardOld)} to the old balance` : ''
     throw new AppError(422, isCash
@@ -672,7 +938,7 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   // names what the money is paying: the current bill, the old balance a
   // check's extra goes to first, or both — never "$0.00 owed" while an old
   // balance is open (verify r2).
-  if (!isCash && over > 0 && input.confirmWrittenAmount !== true) {
+  if (!isCash && !partial && over > 0 && input.confirmWrittenAmount !== true) {
     const against = carriedOwed === 0
       ? `against ${money(owed)} owed`
       : owed === 0
@@ -680,7 +946,9 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
         : `against the ${money(owed)} bill and a ${money(carriedOwed)} old balance`
     throw new AppError(422,
       `You typed ${money(tendered)} ${against} — is the ${methodWord(method)} really ${money(tendered)}? ` +
-      `Check the amount written on it, then confirm.`)
+      (method === 'bank_deposit'
+        ? `Check the amount on the bank's receipt, then confirm.`
+        : `Check the amount written on it, then confirm.`))
   }
   const changeGiven = surplus > 0 && !keepAsCredit ? surplus : 0
   const kept = tendered - changeGiven   // what went in the drawer
@@ -688,7 +956,43 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   // ── Write ───────────────────────────────────────────────────────────────
   const refNote = input.reference ? ` (ref ${input.reference})` : ''
   const provenance = input.provenance ? ` — ${input.provenance}` : ''
-  const note = `Recorded as manual ${method} payment${refNote}${provenance}`
+  // 10/5: a bank deposit is named in words (the older methods keep the notes they always had).
+  const note = `Recorded as manual ${method === 'bank_deposit' ? methodWord(method) : method} payment${refNote}${provenance}`
+
+  // 10/5: a rent bill paid in part — the paid slice keeps the row (and any
+  // credit already on it); the rest stays open on its own row of the same
+  // bill (is_remainder), owed as before, late fees and all. Every dollar is
+  // counted once: slice + rest = the bill.
+  const restRows: StillOwedRow[] = []
+  for (const sp of partSplits) {
+    const restC = sp.owedOnRow - sp.take
+    const sliceC = toCents(sp.row.amount) - restC
+    await client.query(
+      `UPDATE payments SET amount = $2::numeric,
+              notes = COALESCE(notes || ' — ', '') || 'paid in part; $' || $3 || ' still owed'
+        WHERE id = $1`,
+      [sp.row.id, toDollars(sliceC).toFixed(2), toDollars(restC).toFixed(2)])
+    const rest = await client.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, invoice_id,
+                             type, amount, status, due_date, entry_description, notes, is_remainder, revenue_owner)
+       SELECT unit_id, lease_id, tenant_id, landlord_id, invoice_id,
+              type, $2::numeric, 'pending', due_date, entry_description, $3, TRUE, revenue_owner
+         FROM payments WHERE id = $1
+       RETURNING id`,
+      [sp.row.id, toDollars(restC).toFixed(2), PART_PAYMENT_REST_NOTE])
+    restRows.push({
+      id: rest.rows[0].id, type: sp.row.type, entryDescription: sp.row.entryDescription,
+      dueDate: sp.row.dueDate, amount: toDollars(restC), restOf: sp.row.id,
+    })
+  }
+  const stillOwedRows: StillOwedRow[] = [
+    ...restRows,
+    ...notReached.map(r => ({
+      id: r.id, type: r.type, entryDescription: r.entryDescription, dueDate: r.dueDate,
+      amount: toDollars(owedOn.get(r.id) ?? 0), restOf: null,
+    })),
+  ].sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+  const stillOwedC = stillOwedRows.reduce((s, r) => s + toCents(r.amount), 0)
 
   // The old balance, oldest first; only the last row it reaches may be paid in part.
   const carriedPaid: string[] = []
@@ -732,8 +1036,13 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
     const oldPart = towardOld > 0 ? `; ${money(towardOld)} went to the old balance` : ''
     const handedOver = isCash
       ? `Handed over ${money(tendered)}`
-      : `Handed over a ${methodWord(method)} for ${money(tendered)} (amount confirmed)`
-    const handed = changeGiven > 0
+      : method === 'bank_deposit'
+        ? `Deposited ${money(tendered)} at the bank${partial ? '' : ' (amount confirmed)'}`
+        : `Handed over a ${methodWord(method)} for ${money(tendered)}${partial ? '' : ' (amount confirmed)'}`
+    const handed = partial
+      ? `${handedOver}${oldPart}${keepAsCredit ? `; ${money(surplus)} kept as credit` : ''}. ` +
+        `Part payment: ${money(stillOwedC)} still owed.`
+      : changeGiven > 0
       ? `Handed over ${money(tendered)}${oldPart}; ${money(changeGiven)} given back as change.`
       : keepAsCredit && isCash
         ? `Handed over ${money(tendered)}${oldPart}; ${towardOld > 0 ? 'the other ' : ''}${money(surplus)} kept as credit — no change on hand.`
@@ -765,7 +1074,10 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
       source: input.source ?? 'desk', createdBy: input.takenBy ?? null, remittanceId: receiptId,
     })
   }
-  const toSettle = [...q.rows.map(r => r.id), ...carriedPaid]
+  // Every row of the bill the money (or the credit) paid in full, and each
+  // slice of a bill paid in part; a bill a part payment did not reach stays open.
+  const lineIds = new Set(lines.map(l => l.paymentId))
+  const toSettle = [...q.rows.filter(r => (owedOn.get(r.id) ?? 0) === 0 || lineIds.has(r.id)).map(r => r.id), ...carriedPaid]
   // A row the account credit paid in full carries no money from the drawer:
   // its note says what paid it, never "Recorded as manual cash payment".
   const moneyRows = new Set(lines.filter(l => l.cents > 0).map(l => l.paymentId))
@@ -815,9 +1127,34 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
     }
   }
 
+  // 10/5 (Nic): on each bill the deposit paid in full, late fees the tenant
+  // had already paid for days after the deposit come back as a late-fee
+  // refund credit (the unpaid ones came off before the money was placed). A
+  // bill paid only in part, or not reached, keeps every late fee.
+  let backdateRefunded = 0
+  const backdateRefundCredits: string[] = []
+  if (backdatedTo) {
+    const { reverseLateFees } = await import('./bankDepositConfirm')
+    const short = new Set([...partSplits.map(x => x.row.invoiceId), ...notReached.map(r => r.invoiceId)])
+    const invoices = deskInvoices(q).filter(i => !short.has(i))
+    for (const invoiceId of invoices) {
+      const head = q.rows.find(r => r.invoiceId === invoiceId)!
+      const r = await reverseLateFees(client, invoiceId, backdatedTo, {
+        settlingIds: settledIds, tenantId, landlordId, leaseId: head.leaseId, createdBy: input.takenBy ?? null,
+      })
+      backdateZeroed += toCents(r.unbilled)
+      backdateRefunded += toCents(r.refunded)
+      if (r.refundCreditId) backdateRefundCredits.push(r.refundCreditId)
+    }
+  }
+
+  const partPaidIds = partSplits.map(sp => sp.row.id).sort()
   const after = await afterRowsSettled(client, settledIds, {
     attestationSource: 'landlord_self_reported_with_evidence',
     attestationEvidence: { manual_method: method, reference: input.reference ?? null },
+    // 10/5 (Nic): a bill's on-time or late mark is for the day it is paid in
+    // full — a slice paid in part carries none; its rest earns the mark.
+    partPaidIds,
     receipt: input.sendReceipt === false ? null : {
       method: kept === 0 ? 'your account credit'
         : changeGiven > 0 ? `${methodWord(method)} (change given ${money(changeGiven)})`
@@ -825,6 +1162,9 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
         : methodWord(method),
       reference: input.reference ?? null,
       creditBanked: keepAsCredit ? toDollars(surplus) : 0,
+      // 10/5: the receipt says what was paid and what is still owed.
+      partPaidIds,
+      stillOwedPaymentIds: stillOwedRows.map(r => r.id),
     },
   })
 
@@ -839,13 +1179,48 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
     creditId,
     receiptId,
     depositRecords,
+    stillOwed: toDollars(stillOwedC),
+    stillOwedRows,
+    partPaidIds,
+    lateFeesReversed: {
+      unbilled: toDollars(backdateZeroed), refunded: toDollars(backdateRefunded), refundCreditIds: backdateRefundCredits,
+    },
     afterCommit: async () => {
       if (done) return
       done = true
       await after.afterCommit()
       await cancelSupersededIntents(cancelAfterCommit)
+      if (backdatedTo && backdateZeroed + backdateRefunded > 0) {
+        await tellTenantLateFeesOff(tenantId, backdatedTo, toDollars(backdateZeroed), toDollars(backdateRefunded))
+          .catch(e => logger.error({ err: e }, '[manual-settle] late-fee notice failed'))
+        // A refund credit that covers a whole bill pays it (its own transaction).
+        if (backdateRefundCredits.length > 0) {
+          const { runWholeBillCheckAfterCommit } = await import('./creditUse')
+          await runWholeBillCheckAfterCommit({ tenantId, landlordId })
+            .catch(e => logger.error({ err: e }, '[manual-settle] whole-bill check failed'))
+        }
+      }
     },
   }
+}
+
+/** 10/5 (Nic): the tenant hears why a late fee came off — the bank deposit's date. Never throws past the caller's catch. */
+async function tellTenantLateFeesOff(tenantId: string, depositedOn: string, unbilled: number, refunded: number): Promise<void> {
+  const { queryOne } = await import('../db')
+  const { createNotification } = await import('./notifications')
+  const u = (await queryOne<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id = $1`, [tenantId]))?.user_id
+  if (!u) return
+  const total = unbilled + refunded
+  await createNotification({
+    userId: u,
+    type: 'payment_recorded',
+    title: 'A late fee came off your bill',
+    body: `Your bank deposit was recorded as made on ${depositedOn}, so $${total.toFixed(2)} in late fees charged after that day ` +
+      (refunded > 0 && unbilled === 0 ? 'was refunded to your account as credit.'
+        : refunded > 0 ? `came off — $${refunded.toFixed(2)} of it you had already paid, refunded to your account as credit.`
+        : 'came off your bill.'),
+    actionUrl: '/payments',
+  })
 }
 
 /** The lease paid-ahead money sits on: the one asked for, the opened charge's, else the newest active one. */

@@ -15,7 +15,7 @@ import {
   matchDeposit, isPreselectable, memoSaysTransfer,
   type OpenCharge, type TenantDeclaredDeposit, type DepositMatch,
 } from './bankDepositMatch'
-import { DECLARATION_DATE_WINDOW_DAYS } from './bankDepositMatch'
+import { declarationReachesSql } from './bankDepositMatch'
 import { bankPayableRowSql, allocationOrderSql } from './moneyPredicates'
 
 // Step 9 review (fix pass 2): a FlexDeposit payment is GAM's custody
@@ -101,14 +101,16 @@ async function declarationsFor(
 ): Promise<TenantDeclaredDeposit[]> {
   const rows = await query<any>(
     `SELECT id, lease_id, tenant_id, amount::float AS amount,
-            to_char(declared_date,'YYYY-MM-DD') AS declared_date, method
+            to_char(declared_date,'YYYY-MM-DD') AS declared_date, method,
+            reference, receipt_photo_url
        FROM tenant_declared_deposits
       WHERE landlord_id = $1 AND status = 'pending'
-        AND declared_date BETWEEN ($2::date - $3::int) AND ($2::date + $3::int)`,
-    [landlordId, postedDate, DECLARATION_DATE_WINDOW_DAYS])
+        AND ${declarationReachesSql('declared_date', '$2::date')}`,
+    [landlordId, postedDate])
   return rows.map((r: any) => ({
     id: r.id, leaseId: r.lease_id, tenantId: r.tenant_id,
     amount: Number(r.amount), declaredDate: r.declared_date, method: r.method,
+    reference: r.reference ?? null, receiptPhotoUrl: r.receipt_photo_url ?? null,
   }))
 }
 

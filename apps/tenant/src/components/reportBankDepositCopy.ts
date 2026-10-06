@@ -48,8 +48,9 @@ export function reportDepositCopy(w: BankWatch, expiresInDays?: number | null): 
     case 'watching':
       return {
         intro: 'You deposited rent straight into your landlord’s account? Tell us and we’ll watch '
-          + 'their bank for it. When it shows up we’ll apply it for you, dated the day you paid, '
-          + 'not the day the bank posted it.',
+          + 'their bank for it. When it shows up we’ll apply it for you, dated the day you paid '
+          + 'when the bank shows it that day or the next business day. If it shows up later than '
+          + 'that, the bank’s date is used.',
         warning: 'Give the bank a few hours to show the deposit. If you report it before you’ve been, '
           + 'there will be nothing for us to find, and the report ends after '
           + `${expiresInDays && expiresInDays > 0 ? `${expiresInDays} days` : 'a week'}.`,
@@ -100,6 +101,9 @@ export function pendingReportStatus(bankFeedLinked: boolean | null | undefined):
   }
   return 'Your balance stays the same until it is marked paid. Keep your deposit slip.'
 }
+
+/** 10/5 (Nic): the report was made but its optional photo of the bank's receipt did not go up. */
+export const PHOTO_NOT_SENT = 'The photo of the bank’s receipt did not upload — your report is made without it.'
 
 /** Said when the same deposit was already reported (a double tap). */
 export function alreadyReportedMessage(w: BankWatch): string {

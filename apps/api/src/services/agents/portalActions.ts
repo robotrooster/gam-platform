@@ -578,7 +578,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'bank is not connected tell them to let their landlord know they paid and keep their slip — never ' +
       'say GAM tells the landlord. A reply with alreadyReported means they reported this deposit before ' +
       'and nothing new was filed; its message says so, with the same next step — relay that too. ' +
-      'Take the reference number if the deposit or the money order has one.\n' +
+      'Ask for the deposit reference number from the bank\u2019s receipt — it is required.\n' +
       'declaredDate is the day THEY went to the bank, in their own timezone, which can legitimately ' +
       'be later than the date at the property. Never tell them a date they give you is in the future.',
     params: {
@@ -586,9 +586,9 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       amount: { type: 'number', description: 'How much they paid in.' },
       declaredDate: { type: 'string', description: 'YYYY-MM-DD — the day they went to the bank.' },
       method: { type: 'string', description: 'cash, check, or money_order.' },
-      reference: { type: 'string', description: 'Deposit slip, check or money-order number, if there is one.' },
+      reference: { type: 'string', description: 'The deposit reference number from the bank\u2019s receipt.' },
     },
-    required: ['leaseId', 'amount', 'declaredDate', 'method'],
+    required: ['leaseId', 'amount', 'declaredDate', 'method', 'reference'],
     confirmFirst: true,
   },
   {

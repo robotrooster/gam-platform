@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Tjz1tvDPeSs0N9dQ6ykiDfuhRVLimyRR5aP6hyAXsLDRSwHB4vKoQOVIWukkVba
+\restrict NbhFJGpLoIpDp8z2H4xhyN1FaFctQtZjzvuyanoUyLXuKrwAkynfbdm5TDvtNRI
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7540,7 +7540,7 @@ CREATE TABLE public.payments (
     CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text, 'HOMEPMT'::text, 'FCPAYDOWN'::text, 'DECLINEFEE'::text, 'BALANCE'::text, 'OTHERFEE'::text]))),
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
     CONSTRAINT payments_issued_credit_amount_nonneg CHECK ((issued_credit_amount >= (0)::numeric)),
-    CONSTRAINT payments_manual_method_check CHECK (((manual_method IS NULL) OR (manual_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'prior_arrangement'::text])))),
+    CONSTRAINT payments_manual_method_check CHECK (((manual_method IS NULL) OR (manual_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'bank_deposit'::text, 'prior_arrangement'::text])))),
     CONSTRAINT payments_payment_channel_check CHECK (((payment_channel IS NULL) OR (payment_channel = ANY (ARRAY['online'::text, 'in_person'::text])))),
     CONSTRAINT payments_retry_count_check CHECK (((retry_count >= 0) AND (retry_count <= 2))),
     CONSTRAINT payments_revenue_owner_check CHECK ((revenue_owner = ANY (ARRAY['landlord'::text, 'gam'::text, 'held'::text]))),
@@ -9246,6 +9246,7 @@ CREATE TABLE public.properties (
     maintenance_categories text[],
     maintenance_note text,
     meter_photo_required boolean DEFAULT false NOT NULL,
+    accept_partial_payments boolean DEFAULT false NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
@@ -9377,6 +9378,13 @@ COMMENT ON COLUMN public.properties.move_in_collects_next_period IS 'S648: TRUE 
 --
 
 COMMENT ON COLUMN public.properties.rent_due_mode IS 'S648: fixed_day = every lease due on rent_due_day; move_in_day = each lease due on its move-in day (no proration; 29th-31st move-ins due on the 1st).';
+
+
+--
+-- Name: COLUMN properties.accept_partial_payments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.accept_partial_payments IS '10/5 (Nic): a payment RECORDED here (cash, check, money order, bank deposit) may be less than what is owed: it pays the oldest bills first, a rent bill it does not cover stays open for the rest, and late fees keep applying to it. Online payments still pay in full. Default off.';
 
 
 --
@@ -11435,8 +11443,16 @@ CREATE TABLE public.tenant_declared_deposits (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     recorded_remittance_id uuid,
+    receipt_photo_url text,
+    receipt_photo_name text,
+    receipt_photo_mime text,
+    receipt_photo_size integer,
+    receipt_photo_uploaded_at timestamp with time zone,
+    bank_posted_date date,
+    false_date_flagged_at timestamp with time zone,
     CONSTRAINT tenant_declared_deposits_amount_positive CHECK ((amount > (0)::numeric)),
     CONSTRAINT tenant_declared_deposits_confirmed_has_txn CHECK (((status <> 'confirmed'::text) OR (bank_transaction_id IS NOT NULL))),
+    CONSTRAINT tenant_declared_deposits_flag_has_bank_date CHECK (((false_date_flagged_at IS NULL) OR ((bank_posted_date IS NOT NULL) AND (bank_posted_date > declared_date)))),
     CONSTRAINT tenant_declared_deposits_method_check CHECK ((method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text]))),
     CONSTRAINT tenant_declared_deposits_recorded_has_receipt CHECK (((status = 'recorded'::text) = (recorded_remittance_id IS NOT NULL))),
     CONSTRAINT tenant_declared_deposits_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'confirmed'::text, 'unconfirmed'::text, 'withdrawn'::text, 'recorded'::text])))
@@ -11455,6 +11471,27 @@ COMMENT ON TABLE public.tenant_declared_deposits IS 'S624: a tenant''s claim tha
 --
 
 COMMENT ON COLUMN public.tenant_declared_deposits.recorded_remittance_id IS 'S655 (decisions #11): status recorded — the landlord''s own receipt (cash, check or money order, dated on or after the reported day, for at least the reported amount) that covered this report. One receipt covers one report.';
+
+
+--
+-- Name: COLUMN tenant_declared_deposits.receipt_photo_url; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_declared_deposits.receipt_photo_url IS '10/5 (Nic): the tenant''s photo of the bank''s deposit receipt (authed route /api/declared-deposits/receipt-photos/<file>, per-row authorization: the tenant who reported it, or that landlord''s own people at a property they work at).';
+
+
+--
+-- Name: COLUMN tenant_declared_deposits.bank_posted_date; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_declared_deposits.bank_posted_date IS '10/5 (Nic): the day the bank posted the deposit that confirmed this report. The reported date counts only when this is that day or the next business day after it.';
+
+
+--
+-- Name: COLUMN tenant_declared_deposits.false_date_flagged_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_declared_deposits.false_date_flagged_at IS '10/5 (Nic): the bank posted this deposit later than the next business day after the reported date, so the reported date was false: the bank''s date decided the late fees, and this report counts as a strike toward the report button''s trust.';
 
 
 --
@@ -11576,9 +11613,16 @@ CREATE TABLE public.tenant_remittances (
     reference text,
     notes text,
     received_by uuid,
+    deposit_photo_url text,
+    deposit_photo_name text,
+    deposit_photo_mime text,
+    deposit_photo_size integer,
+    deposit_photo_uploaded_by uuid,
+    deposit_photo_uploaded_at timestamp with time zone,
     CONSTRAINT tenant_remittances_amount_check CHECK ((amount > (0)::numeric)),
     CONSTRAINT tenant_remittances_applied_amount_check CHECK ((applied_amount >= (0)::numeric)),
-    CONSTRAINT tenant_remittances_payment_method_check CHECK ((payment_method = ANY (ARRAY['ach'::text, 'card'::text, 'cash'::text, 'check'::text, 'money_order'::text]))),
+    CONSTRAINT tenant_remittances_deposit_photo_bank_deposit_only CHECK (((deposit_photo_url IS NULL) OR (payment_method = 'bank_deposit'::text))),
+    CONSTRAINT tenant_remittances_payment_method_check CHECK ((payment_method = ANY (ARRAY['ach'::text, 'card'::text, 'cash'::text, 'check'::text, 'money_order'::text, 'bank_deposit'::text]))),
     CONSTRAINT tenant_remittances_status_check CHECK ((status = ANY (ARRAY['processing'::text, 'settled'::text, 'failed'::text]))),
     CONSTRAINT tenant_remittances_unapplied_amount_check CHECK ((unapplied_amount >= (0)::numeric))
 );
@@ -11610,6 +11654,13 @@ COMMENT ON COLUMN public.tenant_remittances.reference IS 'S652: the check or mon
 --
 
 COMMENT ON COLUMN public.tenant_remittances.received_by IS 'S652: who at the office posted this manual receipt.';
+
+
+--
+-- Name: COLUMN tenant_remittances.deposit_photo_url; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_remittances.deposit_photo_url IS '10/5 (Nic): the photo of the bank''s deposit receipt for a recorded bank deposit (authed route /api/payments/deposit-photos/<file>, per-row authorization). Never shown to the tenant.';
 
 
 --
@@ -22305,10 +22356,24 @@ CREATE UNIQUE INDEX ux_tenant_declared_deposits_bank_txn ON public.tenant_declar
 
 
 --
+-- Name: ux_tenant_declared_deposits_receipt_photo_url; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_tenant_declared_deposits_receipt_photo_url ON public.tenant_declared_deposits USING btree (receipt_photo_url) WHERE (receipt_photo_url IS NOT NULL);
+
+
+--
 -- Name: ux_tenant_declared_deposits_recorded_remittance; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX ux_tenant_declared_deposits_recorded_remittance ON public.tenant_declared_deposits USING btree (recorded_remittance_id) WHERE (recorded_remittance_id IS NOT NULL);
+
+
+--
+-- Name: ux_tenant_remittances_deposit_photo_url; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_tenant_remittances_deposit_photo_url ON public.tenant_remittances USING btree (deposit_photo_url) WHERE (deposit_photo_url IS NOT NULL);
 
 
 --
@@ -31134,5 +31199,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Tjz1tvDPeSs0N9dQ6ykiDfuhRVLimyRR5aP6hyAXsLDRSwHB4vKoQOVIWukkVba
+\unrestrict NbhFJGpLoIpDp8z2H4xhyN1FaFctQtZjzvuyanoUyLXuKrwAkynfbdm5TDvtNRI
 

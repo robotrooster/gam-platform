@@ -462,6 +462,8 @@ function kindOf(f: Funding): { kind: StayRefundPartKind | 'unrecorded'; how: str
   if (f.method === 'card') return stripe ? { kind: 'card', how: 'Card' } : { kind: 'unrecorded', how: 'Card' }
   if (f.method === 'ach') return stripe ? { kind: 'bank', how: 'Bank payment' } : { kind: 'cash', how: 'Bank deposit' }
   if (f.method === 'money_order') return { kind: 'money_order', how: 'Money order' }
+  // 10/5: the resident's cash put into the landlord's bank — given back like cash.
+  if (f.method === 'bank_deposit') return { kind: 'cash', how: 'Bank deposit' }
   if (f.method === 'check') return { kind: 'check', how: 'Check' }
   return { kind: 'cash', how: 'Cash' }
 }

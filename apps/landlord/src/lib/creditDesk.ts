@@ -17,7 +17,8 @@
  * Record click, in the same words the server would refuse with.
  */
 import {
-  ACH_RETURN_CONFIG, PAYMENT_REVERSAL_TYPE_VALUES, PAYMENT_STATUS_LABEL,
+  ACH_RETURN_CONFIG, PAYMENT_REVERSAL_TYPE_VALUES, PAYMENT_STATUS_LABEL, MANUAL_PAYMENT_METHOD_WORD,
+  bankReceiptPhotoProblem, DEPOSIT_REFERENCE_LABEL, monthDayLabel,
   type ManualPaymentMethod, type PaymentReversalType, type PaymentStatus,
 } from '@gam/shared'
 
@@ -146,13 +147,21 @@ export function creditBesideText(available: number | string | null | undefined, 
  * The Front Desk's sentence for somebody who owes: the FULL balance, with their
  * credit said beside it as a question for them — never taken off the figure.
  */
-export function deskBalanceSentence(b: { first: string; owed: number; credit: number; when: string | null; overdue: boolean }): string {
+export function deskBalanceSentence(b: {
+  first: string; owed: number; credit: number; when: string | null; overdue: boolean
+  /** 10/5 (Nic): the property takes part payments (recorded ones). */
+  partialOk?: boolean
+}): string {
   const head = `${b.first} owes ${money(b.owed)}${b.when ? ` — oldest bill ${b.overdue ? 'was due' : 'due'} ${b.when}` : ''}.`
   if (toCents(b.credit) > 0) {
     return `${head} They have ${money(b.credit)} of credit that can go toward it — ask whether they want to use it or save it.`
-      + ' Whatever is left is taken in full; rent cannot be part-paid.'
+      + (b.partialOk
+        ? ' They can pay part of what is left; what they do not pay stays owed, and late fees still apply.'
+        : ' Whatever is left is taken in full; rent cannot be part-paid.')
   }
-  return `${head} Take the full amount; rent cannot be part-paid.`
+  return b.partialOk
+    ? `${head} They can pay part; what they do not pay stays owed, and late fees still apply.`
+    : `${head} Take the full amount; rent cannot be part-paid.`
 }
 
 // ─── Outstanding Balances ────────────────────────────────────────────────────
@@ -410,11 +419,15 @@ export function matchPayerHits(hits: readonly PayerHit[], typed: string): PayerH
 export interface DeskQuoteRow {
   id: string
   leaseId: string | null
+  /** The bill (invoice) the row is on. */
+  invoiceId?: string | null
   type: string
   entryDescription?: string | null
   amount: number
   dueDate: string
   creditAlreadyApplied: number
+  /** What "Use" would spend on this charge (10/5: so a part payment can say which bill stays owed). */
+  creditIfUsed?: number
   notes: string | null
   unitNumber: string | null
   propertyName: string | null
@@ -495,6 +508,16 @@ export interface DeskQuote {
   owedIfSaved: number
   fullBalance: number
   scheduledRetries: Array<{ nextRetryAt: string | null }>
+  /**
+   * 10/5 (Nic): the property takes part payments — less than the bill may be
+   * recorded; the oldest bills are paid first and the rest stays owed (late
+   * fees still apply). Absent or false: pay in full.
+   */
+  partialPaymentsAllowed?: boolean
+  /** 10/5 (Nic): read with ?depositedOn= — late fees charged after that day, off this bill when the deposit pays it in full. */
+  lateFeesOffIfPaidInFull?: number
+  /** 10/5: the same, bill by bill — a bill the deposit pays only in part keeps its own. */
+  lateFeesOffByBill?: Array<{ invoiceId: string; amount: number }>
 }
 
 /** The desk's answer to "credit available $X": Use, Save, or not asked yet. */
@@ -567,7 +590,87 @@ export function postAnchor(q: Pick<DeskQuote, 'anchorOpen' | 'anchorPaymentId' |
   return q.rows[0]?.id ?? q.oldBalance[0]?.id ?? null
 }
 
-const METHOD_WORD: Record<ManualPaymentMethod, string> = { cash: 'cash', check: 'check', money_order: 'money order' }
+const METHOD_WORD: Record<ManualPaymentMethod, string> = MANUAL_PAYMENT_METHOD_WORD
+
+/**
+ * 10/5 (Nic): what the desk types for each way of paying — the amount box,
+ * and the number that identifies it (cash has none). A bank deposit's number
+ * is the reference on the bank's receipt: "in case somebody else happens to
+ * deposit the same amount".
+ */
+export const AMOUNT_FIELD_LABEL: Record<ManualPaymentMethod, string> = {
+  cash: 'Cash handed over',
+  check: 'Amount on the check',
+  money_order: 'Amount on the money order',
+  bank_deposit: 'Amount deposited',
+}
+export const NUMBER_FIELD_LABEL: Record<ManualPaymentMethod, string> = {
+  cash: '',
+  check: 'Check number',
+  money_order: 'Money order number',
+  bank_deposit: DEPOSIT_REFERENCE_LABEL,
+}
+/** Said when Record is pressed without the number. */
+export function numberMissingMessage(method: ManualPaymentMethod): string {
+  return method === 'bank_deposit'
+    ? 'Enter the deposit reference number from the bank\'s receipt — it tells this deposit apart from anyone else\'s for the same amount.'
+    : `Enter the ${METHOD_WORD[method]} number — it is the receipt if the payment is ever questioned.`
+}
+
+/**
+ * 10/5 (Nic): the photo of the bank's deposit receipt (optional, bank deposit
+ * only). Null when it can be sent; else what is wrong with it, in plain words.
+ */
+export function depositPhotoProblem(file: { type: string; size: number } | null | undefined): string | null {
+  // The tenant's photo on their own report takes the same files (@gam/shared).
+  return bankReceiptPhotoProblem(file)
+}
+
+/**
+ * 10/5 (Nic): a bank deposit dated before late fees were charged — said in
+ * the window ("the deposit was made before …") and after it is recorded.
+ * Null when nothing comes off.
+ */
+export function lateFeesOffText(depositedOn: string, unbilled: number, refunded = 0): string | null {
+  const total = toCents(unbilled) + toCents(refunded)
+  if (total <= 0) return null
+  const day = monthDayLabel(depositedOn)
+  if (toCents(refunded) > 0) {
+    return `${money(toDollars(total))} in late fees charged after ${day} came off — ` +
+      `${money(refunded)} of it they had already paid, given back as credit.`
+  }
+  return `${money(toDollars(total))} in late fees charged after ${day} came off — the money was in the bank that day.`
+}
+
+/** "October rent" — a bill's month and what it is, for "stays owed on …". */
+export function billName(dueDate: string, label: string): string {
+  const m = /^\d{4}-(\d{2})/.exec(String(dueDate ?? ''))
+  const month = m ? MONTHS[Number(m[1]) - 1] : null
+  const what = String(label || 'bill').split(' · ')[0].trim().toLowerCase()
+  return month ? `${month} ${what}` : what
+}
+
+/** "a, b and c". */
+function andList(xs: string[]): string {
+  const u = [...new Set(xs)]
+  return u.length <= 1 ? (u[0] ?? '') : `${u.slice(0, -1).join(', ')} and ${u[u.length - 1]}`
+}
+
+/**
+ * 10/5 (Nic): a bank deposit dated back, recorded as a part payment — the late
+ * fees the window left off the bills it pays only in part go back on them (the
+ * server judges each bill: services/manualPaymentSettle). Cents.
+ */
+export function lateFeesBackOnShortBills(q: Pick<DeskQuote, 'lateFeesOffByBill'>, shortInvoiceIds: readonly string[]): number {
+  return (q.lateFeesOffByBill ?? [])
+    .filter(b => shortInvoiceIds.includes(b.invoiceId))
+    .reduce((s, b) => s + toCents(b.amount), 0)
+}
+
+/** 10/5 (Nic): "$100.00 stays owed on October rent — late fees still apply." */
+export function stillOwedText(cents: number, names: string[]): string {
+  return `${money(toDollars(cents))} stays owed${names.length ? ` on ${andList(names)}` : ''} — late fees still apply.`
+}
 
 export interface TenderInput {
   method: ManualPaymentMethod
@@ -582,6 +685,8 @@ export interface TenderInput {
   writtenConfirmed: boolean
   /** The credit figure (cents) on screen when the desk said Use or Save; null/absent = the current figure. */
   answeredCreditCents?: number | null
+  /** What a charge is called ("Rent", "Water") — for the part-payment line. Default: its type. */
+  nameOf?: (r: DeskQuoteRow) => string
 }
 
 export type TenderStop =
@@ -607,6 +712,48 @@ export interface TenderPlan {
   message: string | null
   /** amountTendered / creditToUse / towardOldBalance / surplusHandling / confirmWrittenAmount to send. */
   body: Record<string, unknown> | null
+  /**
+   * 10/5 (Nic): a part payment (the property takes them) — what stays owed
+   * after it (cents) and the line that says so; 0 / null when paid in full.
+   */
+  stillOwedCents: number
+  stillOwedText: string | null
+  /** 10/5: the bills (invoices) a part payment leaves owed — paid in part or not reached — and what they are called. */
+  shortInvoiceIds: string[]
+  stillOwedNames: string[]
+}
+
+/**
+ * 10/5 (Nic): a part payment, as services/manualPaymentSettle takes it — the
+ * money pays the oldest bills first, each in full; a RENT bill it cannot cover
+ * in full is paid in part (the rest stays owed); any other bill it cannot cover
+ * is passed by and stays owed whole; money left after that (rare) is kept —
+ * the old balance first, then credit.
+ */
+export function partialPlan(q: DeskQuote, choice: CreditChoice, tenderedC: number, nameOf?: (r: DeskQuoteRow) => string): {
+  stillOwedCents: number; names: string[]; toOldCents: number; keptCents: number; shortInvoiceIds: string[]
+} {
+  const useCredit = choice === 'use' && creditChoiceNeeded(q)
+  let left = tenderedC
+  let stillOwed = 0
+  const names: string[] = []
+  const shortInvoiceIds: string[] = []
+  const name = (r: DeskQuoteRow) => billName(r.dueDate, nameOf ? nameOf(r) : r.type)
+  for (const r of q.rows ?? []) {
+    const m = Math.max(0, toCents(r.amount) - toCents(r.creditAlreadyApplied) - (useCredit ? toCents(r.creditIfUsed) : 0))
+    if (m === 0) continue
+    if (left >= m) { left -= m; continue }
+    if (left > 0 && r.type === 'rent') {
+      stillOwed += m - left
+      left = 0
+    } else {
+      stillOwed += m
+    }
+    names.push(name(r))
+    if (r.invoiceId && !shortInvoiceIds.includes(r.invoiceId)) shortInvoiceIds.push(r.invoiceId)
+  }
+  const toOld = Math.min(left, oldBalanceOwedCents(q))
+  return { stillOwedCents: stillOwed, names, toOldCents: toOld, keptCents: left - toOld, shortInvoiceIds }
 }
 
 /**
@@ -636,7 +783,7 @@ export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
     owedCents: owedC, oldOwedCents: oldOwedC, overCents: 0, toOldCents: 0, surplusCents: 0,
     changeCents: 0, keptAsCreditCents: 0, creditUsedCents: creditUsedC,
     ifChange: { changeCents: 0, toOldCents: 0 }, ifKept: { toOldCents: 0, creditCents: 0 },
-    stop: null, message: null, body: null,
+    stop: null, message: null, body: null, stillOwedCents: 0, stillOwedText: null, shortInvoiceIds: [], stillOwedNames: [],
   }
   const stop = (s: TenderStop, message: string | null, extra: Partial<TenderPlan> = {}): TenderPlan =>
     ({ ...blank, ...extra, stop: s, message })
@@ -651,9 +798,27 @@ export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
       `They have ${money(toDollars(usableC))} of credit that can pay part of this bill. Choose Use or Save first.`)
   }
   if (tenderedC === null) return stop('amount', null)
-  if (tenderedC < owedC) {
+  if (tenderedC < owedC && !q.partialPaymentsAllowed) {
     return stop('short',
       `That is ${money(toDollars(owedC - tenderedC))} short — ${money(toDollars(tenderedC))} against ${money(toDollars(owedC))} owed. Rent is paid in full.`)
+  }
+  // 10/5 (Nic): the property takes part payments — "there's really no way to
+  // stop somebody from going into the bank and making a partial".
+  if (tenderedC < owedC) {
+    if (tenderedC === 0) return stop('amount', null)
+    const part = partialPlan(q, input.choice, tenderedC, input.nameOf)
+    if (part.keptCents > 0 && creditUsedC > 0) {
+      return stop('credit_and_keep',
+        `Credit is being used on this bill and ${money(toDollars(part.keptCents))} of this payment would be kept as credit beside it. Choose Save instead.`)
+    }
+    const body: Record<string, unknown> = { method: input.method, amountTendered: toDollars(tenderedC) }
+    const creditToUse = creditToUseFor(q, input.choice, input.answeredCreditCents)
+    if (creditToUse !== undefined) body.creditToUse = creditToUse
+    return {
+      ...blank, toOldCents: part.toOldCents, surplusCents: part.keptCents, keptAsCreditCents: part.keptCents, body,
+      stillOwedCents: part.stillOwedCents, stillOwedText: stillOwedText(part.stillOwedCents, part.names),
+      shortInvoiceIds: part.shortInvoiceIds, stillOwedNames: part.names,
+    }
   }
   const overC = tenderedC - owedC
   const word = METHOD_WORD[input.method]
@@ -705,8 +870,9 @@ export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
       : owedC === 0
         ? `toward the ${money(toDollars(oldOwedC))} old balance`
         : `against the ${money(toDollars(owedC))} bill and a ${money(toDollars(oldOwedC))} old balance`
+    const where = input.method === 'bank_deposit' ? 'Check the amount on the bank\'s receipt' : 'Check the amount written on it'
     return stop('written_confirm',
-      `You typed ${money(toDollars(tenderedC))} ${against} — is the ${word} really ${money(toDollars(tenderedC))}? Check the amount written on it, then confirm.`,
+      `You typed ${money(toDollars(tenderedC))} ${against} — is the ${word} really ${money(toDollars(tenderedC))}? ${where}, then confirm.`,
       { overCents: overC, toOldCents: toOldC, surplusCents: surplusC, ifChange, ifKept })
   }
   const changeC = surplusC > 0 && !keepAsCredit ? surplusC : 0
@@ -740,6 +906,10 @@ export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
 export function recordedMessage(name: string, r: {
   amountSettled?: number; creditUsed?: number; towardOldBalance?: number
   changeGiven?: number; surplus?: number; creditId?: string | null
+  /** 10/5: a part payment — what is still owed after it, and the words for where. */
+  stillOwed?: number; stillOwedNames?: string[]
+  /** 10/5 (Nic): a bank deposit dated back — late fees charged after that day that came off. */
+  depositedOn?: string | null; lateFeesUnbilled?: number; lateFeesRefunded?: number
 }): string {
   const parts: string[] = []
   const settled = toCents(r.amountSettled)
@@ -749,7 +919,9 @@ export function recordedMessage(name: string, r: {
   if (toCents(r.towardOldBalance) > 0) parts.push(`${money(r.towardOldBalance)} went to the old balance`)
   if (toCents(r.changeGiven) > 0) parts.push(`give ${money(r.changeGiven)} change`)
   else if (toCents(r.surplus) > 0 && r.creditId) parts.push(`${money(r.surplus)} kept on their account as credit`)
-  return parts.join(' — ') + '.'
+  if (toCents(r.stillOwed) > 0) return `${parts.join(' — ')} — ${stillOwedText(toCents(r.stillOwed), r.stillOwedNames ?? [])}`
+  const feesOff = r.depositedOn ? lateFeesOffText(r.depositedOn, r.lateFeesUnbilled ?? 0, r.lateFeesRefunded ?? 0) : null
+  return parts.join(' — ') + '.' + (feesOff ? ` ${feesOff}` : '')
 }
 
 /**
@@ -907,12 +1079,19 @@ export function readerFinishedMessage(
 /** A check or money order posted ahead: "is it really $X?" before it becomes money paid ahead. */
 export function postConfirmQuestion(method: ManualPaymentMethod, cents: number): string | null {
   if (method === 'cash' || !(cents > 0)) return null
-  return `Is the ${METHOD_WORD[method]} really ${money(toDollars(cents))}? Check the amount written on it. What is open is paid first; the rest is kept on their account as paid ahead.`
+  const where = method === 'bank_deposit' ? 'Check the amount on the bank\'s receipt.' : 'Check the amount written on it.'
+  // 10/5: worded for every outcome — where the property takes part payments,
+  // an amount under what is owed pays part of the bill and nothing is paid ahead.
+  return `Is the ${METHOD_WORD[method]} really ${money(toDollars(cents))}? ${where} It pays what is open first, oldest bill first; anything over what is owed is kept on their account as paid ahead.`
 }
 
-/** A check or money order is identified by its number (S637): required before it is recorded. */
+/**
+ * A check or money order is identified by its number (S637), and a bank
+ * deposit by the reference on the bank's receipt (10/5): required before it
+ * is recorded.
+ */
 export function numberRequired(method: ManualPaymentMethod): boolean {
-  return method === 'check' || method === 'money_order'
+  return method === 'check' || method === 'money_order' || method === 'bank_deposit'
 }
 
 // ─── The tenant page's credit card ───────────────────────────────────────────
@@ -992,6 +1171,20 @@ export interface LedgerPayment {
    */
   creditReturned: number
   methodLabel: string
+  /** 10/5: the receipt this payment is, its reference (check / money-order number, bank deposit reference). */
+  receiptId?: string | null
+  reference?: string | null
+  /** 10/5 (Nic): a bank deposit's photo of the bank's receipt (authed URL; the landlord's own people only). */
+  depositPhotoUrl?: string | null
+  /**
+   * 10/5 (Nic): paid from a bank deposit the tenant reported on an earlier
+   * day than the bank shows — the two dates (the screen says "Said they
+   * deposited Oct 1 — the bank shows Oct 6."). Null otherwise.
+   */
+  depositDateFlag?: { said: string; bank: string } | null
+  /** 10/5 (Nic): the tenant's own photo of the bank's receipt on that report (authed URL). */
+  tenantReceiptPhotoUrl?: string | null
+  method?: string | null
   status: 'settled' | 'clearing' | 'returned'
   statusLabel: string
   paidFor: string

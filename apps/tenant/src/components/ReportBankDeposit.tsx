@@ -31,13 +31,15 @@
 import { useState } from 'react'
 import { useQuery } from 'react-query'
 import {
-  MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, formatCurrency,
-  type ManualPaymentMethod,
+  DEPOSITABLE_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, formatCurrency,
+  DEPOSIT_REFERENCE_LABEL, bankReceiptPhotoProblem, bankDateUsedText,
+  type ManualPaymentMethod, type DepositablePaymentMethod,
 } from '@gam/shared'
-import { apiGet, apiPost, apiDelete } from '../lib/api'
+import { apiGet, apiPost, apiDelete, apiUpload } from '../lib/api'
+import { AuthedImg } from './AuthedMedia'
 import {
   ONLY_AFTER_YOU_PAID, alreadyReportedMessage, bankWatch, pendingReportStatus, reportDepositCopy,
-  reportStandsNow,
+  reportStandsNow, PHOTO_NOT_SENT,
 } from './reportBankDepositCopy'
 
 interface Props {
@@ -56,8 +58,10 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
   Props & { onClose: () => void }) {
   const [amountText, setAmountText] = useState(outstanding > 0 ? outstanding.toFixed(2) : '')
   const [declaredDate, setDeclaredDate] = useState(todayISO())
-  const [method, setMethod] = useState<ManualPaymentMethod>('cash')
+  const [method, setMethod] = useState<DepositablePaymentMethod>('cash')
   const [reference, setReference] = useState('')
+  // 10/5 (Nic): an optional photo of the bank's receipt, sent once the report is made.
+  const [photo, setPhoto] = useState<File | null>(null)
   const [confirmed, setConfirmed] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [done, setDone] = useState<string | null>(null)
@@ -77,19 +81,31 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
   const copy = reportDepositCopy(watch, feed.data?.expiresInDays)
 
   const amount = Number(amountText)
-  const canSubmit = confirmed && amount > 0 && !!declaredDate && !submitting && copy.canReport
+  // 10/5 (Nic): the reference number from the bank's receipt is required.
+  const canSubmit = confirmed && amount > 0 && !!declaredDate && !!reference.trim() && !submitting && copy.canReport
 
   async function submit() {
     setError(null); setSubmitting(true)
     try {
       const res: any = await apiPost('/declared-deposits', {
         leaseId, amount, declaredDate, method,
-        reference: reference.trim() || undefined,
+        reference: reference.trim(),
       })
+      // The photo goes on the report just made (or the one already made).
+      let photoNote = ''
+      if (photo && res?.data?.id) {
+        try {
+          const fd = new FormData()
+          fd.append('photo', photo)
+          await apiUpload(`/declared-deposits/${res.data.id}/receipt-photo`, fd)
+        } catch {
+          photoNote = ` ${PHOTO_NOT_SENT}`
+        }
+      }
       // The server's own sentence is the authority: it checks the bank link
       // at the moment of reporting.
-      setDone(res?.data?.message
-        ?? (res?.data?.alreadyReported ? alreadyReportedMessage(watch) : 'Reported.'))
+      setDone((res?.data?.message
+        ?? (res?.data?.alreadyReported ? alreadyReportedMessage(watch) : 'Reported.')) + photoNote)
       onReported()
     } catch (e: any) {
       setError(e?.message || 'We could not record that. Try again.')
@@ -159,7 +175,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
                 same amount on the same day — a bank memo describes what was
                 deposited even when it names nobody. */}
             <div style={{ display: 'flex', gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
-              {MANUAL_PAYMENT_METHODS.map((m) => (
+              {DEPOSITABLE_PAYMENT_METHODS.map((m) => (
                 <button key={m} type="button" onClick={() => setMethod(m)}
                   className={method === m ? 'btn-primary' : 'btn-ghost'}
                   style={{ fontSize: '.78rem', padding: '6px 12px' }}>
@@ -168,12 +184,27 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
               ))}
             </div>
 
-            <label style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
-              Check or money-order number <span style={{ color: 'var(--t3)' }}>(optional)</span>
+            {/* 10/5 (Nic): required — it tells this deposit apart from anyone
+                else's for the same amount. */}
+            <label htmlFor="report-deposit-reference"
+              style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
+              {DEPOSIT_REFERENCE_LABEL}
             </label>
-            <input value={reference} maxLength={120}
+            <input id="report-deposit-reference" value={reference} maxLength={120} required
               onChange={(e) => setReference(e.target.value)} style={inputStyle}
-              placeholder="Helps us find it faster" />
+              placeholder="e.g. 004417" />
+
+            <label htmlFor="report-deposit-photo"
+              style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
+              Photo of the bank’s receipt <span style={{ color: 'var(--t3)' }}>(optional)</span>
+            </label>
+            <input id="report-deposit-photo" type="file" accept="image/*" style={{ ...inputStyle, padding: '7px 9px' }}
+              onChange={(e) => {
+                const f = e.target.files?.[0] ?? null
+                const problem = bankReceiptPhotoProblem(f)
+                if (problem) { setError(problem); setPhoto(null); e.target.value = ''; return }
+                setError(null); setPhoto(f)
+              }} />
 
             {/* The load-bearing sentence. A tenant who thinks this paid their rent
                 stops worrying about a bill that is still due. */}
@@ -236,7 +267,10 @@ export function ReportedDeposits({ reports, onWithdrawn, refusal, onRefusal, sta
   const [ownRefusal, setOwnRefusal] = useState<WithdrawRefusal | null>(null)
   const withdrawError = onRefusal ? (refusal ?? null) : ownRefusal
   const setWithdrawError = onRefusal ?? setOwnRefusal
-  const open = reports.filter(r => r.status === 'pending' || r.status === 'unconfirmed')
+  // 10/5 (Nic): a report the bank showed on a later day stays here, saying
+  // the bank's date was used and why.
+  const open = reports.filter(r => r.status === 'pending' || r.status === 'unconfirmed'
+    || (r.status === 'confirmed' && r.bankDateUsed && r.bankPostedDate))
   // A refused "I hadn't paid" is usually a report matched or closed in the
   // meantime, which has just left the open list: when it was the only one,
   // the list stays up to say what happened rather than vanishing.
@@ -272,11 +306,17 @@ export function ReportedDeposits({ reports, onWithdrawn, refusal, onRefusal, sta
             <span style={{ color: 'var(--t3)' }}>
               {' · '}{MANUAL_PAYMENT_METHOD_LABELS[r.method as ManualPaymentMethod] ?? 'Other'}
             </span>
+            {r.reference && (
+              <span style={{ color: 'var(--t3)' }}>{' · Ref '}{r.reference}</span>
+            )}
             <div style={{ color: 'var(--t3)', fontSize: '.72rem', marginTop: 2 }}>
               {r.status === 'pending'
                 ? pendingReportStatus(r.bankFeedLinked)
-                : (r.resolutionNote || 'We could not find a matching deposit.')}
+                : r.status === 'confirmed'
+                  ? bankDateUsedText(r.declaredDate, r.bankPostedDate)
+                  : (r.resolutionNote || 'We could not find a matching deposit.')}
             </div>
+            {r.receiptPhotoUrl && <ReceiptPhotoButton url={r.receiptPhotoUrl} />}
           </span>
           {r.status === 'pending' && (
             <button className="btn-ghost" disabled={busy === r.id}
@@ -295,6 +335,35 @@ export function ReportedDeposits({ reports, onWithdrawn, refusal, onRefusal, sta
             onClick={() => setWithdrawError(null)}>
             OK
           </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 10/5 (Nic): the tenant's own photo of the bank's receipt, shown in the app (the file sits behind the sign-in). */
+function ReceiptPhotoButton({ url }: { url: string }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div style={{ marginTop: 4 }}>
+      <button type="button" className="btn-primary" style={{ fontSize: '.7rem', padding: '3px 10px' }}
+        onClick={() => setOpen(true)}>
+        Photo of the bank’s receipt
+      </button>
+      {open && (
+        <div onClick={() => setOpen(false)} style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,.7)', display: 'flex',
+          alignItems: 'center', justifyContent: 'center', zIndex: 110, padding: 16,
+        }}>
+          <div onClick={(e) => e.stopPropagation()} style={{
+            background: 'var(--bg2)', border: '1px solid var(--b1)', borderRadius: 12, padding: 16,
+            width: '100%', maxWidth: 520,
+          }}>
+            <AuthedImg path={url} alt="Photo of the bank's receipt"
+              style={{ display: 'block', width: '100%', maxHeight: '70vh', objectFit: 'contain', borderRadius: 8 }} />
+            <button type="button" className="btn-ghost" style={{ width: '100%', marginTop: 12 }}
+              onClick={() => setOpen(false)}>Close</button>
+          </div>
         </div>
       )}
     </div>

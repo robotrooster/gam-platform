@@ -15,13 +15,19 @@
 // deposit is worth several days of late fees (services/depositBackdate.ts).
 
 import { Router } from 'express'
+import fs from 'fs'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth } from '../middleware/auth'
+import { requireAuth, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
-import { MANUAL_PAYMENT_METHODS } from '@gam/shared'
+import { DEPOSITABLE_PAYMENT_METHODS } from '@gam/shared'
 import { DateTime } from 'luxon'
+import { resolveUploadPath } from '../lib/uploadPaths'
+import { bankReceiptPhotoDir, takeBankReceiptPhoto, landlordsOwnUser } from '../lib/bankReceiptPhotos'
+import {
+  UNCONFIRMED_STRIKE_LIMIT, DECLARATION_STRIKE_SQL, declarationStrikes,
+} from '../services/declaredDepositTrust'
 
 export const declaredDepositsRouter = Router()
 declaredDepositsRouter.use(requireAuth)
@@ -36,10 +42,18 @@ declaredDepositsRouter.use(requireAuth)
 export const DECLARATION_EXPIRY_DAYS = 7
 
 /**
- * How many unmatched claims a tenant may make before the button stops trusting
- * them. Two is deliberate: one is a mistake, two is a pattern worth naming.
+ * How many strikes a tenant may have before the button stops trusting them —
+ * a report never found at the bank, or (10/5, Nic) one the bank showed on a
+ * later day than the tenant gave (services/declaredDepositTrust).
  */
-export const UNCONFIRMED_STRIKE_LIMIT = 2
+export { UNCONFIRMED_STRIKE_LIMIT }
+
+/**
+ * 10/5 (Nic): the deposit reference number from the bank's receipt is required
+ * — it tells this deposit apart from anyone else's for the same amount.
+ */
+export const DECLARATION_REFERENCE_REQUIRED =
+  'Enter the deposit reference number from the bank\'s receipt — it tells your deposit apart from anyone else\'s for the same amount.'
 
 const declareSchema = z.object({
   leaseId: z.string().uuid(),
@@ -47,8 +61,12 @@ const declareSchema = z.object({
   // The date they say they went to the bank. Never the payment date on its own —
   // it only governs once a bank row corroborates it.
   declaredDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  method: z.enum(MANUAL_PAYMENT_METHODS),
-  reference: z.string().max(120).optional(),
+  // 10/5: what they took into the bank (cash, a check, a money order).
+  method: z.enum(DEPOSITABLE_PAYMENT_METHODS),
+  // 10/5 (Nic): the reference number on the bank's receipt — required
+  // (DECLARATION_REFERENCE_REQUIRED, checked after parsing so the refusal is
+  // a sentence).
+  reference: z.string().max(120).optional().nullable(),
 })
 
 /**
@@ -74,7 +92,7 @@ async function bankFeedWatching(landlordId: string): Promise<boolean> {
  */
 function whatHappensNext(bankFeedLinked: boolean): string {
   return bankFeedLinked
-    ? 'Your balance stays the same until your deposit shows up in the bank — usually a day or two. We will apply it automatically and date it to the day you paid.'
+    ? 'Your balance stays the same until your deposit shows up in the bank — usually a day or two. We will apply it automatically, dated the day you paid when the bank shows it that day or the next business day (otherwise the bank’s date counts).'
     : 'Your landlord’s bank isn’t connected to GAM right now, so we can’t watch for this deposit ourselves. Let your landlord know you paid and keep your deposit slip — they’ll check their bank and mark your bill paid. Your balance stays the same until they do.'
 }
 
@@ -104,6 +122,8 @@ declaredDepositsRouter.post('/', async (req, res, next) => {
     const tenantId = req.user!.profileId
     if (!tenantId) throw new AppError(403, 'Only a tenant can report a deposit')
     const body = declareSchema.parse(req.body)
+    const reference = (body.reference ?? '').trim()
+    if (!reference) throw new AppError(400, DECLARATION_REFERENCE_REQUIRED)
 
     const landlordId = await assertTenantsLease(tenantId, body.leaseId)
 
@@ -157,17 +177,14 @@ declaredDepositsRouter.post('/', async (req, res, next) => {
       })
     }
 
-    const strikes = await queryOne<{ n: string }>(
-      `SELECT COUNT(*) AS n FROM tenant_declared_deposits
-        WHERE tenant_id = $1 AND status = 'unconfirmed'`, [tenantId])
-    const strikeCount = parseInt(strikes?.n ?? '0', 10)
+    const strikeCount = await declarationStrikes(tenantId)
 
     const row = await queryOne<{ id: string }>(
       `INSERT INTO tenant_declared_deposits
          (tenant_id, lease_id, landlord_id, amount, declared_date, method, reference)
        VALUES ($1,$2,$3,$4,$5::date,$6,$7) RETURNING id`,
       [tenantId, body.leaseId, landlordId, body.amount.toFixed(2),
-       body.declaredDate, body.method, body.reference ?? null])
+       body.declaredDate, body.method, reference])
 
     // S655 review: the promise depends on whether GAM is reading the
     // landlord's bank. With no link (Country Acres / TruBlu today), a link in
@@ -212,12 +229,91 @@ declaredDepositsRouter.get('/', async (req, res, next) => {
               to_char(d.declared_date,'YYYY-MM-DD') AS declared_date,
               d.method, d.reference, d.status, d.resolution_note,
               to_char(d.confirmed_at,'YYYY-MM-DD') AS confirmed_on,
-              ${BANK_FEED_WATCHING_SQL('d.landlord_id')} AS bank_feed_linked
+              ${BANK_FEED_WATCHING_SQL('d.landlord_id')} AS bank_feed_linked,
+              -- 10/5 (Nic): their photo of the bank's receipt (served only to
+              -- them and the landlord's own people), and the bank's date when
+              -- it did not bear theirs out.
+              d.receipt_photo_url,
+              to_char(d.bank_posted_date,'YYYY-MM-DD') AS bank_posted_date,
+              (d.false_date_flagged_at IS NOT NULL) AS bank_date_used
          FROM tenant_declared_deposits d
         WHERE d.tenant_id = $1
         ORDER BY d.created_at DESC
         LIMIT 50`, [tenantId])
     res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// ─── 10/5 (Nic): the tenant's photo of the bank's receipt ─────────────────────
+//
+// Optional, added to their own report after it is made (the report itself is
+// plain JSON). Stored like the landlord's bank-deposit photo
+// (lib/bankReceiptPhotos): images only, the same size cap, an unguessable file
+// name, and one authed serve route that authorizes PER ROW — the tenant who
+// made the report, or that landlord's own people at a property they work at.
+// Anyone else is told it is not there. Never a GAM admin from here, never a
+// static URL.
+const reportPhotoDir = bankReceiptPhotoDir('declared-deposit-receipts')
+const takeReportPhoto = takeBankReceiptPhoto(reportPhotoDir)
+const REPORT_PHOTO_PATH = '/api/declared-deposits/receipt-photos/'
+
+// POST /api/declared-deposits/:id/receipt-photo — multipart, field 'photo'.
+declaredDepositsRouter.post('/:id/receipt-photo', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant' || !req.user!.profileId) {
+      throw new AppError(403, 'Only the tenant who reported the deposit can add the bank\'s receipt to it')
+    }
+    if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, 'Report not found')
+    const row = await queryOne<{ status: string }>(
+      `SELECT status FROM tenant_declared_deposits WHERE id = $1 AND tenant_id = $2`,
+      [req.params.id, req.user!.profileId])
+    if (!row) throw new AppError(404, 'Report not found')
+    if (row.status === 'withdrawn') {
+      throw new AppError(409, 'That report was taken back, so there is nothing to add a photo to.')
+    }
+    next()
+  } catch (e) { next(e) }
+}, takeReportPhoto, async (req: any, res, next) => {
+  try {
+    if (!req.file) throw new AppError(400, 'Choose a photo of the bank\'s receipt.')
+    const url = REPORT_PHOTO_PATH + req.file.filename
+    const row = await queryOne<{ id: string; receipt_photo_url: string }>(
+      `UPDATE tenant_declared_deposits
+          SET receipt_photo_url = $3, receipt_photo_name = $4, receipt_photo_mime = $5,
+              receipt_photo_size = $6, receipt_photo_uploaded_at = NOW(), updated_at = NOW()
+        WHERE id = $1 AND tenant_id = $2 AND status <> 'withdrawn'
+       RETURNING id, receipt_photo_url`,
+      [req.params.id, req.user!.profileId, url, String(req.file.originalname || 'receipt').slice(0, 200),
+       req.file.mimetype, req.file.size])
+    if (!row) throw new AppError(404, 'Report not found')
+    res.json({ success: true, data: { id: row.id, receiptPhotoUrl: row.receipt_photo_url } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/declared-deposits/receipt-photos/:filename — the photo, per row.
+declaredDepositsRouter.get('/receipt-photos/:filename', async (req, res, next) => {
+  try {
+    const d = await queryOne<{ tenant_id: string; landlord_id: string; property_id: string | null }>(
+      `SELECT d.tenant_id, d.landlord_id, u.property_id
+         FROM tenant_declared_deposits d
+         LEFT JOIN leases l ON l.id = d.lease_id
+         LEFT JOIN units u  ON u.id = l.unit_id
+        WHERE d.receipt_photo_url = $1`, [REPORT_PHOTO_PATH + req.params.filename])
+    let allowed = false
+    if (d && req.user!.role === 'tenant') {
+      allowed = req.user!.profileId === d.tenant_id
+    } else if (d && landlordsOwnUser(req.user, d.landlord_id)) {
+      // A staffer assigned to some properties sees the reports made there only.
+      const scoped = await getScopedPropertyIds(req.user)
+      allowed = scoped === null || (!!d.property_id && scoped.includes(d.property_id))
+    }
+    // Someone else's photo reads as missing, never as "forbidden".
+    if (!allowed) throw new AppError(404, 'Not found')
+    const fp = resolveUploadPath(reportPhotoDir, req.params.filename)
+    if (!fp) throw new AppError(400, 'Invalid filename')
+    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.sendFile(fp)
   } catch (e) { next(e) }
 })
 
@@ -280,17 +376,29 @@ declaredDepositsRouter.get('/landlord/open', async (req, res, next) => {
               d.method, d.reference, d.status,
               u.unit_number,
               TRIM(COALESCE(usr.first_name,'') || ' ' || COALESCE(usr.last_name,'')) AS tenant_name,
+              -- 10/5: this landlord's own reports only — never another company's.
               (SELECT COUNT(*) FROM tenant_declared_deposits x
-                WHERE x.tenant_id = d.tenant_id AND x.status = 'unconfirmed')::int
-                AS prior_unconfirmed
+                WHERE x.tenant_id = d.tenant_id AND x.landlord_id = d.landlord_id
+                  AND ${DECLARATION_STRIKE_SQL('x')})::int
+                AS prior_unconfirmed,
+              -- 10/5 (Nic): the tenant's photo of the bank's receipt, and the
+              -- flag when the bank showed the deposit on a later day than they said.
+              d.receipt_photo_url,
+              to_char(d.bank_posted_date,'YYYY-MM-DD') AS bank_posted_date,
+              (d.false_date_flagged_at IS NOT NULL) AS date_flagged
          FROM tenant_declared_deposits d
          JOIN leases l ON l.id = d.lease_id
          JOIN units u ON u.id = l.unit_id
          JOIN tenants t ON t.id = d.tenant_id
          JOIN users usr ON usr.id = t.user_id
-        WHERE d.landlord_id = $1 AND d.status IN ('pending','unconfirmed')
-        ORDER BY d.status, d.declared_date DESC
-        LIMIT 200`, [landlordId])
+        WHERE d.landlord_id = $1
+          AND (d.status IN ('pending','unconfirmed') OR d.false_date_flagged_at IS NOT NULL)
+          -- A staffer assigned to some properties sees the reports made there only.
+          AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
+        -- 10/5: open reports first (a flagged confirmed one never ages out, and
+        -- must not push a live report off the list), then the newest.
+        ORDER BY (d.status IN ('pending','unconfirmed')) DESC, d.declared_date DESC, d.id
+        LIMIT 200`, [landlordId, await getScopedPropertyIds(req.user)])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })

@@ -2638,6 +2638,8 @@ export async function emailPaymentReceipt(
     creditBanked?: number
     /** S655: "your October bill", for a bill paid entirely with account credit. */
     billLabel?: string | null
+    /** 10/5 (Nic): a part payment — what is still owed after it, by charge. */
+    stillOwed?: Array<{ label: string; detail?: string | null; amount: number }>
     portalUrl?: string
   },
   ctx?: { landlordId?: string; tenantId?: string; paymentId?: string; replyTo?: ReplyTo },
@@ -2651,6 +2653,7 @@ export async function emailPaymentReceipt(
   // S655: nothing was charged — the account credit paid the whole thing.
   const creditOnly = args.amount <= 0 && credit > 0
   const bill = args.billLabel || 'bill'
+  const owedTotal = Math.round((args.stillOwed ?? []).reduce((t, l) => t + Math.round(l.amount * 100), 0)) / 100
 
   const line = (label: string, amount: string, color = '#b8c4d8', detail?: string | null) =>
     `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:${color};margin-bottom:5px">
@@ -2691,6 +2694,17 @@ export async function emailPaymentReceipt(
       (banked > 0
         ? p(`You paid <strong style="color:#eef1f8">${money(banked)}</strong> more than was owed. It is kept on your account as credit. It pays a bill by itself only when it covers the whole bill; otherwise you can choose to use it when you pay.`)
         : '') +
+      (owedTotal > 0
+        ? `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #d9534f">
+             <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">Still owed</div>
+             ${(args.stillOwed ?? []).map(l => line(l.label, money(l.amount), '#b8c4d8', l.detail)).join('')}
+             <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                         border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+               <span>Still owed</span><span>${money(owedTotal)}</span>
+             </div>
+           </div>` +
+          p(`This payment did not cover the whole bill. <strong style="color:#eef1f8">${money(owedTotal)}</strong> is still owed, and late fees under your lease still apply to it until it is paid.`)
+        : '') +
       (args.portalUrl ? btn('View your account', args.portalUrl) : '') +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Keep this receipt for your records.</div>`
     ),
@@ -2699,7 +2713,8 @@ export async function emailPaymentReceipt(
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.paymentId ? 'payment' : null,
       relatedEntityId: ctx?.paymentId ?? null,
-      metadata: { amount: Math.max(0, args.amount), credit_applied: credit, credit_banked: banked, credit_only: creditOnly },
+      metadata: { amount: Math.max(0, args.amount), credit_applied: credit, credit_banked: banked, credit_only: creditOnly,
+                  ...(owedTotal > 0 ? { still_owed: owedTotal } : {}) },
       replyTo: ctx?.replyTo,
     },
     // A receipt is something people reply to when a figure looks wrong.

@@ -37,9 +37,10 @@ import { FRESH_LIST, actionFailedSentence, loadFailedSentence } from './deskErro
 import { useCompanyMissing, useEntities } from '../components/EntityPicker'
 import { MakeDepositPanel } from './MakeDepositPanel'
 import '../styles/bank-reconciliation.css'
+import { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 import {
-  formatCurrency, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
-  type ManualPaymentMethod,
+  formatCurrency, DEPOSITABLE_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, declaredDateFlagText,
+  type ManualPaymentMethod, type DepositablePaymentMethod,
 } from '@gam/shared'
 
 /** Plain sentence per confidence — never the raw enum. */
@@ -100,7 +101,8 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
     () => apiGet('/bank-feed/deposits/unmatched' + entityQS),
     { ...FRESH_LIST, enabled: !companyMissing && !companiesLoading })
   const [chosen, setChosen] = useState<Record<string, string>>({})
-  const [method, setMethod] = useState<Record<string, ManualPaymentMethod>>({})
+  // 10/5: what went into the bank — cash, a check or a money order.
+  const [method, setMethod] = useState<Record<string, DepositablePaymentMethod>>({})
   // Why an action on one deposit failed, keyed by that deposit: said on its
   // card, or — when the list read again no longer holds it (matched or filed
   // meanwhile) — once above the list, naming the deposit.
@@ -136,7 +138,7 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
   }
 
   const confirm = useMutation(
-    (v: { id: string; name: string; chargeIds: string[]; method: ManualPaymentMethod; declarationId?: string }) =>
+    (v: { id: string; name: string; chargeIds: string[]; method: DepositablePaymentMethod; declarationId?: string }) =>
       apiPost(`/bank-feed/deposits/${v.id}/confirm`, {
         chargeIds: v.chargeIds, method: v.method, declarationId: v.declarationId ?? null,
       }),
@@ -318,7 +320,8 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
             )}
             <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
               {d.candidates.map((c: any) => (
-                <label key={c.leaseId} style={{
+                <div key={c.leaseId}>
+                <label style={{
                   display: 'flex', gap: 10, alignItems: 'flex-start', cursor: 'pointer',
                   padding: '7px 9px', borderRadius: 8,
                   border: `1px solid ${c.leaseId === pick ? 'var(--gold)' : 'var(--border-1)'}`,
@@ -331,16 +334,36 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
                     <strong>{c.tenantName}</strong>
                     <span style={{ color: 'var(--text-3)' }}> · {c.unitNumber} · {formatCurrency(Number(c.total))}</span>
                     <div style={{ color: 'var(--text-3)', fontSize: '.72rem', marginTop: 2 }}>
-                      {CONFIDENCE_LABEL[c.confidence] ?? c.confidence} — {c.reason}
+                      {CONFIDENCE_LABEL[c.confidence] ?? 'Possible match'} — {c.reason}
                     </div>
                   </span>
                 </label>
+                  {/* 10/5 (Nic): the tenant's report — its reference, their photo of
+                      the bank's receipt, and a plain flag when the bank shows a later day. */}
+                  {c.declaration && (
+                    <div style={{ fontSize: '.72rem', marginTop: 4, paddingLeft: 32 }}>
+                      {c.declaration.reference && (
+                        <span style={{ color: 'var(--text-2)' }}>Deposit reference {c.declaration.reference}</span>
+                      )}
+                      {!c.declaration.dateHolds && (
+                        <div role="note" style={{ marginTop: 2, color: 'var(--amber)', fontWeight: 600 }}>
+                          {declaredDateFlagText(c.declaration.declaredDate, d.postedDate)}{' '}
+                          The bank's date counts, so late fees up to it stay.
+                        </div>
+                      )}
+                      {c.declaration.receiptPhotoUrl && (
+                        <BankReceiptPhoto receiptId={null} url={c.declaration.receiptPhotoUrl}
+                          canAdd={false} onAdded={() => {}} label="Tenant's photo of the bank receipt" />
+                      )}
+                    </div>
+                  )}
+                </div>
               ))}
             </div>
 
             <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
               <span style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>Paid by</span>
-              {MANUAL_PAYMENT_METHODS.map((opt) => (
+              {DEPOSITABLE_PAYMENT_METHODS.map((opt) => (
                 <button key={opt} type="button"
                   className={m === opt ? 'btn btn-primary btn-sm' : 'btn btn-ghost btn-sm'}
                   aria-pressed={m === opt}
@@ -355,6 +378,9 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
               disabled={!cand || cand.chargeIds.length === 0 || confirm.isLoading || settingAsideThis}
               onClick={() => cand && confirm.mutate({
                 id: d.transactionId, name, chargeIds: cand.chargeIds, method: m,
+                // 10/5 (Nic): the tenant's report this match was made from — the
+                // landlord confirming it is what ties the report to this deposit.
+                declarationId: cand.declaration?.id,
               })}>
               {recordingThis ? 'Recording…'
                 : cand ? `Record as paid by ${cand.tenantName}` : 'Pick who paid this deposit'}

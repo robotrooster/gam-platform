@@ -48,6 +48,31 @@ export function usFederalHolidays(year: number): string[] {
   return all.map(d => d.toISODate()!).sort()
 }
 
+/**
+ * 10/5 (Nic): the days BANKS are closed for a holiday — the Federal Reserve's
+ * rule, which differs from the federal-employee rule above in one way: a
+ * holiday on a Saturday is NOT moved to the Friday before (the Fed and banks
+ * stay open that Friday); one on a Sunday is still closed the Monday after.
+ * Used to judge when a bank posts a branch deposit (lastPostingDayFor).
+ */
+export function usBankHolidays(year: number): string[] {
+  const fixed: Array<[number, number]> = [[1, 1], [6, 19], [7, 4], [11, 11], [12, 25]]
+  const fixedClosed = fixed
+    .map(([m, d]) => DateTime.fromObject({ year, month: m, day: d }, { zone: 'utc' }))
+    .filter(dt => dt.weekday !== 6)
+    .map(dt => (dt.weekday === 7 ? dt.plus({ days: 1 }) : dt))
+  const floats: DateTime[] = [
+    nthWeekdayOfMonth(year, 1, 1, 3), nthWeekdayOfMonth(year, 2, 1, 3), lastWeekdayOfMonth(year, 5, 1),
+    nthWeekdayOfMonth(year, 9, 1, 1), nthWeekdayOfMonth(year, 10, 1, 2), nthWeekdayOfMonth(year, 11, 4, 4),
+  ]
+  return [...fixedClosed, ...floats].map(d => d.toISODate()!).sort()
+}
+
+/** 10/5: `n` days banks are open after `from` — weekends and bank holidays (usBankHolidays) skipped. */
+export function addBankBusinessDays(from: string, n: number): string {
+  return walkBusinessDays(from, n, usBankHolidays)
+}
+
 export function isUsFederalHoliday(isoDate: string): boolean {
   const year = parseInt(isoDate.slice(0, 4), 10)
   return usFederalHolidays(year).includes(isoDate)
@@ -88,11 +113,15 @@ export function daysInMonth(year: number, month: number): number {
  * straddles New Year is correct in both years.
  */
 export function addBusinessDays(from: string, n: number): string {
+  return walkBusinessDays(from, n, usFederalHolidays)
+}
+
+function walkBusinessDays(from: string, n: number, holidaysOf: (year: number) => string[]): string {
   let dt = DateTime.fromISO(from, { zone: 'utc' })
   const holidaysByYear = new Map<number, Set<string>>()
   const holidaysFor = (year: number): Set<string> => {
     let s = holidaysByYear.get(year)
-    if (!s) { s = new Set(usFederalHolidays(year)); holidaysByYear.set(year, s) }
+    if (!s) { s = new Set(holidaysOf(year)); holidaysByYear.set(year, s) }
     return s
   }
   let moved = 0

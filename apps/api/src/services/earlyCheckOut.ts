@@ -227,7 +227,9 @@ export interface MoneySource {
 const methodKind = (m: string): StayRefundPartKind => (
   m === 'card' || m === 'card_on_file' ? 'card'
     : m === 'ach' ? 'bank'
-    : m === 'cash' ? 'cash'
+    // 10/5: a bank deposit was the resident's cash put into the landlord's
+    // bank — it is given back like cash.
+    : m === 'cash' || m === 'bank_deposit' ? 'cash'
     : m === 'money_order' ? 'money_order'
     : m === 'charge' ? 'charge'
     : 'check')
@@ -316,7 +318,8 @@ async function leaseSources(q: Q, s: StayRow): Promise<MoneySource[]> {
       ORDER BY COALESCE(r.settled_at, r.created_at) DESC, r.id DESC`, [s.lease_id])).rows
   const out: MoneySource[] = rent.map((r): MoneySource => {
     const kind = methodKind(r.payment_method ?? 'cash')
-    const how = kind === 'card' ? 'Card' : kind === 'bank' ? 'Bank payment' : kind === 'cash' ? 'Cash'
+    const how = kind === 'card' ? 'Card' : kind === 'bank' ? 'Bank payment'
+      : r.payment_method === 'bank_deposit' ? 'Bank deposit' : kind === 'cash' ? 'Cash'
       : kind === 'money_order' ? 'Money order' : 'Check'
     const paid = round2(r.toward - r.parts_toward)
     const stripe = kind === 'card' || kind === 'bank'

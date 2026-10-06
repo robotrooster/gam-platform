@@ -1264,6 +1264,26 @@ propertiesRouter.patch('/:id/onboarding-late-fee-waiver', requirePerm('propertie
   } catch (e) { next(e) }
 })
 
+// PATCH /api/properties/:id/partial-payments — 10/5 (Nic): "Maybe that's
+// something we set at the property level settings and let his property be set
+// to take partial payments because there's really no way to stop somebody from
+// going into the bank and making a partial." Body { accept: boolean }. Default
+// off. Applies to payments RECORDED here (cash, check, money order, bank
+// deposit): they may be less than the bill, pay the oldest bills first, and
+// what is left stays owed with late fees still applying. Online payments still
+// pay in full.
+propertiesRouter.patch('/:id/partial-payments', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { accept } = z.object({ accept: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE properties SET accept_partial_payments = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, accept])
+    res.json({ success: true, data: { propertyId: req.params.id, acceptPartialPayments: accept } })
+  } catch (e) { next(e) }
+})
+
 /**
  * S655 — record a change to a property's owner-signing routing and re-route
  * the owner's open signing seats. Runs on the CALLER's transaction — the same

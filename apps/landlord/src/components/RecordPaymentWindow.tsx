@@ -26,8 +26,8 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, type ManualPaymentMethod } from '@gam/shared'
-import { apiGet, apiPost } from '../lib/api'
+import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, MANUAL_PAYMENT_METHOD_WORD, type ManualPaymentMethod } from '@gam/shared'
+import { api, apiGet, apiPost } from '../lib/api'
 import { TAP_WINDOW_SECONDS } from '../lib/terminal'
 import {
   money, toCents, toDollars, parseAmount, dayWord, localToday,
@@ -36,6 +36,7 @@ import {
   postConfirmQuestion, numberRequired, deskFigures, sameFigures, figuresMovedMessage, CREDIT_USE_RULE,
   chargeMonthsRange, readChargesById, CHARGE_PAGE_SIZE, withReaderTaken, readerFinishedMessage,
   deskOnItsWay, nextAwaitingRereadAt, awaitingOpensAtWord,
+  AMOUNT_FIELD_LABEL, NUMBER_FIELD_LABEL, numberMissingMessage, depositPhotoProblem, billName, stillOwedText, lateFeesOffText, lateFeesBackOnShortBills,
   type CreditChoice, type DeskFigures, type DeskQuote, type DeskQuoteRow, type ReaderQuote, type ReaderSpace,
 } from '../lib/creditDesk'
 import '../styles/credit-desk.css'
@@ -48,6 +49,44 @@ const MSG_CLASS: Record<NonNullable<Msg>['kind'], string> = {
 function Message({ msg }: { msg: Msg }) {
   if (!msg) return null
   return <div className={`${MSG_CLASS[msg.kind]} cd-msg`} role={msg.kind === 'error' ? 'alert' : 'status'}>{msg.text}</div>
+}
+
+/**
+ * 10/5 (Nic): "maybe ... add a picture of the receipt" — the photo of the
+ * bank's deposit receipt, sent once the payment is recorded (it goes on that
+ * payment's receipt). Resolves to null when it went up, else the words to add
+ * to the result: the payment itself was recorded either way.
+ */
+export async function sendDepositPhoto(receiptId: string | null | undefined, photo: File | null): Promise<string | null> {
+  if (!photo) return null
+  if (!receiptId) return 'The photo of the bank\'s receipt was not added — add it from Payments.'
+  try {
+    const fd = new FormData()
+    fd.append('photo', photo)
+    await api.post(`/payments/remittances/${receiptId}/deposit-photo`, fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+    return null
+  } catch {
+    return 'The photo of the bank\'s receipt did not upload — add it from Payments.'
+  }
+}
+
+/** 10/5 (Nic): the optional photo of the bank's deposit receipt, picked before Record. */
+export function DepositPhotoField({ photo, onPick, disabled = false }: {
+  photo: File | null; onPick: (f: File | null, problem: string | null) => void; disabled?: boolean
+}) {
+  return (
+    <label className="cd-field">
+      <span className="cd-field-label">Photo of the bank&apos;s deposit receipt (optional)</span>
+      <input className="form-input" type="file" accept="image/*" disabled={disabled}
+        onChange={e => {
+          const f = e.target.files?.[0] ?? null
+          const problem = depositPhotoProblem(f)
+          onPick(problem ? null : f, problem)
+          if (problem) e.target.value = ''
+        }} />
+      {photo && <span className="cd-line-meta">{photo.name}</span>}
+    </label>
+  )
 }
 
 /** How long Close waits for the bill read after the last card before it says the take alone (fix pass 5). */
@@ -135,7 +174,16 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   // cancel a charge the customer is about to tap, or drop one being recorded.
   const [readerBusy, setReaderBusy] = useState<Record<string, boolean>>({})
   const anyReaderBusy = Object.values(readerBusy).some(Boolean)
-  const quoteKey = ['desk-quote', anchorPaymentId]
+  const [mode, setMode] = useState<ManualPaymentMethod | 'reader' | null>(null)
+  // 10/5: the day the resident put the money in the bank — logged after the
+  // fact, the payment counts from that day (its on-time or late mark), and
+  // paid in full, late fees charged after it come off — so the bill is read
+  // as of that day (?depositedOn=).
+  const deskToday = localToday()
+  const [depositedOn, setDepositedOn] = useState(deskToday)
+  const backdatedTo = mode === 'bank_deposit' && /^\d{4}-\d{2}-\d{2}$/.test(depositedOn) && depositedOn < deskToday
+    ? depositedOn : null
+  const quoteKey = ['desk-quote', anchorPaymentId, backdatedTo]
   // The window's result, said ONCE (fix pass 3): the screen that stays up with
   // the change to hand back, and the one notice the page keeps.
   const [done, setDone] = useState<{ text: string; change: number } | null>(null)
@@ -152,8 +200,8 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   // moment that space is taken. Fix pass 3: once the window is finished it is
   // not read at all — the done screen (and the change on it) never moves.
   const { data: quote, isLoading, error: quoteError, refetch, isFetching, dataUpdatedAt, errorUpdatedAt } = useQuery<DeskQuote>(
-    quoteKey, () => apiGet<DeskQuote>(`/payments/${anchorPaymentId}/record-manual/quote`),
-    { staleTime: 0, cacheTime: 0, retry: false, enabled: !done,
+    quoteKey, () => apiGet<DeskQuote>(`/payments/${anchorPaymentId}/record-manual/quote${backdatedTo ? `?depositedOn=${backdatedTo}` : ''}`),
+    { staleTime: 0, cacheTime: 0, retry: false, enabled: !done, keepPreviousData: true,
       refetchOnWindowFocus: !anyReaderBusy && !done, refetchOnReconnect: !anyReaderBusy && !done })
   // The words each line goes by — the same lines the Outstanding breakdown reads.
   const { data: invoices = [] } = useQuery<any[]>(
@@ -165,7 +213,6 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
     return m
   }, [invoices])
 
-  const [mode, setMode] = useState<ManualPaymentMethod | 'reader' | null>(null)
   const [choice, setChoice] = useState<CreditChoice>(null)
   // The credit figure on screen (cents) when the desk said Use or Save — the
   // figure sent back, so a credit that moved afterwards is the server's 409,
@@ -173,6 +220,8 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   const [shownCredit, setShownCredit] = useState<number | null>(null)
   const [tendered, setTendered] = useState('')
   const [reference, setReference] = useState('')
+  // 10/5 (Nic): a bank deposit's optional photo of the bank's receipt.
+  const [photo, setPhoto] = useState<File | null>(null)
   const [towardOld, setTowardOld] = useState('')
   const [surplusHandling, setSurplusHandling] = useState<'change' | 'credit' | null>(null)
   const [writtenConfirmed, setWrittenConfirmed] = useState(false)
@@ -277,10 +326,17 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   const method: ManualPaymentMethod | null = mode && mode !== 'reader' ? mode : (creditOnly && mode === null ? 'cash' : null)
   const tenderedCents = parseAmount(tendered)
   const towardOldCents = parseAmount(towardOld)
+  // "Rent", "Water" — what each line of the bill is called (for "stays owed on October rent").
+  const labelOf = (id: string, type: string) => labels.get(id)?.label ?? humanize(type)
   const plan = quote && method ? planTender(quote, {
     method, tenderedCents, choice: liveChoice, towardOldCents, surplusHandling: liveSurplus, writtenConfirmed: liveWritten,
     answeredCreditCents: liveChoice !== null ? shownCredit : null,
+    nameOf: r => labelOf(r.id, r.type),
   }) : null
+  // 10/5 (Nic): a bank deposit dated back that pays a bill only in part — the
+  // late fees left off that bill go back on it (the server judges each bill).
+  const feesBackCents = quote && plan && method === 'bank_deposit' && backdatedTo
+    ? lateFeesBackOnShortBills(quote, plan.shortInvoiceIds) : 0
   const needNumber = !!method && numberRequired(method)
   const oldOwed = quote ? oldBalanceOwedCents(quote) : 0
   const anchor = quote ? postAnchor(quote) : null
@@ -299,7 +355,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   const record = async () => {
     if (!quote || !plan?.body || !anchor || !method) return
     if (needNumber && !reference.trim()) {
-      setMsg({ kind: 'error', text: `Enter the ${method === 'check' ? 'check' : 'money order'} number — it is the receipt if the payment is ever questioned.` })
+      setMsg({ kind: 'error', text: numberMissingMessage(method) })
       return
     }
     setSaving(true); clearMsg()
@@ -307,11 +363,21 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
       const r: any = await apiPost(`/payments/${anchor}/record-manual`, {
         ...plan.body,
         reference: reference.trim() || undefined,
+        // Today is the default: sent only when the deposit was made earlier.
+        ...(method === 'bank_deposit' && depositedOn && depositedOn !== deskToday ? { depositedOn } : {}),
       })
       const d = r?.data ?? {}
+      // 10/5: a part payment says what stays owed, and on which bills.
+      const stillOwedNames = (Array.isArray(d.stillOwedRows) ? d.stillOwedRows : [])
+        .map((x: any) => billName(String(x.dueDate ?? ''), labelOf(String(x.restOf ?? x.id), String(x.type ?? ''))))
+      // 10/5 (Nic): the photo of the bank's receipt goes on the payment just recorded.
+      const photoNote = method === 'bank_deposit' ? await sendDepositPhoto(d.receiptId, photo) : null
       // A space taken on the reader earlier in this visit is said too (fix pass
       // 2): the closing notice is the only word on it once the window is gone.
-      const text = withReaderTaken(recordedMessage(name, d), takenOnReader)
+      const text = withReaderTaken(recordedMessage(name, {
+        ...d, stillOwedNames, depositedOn: method === 'bank_deposit' ? depositedOn : null,
+      }), takenOnReader)
+        + (photoNote ? ` ${photoNote}` : '')
       qc.invalidateQueries('outstanding-balances')
       qc.invalidateQueries(['balance-invoices', tenantId])
       qc.invalidateQueries('payments-ledger')
@@ -377,7 +443,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   }, [allTapped, readAfterTake])   // eslint-disable-line react-hooks/exhaustive-deps
 
   const pickMode = (m: ManualPaymentMethod | 'reader') => {
-    setMode(m); setTendered(''); setReference(''); setTowardOld('')
+    setMode(m); setTendered(''); setReference(''); setPhoto(null); setDepositedOn(deskToday); setTowardOld('')
     setSurplusHandling(null); setWrittenConfirmed(false); clearMsg()
   }
 
@@ -560,9 +626,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
 
               {method && mode !== null && (<>
                 <label className="cd-field">
-                  <span className="cd-field-label">
-                    {method === 'cash' ? 'Cash handed over' : method === 'check' ? 'Amount on the check' : 'Amount on the money order'}
-                  </span>
+                  <span className="cd-field-label">{AMOUNT_FIELD_LABEL[method]}</span>
                   <input className="form-input mono" inputMode="decimal" autoFocus
                     placeholder={plan ? toDollars(plan.owedCents).toFixed(2) : ''}
                     value={tendered}
@@ -570,10 +634,40 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                 </label>
                 {needNumber && (
                   <label className="cd-field">
-                    <span className="cd-field-label">{method === 'check' ? 'Check number' : 'Money order number'}</span>
+                    <span className="cd-field-label">{NUMBER_FIELD_LABEL[method]}</span>
                     <input className="form-input" value={reference} maxLength={120} placeholder="e.g. 1042"
                       onChange={e => { setReference(e.target.value); clearMsg() }} />
                   </label>
+                )}
+                {method === 'bank_deposit' && (
+                  <label className="cd-field">
+                    <span className="cd-field-label">Date deposited</span>
+                    <input className="form-input" type="date" value={depositedOn} max={deskToday}
+                      onChange={e => { setDepositedOn(e.target.value); clearMsg() }} />
+                  </label>
+                )}
+                {/* 10/5 (Nic): late fees go by the day the money went into the bank. */}
+                {method === 'bank_deposit' && backdatedTo && toCents(quote?.lateFeesOffIfPaidInFull) > 0 && (
+                  <div className="cd-note" role="status">
+                    Deposited before {money(quote!.lateFeesOffIfPaidInFull!)} in late fees were charged: they are left
+                    off this bill, and come off each bill this deposit pays in full. A bill it pays only in part keeps its late fees.
+                  </div>
+                )}
+                {/* 10/5 (Nic): "maybe ... add a picture of the receipt" — a bank deposit only. */}
+                {method === 'bank_deposit' && (
+                  <DepositPhotoField photo={photo} disabled={saving}
+                    onPick={(f, problem) => { setPhoto(f); if (problem) setMsg({ kind: 'error', text: problem }); else clearMsg() }} />
+                )}
+
+                {/* 10/5 (Nic): the property takes part payments — what stays owed after this one. */}
+                {plan && plan.stop === null && plan.stillOwedText && (
+                  <div className="alert alert-warn cd-msg" role="status">
+                    Part payment. {feesBackCents > 0
+                      ? `${stillOwedText(plan.stillOwedCents + feesBackCents, plan.stillOwedNames)} That includes ${money(toDollars(feesBackCents))} in late fees, which stay on a bill paid only in part.`
+                      : plan.stillOwedText}
+                    {plan.toOldCents > 0 ? ` ${money(toDollars(plan.toOldCents))} goes to the old balance.` : ''}
+                    {plan.keptAsCreditCents > 0 ? ` ${money(toDollars(plan.keptAsCreditCents))} is kept on their account as credit.` : ''}
+                  </div>
                 )}
 
                 {/* Cash over the bill with change given: some of it may go to the old balance. */}
@@ -633,9 +727,9 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                 )}
 
                 {planMsg && plan?.stop !== 'short' && <Message msg={{ kind: 'error', text: planMsg }} />}
-                {method !== 'cash' && plan && plan.stop === null && plan.surplusCents > 0 && (
+                {method !== 'cash' && plan && plan.stop === null && plan.surplusCents > 0 && !plan.stillOwedText && (
                   <div className="cd-note">
-                    No change is given on a {method === 'check' ? 'check' : 'money order'}.
+                    No change is given on a {MANUAL_PAYMENT_METHOD_WORD[method]}.
                     {plan.toOldCents > 0 ? ` ${money(toDollars(plan.toOldCents))} pays the old balance;` : ''}
                     {' '}{money(toDollars(plan.surplusCents))} stays on their account as credit. {CREDIT_USE_RULE}
                   </div>
@@ -713,7 +807,8 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
         <div className="cd-actions cd-footer">
           {method && quote && !nothingHere && (
             <button className="btn btn-primary cd-grow"
-              disabled={saving || closing || isFetching || !plan || plan.stop !== null || !anchor || (needNumber && !reference.trim())}
+              disabled={saving || closing || isFetching || !plan || plan.stop !== null || !anchor || (needNumber && !reference.trim())
+                || (method === 'bank_deposit' && (!depositedOn || depositedOn > deskToday))}
               onClick={record}>
               {saving ? 'Recording…'
                 : creditOnly && (tenderedCents ?? 0) === 0
@@ -1181,6 +1276,8 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
   const [method, setMethod] = useState<ManualPaymentMethod | null>(null)
   const [amount, setAmount] = useState('')
   const [reference, setReference] = useState('')
+  // 10/5 (Nic): a bank deposit's optional photo of the bank's receipt.
+  const [photo, setPhoto] = useState<File | null>(null)
   const [receivedAt, setReceivedAt] = useState(today)
   const [notes, setNotes] = useState('')
   const [confirming, setConfirming] = useState(false)
@@ -1203,13 +1300,25 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
       const parts = [`Posted ${money(toDollars(cents))} from ${name}`]
       if (toCents(d.applied) > 0) parts.push(`${money(d.applied)} paid what was open`)
       if (toCents(d.paidAhead) > 0) parts.push(`${money(d.paidAhead)} kept as paid ahead`)
+      // 10/5: the property takes part payments — what stays owed after this one.
+      if (toCents(d.stillOwed) > 0) {
+        const names = (Array.isArray(d.stillOwedRows) ? d.stillOwedRows : [])
+          .map((x: any) => billName(String(x.dueDate ?? ''), humanize(String(x.type ?? ''))))
+        parts.push(stillOwedText(toCents(d.stillOwed), names).replace(/\.$/, ''))
+      }
+      // 10/5 (Nic): a bank deposit dated back — late fees charged after it came off.
+      const feesOff = method === 'bank_deposit' && receivedAt
+        ? lateFeesOffText(receivedAt, Number(d.lateFeesUnbilled ?? 0), Number(d.lateFeesRefunded ?? 0)) : null
+      if (feesOff) parts.push(feesOff.replace(/\.$/, ''))
+      // 10/5 (Nic): the photo of the bank's receipt goes on the payment just posted.
+      const photoNote = method === 'bank_deposit' ? await sendDepositPhoto(d.remittanceId, photo) : null
       qc.invalidateQueries('outstanding-balances')
       qc.invalidateQueries(['tenant-profile', tenantId])
       qc.invalidateQueries('payments-ledger')
       // A payment posted by hand is cash for the bank deposit too.
       qc.invalidateQueries('undeposited-cash')
       qc.invalidateQueries('deposit-slips')
-      onPosted(parts.join(' — ') + '.')
+      onPosted(parts.join(' — ') + '.' + (photoNote ? ` ${photoNote}` : ''))
     } catch (e) {
       setConfirming(false)
       setMsg({ kind: 'error', text: serverMessage(e, 'That payment could not be posted. Nothing was recorded — try again.') })
@@ -1231,32 +1340,36 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
             )}
           </div>
           <div className="cd-sub">
-            Money that arrived before its bill. It pays what is open first; the rest is kept on their account as
-            paid ahead. {CREDIT_USE_RULE}
+            Money that arrived before its bill. It pays what is open first, oldest bill first; anything over what
+            is owed is kept on their account as paid ahead. {CREDIT_USE_RULE}
           </div>
         </div>
         <div className="cd-window-body">
           <div className="cd-methods" role="group" aria-label="How they paid">
             {MANUAL_PAYMENT_METHODS.map(m => (
               <button key={m} type="button" className={`cd-option${method === m ? ' on' : ''}`}
-                onClick={() => { setMethod(m); setReference(''); setConfirming(false); setMsg(null) }}>
+                onClick={() => { setMethod(m); setReference(''); setPhoto(null); setConfirming(false); setMsg(null) }}>
                 <span className="cd-option-title">{MANUAL_PAYMENT_METHOD_LABELS[m]}</span>
               </button>
             ))}
           </div>
           <label className="cd-field">
-            <span className="cd-field-label">Amount received</span>
+            <span className="cd-field-label">{method === 'bank_deposit' ? AMOUNT_FIELD_LABEL[method] : 'Amount received'}</span>
             <input className="form-input mono" inputMode="decimal" placeholder="0.00" value={amount}
               onChange={e => { setAmount(e.target.value); setConfirming(false) }} />
           </label>
-          {needNumber && (
+          {needNumber && method && (
             <label className="cd-field">
-              <span className="cd-field-label">{method === 'check' ? 'Check number' : 'Money order number'}</span>
-              <input className="form-input" value={reference} maxLength={64} onChange={e => setReference(e.target.value)} />
+              <span className="cd-field-label">{NUMBER_FIELD_LABEL[method]}</span>
+              <input className="form-input" value={reference} maxLength={120} onChange={e => setReference(e.target.value)} />
             </label>
           )}
+          {method === 'bank_deposit' && (
+            <DepositPhotoField photo={photo} disabled={saving}
+              onPick={(f, problem) => { setPhoto(f); setMsg(problem ? { kind: 'error', text: problem } : null) }} />
+          )}
           <label className="cd-field">
-            <span className="cd-field-label">Date received</span>
+            <span className="cd-field-label">{method === 'bank_deposit' ? 'Date deposited' : 'Date received'}</span>
             <input className="form-input" type="date" value={receivedAt} max={today} onChange={e => setReceivedAt(e.target.value)} />
           </label>
           <label className="cd-field">

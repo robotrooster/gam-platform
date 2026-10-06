@@ -268,6 +268,25 @@ export interface LedgerPayment {
   credit_returned: number
   method: string | null
   method_label: string
+  /**
+   * 10/5 (Nic): the receipt this payment is (null when it has none: paid from
+   * credit, or settled with no receipt), its reference — a check or
+   * money-order number, a bank deposit's reference — and, for a bank deposit,
+   * the photo of the bank's receipt (an authed URL; the landlord's own people
+   * only — this ledger is never the tenant's).
+   */
+  receipt_id: string | null
+  reference: string | null
+  deposit_photo_url: string | null
+  /**
+   * 10/5 (Nic): a payment made from a bank deposit the tenant reported — the
+   * date they gave and the bank's, when the bank showed it on a later day than
+   * the next business day after theirs (the bank's date was used; the screen
+   * says "Said they deposited Oct 1 — the bank shows Oct 6."). Null otherwise.
+   */
+  deposit_date_flag: { said: string; bank: string } | null
+  /** 10/5 (Nic): the tenant's own photo of the bank's receipt on that report (an authed URL). */
+  tenant_receipt_photo_url: string | null
   status: LedgerPaymentStatus
   status_label: string
   /** "September rent, September water". */
@@ -603,6 +622,8 @@ interface FiledPart {
 interface ReceiptFacts {
   id: string; tenant_id: string; status: string; payment_method: string | null
   retrying: boolean; paid_on: string; arrived_on: string | null; channel: string | null
+  reference: string | null; deposit_photo_url: string | null
+  flag_said: string | null; flag_bank: string | null; tenant_receipt_photo_url: string | null
 }
 
 interface Draft {
@@ -759,8 +780,21 @@ export async function listPaymentsByMonth(opts: PaymentsMonthOptions): Promise<P
             CASE WHEN rem.status = 'settled'
                  THEN to_char(${propertyDaySql('COALESCE(rem.settled_at, rem.created_at)', 'rem')}, 'YYYY-MM-DD') END AS arrived_on,
             (SELECT ap.payment_channel FROM remittance_applications ra JOIN payments ap ON ap.id = ra.payment_id
-              WHERE ra.remittance_id = rem.id AND ap.payment_channel IS NOT NULL ORDER BY ap.id LIMIT 1) AS channel
+              WHERE ra.remittance_id = rem.id AND ap.payment_channel IS NOT NULL ORDER BY ap.id LIMIT 1) AS channel,
+            tr.reference, tr.deposit_photo_url,
+            -- 10/5 (Nic): the tenant's report this bank deposit confirmed
+            -- (the match's receipt), its flag and its photo.
+            CASE WHEN dd.false_date_flagged_at IS NOT NULL THEN to_char(dd.declared_date, 'YYYY-MM-DD') END AS flag_said,
+            CASE WHEN dd.false_date_flagged_at IS NOT NULL THEN to_char(dd.bank_posted_date, 'YYYY-MM-DD') END AS flag_bank,
+            dd.receipt_photo_url AS tenant_receipt_photo_url
        FROM rem
+       JOIN tenant_remittances tr ON tr.id = rem.id
+       LEFT JOIN LATERAL (
+         SELECT d.declared_date, d.bank_posted_date, d.false_date_flagged_at, d.receipt_photo_url
+           FROM tenant_declared_deposits d
+           JOIN bank_transactions bt ON bt.id = d.bank_transaction_id
+          WHERE d.status = 'confirmed' AND bt.auto_settle_undo->>'receiptId' = tr.id::text
+          LIMIT 1) dd ON TRUE
       WHERE rem.id = ANY($2::uuid[])`,
     [landlordIds, receiptIds]) : []).map(r => [r.id, r]))
 
@@ -917,6 +951,11 @@ export async function listPaymentsByMonth(opts: PaymentsMonthOptions): Promise<P
       credit_returned: dollars(creditReturnedC),
       method,
       method_label: methodLabel(method, channel),
+      receipt_id: receipt ? receipt.id : null,
+      reference: receipt?.reference ?? null,
+      deposit_photo_url: receipt?.deposit_photo_url ?? null,
+      deposit_date_flag: receipt?.flag_said && receipt?.flag_bank ? { said: receipt.flag_said, bank: receipt.flag_bank } : null,
+      tenant_receipt_photo_url: receipt?.tenant_receipt_photo_url ?? null,
       status,
       status_label: LEDGER_PAYMENT_STATUS_LABEL[status],
       paid_for: uniq(lines.map(l => `${monthLabel(l.due_date)} ${lowerFirst(l.label)}`)).join(', '),

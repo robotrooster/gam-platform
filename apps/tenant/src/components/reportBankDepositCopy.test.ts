@@ -47,6 +47,9 @@ describe('reporting a deposit when GAM is reading the landlord’s bank', () => 
     const copy = reportDepositCopy('watching', 7)
     expect(copy.intro).toMatch(/watch their bank/)
     expect(copy.intro).toMatch(/dated the day you paid/)
+    // 10/5 (Nic): only when the bank shows it that day or the next business day.
+    expect(copy.intro).toMatch(/that day or the next business day/)
+    expect(copy.intro).toMatch(/the bank’s date is used/)
     expect(copy.warning).toMatch(/ends after 7 days/)
     expect(copy.confirm).toMatch(/until it shows up in the bank/)
   })

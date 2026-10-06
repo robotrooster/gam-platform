@@ -51,6 +51,17 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
     const residents = await listOpenTenantBalances({
       landlordIds, propertyIds: scopedIds, includeClearing: true, includeWorkTrade: seesWorkTrade,
     })
+    // 10/5 (Nic): whether money RECORDED for this household may be less than
+    // the bill — every property it owes at takes part payments (the desk
+    // quote's rule, services/manualPaymentSettle) — so the Front Desk never
+    // tells someone "rent cannot be part-paid" where it can.
+    const propIds = [...new Set(residents.flatMap(r => r.property_ids ?? []).filter((x): x is string => !!x))]
+    const partialOk = new Set(propIds.length ? (await query<{ id: string }>(
+      `SELECT id FROM properties WHERE id = ANY($1::uuid[]) AND accept_partial_payments`, [propIds])).map(r => r.id) : [])
+    for (const r of residents as any[]) {
+      const ids: string[] = (r.property_ids ?? []).filter((x: string | null) => !!x)
+      r.accept_partial_payments = ids.length > 0 && ids.every(id => partialOk.has(id))
+    }
     const out: any[] = residents.filter(r => listClearingOnly || r.status === 'owes')
     const everyone: any[] = [...residents]
     // S649 (Nic): "make sure POS pay links and outstanding tickets show in

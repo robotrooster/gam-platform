@@ -1,7 +1,7 @@
 import { Fragment, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
-import { TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL } from '@gam/shared'
+import { TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL, declaredDateFlagText } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { useAuth } from '../context/AuthContext'
@@ -14,6 +14,11 @@ import {
   type LedgerPayment, type ReturnFacts,
 } from '../lib/creditDesk'
 import '../styles/credit-desk.css'
+
+// 10/5 (Nic): the photo of a bank's receipt on a payment (its own file, so the
+// bank review shows the tenant's photo without loading this page).
+export { BankReceiptPhoto } from '../components/BankReceiptPhoto'
+import { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 
 // ── THE PAYMENTS TAB: PAYMENTS ALREADY MADE, BY MONTH ──────────────────────
 //
@@ -401,7 +406,25 @@ export function PaymentsPage() {
                           {toCents(p.returned) > 0 && <div className="cd-ledger-sub cd-timing-late">{money(p.returned)} taken back</div>}
                           {toCents(p.creditReturned) > 0 && <div className="cd-ledger-sub cd-timing-late">{money(p.creditReturned)} credit taken back</div>}
                         </td>
-                        <td>{p.methodLabel}</td>
+                        <td>
+                          {p.methodLabel}
+                          {p.reference && <div className="cd-ledger-sub">#{p.reference}</div>}
+                          {p.method === 'bank_deposit' && (
+                            <BankReceiptPhoto receiptId={p.receiptId} url={p.depositPhotoUrl}
+                              canAdd={can('take_payment')} onAdded={() => refetch()} />
+                          )}
+                          {/* 10/5 (Nic): the tenant's report this deposit confirmed — their
+                              photo, and the flag when the bank showed a later day. */}
+                          {p.tenantReceiptPhotoUrl && (
+                            <BankReceiptPhoto receiptId={p.receiptId} url={p.tenantReceiptPhotoUrl}
+                              canAdd={false} onAdded={() => {}} label="Tenant's photo of the bank receipt" />
+                          )}
+                          {p.depositDateFlag && (
+                            <div className="cd-ledger-sub cd-timing-late" role="note">
+                              {declaredDateFlagText(p.depositDateFlag.said, p.depositDateFlag.bank)}
+                            </div>
+                          )}
+                        </td>
                         <td className={p.daysLate > 0 ? 'cd-timing-late' : undefined}>{p.timingLabel}</td>
                         <td>
                           <span className={`badge ${STATUS_BADGE[p.status] ?? 'badge-muted'}`}>{p.statusLabel}</span>

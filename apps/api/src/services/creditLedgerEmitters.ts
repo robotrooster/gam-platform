@@ -105,6 +105,16 @@ async function isOnboardingMonthCharge(client: PoolClient, paymentId: string): P
 export const PART_PAID_REST_NOTE = 'What is left of the old balance after a part payment'
 
 /**
+ * 10/5 (Nic): the note manualPaymentSettle writes on the rest of a bill (rent)
+ * a part payment did not cover. The rest is its own open row (is_remainder) on
+ * the same bill, so late fees keep applying to it; like the rest of an old
+ * balance, it carries over the bill it belongs to, so its on-time or late mark
+ * — written the day it is paid, i.e. the day the bill is paid in full — counts
+ * from that bill.
+ */
+export const PART_PAYMENT_REST_NOTE = 'What is left of this bill after a part payment'
+
+/**
  * A payment row's kind, and the day GAM wrote the bill it belongs to on the
  * property's calendar (null when the row has no creation time). Null when the
  * row is not found.
@@ -126,7 +136,7 @@ async function billFacts(
   const { rows } = await client.query<{ type: string; written_at: Date | null }>(
     `SELECT p.type, CASE
               WHEN p.reversal_id IS NOT NULL
-                OR (p.is_remainder AND p.notes LIKE ($2 || '%'))
+                OR (p.is_remainder AND (p.notes LIKE ($2 || '%') OR p.notes LIKE ($3 || '%')))
               THEN (SELECT MIN(f.created_at) FROM payments f
                      WHERE f.lease_id IS NOT DISTINCT FROM p.lease_id
                        AND f.tenant_id IS NOT DISTINCT FROM p.tenant_id
@@ -138,7 +148,7 @@ async function billFacts(
             END AS written_at
        FROM payments p
       WHERE p.id = $1`,
-    [paymentId, PART_PAID_REST_NOTE])
+    [paymentId, PART_PAID_REST_NOTE, PART_PAYMENT_REST_NOTE])
   const row = rows[0]
   if (!row) return null
   const at = row.written_at

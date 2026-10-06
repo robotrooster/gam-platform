@@ -5516,6 +5516,7 @@ export function formatCurrency(amount: number): string {
 
 // === S25: businessDay + paymentAllocation re-exports ===
 export * from './businessDay'
+import { addBankBusinessDays as _addBankBusinessDays } from './businessDay'
 // S633: the standalone-page scroll unlock, shared so it cannot be fixed in one
 // portal and left broken in the other — which is exactly what happened.
 export * from './standaloneScroll'
@@ -5608,6 +5609,7 @@ export function paidByLabel(
     case 'cash':              return 'Cash'
     case 'check':             return 'Check'
     case 'money_order':       return 'Money order'
+    case 'bank_deposit':      return 'Bank deposit'
     case 'prior_arrangement': return 'Prior arrangement'
     case 'ach':               return 'Bank (ACH)'
     case 'card':              return channel === 'in_person' ? 'Card · in person' : 'Card · online'
@@ -5615,8 +5617,97 @@ export function paidByLabel(
   }
 }
 
-export const MANUAL_PAYMENT_METHODS = ['cash', 'check', 'money_order'] as const
+// 10/5 (Nic): 'bank_deposit' — in Mattoon (Country Acres) residents "go into
+// the bank and deposit cash into the bank", and the office logs it from the
+// bank's receipt: "a reference number to the bank deposit in case somebody else
+// happens to deposit the same amount", and optionally a photo of that receipt.
+// It is the resident's cash already in the landlord's bank: no change is ever
+// given (anything over what is owed is kept as credit, like a check), it is
+// free like cash and checks, and it is never cash on hand waiting to be
+// deposited — DEPOSITABLE_PAYMENT_METHODS below leaves it out.
+export const MANUAL_PAYMENT_METHODS = ['cash', 'check', 'money_order', 'bank_deposit'] as const
 export type ManualPaymentMethod = typeof MANUAL_PAYMENT_METHODS[number]
+/**
+ * 10/5 (Nic): the recorded methods that are money handed over and still to be
+ * taken to the bank — what a deposit slip carries, what a resident reports
+ * having deposited, and what a bank-feed deposit is matched as. A bank deposit
+ * is already in the bank, so it is not one of them.
+ */
+export const DEPOSITABLE_PAYMENT_METHODS = ['cash', 'check', 'money_order'] as const
+export type DepositablePaymentMethod = typeof DEPOSITABLE_PAYMENT_METHODS[number]
+/** The method in a sentence ("No change is given on a bank deposit"). */
+export const MANUAL_PAYMENT_METHOD_WORD: Record<ManualPaymentMethod, string> = {
+  cash: 'cash', check: 'check', money_order: 'money order', bank_deposit: 'bank deposit',
+}
+/** 10/5 (Nic): the photo of the bank's deposit receipt — images only. */
+export const BANK_DEPOSIT_PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'] as const
+export const BANK_DEPOSIT_PHOTO_MAX_BYTES = 10 * 1024 * 1024
+/**
+ * 10/5 (Nic): the one line beside the per-property "Accept partial payments"
+ * setting. Generic on purpose — no state-specific text (national platform).
+ */
+export const PARTIAL_PAYMENTS_LAW_NOTE = 'Some places limit what happens after you accept part of the rent — check your local laws.'
+/**
+ * 10/5 (Nic): why a picked photo of the bank's receipt cannot be sent (null:
+ * it can) — the landlord's photo on a recorded bank deposit and the tenant's
+ * on their own report take the same files.
+ */
+export function bankReceiptPhotoProblem(file: { type: string; size: number } | null | undefined): string | null {
+  if (!file) return null
+  if (!(BANK_DEPOSIT_PHOTO_TYPES as readonly string[]).includes(file.type)) {
+    return 'Choose a photo (JPEG, PNG, WebP or HEIC) of the bank\'s receipt.'
+  }
+  if (file.size > BANK_DEPOSIT_PHOTO_MAX_BYTES) {
+    return `That photo is too large — the limit is ${Math.round(BANK_DEPOSIT_PHOTO_MAX_BYTES / (1024 * 1024))} MB.`
+  }
+  return null
+}
+/** 10/5 (Nic): the box for a bank deposit's reference — the desk's and the tenant's report. */
+export const DEPOSIT_REFERENCE_LABEL = 'Deposit reference number — from the bank\'s receipt'
+
+// ── 10/5 (Nic): the date a tenant says they deposited, against the bank's ──
+//
+// "if they say they paid on time and it was actually late we need to make
+// sure that they get the late fee and then they get flagged for false
+// information." A branch deposit posts the same day or the next business day
+// (a weekend or a bank holiday rolls it forward). The tenant's date counts only
+// when the bank posted the deposit by then; later than that the bank's date
+// decides, and the report is flagged.
+
+/** "2026-10-01" → "Oct 1" (the date as written, no time zone involved). */
+export function monthDayLabel(iso: string): string {
+  const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number)
+  if (!y || !m || !d) return String(iso)
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  return `${MONTHS[m - 1]} ${d}`
+}
+/**
+ * The last day the bank may post a deposit made on `declaredDate` for that date
+ * to count: the next day banks are open. Bank holidays, not the federal-
+ * employee calendar: a holiday on a Saturday leaves the Friday before open
+ * (usBankHolidays), so Thu Jul 2, 2026 must post by Fri Jul 3.
+ */
+export function lastPostingDayFor(declaredDate: string): string {
+  return _addBankBusinessDays(declaredDate, 1)
+}
+/**
+ * Does the bank's posting bear out the date the tenant gave? True when the bank
+ * posted it that day or by the next business day after it (and when the
+ * tenant's date is the later one — that claims nothing earlier than the bank).
+ */
+export function declaredDateHolds(declaredDate: string, bankPostedDate: string): boolean {
+  return bankPostedDate <= lastPostingDayFor(declaredDate)
+}
+/** The landlord's flag on a report and on the payment it made. */
+export function declaredDateFlagText(declaredDate: string, bankPostedDate: string): string {
+  return `Said they deposited ${monthDayLabel(declaredDate)} — the bank shows ${monthDayLabel(bankPostedDate)}.`
+}
+/** What the tenant is told on their own report — the bank's date and why, without accusing. */
+export function bankDateUsedText(declaredDate: string, bankPostedDate: string): string {
+  return `The bank shows this deposit on ${monthDayLabel(bankPostedDate)}, not ${monthDayLabel(declaredDate)}. `
+    + 'A deposit counts from the day you made it only when the bank shows it that day or the next business day, '
+    + `so your payment counts from ${monthDayLabel(bankPostedDate)}, and any late fees up to then stay.`
+}
 export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> = {
   cash: 'Cash',
   // S607 (Nic): a cashier's check is a CHECK. Deliberately NOT its own value —
@@ -5631,6 +5722,7 @@ export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> =
   // window it sits in.
   check: 'Check',
   money_order: 'Money order',
+  bank_deposit: 'Bank deposit',
 }
 // S654 (Nic): "There's no fee. Paying cash or check is free." The old manual-
 // payment fee is gone entirely — no constant, no waiver, no fee-payer setting.

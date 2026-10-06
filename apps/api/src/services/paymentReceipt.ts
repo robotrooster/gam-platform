@@ -50,6 +50,10 @@ export interface ReceiptOpts {
    * these rows, else the person the first row is billed to.
    */
   payerTenantId?: string | null
+  /** 10/5 (Nic): rows of this payment that were paid only in part (their line says so). */
+  partPaidIds?: string[]
+  /** 10/5 (Nic): the open rows a part payment left owed — listed as still owed. */
+  stillOwedPaymentIds?: string[]
 }
 
 /** One line of a receipt: the charge by name, with its detail, at its full amount. */
@@ -176,6 +180,25 @@ export async function sendPaymentReceipt(opts: ReceiptOpts): Promise<string | nu
     if (!payer?.email) return null
 
     const f = receiptFigures(rows, opts.creditBanked ?? 0)
+    // 10/5 (Nic): a part payment's receipt says what was paid and what is still owed.
+    const partPaid = new Set(opts.partPaidIds ?? [])
+    rows.forEach((r: any, i: number) => {
+      if (partPaid.has(r.id)) f.lines[i] = { ...f.lines[i], detail: `${f.lines[i].detail ? `${f.lines[i].detail} · ` : ''}paid in part` }
+    })
+    const owedRows = opts.stillOwedPaymentIds?.length ? await query<any>(
+      `SELECT p.id, p.type, p.amount::float AS amount, p.notes, p.entry_description,
+              ${chargeLabelColumnsSql('p')},
+              to_char(p.due_date,'Mon FMDD, YYYY') AS due_date,
+              (SELECT COALESCE(SUM(cu.amount), 0) FROM credit_uses cu
+                WHERE cu.payment_id = p.id AND cu.status IN ('held','applied'))::float AS credit_used
+         FROM payments p
+        WHERE p.id = ANY($1::uuid[]) AND p.status IN ('pending', 'failed')
+        ORDER BY p.due_date, p.created_at`,
+      [opts.stillOwedPaymentIds]) : []
+    const stillOwed = owedRows.map((r: any) => {
+      const [line] = receiptFigures([r]).lines
+      return { ...line, amount: Math.max(0, cents(r.amount) - cents(r.credit_used)) / 100 }
+    }).filter(l => l.amount > 0)
     return await emailPaymentReceipt(payer.email, {
       tenantName: payer.first_name || payer.tenant_name || 'there',
       unitLabel: `Unit ${first.unit_number} — ${first.property_name}`,
@@ -191,6 +214,7 @@ export async function sendPaymentReceipt(opts: ReceiptOpts): Promise<string | nu
       creditApplied: f.creditApplied,
       creditBanked: f.creditBanked,
       billLabel: f.billLabel,
+      stillOwed,
       portalUrl: TENANT_APP_URL,
     }, {
       landlordId: first.landlord_id,

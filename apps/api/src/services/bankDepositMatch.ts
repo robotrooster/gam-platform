@@ -41,7 +41,7 @@
 //     "covers $X of $Y owed"; what is over the lines it pays becomes paid-ahead
 //     money when the landlord records it (services/bankDepositConfirm).
 
-import { sortForAllocation } from '@gam/shared'
+import { sortForAllocation, declaredDateHolds } from '@gam/shared'
 
 export interface OpenCharge {
   id: string
@@ -92,6 +92,10 @@ export interface TenantDeclaredDeposit {
    * definition, since you cannot photograph cash.
    */
   method: 'cash' | 'check' | 'money_order'
+  /** 10/5 (Nic): the deposit reference number from the bank's receipt (older reports may have none). */
+  reference?: string | null
+  /** 10/5 (Nic): the tenant's photo of the bank's receipt (an authed URL), if they added one. */
+  receiptPhotoUrl?: string | null
 }
 
 /**
@@ -166,6 +170,20 @@ export interface DepositMatch {
   rivals: number
   /** Plain sentence for the landlord's screen. Never a raw enum. */
   reason: string
+  /**
+   * 10/5 (Nic): the tenant's report behind a 'declared' match — what the
+   * landlord sees beside it (the reference, the photo of the bank's receipt)
+   * and whether the bank bears out the date they gave (false: the bank posted
+   * it later than the next business day, so the bank's date counts and the
+   * report is flagged when it is recorded).
+   */
+  declaration?: {
+    id: string
+    declaredDate: string
+    reference: string | null
+    receiptPhotoUrl: string | null
+    dateHolds: boolean
+  }
 }
 
 /**
@@ -254,6 +272,33 @@ export function isAutoSettleable(m: DepositMatch, all: readonly DepositMatch[], 
  * without being so wide that two consecutive months could overlap.
  */
 export const DECLARATION_DATE_WINDOW_DAYS = 4
+
+/**
+ * 10/5 (Nic): how long AFTER the date a tenant gave the bank may post the
+ * deposit and still be the one they reported — a week, the time a report
+ * waits for its deposit (routes/declaredDeposits DECLARATION_EXPIRY_DAYS).
+ *
+ * Nic: "if they say they paid on time and it was actually late we need to make
+ * sure that they get the late fee and then they get flagged for false
+ * information." A report dated Oct 1 for a deposit the bank posted Oct 6 is
+ * that deposit with a false date: it matches, the bank's date decides the late
+ * fees, and the report is flagged (services/depositBackdate). Inside the old
+ * four-day reach it would have found nothing and expired as "not found".
+ * Earlier than the posting the reach stays four days (a date after the bank's
+ * is a slip of the calendar, and the bank's date is used).
+ */
+export const DECLARATION_POSTED_LATE_DAYS = 7
+
+/** Can a report dated `declaredDate` be the deposit the bank posted on `postedDate`? */
+export function declarationReaches(declaredDate: string, postedDate: string): boolean {
+  const late = Math.round((Date.parse(`${postedDate}T00:00:00Z`) - Date.parse(`${declaredDate}T00:00:00Z`)) / 86400000)
+  return late <= DECLARATION_POSTED_LATE_DAYS && -late <= DECLARATION_DATE_WINDOW_DAYS
+}
+
+/** SQL twin of declarationReaches: `declared` (a date) can be the deposit posted on `posted` (a date). */
+export function declarationReachesSql(declared: string, posted: string): string {
+  return `${declared} BETWEEN (${posted} - ${DECLARATION_POSTED_LATE_DAYS}) AND (${posted} + ${DECLARATION_DATE_WINDOW_DAYS})`
+}
 
 export function daysApart(a: string, b: string): number {
   const ms = Math.abs(Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`))
@@ -539,7 +584,7 @@ export function matchDeposit(
   // nothing to do at all.
   const declared = (opts.declarations ?? []).filter(d =>
     cents(d.amount) === depositCents
-    && daysApart(d.declaredDate, deposit.postedDate) <= DECLARATION_DATE_WINDOW_DAYS)
+    && declarationReaches(d.declaredDate, deposit.postedDate))
 
   // Group by lease: a deposit pays one tenant's charges. A single deposit
   // covering TWO tenants (a landlord banking the day's cash in one go) is a
@@ -561,7 +606,22 @@ export function matchDeposit(
   // agrees with the bank memo is the better answer — this is the tiebreaker Nic
   // asked for. If it separates them cleanly, the ambiguity disappears entirely.
   const agreeing = declared.filter(d => !methodContradicts(d.method, deposit.description))
-  const usable = agreeing.length > 0 ? agreeing : declared
+  // 10/5: one report per lease — the one this deposit bears out first, then
+  // the nearest date. A report now reaches a week back (DECLARATION_POSTED_
+  // LATE_DAYS), so a weekly payer's last week's report and this week's can
+  // both reach this deposit; it is this week's, never a flag on last week's.
+  const nearestPerLease = new Map<string, TenantDeclaredDeposit>()
+  const better = (a: TenantDeclaredDeposit, b: TenantDeclaredDeposit) => {
+    const ha = declaredDateHolds(a.declaredDate, deposit.postedDate), hb = declaredDateHolds(b.declaredDate, deposit.postedDate)
+    if (ha !== hb) return ha
+    const ga = daysApart(a.declaredDate, deposit.postedDate), gb = daysApart(b.declaredDate, deposit.postedDate)
+    return ga !== gb ? ga < gb : a.id < b.id
+  }
+  for (const d of agreeing.length > 0 ? agreeing : declared) {
+    const cur = nearestPerLease.get(d.leaseId)
+    if (!cur || better(d, cur)) nearestPerLease.set(d.leaseId, d)
+  }
+  const usable = [...nearestPerLease.values()]
 
   for (const d of usable) {
     const charges = byLease.get(d.leaseId) ?? []
@@ -576,6 +636,8 @@ export function matchDeposit(
     const lines = exact ?? oldestLinesWithin(charges, deposit.amount)
     const totalCents = lines.reduce((s, c) => s + cents(c.amount), 0)
     const covers = coversText(totalCents, owedCents)
+    // 10/5 (Nic): the bank's date counts when it posted later than the next business day.
+    const dateHolds = declaredDateHolds(d.declaredDate, deposit.postedDate)
     cands.push({
       rank: exact ? -1 : 1,
       m: {
@@ -585,9 +647,15 @@ export function matchDeposit(
         total: totalCents / 100, owed: owedCents / 100, exact: !!exact,
         confidence: 'declared',
         rivals: 0,
-        reason: exact
+        reason: (exact
           ? `${said}, and this deposit matches ${linesWord(lines.length, true)} exactly${covers ? ` — it ${covers}` : ''}.`
-          : `${said}, but it does not add up to any set of their open charges: ${noTieOut(depositCents, lines, owedCents)}. Check it before recording.`,
+          : `${said}, but it does not add up to any set of their open charges: ${noTieOut(depositCents, lines, owedCents)}. Check it before recording.`),
+        // 10/5: a false date is said once, from `declaration.dateHolds` (the
+        // match screen's own flag line) — never also in this reason.
+        declaration: {
+          id: d.id, declaredDate: d.declaredDate, reference: d.reference ?? null,
+          receiptPhotoUrl: d.receiptPhotoUrl ?? null, dateHolds,
+        },
       },
     })
   }

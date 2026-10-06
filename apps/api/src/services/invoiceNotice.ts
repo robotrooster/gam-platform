@@ -177,8 +177,13 @@ const UTILITY_WORDS: Array<[RegExp, UtilityType]> = [
   [/\btrash\b/i, 'trash'],
   [/\bpropane\b/i, 'propane'],
 ]
-/** A note segment that is about the PAYMENT, never the charge. */
-const TAG = /^(recorded as|covered by|paid (with|on time|off-platform|in full)|work trade|suspended|waived|reopened|corrected|correction|settled|refunded|s\d{3,}:)/i
+/**
+ * A note segment that is about the PAYMENT, never the charge. 10/5: so are
+ * "paid in part; $X still owed" (a part payment's paid slice) and "partly paid
+ * toward the old balance; …" / "part of the old balance; …" (an old balance
+ * paid down) — never shown as what the charge is.
+ */
+const TAG = /^(recorded as|covered by|paid (with|on time|off-platform|in full|in part)|partly paid|part of the old balance|work trade|suspended|waived|reopened|corrected|correction|settled|refunded|s\d{3,}:)/i
 /** A note segment that only names the space ("RV 44"): the bill already says where. */
 const SPACE_ONLY = /^(rv|mh|apt|apartment|unit|lot|site|space|spot|house|cabin|storage)\s*#?\s*[\w-]{1,6}$/i
 

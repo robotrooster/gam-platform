@@ -84,6 +84,13 @@ describe('the credit beside a balance (Nic, 10/2: shown beside it, never taken o
     expect(deskBalanceSentence({ first: 'Russ', owed: 460, credit: 0, when: null, overdue: false }))
       .toBe('Russ owes $460.00. Take the full amount; rent cannot be part-paid.')
   })
+  it('10/5: where the property takes part payments, the Front Desk never says rent cannot be part-paid', () => {
+    expect(deskBalanceSentence({ first: 'Russ', owed: 460, credit: 0, when: null, overdue: false, partialOk: true }))
+      .toBe('Russ owes $460.00. They can pay part; what they do not pay stays owed, and late fees still apply.')
+    const withCredit = deskBalanceSentence({ first: 'Kim', owed: 935.45, credit: 450, when: 'Sep 1', overdue: true, partialOk: true })
+    expect(withCredit).toMatch(/ask whether they want to use it or save it\. They can pay part of what is left; what they do not pay stays owed, and late fees still apply\.$/)
+    expect(withCredit).not.toMatch(/cannot be part-paid/)
+  })
 })
 
 describe('Outstanding Balances (decisions #29)', () => {
@@ -482,7 +489,7 @@ describe('the card reader at the desk', () => {
 
 describe('posting a payment that arrived before its bill', () => {
   it('a check or money order asks "is it really $X?"; cash does not', () => {
-    expect(postConfirmQuestion('check', 92000)).toBe('Is the check really $920.00? Check the amount written on it. What is open is paid first; the rest is kept on their account as paid ahead.')
+    expect(postConfirmQuestion('check', 92000)).toBe('Is the check really $920.00? Check the amount written on it. It pays what is open first, oldest bill first; anything over what is owed is kept on their account as paid ahead.')
     expect(postConfirmQuestion('cash', 92000)).toBeNull()
   })
   it('a check or money order needs its number; cash does not', () => {
@@ -661,5 +668,114 @@ describe('awaitingOpensAtWord — the hour a card hold opens the bill at the des
 
   it('an unknown time zone falls back to the browser\'s clock with its zone named, never throwing', () => {
     expect(awaitingOpensAtWord({ confirmBy, timezone: 'Not/AZone' })).toMatch(/^\d{1,2}:\d{2} [AP]M \S+$/)
+  })
+})
+
+// ─── 10/5 (Nic): bank deposits and part payments ─────────────────────────────
+
+import {
+  planTender as planTender105, partialPlan, billName, stillOwedText, numberRequired as numberRequired105,
+  numberMissingMessage, depositPhotoProblem, postConfirmQuestion as postConfirmQuestion105, lateFeesBackOnShortBills,
+  type DeskQuote as DeskQuote105,
+} from './creditDesk'
+
+const bill105 = (rows: Array<{ id: string; type: string; amount: number; dueDate: string; creditIfUsed?: number }>,
+                 over: Partial<DeskQuote105> = {}): DeskQuote105 => {
+  const total = rows.reduce((t, r) => t + r.amount, 0)
+  return {
+    anchorPaymentId: rows[0]?.id ?? 'x', anchorOpen: true, paymentsPaused: false,
+    rows: rows.map(r => ({ leaseId: 'L1', entryDescription: null, creditAlreadyApplied: 0, notes: null, unitNumber: null, propertyName: null, ...r })),
+    currentTotal: total, oldBalance: [], oldBalanceTotal: 0, payOnline: [], payOnlineTotal: 0, paused: [], pausedTotal: 0,
+    clearing: 0, creditAlreadyApplied: 0, creditAvailable: 0, creditSetAsideElsewhere: 0, creditOnFile: 0,
+    owedIfUsed: total, owedIfSaved: total, fullBalance: total, scheduledRetries: [], ...over,
+  }
+}
+const tender105 = (q: DeskQuote105, method: any, cents: number) => planTender105(q, {
+  method, tenderedCents: cents, choice: null, towardOldCents: null, surplusHandling: null, writtenConfirmed: false,
+  nameOf: r => (r.type === 'rent' ? 'Rent' : r.type === 'utility' ? 'Water' : r.type),
+})
+
+describe('10/5: a bank deposit is identified by the reference on the bank\'s receipt', () => {
+  it('the number is required for a check, a money order and a bank deposit — never cash', () => {
+    expect(numberRequired105('bank_deposit')).toBe(true)
+    expect(numberRequired105('check')).toBe(true)
+    expect(numberRequired105('cash')).toBe(false)
+    expect(numberMissingMessage('bank_deposit')).toMatch(/deposit reference number from the bank's receipt/)
+    expect(numberMissingMessage('money_order')).toBe('Enter the money order number — it is the receipt if the payment is ever questioned.')
+  })
+  it('a bank deposit over the bill is confirmed against the bank\'s receipt, and kept as credit — never change', () => {
+    const q = bill105([{ id: 'r1', type: 'rent', amount: 600, dueDate: '2026-10-01' }])
+    const ask = tender105(q, 'bank_deposit', 65000)
+    expect(ask.stop).toBe('written_confirm')
+    expect(ask.message).toBe("You typed $650.00 against $600.00 owed — is the bank deposit really $650.00? Check the amount on the bank's receipt, then confirm.")
+    const ok = planTender105(q, { method: 'bank_deposit', tenderedCents: 65000, choice: null, towardOldCents: null, surplusHandling: null, writtenConfirmed: true })
+    expect(ok.stop).toBeNull()
+    expect(ok.changeCents).toBe(0)
+    expect(ok.keptAsCreditCents).toBe(5000)
+    expect(ok.body).toEqual({ method: 'bank_deposit', amountTendered: 650, surplusHandling: 'credit', confirmWrittenAmount: true })
+    expect(postConfirmQuestion105('bank_deposit', 30000)).toMatch(/^Is the bank deposit really \$300\.00\? Check the amount on the bank's receipt\./)
+  })
+  it('the photo: images only, within the size limit', () => {
+    expect(depositPhotoProblem(null)).toBeNull()
+    expect(depositPhotoProblem({ type: 'image/jpeg', size: 1000 })).toBeNull()
+    expect(depositPhotoProblem({ type: 'image/heic', size: 1000 })).toBeNull()
+    expect(depositPhotoProblem({ type: 'application/pdf', size: 1000 })).toMatch(/Choose a photo/)
+    expect(depositPhotoProblem({ type: 'image/png', size: 50 * 1024 * 1024 })).toMatch(/too large/)
+  })
+})
+
+describe('10/5: part payments, where the property takes them', () => {
+  const oct = { id: 'r1', type: 'rent', amount: 600, dueDate: '2026-10-01' }
+  it('off: short is refused, as before', () => {
+    const p = tender105(bill105([oct]), 'cash', 50000)
+    expect(p.stop).toBe('short')
+    expect(p.message).toBe('That is $100.00 short — $500.00 against $600.00 owed. Rent is paid in full.')
+  })
+  it('on: short is recorded, and the window says what stays owed', () => {
+    const p = tender105(bill105([oct], { partialPaymentsAllowed: true }), 'bank_deposit', 50000)
+    expect(p.stop).toBeNull()
+    expect(p.stillOwedCents).toBe(10000)
+    expect(p.stillOwedText).toBe('$100.00 stays owed on October rent — late fees still apply.')
+    expect(p.body).toEqual({ method: 'bank_deposit', amountTendered: 500 })
+    expect(p.changeCents).toBe(0)
+  })
+  it('the oldest bill is paid first, a rent bill in part, and a bill that cannot be paid in part is passed by', () => {
+    const q = bill105([
+      { id: 's', type: 'rent', amount: 600, dueDate: '2026-09-01' },
+      { id: 'w', type: 'utility', amount: 50, dueDate: '2026-09-01' },
+      { id: 'o', type: 'rent', amount: 600, dueDate: '2026-10-01' },
+    ], { partialPaymentsAllowed: true })
+    // $620: September rent in full; September water ($50) cannot be paid in part — passed by; $20 to October rent.
+    expect(partialPlan(q, null, 62000, r => (r.type === 'rent' ? 'Rent' : 'Water'))).toEqual({ stillOwedCents: 63000, names: ['September water', 'October rent'], toOldCents: 0, keptCents: 0, shortInvoiceIds: [] })
+    expect(tender105(q, 'cash', 62000).stillOwedText).toBe('$630.00 stays owed on September water and October rent — late fees still apply.')
+  })
+  it('with Use, the credit the plan spends on each charge comes off it first', () => {
+    const q = bill105([{ ...oct, creditIfUsed: 50 }], { partialPaymentsAllowed: true, creditAvailable: 50, owedIfUsed: 550 })
+    const p = planTender105(q, { method: 'cash', tenderedCents: 50000, choice: 'use', towardOldCents: null, surplusHandling: null,
+      writtenConfirmed: false, answeredCreditCents: 5000, nameOf: () => 'Rent' })
+    expect(p.stop).toBeNull()
+    expect(p.stillOwedText).toBe('$50.00 stays owed on October rent — late fees still apply.')
+    expect(p.body).toEqual({ method: 'cash', amountTendered: 500, creditToUse: 50 })
+  })
+  // 10/5 (Nic): a bank deposit dated back that pays a bill only in part — the
+  // late fees the window left off THAT bill go back on it; a bill paid in full keeps them off.
+  it('a dated-back deposit paid in part: the short bill\'s own late fees are added back to what stays owed', () => {
+    const q = bill105([
+      { id: 's', type: 'rent', amount: 600, dueDate: '2026-09-01', invoiceId: 'INV-SEP' } as any,
+      { id: 'o', type: 'rent', amount: 600, dueDate: '2026-10-01', invoiceId: 'INV-OCT' } as any,
+    ], {
+      partialPaymentsAllowed: true, lateFeesOffIfPaidInFull: 50,
+      lateFeesOffByBill: [{ invoiceId: 'INV-SEP', amount: 25 }, { invoiceId: 'INV-OCT', amount: 25 }],
+    })
+    const p = tender105(q, 'bank_deposit', 90000)
+    expect(p.shortInvoiceIds).toEqual(['INV-OCT'])
+    expect(p.stillOwedNames).toEqual(['October rent'])
+    expect(lateFeesBackOnShortBills(q, p.shortInvoiceIds)).toBe(2500)
+    expect(stillOwedText(p.stillOwedCents + 2500, p.stillOwedNames)).toBe('$325.00 stays owed on October rent — late fees still apply.')
+  })
+  it('names a bill by its month and what it is', () => {
+    expect(billName('2026-10-01', 'Rent')).toBe('October rent')
+    expect(billName('2026-09-15', 'Water · Aug 1–31')).toBe('September water')
+    expect(stillOwedText(2500, [])).toBe('$25.00 stays owed — late fees still apply.')
   })
 })

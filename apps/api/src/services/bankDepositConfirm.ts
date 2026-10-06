@@ -11,7 +11,10 @@
 // past, so it settles on the date the money actually moved — the tenant's own
 // declared date when a bank row corroborates it, otherwise the bank's posting.
 // Late fees that accrued after that date were charged for an absence that was
-// not real, and are undone.
+// not real, and are undone. 10/5 (Nic): the declared date corroborates only
+// when the bank posted the deposit that day or the next business day after it;
+// later than that the bank's date governs and the report is flagged for false
+// information (a strike — services/declaredDepositTrust).
 //
 // WHAT IS NOT ERASED. GAM does not delete money records (standing retention
 // rule). A late fee the tenant has ALREADY PAID cannot be un-charged, so it
@@ -50,10 +53,12 @@ import { getClient, query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { settleManualRentPayment } from './manualPaymentSettle'
 import type { DepositRecordRaised } from './leaseFeesSync'
-import { backdateLateFees, effectivePaidDateFor, type LateFeeTick } from './depositBackdate'
+import { backdateLateFees, effectivePaidDateFor, declaredDateIsFalse, type LateFeeTick } from './depositBackdate'
 import {
-  daysApart, methodContradicts, coversText, DECLARATION_DATE_WINDOW_DAYS,
+  daysApart, methodContradicts, coversText, declarationReaches, declarationReachesSql,
 } from './bankDepositMatch'
+import { bankDateUsedText, declaredDateFlagText } from '@gam/shared'
+import { tellLandlordAtStrikeLimit } from './declaredDepositTrust'
 import {
   lockHousehold, lockPaymentRowsById, isBankPayableRow, bankPayableRowSql, allocationOrderSql,
   type MoneyRowFacts,
@@ -171,6 +176,12 @@ export interface ConfirmDepositResult {
   coverage: string | null
   receiptId: string
   declarationId: string | null
+  /**
+   * 10/5 (Nic): the tenant's report gave an earlier date than the bank bears
+   * out (posted later than the next business day after it) — the bank's date
+   * was used and the report is flagged. Null: no report, or its date held.
+   */
+  declaredDateFlag: { declaredDate: string; bankPostedDate: string } | null
   undo: DepositSettleUndo
 }
 
@@ -267,11 +278,21 @@ async function lateFeeCutoffDate(
  *   - The refund for fees already paid is a credit the landlord gives
  *     (createIssuedCredit): it settles nothing here.
  */
-async function reverseLateFees(
+export async function reverseLateFees(
   client: PoolClient,
   invoiceId: string,
   effectivePaidDate: string,
-  o: { settlingIds: readonly string[]; tenantId: string; landlordId: string; leaseId: string | null; createdBy: string | null },
+  o: {
+    settlingIds: readonly string[]; tenantId: string; landlordId: string; leaseId: string | null; createdBy: string | null
+    /**
+     * 10/5 (Nic): false — zero the unpaid fees only; the fees already paid
+     * are refunded by a later call once the bill is paid (a landlord's
+     * recorded bank deposit: services/manualPaymentSettle, which decides
+     * whether the deposit pays the bill in full only after the unpaid fees
+     * are off it). Default true.
+     */
+    refundPaid?: boolean
+  },
 ): Promise<{ unbilled: number; refunded: number; zeroed: DepositSettleUndo['lateFeesZeroed']; refundCreditId: string | null }> {
   const none = { unbilled: 0, refunded: 0, zeroed: [], refundCreditId: null }
   const cutoff = await lateFeeCutoffDate(client, invoiceId, effectivePaidDate, o.settlingIds)
@@ -318,7 +339,7 @@ async function reverseLateFees(
   }
 
   let refundCreditId: string | null = null
-  if (out.refundAmount > 0) {
+  if (out.refundAmount > 0 && o.refundPaid !== false) {
     refundCreditId = await createIssuedCredit(client, {
       landlordId: o.landlordId, tenantId: o.tenantId, leaseId: o.leaseId,
       amount: out.refundAmount, category: 'late_fee_refund',
@@ -329,7 +350,7 @@ async function reverseLateFees(
 
   return {
     unbilled: toDollars(zeroed.reduce((s, z) => s + toCents(z.priorAmount), 0)),
-    refunded: out.refundAmount,
+    refunded: o.refundPaid === false ? 0 : out.refundAmount,
     zeroed,
     refundCreditId,
   }
@@ -375,12 +396,22 @@ async function findMatchingDeclaration(
        FROM tenant_declared_deposits
       WHERE landlord_id = $1 AND lease_id = ANY($2::uuid[]) AND status = 'pending'
         AND amount = $3::numeric
-        AND declared_date BETWEEN ($4::date - $5::int) AND ($4::date + $5::int)
+        AND ${declarationReachesSql('declared_date', '$4::date')}
       ORDER BY id
         FOR UPDATE`,
-    [a.landlordId, [...a.leaseIds], toDollars(toCents(a.amount)).toFixed(2), a.postedDate, DECLARATION_DATE_WINDOW_DAYS])
+    [a.landlordId, [...a.leaseIds], toDollars(toCents(a.amount)).toFixed(2), a.postedDate])
   const ranked = r.rows
-    .map(d => ({ ...d, contradicts: methodContradicts(d.method, a.description), gap: daysApart(d.declared_date, a.postedDate) }))
+    // 10/5 (Nic): only a report this deposit BEARS OUT is attached unasked. A
+    // report it would flag for false information (the bank posted it later
+    // than the next business day) is attached only when a person or the
+    // feed's own decision chose that report (an explicit declarationId: the
+    // landlord confirming the tenant's report on the match screen, or
+    // bankFeed.decideDeposit step 3) — never by amount alone, so no report is
+    // flagged and struck by a deposit nobody tied to it.
+    .filter(d => !declaredDateIsFalse(d.declared_date, a.postedDate))
+    .map(d => ({
+      ...d, contradicts: methodContradicts(d.method, a.description), gap: daysApart(d.declared_date, a.postedDate),
+    }))
     .sort((x, y) => Number(x.contradicts) - Number(y.contradicts) || x.gap - y.gap || x.id.localeCompare(y.id))
   return ranked[0]?.id ?? null
 }
@@ -470,7 +501,7 @@ export async function confirmDepositMatch(
       if (toCents(d.amount) !== depositCents) {
         throw new AppError(409, `That report is for ${money(toCents(d.amount))}, not this ${money(depositCents)} deposit.`)
       }
-      if (daysApart(d.declared_date, txn.posted_date) > DECLARATION_DATE_WINDOW_DAYS) {
+      if (!declarationReaches(d.declared_date, txn.posted_date)) {
         throw new AppError(409, `That report is dated ${d.declared_date}, too far from when this deposit posted (${txn.posted_date}) to be the same money.`)
       }
       householdTenant = d.tenant_id
@@ -507,7 +538,15 @@ export async function confirmDepositMatch(
       }
     }
 
+    // 10/5 (Nic): the tenant's date counts only when the bank posted the
+    // deposit that day or the next business day after it. Later than that it
+    // was false: the bank's date decides (nothing is backdated, the late fees
+    // up to the bank's date stand), the deposit still pays the bill, and the
+    // report is flagged — a strike toward the report button's trust.
     const effectivePaidDate = effectivePaidDateFor(declaredDate, txn.posted_date)
+    const dateFalse = declaredDateIsFalse(declaredDate, txn.posted_date)
+    const declaredDateFlag = dateFalse && declaredDate
+      ? { declaredDate, bankPostedDate: txn.posted_date as string } : null
     const settledAt = new Date(`${effectivePaidDate}T12:00:00Z`)
 
     const charges = (await client.query<ChargeRow>(
@@ -724,12 +763,18 @@ export async function confirmDepositMatch(
       [txn.id, settledIds[0] ?? charges[0].id, JSON.stringify(undo), input.auto === true])
 
     if (declarationId) {
+      // 10/5 (Nic): the bank's date is kept on the report; a false date is
+      // flagged, with what the tenant is told on their own report.
       await client.query(
         `UPDATE tenant_declared_deposits
             SET status='confirmed', bank_transaction_id=$2, confirmed_at=NOW(),
+                bank_posted_date = $3::date,
+                false_date_flagged_at = CASE WHEN $4::boolean THEN NOW() ELSE NULL END,
+                resolution_note = CASE WHEN $4::boolean THEN $5 ELSE resolution_note END,
                 updated_at=NOW()
           WHERE id=$1 AND status = 'pending'`,
-        [declarationId, txn.id])
+        [declarationId, txn.id, txn.posted_date, !!declaredDateFlag,
+         declaredDateFlag ? bankDateUsedText(declaredDateFlag.declaredDate, declaredDateFlag.bankPostedDate) : null])
     }
 
     await client.query('COMMIT')
@@ -758,8 +803,13 @@ export async function confirmDepositMatch(
     void notifyBothSides({
       tenantId: householdTenant, landlordId: txn.landlord_id, effectivePaidDate, unbilled, refunded,
       amount: toDollars(depositCents), paidAhead: toDollars(excessCents), coverage,
-      auto: input.auto === true, postedDate: txn.posted_date,
+      auto: input.auto === true, postedDate: txn.posted_date, declaredDateFlag,
     }).catch(e => logger.error({ err: e }, '[deposit-confirm] notify failed'))
+    // 10/5 (Nic): a flagged report is a strike; at the limit the landlord is told.
+    if (declaredDateFlag) {
+      void tellLandlordAtStrikeLimit(householdTenant, txn.landlord_id)
+        .catch(e => logger.error({ err: e }, '[deposit-confirm] strike notice failed'))
+    }
 
     return {
       settledChargeIds: settledIds,
@@ -773,6 +823,7 @@ export async function confirmDepositMatch(
       coverage,
       receiptId,
       declarationId,
+      declaredDateFlag,
       undo,
     }
   } catch (e) {
@@ -867,6 +918,8 @@ async function notifyBothSides(o: {
   unbilled: number; refunded: number; amount: number; paidAhead: number; coverage: string | null
   /** S655 (Step 12): settled by itself on amount — both sides are told, the landlord with Undo. */
   auto?: boolean; postedDate?: string
+  /** 10/5 (Nic): the tenant's date was not borne out by the bank — the bank's date was used. */
+  declaredDateFlag?: { declaredDate: string; bankPostedDate: string } | null
 }): Promise<void> {
   const reversed = o.unbilled + o.refunded
   const aheadLine = o.paidAhead > 0
@@ -880,13 +933,16 @@ async function notifyBothSides(o: {
     const lateLine = reversed > 0
       ? ` Your late ${reversed === o.refunded ? 'fee has been refunded' : 'fees have been removed'} — $${reversed.toFixed(2)} — because your deposit shows you paid on ${o.effectivePaidDate}.`
       : ''
+    const dateLine = o.declaredDateFlag
+      ? ` ${bankDateUsedText(o.declaredDateFlag.declaredDate, o.declaredDateFlag.bankPostedDate)}`
+      : ''
     await createNotification({
       userId: tenantUser,
       type: 'payment_recorded',
       title: 'Your bank deposit has been applied',
       body: o.auto
-        ? `We applied your $${o.amount.toFixed(2)} deposit of ${o.postedDate ?? o.effectivePaidDate} to your bill — it matched what you owed to the cent. If it wasn’t yours, tell your landlord.${lateLine}`
-        : `We matched your $${o.amount.toFixed(2)} deposit and applied it to your bill, dated ${o.effectivePaidDate}.${coverLine}${aheadLine}${lateLine}`,
+        ? `We applied your $${o.amount.toFixed(2)} deposit of ${o.postedDate ?? o.effectivePaidDate} to your bill — it matched what you owed to the cent. If it wasn’t yours, tell your landlord.${lateLine}${dateLine}`
+        : `We matched your $${o.amount.toFixed(2)} deposit and applied it to your bill, dated ${o.effectivePaidDate}.${coverLine}${aheadLine}${lateLine}${dateLine}`,
       actionUrl: '/payments',
     })
   }
@@ -897,6 +953,10 @@ async function notifyBothSides(o: {
     const lateLine = reversed > 0
       ? ` $${reversed.toFixed(2)} in late fees was reversed — the deposit is dated ${o.effectivePaidDate}.`
       : ''
+    // 10/5 (Nic): the flag, in the same words as on the report and the payment.
+    const flagLine = o.declaredDateFlag
+      ? ` ${declaredDateFlagText(o.declaredDateFlag.declaredDate, o.declaredDateFlag.bankPostedDate)} The bank's date was used, so the late fees up to it stand.`
+      : ''
     await createNotification({
       userId: landlordUser,
       landlordId: o.landlordId,
@@ -906,8 +966,8 @@ async function notifyBothSides(o: {
       title: o.auto ? 'A bank deposit was applied to rent by itself' : 'A bank deposit was applied to rent',
       body: o.auto
         ? `Your $${o.amount.toFixed(2)} bank deposit of ${o.postedDate ?? o.effectivePaidDate} was auto-applied — it was exactly one tenant’s whole bill and nothing else fit. ` +
-          `If that is wrong, press Undo on it under Bank → Bank feed.${lateLine}`
-        : `A $${o.amount.toFixed(2)} deposit was matched to rent and recorded as paid ${o.effectivePaidDate}.${coverLine}${aheadLine}${lateLine}`,
+          `If that is wrong, press Undo on it under Bank → Bank feed.${lateLine}${flagLine}`
+        : `A $${o.amount.toFixed(2)} deposit was matched to rent and recorded as paid ${o.effectivePaidDate}.${coverLine}${aheadLine}${lateLine}${flagLine}`,
       actionUrl: o.auto ? '/bank?tab=feed' : '/payments',
     })
   }
@@ -1230,7 +1290,11 @@ export async function undoDepositMatch(input: {
     if (snap.declarationId) {
       await client.query(
         `UPDATE tenant_declared_deposits
-            SET status = 'pending', bank_transaction_id = NULL, confirmed_at = NULL, updated_at = NOW()
+            SET status = 'pending', bank_transaction_id = NULL, confirmed_at = NULL,
+                -- 10/5: the bank's date and any flag went with the match.
+                resolution_note = CASE WHEN false_date_flagged_at IS NOT NULL THEN NULL ELSE resolution_note END,
+                bank_posted_date = NULL, false_date_flagged_at = NULL,
+                updated_at = NOW()
           WHERE id = $1 AND status = 'confirmed' AND bank_transaction_id = $2`, [snap.declarationId, txn.id])
     }
     await client.query(

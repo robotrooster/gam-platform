@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { collectedRentMtd, incomeCardFrom } from '../lib/rentCollected'
-import { occupancyRateFrom, INCOME_CATEGORY_LABEL, type IncomeBasis } from '@gam/shared'
+import { occupancyRateFrom, INCOME_CATEGORY_LABEL, MANUAL_PAYMENT_METHOD_LABELS, type IncomeBasis } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
@@ -106,7 +106,8 @@ function lastMonths(n: number): string[] {
   return out
 }
 
-const MANUAL_LABEL: Record<string, string> = { cash: 'Cash', check: 'Check', money_order: 'Money order', prior_arrangement: 'Prior arrangement' }
+// 10/5: from the shared labels, so a new recorded method (a bank deposit) is named here too.
+const MANUAL_LABEL: Record<string, string> = { ...MANUAL_PAYMENT_METHOD_LABELS, prior_arrangement: 'Prior arrangement' }
 /** S652 (Nic): "it doesn't tell me if they paid cash or not." */
 function methodLabel(p: any): string {
   return p.manual_method ? (MANUAL_LABEL[p.manual_method] || 'Other')

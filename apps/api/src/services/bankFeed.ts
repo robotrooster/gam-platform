@@ -943,9 +943,9 @@ async function runDepositSteps(landlordId: string, allowed: Set<DepositActionKin
  * is the plan's; a deposit that two different things could explain waits.
  */
 async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
-  const { openSlipsFitting, cashProposalFor } = await import('./depositSlips')
+  const { openSlipsFitting, cashProposalFor, bankMatchReceiptSql } = await import('./depositSlips')
   const { candidatesForDeposit } = await import('./bankDepositCandidates')
-  const { isPreselectable, isAutoSettleable, memoMethodHint, memoSaysTransfer, DECLARATION_DATE_WINDOW_DAYS, AUTO_SETTLE_SAME_AMOUNT_DAYS } =
+  const { isPreselectable, isAutoSettleable, memoMethodHint, memoSaysTransfer, DECLARATION_DATE_WINDOW_DAYS, AUTO_SETTLE_SAME_AMOUNT_DAYS, declarationReachesSql } =
     await import('./bankDepositMatch')
   const slips = await openSlipsFitting(db, txn.landlord_id, txn)
   // Who the memo names, read fresh from the bank's own words (a row stored
@@ -965,8 +965,8 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
   const reports = Number((await queryOne<{ n: string }>(
     `SELECT COUNT(*)::text AS n FROM tenant_declared_deposits
       WHERE landlord_id = $1 AND status = 'pending' AND amount = $2::numeric
-        AND declared_date BETWEEN ($3::date - $4::int) AND ($3::date + $4::int)`,
-    [txn.landlord_id, Number(txn.amount).toFixed(2), txn.posted_date, DECLARATION_DATE_WINDOW_DAYS]))?.n ?? 0)
+        AND ${declarationReachesSql('declared_date', '$3::date')}`,
+    [txn.landlord_id, Number(txn.amount).toFixed(2), txn.posted_date]))?.n ?? 0)
 
   // A tenant's whole bill, to the cent, with nothing else fitting.
   const cashAny = cash.kind === 'everything' || cash.kind === 'one' || cash.kind === 'several'
@@ -1026,6 +1026,24 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
   // Something says a tenant paid this — their report, or a whole bill that fits it.
   const tenantSignal = reports > 0 || autoSettle !== null
 
+  // 0. 10/5 (Nic): a bank deposit the office already recorded from the bank's
+  //    receipt is money this line may well BE. It is never cash on hand (no
+  //    slip, no office cash competes for it), so without this the same dollars
+  //    could settle a second bill by amount alone (a household two months
+  //    behind: the recorded deposit paid the older month, and this line would
+  //    "pay" the newer one), be confirmed against a tenant's report, or be
+  //    filed as income. A person looks at it instead.
+  const recordedBankDeposit = await queryOne<{ id: string }>(
+    `SELECT r.id FROM tenant_remittances r
+      WHERE r.landlord_id = $1 AND r.status = 'settled' AND r.payment_method = 'bank_deposit'
+        AND r.stripe_payment_intent_id IS NULL
+        AND r.amount = $2::numeric
+        AND r.settled_at::date BETWEEN ($3::date - $4::int) AND ($3::date + $4::int)
+        AND NOT ${bankMatchReceiptSql('r')}
+      LIMIT 1`,
+    [txn.landlord_id, Number(txn.amount).toFixed(2), txn.posted_date, DECLARATION_DATE_WINDOW_DAYS])
+  if (recordedBankDeposit) return { kind: 'review', why: 'a bank deposit the office already recorded' }
+
   // 1. A deposit slip staff made (a transfer is never the office's bag).
   if (slips.length > 0 && transfer) return { kind: 'review', why: 'a transfer between accounts' }
   if (slips.length > 0) {
@@ -1040,11 +1058,12 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
   // 3. A tenant's report the bank confirms.
   const top = candidates[0]
   if (top && top.confidence === 'declared' && isPreselectable(top) && top.chargeIds.length > 0) {
-    const decl = await queryOne<{ id: string; method: string }>(
-      `SELECT id, method FROM tenant_declared_deposits
-        WHERE lease_id = $1 AND status = 'pending' AND amount = $2
-        ORDER BY declared_date DESC LIMIT 1`,
-      [top.leaseId, Number(txn.amount).toFixed(2)])
+    // 10/5: the very report the match was made from (before, the newest
+    // pending report of that amount on the lease — which could be another
+    // month's, out of this deposit's reach, and the confirm then refused it).
+    const decl = top.declaration ? await queryOne<{ id: string; method: string }>(
+      `SELECT id, method FROM tenant_declared_deposits WHERE id = $1 AND status = 'pending'`,
+      [top.declaration.id]) : null
     if (decl) return { kind: 'declared', chargeIds: top.chargeIds, declarationId: decl.id, method: decl.method }
   }
   // 4. A tenant's whole bill, to the cent, nothing else fitting (no slip and no

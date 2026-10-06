@@ -18,9 +18,8 @@ import { DateTime } from 'luxon'
 import { query } from '../db'
 import { createNotification } from '../services/notifications'
 import { logger } from '../lib/logger'
-import {
-  DECLARATION_EXPIRY_DAYS, UNCONFIRMED_STRIKE_LIMIT,
-} from '../routes/declaredDeposits'
+import { DECLARATION_EXPIRY_DAYS } from '../routes/declaredDeposits'
+import { tellLandlordAtStrikeLimit } from '../services/declaredDepositTrust'
 
 export interface ExpirySweepResult {
   expired: number
@@ -106,7 +105,9 @@ function recordedReceiptMatchSql(rule: RecordedByLandlordRule, d = 'd', r = 'r')
   const recordedOn = `(${r}.settled_at AT TIME ZONE ${REPORT_TZ_SQL(d)})::date`
   return `(${r}.landlord_id = ${d}.landlord_id
         AND ${r}.status = 'settled'
-        AND ${r}.payment_method IN ('cash','check','money_order')
+        -- 10/5 (Nic): a bank deposit the landlord recorded from the bank's
+        -- receipt is the very deposit a resident reports making.
+        AND ${r}.payment_method IN ('cash','check','money_order','bank_deposit')
         AND ${r}.settled_at IS NOT NULL
         AND ${r}.amount >= ${d}.amount
         AND (${r}.tenant_id = ${d}.tenant_id OR ${r}.lease_id = ${d}.lease_id)
@@ -135,7 +136,9 @@ function recordedReceiptMatchSql(rule: RecordedByLandlordRule, d = 'd', r = 'r')
  *
  * At a company whose bank GAM was reading for this deposit, only when the rule
  * says so (off: #11 as written) and only once the report's window has run out;
- * everywhere else, at once.
+ * everywhere else, at once. 10/5 (Nic): a receipt the office recorded as a
+ * BANK DEPOSIT closes it at once everywhere — the bank feed holds that line for
+ * review and never confirms the report against it.
  */
 export async function resolveReportsRecordedByLandlord(
   asOf?: string,
@@ -155,6 +158,13 @@ export async function resolveReportsRecordedByLandlord(
        JOIN tenant_remittances r ON ${recordedReceiptMatchSql(rule)}
       WHERE d.status = 'pending'
         AND (NOT ${BANK_WATCHED_REPORT_SQL('d')}
+             -- 10/5 (Nic): a BANK DEPOSIT the office recorded from the bank's
+             -- receipt closes the report at once, bank linked or not. The bank
+             -- feed holds that line for a person (bankFeed.decideDeposit step
+             -- 0) and never confirms the report against it, so without this an
+             -- honest report would expire as "not found" — a strike for the
+             -- very deposit the landlord recorded.
+             OR r.payment_method = 'bank_deposit'
              OR ($3::boolean AND d.declared_date < ($1::date - $2::int)))
       -- A receipt for exactly the reported amount is that report's first (MH 21
       -- reported $666.50 on 9/4 and $815 on 10/1: an $815 receipt is the 10/1
@@ -166,7 +176,8 @@ export async function resolveReportsRecordedByLandlord(
   for (const p of pairs) {
     if (doneReports.has(p.declaration_id) || usedReceipts.has(p.remittance_id)) continue
     try {
-      const word = p.payment_method === 'money_order' ? 'money order' : p.payment_method
+      const word = p.payment_method === 'money_order' ? 'money order'
+        : p.payment_method === 'bank_deposit' ? 'bank deposit' : p.payment_method
       const row = await query<{ id: string }>(
         `UPDATE tenant_declared_deposits
             SET status = 'recorded', recorded_remittance_id = $2, confirmed_at = NOW(),
@@ -273,25 +284,10 @@ export async function sweepExpiredDeclarations(
           })
         }
 
-        // Count strikes AFTER this one lands, so the threshold means what it says.
-        const strikes = await query<{ n: string }>(
-          `SELECT COUNT(*) AS n FROM tenant_declared_deposits
-            WHERE tenant_id = $1 AND status = 'unconfirmed'`, [r.tenant_id])
-        if (parseInt(strikes[0]?.n ?? '0', 10) >= UNCONFIRMED_STRIKE_LIMIT) {
-          result.tenantsFlagged++
-          const l = await query<{ user_id: string }>(
-            `SELECT user_id FROM landlords WHERE id = $1`, [r.landlord_id])
-          if (l[0]?.user_id) {
-            await createNotification({
-              userId: l[0].user_id,
-              landlordId: r.landlord_id,
-              type: 'deposit_reports_unconfirmed',
-              title: 'Repeated deposit reports have not matched',
-              body: `A tenant has now reported ${strikes[0].n} bank deposits that never appeared in your feed. Their balance was never credited for any of them. Worth a conversation — it may be a wrong account number rather than anything else.`,
-              actionUrl: '/bank-feed',
-            })
-          }
-        }
+        // Count strikes AFTER this one lands, so the threshold means what it
+        // says. 10/5 (Nic): a report the bank showed on a later day than the
+        // tenant gave counts too (services/declaredDepositTrust).
+        if (await tellLandlordAtStrikeLimit(r.tenant_id, r.landlord_id)) result.tenantsFlagged++
       } catch (e) {
         result.errors.push(e instanceof Error ? e.message : String(e))
       }

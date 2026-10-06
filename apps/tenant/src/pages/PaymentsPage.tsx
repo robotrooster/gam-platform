@@ -449,6 +449,14 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
       : []
   const depositRefusalInCard =
     !!depositRefusal && reportsInCard.some((d: any) => d.id === depositRefusal.id)
+  // 10/5 (Nic): a report the bank showed on a later day than the tenant gave
+  // says so on their own report. Once the deposit paid the bill there may be
+  // no balance card to hold it, so it stands on its own.
+  // A report a refused "I hadn't paid" is showing on its own (below) is left
+  // out here, so it never shows twice.
+  const flaggedOutsideCard = declaredDeposits.filter((d: any) =>
+    d.status === 'confirmed' && d.bankDateUsed && d.bankPostedDate && !reportsInCard.some((x: any) => x.id === d.id)
+    && !(depositRefusal && !depositRefusalInCard && d.id === depositRefusal.id))
   const cardRefusal = depositRefusalInCard ? depositRefusal : null
 
   // "Pay all" — ONLY when there are 2+ payable leases (any mix: two units, a
@@ -752,6 +760,12 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
         ) : null
       ))}
 
+      {flaggedOutsideCard.length > 0 && (
+        <div className="card" style={{ padding: 16, marginTop: 16 }}>
+          <ReportedDeposits standalone reports={flaggedOutsideCard} onWithdrawn={refetchAll} />
+        </div>
+      )}
+
       {/* S655 review: a refused "I hadn't paid" whose balance card has gone —
           the report was applied and paid the bill off. It stays on screen,
           saying where the report stands, until the tenant presses OK. */}
@@ -918,6 +932,8 @@ function RemittancesCard({ remittances, prepaidRemaining, prepaidMonthlyDraw, wa
 }) {
   const [openId, setOpenId] = useState<string | null>(null)
 
+  // ACH and card in the list's own short words; a payment recorded by the
+  // office (cash, check, money order, 10/5 bank deposit) in the shared ones.
   const METHOD_LABEL: Record<string, string> = { ach: 'ACH', card: 'Card' }
   // Entry descriptions like 'RENT'/'LATEFEE' just restate the type —
   // showing both reads as a stutter next to the type badge.
@@ -971,7 +987,7 @@ function RemittancesCard({ remittances, prepaidRemaining, prepaidMonthlyDraw, wa
                   {formatCurrency(r.amount)}
                 </span>
                 {r.paymentMethod && (
-                  <span className="badge b-muted">{METHOD_LABEL[r.paymentMethod] ?? humanize(r.paymentMethod)}</span>
+                  <span className="badge b-muted">{METHOD_LABEL[r.paymentMethod] ?? paidByLabel(r.paymentMethod, null) ?? humanize(r.paymentMethod)}</span>
                 )}
                 {cardState
                   ? <span className="badge b-muted">{CARD_HISTORY_STATE_LABEL[cardState]}</span>

@@ -246,6 +246,12 @@ const DELIBERATE = new Map(Object.entries({
   'inspections POST /:id/videos': 'inspection video is taken on site and uploaded there',
   'esign POST /upload': 'the template PDF is a file the landlord uploads',
   'tenants POST /avatar': 'a profile photo is a file the tenant chooses',
+  // 10/5 (Nic): photos of a bank's deposit receipt are files taken of paper.
+  'payments POST /remittances/:id/deposit-photo': 'a photo of the bank\'s receipt is a file the landlord takes and uploads',
+  'declaredDeposits POST /:id/receipt-photo': 'a photo of the bank\'s receipt is a file the tenant takes and uploads',
+  // 10/5 (Nic): taking part payments has local-law weight; the landlord turns
+  // it on beside the screen's "check your local laws" note.
+  'properties PATCH /:id/partial-payments': 'accepting part of the rent is a landlord\'s money policy, set on the property screen beside its local-laws note',
   'landlords POST /me/pending-tenants/:intentId/document': 'the lease PDF is a file the landlord uploads',
 
   // A SIGNATURE IS THE PERSON'S. The agent never signs, never declines a

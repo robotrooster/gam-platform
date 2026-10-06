@@ -468,3 +468,52 @@ describe('a list that did not load never reads as “nothing here”', () => {
     expect(server.gets).toContain('/bank-feed/cash-position?entityId=co2')
   })
 })
+
+// 10/5 (Nic): the tenant's report on the match screen — its reference, their
+// photo of the bank's receipt, and a plain flag when the bank shows a later day.
+describe('a deposit a tenant reported', () => {
+  const reported = (declaration: any) => deposit({
+    id: 'txn9', description: 'BRANCH DEPOSIT', transferMemo: false,
+    candidates: [{
+      ...cand({ leaseId: 'l1', tenantName: 'Rae Tull', unit: 'Lot 7', confidence: 'declared', preselect: true, chargeIds: ['c1'] }),
+      declaration,
+    }],
+  })
+
+  it('posted later than the next business day: says so in plain words, with the reference and the tenant’s photo', async () => {
+    server.deposits = [{ ...reported({
+      id: 'dd1', declaredDate: '2026-09-28', reference: 'DEP-1001',
+      receiptPhotoUrl: '/api/declared-deposits/receipt-photos/r.jpg', dateHolds: false,
+    }), postedDate: '2026-10-03' }]
+    await open()
+    expect(text()).toContain('Tenant reported this deposit')
+    expect(text()).toContain('Deposit reference DEP-1001')
+    expect(text()).toContain('Said they deposited Sep 28 — the bank shows Oct 3. The bank\'s date counts, so late fees up to it stay.')
+    expect(button(/^Tenant's photo of the bank receipt$/)).toBeTruthy()
+    // The photo opens in the app, not by picking the tenant.
+    expect(radios()[0].checked).toBe(true)
+  })
+
+  it('the flag is said once, and recording it ties the deposit to that very report', async () => {
+    server.deposits = [{ ...reported({
+      id: 'dd1', declaredDate: '2026-09-28', reference: 'DEP-1001', receiptPhotoUrl: null, dateHolds: false,
+    }), postedDate: '2026-10-03' }]
+    // The reason as the server writes it (bankDepositMatch.matchDeposit): the flag is not in it.
+    server.deposits[0].candidates[0].reason = 'Rae Tull reported paying $450.00 at the bank on 2026-09-28, and this deposit matches 1 charge exactly.'
+    await open()
+    expect(text().split('Said they deposited Sep 28').length - 1).toBe(1)
+    await click(button(/Record as paid by Rae Tull/))
+    await until(() => server.posts.length === 1, 'the confirm')
+    expect(server.posts[0]).toEqual({
+      url: '/bank-feed/deposits/txn9/confirm', body: { chargeIds: ['c1'], method: 'cash', declarationId: 'dd1' },
+    })
+  })
+
+  it('posted when they said (or the next business day): no flag', async () => {
+    server.deposits = [reported({ id: 'dd1', declaredDate: '2026-10-02', reference: 'DEP-1002', receiptPhotoUrl: null, dateHolds: true })]
+    await open()
+    expect(text()).toContain('Deposit reference DEP-1002')
+    expect(text()).not.toContain('Said they deposited')
+    expect(button(/^Tenant's photo of the bank receipt$/)).toBeUndefined()
+  })
+})

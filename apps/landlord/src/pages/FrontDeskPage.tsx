@@ -48,6 +48,8 @@ type Balance = {
   // BESIDE it — never taken off it. creditOnAccount is everything on file.
   creditAvailable: number
   creditOnAccount: number
+  // 10/5 (Nic): every property they owe at takes part payments (recorded ones).
+  acceptPartialPayments?: boolean
   oldestDueDate: string | null
   openInvoices: number
   // S652: money owed outside a rent ledger — an emailed pay link, or a
@@ -232,11 +234,11 @@ function classifyBalance(b: Balance, who: Who): { phase: PhaseId; say: string } 
            : 'Ask the owner or a manager to settle it at the register.'),
     }
   }
-  // Rent is pay-in-full platform-wide, so a part payment is not an option the
-  // desk can offer — saying so here stops them promising one at the counter.
+  // Rent is pay-in-full unless the property takes part payments (10/5, Nic) —
+  // saying which here stops the desk promising (or refusing) one at the counter.
   return {
     phase: overdue ? 'overdue' : 'due',
-    say: deskBalanceSentence({ first, owed, credit, when, overdue }),
+    say: deskBalanceSentence({ first, owed, credit, when, overdue, partialOk: b.acceptPartialPayments === true }),
   }
 }
 

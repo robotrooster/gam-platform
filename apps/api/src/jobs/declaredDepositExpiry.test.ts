@@ -263,6 +263,38 @@ describe('a report the landlord recorded by hand', () => {
     expect(n.map((x: any) => x.title)).toContain('Your landlord recorded your payment')
   })
 
+  // 10/5 (Nic): a bank deposit the landlord logged from the bank's receipt is
+  // the very deposit the resident reported making.
+  it('closes as recorded when the landlord logged it as a bank deposit', async () => {
+    const d = await declare(3, 'none')
+    const rem = await receipt(d, { amount: 250, method: 'bank_deposit', daysAgo: 1 })
+    expect(await sweepExpiredDeclarations()).toMatchObject({ recorded: 1, expired: 0 })
+    const row = (await db.query(
+      `SELECT status, recorded_remittance_id, resolution_note FROM tenant_declared_deposits WHERE id=$1`, [d.id])).rows[0]
+    expect(row.status).toBe('recorded')
+    expect(row.recorded_remittance_id).toBe(rem)
+    expect(row.resolution_note).toMatch(/Recorded by your landlord: a \$250\.00 bank deposit payment/)
+  })
+
+  // 10/5 (Nic): where GAM reads the bank, the feed holds the line of a bank
+  // deposit the office already recorded for a person (it never confirms the
+  // report against it), so the recorded deposit closes the report — never an
+  // expiry and a strike for the very deposit the landlord recorded.
+  it('where GAM reads the bank, a recorded BANK DEPOSIT closes the report at once — no strike, no landlord alert', async () => {
+    const d = await declare(DECLARATION_EXPIRY_DAYS + 2)       // bank linked and read past the window
+    const rem = await receipt(d, { amount: 250, method: 'bank_deposit', daysAgo: DECLARATION_EXPIRY_DAYS })
+    const r = await sweepExpiredDeclarations()
+    expect(r).toMatchObject({ recorded: 1, expired: 0, tenantsFlagged: 0 })
+    const row = (await db.query(
+      `SELECT status, recorded_remittance_id FROM tenant_declared_deposits WHERE id=$1`, [d.id])).rows[0]
+    expect(row).toMatchObject({ status: 'recorded', recorded_remittance_id: rem })
+    // And inside the report's window too: nothing waits for a bank line the feed holds back.
+    const fresh = await declare(2)
+    await receipt(fresh, { amount: 250, method: 'bank_deposit', daysAgo: 1 })
+    expect((await sweepExpiredDeclarations()).recorded).toBe(1)
+    expect((await statusOf(fresh.id)).status).toBe('recorded')
+  })
+
   it('where the bank is being read, waits for the bank match until the report’s window has run', async () => {
     const d = await declare(2)                                    // bank linked and synced, window still open
     await receipt(d, { amount: 250, method: 'cash', daysAgo: 1 })

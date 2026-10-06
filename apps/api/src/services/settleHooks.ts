@@ -57,6 +57,13 @@ export interface AfterRowsSettledContext {
   /** The receipt to send AFTER the caller commits, covering every row passed.
    *  null when this event sends no receipt (or the caller sends its own). */
   receipt: Omit<ReceiptOpts, 'paymentIds'> | null
+  /**
+   * 10/5 (Nic): rows the caller paid only IN PART (a part payment recorded at
+   * the desk; the rest stays open on its own row). They settle, but carry no
+   * on-time or late mark: a bill's mark is for the day it is paid in full,
+   * which is when its rest is paid.
+   */
+  partPaidIds?: readonly string[]
 }
 
 export interface AfterRowsSettledResult {
@@ -131,7 +138,9 @@ export async function afterRowsSettled(
   // 10/5 (Nic): "money movement is the end of onboarding" — every type.
   const billingActivated = await activateBillingForSettledPayments(client, fresh.map(r => r.id))
 
-  const markable = fresh.filter(r => r.tenant_id && r.due_date && (r.type === 'rent' || r.type === 'utility'))
+  const partPaid = new Set(ctx.partPaidIds ?? [])
+  const markable = fresh.filter(r => r.tenant_id && r.due_date && (r.type === 'rent' || r.type === 'utility')
+    && !partPaid.has(r.id))
   const marked = new Set(markable.length === 0 ? [] : (await client.query<{ payment_id: string }>(
     `SELECT DISTINCT e.event_data->>'payment_id' AS payment_id
        FROM credit_events e
