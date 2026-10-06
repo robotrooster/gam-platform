@@ -27,6 +27,11 @@ export interface LeaseBill {
   propertyName?:    string | null
   unitNumber?:      string | null
   paymentBlocked?:  boolean
+  /**
+   * 10/6 (Nic): the property takes rent its tenants deposit at the landlord's
+   * bank — only then is "I paid at the bank — report a deposit" offered.
+   */
+  bankDepositsTaken?: boolean
   /** The bill and the old balance, before any credit. */
   outstanding:      number
   /** The old balance (S622): paid last, may be paid down in part, never paid by credit. */

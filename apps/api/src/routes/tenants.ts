@@ -1895,6 +1895,8 @@ tenantsRouter.get('/payments', async (req, res, next) => {
              COALESCE(p.manual_method, rm.payment_method,
                CASE WHEN EXISTS (SELECT 1 FROM credit_uses cu WHERE cu.payment_id = p.id
                                    AND cu.source = 'late_fee_credit' AND cu.status = 'applied') THEN 'late_fee_credit'
+                    -- 10/6 (Nic): a late fee a matched bank line showed was never owed, taken off at $0.00.
+                    WHEN p.type = 'late_fee' AND p.amount = 0 AND p.notes LIKE '%Came off: the bank shows the deposit on %' THEN 'late_fee_off_bank'
                     WHEN p.status = 'settled' AND p.amount > 0 AND p.issued_credit_amount >= p.amount THEN 'credit'
                END) AS paid_by
       FROM payments p
@@ -2127,8 +2129,11 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
       if (returningResident) {
         // Over the allowance the option is simply refused (S652) — before
         // anything is written, so no half-made invite is left behind.
-        const { returningResidentAllowance, RETURNING_ALLOWANCE_USED_MESSAGE } = await import('../services/onboardingWindow')
-        if ((await returningResidentAllowance(inviterPropertyId!)).left <= 0) {
+        // 10/6 (Nic): one count per person per property per rolling year — the
+        // household's lead, already attested here (an invite or a reservation),
+        // is returning again for free.
+        const { returningAllowanceFor, RETURNING_ALLOWANCE_USED_MESSAGE } = await import('../services/onboardingWindow')
+        if (!(await returningAllowanceFor(inviterPropertyId!, { email: lead.email ?? null })).available) {
           throw new AppError(409, RETURNING_ALLOWANCE_USED_MESSAGE)
         }
       }

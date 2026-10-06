@@ -27,7 +27,7 @@ import {
 import { reservationDue, releaseReservationTickets, ticketCarriesStay, stayItemIdsIn, stayTaxRate, taxInsidePayment, checkOutFor,
   priceWholeStay, wholeStayPrice, leaseDepositFor, stayExtensionQuote, extendStayByMonth, payTowardStay, SCREENING_LINE_NAME,
   type ReservationDue, type StayExtension } from '../services/registerStay'
-import { stayNeeds, recordScreeningPrepayment, markScreeningRequired, chooseStayTerms, screeningCollectedBy, continuousStayNights, screeningPaidForStay, type StayNeeds } from '../services/stayTerms'
+import { stayNeeds, recordScreeningPrepayment, markScreeningRequired, chooseStayTerms, screeningCollectedBy, continuousStayNights, screeningPaidForStay, canAttestReturningGuest, attestReturningGuest, RETURNING_GUEST_NOT_ALLOWED, type StayNeeds } from '../services/stayTerms'
 import {
   LINK_PAID_ONLINE, LINK_PAGE_STUCK, reservationNoDiscountWords, reservationPaidWords, reservationWhat, reservationLineName,
   closeLinkPageNow, closeOtherLinkCheckouts, closeIfPaidInFull, expireClosedLinks, linkOpenedMeanwhileWords,
@@ -910,6 +910,8 @@ interface CounterStayAt {
   extendBookingId: string | null
   /** 10/5 (Nic, R8): the background check's fee as the register shows it — refused when it is not the server's. */
   screeningFee: number | null
+  /** 10/6 (Nic): "Returning guest — they've stayed with us before" — no background check (owner / a manager only). */
+  returningGuest: boolean
 }
 
 /**
@@ -944,7 +946,13 @@ function counterStayAt(items: any[], stay: unknown): CounterStayAt | null {
     guestEmail: strOrNull(s?.guestEmail) ?? strOrNull(line?.stayEmail),
     stayTerms: (STAY_TERMS as readonly string[]).includes(terms) ? terms as StayTerms : null,
     screeningFee: fee == null || fee === '' || !Number.isFinite(Number(fee)) ? null : Number(fee),
+    returningGuest: s?.returningGuest === true || line?.stayReturning === true,
   }
+}
+
+/** 10/6 (Nic): the returning-guest choice is the owner's or a manager's — refused in words for anyone else. */
+function assertMayAttestReturning(req: any, at: CounterStayAt | null): void {
+  if (at?.returningGuest && !canAttestReturningGuest(req.user)) throw new AppError(403, RETURNING_GUEST_NOT_ALLOWED)
 }
 
 /**
@@ -1057,7 +1065,7 @@ function assertStayAnswered(plan: CounterStayPlan, press: string): void {
 }
 
 async function priceCounterStay(landlordId: string, propertyId: string | null, items: any[], at: CounterStayAt | null, press: string, discountAmount?: unknown,
-                                opts: { strict?: boolean } = {}): Promise<{
+                                opts: { strict?: boolean; offerReturning?: boolean } = {}): Promise<{
   items: any[]; stayLines: { itemId: string; qty: number; stayUnit: 'night' | 'week' | 'month'; name: string; lineTotal: number }[]
   plan: CounterStayPlan | null
 }> {
@@ -1103,7 +1111,8 @@ async function priceCounterStay(landlordId: string, propertyId: string | null, i
     }
     const email = at.guestEmail ?? ext.guestEmail
     const needs = await stayNeeds({ landlordId, propertyId, bookingId: ext.bookingId, tenantId: ext.tenantId, email,
-      checkIn: ext.checkIn, checkOut: ext.checkOut, stayTerms: at.stayTerms })
+      checkIn: ext.checkIn, checkOut: ext.checkOut, stayTerms: at.stayTerms,
+      returning: at.returningGuest, offerReturning: opts.offerReturning })
     plan = {
       ext, unitId: ext.unitId, unitNumber: ext.unitNumber, checkIn: ext.fromCheckOut, checkOut: ext.checkOut,
       stayTotal: ext.price, charge: ext.price, tax: { amount: 0, rate: 0 }, needs,
@@ -1122,7 +1131,8 @@ async function priceCounterStay(landlordId: string, propertyId: string | null, i
     const priced = await priceWholeStay(db, at.unitId, stayUnit, qty, at.checkIn,
       (unit, word) => `Site ${unit} has no ${word} rate set, and neither does the property, so this stay cannot be priced — nothing was charged. `
         + `Set the site's ${word} rate (or the property's), then press ${press} again.`)
-    const needs = await stayNeeds({ landlordId, propertyId, email: at.guestEmail, checkIn: at.checkIn, checkOut: priced.checkOut, stayTerms: at.stayTerms })
+    const needs = await stayNeeds({ landlordId, propertyId, email: at.guestEmail, checkIn: at.checkIn, checkOut: priced.checkOut, stayTerms: at.stayTerms,
+      returning: at.returningGuest, offerReturning: opts.offerReturning })
     const terms = needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null
     // R2/R4: a lease is paid its deposit now; its lease bills the rest (and prorates, by the property's setting).
     const lease = terms === 'lease'
@@ -1132,7 +1142,10 @@ async function priceCounterStay(landlordId: string, propertyId: string | null, i
       stayTotal: priced.total, charge, tax: lease ? { amount: 0, rate: 0 } : { amount: priced.tax, rate: priced.taxRate },
       needs, terms, email: at.guestEmail,
       screeningFee: needs.screening === 'fee_due' ? needs.screeningFee?.amount ?? 0 : 0,
-      what: reservationWhat({ nights: priced.nights, unitNumber: priced.unitNumber, checkIn: at.checkIn, checkOut: priced.checkOut }),
+      // 10/6 (Nic): six nights rung as nights are charged the week's price when
+      // it is lower — the ticket and the receipt say so.
+      what: reservationWhat({ nights: priced.nights, unitNumber: priced.unitNumber, checkIn: at.checkIn, checkOut: priced.checkOut })
+        + (priced.lowerRateWords && !lease ? ` — ${priced.lowerRateWords}` : ''),
     }
   }
   if (opts.strict) assertStayAnswered(plan, press)
@@ -1274,7 +1287,7 @@ async function priceReservationCart(landlordId: string, bookingId: string, items
   // decisions #21: the schedule priced it with its lodging tax in it (a stay
   // under 30 nights); the sale records that part as tax. A long stay's charge
   // here is its deposit (decisions #15) — no tax in that.
-  const rate = due.leaseBillsRest ? 0 : stayTaxRate(due.rates, due.taxPct, due.bookedNights)
+  const rate = due.leaseBillsRest ? 0 : stayTaxRate(due.rates, due.taxPct, due.bookedNights, { checkIn: due.checkIn, total: due.total, monthStay: due.monthStay })
   // 10/3 (review): its share of the stay's tax — with what was paid ahead (a
   // deposit), the parts add up to the stay's tax (taxInsidePayment).
   const stayTax = { amount: taxInsidePayment(due.paid, due.owed, rate), rate }
@@ -1695,12 +1708,13 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
     // with no rate for this length is still LISTED — dropping it would read as
     // "occupied", which is a lie about a site that is standing empty — but it
     // cannot be picked until somebody sets the rate.
-    // 10/5 (Nic, R5): what the stay costs on each site is whole nights, weeks
-    // or months at the site's rate for one of them (wholeStayPrice — never
-    // prorated; the property's lodging tax inside under 30 nights), the same
-    // figure the sale and a pay link charge; `lodgingTax` is the tax inside
-    // it. A site with no rate for this length has no lineTotal and cannot be
-    // picked.
+    // 10/5 (Nic, R5): what the stay costs on each site is never prorated
+    // (wholeStayPrice; the property's lodging tax inside under 30 nights), the
+    // same figure the sale and a pay link charge; `lodgingTax` is the tax
+    // inside it. 10/6 (Nic): it is the one price every door charges for those
+    // nights — the cheapest whole months, weeks and nights that cover them —
+    // and `lowerRateWords` says when that is a bigger rate than was rung up.
+    // A site with no rate to price it has no lineTotal and cannot be picked.
     res.json({ success: true, data: {
       checkIn, checkOut, nights: nightsBetween(checkIn, checkOut),
       stayUnit,
@@ -1711,6 +1725,7 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
           rate: u.rate ?? null,
           lineTotal: priced.total > 0 ? priced.total : null,
           lodgingTax: priced.total > 0 ? priced.tax : null,
+          lowerRateWords: priced.total > 0 ? priced.lowerRateWords : null,
         }
       }),
     } })
@@ -1735,6 +1750,10 @@ function stayPlanOut(plan: CounterStayPlan) {
     screening: plan.needs.screening,
     screeningFee: plan.screeningFee > 0 ? plan.screeningFee : null,
     screeningLineName: SCREENING_LINE_NAME,
+    // 10/6 (Nic): the third choice beside the check's fee — available, or
+    // greyed with the allowance words (never the count). Only for a desk that may use it.
+    returning: plan.needs.returningOffer,
+    returningGuest: plan.needs.screening === 'returning',
     leaseChoice: plan.needs.leaseChoice,
     terms: plan.terms,
     leaseOrStayWords: longStay ? LEASE_OR_STAY_WORDS : null,
@@ -1768,8 +1787,9 @@ posRouter.post('/stays/quote', requirePerm('pos.ring_sale'), async (req: any, re
     const qty = Number(b.qty)
     const at = counterStayAt([], b)
     if (!at) throw new AppError(400, 'Pick a site and an arrival date — or the stay to add a month to — first.')
+    assertMayAttestReturning(req, at)
     const c = await priceCounterStay(posLandlordId(req), propertyId, [{ id: itemId, qty, price: 0 }], { ...at, screeningFee: null },
-      'Use this site')
+      'Use this site', undefined, { offerReturning: canAttestReturningGuest(req.user) })
     if (!c.plan) throw new AppError(400, 'That item is not a stay — take it out of the cart, then add the stay again.')
     res.json({ success: true, data: stayPlanOut(c.plan) })
   } catch (e) { next(e) }
@@ -2495,6 +2515,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       // the counter's lease answer — every answer the stay needs is checked
       // here, before any money moves (assertStayAnswered).
       const stayAt = stay ? counterStayAt([], stay) : null
+      assertMayAttestReturning(req, stayAt)
       const hasStayAt = !!stayAt
       const counter = payLink ? { items, stayLines: [] as any[], plan: null }
         : await priceCounterStay(posLandlordId(req), propertyId, items, stayAt, 'Charge', discountAmount, { strict: true })
@@ -2934,7 +2955,8 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           lines: stayLines,
           details: { ...stay, guestEmail: stayPlan?.email ?? stay?.guestEmail ?? null },
           stayTerms: stayPlan?.terms ?? null,
-          screeningRequired: (stayPlan?.needs.nights ?? 0) >= STAY_SCREENING_NIGHTS,
+          // 10/6: a returning guest never waits on screening.
+          screeningRequired: (stayPlan?.needs.nights ?? 0) >= STAY_SCREENING_NIGHTS && stayPlan?.needs.screening !== 'returning',
           depositAmount: leaseChosen ? stayPlan!.charge : null,
         })
         // 10/2 (review): paid in full at the counter — nothing left to bill on arrival day.
@@ -2955,6 +2977,8 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       // landlord's next payout, cash or card alike. A guest with a check on
       // file pays nothing, but check-in still waits on it (R9).
       let screeningAfterCommit: (() => Promise<void>) | null = null
+      // 10/6 (review): closes the card pages of links whose check fee came off (returning guest).
+      let returningAfterCommit: (() => Promise<void>) | null = null
       if (stayPlan && stayBooking) {
         if (stayPlan.screeningFee > 0) {
           const rec = await recordScreeningPrepayment(client, {
@@ -2969,8 +2993,15 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
             logger.error({ bookingId: stayBooking.bookingId, saleId: tx.id }, '[POS] a background-check fee was taken for a stay that already had one recorded — left in the sale for the landlord to give back')
           }
           screeningAfterCommit = rec.afterCommit
-        } else if (stayPlan.needs.nights >= STAY_SCREENING_NIGHTS) {
+        } else if (stayPlan.needs.nights >= STAY_SCREENING_NIGHTS && stayPlan.needs.screening !== 'returning') {
           await markScreeningRequired(client, stayBooking.bookingId)
+        }
+        // 10/6 (Nic): "Returning guest — they've stayed with us before" — who
+        // and when, on the stay, counted against the property's allowance
+        // under its lock, with the sale or not at all.
+        if (stayPlan.needs.returningAttestNow) {
+          const r = await attestReturningGuest(client, { bookingId: stayBooking.bookingId, propertyId, byUserId: req.user!.userId, chainBookingIds: stayPlan.needs.chain.bookingIds })
+          returningAfterCommit = r.afterCommit
         }
       }
       // 10/5 (Nic, M2): a reservation ticket's background check — sold from
@@ -3021,6 +3052,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       await expireClosedLinks(closedWithSale)
       // 10/5 (Nic, R8): the guest's (already paid) background-check link.
       if (screeningAfterCommit) await screeningAfterCommit()
+      if (returningAfterCommit) await returningAfterCommit()
       // 10/5 (Nic, R2): "either way, it goes to me" — a lease chosen drafts it
       // for the landlord; a stay with no lease is billed its site's utilities
       // (R11) and the landlord is told. Never a reason to undo the sale.

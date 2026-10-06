@@ -861,8 +861,21 @@ export async function autoFileIncome(landlordId: string): Promise<number> {
   return (await runDepositSteps(landlordId, new Set<DepositActionKind>(['auto_file']))).autoFiled
 }
 
+/**
+ * 10/6 (Nic, "Yes, build it"): a bank line that IS a deposit the office
+ * already logged by hand is tied to it by itself when GAM is certain
+ * (recordedDepositMatch.recordedDepositToTieBySelf), and the bank's date then
+ * decides the late fees and the payment mark. One step of reconcileDeposits,
+ * callable on its own.
+ */
+export async function tieRecordedDeposits(landlordId: string): Promise<number> {
+  return (await runDepositSteps(landlordId, new Set<DepositActionKind>(['recorded']))).recorded
+}
+
 export interface ReconcileResult {
   payouts: number; slips: number; inferred: number; declared: number; autoSettled: number; autoFiled: number
+  /** 10/6: bank lines tied to a deposit the office already logged by hand. */
+  recorded: number
 }
 
 /**
@@ -879,11 +892,11 @@ export async function reconcileDeposits(landlordId: string): Promise<ReconcileRe
     logger.warn({ err: e, landlordId }, '[bank-feed] payout matching skipped')
   }
   const r = await runDepositSteps(landlordId, new Set<DepositActionKind>(
-    ['slip', 'inferred', 'declared', 'auto_settle', 'auto_file']))
+    ['recorded', 'slip', 'inferred', 'declared', 'auto_settle', 'auto_file']))
   return { ...r, payouts }
 }
 
-export type DepositActionKind = 'slip' | 'inferred' | 'declared' | 'auto_settle' | 'auto_file'
+export type DepositActionKind = 'recorded' | 'slip' | 'inferred' | 'declared' | 'auto_settle' | 'auto_file'
 
 /** A money-in row nobody has acted on, the bank has posted, and no person has undone. */
 const RECONCILABLE_SQL = (t: string) => `(${AUTO_MATCHABLE_SQL(t)} AND ${t}.auto_settle_undo IS NULL)`
@@ -894,6 +907,7 @@ interface DepositRow {
 }
 
 type DepositDecision =
+  | { kind: 'recorded'; receiptId: string }
   | { kind: 'slip'; slipId: string }
   | { kind: 'inferred'; items: import('./depositSlips').CashItem[] }
   | { kind: 'declared'; chargeIds: string[]; declarationId: string; method: string }
@@ -906,7 +920,7 @@ interface AutoFileRule {
 }
 
 async function runDepositSteps(landlordId: string, allowed: Set<DepositActionKind>): Promise<Omit<ReconcileResult, 'payouts'>> {
-  const out = { slips: 0, inferred: 0, declared: 0, autoSettled: 0, autoFiled: 0 }
+  const out = { slips: 0, inferred: 0, declared: 0, autoSettled: 0, autoFiled: 0, recorded: 0 }
   let rows: DepositRow[]
   try {
     rows = await query<DepositRow>(
@@ -924,7 +938,8 @@ async function runDepositSteps(landlordId: string, allowed: Set<DepositActionKin
       const d = await decideDeposit(txn)
       if (d.kind === 'review' || !allowed.has(d.kind)) continue
       if (await actOnDeposit(txn, d)) {
-        if (d.kind === 'slip') out.slips++
+        if (d.kind === 'recorded') out.recorded++
+        else if (d.kind === 'slip') out.slips++
         else if (d.kind === 'inferred') out.inferred++
         else if (d.kind === 'declared') out.declared++
         else if (d.kind === 'auto_settle') out.autoSettled++
@@ -943,9 +958,9 @@ async function runDepositSteps(landlordId: string, allowed: Set<DepositActionKin
  * is the plan's; a deposit that two different things could explain waits.
  */
 async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
-  const { openSlipsFitting, cashProposalFor, bankMatchReceiptSql } = await import('./depositSlips')
+  const { openSlipsFitting, cashProposalFor } = await import('./depositSlips')
   const { candidatesForDeposit } = await import('./bankDepositCandidates')
-  const { isPreselectable, isAutoSettleable, memoMethodHint, memoSaysTransfer, DECLARATION_DATE_WINDOW_DAYS, AUTO_SETTLE_SAME_AMOUNT_DAYS, declarationReachesSql } =
+  const { isPreselectable, isAutoSettleable, memoMethodHint, memoSaysTransfer, AUTO_SETTLE_SAME_AMOUNT_DAYS } =
     await import('./bankDepositMatch')
   const slips = await openSlipsFitting(db, txn.landlord_id, txn)
   // Who the memo names, read fresh from the bank's own words (a row stored
@@ -961,16 +976,21 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
   const cash = transfer || namesAPayer(payerKey)
     ? { kind: 'none' as const, items: [], totalCents: 0, note: '' }
     : await cashProposalFor(db, txn.landlord_id, txn)
-  const { candidates } = await candidatesForDeposit(txn)
-  const reports = Number((await queryOne<{ n: string }>(
-    `SELECT COUNT(*)::text AS n FROM tenant_declared_deposits
-      WHERE landlord_id = $1 AND status = 'pending' AND amount = $2::numeric
-        AND ${declarationReachesSql('declared_date', '$3::date')}`,
-    [txn.landlord_id, Number(txn.amount).toFixed(2), txn.posted_date]))?.n ?? 0)
+  // 10/6 (Nic): the one matcher pairs the company's reports with its lines
+  // (services/declaredDepositAssign). A tenant's report counts for THIS line
+  // only when the matcher pairs it here, or puts it in a conflict over this
+  // line for the landlord to pick — never a report paired with another line.
+  const { loadReportAssignment } = await import('./declaredDepositAssign')
+  const assignment = await loadReportAssignment(db, txn.landlord_id)
+  const verdict = assignment.lines.get(txn.id) ?? null
+  const { candidates } = await candidatesForDeposit(txn, { assignment })
+  const reports = verdict?.kind === 'assigned' ? 1
+    : verdict?.kind === 'conflict' ? verdict.conflict.reportIds.length : 0
 
   // A tenant's whole bill, to the cent, with nothing else fitting.
   const cashAny = cash.kind === 'everything' || cash.kind === 'one' || cash.kind === 'several'
   let autoSettle: { chargeIds: string[]; method: 'cash' | 'check' | 'money_order' } | null = null
+  let offPropertyBillFits = false
   const sameAmount = Number((await queryOne<{ n: string }>(
     `SELECT COUNT(*)::text AS n FROM bank_transactions o
       WHERE o.landlord_id = $1 AND o.id <> $2 AND o.amount = $3::numeric AND o.amount > 0
@@ -1017,6 +1037,11 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
       competingCash: false,
       description: txn.description,
     })) {
+      // 10/6 (Nic): only where tenants deposit rent at the bank does GAM
+      // settle their bill from a bank line by itself. Elsewhere the whole bill
+      // that fits is still a reason the office's slip or cash is not assumed
+      // (tenantSignal, exactly as before the setting) — a person looks.
+      if (!m.depositsTaken) { offPropertyBillFits = true; break }
       // A named match settles only from a check-shaped memo (isTenantCheckMemo).
       const hint = memoMethodHint(txn.description)
       autoSettle = { chargeIds: m.chargeIds, method: m.confidence === 'named_exact' ? 'check' : (hint ?? 'cash') }
@@ -1024,7 +1049,7 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
     }
   }
   // Something says a tenant paid this — their report, or a whole bill that fits it.
-  const tenantSignal = reports > 0 || autoSettle !== null
+  const tenantSignal = reports > 0 || autoSettle !== null || offPropertyBillFits
 
   // 0. 10/5 (Nic): a bank deposit the office already recorded from the bank's
   //    receipt is money this line may well BE. It is never cash on hand (no
@@ -1033,16 +1058,30 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
   //    behind: the recorded deposit paid the older month, and this line would
   //    "pay" the newer one), be confirmed against a tenant's report, or be
   //    filed as income. A person looks at it instead.
-  const recordedBankDeposit = await queryOne<{ id: string }>(
-    `SELECT r.id FROM tenant_remittances r
-      WHERE r.landlord_id = $1 AND r.status = 'settled' AND r.payment_method = 'bank_deposit'
-        AND r.stripe_payment_intent_id IS NULL
-        AND r.amount = $2::numeric
-        AND r.settled_at::date BETWEEN ($3::date - $4::int) AND ($3::date + $4::int)
-        AND NOT ${bankMatchReceiptSql('r')}
-      LIMIT 1`,
-    [txn.landlord_id, Number(txn.amount).toFixed(2), txn.posted_date, DECLARATION_DATE_WINDOW_DAYS])
-  if (recordedBankDeposit) return { kind: 'review', why: 'a bank deposit the office already recorded' }
+  //
+  //    10/6 (Nic, "Yes, build it"): and when GAM is certain which recorded
+  //    deposit this line IS — its reference number on the line, or the only
+  //    one that fits with no other line of the same amount near it, at a
+  //    property that takes bank deposits from tenants — it is tied to it, and
+  //    the bank's date decides that deposit's late fees and payment mark
+  //    (services/recordedDepositMatch). Otherwise a person picks.
+  const { recordedDepositsFitting, recordedDepositToTieBySelf } = await import('./recordedDepositMatch')
+  const recorded = await recordedDepositsFitting(db, txn)
+  if (recorded.length > 0) {
+    // A tenant who could have made this deposit themselves (their report, or
+    // an open bill of exactly this amount) means the line may be theirs, not
+    // the recorded one — a person picks, unless the reference number says.
+    const tenantCouldBePayer = reports > 0 || candidates.some(c => c.exact)
+    const tie = recordedDepositToTieBySelf(recorded, txn.posted_date, sameAmount, tenantCouldBePayer)
+    if (tie) return { kind: 'recorded', receiptId: tie.receiptId }
+    return { kind: 'review', why: 'a bank deposit the office already recorded' }
+  }
+
+  // 10/6 (Nic): tenants' reports GAM will not pick between — two claiming
+  // this line with nothing to tell them apart, lines on different days where
+  // who gets which decides who paid late, or this line equal to what two or
+  // more reported together. Nothing here decides it; the landlord picks.
+  if (verdict?.kind === 'conflict') return { kind: 'review', why: 'tenants’ reports the landlord must pick between' }
 
   // 1. A deposit slip staff made (a transfer is never the office's bag).
   if (slips.length > 0 && transfer) return { kind: 'review', why: 'a transfer between accounts' }
@@ -1057,7 +1096,7 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
   }
   // 3. A tenant's report the bank confirms.
   const top = candidates[0]
-  if (top && top.confidence === 'declared' && isPreselectable(top) && top.chargeIds.length > 0) {
+  if (top && top.confidence === 'declared' && top.depositsTaken && isPreselectable(top) && top.chargeIds.length > 0) {
     // 10/5: the very report the match was made from (before, the newest
     // pending report of that amount on the lease — which could be another
     // month's, out of this deposit's reach, and the confirm then refused it).
@@ -1079,6 +1118,11 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
 }
 
 async function actOnDeposit(txn: DepositRow, d: DepositDecision): Promise<boolean> {
+  if (d.kind === 'recorded') {
+    const { matchRecordedDeposit } = await import('./recordedDepositMatch')
+    await matchRecordedDeposit({ bankTransactionId: txn.id, receiptId: d.receiptId, confirmedByUserId: null, auto: true })
+    return true
+  }
   if (d.kind === 'declared' || d.kind === 'auto_settle') {
     const { confirmDepositMatch } = await import('./bankDepositConfirm')
     await confirmDepositMatch({

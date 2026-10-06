@@ -9,7 +9,7 @@ import { landlordScopeIds } from '../lib/landlordScope'
 import { canonicalUnitNumber, UNIT_TYPE_PREFIX, BOOKING_STATUSES, BOOKING_STATUS_LABEL, SUB_PERMISSION_LABEL, PERMISSION_CATALOG, type BookingStatus } from '@gam/shared'
 import { STAY_TERMS, STAY_SCREENING_NIGHTS, stayHeldWords, type StayTerms } from '@gam/shared'
 import { centsWords, NEVER_MOVED_IN_NOTE, NEVER_MOVED_IN_REASON } from '../lib/unwindIssuedLease'
-import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
+import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE, type StayConflict } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
@@ -19,8 +19,14 @@ import { linkUnitToSubtype } from '../services/unitSubtype'
 import { recordBookingEvent, recordBookingChange } from '../services/bookingEvents'
 import {
   stayNeeds, markScreeningRequired, chooseStayTerms, draftLeaseFromStay, syncStayUtilityAgreement, checkInBlock,
-  continuousStayNights, type StayNeeds, type CheckInBlock,
+  continuousStayNights, canAttestReturningGuest, attestReturningGuest, planStayGuestAccount,
+  RETURNING_GUEST_NOT_ALLOWED, type StayNeeds, type CheckInBlock,
 } from '../services/stayTerms'
+import {
+  stayWorkTradeIn, coversRent, syncStayWorkTrade, stayWorkTradeSkippedWords, stayRentCovered, stayWorkTradeOf,
+  sendStayWorkTradeInvite, type StayWorkTradeInvite,
+  type StayWorkTradeTerms,
+} from '../services/stayWorkTrade'
 import { unitPendingReads } from '../services/utilityReadingRuns'
 import { syncLeaseWithBookingDates } from '../services/bookingLeaseBilling'
 import { bookedDayBeforeEarlyCheckOut, checkOutChangeRefusal, onCheckOutUndone, afterPatchEarlyCheckOut, refundNeedsRetrySql, healLeaseEnds } from '../services/earlyCheckOut'
@@ -462,6 +468,10 @@ const LONG_STAY_NEEDS_EMAIL =
 function screeningFeeRouteBody(needs: StayNeeds, hasEmail: boolean) {
   const fee = needs.screeningFee?.amount ?? 0
   return {
+    // 10/6 (Nic): the third choice — "Returning guest — they've stayed with us
+    // before" — for a desk allowed to use it. Unavailable (the property's
+    // allowance is used up) it says so in words, never the count.
+    returning: needs.returningOffer,
     success: false as const,
     code: 'screening_fee_route_needed' as const,
     error: `This guest is staying ${needs.nights} nights in a row, so they need a background check before check-in, `
@@ -557,7 +567,8 @@ async function afterStaySaved(bookingId: string, needs: StayNeeds | null, given:
                               byUserId: string): Promise<{ terms: StayTerms | null; leaseId: string | null }> {
   const out: { terms: StayTerms | null; leaseId: string | null } = { terms: null, leaseId: null }
   try {
-    if (needs && needs.nights >= STAY_SCREENING_NIGHTS) await markScreeningRequired(null, bookingId)
+    // 10/6: a returning guest (attested now or on an earlier leg) never waits.
+    if (needs && needs.nights >= STAY_SCREENING_NIGHTS && needs.screening !== 'returning') await markScreeningRequired(null, bookingId)
     const answer: StayTerms | null = !needs ? null
       : given && needs.leaseChoice === given ? given
       : !given && needs.leaseChoice === 'stay' ? 'stay'
@@ -573,6 +584,48 @@ async function afterStaySaved(bookingId: string, needs: StayNeeds | null, given:
     logger.error({ err, bookingId }, '[booking] stay terms follow-through failed')
   }
   return out
+}
+
+/**
+ * 10/6 (Nic): the returning-guest choice and a work trade, as a reservation
+ * save sends them — refused in words for a desk without the permission each
+ * needs (owner / a manager allowed to invite tenants; "Create / update
+ * work-trade agreements"), before anything is written.
+ */
+function returningGuestIn(req: any): boolean {
+  const on = req.body?.returningGuest === true
+  if (on && !canAttestReturningGuest(req.user)) throw new AppError(403, RETURNING_GUEST_NOT_ALLOWED)
+  return on
+}
+function workTradeIn(req: any): StayWorkTradeTerms | null | undefined {
+  const t = stayWorkTradeIn(req.body?.workTrade)
+  if (t !== undefined && !userHasPerm(req.user, 'work_trade.manage')) {
+    throw new AppError(403, 'A work trade needs the "Create / update work-trade agreements" permission. Ask the account owner to turn it on for you on the Team page. Nothing was saved.')
+  }
+  return t
+}
+/** A work trade is made for the guest's own account: refused before anything is written when it can't be. */
+async function assertWorkTradeGuest(b: { tenant_id: string | null; guest_email: string | null; landlord_id: string }): Promise<void> {
+  const plan = await planStayGuestAccount(b)
+  if (!plan.ok) throw new AppError(400, stayWorkTradeSkippedWords(plan.reason))
+}
+
+/**
+ * 10/6 (review): what marking a guest as returning did to a background-check
+ * fee that had already gone out (services/stayTerms attestReturningGuest), in
+ * the desk's words — or null when nothing carried one.
+ */
+function returningFeeWords(d: import('../services/stayTerms').ScreeningFeeDropped): string | null {
+  const parts: string[] = []
+  if (d.linksChanged) parts.push(d.linksChanged === 1
+    ? 'The pay link already sent no longer asks for the background check — the same link now asks the rest.'
+    : `The ${d.linksChanged} pay links already sent no longer ask for the background check — the same links now ask the rest.`)
+  if (d.linksClosed) parts.push(d.linksClosed === 1
+    ? 'The pay link sent for the background check was closed — nothing is left on it to pay.'
+    : `${d.linksClosed} pay links sent for the background check were closed — nothing is left on them to pay.`)
+  if (d.ticketsChanged) parts.push('The background check came off the stay\'s register ticket.')
+  if (d.ticketsVoided) parts.push('The stay\'s register ticket was closed — nothing is left on it to pay.')
+  return parts.length ? `Returning guest: no background check. ${parts.join(' ')}` : null
 }
 
 /** The 409 a check-in waiting on screening gets (R9). No override — owners included. */
@@ -761,6 +814,9 @@ async function putRelocatedBack(moves: RelocatedStay[]): Promise<void> {
       await c.query(`UPDATE unit_bookings SET unit_id = $2, updated_at = NOW() WHERE id = $1`, [m.bookingId, m.fromUnitId])
       await c.query('COMMIT')
       logger.info({ bookingId: m.bookingId }, '[extend] a reservation moved for an extension that did not happen on that site is back on it')
+      // 10/6 (review): its work trade and utilities go back with it.
+      await syncStayUtilityAgreement(m.bookingId).catch(err =>
+        logger.error({ err, bookingId: m.bookingId }, '[extend] the stay put back could not bring its work trade or utilities with it'))
     } catch (err) {
       await c.query('ROLLBACK').catch(() => {})
       logger.error({ err, bookingId: m.bookingId }, '[extend] could not put a moved reservation back on its site')
@@ -823,6 +879,16 @@ async function endLeaseOnDayLeftSteps(
     + 'To end the lease on the day they left instead, '
     + (conflict === 'booking' ? 'move that reservation first' : 'free those nights on the site first')
     + `; then ${steps}, and check them out again.`
+}
+
+/**
+ * 10/6 (Nic): the question asked before a person moves a stay onto a site the
+ * guest asked not to have — "She asked not to be on RV 14. Move her there
+ * anyway?" The schedule does not know who is "she", so it says their name.
+ */
+export function avoidedSiteWords(guestName: string | null | undefined, unitNumber: string): string {
+  const who = guestName && guestName.trim() ? guestName.trim() : 'This guest'
+  return `${who} asked not to be on ${unitNumber}. Move them there anyway?`
 }
 
 // S653: the avoid list is body-supplied ids. Keep only units that exist at the
@@ -2307,7 +2373,15 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       payAtRegister: z.boolean().nullish(),
       /** Which register item this stay is sold as — the button, not the price. */
       stayItemId: z.string().uuid().nullish(),
+      // 10/6 (Nic): "Returning guest — they've stayed with us before" (no
+      // background check), and a work trade for the stay. Read below.
+      returningGuest: z.boolean().nullish(),
+      workTrade: z.any().optional(),
     }).parse(req.body)
+    const returningGuest = returningGuestIn(req)
+    const workTrade = workTradeIn(req) ?? null
+    // 10/6 (Nic): a work trade that covers rent makes the site charge $0.
+    const rentTraded = coversRent(workTrade)
 
     const checkInD  = new Date(body.checkIn)
     const checkOutD = new Date(body.checkOut)
@@ -2387,11 +2461,15 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       landlordId: unit.landlord_id, propertyId: unit.property_id,
       tenantId: body.tenantId ?? null, email: body.guestEmail ?? null,
       checkIn: body.checkIn, checkOut: body.checkOut, stayTerms: stayTermsGiven,
+      returning: returningGuest, offerReturning: canAttestReturningGuest(req.user),
     })
     if (needs.nights >= STAY_SCREENING_NIGHTS && !needs.chain.email && !needs.chain.tenantId) {
       throw new AppError(400, LONG_STAY_NEEDS_EMAIL)
     }
     if (needs.leaseChoice === 'needed') return void res.status(409).json(stayTermsNeededBody(needs))
+    if (workTrade) {
+      await assertWorkTradeGuest({ tenant_id: body.tenantId ?? null, guest_email: body.guestEmail ?? null, landlord_id: unit.landlord_id })
+    }
     // A2: the check's fee rides on a deposit link or a register ticket — never
     // a stay confirmed straight onto the schedule (screeningFeeRouteBody).
     // One fee per continuous stay (M3): a back-to-back leg whose ticket or link
@@ -2407,27 +2485,29 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // PROPERTY default per rate when the unit hasn't been configured separately
     // (Nic: rates are uniform by default — RV spots/storage share a price — but
     // a landlord can override a specific unit, e.g. pull-through vs back-in RV
-    // sites). Tier by length, prorated, short-term tax (tax stays property-level).
-    // Falls back to a client-supplied total only when no rate is set at all.
+    // sites). 10/6 (Nic): the schedule's ONE pricing function
+    // (registerStay scheduleStayPrice → shared priceStay): the cheapest whole
+    // months, weeks and nights that cover the stay, short-term tax under 30
+    // nights — the figure the form showed, the booking site and the register
+    // charge. Falls back to a client-supplied total only when no rate is set.
     const prop = await queryOne<any>(
       'SELECT nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate FROM properties WHERE id=$1',
       [unit.property_id])
-    const staffMonthlyRate = unit.monthly_rate ?? prop?.monthly_rate
-    const price = computeStayPrice(
+    const price = scheduleStayPrice(
       { nightly: unit.nightly_rate ?? prop?.nightly_rate,
         weekly:  unit.weekly_rate  ?? prop?.weekly_rate,
-        monthly: staffMonthlyRate },
-      Number(prop?.short_term_tax_rate || 0), nights)
-    // S547: monthly-tier stays price on the calendar-aligned schedule (prorated
-    // arrival/departure months, flat months between) — same rule everywhere.
-    const total = price.tier === 'monthly' && staffMonthlyRate != null
-      ? computeMonthlyStaySchedule(body.checkIn, body.checkOut, Number(staffMonthlyRate)).total
-      : price.total > 0 ? price.total : (body.totalAmount || 0)
+        monthly: unit.monthly_rate ?? prop?.monthly_rate },
+      prop?.short_term_tax_rate ?? 0, body.checkIn, body.checkOut)
+    // 10/6 (Nic): a work trade that covers rent — the site costs the guest nothing.
+    const total = rentTraded ? 0 : price.total > 0 ? price.total : (body.totalAmount || 0)
     // S526 (Nic): reservations carry ZERO platform fee — GAM's income is the
     // $2/occupied-unit monthly fee (services/platformFee.ts), not a booking cut.
     const platformFee = 0
 
-    const bookingStatus = (wantsDeposit || wantsRegister) ? 'tentative' : 'confirmed'
+    // 10/6 (Nic): nothing to pay for the site (its rent is traded) and no check
+    // fee to collect — no deposit link or register ticket: confirmed directly.
+    const routedToPay = (wantsDeposit || wantsRegister) && !(rentTraded && !feeDue)
+    const bookingStatus = routedToPay ? 'tentative' : 'confirmed'
 
     // S652: clearing the site and taking it are one act. Either this guest has
     // the site and the holder has been moved or told, or neither happened —
@@ -2450,6 +2530,10 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     //      starts again from the top.
     let booking: any
     let displaced: import('../services/holdDisplacement').DisplacementOutcome[] = []
+    // 10/6 (review): a placeholder account's set-up link, made with the work trade.
+    let wtInvite: StayWorkTradeInvite | null = null
+    // 10/6 (review): closes the card pages of links whose check fee came off (returning guest).
+    let returningAfterCommit: (() => Promise<void>) | null = null
     for (let attempt = 1; ; attempt++) {
       if (attempt > 1) await pauseBeforeTry(attempt - 1)
       displaced = []
@@ -2488,6 +2572,20 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
            body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
            total, platformFee, body.notes ?? null, body.source ?? 'direct', body.requiredSiteLayout ?? 'none', body.requiredAmpService ?? 'none',
            body.lockedToUnit === true, bookingStatus, avoided])).rows[0]
+        // 10/6 (Nic): the landlord's "Returning guest" (who and when), counted
+        // against the property's allowance under its lock — and the stay's work
+        // trade — with the stay, or not at all.
+        returningAfterCommit = null
+        if (needs.returningAttestNow) {
+          const r = await attestReturningGuest(bookingClient, { bookingId: booking.id, propertyId: unit.property_id, byUserId: req.user!.userId, chainBookingIds: needs.chain.bookingIds })
+          returningAfterCommit = r.afterCommit
+        }
+        wtInvite = null
+        if (workTrade) {
+          const wt = await syncStayWorkTrade(booking.id, { terms: workTrade, byUserId: req.user!.userId, client: bookingClient })
+          if (wt.action === 'skipped') throw new AppError(400, stayWorkTradeSkippedWords(wt.reason))
+          if (wt.action === 'created') wtInvite = wt.invite
+        }
         await bookingClient.query('COMMIT')
         break
       } catch (e) {
@@ -2524,7 +2622,10 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // auto-draft is gone). The counter's answer is carried out here: a lease
     // chosen drafts one for the landlord, a stay bills its site's utilities, and
     // the landlord is told either way. 22+ nights: check-in waits on screening.
+    if (returningAfterCommit) await returningAfterCommit()
     const stayDone = await afterStaySaved(booking.id, needs, stayTermsGiven, req.user!.userId)
+    // 10/6 (review): the guest's way into their account, for the work trade.
+    await sendStayWorkTradeInvite(booking.id, wtInvite)
     // R8: nothing on file → the check's fee rides on the payment this stay is
     // handed to below (the schedule takes no money itself).
     const screeningFee = feeDue && needs.screeningFee ? needs.screeningFee.amount : null
@@ -2545,10 +2646,11 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // this site — a guest who phones and a guest who books online are buying
     // the same thing and are told the same number.
     let depositLink: { id: string; url: string } | null = null
-    if (wantsDeposit) {
+    if (wantsDeposit && routedToPay) {
       try {
         const { quoteStayDeposit } = await import('../services/propertyBooking')
-        const depositAmount = await quoteStayDeposit(unit.id, body.checkIn, body.checkOut)
+        // 10/6: a work trade covering rent leaves only the check's fee to send.
+        const depositAmount = rentTraded ? 0 : await quoteStayDeposit(unit.id, body.checkIn, body.checkOut)
         const { createBookingDepositLink } = await import('./posPayLinks')
         // 10/5 (R8, A2): the background check's fee goes on the link as its own
         // fixed line (`screeningFee`, the server's figure) — a $0 deposit still
@@ -2571,7 +2673,7 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // confirms THAT reservation — the register cannot invent a second booking
     // for a site the schedule has already committed.
     let registerTicketId: string | null = null
-    if (wantsRegister) {
+    if (wantsRegister && routedToPay) {
       try {
         const item = body.stayItemId
           ? await queryOne<any>(
@@ -2628,8 +2730,45 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       // Fee due but no link or ticket to carry it: nothing collected it yet.
       screeningFeeUncollected: !!screeningFee && !depositLink && !registerTicketId,
       heldThrough: needs.leaseChoice === 'stay' ? stayHeldWords(needs.chain.checkOut) : null,
+      // 10/6: what the details will say.
+      returningGuest: needs.screening === 'returning',
+      workTrade: workTrade ? { coveredCharges: workTrade.coveredCharges, trusted: workTrade.trusted, rentTraded } : null,
     }
     res.status(201).json({ success: true, data: { ...booking, depositLink, registerTicketId, stay } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/units/:id/returning-guest?email=&checkIn=&checkOut=&bookingId= —
+// 10/6 (Nic): what the reservation form shows beside the background check for
+// a stay on this site: does it need one (22+ continuous nights, nothing on
+// file), and may "Returning guest — they've stayed with us before" be used —
+// available, or greyed with the allowance words (never the count). Nothing is
+// written. A desk without the permission is told it is not offered.
+unitsRouter.get('/:id/returning-guest', requirePerm('schedule.create_reservation', 'schedule.edit_reservation'), async (req, res, next) => {
+  try {
+    const unit = await queryOne<{ landlord_id: string; property_id: string }>(
+      'SELECT landlord_id, property_id FROM units WHERE id = $1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, unit.property_id)
+    const day = (v: unknown) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null)
+    const checkIn = day(req.query.checkIn)
+    const checkOut = day(req.query.checkOut)
+    if (!checkIn || !checkOut || checkOut <= checkIn) throw new AppError(400, 'Pick the arrival and leaving days first.')
+    const email = typeof req.query.email === 'string' && req.query.email.trim() ? req.query.email.trim() : null
+    const bookingId = typeof req.query.bookingId === 'string' && /^[0-9a-f-]{36}$/i.test(req.query.bookingId) ? req.query.bookingId : null
+    const offered = canAttestReturningGuest(req.user)
+    const needs = await stayNeeds({
+      landlordId: unit.landlord_id, propertyId: unit.property_id, bookingId, email, checkIn, checkOut,
+      offerReturning: offered,
+    })
+    res.json({ success: true, data: {
+      nights: needs.nights,
+      screening: needs.screening,
+      screeningFee: needs.screening === 'fee_due' ? needs.screeningFee?.amount ?? null : null,
+      offered,
+      returning: needs.returningOffer,
+    } })
   } catch (e) { next(e) }
 })
 
@@ -2736,7 +2875,12 @@ unitsRouter.get('/:id/bookings', requirePerm(
       SELECT b.*,
              u.unit_number,
              u.unit_type,
-             p.requires_booking_acknowledgment
+             p.requires_booking_acknowledgment,
+             -- 10/6: the stay's work trade, as the master schedule shows it.
+             (SELECT jsonb_build_object('id', w.id, 'covered_charges', w.covered_charges, 'trusted', w.trusted,
+                                        'tracks_hours', w.tracks_hours, 'monthly_hours_target', w.monthly_hours_target,
+                                        'duties', w.duties, 'status', w.status)
+                FROM work_trade_agreements w WHERE w.booking_id = b.id AND w.status <> 'ended' LIMIT 1) AS work_trade
       FROM unit_bookings b
       JOIN units u ON u.id = b.unit_id
       JOIN properties p ON p.id = u.property_id
@@ -3397,7 +3541,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     let newUnitId = unitId || booking.unit_id
     // Every date in this handler is plain 'YYYY-MM-DD' text — the request's day
     // or the stored day read as text above. pg hands DATE columns back as JS
-    // Dates, and computeMonthlyStaySchedule calls .slice on its dates: a
+    // Dates, and the stay pricing slices its dates: a
     // one-date edit of a monthly stay ("two more nights") crashed with a 500.
     const newCheckIn: string = checkInChanged ? checkInDay! : booking.check_in_day
     const newCheckOut: string = checkOutMoved?.to ?? checkOutRestored?.to
@@ -3411,6 +3555,33 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // new nights are known to be free (stayAsk).
     const stayTermsGiven = stayTermsIn(req.body?.stayTerms)
     let stayAsk: StayNeeds | null = null
+
+    // ── 10/6 (Nic): RETURNING GUEST AND WORK TRADE ON A RESERVATION EDIT ──────
+    //
+    // "Returning guest — they've stayed with us before" may be chosen on an
+    // edit too: for a stay that needs a background check and has none on file
+    // (22+ continuous nights), it is recorded with the save and the stay no
+    // longer waits on screening. A work trade can be ticked, changed or taken
+    // off; it follows the stay's new dates and site. Both are refused, before
+    // anything is written, for a desk without the permission each needs.
+    const returningGuest = returningGuestIn(req)
+    const workTrade = workTradeIn(req)
+    const tradeBefore = await stayWorkTradeOf(booking.id)
+    const rentTradedBefore = !!tradeBefore && tradeBefore.status !== 'ended' && tradeBefore.covered_charges.includes('rent')
+    const rentTraded = workTrade === undefined ? rentTradedBefore : coversRent(workTrade)
+    const tookMoney = !!booking.pos_transaction_id || !!booking.deposit_paid_at || !!booking.balance_paid_at
+    if (rentTraded && !rentTradedBefore && tookMoney && Number(booking.total_amount) > 0) {
+      throw new AppError(409,
+        `${guest === 'This guest' ? 'This stay' : `${guest}'s stay`} already has money paid toward it, so its rent can't be traded now. `
+        + 'Leave Rent unticked in the work trade, or settle what was paid first. Nothing was saved.')
+    }
+    if (workTrade) {
+      await assertWorkTradeGuest({
+        tenant_id: booking.tenant_id ?? null,
+        guest_email: (typeof guestEmail === 'string' && guestEmail.trim()) || booking.guest_email || null,
+        landlord_id: booking.landlord_id,
+      })
+    }
 
     // W-20: set when the extension fallback moved the EXTENDING guest to a
     // different site — surfaced in the response so staff can tell them.
@@ -3459,10 +3630,20 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       // Moving to another unit: the destination property must also be in scope.
       if (unitId && unitId !== booking.unit_id) {
         await assertPropertyInScope(req.user, targetUnit.property_id)
-        // S653: never onto a site they asked not to have.
+        // S653: never onto a site they asked not to have — by the system.
+        // 10/6 (Nic): "we need it to actually do something in the schedule."
+        // Every move the system makes skips an avoided site (compression, the
+        // extension relocations, an unpaid hold moved for a payer). A person
+        // dragging the stay there by hand is asked first, in plain words, and
+        // the move goes through only when they confirm (overrideAvoided).
         const avoidNow = avoidedIn ?? (booking.avoided_unit_ids ?? [])
-        if (avoidNow.includes(unitId)) {
-          throw new AppError(409, `${targetUnit.unit_number} is on this guest's avoid list — pick another site`)
+        if (avoidNow.includes(unitId) && req.body?.overrideAvoided !== true) {
+          return void res.status(409).json({
+            success: false,
+            code: 'avoided_site',
+            error: avoidedSiteWords(booking.guest_name, targetUnit.unit_number),
+            unitNumber: targetUnit.unit_number,
+          })
         }
       }
 
@@ -3507,6 +3688,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           landlordId: booking.landlord_id, propertyId: targetUnit.property_id, bookingId: booking.id,
           checkIn: newCheckIn, checkOut: newCheckOut,
           stayTerms: stayTermsGiven ?? (hasLease ? 'lease' : null),
+          returning: returningGuest && !hasLease, offerReturning: canAttestReturningGuest(req.user),
         })
         if (stayAsk.leaseChoice === 'needed') return void res.status(409).json(stayTermsNeededBody(stayAsk))
         if (!hasLease && stayAsk.nights >= STAY_SCREENING_NIGHTS && nightsBefore < STAY_SCREENING_NIGHTS
@@ -3557,7 +3739,10 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           const compatible = candidates.filter((c: any) =>
             !isSiteLayoutMismatch(booking.required_site_layout, c.rv_site_layout) &&
             !isAmpServiceMismatch(booking.required_amp_service, c.rv_amp_service) &&
-            !(booking.avoided_unit_ids ?? []).includes(c.id))   // S653
+            // S653; 10/6 (review): the list this same save stores — a site
+            // added to the avoid list in the edit that lengthens the stay is
+            // already avoided here.
+            !(avoidedIn ?? booking.avoided_unit_ids ?? []).includes(c.id))
           const ranked = await rankUnitsBestFit(
             compatible.map((c: any) => c.id),
             { checkIn: newCheckIn, checkOut: newCheckOut })
@@ -3582,6 +3767,18 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         refusal: (c) => STAY_CONFLICT_MESSAGE[c],
       })
     }
+
+    // 10/6: "Returning guest" chosen on an edit that does not lengthen the stay —
+    // asked of the stay as it will stand (a stay that does not need a check,
+    // or already has one on file, records nothing).
+    let returningNow: StayNeeds | null = null
+    if (returningGuest && !stayAsk && SITE_HOLDING_STATUSES.includes(status || booking.status)) {
+      returningNow = await stayNeeds({
+        landlordId: booking.landlord_id, propertyId: targetUnit?.property_id ?? bookingUnit!.property_id, bookingId: booking.id,
+        checkIn: newCheckIn, checkOut: newCheckOut, returning: true,
+      })
+    }
+    const attestReturning = !!(stayAsk?.returningAttestNow || returningNow?.returningAttestNow)
 
     // S559: same-day turnover guard — do NOT check a new guest into a spot
     // whose previous occupant's submeter hasn't been read yet, or the two
@@ -3608,7 +3805,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // the stay's row is locked (a decision undone in between is honored).
     // Putting back a check-out is not an arrival — the guest was already in.
     const arriving = status === 'checked_in' && booking.status !== 'checked_in' && booking.status !== 'checked_out'
-    if (arriving) {
+    if (arriving && !attestReturning) {
       const block = await checkInBlock(booking.id)
       if (block) {
         if (relocated.length) {
@@ -3665,13 +3862,17 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // priced stay keeps its total through a site move or an arrival-day
     // correction, and a stay with no price yet is priced on the nights it was
     // BOOKED for (arrival to the booked check-out), never on the shortened stay.
-    const unpriced = !(Number(booking.total_amount) > 0)
+    const unpriced = !(Number(booking.total_amount) > 0) && !rentTradedBefore
       && !booking.pos_transaction_id && !booking.deposit_paid_at && !booking.balance_paid_at
     // (A correction of the day a checked-out guest left is a check-out too.)
     const isCheckOut = status === 'checked_out' && (booking.status !== 'checked_out' || leftOnCorrected)
     const priceUnpriced = unpriced && !isCheckOut && !checkOutMoved && !checkOutRestored
       && !!(checkIn || checkOut || unitId)
-    const repriceDue = keepsEarlyCheckOut ? priceUnpriced : (datesOrUnitChanged || priceUnpriced)
+    // 10/6: rent traded or no longer traded by this save — the stay is priced again.
+    // 10/6 (review): a traded stay whose check fee was paid (a $0 + fee link or
+    // ticket) has taken money but owes no rent — taking the trade off prices it.
+    const tradeFlipped = rentTraded !== rentTradedBefore && (!tookMoney || rentTradedBefore)
+    const repriceDue = keepsEarlyCheckOut ? priceUnpriced : (datesOrUnitChanged || priceUnpriced || tradeFlipped)
     const priceThrough = keepsEarlyCheckOut ? early!.booked : newCheckOut
     if (repriceDue && !targetUnit) {
       targetUnit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [newUnitId, booking.landlord_id])
@@ -3682,9 +3883,9 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         'SELECT nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate FROM properties WHERE id=$1',
         [targetUnit.property_id])
       // 10/4 (early check-out plan, BUG-D): the schedule's ONE pricing function
-      // (services/registerStay scheduleStayPrice: computeStayPrice tiered by
-      // length plus the lodging tax under 30 nights; a monthly-tier stay on the
-      // calendar-aligned schedule, S547) — the copy that lived here could drift
+      // (services/registerStay scheduleStayPrice — 10/6: the shared priceStay,
+      // the cheapest whole months, weeks and nights that cover the stay, plus
+      // the lodging tax under 30 nights) — the copy that lived here could drift
       // from what the register, a pay link and the early check-out price.
       const priced = scheduleStayPrice(
         { nightly: targetUnit.nightly_rate ?? prop?.nightly_rate,
@@ -3693,6 +3894,11 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         prop?.short_term_tax_rate ?? 0, newCheckIn, priceThrough)
       if (priced.total > 0) newTotal = priced.total
     }
+    // 10/6 (Nic): a work trade that covers rent — the site costs the guest nothing.
+    // 10/6 (review): even after money was taken — that money was the check's
+    // fee (rent cannot be traded onto a stay with money paid toward a real
+    // total; refused above), so a re-dated or moved traded stay stays $0.
+    if (repriceDue && rentTraded) newTotal = 0
 
     const avoidedFinal = avoidedIn
       ? await scopedAvoidedUnits(avoidedIn, targetUnit?.property_id ?? bookingUnit!.property_id)
@@ -3723,6 +3929,11 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       `SELECT 1 FROM leases WHERE source_booking_id = $1 AND status IN ('active', 'pending') LIMIT 1`, [booking.id]))
 
     let updated: any
+    // 10/6 (review): a placeholder account's set-up link, made with the work trade.
+    let editWtInvite: StayWorkTradeInvite | null = null
+    // 10/6 (review): what the returning guest took the check's fee off, and the card pages to close.
+    let editReturningAfterCommit: (() => Promise<void>) | null = null
+    let editFeeDropped: import('../services/stayTerms').ScreeningFeeDropped | null = null
     // Step 9 final fix (fix pass 1): what canceling the stay closed on the
     // lease drafted with it, and the bank pulls that close stopped (canceled
     // after the commit).
@@ -3769,7 +3980,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           throw new AppError(409, reservationChanged)
         }
         // 10/5 (R9): the screening gate again, with the stay's row locked.
-        if (arriving) {
+        if (arriving && !attestReturning) {
           const blockNow = await checkInBlock(booking.id)
           if (blockNow) {
             screeningBlockedInSave = blockNow
@@ -4066,6 +4277,24 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           })
           statusRecordedInSave = true
         }
+        // 10/6 (Nic): the returning guest (who and when, counted against the
+        // property's allowance under its lock) and the work trade, with the save.
+        editReturningAfterCommit = null
+        editFeeDropped = null
+        if (attestReturning) {
+          const r = await attestReturningGuest(tx, {
+            bookingId: booking.id, propertyId: targetUnit?.property_id ?? bookingUnit!.property_id, byUserId: req.user!.userId,
+            chainBookingIds: (stayAsk ?? returningNow)?.chain.bookingIds ?? [],
+          })
+          editReturningAfterCommit = r.afterCommit
+          editFeeDropped = r.feeDropped
+        }
+        editWtInvite = null
+        if (workTrade !== undefined) {
+          const wt = await syncStayWorkTrade(booking.id, { terms: workTrade, byUserId: req.user!.userId, client: tx })
+          if (wt.action === 'skipped') throw new AppError(400, stayWorkTradeSkippedWords(wt.reason))
+          if (wt.action === 'created') editWtInvite = wt.invite
+        }
         await tx.query('COMMIT')
       } catch (e) {
         await tx.query('ROLLBACK').catch(() => {})
@@ -4130,7 +4359,10 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // lease-or-stay answer, check-in waiting on screening at 22+ nights, and
     // the stay's utility agreement kept in step with its dates, its site and
     // its status (ended at check-out, cancellation or no-show — R11).
+    if (editReturningAfterCommit) await editReturningAfterCommit()
     const stayDone = await afterStaySaved(booking.id, stayAsk, stayTermsGiven, req.user!.userId)
+    // 10/6 (review): the guest's way into their account, for the work trade.
+    await sendStayWorkTradeInvite(booking.id, editWtInvite)
 
     // 10/5 (Nic, A2/M3): "A schedule edit/drag that makes an existing stay need
     // the fee creates and emails a pay link for the fee automatically (check-in
@@ -4289,6 +4521,8 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       ...(leaseNote ? { leaseNote } : {}),
       ...(moneyDecisionNeeded ? { moneyDecisionNeeded } : {}),
       ...(leaseClosedOnCancel ? { leaseClosed: leaseClosedWords(guest, leaseClosedOnCancel) } : {}),
+      // 10/6 (review): a returning guest's check fee that had already gone out came off.
+      ...(editFeeDropped && returningFeeWords(editFeeDropped) ? { returningFeeNote: returningFeeWords(editFeeDropped) } : {}),
       // 10/5: what the new dates need — the server's figures, for the screen to say.
       ...(stayAsk ? { stay: {
         nights: stayAsk.nights,
@@ -4361,7 +4595,7 @@ interface AddMonthPlan {
   needs: StayNeeds
 }
 
-async function planAddMonth(req: any, given: StayTerms | null): Promise<AddMonthPlan> {
+async function planAddMonth(req: any, given: StayTerms | null, returning = false): Promise<AddMonthPlan> {
   const booking = await queryOne<any>(
     `SELECT b.id, b.unit_id, b.landlord_id, b.guest_name, b.tenant_id, u.property_id
        FROM unit_bookings b JOIN units u ON u.id = b.unit_id
@@ -4378,6 +4612,8 @@ async function planAddMonth(req: any, given: StayTerms | null): Promise<AddMonth
   const needs = await stayNeeds({
     landlordId: booking.landlord_id, propertyId: booking.property_id, bookingId: booking.id,
     checkIn: ext.checkIn, checkOut: ext.checkOut, stayTerms: given,
+    // 10/6 (Nic): the returning-guest choice beside the check's fee.
+    returning, offerReturning: canAttestReturningGuest(req.user),
   })
   return { booking, ext, needs }
 }
@@ -4393,6 +4629,8 @@ const addMonthQuote = ({ ext, needs }: AddMonthPlan) => ({
   question: needs.leaseChoice === 'needed' ? stayTermsQuestion(needs.nights) : null,
   screening: needs.screening,
   screeningFee: needs.screening === 'fee_due' ? needs.screeningFee?.amount ?? null : null,
+  // 10/6: "Returning guest — they've stayed with us before", when the desk may use it.
+  returning: needs.returningOffer,
   heldThrough: needs.leaseChoice === 'stay' || needs.leaseChoice === 'needed'
     ? stayHeldWords(needs.chain.checkOut > ext.checkOut ? needs.chain.checkOut : ext.checkOut)
     : null,
@@ -4410,7 +4648,7 @@ unitsRouter.get('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edit
 unitsRouter.post('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edit_reservation'), async (req, res, next) => {
   try {
     const given = stayTermsIn(req.body?.stayTerms)
-    const plan = await planAddMonth(req, given)
+    const plan = await planAddMonth(req, given, returningGuestIn(req))
     const { booking, ext, needs } = plan
     if (needs.leaseChoice === 'needed') return void res.status(409).json(stayTermsNeededBody(needs))
     if (needs.nights >= STAY_SCREENING_NIGHTS && !needs.chain.email && !needs.chain.tenantId) {
@@ -4436,7 +4674,10 @@ unitsRouter.post('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edi
       `SELECT id, name FROM pos_items
         WHERE property_id = $1 AND landlord_id = $2 AND is_active = TRUE AND stay_unit = 'month'
         ORDER BY created_at LIMIT 1`, [ext.propertyId, booking.landlord_id])
-    if (!item) {
+    // 10/6 (Nic): a work trade covering the stay's rent — the month costs
+    // nothing, so it goes on no ticket (unless the check's fee rides on one).
+    const monthFree = !(ext.price > 0)
+    if (!item && !monthFree) {
       throw new AppError(409,
         'This property has no register button for a month\'s stay, so the month can\'t be rung up. '
         + 'Add one under Register items, then try again.')
@@ -4448,6 +4689,13 @@ unitsRouter.post('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edi
       && !(await screeningFeeAlreadyCarried(needs.chain.bookingIds.length ? needs.chain.bookingIds : [booking.id]).catch(() => false))
       ? needs.screeningFee.amount : null
     let ticketId: string | null = null
+    // 10/6 (review): closes the card pages of links whose check fee came off (returning guest).
+    let returningAfterCommit: (() => Promise<void>) | null = null
+    if (monthFree && screeningFee && !item) {
+      throw new AppError(409,
+        'This property has no register button for a month\'s stay, so the background check\'s fee can\'t be rung up with the month. '
+        + 'Add one under Register items, then try again.')
+    }
     const tx = await getClient()
     try {
       await tx.query('BEGIN')
@@ -4472,11 +4720,20 @@ unitsRouter.post('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edi
       // To the till: the stay's open ticket when it has one (the register
       // charges what the reservation owes, the month included); otherwise a
       // new one for the month. The check's fee rides on it, once.
+      // 10/6 (review): the returning guest first — a check fee already sent
+      // for this stay comes off its ticket or link (attestReturningGuest), and
+      // the ticket below is read as it stands after that.
+      if (needs.returningAttestNow) {
+        const r = await attestReturningGuest(tx, { bookingId: booking.id, propertyId: ext.propertyId, byUserId: req.user!.userId, chainBookingIds: needs.chain.bookingIds })
+        returningAfterCommit = r.afterCommit
+      }
       const open = (await tx.query<{ id: string; items: any }>(
         `SELECT id, items FROM pos_open_tickets
           WHERE booking_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
         [booking.id])).rows[0]
-      if (open) {
+      if (monthFree && !screeningFee) {
+        // Nothing to ring up.
+      } else if (open) {
         ticketId = open.id
         const items: any[] = Array.isArray(open.items) ? open.items : []
         if (screeningFee && !items.some((i: any) => i?.[SCREENING_FEE_LINE_FLAG])) {
@@ -4484,7 +4741,7 @@ unitsRouter.post('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edi
             [open.id, JSON.stringify([...items, screeningFeeTicketLine(screeningFee)])])
         }
       } else {
-        const lines: Record<string, unknown>[] = [{ id: item.id, name: item.name, qty: 1, price: 0, tax: 0 }]
+        const lines: Record<string, unknown>[] = [{ id: item!.id, name: item!.name, qty: 1, price: 0, tax: 0 }]
         if (screeningFee) lines.push(screeningFeeTicketLine(screeningFee))
         ticketId = (await tx.query<{ id: string }>(
           `INSERT INTO pos_open_tickets
@@ -4501,6 +4758,7 @@ unitsRouter.post('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edi
       if (isDeadlock(e) || isLockBusy(e)) throw new AppError(409, SAVED_AT_THE_SAME_MOMENT)
       throw e
     } finally { tx.release() }
+    if (returningAfterCommit) await returningAfterCommit()
 
     // What the longer stay needs: 22+ → check-in waits on screening; the
     // counter's "stay" answer (or one the stay already had) → its utilities
@@ -4668,7 +4926,13 @@ unitsRouter.get('/schedule/master', requirePerm(
              -- 10/5: the lease drafted from the stay (a lease chosen, or offered
              -- later), so the window shows it instead of "Offer a lease".
              (SELECT l.id FROM leases l WHERE l.source_booking_id = b.id AND l.status IN ('pending', 'active')
-               ORDER BY l.created_at DESC LIMIT 1) AS stay_lease_id
+               ORDER BY l.created_at DESC LIMIT 1) AS stay_lease_id,
+             -- 10/6 (Nic): a work trade made for the stay — what it covers and
+             -- whether the person is trusted — for the reservation's details.
+             (SELECT jsonb_build_object('id', w.id, 'covered_charges', w.covered_charges, 'trusted', w.trusted,
+                                        'tracks_hours', w.tracks_hours, 'monthly_hours_target', w.monthly_hours_target,
+                                        'duties', w.duties, 'status', w.status)
+                FROM work_trade_agreements w WHERE w.booking_id = b.id AND w.status <> 'ended' LIMIT 1) AS work_trade
       FROM unit_bookings b
       JOIN units u ON u.id = b.unit_id
       JOIN properties p ON p.id = u.property_id

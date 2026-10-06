@@ -250,6 +250,7 @@ describe('guest tools scope to the actor.bookingId', () => {
     })
     mockFindStayConflict.mockResolvedValueOnce(null)
     mockQuery
+      .mockResolvedValueOnce([])              // 10/6: the site's rates (none here — the night is priced off the booking)
       .mockResolvedValueOnce([])              // dedupe
       .mockResolvedValueOnce([])              // UPDATE unit_bookings
       .mockResolvedValueOnce([{ id: 'cr2' }]) // insert
@@ -268,6 +269,7 @@ describe('guest tools scope to the actor.bookingId', () => {
     })
     mockFindStayConflict.mockResolvedValueOnce('booking')
     mockQuery
+      .mockResolvedValueOnce([])              // 10/6: the site's rates
       .mockResolvedValueOnce([])              // dedupe
       .mockResolvedValueOnce([{ id: 'cr3' }]) // insert
     const r: any = await requestBookingChange.execute({ request_type: 'extra_night', confirmed: true }, GUEST_ACTOR)

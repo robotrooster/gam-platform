@@ -341,6 +341,10 @@ interface TypeAvail {
   id: string; name: string; unitType: string
   available: boolean; unavailableReason: string | null
   total: number | null; tax: number; depositAmount: number | null
+  // 10/6 (Nic): what the stay is charged as — "1 week" for six nights when the week is the lower price
+  chargedAs: string | null
+  // 10/6 (review): true only when the bigger rate beat the smaller ones
+  chargedLower?: boolean
   // S648: deposits are card only, with the card fee on top
   depositCardFee: number | null
   minStayNights: number | null; checkInTime: string | null; checkOutTime: string | null
@@ -536,6 +540,7 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
               ) : (
                 <>
                   <span className="price" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{money(t.total)}</span> · {nightsLabel}
+                  {t.chargedAs && t.chargedAs !== nightsLabel && <> · charged as {t.chargedAs}{t.chargedLower ? ', the lower price' : ''}</>}
                   {t.tax > 0 && <><br />incl. {money(t.tax)} lodging tax</>}
                 </>
               )}

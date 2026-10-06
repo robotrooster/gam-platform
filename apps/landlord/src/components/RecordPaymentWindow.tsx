@@ -41,7 +41,7 @@ import {
   chargeMonthsRange, readChargesById, CHARGE_PAGE_SIZE, withReaderTaken, readerFinishedMessage,
   deskOnItsWay, nextAwaitingRereadAt, awaitingOpensAtWord,
   AMOUNT_FIELD_LABEL, NUMBER_FIELD_LABEL, numberMissingMessage, depositPhotoProblem, billName, stillOwedText, lateFeeOutcomeText, lateFeesBackOnShortBills,
-  onboardingLateFeeBoxApplies,
+  onboardingLateFeeBoxApplies, recordableMethods,
   type CreditChoice, type DeskFigures, type DeskQuote, type DeskQuoteRow, type ReaderQuote, type ReaderSpace,
 } from '../lib/creditDesk'
 import '../styles/credit-desk.css'
@@ -638,7 +638,8 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
               <div className="cd-methods" role="group" aria-label="How they are paying">
                 {/* While the reader is taking a card, the method stays put: switching
                     away would cancel a charge the customer is about to tap. */}
-                {MANUAL_PAYMENT_METHODS.map(m => (
+                {/* 10/6 (Nic): "Bank deposit" only where tenants deposit rent at the bank. */}
+                {recordableMethods(MANUAL_PAYMENT_METHODS, quote).map(m => (
                   <button key={m} type="button" className={`cd-option${mode === m ? ' on' : ''}`} disabled={anyReaderBusy || closing}
                     title={anyReaderBusy ? 'Finish or cancel the payment on the reader first' : undefined}
                     onClick={() => pickMode(m)}>
@@ -680,7 +681,8 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                   <div className="cd-note" role="status">
                     Deposited before {money(quote!.lateFeesOffIfPaidInFull!)} in late fees were charged: each bill this deposit
                     pays in full gets them credited, and the payment still counts as late on their history. A bill it pays only in
-                    part keeps its late fees.
+                    part keeps its late fees. When your bank feed shows this deposit, the bank's date decides: a late fee charged
+                    after it comes off, and the payment counts from that day.
                   </div>
                 )}
                 {onboardingBox && (
@@ -1316,10 +1318,15 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
   // 10/6 (Nic): a bank deposit dated back — the server says whether it takes a
   // late fee off the onboarding month's bill, where the box applies.
   const backdated = method === 'bank_deposit' && /^\d{4}-\d{2}-\d{2}$/.test(receivedAt) && receivedAt < today ? receivedAt : null
-  const { data: postQuote } = useQuery<{ lateFeesOffIfPaidInFull: number; onboardingLateFeesOff: number; canDeleteLateFees: boolean }>(
+  const { data: postQuote } = useQuery<{ lateFeesOffIfPaidInFull: number; onboardingLateFeesOff: number; canDeleteLateFees: boolean; bankDepositAllowed?: boolean }>(
     ['post-payment-quote', tenantId, backdated],
     () => apiGet(`/payments/post-payment/quote?tenantId=${tenantId}&depositedOn=${backdated}`),
     { enabled: !!backdated, retry: false, staleTime: 0, cacheTime: 0 })
+  // 10/6 (Nic): "Bank deposit" is offered only where tenants deposit rent at the bank.
+  const { data: postPlace } = useQuery<{ bankDepositAllowed?: boolean }>(
+    ['post-payment-place', tenantId],
+    () => apiGet(`/payments/post-payment/quote?tenantId=${tenantId}`),
+    { retry: false, staleTime: 0, cacheTime: 0 })
   const onboardingBox = !!backdated && onboardingLateFeeBoxApplies(postQuote)
   const [deleteOnboardingFee, setDeleteOnboardingFee] = useState(false)
   const [notes, setNotes] = useState('')
@@ -1393,7 +1400,7 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
         </div>
         <div className="cd-window-body">
           <div className="cd-methods" role="group" aria-label="How they paid">
-            {MANUAL_PAYMENT_METHODS.map(m => (
+            {recordableMethods(MANUAL_PAYMENT_METHODS, postPlace ?? { bankDepositAllowed: false }).map(m => (
               <button key={m} type="button" className={`cd-option${method === m ? ' on' : ''}`}
                 onClick={() => { setMethod(m); setReference(''); setPhoto(null); setConfirming(false); setMsg(null) }}>
                 <span className="cd-option-title">{MANUAL_PAYMENT_METHOD_LABELS[m]}</span>

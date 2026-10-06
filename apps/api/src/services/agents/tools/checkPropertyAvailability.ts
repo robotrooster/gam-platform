@@ -1,7 +1,8 @@
 /**
  * Tool: check_availability (visitor). A real quote for THIS property on specific
- * dates — which site types are open and the exact total (auto-tiered
- * nightly/weekly/monthly, with lodging tax and deposit). Hard-scoped to
+ * dates — which site types are open and the exact total (10/6: the one price
+ * every door charges — the cheapest whole months, weeks and nights that cover
+ * the stay — with lodging tax and deposit). Hard-scoped to
  * actor.propertyId. Read-only — it never holds a site; use create_booking_checkout
  * to reserve. Mirrors the public booking site's availability engine exactly
  * (same source), so the number the agent quotes matches the booking form.
@@ -121,6 +122,8 @@ export const checkPropertyAvailability: AgentTool = {
         unavailableReason: a.unavailableReason,
         tier: a.tier,
         total: a.total,
+        // 10/6 (Nic): what the stay is charged as ("1 week" for six nights when the week is cheaper).
+        chargedAs: a.chargedAs,
         // S648: card only; the card fee follows the property's choice.
         deposit: a.depositAmount,
         // 10/5 (R8): the background check's fixed fee on the charge (null under 22 nights).
@@ -157,7 +160,8 @@ export const checkPropertyAvailability: AgentTool = {
       depositPct: Number(prop.booking_deposit_pct),
       siteTypes,
       note:
-        'Totals are the full stay in US dollars, tax included where it applies. dueNow.total is what the guest ' +
+        'Totals are the full stay in US dollars, tax included where it applies — always the lowest price for those ' +
+        'nights (chargedAs says how: six nights can cost the same as a week). dueNow.total is what the guest ' +
         'pays now to book (the rest is due per the host). backgroundCheckFee, when set, is part of that charge and ' +
         'cannot be removed — a background check is required for stays over three weeks. When longStay is set ' +
         '(30 nights or more), quote BOTH choices and ask the guest, in these words: "' + LEASE_OR_STAY_WORDS + '" ' +

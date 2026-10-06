@@ -29,6 +29,8 @@ const server = vi.hoisted(() => ({
   patches: [] as { url: string; body: any }[],
   recordResult: null as any,
   postResult: null as any,
+  /** 10/6: does the tenant's property take bank deposits (GET /payments/post-payment/quote without a date)? */
+  postBankDepositAllowed: true,
 }))
 
 vi.mock('../lib/api', () => ({
@@ -41,6 +43,7 @@ vi.mock('../lib/api', () => ({
     if (url.includes('/record-manual/quote')) {
       return JSON.parse(JSON.stringify(url.includes('depositedOn=') && server.datedQuote ? server.datedQuote : server.quote))
     }
+    if (url.includes('/post-payment/quote')) return { lateFeesOffIfPaidInFull: 0, onboardingLateFeesOff: 0, canDeleteLateFees: true, bankDepositAllowed: server.postBankDepositAllowed }
     if (url.startsWith('/balances/')) return [{ lines: [{ id: 'r1', label: 'Rent', detail: null }, { id: 'r0', label: 'Rent', detail: null }] }]
     if (url.startsWith('/payments?type=rent')) return []
     if (url.includes('/reader/readers')) return []
@@ -61,7 +64,7 @@ vi.mock('../lib/api', () => ({
 vi.mock('../lib/terminal', () => ({ TAP_WINDOW_SECONDS: 10 }))
 
 import { RecordPaymentWindow, PostPaymentForm } from './RecordPaymentWindow'
-import { PartialPaymentsCard } from '../pages/PropertyDetailPage'
+import { PartialPaymentsCard, TenantsDepositAtBankCard } from '../pages/PropertyDetailPage'
 import { BankReceiptPhoto } from '../pages/PaymentsPage'
 
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
@@ -90,7 +93,7 @@ let onClose: ReturnType<typeof vi.fn>
 let onRecorded: ReturnType<typeof vi.fn>
 beforeEach(() => {
   server.posts = []; server.uploads = []; server.patches = []; server.recordResult = null; server.postResult = null
-  server.gets = []; server.datedQuote = null
+  server.gets = []; server.datedQuote = null; server.postBankDepositAllowed = true
   onClose = vi.fn(); onRecorded = vi.fn()
   host = document.createElement('div')
   document.body.appendChild(host)
@@ -322,6 +325,32 @@ describe('Bank deposit in "Post a payment"', () => {
     })
     expect(server.uploads.map(u => u.url)).toEqual(['/payments/remittances/rem_post/deposit-photo'])
   })
+
+  it('10/6: where the property does not take bank deposits from tenants, "Bank deposit" is not offered', async () => {
+    server.postBankDepositAllowed = false
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={qc()}>
+          <PostPaymentForm tenantId="t1" name="Rae Tull" onClose={onClose} onPosted={() => {}} />
+        </QueryClientProvider>)
+    })
+    await until(() => server.gets.some(u => u.includes('/post-payment/quote?tenantId=t1')), 'the setting read')
+    const methods = [...host.querySelectorAll('.cd-methods .cd-option-title')].map(e => e.textContent)
+    expect(methods).toEqual(['Cash', 'Check', 'Money order'])
+  })
+})
+
+describe('10/6: Record payment reads the property setting', () => {
+  it('"Bank deposit" is offered only when the quote says the property takes them', async () => {
+    server.quote = quote({ bankDepositAllowed: false })
+    await openDesk()
+    expect([...host.querySelectorAll('.cd-methods .cd-option-title')].map(e => e.textContent)).not.toContain('Bank deposit')
+    act(() => root.unmount())
+    root = createRoot(host)
+    server.quote = quote({ bankDepositAllowed: true })
+    await openDesk()
+    expect([...host.querySelectorAll('.cd-methods .cd-option-title')].map(e => e.textContent)).toContain('Bank deposit')
+  })
 })
 
 describe('part payments at the desk', () => {
@@ -410,6 +439,26 @@ describe('the property setting', () => {
     })
     expect((host.querySelector('input[type="checkbox"]') as HTMLInputElement).checked).toBe(true)
     expect(text()).toContain('It pays the oldest bills first; what is left stays owed, and late fees still apply to it. Tenants paying online still pay in full.')
+  })
+})
+
+describe('10/6: "Tenants may deposit rent directly at the bank" on the property page', () => {
+  it('is a checkbox, off by default, with its one plain line — and turning it on saves it', async () => {
+    const onSaved = vi.fn()
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={qc()}>
+          <TenantsDepositAtBankCard property={{ id: 'p1', tenantsDepositAtBank: false }} onSaved={onSaved} />
+        </QueryClientProvider>)
+    })
+    expect(text()).toContain('Tenants may deposit rent directly at the bank')
+    expect(text()).toContain('Tenants deposit rent at your bank themselves. GAM matches each deposit to their bill using your bank feed.')
+    const box = host.querySelector('input[type="checkbox"]') as HTMLInputElement
+    expect(box.checked).toBe(false)
+    await act(async () => { box.click() })
+    await until(() => server.patches.length === 1, 'the setting saved')
+    expect(server.patches[0]).toEqual({ url: '/properties/p1/tenants-deposit-at-bank', body: { allowed: true } })
+    await until(() => onSaved.mock.calls.length === 1, 'the page told')
   })
 })
 

@@ -45,7 +45,7 @@ import { AppError } from '../middleware/errorHandler'
 import { depositOrMoveOutRowSql } from './moneyPredicates'
 import { STAY_SHORTENED_CREDIT_NOTE } from './bookingLeaseBilling'
 import { RESERVATION_PAID_SQL } from './bookingLeaseDraft'
-import { soldCheckOutSql } from './registerStay'
+import { soldCheckOutSql, untaxedMonthStaySql } from './registerStay'
 import { disputeShareLineSql, disputeFeeLineSql } from './paymentReversal'
 import { PAID_AHEAD_PART_TAKEN_BACK } from './creditUse'
 
@@ -972,7 +972,7 @@ function ownBilledPartsSql(b: string): string {
 /**
  * A booking's (alias `b`) short-stay tax rate, in percent, as the reports read
  * it. A stay booked on the public page is quoted with the property's short-stay
- * tax already in it (computeStayPrice: stays under 30 nights are taxed), and
+ * tax already in it (priceStay: stays under 30 nights are taxed), and
  * its deposit is a share of that taxed total, so its pre-tax share is the
  * deposit over (1 + rate). decisions #33: the stay is taxed by the length it
  * was SOLD for (registerStay soldCheckOutSql: the booked check-out), never by
@@ -982,7 +982,22 @@ function ownBilledPartsSql(b: string): string {
  * `pr` is the booking's property.
  */
 function stayTaxPctSql(b: string, pr: string): string {
-  return `(CASE WHEN (${soldCheckOutSql(a(b))} - ${a(b)}.check_in) < 30 THEN COALESCE(${a(pr)}.short_term_tax_rate, 0) ELSE 0 END)`
+  // 10/6 (Nic, shared priceStay), untaxed short of 30 nights:
+  //  • the first month of a 30+ night stay booked online (untaxedMonthStaySql
+  //    — the stay asked for is 30+ nights; firstStayMonth charges no tax);
+  //  • a stay of exactly one calendar month (Feb 1 → Mar 1, 28 nights) only
+  //    when the month's price won — its price is the monthly rate — and it was
+  //    priced by the 10/6 rule (earlier ones were taxed, and past months'
+  //    reports are never rewritten). The booking keeps no record of the tax it
+  //    was charged; the current rate stands in, as above.
+  const x = a(b)
+  return `(CASE WHEN (${soldCheckOutSql(x)} - ${x}.check_in) < 30
+                 AND NOT ${untaxedMonthStaySql(x)}
+                 AND NOT ((${x}.check_in + INTERVAL '1 month')::date = ${soldCheckOutSql(x)}
+                          AND ${x}.created_at >= DATE '2026-10-06'
+                          AND ABS(COALESCE(${x}.total_amount, 0) - COALESCE(
+                                (SELECT COALESCE(smu.monthly_rate, ${a(pr)}.monthly_rate) FROM units smu WHERE smu.id = ${x}.unit_id), -1)) < 0.005)
+            THEN COALESCE(${a(pr)}.short_term_tax_rate, 0) ELSE 0 END)`
 }
 
 /**

@@ -5,11 +5,13 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, type BookingStatus, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, priceStay, stayLowerRateWords, stayNightsBetween, addStayDays, addCalendarMonths, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, type BookingStatus, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate } from '@gam/shared'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
 import { OutOfOrderModal } from './OutOfOrderModal'
 import { EarlyCheckOutModal } from '../components/EarlyCheckOutModal'
+import { WorkTradeTermsFields, defaultWorkTradeTerms, workTradeTermsPayload, workTradeTermsFrom, workTradeLine, workTradeEditPayload, type WorkTradeTerms } from '../components/WorkTradeTermsFields'
+import { ReturningGuestChoice, useReturningGuestOffer, RETURNING_GUEST_WORDS, RETURNING_GUEST_DETAIL, type ReturningOffer } from '../components/ReturningGuestChoice'
 import { NeverMovedInBody, type NeverMovedInPreview, refreshAfterLeaseClose } from './LeasesPage'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -323,8 +325,8 @@ export function SchedulePage() {
   // 10/5 (Nic, A2): a stay that needs the background check's fee can't be
   // confirmed straight onto the schedule — the desk picks how it is paid: a pay
   // link emailed to the guest, or the register. The pick rides on the same save.
-  const [feeRoute, setFeeRoute] = useState<{ message: string; canSendLink: boolean; resend: (m: 'link' | 'register') => void } | null>(null)
-  const payRouteAnswer = useRef<'link' | 'register' | null>(null)
+  const [feeRoute, setFeeRoute] = useState<{ message: string; canSendLink: boolean; returning: ReturningOffer | null; resend: (m: 'link' | 'register' | 'returning') => void } | null>(null)
+  const payRouteAnswer = useRef<'link' | 'register' | 'returning' | null>(null)
   // 10/5 (Nic, R9): a check-in refused because the background check isn't
   // back and decided yet — shown in its own window, with no override.
   const [screeningWait, setScreeningWait] = useState<{ message: string; waitingOn: string } | null>(null)
@@ -354,6 +356,26 @@ export function SchedulePage() {
   const [pickedUnit, setPickedUnit] = useState<any | null>(null)
   const [lockSite, setLockSite] = useState(false)
   const [payMode, setPayMode] = useState<'link' | 'register'>('link')
+  // 10/6 (Nic): "Returning guest — they've stayed with us before" (no
+  // background check) and "Work trade" on the new-reservation form.
+  const [resvReturning, setResvReturning] = useState(false)
+  const [resvWorkTrade, setResvWorkTrade] = useState(false)
+  const [resvWt, setResvWt] = useState<WorkTradeTerms>(defaultWorkTradeTerms)
+  // …and on the reservation edit.
+  const [editReturning, setEditReturning] = useState(false)
+  const [editWorkTrade, setEditWorkTrade] = useState(false)
+  const [editWt, setEditWt] = useState<WorkTradeTerms>(defaultWorkTradeTerms)
+  // The returning-guest choice as the server offers it for the stay being
+  // made or edited (needs a check? may this desk use it? allowance left?).
+  const resvOffer = useReturningGuestOffer({
+    unitId: pickedUnit?.id, checkIn: newBooking.checkIn, checkOut: newBooking.checkOut, email: newBooking.guestEmail,
+    enabled: newResvOpen && !!pickedUnit,
+  })
+  const editOffer = useReturningGuestOffer({
+    unitId: editForm?.unitId, checkIn: editForm?.checkIn ?? '', checkOut: editForm?.checkOut ?? '', email: editForm?.guestEmail,
+    bookingId: detailBooking?.id ?? null,
+    enabled: !!editForm && !!detailBooking && !detailBooking.isLease && !detailBooking.returningGuestAt,
+  })
   const [resvAmp, setResvAmp] = useState<string>('none')
   const [selectedCell, setSelectedCell] = useState<{unitId:string; date:string}|null>(null)
   // Booking-guest access: the link a no-account guest uses to reach their
@@ -650,6 +672,12 @@ export function SchedulePage() {
   const pendingAckCount = resvList.filter(needsAckResv).length
 
   const units: any[] = schedule?.units || []
+  // The property's work-trade hours setting, for the picker's placeholder.
+  const wtPropertyId = (resvWorkTrade && pickedUnit?.propertyId)
+    || (editWorkTrade && units.find((u: any) => u.id === editForm?.unitId)?.propertyId) || null
+  const { data: wtTarget } = useQuery<any>(['wt-target', wtPropertyId],
+    () => apiGet(`/work-trade/property/${wtPropertyId}/target`),
+    { enabled: !!wtPropertyId && can('work_trade.manage'), staleTime: 60_000, retry: false })
 
 
   const bookings: any[] = schedule?.bookings || []
@@ -718,6 +746,8 @@ export function SchedulePage() {
   const withPayRoute = (fallback: 'link' | 'register' | null) => {
     const m = payRouteAnswer.current ?? fallback
     payRouteAnswer.current = null
+    // 10/6 (Nic): the third choice — no background check, so nothing to pay for it.
+    if (m === 'returning') return { returningGuest: true, ...(fallback ? { sendDepositLink: fallback === 'link', payAtRegister: fallback === 'register' } : {}) }
     return m ? { sendDepositLink: m === 'link', payAtRegister: m === 'register' } : {}
   }
   const askFeeRouteIf = (e: any, resend: () => void): boolean => {
@@ -725,7 +755,7 @@ export function SchedulePage() {
     if (e?.response?.status !== 409 || body?.code !== 'screening_fee_route_needed') return false
     const terms = lastTerms.current
     setFeeRoute({
-      message: body.error, canSendLink: !!body.canSendLink,
+      message: body.error, canSendLink: !!body.canSendLink, returning: body.returning ?? null,
       resend: (m) => { payRouteAnswer.current = m; termsAnswer.current = terms; setFeeRoute(null); resend() },
     })
     return true
@@ -746,7 +776,10 @@ export function SchedulePage() {
       }
     } else if (stay.screening === 'on_file') {
       toast('This stay needs a background check before check-in — the guest already has one on file.')
+    } else if (stay.screening === 'returning') {
+      toast('Returning guest — no background check needed for this stay.')
     }
+    if (stay.workTrade?.rentTraded) toast('Work trade — the site is covered, so there is nothing to pay for it.')
   }
   const createBookingMut = useMutation(
     () => {
@@ -777,22 +810,28 @@ export function SchedulePage() {
   // "New Reservation" flow: dates → contact → pick an available unit (the pick
   // completes it). The per-unit "+ Book" buttons keep their own unit context
   // via bookingModal.
+  // 10/6 (Nic): nights are check-out − check-in, the same count the server
+  // keeps ("leaving on the 5th" from the 30th is five nights, not six).
   const resvNights = (() => {
     const { checkIn, checkOut } = newBooking
     if (!checkIn || !checkOut || checkOut <= checkIn) return 0
-    return Math.round((new Date(checkOut+'T12:00:00').getTime() - new Date(checkIn+'T12:00:00').getTime())/86400000)
+    return stayNightsBetween(checkIn, checkOut)
   })()
-  // Rate is implied by the length of stay (≥30 → monthly, ≥7 → weekly, else
-  // nightly), prorated, with short-term tax. Pulled from the UNIT's rate, with
-  // the PROPERTY rate as the default fallback (Nic: a landlord can price a
-  // specific unit — e.g. pull-through vs back-in RV — separately). Mirrors the
-  // authoritative backend computation in POST /units/:id/bookings.
+  // The booking's lease type names its length (the server keeps it); the
+  // PRICE is not tiered by it (below).
   const resvType = resvNights >= 30 ? 'month_to_month' : resvNights >= 7 ? 'weekly' : 'nightly'
-  const stayPriceForUnit = (u: any) => computeStayPrice(
+  // 10/6 (Nic): "It should be charging them the price, the configuration
+  // that's going to be the cheapest option for them." The shared priceStay —
+  // the cheapest whole months, weeks and nights that cover the stay, at the
+  // UNIT's rate with the PROPERTY rate as the fallback, plus short-term tax —
+  // the same function POST /units/:id/bookings, the booking site, a pay link
+  // and the register price with.
+  const stayPriceForUnit = (u: any) => priceStay(
     { nightly: u.nightlyRate ?? u.propertyNightlyRate,
       weekly:  u.weeklyRate  ?? u.propertyWeeklyRate,
       monthly: u.monthlyRate ?? u.propertyMonthlyRate },
     Number(u.propertyTaxRate || 0),
+    newBooking.checkIn,
     resvNights,
   )
   const resvGuestName = `${resvFirst.trim()} ${resvLast.trim()}`.trim()
@@ -804,6 +843,7 @@ export function SchedulePage() {
   const closeNewResv = () => {
     setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none'); setResvAvoid('')
     setShowAvail(false); setPickedUnit(null); setLockSite(false); setPayMode('link')
+    setResvReturning(false); setResvWorkTrade(false); setResvWt(defaultWorkTradeTerms())
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
   }
   // Combined RV-requirement mismatch reasons for a unit (layout + amp). Empty =
@@ -836,8 +876,12 @@ export function SchedulePage() {
       // Nic's two exits. A deposit link is right for somebody who rang in
       // February about March, and absurd for a man standing at the desk with
       // his rig idling outside — he pays at the till, three feet away.
-      ...withPayRoute(payMode),
+      // 10/6: a work trade covering rent has nothing to pay for the site — the
+      // reservation is confirmed now (a check's fee, if due, asks how).
+      ...withPayRoute(resvWorkTrade && resvWt.coveredCharges.includes('rent') ? null : payMode),
       ...withTerms(),
+      ...(resvReturning ? { returningGuest: true } : {}),
+      ...(resvWorkTrade ? { workTrade: workTradeTermsPayload(resvWt) } : {}),
     }),
     {
       onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); closeNewResv() },
@@ -907,11 +951,23 @@ export function SchedulePage() {
     return true
   }
   const saveError = (e: any, fallback: string) => e?.response?.data?.error || fallback
+  // 10/6 (Nic): a site the guest asked not to have. The schedule's own moves
+  // skip it; a person moving them there is asked first — "She asked not to be
+  // on RV 14. Move her there anyway?" — and the move is sent again, confirmed.
+  const askAvoidedIf = (e: any, resend: () => void): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'avoided_site') return false
+    appConfirm(body.error, { confirmLabel: 'Move them there' }).then(ok => { if (ok) resend() })
+    return true
+  }
+  const avoidedWords = (b: any, unitNumber: string) =>
+    `${(b?.guestName || '').trim() || 'This guest'} asked not to be on ${unitNumber}.`
 
   const moveBookingMut = useMutation(
-    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string}) =>
+    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string; overrideAvoided?: boolean}) =>
       apiPatch(`/units/${payload.unitId}/bookings/${payload.bookingId}`, {
         unitId: payload.unitId, checkIn: payload.checkIn, checkOut: payload.checkOut, ...withTerms(),
+        ...(payload.overrideAvoided ? { overrideAvoided: true } : {}),
       }),
     {
       // 10/5 (M3): a drag that made the stay need a background check says what was sent.
@@ -919,6 +975,7 @@ export function SchedulePage() {
       onError: (e: any, payload) => {
         if (takeLatestIfChanged(e)) return
         if (askTermsIf(e, () => moveBookingMut.mutate(payload))) return
+        if (askAvoidedIf(e, () => moveBookingMut.mutate({ ...payload, overrideAvoided: true }))) return
         toast.error(saveError(e, 'Cannot move reservation — date conflict on that unit.'))
       }
     }
@@ -1028,7 +1085,7 @@ export function SchedulePage() {
   // Edit an existing reservation (guest contact, dates, unit, notes). The
   // backend reprices on a date/unit change and COALESCEs unchanged fields.
   const editBookingMut = useMutation(
-    (vars: {orig:any; form:NonNullable<typeof editForm>}) =>
+    (vars: {orig:any; form:NonNullable<typeof editForm>; overrideAvoided?: boolean}) =>
       apiPatch(`/units/${vars.orig.unitId}/bookings/${vars.orig.id}`, {
         guestName: vars.form.guestName.trim() || null,
         guestEmail: vars.form.guestEmail.trim() || null,
@@ -1046,6 +1103,15 @@ export function SchedulePage() {
           return units.filter((u:any)=>u.propertyId===propId && toks.includes(String(u.unitNumber||'').toLowerCase().replace(/\s+/g,''))).map((u:any)=>u.id)
         })(),
         ...withTerms(),
+        // 10/6: confirmed after "They asked not to be on …" (askAvoidedIf).
+        ...(vars.overrideAvoided ? { overrideAvoided: true } : {}),
+        // 10/6 (Nic): returning guest, and the stay's work trade — ticked,
+        // changed, or taken off (null). Left out when nothing about it changed.
+        ...(editReturning && !vars.orig.returningGuestAt ? { returningGuest: true } : {}),
+        // 10/6 (review): only a desk that may change work trades sends it, and
+        // only when the tick or the terms changed — a desk without that
+        // permission can still save a traded reservation's notes and dates.
+        ...workTradeEditPayload({ canManage: can('work_trade.manage'), ticked: editWorkTrade, terms: editWt, original: vars.orig.workTrade }),
       }),
     {
       onSuccess: (resp:any) => {
@@ -1058,10 +1124,13 @@ export function SchedulePage() {
         setEditForm(null); setEditError('')
         // 10/5: what the longer stay needs (M3: the check's pay link, when one was emailed).
         sayStaySaved(b?.stay)
+        // 10/6 (review): a returning guest's check fee that had already gone out came off.
+        if (b?.returningFeeNote) toast(b.returningFeeNote)
       },
       onError: (e:any, vars) => {
         if (takeLatestIfChanged(e, { inForm: true })) return
         if (askTermsIf(e, () => editBookingMut.mutate(vars))) return
+        if (askAvoidedIf(e, () => editBookingMut.mutate({ ...vars, overrideAvoided: true }))) return
         setEditError(e?.response?.data?.error || e?.message || 'Could not save changes.')
       },
     }
@@ -1078,6 +1147,9 @@ export function SchedulePage() {
       requiredAmpService: d.requiredAmpService || 'none',
       avoid: (d.avoidedUnitIds || []).map((id:string)=>unitNumberOf(id)).filter(Boolean).join(', '),
     })
+    setEditReturning(false)
+    setEditWorkTrade(!!d.workTrade)
+    setEditWt(d.workTrade ? workTradeTermsFrom(d.workTrade) : defaultWorkTradeTerms())
   }
 
   // The stay link is auto-emailed when a reservation is created; this is for
@@ -1406,10 +1478,15 @@ export function SchedulePage() {
       l.unitId === tUnitId && rangeDays.some(d => d >= dayOnly(l.startDate) && (!l.endDate || d <= dayOnly(l.endDate))))
     if (hasBookingConflict || hasLeaseConflict) { toast.error('That unit is already occupied for those dates.'); return }
     if (oooOverlaps(tUnitId, newCheckIn, newCheckOut)) { toast.error('That site is out of order for those dates.'); return }
-    const doMove = () => moveBookingMut.mutate({ bookingId: b.id, unitId: tUnitId, checkIn: newCheckIn, checkOut: newCheckOut })
+    // 10/6 (Nic): a site the guest asked not to have is a plain question, never a quiet move.
+    const avoided = !sameUnit && ((b.avoidedUnitIds || []) as string[]).includes(tUnitId)
+    const doMove = () => moveBookingMut.mutate({ bookingId: b.id, unitId: tUnitId, checkIn: newCheckIn, checkOut: newCheckOut,
+      ...(avoided ? { overrideAvoided: true } : {}) })
     const mismatchReasons = sameUnit ? [] : rvMismatchReasons(b.requiredSiteLayout, b.requiredAmpService, targetUnit)
     if (mismatchReasons.length) {
-      appConfirm(`Unit ${targetUnit.unitNumber} doesn't match this reservation:\n· ${mismatchReasons.join('\n· ')}\n\nMove it anyway?`, { confirmLabel: 'Move it' }).then(ok => { if (ok) doMove() })
+      appConfirm(`${avoided ? `${avoidedWords(b, targetUnit.unitNumber)}\n\n` : ''}Unit ${targetUnit.unitNumber} doesn't match this reservation:\n· ${mismatchReasons.join('\n· ')}\n\nMove ${avoided ? 'them there' : 'it'} anyway?`, { confirmLabel: avoided ? 'Move them there' : 'Move it' }).then(ok => { if (ok) doMove() })
+    } else if (avoided) {
+      appConfirm(`${avoidedWords(b, targetUnit.unitNumber)} Move them there anyway?`, { confirmLabel: 'Move them there' }).then(ok => { if (ok) doMove() })
     } else {
       doMove()
     }
@@ -2579,10 +2656,11 @@ export function SchedulePage() {
         // Live re-price preview while editing (unit rate → property default).
         const eu = isEditing ? units.find((u:any)=>u.id===editForm!.unitId) : null
         const eNights = isEditing && editForm!.checkIn && editForm!.checkOut && editForm!.checkOut>editForm!.checkIn
-          ? Math.round((new Date(editForm!.checkOut+'T12:00:00').getTime()-new Date(editForm!.checkIn+'T12:00:00').getTime())/86400000) : 0
-        const ePrice = eu ? computeStayPrice(
+          ? stayNightsBetween(editForm!.checkIn, editForm!.checkOut) : 0
+        // 10/6: the one price every door charges (shared priceStay).
+        const ePrice = eu && eNights > 0 ? priceStay(
           { nightly: eu.nightlyRate ?? eu.propertyNightlyRate, weekly: eu.weeklyRate ?? eu.propertyWeeklyRate, monthly: eu.monthlyRate ?? eu.propertyMonthlyRate },
-          Number(eu.propertyTaxRate || 0), eNights) : null
+          Number(eu.propertyTaxRate || 0), editForm!.checkIn, eNights) : null
         const editValid = isEditing && eNights > 0 && !!editForm!.guestName.trim()
         // W-19: filter-first — options are the server's available+compatible
         // list; the current unit always stays so the selection can't vanish
@@ -2603,7 +2681,7 @@ export function SchedulePage() {
                   <div>
                     <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Unit</div>
                     <select className="form-input" style={{width:'100%'}} value={editForm!.unitId} onChange={e=>setEditForm(s=>s&&({...s,unitId:e.target.value}))}>
-                      {unitOptions.map((u:any)=><option key={u.id} value={u.id}>{u.unitNumber} · {u.propertyName}{u.rvSiteLayout && u.rvSiteLayout!=='none' ? ` (${RV_SITE_LAYOUT_LABEL[u.rvSiteLayout as keyof typeof RV_SITE_LAYOUT_LABEL]})` : ''}</option>)}
+                      {unitOptions.map((u:any)=><option key={u.id} value={u.id}>{u.unitNumber} · {u.propertyName}{u.rvSiteLayout && u.rvSiteLayout!=='none' ? ` (${RV_SITE_LAYOUT_LABEL[u.rvSiteLayout as keyof typeof RV_SITE_LAYOUT_LABEL]})` : ''}{u.id!==d.unitId && ((d.avoidedUnitIds||[]) as string[]).includes(u.id) ? ' — they asked not to be here' : ''}</option>)}
                     </select>
                   </div>
                   <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
@@ -2633,11 +2711,35 @@ export function SchedulePage() {
                     <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" style={{width:'100%'}} value={editForm!.guestPhone} onChange={e=>setEditForm(s=>s&&({...s,guestPhone:e.target.value}))} /></div>
                   </div>
                   <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Notes</div><textarea className="form-input" style={{width:'100%',minHeight:54}} value={editForm!.notes} onChange={e=>setEditForm(s=>s&&({...s,notes:e.target.value}))} /></div>
-                  {ePrice && <div style={{fontSize:'.78rem',color:'var(--text-3)'}}>{eNights} night{eNights===1?'':'s'} · new total <span style={{color:'var(--gold)',fontWeight:600}}>{fmt(ePrice.total)}</span></div>}
+                  {/* 10/6 (Nic): the stay's work trade — ticked, changed or taken off. */}
+                  {can('work_trade.manage') && (
+                    <div style={{padding:'10px 12px',border:'1px solid var(--border-1)',borderRadius:8,background:'var(--bg-2)'}}>
+                      <label style={{display:'flex',alignItems:'center',gap:8,fontSize:'.8rem',fontWeight:600,color:'var(--text-0)',cursor:'pointer'}}>
+                        <input type="checkbox" checked={editWorkTrade} onChange={e=>setEditWorkTrade(e.target.checked)} />
+                        Work trade
+                      </label>
+                      {editWorkTrade && (
+                        <div style={{marginTop:10}}>
+                          <WorkTradeTermsFields value={editWt} onChange={setEditWt} propertyHours={wtTarget?.target ?? null} />
+                        </div>
+                      )}
+                      {!editWorkTrade && d.workTrade && (
+                        <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:4}}>Saving ends their work trade.</div>
+                      )}
+                    </div>
+                  )}
+                  {/* 10/6 (Nic): a returning guest needs no background check. */}
+                  {d.returningGuestAt
+                    ? <div style={{fontSize:'.74rem',color:'var(--text-2)'}}>{RETURNING_GUEST_DETAIL}</div>
+                    : editOffer.data?.screening === 'fee_due' && (
+                      <ReturningGuestChoice offer={editOffer.data.returning} checked={editReturning}
+                        onChange={setEditReturning} fee={editOffer.data.screeningFee} />
+                    )}
+                  {ePrice && <div style={{fontSize:'.78rem',color:'var(--text-3)'}}>{eNights} night{eNights===1?'':'s'} · new total <span style={{color:'var(--gold)',fontWeight:600}}>{editWorkTrade && editWt.coveredCharges.includes('rent') ? fmt(0) + ' — rent covered by work trade' : fmt(ePrice.total)}</span></div>}
                   {editError && <div style={{fontSize:'.76rem',color:'var(--red,#ff6b81)'}}>{editError}</div>}
                   <div style={{display:'flex',gap:8,marginTop:4}}>
                     <button className="btn btn-ghost btn-sm" onClick={()=>{setEditForm(null);setEditError('')}}>Cancel</button>
-                    <button className="btn btn-primary btn-sm" style={{marginLeft:'auto'}} disabled={!editValid || editBookingMut.isLoading}
+                    <button className="btn btn-primary btn-sm" style={{marginLeft:'auto'}} disabled={!editValid || editBookingMut.isLoading || (editWorkTrade && !editWt.coveredCharges.length)}
                       onClick={()=>editBookingMut.mutate({orig:d, form:editForm!})}>
                       {editBookingMut.isLoading?'Saving…':'Save changes'}
                     </button>
@@ -2676,6 +2778,13 @@ export function SchedulePage() {
                       <div style={{fontSize:'.74rem',color:'var(--text-3)',marginTop:2}}>Held through {longCalendarDate(dayOnly(d.checkOut))} — after that the site can be booked by someone else.</div>
                     )}
                   </div></>
+                )}
+                {/* 10/6 (Nic): what the desk confirmed, and the stay's work trade. */}
+                {!isLease && d.returningGuestAt && (
+                  <><div style={{color:'var(--text-3)'}}>Background check</div><div>{RETURNING_GUEST_DETAIL}</div></>
+                )}
+                {!isLease && d.workTrade && (
+                  <><div style={{color:'var(--text-3)'}}>Work trade</div><div>{workTradeLine(d.workTrade)}</div></>
                 )}
                 {/* 10/5 (Nic, R9): check-in waits on the background check. */}
                 {!isLease && d.screeningBlock && (
@@ -2822,11 +2931,10 @@ export function SchedulePage() {
               {/* 1 · Dates */}
               <div>
                 <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>1 · Dates</div>
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Arriving</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkIn} onChange={e=>{setShowAvail(false); setPickedUnit(null); setNewBooking(s=>({...s,checkIn:e.target.value}))}} /></div>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Leaving</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkOut} onChange={e=>{setShowAvail(false); setPickedUnit(null); setNewBooking(s=>({...s,checkOut:e.target.value}))}} /></div>
-                </div>
-                {datesValid && <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>{resvNights} night{resvNights===1?'':'s'} · billed {resvType==='month_to_month'?'monthly':resvType}</div>}
+                {/* 10/6 (Nic): arrival, then Add a day / a week / a month, the
+                    night count and the leaving day — StayDatesFields below. */}
+                <StayDatesFields checkIn={newBooking.checkIn} checkOut={newBooking.checkOut}
+                  onChange={(checkIn, checkOut) => { setShowAvail(false); setPickedUnit(null); setNewBooking(st => ({ ...st, checkIn, checkOut })) }} />
 
                 {/* Optional: what the customer says they need, before the list
                     is drawn, so the counter is not reading out sites that will
@@ -2925,6 +3033,8 @@ export function SchedulePage() {
                           <div style={{textAlign:'right'}}>
                             <div style={{fontWeight:700,fontSize:'.9rem',color:'var(--gold)'}}>{fmt(price.total)}</div>
                             <div style={{fontSize:'.68rem',color:'var(--text-3)'}}>{resvNights} night{resvNights===1?'':'s'}</div>
+                            {/* 10/6 (Nic): six nights at the week's price, said so. */}
+                            {stayLowerRateWords(price) && <div style={{fontSize:'.66rem',color:'var(--text-3)'}}>{stayLowerRateWords(price)}</div>}
                           </div>
                         </div>
                       )
@@ -2954,11 +3064,57 @@ export function SchedulePage() {
                   Keep them on {pickedUnit.unitNumber} — do not let the schedule move them
                 </label>
 
+                {/* 10/6 (Nic): "Mark them as work trade. Boom." Covers
+                    everything by default (untick any); monitored or trusted;
+                    the hours are the property's setting. */}
+                {can('work_trade.manage') && (
+                  <div style={{marginTop:12,padding:'10px 12px',border:'1px solid var(--border-1)',borderRadius:8,background:'var(--bg-2)'}}>
+                    <label style={{display:'flex',alignItems:'center',gap:8,fontSize:'.8rem',fontWeight:600,color:'var(--text-0)',cursor:'pointer'}}>
+                      <input type="checkbox" checked={resvWorkTrade} onChange={e=>setResvWorkTrade(e.target.checked)} />
+                      Work trade
+                    </label>
+                    {resvWorkTrade && (
+                      <div style={{marginTop:10}}>
+                        <WorkTradeTermsFields value={resvWt} onChange={setResvWt} propertyHours={wtTarget?.target ?? null} />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 10/6 (Nic): a stay of more than three weeks needs a
+                    background check — unless they've stayed here before. */}
+                {resvOffer.data?.screening === 'fee_due' && (
+                  <div style={{marginTop:12,display:'grid',gap:6}}>
+                    <div style={{fontSize:'.74rem',color:'var(--text-2)',lineHeight:1.5}}>
+                      This stay is {resvOffer.data.nights} nights in a row, so the guest needs a background check before check-in
+                      {resvOffer.data.screeningFee != null ? <> — its {fmt(resvOffer.data.screeningFee)} fee is paid with the stay</> : null}.
+                    </div>
+                    <ReturningGuestChoice offer={resvOffer.data.returning} checked={resvReturning}
+                      onChange={setResvReturning} fee={resvOffer.data.screeningFee} />
+                  </div>
+                )}
+                {resvOffer.data?.screening === 'returning' && (
+                  <div style={{marginTop:12,fontSize:'.74rem',color:'var(--text-2)'}}>{RETURNING_GUEST_DETAIL} — no background check for this stay.</div>
+                )}
+
+                {(() => {
+                  // 10/6: a work trade covering rent — nothing to pay for the site.
+                  const rentTraded = resvWorkTrade && resvWt.coveredCharges.includes('rent')
+                  if (rentTraded) return (
+                    <div style={{fontSize:'.74rem',color:'var(--text-2)',marginTop:12,lineHeight:1.5}}>
+                      Rent is covered by the work trade, so there is nothing to pay for the site — the reservation is confirmed now.
+                      {resvOffer.data?.screening === 'fee_due' && !resvReturning ? ' You will be asked how the background check is paid.' : ''}
+                    </div>
+                  )
+                  return null
+                })()}
+
                 {/* S652 (Nic): "it needs to generate either a pay link from the
                     scheduling flow or send it to the point of sale for payment
                     there in person." Either way the site comes off the calendar
                     now — the sales inventory and the calendar inventory are the
                     same inventory. */}
+                {!(resvWorkTrade && resvWt.coveredCharges.includes('rent')) && (
                 <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6,marginTop:14}}>
                   {([['link','Email a deposit link'],['register','Paying at the counter']] as const).map(([m,label])=>(
                     <button key={m} onClick={()=>setPayMode(m)}
@@ -2967,28 +3123,34 @@ export function SchedulePage() {
                               cursor:'pointer',fontSize:'.74rem',fontWeight:payMode===m?700:400,
                               color:payMode===m?'var(--gold)':'var(--text-2)'}}>{label}</button>
                   ))}
-                </div>
+                </div>)}
 
                 <button className="btn btn-primary" style={{width:'100%',marginTop:10}}
-                        disabled={(payMode==='link' && !hasContact) || !resvGuestName || createResvMut.isLoading}
+                        disabled={(payMode==='link' && !hasContact && !(resvWorkTrade && resvWt.coveredCharges.includes('rent')))
+                          || !resvGuestName || createResvMut.isLoading
+                          || (resvWorkTrade && (!resvWt.coveredCharges.length || !validEmail))}
                         onClick={async ()=>{
                           const reasons = rvMismatchReasons(resvLayout, resvAmp, pickedUnit)
                           if (reasons.length && !(await appConfirm(`${pickedUnit.unitNumber} doesn't match:\n· ${reasons.join('\n· ')}\n\nReserve it anyway?`, { confirmLabel: 'Reserve it' }))) return
                           setResvError(''); createResvMut.mutate(pickedUnit)
                         }}>
                   {createResvMut.isLoading ? 'Holding the site…'
+                   : resvWorkTrade && resvWt.coveredCharges.includes('rent') ? 'Reserve — work trade'
                    : payMode==='register' ? 'Hold it and send to the register'
                    : 'Reserve and email the deposit link'}
                 </button>
-                {payMode==='link' && !hasContact &&
+                {resvWorkTrade && !validEmail &&
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A work trade is made for the guest's own account, so it needs their email.</div>}
+                {payMode==='link' && !hasContact && !(resvWorkTrade && resvWt.coveredCharges.includes('rent')) &&
                   <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name, an email and a phone number — the email is where the deposit link goes.</div>}
                 {payMode==='register' && !resvGuestName &&
                   <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name is enough when they are paying here.</div>}
+                {!(resvWorkTrade && resvWt.coveredCharges.includes('rent')) &&
                 <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6,lineHeight:1.5}}>
                   {payMode==='register'
                     ? 'The site comes off the board now and a ticket appears on the register. Ringing it up confirms this same reservation.'
                     : 'The site is held for them with no deadline. If it is still unpaid when the park fills up, they get moved to another site — or told, if there is nothing else.'}
-                </div>
+                </div>}
               </div>)}
 
               {resvError && <div style={{fontSize:'.78rem',color:'var(--red,#ff6b81)'}}>{resvError}</div>}
@@ -3108,7 +3270,7 @@ export function SchedulePage() {
           dropdown (implied by stay length). */}
       {bookingModal.show && (() => {
         const bkNights = (newBooking.checkIn && newBooking.checkOut && newBooking.checkOut > newBooking.checkIn)
-          ? Math.round((new Date(newBooking.checkOut+'T12:00:00').getTime() - new Date(newBooking.checkIn+'T12:00:00').getTime())/86400000)
+          ? stayNightsBetween(newBooking.checkIn, newBooking.checkOut)
           : 0
         const bkEmailValid = /.+@.+\..+/.test(newBooking.guestEmail.trim())
         const bkReady = bkNights > 0 && !!bookFirst.trim() && !!bookLast.trim() && bkEmailValid && !!newBooking.guestPhone.trim()
@@ -3128,11 +3290,20 @@ export function SchedulePage() {
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-in</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkIn} onChange={e=>setNewBooking(s=>({...s,checkIn:e.target.value}))} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-out</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkOut} onChange={e=>setNewBooking(s=>({...s,checkOut:e.target.value}))} /></div>
               </div>
-              {bkNights > 0 && (
-                <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>
-                  {bkNights} night{bkNights===1?'':'s'} · billed {bkNights>=30?'monthly':bkNights>=7?'weekly':'nightly'}
-                </div>
-              )}
+              {bkNights > 0 && (() => {
+                // 10/6 (Nic): the one price every door charges for these nights.
+                const u = bookingModal.unit
+                const p = u ? priceStay(
+                  { nightly: u.nightlyRate ?? u.propertyNightlyRate, weekly: u.weeklyRate ?? u.propertyWeeklyRate, monthly: u.monthlyRate ?? u.propertyMonthlyRate },
+                  Number(u.propertyTaxRate || 0), newBooking.checkIn, bkNights) : null
+                const lower = p ? stayLowerRateWords(p) : null
+                return (
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>
+                    {bkNights} night{bkNights===1?'':'s'} — leaving {leavingDayLabel(newBooking.checkOut)}
+                    {p && p.total > 0 ? <> · {fmt(p.total)}{lower ? ` (${lower})` : ''}</> : null}
+                  </div>
+                )
+              })()}
               <button className="btn btn-primary" onClick={()=>createBookingMut.mutate()} disabled={!bkReady||createBookingMut.isLoading}>
                 {createBookingMut.isLoading?'Creating...':'Create Reservation'}
               </button>
@@ -3197,7 +3368,16 @@ export function SchedulePage() {
                 <button className="btn btn-primary btn-sm" onClick={()=>feeRoute.resend('link')}>Email a pay link</button>
               )}
               <button className="btn btn-primary btn-sm" onClick={()=>feeRoute.resend('register')}>Send to the register</button>
+              {/* 10/6 (Nic): the third choice — owner or a manager only (the server says whether it is offered). */}
+              {feeRoute.returning?.available && (
+                <button className="btn btn-primary btn-sm" onClick={()=>feeRoute.resend('returning')}>{RETURNING_GUEST_WORDS}</button>
+              )}
             </div>
+            {feeRoute.returning && !feeRoute.returning.available && (
+              <div style={{ marginTop: 10, fontSize: '.74rem', color: 'var(--text-3)', opacity: .7, lineHeight: 1.5 }}>
+                <b style={{ color: 'var(--text-1)' }}>{RETURNING_GUEST_WORDS}</b> — {feeRoute.returning.message}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -3216,6 +3396,77 @@ export function SchedulePage() {
  *     to do (fix pass 3, review; the cancel-check says the same in words).
  */
 export const CANCEL_HIDDEN_STATUSES: readonly string[] = ['cancelled', 'checked_out', 'checked_in', 'no_show']
+
+/**
+ * 10/6 (Nic): "If I pick a start date, I want some buttons that say add a day,
+ * add a week, add a month... And then it will give you the total number of
+ * nights. And automatically input the leaving date to match... if I click four
+ * times on the button to add a day, it would change the leaving date to be four
+ * days after the start of the reservation." People get overnight stays wrong —
+ * leaving on the 5th from the 30th is five nights, not six — so the count is
+ * shown in plain words beside the leaving day.
+ *
+ * Each press lengthens the stay from the leaving day already there (from the
+ * arrival when there is none): one night, seven nights, or one calendar month
+ * (Oct 4 → Nov 4). No take-away buttons (Nic): a wrong press is fixed by picking
+ * the leaving day by hand, which still works and keeps the count in step.
+ * Nights are check-out − check-in, the count the server keeps.
+ */
+export function lengthenStay(checkIn: string, checkOut: string, by: 'day' | 'week' | 'month'): string | null {
+  if (!checkIn) return null
+  const from = checkOut && checkOut > checkIn ? checkOut : checkIn
+  if (by === 'month') {
+    // Months count from the arrival, as the price does (priceStay): a stay
+    // already whole months long gets the next whole month from the arrival, so
+    // a 31st arrival goes Feb 28 → Mar 31, never Feb 28 → Mar 28 (three nights
+    // short of the two months it is charged).
+    if (from > checkIn) {
+      for (let k = 1; k <= 240; k++) {
+        const at = addCalendarMonths(checkIn, k)
+        if (at === from) return addCalendarMonths(checkIn, k + 1)
+        if (at > from) break
+      }
+    }
+    return addCalendarMonths(from, 1)
+  }
+  return addStayDays(from, by === 'week' ? 7 : 1)
+}
+/** "Wed, Oct 10" */
+export const leavingDayLabel = (ymd: string) =>
+  new Date(ymd + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
+
+export function StayDatesFields({ checkIn, checkOut, onChange }: {
+  checkIn: string; checkOut: string; onChange: (checkIn: string, checkOut: string) => void
+}) {
+  const valid = !!checkIn && !!checkOut && checkOut > checkIn
+  const nights = valid ? stayNightsBetween(checkIn, checkOut) : 0
+  const add = (by: 'day' | 'week' | 'month') => {
+    const to = lengthenStay(checkIn, checkOut, by)
+    if (to) onChange(checkIn, to)
+  }
+  return (
+    <>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+        <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Arriving</div>
+          <input className="form-input" type="date" aria-label="Arriving" style={{width:'100%'}} value={checkIn}
+                 onChange={e=>onChange(e.target.value, checkOut)} /></div>
+        <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Leaving</div>
+          <input className="form-input" type="date" aria-label="Leaving" style={{width:'100%'}} min={checkIn || undefined} value={checkOut}
+                 onChange={e=>onChange(checkIn, e.target.value)} /></div>
+      </div>
+      <div style={{display:'flex',gap:8,marginTop:8,flexWrap:'wrap'}}>
+        <button type="button" className="btn btn-primary btn-sm" disabled={!checkIn} onClick={()=>add('day')}>Add a day</button>
+        <button type="button" className="btn btn-primary btn-sm" disabled={!checkIn} onClick={()=>add('week')}>Add a week</button>
+        <button type="button" className="btn btn-primary btn-sm" disabled={!checkIn} onClick={()=>add('month')}>Add a month</button>
+      </div>
+      {valid && (
+        <div data-testid="resv-nights" style={{fontSize:'.86rem',fontWeight:700,color:'var(--text-1)',marginTop:8}}>
+          {nights} night{nights===1?'':'s'} — leaving {leavingDayLabel(checkOut)}
+        </div>
+      )}
+    </>
+  )
+}
 
 /**
  * The detail panel's Cancel reservation button (opens CancelReservationModal),
@@ -3452,6 +3703,8 @@ function AddMonthModal({ booking, onClose, onDone }: {
   const [quote, setQuote] = useState<any>(null)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
+  // 10/6 (Nic): "Returning guest — they've stayed with us before" — no check, no fee.
+  const [returning, setReturning] = useState(false)
   useEffect(() => {
     let live = true
     apiGet(`/units/${booking.unitId}/bookings/${booking.id}/add-month`)
@@ -3462,7 +3715,8 @@ function AddMonthModal({ booking, onClose, onDone }: {
   const send = async (stayTerms?: StayTerms) => {
     setBusy(true); setErr('')
     try {
-      const r: any = await apiPost(`/units/${booking.unitId}/bookings/${booking.id}/add-month`, stayTerms ? { stayTerms } : {})
+      const r: any = await apiPost(`/units/${booking.unitId}/bookings/${booking.id}/add-month`,
+        { ...(stayTerms ? { stayTerms } : {}), ...(returning ? { returningGuest: true } : {}) })
       onDone(r?.data)
     } catch (e: any) {
       const body = e?.response?.data
@@ -3482,12 +3736,21 @@ function AddMonthModal({ booking, onClose, onDone }: {
             <div>{longCalendarDate(quote.fromCheckOut)} → <strong>{longCalendarDate(quote.newCheckOut)}</strong> <span style={{ color: 'var(--text-3)' }}>({quote.addedNights} nights added)</span></div>
             <div style={{ color: 'var(--text-3)' }}>The month</div>
             <div style={{ color: 'var(--gold)', fontWeight: 600 }}>{fmt(quote.monthPrice)}</div>
-            {quote.screeningFee != null && (<>
+            {quote.screeningFee != null && !returning && (<>
               <div style={{ color: 'var(--text-3)' }}>Background check</div>
               <div>{fmt(quote.screeningFee)} <span style={{ color: 'var(--text-3)' }}>— the stay is now more than three weeks and nothing is on file, so the check's fee goes on the same ticket.</span></div>
             </>)}
+            {quote.screening === 'returning' && (<>
+              <div style={{ color: 'var(--text-3)' }}>Background check</div>
+              <div>{RETURNING_GUEST_DETAIL}</div>
+            </>)}
             <div style={{ color: 'var(--text-3)' }}>Paid</div>
-            <div>At the register — the month goes on the stay's ticket.</div>
+            <div>{Number(quote.monthPrice) > 0 ? 'At the register — the month goes on the stay\'s ticket.' : 'Nothing to pay — rent is covered by their work trade.'}</div>
+          </div>
+        )}
+        {quote?.screeningFee != null && quote?.returning && (
+          <div style={{ marginBottom: 10 }}>
+            <ReturningGuestChoice offer={quote.returning} checked={returning} onChange={setReturning} fee={quote.screeningFee} />
           </div>
         )}
         {asking && (

@@ -32,7 +32,9 @@ import { useState } from 'react'
 import { useQuery } from 'react-query'
 import {
   DEPOSITABLE_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, formatCurrency,
-  DEPOSIT_REFERENCE_LABEL, bankReceiptPhotoProblem, bankDateUsedText,
+  DEPOSIT_REFERENCE_LABEL, bankReceiptPhotoProblem, bankDateUsedText, BANK_DEPOSIT_REPORT_NOT_TAKEN,
+  DEPOSIT_HOURS, DEPOSIT_AFTER_HOURS, DEPOSIT_AFTER_HOURS_LABEL, DEPOSIT_HOUR_QUESTION, DEPOSIT_HOUR_HINT,
+  depositHourLabel, reportedTimeText,
   type ManualPaymentMethod, type DepositablePaymentMethod,
 } from '@gam/shared'
 import { apiGet, apiPost, apiDelete, apiUpload } from '../lib/api'
@@ -60,6 +62,8 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
   const [declaredDate, setDeclaredDate] = useState(todayISO())
   const [method, setMethod] = useState<DepositablePaymentMethod>('cash')
   const [reference, setReference] = useState('')
+  // 10/6 (Nic): about what time they were at the bank — required. '' until picked.
+  const [hour, setHour] = useState('')
   // 10/5 (Nic): an optional photo of the bank's receipt, sent once the report is made.
   const [photo, setPhoto] = useState<File | null>(null)
   const [confirmed, setConfirmed] = useState(false)
@@ -71,7 +75,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
   // landlord's bank decides what the window may promise.
   const feed = useQuery(
     ['declared-deposit-feed', leaseId],
-    () => apiGet<{ leaseId: string; bankFeedLinked: boolean; expiresInDays?: number }>(
+    () => apiGet<{ leaseId: string; bankFeedLinked: boolean; expiresInDays?: number; depositsTaken?: boolean; notTakenMessage?: string }>(
       `/declared-deposits/feed/${leaseId}`),
     { staleTime: 0, retry: 1 },
   )
@@ -82,7 +86,8 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
 
   const amount = Number(amountText)
   // 10/5 (Nic): the reference number from the bank's receipt is required.
-  const canSubmit = confirmed && amount > 0 && !!declaredDate && !!reference.trim() && !submitting && copy.canReport
+  // 10/6 (Nic): and about what time they were at the bank.
+  const canSubmit = confirmed && amount > 0 && !!declaredDate && !!reference.trim() && !!hour && !submitting && copy.canReport
 
   async function submit() {
     setError(null); setSubmitting(true)
@@ -90,6 +95,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
       const res: any = await apiPost('/declared-deposits', {
         leaseId, amount, declaredDate, method,
         reference: reference.trim(),
+        depositHour: hour === DEPOSIT_AFTER_HOURS ? DEPOSIT_AFTER_HOURS : Number(hour),
       })
       // The photo goes on the report just made (or the one already made).
       let photoNote = ''
@@ -127,7 +133,16 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
           Report a deposit you made at the bank
         </div>
 
-        {done ? (
+        {feed.data?.depositsTaken === false ? (
+          // 10/6 (Nic): the landlord does not take rent deposited at their bank here.
+          <>
+            <div style={{ marginTop: 14, fontSize: '.82rem', lineHeight: 1.55, color: 'var(--t1)' }}>
+              {feed.data.notTakenMessage ?? BANK_DEPOSIT_REPORT_NOT_TAKEN}
+            </div>
+            <button className="btn-primary" style={{ width: '100%', marginTop: 16 }}
+              onClick={onClose}>Done</button>
+          </>
+        ) : done ? (
           <>
             <div style={{
               marginTop: 14, padding: 12, borderRadius: 8,
@@ -167,6 +182,25 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
             </label>
             <input type="date" value={declaredDate} max={todayISO()}
               onChange={(e) => setDeclaredDate(e.target.value)} style={inputStyle} />
+
+            {/* 10/6 (Nic): required — "for people that pay the exact same
+                amount, the probability that they're going to be in the bank
+                at exactly the same time also kind of shrinks." */}
+            <label htmlFor="report-deposit-hour"
+              style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
+              {DEPOSIT_HOUR_QUESTION}
+            </label>
+            <select id="report-deposit-hour" value={hour} required
+              onChange={(e) => setHour(e.target.value)} style={inputStyle}>
+              <option value="" disabled>Pick a time</option>
+              {DEPOSIT_HOURS.map((h) => (
+                <option key={h} value={String(h)}>{depositHourLabel(h)}</option>
+              ))}
+              <option value={DEPOSIT_AFTER_HOURS}>{DEPOSIT_AFTER_HOURS_LABEL}</option>
+            </select>
+            <div style={{ fontSize: '.72rem', color: 'var(--t3)', lineHeight: 1.5, marginTop: 4 }}>
+              {DEPOSIT_HOUR_HINT}
+            </div>
 
             <label style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
               How did you pay?
@@ -303,6 +337,12 @@ export function ReportedDeposits({ reports, onWithdrawn, refusal, onRefusal, sta
         }}>
           <span style={{ color: 'var(--t2)', lineHeight: 1.5 }}>
             {formatCurrency(Number(r.amount))} on {r.declaredDate}
+            {/* 10/6 (Nic): about what time they said they were at the bank. */}
+            {reportedTimeText({ hour: r.depositHour, afterHours: r.afterHours }) && (
+              <span style={{ color: 'var(--t3)' }}>
+                {', '}{reportedTimeText({ hour: r.depositHour, afterHours: r.afterHours })}
+              </span>
+            )}
             <span style={{ color: 'var(--t3)' }}>
               {' · '}{MANUAL_PAYMENT_METHOD_LABELS[r.method as ManualPaymentMethod] ?? 'Other'}
             </span>

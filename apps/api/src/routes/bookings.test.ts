@@ -27,7 +27,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { NIGHTS_AGGREGATION_UNIT_TYPES, computeMonthlyStaySchedule, computeStayPrice } from '@gam/shared'
+import { NIGHTS_AGGREGATION_UNIT_TYPES, priceStay, priceStayBetween } from '@gam/shared'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedUtilityMeter } from '../test/dbHelpers'
 import { bookingsRouter } from './bookings'
 import { unitsRouter } from './units'
@@ -885,7 +885,7 @@ describe('PATCH /api/units/:id/bookings/:bookingId — early check-out (S655)', 
     expect(await leaseMoney(leaseId)).toEqual(LEASE_ENDED_TODAY)
   })
 
-  it('a one-date edit of a month-to-month stay is priced on the calendar schedule', async () => {
+  it('a one-date edit of a month-to-month stay is priced by the one rule (10/6: whole months, weeks and nights — never prorated)', async () => {
     // "They are staying two more nights" sends only the new check-out. The
     // other day comes from the stored stay; it used to arrive as a database
     // Date the monthly schedule could not read, and the edit failed with a 500.
@@ -896,14 +896,17 @@ describe('PATCH /api/units/:id/bookings/:bookingId — early check-out (S655)', 
     // 10/5 (Nic, R2): a longer stay of 30+ nights carries the desk's lease-or-stay answer.
     const out = await patchStay(f, stay, { checkOut: '2026-11-02', stayTerms: 'stay' })
     expect(out.status, JSON.stringify(out.body)).toBe(200)
-    const afterOut = computeMonthlyStaySchedule('2026-09-01', '2026-11-02', 1500).total
-    expect(afterOut).toBe(3050)
+    // 10/6 (Nic): two calendar months (Sep 1 → Nov 1) and one night — the
+    // cheapest way to cover 62 nights — never a prorated calendar schedule.
+    const afterOut = priceStayBetween({ nightly: 60, weekly: 350, monthly: 1500 }, 0, '2026-09-01', '2026-11-02').total
+    expect(afterOut).toBe(3060)
     expect(await stayRow(stay)).toMatchObject({ check_out: '2026-11-02', nights: 62, total_amount: afterOut.toFixed(2) })
 
     // And the other way round: only the check-in.
     const inn = await patchStay(f, stay, { checkIn: '2026-09-02' })
     expect(inn.status, JSON.stringify(inn.body)).toBe(200)
-    const afterIn = computeMonthlyStaySchedule('2026-09-02', '2026-11-02', 1500).total
+    const afterIn = priceStayBetween({ nightly: 60, weekly: 350, monthly: 1500 }, 0, '2026-09-02', '2026-11-02').total
+    expect(afterIn).toBe(3000) // exactly two calendar months
     expect(await stayRow(stay)).toMatchObject({ check_in: '2026-09-02', nights: 61, total_amount: afterIn.toFixed(2) })
     await settle()
   })
@@ -916,7 +919,7 @@ describe('PATCH /api/units/:id/bookings/:bookingId — early check-out (S655)', 
     const stay = await seedStay(f, { checkIn: '2026-09-28', checkOut: '2026-10-06', total: 0, status: 'confirmed' })
     const tax = Number((await db.query<{ t: string }>(
       `SELECT COALESCE(short_term_tax_rate, 0)::text AS t FROM properties WHERE id = $1`, [f.propertyId])).rows[0].t)
-    const sitePrice = computeStayPrice({ nightly: 60, weekly: 350, monthly: 1500 }, tax, 8).total
+    const sitePrice = priceStay({ nightly: 60, weekly: 350, monthly: 1500 }, tax, '2026-09-28', 8).total
     expect(sitePrice).toBeGreaterThan(0)
 
     // A status change alone (the check-in button) does not price it.
@@ -1136,7 +1139,7 @@ describe('PATCH /api/units/:id/bookings/:bookingId — early check-out (S655)', 
     expect((await patchStay(f, stay, { status: 'checked_out' })).status).toBe(200)
     const tax = Number((await db.query<{ t: string }>(
       `SELECT COALESCE(short_term_tax_rate, 0)::text AS t FROM properties WHERE id = $1`, [f.propertyId])).rows[0].t)
-    const eightNights = computeStayPrice({ nightly: 60, weekly: 350, monthly: 1500 }, tax, 8).total
+    const eightNights = priceStay({ nightly: 60, weekly: 350, monthly: 1500 }, tax, '2026-09-28', 8).total
 
     const save = await patchStay(f, stay, { checkIn: '2026-09-28', checkOut: PHOENIX_TODAY, unitId: f.unitId })
     expect(save.status, JSON.stringify(save.body)).toBe(200)
@@ -1191,7 +1194,7 @@ describe('PATCH /api/units/:id/bookings/:bookingId — early check-out (S655)', 
     await settle()
     const tax = Number((await db.query<{ t: string }>(
       `SELECT COALESCE(short_term_tax_rate, 0)::text AS t FROM properties WHERE id = $1`, [f.propertyId])).rows[0].t)
-    const threeNights = computeStayPrice({ nightly: 60, weekly: 350, monthly: 1500 }, tax, 3).total
+    const threeNights = priceStay({ nightly: 60, weekly: 350, monthly: 1500 }, tax, '2026-09-28', 3).total
     expect((await stayRow(stay)).total_amount).toBe(threeNights.toFixed(2))
 
     const undo = await patchStay(f, stay, { status: 'checked_in' })
@@ -1750,7 +1753,7 @@ describe('PATCH /api/units/:id/bookings/:bookingId — early check-out (S655)', 
     // shorter dates (decisions #33), and is still Checked out...
     const edit = await patchStay(f, stay, { checkIn: '2026-09-28', checkOut: '2026-10-04', unitId: f.unitId })
     expect(edit.status, JSON.stringify(edit.body)).toBe(200)
-    const shorter = computeStayPrice({ nightly: 60, weekly: 350, monthly: 1500 }, await taxPctOf(f), 6).total
+    const shorter = priceStay({ nightly: 60, weekly: 350, monthly: 1500 }, await taxPctOf(f), '2026-09-28', 6).total
     expect(await stayRow(stay)).toMatchObject({
       status: 'checked_out', check_out: '2026-10-04', nights: 6, total_amount: shorter.toFixed(2),
     })

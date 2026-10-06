@@ -61,7 +61,9 @@ describe('action parity — what a person can do, the agent should be able to do
   it('the surface is roughly the size we think it is', () => {
     // A large move either way means routes were added or the silo list rotted.
     expect(reachable).toBeGreaterThan(250)
-    expect(reachable).toBeLessThan(450)
+    // 10/6: 451 after the per-property bank-deposit setting and the bank
+    // feed's deposit matching each added a mutating route.
+    expect(reachable).toBeLessThan(475)
   })
 
   it('nothing from another portal has crept into a landlord or tenant agent', async () => {

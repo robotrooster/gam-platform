@@ -127,14 +127,26 @@ describe('the counter takes a reservation', () => {
     expect(ok.status, JSON.stringify(ok.body)).toBe(201)
     const [b] = await query<any>(`SELECT avoided_unit_ids FROM unit_bookings`)
     expect(b.avoided_unit_ids).toEqual([f.unitIds[0]])   // the stray id was dropped
-    // and an edit cannot drag them onto it either
+    // and a person moving them onto it is asked first, in plain words (10/6, Nic):
+    // "She asked not to be on RV 14. Move her there anyway?"
     const moved = await request(buildApp()).patch(`/api/units/${f.unitIds[1]}/bookings/${ok.body.data.id}`)
       .set('Authorization', `Bearer ${f.token}`).send({ unitId: f.unitIds[0] })
     expect(moved.status).toBe(409)
+    expect(moved.body).toMatchObject({ code: 'avoided_site', error: 'Dale Carter asked not to be on RV 01. Move them there anyway?' })
+    expect((await query<any>(`SELECT unit_id FROM unit_bookings WHERE id = $1`, [ok.body.data.id]))[0].unit_id).toBe(f.unitIds[1])
     const edited = await request(buildApp()).patch(`/api/units/${f.unitIds[1]}/bookings/${ok.body.data.id}`)
       .set('Authorization', `Bearer ${f.token}`).send({ avoidedUnitIds: [f.unitIds[2]] })
     expect(edited.status).toBe(200)
     expect(edited.body.data.avoidedUnitIds).toEqual([f.unitIds[2]])
+    // Confirmed, the move goes through (the list stays as it is).
+    const onAvoided = await request(buildApp()).patch(`/api/units/${f.unitIds[1]}/bookings/${ok.body.data.id}`)
+      .set('Authorization', `Bearer ${f.token}`).send({ unitId: f.unitIds[2] })
+    expect(onAvoided.status).toBe(409)
+    const confirmed = await request(buildApp()).patch(`/api/units/${f.unitIds[1]}/bookings/${ok.body.data.id}`)
+      .set('Authorization', `Bearer ${f.token}`).send({ unitId: f.unitIds[2], overrideAvoided: true })
+    expect(confirmed.status, JSON.stringify(confirmed.body)).toBe(200)
+    const [row] = await query<any>(`SELECT unit_id, avoided_unit_ids FROM unit_bookings WHERE id = $1`, [ok.body.data.id])
+    expect(row).toEqual({ unit_id: f.unitIds[2], avoided_unit_ids: [f.unitIds[2]] })
   })
 
   it('an unpaid hold moves aside for a reservation being paid for', async () => {

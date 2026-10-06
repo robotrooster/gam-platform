@@ -14,9 +14,10 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import type { PoolClient } from 'pg'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant } from '../test/dbHelpers'
-import { emitPaymentSettledEvent } from '../services/creditLedgerEmitters'
+import { emitPaymentSettledEvent, correctMarkForLateFeeOnBill } from '../services/creditLedgerEmitters'
 import { undoDepositMatch } from '../services/bankDepositConfirm'
-import { fixReversedLateFees } from './oct6_fix_reversed_late_fees'
+import { creditLateFee, BANK_SHOWS_LATE_FEE_NOTE } from '../services/lateFeeCredit'
+import { fixReversedLateFees, correctBankMatchedCreditedFees } from './oct6_fix_reversed_late_fees'
 
 const TZ = 'America/Phoenix'
 
@@ -82,6 +83,32 @@ async function zeroedTheOldWay(o: { onboarding: boolean }) {
   } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e } finally { c.release() }
 }
 
+/** The bank match that paid the rent (its receipt, its bank line and allocation, its undo record listing the zeroed fee). */
+async function bankMatchOf(z: Awaited<ReturnType<typeof zeroedTheOldWay>>, o: { zeroed: boolean }) {
+  const rem = (await db.query<{ id: string }>(
+    `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, status, payment_method, processing_fee_amount)
+     VALUES ($1,$2,$3,600,600,0,'settled','bank_deposit',0) RETURNING id`, [z.tenantId, z.leaseId, z.landlordId])).rows[0].id
+  await db.query(`INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied) VALUES ($1,$2,600)`, [rem, z.rentId])
+  const conn = (await db.query<{ id: string }>(
+    `INSERT INTO bank_connections (landlord_id, provider, status) VALUES ($1,'stripe_fc','active') RETURNING id`, [z.landlordId])).rows[0].id
+  const creditEventIds = (await liveMarks(z.rentId)).map((m: any) => m.id)
+  const undoRecord = {
+    version: 1,
+    rows: [{ paymentId: z.rentId, priorStatus: 'pending', priorNextRetryAt: null, priorIntentId: null, money: 600 }],
+    lateFeesZeroed: o.zeroed ? [{ paymentId: z.feeId, priorAmount: 25, priorStatus: 'pending', priorNotes: null }] : [],
+    lateFeeRefundCreditIds: [], paidAheadCreditId: null, receiptId: rem, declarationId: null, creditEventIds, confirmedBy: null,
+  }
+  const txn = (await db.query<{ id: string }>(
+    `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status,
+                                    matched_payment_id, auto_settle_undo)
+     VALUES ($1,$2,$3,$4::date,600,'BRANCH DEPOSIT','matched',$5,$6::jsonb) RETURNING id`,
+    [conn, z.landlordId, randomUUID(), z.dueDay, z.rentId, JSON.stringify(undoRecord)])).rows[0].id
+  await db.query(
+    `INSERT INTO bank_deposit_allocations (bank_transaction_id, payment_id, landlord_id, amount, effective_paid_date)
+     VALUES ($1,$2,$3,600,$4::date)`, [txn, z.rentId, z.landlordId, z.dueDay])
+  return { txn, receiptId: rem }
+}
+
 const fee = async (id: string) => (await db.query<any>(
   `SELECT amount::float AS amount, status, issued_credit_amount::float AS credited, notes FROM payments WHERE id = $1`, [id])).rows[0] ?? null
 const liveMarks = async (id: string) => (await db.query<any>(
@@ -142,37 +169,85 @@ describe('oct6_fix_reversed_late_fees', () => {
     expect(await fee(gone.feeId)).toBeNull()
   })
 
-  it('a bank match\'s undo record lists the fee as credited afterwards, so Undo takes the credit back exactly', async () => {
+  it('10/6 table: a fee a BANK MATCH zeroed is the bank\'s decision — left at $0.00, never turned into a credit', async () => {
     const z = await zeroedTheOldWay({ onboarding: false })
-    const rem = (await db.query<{ id: string }>(
-      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, status, payment_method, processing_fee_amount)
-       VALUES ($1,$2,$3,600,600,0,'settled','bank_deposit',0) RETURNING id`, [z.tenantId, z.leaseId, z.landlordId])).rows[0].id
-    await db.query(`INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied) VALUES ($1,$2,600)`, [rem, z.rentId])
-    const conn = (await db.query<{ id: string }>(
-      `INSERT INTO bank_connections (landlord_id, provider, status) VALUES ($1,'stripe_fc','active') RETURNING id`, [z.landlordId])).rows[0].id
-    const undoRecord = {
-      version: 1,
-      rows: [{ paymentId: z.rentId, priorStatus: 'pending', priorNextRetryAt: null, priorIntentId: null, money: 600 }],
-      lateFeesZeroed: [{ paymentId: z.feeId, priorAmount: 25, priorStatus: 'pending', priorNotes: null }],
-      lateFeeRefundCreditIds: [], paidAheadCreditId: null, receiptId: rem, declarationId: null, creditEventIds: [], confirmedBy: null,
-    }
-    const txn = (await db.query<{ id: string }>(
-      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status,
-                                      matched_payment_id, auto_settle_undo)
-       VALUES ($1,$2,$3,$4::date,600,'BRANCH DEPOSIT','matched',$5,$6::jsonb) RETURNING id`,
-      [conn, z.landlordId, randomUUID(), z.dueDay, z.rentId, JSON.stringify(undoRecord)])).rows[0].id
+    const { txn } = await bankMatchOf(z, { zeroed: true })
+    const before = (await db.query<any>(`SELECT auto_settle_undo FROM bank_transactions WHERE id = $1`, [txn])).rows[0].auto_settle_undo
+    const marks = await liveMarks(z.rentId)
 
     const r = await tx(c => fixReversedLateFees(c), true)
-    expect(r.fixed[0].undoRecordUpdated).toBe(txn)
-    const after = (await db.query<any>(`SELECT auto_settle_undo FROM bank_transactions WHERE id = $1`, [txn])).rows[0].auto_settle_undo
-    expect(after.lateFeesZeroed).toEqual([])
-    expect(after.lateFeesCredited).toEqual([expect.objectContaining({ paymentId: z.feeId, amount: 25, priorStatus: 'pending' })])
+    expect(r.fixed).toEqual([])
+    expect(r.skipped).toEqual([{ paymentId: z.feeId, why: expect.stringContaining('the bank\'s date decides') }])
+    expect(await fee(z.feeId)).toMatchObject({ amount: 0, status: 'settled', credited: 0 })
+    expect((await db.query<any>(`SELECT auto_settle_undo FROM bank_transactions WHERE id = $1`, [txn])).rows[0].auto_settle_undo).toEqual(before)
+    expect((await liveMarks(z.rentId)).map(m => m.id)).toEqual(marks.map(m => m.id))
+    // Part B finds nothing to do either (nothing was credited).
+    expect(await tx(c => correctBankMatchedCreditedFees(c), true)).toEqual({ zeroed: [], skipped: [], subjects: [] })
+  })
 
+  it('10/6 table: a fee zeroed on a bill a bank line is tied to (bank_deposit_allocations) is left at $0.00 too', async () => {
+    const z = await zeroedTheOldWay({ onboarding: false })
+    const conn = (await db.query<{ id: string }>(
+      `INSERT INTO bank_connections (landlord_id, provider, status) VALUES ($1,'stripe_fc','active') RETURNING id`, [z.landlordId])).rows[0].id
+    const t = (await db.query<{ id: string }>(
+      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status)
+       VALUES ($1,$2,$3,$4::date,600,'BRANCH DEPOSIT','matched') RETURNING id`, [conn, z.landlordId, randomUUID(), z.dueDay])).rows[0].id
+    await db.query(
+      `INSERT INTO bank_deposit_allocations (bank_transaction_id, payment_id, landlord_id, amount, effective_paid_date)
+       VALUES ($1,$2,$3,600,$4::date)`, [t, z.rentId, z.landlordId, z.dueDay])
+    const r = await tx(c => fixReversedLateFees(c), true)
+    expect(r.fixed).toEqual([])
+    expect(r.skipped).toHaveLength(1)
+    expect(await fee(z.feeId)).toMatchObject({ amount: 0 })
+  })
+
+  it('part B: a fee a bank match CREDITED (this script before the table, or a match while 0763a6b was live) is zeroed, the undo record rewritten, the mark corrected to ON TIME from the bank\'s day — once; Undo then puts it all back as before the match', async () => {
+    const z = await zeroedTheOldWay({ onboarding: false })
+    const { txn } = await bankMatchOf(z, { zeroed: true })
+    // As the earlier run of this script left it: charged again, credited, the undo record listing it as credited, the rent LATE.
+    const recordedAt = new Date(Date.now() - 86_400_000)
+    await tx(async c => {
+      await c.query(`UPDATE payments SET amount = 25, status = 'pending', settled_at = NULL, notes = NULL WHERE id = $1`, [z.feeId])
+      const cr = await creditLateFee(c, z.feeId, { paidOn: z.dueDay, tenantId: z.tenantId, createdBy: null })
+      await c.query(
+        `UPDATE bank_transactions SET auto_settle_undo = jsonb_set(jsonb_set(auto_settle_undo, '{lateFeesZeroed}', '[]'::jsonb),
+                '{lateFeesCredited}', jsonb_build_array($2::jsonb)) WHERE id = $1`,
+        [txn, JSON.stringify({ paymentId: z.feeId, amount: cr!.amount, priorStatus: 'pending', priorNotes: null,
+          priorIssued: 0, creditId: cr!.creditId, useId: cr!.useId })])
+      await correctMarkForLateFeeOnBill(c, { paymentId: z.rentId, recordedAt })
+    }, true)
+    const [lateMark] = await liveMarks(z.rentId)
+    expect(lateMark.event_type).toMatch(/^payment_received_late_/)
+    const creditId = (await db.query<any>(`SELECT tenant_credit_id FROM credit_uses WHERE payment_id = $1`, [z.feeId])).rows[0].tenant_credit_id
+
+    // A dry run changes nothing.
+    const dry = await tx(c => correctBankMatchedCreditedFees(c), false)
+    expect(dry.zeroed).toHaveLength(1)
+    expect(await fee(z.feeId)).toMatchObject({ amount: 25, credited: 25 })
+
+    const r = await tx(c => correctBankMatchedCreditedFees(c), true)
+    expect(r.skipped).toEqual([])
+    expect(r.zeroed).toEqual([expect.objectContaining({ paymentId: z.feeId, bankTransactionId: txn, amount: 25, paidOn: z.dueDay })])
+    const f = await fee(z.feeId)
+    expect(f).toMatchObject({ amount: 0, status: 'settled', credited: 0 })
+    expect(f.notes).toContain(`${BANK_SHOWS_LATE_FEE_NOTE}${z.dueDay}, before this fee was charged`)
+    expect((await db.query<any>(`SELECT status FROM tenant_credits WHERE id = $1`, [creditId])).rows[0].status).toBe('void')
+    const undo = (await db.query<any>(`SELECT auto_settle_undo FROM bank_transactions WHERE id = $1`, [txn])).rows[0].auto_settle_undo
+    expect(undo.lateFeesCredited).toEqual([])
+    expect(undo.lateFeesZeroed).toEqual([{ paymentId: z.feeId, priorAmount: 25, priorStatus: 'pending', priorNotes: null }])
+    const [now] = await liveMarks(z.rentId)
+    expect(now.event_type).toBe('payment_received_on_time')
+    expect(now.event_data).toMatchObject({ bank_validated: true, corrects_event_id: lateMark.id })
+    expect((await db.query<any>(`SELECT superseded_by FROM credit_events WHERE id = $1`, [lateMark.id])).rows[0].superseded_by).toBe(now.id)
+    // Part A does not undo it, and a second run finds nothing.
+    expect((await tx(c => fixReversedLateFees(c), true)).fixed).toEqual([])
+    expect(await tx(c => correctBankMatchedCreditedFees(c), true)).toEqual({ zeroed: [], skipped: [], subjects: [] })
+
+    // Undo of the match: the fee owed again as it was before the match, the rent open, its mark withdrawn.
     const u = await undoDepositMatch({ bankTransactionId: txn, landlordId: z.landlordId, undoneBy: z.ownerUserId })
     expect(u.lateFeesRestored).toBe(1)
     expect(await fee(z.feeId)).toMatchObject({ amount: 25, status: 'pending', credited: 0 })
-    expect((await db.query<any>(`SELECT status FROM tenant_credits WHERE id = $1`, [after.lateFeesCredited[0].creditId])).rows[0].status)
-      .toBe('void')
+    expect(await liveMarks(z.rentId)).toEqual([])
   })
 
   it('a utility on the same bill paid on time BEFORE the fee was charged keeps its on-time mark (review fix)', async () => {

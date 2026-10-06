@@ -11,7 +11,7 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiPut, apiDel } from '../lib/api'
-import { humanize, processingFeeFor, rvSiteFactsLabel, SUPPORTED_CARD_READER, READER_ORDER_STATUS_LABEL, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms } from '@gam/shared'
+import { humanize, processingFeeFor, rvSiteFactsLabel, SUPPORTED_CARD_READER, READER_ORDER_STATUS_LABEL, STAY_TERMS, STAY_TERMS_LABEL, RETURNING_GUEST_LABEL, type StayTerms } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 import { appConfirm, appPrompt } from '../components/dialogs'
 import { SendPayLinkModal, PayLinksTab } from './POSPayLinks'
@@ -273,7 +273,9 @@ const LAUNCH_HIDE_CHARGE = true
 // background check).
 interface CartItem { id:string; name:string; price:number; qty:number; tax:number; cat:string; icon:string; chargeEligible:boolean; stayUnit?:'night'|'week'|'month'|null; reservation?:boolean; nights?:number
   stayUnitId?:string; stayCheckIn?:string; stayTotal?:number; stayTax?:number
-  stayEmail?:string|null; stayTerms?:StayTerms|null; stayExtend?:string|null; screeningFee?:number|null; fixed?:boolean }
+  stayEmail?:string|null; stayTerms?:StayTerms|null; stayExtend?:string|null; screeningFee?:number|null; fixed?:boolean
+  /** 10/6 (Nic): "Returning guest — they've stayed with us before" — no background check (owner / a manager only). */
+  stayReturning?:boolean|null }
 
 /** 10/3 (decisions #9): a stay whose site and arrival are picked shows what its nights cost; anything else, price × quantity. */
 const stayPriced = (i: CartItem) => !!i.stayUnit && !i.reservation && typeof i.stayTotal === 'number'
@@ -283,7 +285,7 @@ const lineAmount = (i: CartItem) => stayPriced(i) ? Math.round(((i.stayTotal ?? 
 const lineTax = (i: CartItem) => stayPriced(i) ? (i.stayTax ?? 0) : i.price * i.qty * i.tax
 /** A stay's nights changed: its site and price are picked again for the new length. */
 const unpriceStay = <T extends CartItem>(i: T): T => {
-  const { stayUnitId: _u, stayCheckIn: _c, stayTotal: _t, stayTax: _x, stayEmail: _e, stayTerms: _l, stayExtend: _m, screeningFee: _f, ...rest } = i
+  const { stayUnitId: _u, stayCheckIn: _c, stayTotal: _t, stayTax: _x, stayEmail: _e, stayTerms: _l, stayExtend: _m, screeningFee: _f, stayReturning: _r, ...rest } = i
   return rest as T
 }
 
@@ -304,7 +306,8 @@ function wireLine(i: CartItem, ticketId: string | null, linkId: string | null = 
            ...(stayPriced(i) && i.stayUnitId ? { stayUnitId: i.stayUnitId, stayCheckIn: i.stayCheckIn, stayTotal: i.stayTotal,
              // 10/5: who it is for, the lease answer, the month added and the background check's fee as shown.
              ...(i.stayEmail ? { stayEmail: i.stayEmail } : {}), ...(i.stayTerms ? { stayTerms: i.stayTerms } : {}),
-             ...(i.stayExtend ? { stayExtend: i.stayExtend } : {}), ...(i.screeningFee ? { screeningFee: i.screeningFee } : {}) } : {}) }
+             ...(i.stayExtend ? { stayExtend: i.stayExtend } : {}), ...(i.screeningFee ? { screeningFee: i.screeningFee } : {}),
+             ...(i.stayReturning ? { stayReturning: true } : {}) } : {}) }
 }
 
 
@@ -2086,7 +2089,8 @@ export function POSPage() {
                 stay={stayInCart && stayReady && stay ? { unitId: stay.unitId, checkIn: stay.checkIn, guestName: stay.guestName, guestPhone: stay.guestPhone || null,
                                                           guestEmail: stay.guestEmail || null, stayTerms: stay.stayTerms || null,
                                                           extendBookingId: stay.extendBookingId || null, screeningFee: stay.screeningFee || null,
-                                                          screeningLineName: stay.screeningLineName || null, heldWords: stay.heldWords || null } : null}
+                                                          screeningLineName: stay.screeningLineName || null, heldWords: stay.heldWords || null,
+                                                          returningGuest: stay.returningGuest === true } : null}
                 discountAmount={discountAmt}
                 total={discountedSubtotal + taxAmount}
                 customerPaysFee={!absorbsCardFee}
@@ -2974,7 +2978,7 @@ export function POSPage() {
               setCart(c=>c.map(i=>i.id===stayLine.id ? { ...i, price: d.rate != null ? Number(d.rate) : i.price,
                 stayUnitId: d.unitId, stayCheckIn: d.checkIn, stayTotal: Number(d.lineTotal), stayTax: Number(d.lodgingTax) || 0,
                 stayEmail: d.guestEmail || null, stayTerms: d.stayTerms || null, stayExtend: d.extendBookingId || null,
-                screeningFee: d.screeningFee != null ? Number(d.screeningFee) : null } : i))
+                screeningFee: d.screeningFee != null ? Number(d.screeningFee) : null, stayReturning: d.returningGuest === true || null } : i))
             }}
           />
         </div>
@@ -3016,6 +3020,9 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone, onLease
   const [guestPhone, setGuestPhone] = useState<string>(initial?.guestPhone || '')
   const [guestEmail, setGuestEmail] = useState<string>(initial?.guestEmail || '')
   const [stayTerms, setStayTerms] = useState<StayTerms | null>(initial?.stayTerms || null)
+  // 10/6 (Nic): "Returning guest — they've stayed with us before" — no background
+  // check. Offered by the server only to the owner or a manager allowed to invite.
+  const [returning, setReturning] = useState<boolean>(initial?.returningGuest === true)
   const [extendId, setExtendId] = useState<string>(initial?.extendBookingId || '')
   const [findStay, setFindStay] = useState<string>('')
   const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(guestEmail.trim())
@@ -3047,8 +3054,10 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone, onLease
   // 10/5: what the stay comes to and needs — the server's figures, read every
   // time the site, dates, email or answer changes.
   const quoteBody = mode === 'extend'
-    ? (extendId ? { propertyId, itemId: line.id, qty: line.qty, extendBookingId: extendId, guestEmail: emailOk ? guestEmail.trim() : null, stayTerms } : null)
-    : (unitId && checkIn ? { propertyId, itemId: line.id, qty: line.qty, unitId, checkIn, guestEmail: emailOk ? guestEmail.trim() : null, stayTerms } : null)
+    ? (extendId ? { propertyId, itemId: line.id, qty: line.qty, extendBookingId: extendId, guestEmail: emailOk ? guestEmail.trim() : null, stayTerms,
+                    ...(returning ? { returningGuest: true } : {}) } : null)
+    : (unitId && checkIn ? { propertyId, itemId: line.id, qty: line.qty, unitId, checkIn, guestEmail: emailOk ? guestEmail.trim() : null, stayTerms,
+                             ...(returning ? { returningGuest: true } : {}) } : null)
   const quote = useQuery<any>(
     ['stay-quote', JSON.stringify(quoteBody)],
     () => apiPost('/pos/stays/quote', quoteBody).then((r: any) => r.data),
@@ -3142,6 +3151,8 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone, onLease
                     <option key={u.id} value={u.id} disabled={u.lineTotal == null}>
                       {[u.unitNumber, rvSiteFactsLabel(u),
                         u.lineTotal == null ? 'no rate set' : `${fmt(u.lineTotal)}${Number(u.lodgingTax) > 0 ? ' with lodging tax' : ''}`,
+                        // 10/6 (Nic): six nights at the week's price, said so.
+                        u.lineTotal == null ? null : u.lowerRateWords,
                         u.heldByUnpaidHold ? `held, unpaid${u.heldFor ? ` — ${u.heldFor}` : ''}` : null]
                         .filter(Boolean).join(' · ')}
                     </option>
@@ -3198,6 +3209,19 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone, onLease
               {q.screening === 'on_file' && <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.45}}>
                 {q.nights} nights in a row — their background check is already on file or paid for, so nothing is added. Check-in waits for its results and your decision.
               </div>}
+              {/* 10/6 (Nic): the third choice beside the check's fee — greyed with the reason when the property's allowance is used up. */}
+              {q.returning && (q.screening === 'fee_due' || returning) && !leaseInstead && (q.returning.available
+                ? <label style={{display:'flex',alignItems:'flex-start',gap:8,cursor:'pointer',fontSize:'.78rem'}}>
+                    <input type="checkbox" checked={returning} onChange={e=>setReturning(e.target.checked)} style={{marginTop:3}} />
+                    <span><b>{RETURNING_GUEST_LABEL}</b><br/>
+                      <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>No background check and no fee — check-in won't wait on one. GAM records that you confirmed it.</span></span>
+                  </label>
+                : <div style={{fontSize:'.72rem',color:'var(--text-3)',opacity:.7,lineHeight:1.45}}>
+                    <b style={{color:'var(--text-1)'}}>{RETURNING_GUEST_LABEL}</b> — {q.returning.message}
+                  </div>)}
+              {q.screening === 'returning' && <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.45}}>
+                {q.nights} nights in a row — a returning guest, so no background check is needed.
+              </div>}
               {q.leaseOrStayWords && (<>
                 <div style={{color:'var(--text-2)',lineHeight:1.45}}>{q.nights} nights in a row — ask them: lease or no lease? {q.leaseOrStayWords}</div>
                 <div style={{display:'flex',gap:16}}>
@@ -3237,6 +3261,7 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone, onLease
           screeningFee: q.screeningFee ?? null,
           screeningLineName: q.screeningLineName,
           heldWords: q.heldWords ?? null,
+          returningGuest: q.returningGuest === true,
         })}>{(isFetching && !!unitId) || quote.isFetching ? 'Checking…' : mode === 'extend' ? 'Add this month' : 'Use this site'}</button>
         )}
       </div>

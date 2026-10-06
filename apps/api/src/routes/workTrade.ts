@@ -151,22 +151,17 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
       [body.tenantId, landlordId, body.unitId])
     if (!tenantLease) throw new AppError(400, 'This tenant has no active lease on this unit. Work trade requires an active tenancy — add or renew the lease first.')
 
-    const propDefault = await queryOne<{ work_trade_hours_target: number }>(
-      `SELECT p.work_trade_hours_target FROM properties p
-        JOIN units u ON u.property_id = p.id WHERE u.id = $1`, [body.unitId])
-    const agreement = await queryOne<any>(`
-      INSERT INTO work_trade_agreements
-        (unit_id, tenant_id, landlord_id, duties, start_date, end_date, renewal_terms,
-         monthly_hours_target, tracks_hours, covered_charges)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
-              COALESCE($10::text[], ARRAY['rent','fees','water','sewer','electric','gas','trash','propane']))
-      RETURNING *`,
-      [body.unitId, body.tenantId, landlordId, body.duties || null,
-       body.startDate, body.endDate || null, body.renewalTerms || null,
-       body.monthlyHoursTarget ?? propDefault?.work_trade_hours_target ?? 80,
-       body.tracksHours ?? true,
-       body.coveredCharges ?? null]
-    )
+    // 10/6: the ONE insert of an agreement's terms (services/stayWorkTrade) —
+    // the hours default to the property's work-trade setting, the covered
+    // charges to everything — shared with a work trade made on a stay.
+    const { insertWorkTradeAgreement } = await import('../services/stayWorkTrade')
+    const agreement = await insertWorkTradeAgreement({ query: (sql: string, p?: any[]) => query(sql, p ?? []).then(rows => ({ rows })) } as any, {
+      unitId: body.unitId, tenantId: body.tenantId, landlordId,
+      duties: body.duties || null, startDate: body.startDate, endDate: body.endDate || null,
+      renewalTerms: body.renewalTerms || null,
+      hoursTarget: body.monthlyHoursTarget ?? null, tracksHours: body.tracksHours ?? true,
+      coveredCharges: body.coveredCharges ?? null,
+    })
 
     // S631 (Nic): "I have no way to mark that person as a work trade person
     // until they accept the invite and sign the lease. If they sign the lease
@@ -603,6 +598,10 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
         duties=CASE WHEN $10::boolean THEN $11 ELSE duties END,
         carry_forward_indefinite=COALESCE($12,carry_forward_indefinite),
         field_permissions=COALESCE($13::text[],field_permissions),
+        -- 10/6 (review): a work trade made on a reservation that the landlord
+        -- ENDS here no longer follows the stay — a later change to the stay
+        -- (a drag, an edit, Add a month) must not bring it back.
+        booking_id=CASE WHEN $1::text = 'ended' THEN NULL ELSE booking_id END,
         updated_at=NOW()
       WHERE id=$3 RETURNING *`,
       [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null,

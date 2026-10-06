@@ -212,7 +212,10 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       const d = r?.data
       toast(d?.kind === 'deposit_slip'
         ? (d?.slipReopened ? 'Match undone. The deposit slip is waiting for the bank again.' : 'Match undone. Those payments are back on the "not banked" list.')
-        : `Match undone. ${d?.reopenedChargeIds?.length ?? 0} bill line(s) are owed again; the deposit is back in review.`)
+        // 10/6: a line tied to a deposit the office recorded by hand — the payments stay as recorded.
+        : d?.kind === 'recorded_deposit'
+          ? 'Match undone. The deposit you recorded stays as you recorded it, late fees and all; the bank line is back in review.'
+          : `Match undone. ${d?.reopenedChargeIds?.length ?? 0} bill line(s) are owed again; the deposit is back in review.`)
     },
     onError: (e: any) => toast.error(e?.message || 'That match could not be undone.'),
   })

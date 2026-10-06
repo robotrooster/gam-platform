@@ -288,6 +288,94 @@ describe('PATCH /api/units/:id/bookings/:bookingId — update', () => {
     expect(res.body.data.nights).toBe(7)  // 07-01 to 07-08
   })
 
+  // 10/6 (Nic): "would anything inadvertently push her into spot 14...? We
+  // need it to actually do something in the schedule." When the extending
+  // guest is the one moved, a site they asked not to have is never where they
+  // go — and with nothing else open, the extension is refused rather than
+  // landing them there.
+  it('W-20 extension fallback never moves the extending guest onto a site they asked not to have', async () => {
+    const f = await seedUnitsFixture()
+    const mk = async (n: string) => (await db.query<{ id: string }>(
+      `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount, is_bookable, lease_types_allowed)
+       VALUES ($1, $2, $3, 900, TRUE, ARRAY['nightly','weekly']) RETURNING id`,
+      [f.propertyId, f.landlordId, n])).rows[0].id
+    const rv98 = await mk('RV 98')
+    const rv99 = await mk('RV 99')
+    await db.query(`UPDATE units SET is_bookable=TRUE WHERE id=$1`, [f.unitId])
+    const sit = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-01', checkOut: '2026-08-05', guestName: 'Jo Avery', avoidedUnitIds: [rv98] })
+    expect(sit.status, JSON.stringify(sit.body)).toBe(201)
+    const inc = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-05', checkOut: '2026-08-09', guestName: 'Incoming' })
+    // The incoming guest was told their site, so they cannot be moved.
+    await db.query(`UPDATE unit_bookings SET site_reveal_sent_at=now() WHERE id=$1`, [inc.body.data.id])
+    const ext = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${sit.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-08-07' })
+    expect(ext.status, JSON.stringify(ext.body)).toBe(200)
+    // RV 98 is the first open site, but it is on Jo's list.
+    expect(ext.body.extendedGuestMovedTo?.unitNumber).toBe('RV 99')
+    expect((await db.query(`SELECT unit_id FROM unit_bookings WHERE id=$1`, [sit.body.data.id])).rows[0].unit_id).toBe(rv99)
+
+    // Only the avoided site open: the extension is refused, nobody is moved there.
+    const sit2 = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-12', checkOut: '2026-08-15', guestName: 'Jo Avery', avoidedUnitIds: [rv98] })
+    const inc2 = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-15', checkOut: '2026-08-18', guestName: 'Incoming 2' })
+    await db.query(`UPDATE unit_bookings SET site_reveal_sent_at=now() WHERE id=$1`, [inc2.body.data.id])
+    await db.query(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, lease_type, check_in, check_out, status, site_reveal_sent_at)
+       VALUES ($1, $2, 'nightly', '2026-08-10', '2026-08-20', 'confirmed', now())`, [rv99, f.landlordId])
+    const ext2 = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${sit2.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-08-17' })
+    expect(ext2.status).toBe(409)
+    expect(ext2.body.error).toMatch(/no open site fits the extended stay/)
+    expect((await db.query(`SELECT unit_id FROM unit_bookings WHERE id=$1`, [sit2.body.data.id])).rows[0].unit_id).toBe(f.unitId)
+  })
+
+  // 10/6 (review): the avoid list sent WITH the extension is the one honored —
+  // a site added to it in the same save is never where the guest is moved.
+  it('W-20 extension fallback honors a site added to the avoid list in the same save', async () => {
+    const f = await seedUnitsFixture()
+    const mk = async (n: string) => (await db.query<{ id: string }>(
+      `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount, is_bookable, lease_types_allowed)
+       VALUES ($1, $2, $3, 900, TRUE, ARRAY['nightly','weekly']) RETURNING id`,
+      [f.propertyId, f.landlordId, n])).rows[0].id
+    const rv98 = await mk('RV 98')
+    const rv99 = await mk('RV 99')
+    await db.query(`UPDATE units SET is_bookable=TRUE WHERE id=$1`, [f.unitId])
+    const sit = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-01', checkOut: '2026-08-05', guestName: 'Pat Ruiz' })
+    expect(sit.status, JSON.stringify(sit.body)).toBe(201)
+    const inc = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-05', checkOut: '2026-08-09', guestName: 'Incoming' })
+    await db.query(`UPDATE unit_bookings SET site_reveal_sent_at=now() WHERE id=$1`, [inc.body.data.id])
+    const ext = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${sit.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-08-07', avoidedUnitIds: [rv98] })
+    expect(ext.status, JSON.stringify(ext.body)).toBe(200)
+    expect(ext.body.extendedGuestMovedTo?.unitNumber).toBe('RV 99')
+    const row = (await db.query(`SELECT unit_id, avoided_unit_ids FROM unit_bookings WHERE id=$1`, [sit.body.data.id])).rows[0]
+    expect(row.unit_id).toBe(rv99)
+    expect(row.avoided_unit_ids).toEqual([rv98])
+  })
+
   it('W-20 extension protection: boots the following unrevealed reservation; falls back to MOVING THE EXTENDING GUEST; 409s when neither works', async () => {
     const f = await seedUnitsFixture()
     // A second bookable site at the property.

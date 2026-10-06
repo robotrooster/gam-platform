@@ -43,7 +43,7 @@ import { DateTime } from 'luxon'
 import { reservationDue, checkOutFor, releaseReservationTickets, ticketCarriesStay, stayTaxRate, taxInsidePayment,
   priceWholeStay, leaseDepositFor, stayExtensionQuote, extendStayByMonth, undoStayExtension, SCREENING_LINE_NAME,
   type ReservationDue } from '../services/registerStay'
-import { stayNeeds, recordScreeningPrepayment, markScreeningRequired, chooseStayTerms, continuousStayNights, syncStayUtilityAgreement, screeningPaidForStay, type ScreeningCollectedBy } from '../services/stayTerms'
+import { stayNeeds, recordScreeningPrepayment, markScreeningRequired, chooseStayTerms, continuousStayNights, syncStayUtilityAgreement, screeningPaidForStay, canAttestReturningGuest, attestReturningGuest, RETURNING_GUEST_NOT_ALLOWED, type ScreeningCollectedBy } from '../services/stayTerms'
 
 export const posPayLinksRouter = Router()
 posPayLinksRouter.use(requireAuth)
@@ -123,6 +123,8 @@ const createSchema = z.object({
     extendBookingId: z.string().uuid().nullish(),
     /** 10/5 (Nic, R8): the background check's fee as the register showed it. */
     screeningFee: z.number().nonnegative().nullish(),
+    /** 10/6 (Nic): "Returning guest — they've stayed with us before" — no background check (owner / a manager only). */
+    returningGuest: z.boolean().nullish(),
   }).optional(),
 })
 
@@ -447,7 +449,7 @@ export async function linkReservation(q: Q, link: any, opts: { lock?: boolean; p
   // decisions #21: the lodging tax inside it, at the rate the schedule prices
   // these nights with. (A long stay's charge here is its deposit — decisions
   // #15 — and carries no tax.)
-  const rate = due.leaseBillsRest ? 0 : stayTaxRate(due.rates, due.taxPct, due.bookedNights)
+  const rate = due.leaseBillsRest ? 0 : stayTaxRate(due.rates, due.taxPct, due.bookedNights, { checkIn: due.checkIn, total: due.total, monthStay: due.monthStay })
   if (!stay) {
     const asks = round2(typed.reduce((n, l) => n + l.qty * l.price, 0))
     const charge = round2(Math.min(asks, due.owed))
@@ -1176,9 +1178,14 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
   let screeningRequired = false
   let extendPlan: { bookingId: string; fromCheckOut: string; checkOut: string; price: number } | null = null
   let stayWhat: string | null = null
+  let returningAttest = false
+  let returningChain: string[] = []
   if (stayLine && body.stay) {
     const shown = (body.items as any[]).find((i) => i.id === stayLine!.itemId)?.stayTotal
     const email = body.stay.guestEmail ?? body.customer?.email ?? null
+    // 10/6 (Nic): the returning-guest choice is the owner's or a manager's.
+    const returning = body.stay.returningGuest === true
+    if (returning && !canAttestReturningGuest(req.user)) throw new AppError(403, RETURNING_GUEST_NOT_ALLOWED)
     let needs: Awaited<ReturnType<typeof stayNeeds>>
     if (body.stay.extendBookingId) {
       if (stayLine.stayUnit !== 'month' || stayLine.qty !== 1) {
@@ -1187,7 +1194,7 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
       const ext = await stayExtensionQuote(db, { landlordId: prop.landlord_id, propertyId: prop.id, bookingId: body.stay.extendBookingId, nothing: 'sent' })
       needs = await stayNeeds({ landlordId: prop.landlord_id, propertyId: prop.id, bookingId: ext.bookingId, tenantId: ext.tenantId,
         email: body.stay.guestEmail ?? ext.guestEmail ?? body.customer?.email ?? null, checkIn: ext.checkIn, checkOut: ext.checkOut,
-        stayTerms: body.stay.stayTerms ?? null })
+        stayTerms: body.stay.stayTerms ?? null, returning })
       stayWhat = reservationWhat({ nights: ext.addedNights, unitNumber: ext.unitNumber, checkIn: ext.fromCheckOut, checkOut: ext.checkOut })
       if (shown != null && Math.round(Number(shown) * 100) !== Math.round(ext.price * 100)) throw new AppError(409, linkStayNowWords(`a month added — ${stayWhat}`, ext.price))
       stayTerms = needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null
@@ -1220,9 +1227,11 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
         (unit, word) => `Site ${unit} has no ${word} rate set, so this stay cannot be priced — nothing was sent. `
           + `Set the site's ${word} rate (or the property's), then press ${press} again.`)
       needs = await stayNeeds({ landlordId: prop.landlord_id, propertyId: prop.id, email, checkIn: body.stay.checkIn,
-        checkOut: priced.checkOut, stayTerms: body.stay.stayTerms ?? null })
+        checkOut: priced.checkOut, stayTerms: body.stay.stayTerms ?? null, returning })
       stayTerms = needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null
       stayWhat = reservationWhat({ nights: priced.nights, unitNumber: priced.unitNumber, checkIn: body.stay.checkIn, checkOut: priced.checkOut })
+        // 10/6 (Nic): the link says it when the stay is charged at a bigger, lower-priced rate than it was rung up at.
+        + (priced.lowerRateWords && stayTerms !== 'lease' ? ` — ${priced.lowerRateWords}` : '')
       stayTotal = priced.total
       // R2/R4: a lease is sent for its deposit — the reservation then asks
       // exactly that (reservationDue: its lease bills the rest).
@@ -1247,7 +1256,10 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
         + 'A lease holds their site for as long as they stay. A stay holds it only through the time they have paid for. '
         + `Press Cancel, tap the stay above Charge, press Lease or No lease, then press ${press} again. Nothing was sent.`)
     }
-    screeningRequired = needs.nights >= STAY_SCREENING_NIGHTS
+    // 10/6: a returning guest never waits on screening, and is recorded with the link.
+    screeningRequired = needs.nights >= STAY_SCREENING_NIGHTS && needs.screening !== 'returning'
+    returningAttest = needs.returningAttestNow
+    returningChain = needs.chain.bookingIds
     screeningFee = needs.screening === 'fee_due' ? round2(needs.screeningFee?.amount ?? 0) : 0
     // R8: the fee goes out only as the register showed it.
     if (screeningFee > 0 && Math.round((body.stay.screeningFee ?? -1) * 100) !== Math.round(screeningFee * 100)) {
@@ -1311,7 +1323,7 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
   }
   try {
     return await writePayLink(req, body, prop, { payItems, totals, stayLine, stayTotal, posCustomerId,
-      stayTerms, screeningRequired, extendPlan, stayWhat })
+      stayTerms, screeningRequired, extendPlan, stayWhat, returningAttest, returningChain })
   } catch (e) {
     // Nothing went out: a record made for the pick goes again.
     if (madeFromPick) {
@@ -1330,7 +1342,9 @@ async function writePayLink(req: any, body: z.infer<typeof createSchema>, prop: 
                                  /** 10/5 (Nic): the counter's lease-or-stay answer, a stay needing screening, a month added, and the stay in words. */
                                  stayTerms: StayTerms | null; screeningRequired: boolean
                                  extendPlan: { bookingId: string; fromCheckOut: string; checkOut: string; price: number } | null
-                                 stayWhat: string | null }) {
+                                 stayWhat: string | null
+                                 /** 10/6 (Nic): record "Returning guest" on the stay with the link. */
+                                 returningAttest?: boolean; returningChain?: string[] }) {
   const { payItems, totals, stayLine, stayTotal } = w
   // The site comes off the board NOW. A link sitting unpaid in somebody's inbox
   // while the counter sells the same site to a walk-in is the double-booking
@@ -1349,6 +1363,8 @@ async function writePayLink(req: any, body: z.infer<typeof createSchema>, prop: 
       : body.items.length === 1 ? body.items[0].name : `${body.items.length} items`)
   const client = await getClient()
   let link: any
+  // 10/6 (review): closes the card pages of older links whose check fee came off.
+  let returningAfterCommit: (() => Promise<void>) | null = null
   try {
     await client.query('BEGIN')
     if (w.extendPlan) {
@@ -1398,6 +1414,10 @@ async function writePayLink(req: any, body: z.infer<typeof createSchema>, prop: 
       })
       stayBookingId = booking.bookingId
     }
+    if (w.returningAttest && stayBookingId) {
+      const r = await attestReturningGuest(client, { bookingId: stayBookingId, propertyId: prop.id, byUserId: req.user.userId, chainBookingIds: w.returningChain })
+      returningAfterCommit = r.afterCommit
+    }
     link = (await client.query(
       `INSERT INTO pos_pay_links
          (token, landlord_id, property_id, created_by, kind, label, items,
@@ -1417,6 +1437,7 @@ async function writePayLink(req: any, body: z.infer<typeof createSchema>, prop: 
     await client.query('ROLLBACK').catch(() => {})
     throw e
   } finally { client.release() }
+  if (returningAfterCommit) await returningAfterCommit()
 
   const { customerFee, charged } = payLinkCharge(Number(link.total), payerOf(link))
   if (link.kind === 'one_time') {
@@ -2041,6 +2062,12 @@ posPayLinksRouter.post('/:id/cancel', requirePerm('pos.ring_sale'), async (req, 
       const { cancelSupersededIntents } = await import('../services/creditUse')
       await cancelSupersededIntents(stopAfterCommit)   // never throws
     }
+    // 10/6 (review): a hold the link let go of takes its work trade and its
+    // utility agreement with it (ended).
+    if (stayCancelled && stay) {
+      await syncStayUtilityAgreement(stay.bookingId).catch((err) =>
+        logger.error({ err, bookingId: stay.bookingId }, '[pay-link] the cancelled stay\'s work trade or utilities were not ended'))
+    }
     // R11: a stay billed its site's utilities is billed only through its check-out again.
     if (extend && monthGivenBack) {
       await syncStayUtilityAgreement(extend.bookingId).catch((err) =>
@@ -2578,7 +2605,7 @@ export async function finalizePayLink(session: {
     // how most booking-site stays are paid) — its share of the stay's tax
     // (taxInsidePayment), so a deposit and a balance add up to the stay's tax.
     const reservationPart = link.booking_id && (stay || linkBookingLines(link, stay).length)
-    const taxRate = reservationPart && due && !due.closed && !due.leaseBillsRest ? stayTaxRate(due.rates, due.taxPct, due.bookedNights) : 0
+    const taxRate = reservationPart && due && !due.closed && !due.leaseBillsRest ? stayTaxRate(due.rates, due.taxPct, due.bookedNights, { checkIn: due.checkIn, total: due.total, monthStay: due.monthStay }) : 0
     const stayTax = { amount: taxInsidePayment(due?.paid ?? 0, toward, taxRate), rate: taxRate }
     const saleItems = reservationPart
       ? [reservationSaleLine({ id: stay?.itemId ?? null, name: stay ? (due ? reservationLineName(stay.name, due) : stay.name) : (linkBookingLines(link, null)[0]?.name || 'Toward the reservation'),

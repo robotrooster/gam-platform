@@ -23,7 +23,7 @@ import { releaseUnconfirmedCardCharges, releaseUnconfirmedChargeDetailed, CARD_R
          confirmedOnScreen, heldForCardholder } from '../jobs/paymentReconcile'
 import { getClient } from '../db'
 import { payableRowSql, lockHousehold } from '../services/moneyPredicates'
-import { settleManualRentPayment, deskQuote, backdatedLateFeesPreview, DESK_SURPLUS_HANDLING, DESK_SURPLUS_HANDLING_LABEL } from '../services/manualPaymentSettle'
+import { settleManualRentPayment, deskQuote, backdatedLateFeesPreview, tenantsDepositAtBank, DESK_SURPLUS_HANDLING, DESK_SURPLUS_HANDLING_LABEL } from '../services/manualPaymentSettle'
 import { canDeleteLateFees, deleteLateFee, LATE_FEE_DELETE_NOT_ALLOWED } from '../services/lateFeeDelete'
 import { runWholeBillCheckAfterCommit, supersedeScheduledRetry, cancelSupersededIntents,
          usablePaidAheadSql, disputeClaimJoinSql } from '../services/creditUse'
@@ -370,6 +370,8 @@ paymentsRouter.get('/', async (req, res, next) => {
         COALESCE(p.manual_method, rm.payment_method,
           CASE WHEN EXISTS (SELECT 1 FROM credit_uses cu WHERE cu.payment_id = p.id
                               AND cu.source = 'late_fee_credit' AND cu.status = 'applied') THEN 'late_fee_credit'
+               -- 10/6 (Nic): a late fee a matched bank line showed was never owed, taken off at $0.00.
+               WHEN p.type = 'late_fee' AND p.amount = 0 AND p.notes LIKE '%Came off: the bank shows the deposit on %' THEN 'late_fee_off_bank'
                WHEN p.status = 'settled' AND p.amount > 0 AND p.issued_credit_amount >= p.amount THEN 'credit'
           END) AS paid_by,
         -- S568: is this the FIRST open rent charge of a lease while the LANDLORD
@@ -1015,7 +1017,8 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       const rowsShown = [...plan.required, ...plan.carried]
       if (rowsShown.length === 0 && plan.inFlightTotal === 0) continue
       const head = (await client.query<any>(
-        `SELECT l.landlord_id, u.unit_number, pr.name AS property_name, COALESCE(u.payment_block, FALSE) AS payment_block
+        `SELECT l.landlord_id, u.unit_number, pr.name AS property_name, COALESCE(u.payment_block, FALSE) AS payment_block,
+                pr.tenants_deposit_at_bank
            FROM leases l JOIN units u ON u.id = l.unit_id JOIN properties pr ON pr.id = u.property_id
           WHERE l.id = $1`, [leaseId])).rows[0]
       const ids = rowsShown.map(r => r.id)
@@ -1041,6 +1044,9 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
         unitNumber: head?.unit_number ?? null,
         landlordId: plan.landlordId,
         paymentBlocked: head?.payment_block === true,
+        // 10/6 (Nic): the property takes rent its tenants deposit at the bank —
+        // only then is "I paid at the bank — report a deposit" offered.
+        bankDepositsTaken: head?.tenants_deposit_at_bank === true,
         // The whole bill, before any credit (Nic: the full balance is shown).
         outstanding,
         grossOutstanding: outstanding,
@@ -1700,8 +1706,8 @@ const postPaymentSchema = z.object({
 
 /** 10/6 (Nic): the household a posted payment goes to — its newest active lease with one of these companies. */
 async function postPaymentLease(tenantId: string, landlordIds: string[]) {
-  return queryOne<{ landlord_id: string; property_id: string | null }>(
-    `SELECT l.landlord_id, u.property_id
+  return queryOne<{ lease_id: string; landlord_id: string; property_id: string | null }>(
+    `SELECT l.id AS lease_id, l.landlord_id, u.property_id
        FROM leases l JOIN lease_tenants lt ON lt.lease_id = l.id
        LEFT JOIN units u ON u.id = l.unit_id
       WHERE lt.tenant_id = $1 AND lt.status = 'active' AND l.status IN ('active', 'pending')
@@ -1720,25 +1726,30 @@ paymentsRouter.get('/post-payment/quote', requirePerm('take_payment'), async (re
   try {
     const q = z.object({
       tenantId: z.string().uuid(),
-      depositedOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      // 10/6: optional — without it, only whether a bank deposit may be posted here.
+      depositedOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     }).parse(req.query)
     const landlordIds = landlordScopeIds(req.user!)
     if (!landlordIds.length) throw new AppError(403, 'Landlord scope required')
     const lease = await postPaymentLease(q.tenantId, landlordIds)
     if (!lease) throw new AppError(409, 'This tenant has no active lease with you to hold a payment on.')
     await assertChargeInStaffScope(req.user, lease.property_id)
-    depositedOnAsSettledAt('bank_deposit', q.depositedOn, await propertyToday(lease.property_id))
+    // 10/6 (Nic): "Bank deposit" is offered only where tenants deposit rent at the bank.
+    const bankDepositAllowed = await tenantsDepositAtBank(client, { leaseId: lease.lease_id })
     let out = { lateFeesOffIfPaidInFull: 0, onboardingLateFeesOff: 0 }
-    await client.query('BEGIN')
-    try {
-      await lockHousehold(client, q.tenantId, lease.landlord_id)
-      const q0 = await deskQuote(client, { tenantId: q.tenantId, landlordId: lease.landlord_id, lock: true })
-      const z0 = await backdatedLateFeesPreview(client, q0, q.depositedOn)
-      out = { lateFeesOffIfPaidInFull: z0.unbilled, onboardingLateFeesOff: z0.onboardingOff }
-    } finally {
-      await client.query('ROLLBACK').catch(() => {})
+    if (q.depositedOn && bankDepositAllowed) {
+      depositedOnAsSettledAt('bank_deposit', q.depositedOn, await propertyToday(lease.property_id))
+      await client.query('BEGIN')
+      try {
+        await lockHousehold(client, q.tenantId, lease.landlord_id)
+        const q0 = await deskQuote(client, { tenantId: q.tenantId, landlordId: lease.landlord_id, lock: true })
+        const z0 = await backdatedLateFeesPreview(client, q0, q.depositedOn)
+        out = { lateFeesOffIfPaidInFull: z0.unbilled, onboardingLateFeesOff: z0.onboardingOff }
+      } finally {
+        await client.query('ROLLBACK').catch(() => {})
+      }
     }
-    res.json({ success: true, data: { ...out, canDeleteLateFees: canDeleteLateFees(req.user, lease.landlord_id) } })
+    res.json({ success: true, data: { ...out, bankDepositAllowed, canDeleteLateFees: canDeleteLateFees(req.user, lease.landlord_id) } })
   } catch (e) { next(e) } finally { client.release() }
 })
 
@@ -2071,7 +2082,7 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
   const client = await getClient()
   try {
     const pmt = (await client.query<any>(
-      `SELECT p.id, p.landlord_id, p.tenant_id, p.status, p.work_trade_suspended_at, u.payment_block, u.property_id
+      `SELECT p.id, p.landlord_id, p.tenant_id, p.unit_id, p.status, p.work_trade_suspended_at, u.payment_block, u.property_id
          FROM payments p LEFT JOIN units u ON u.id = p.unit_id WHERE p.id = $1`, [req.params.id])).rows[0]
     if (!pmt) throw new AppError(404, 'Payment not found')
     if (!canManageLandlordResource(req.user, pmt.landlord_id)) throw new AppError(403, 'Forbidden')
@@ -2179,6 +2190,8 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
       // 10/6 (Nic): the box applies when this is above 0 and this person may tick it.
       onboardingLateFeesOff,
       canDeleteLateFees: canDeleteLateFees(req.user, pmt.landlord_id),
+      // 10/6 (Nic): "Bank deposit" is offered only where tenants deposit rent at the bank.
+      bankDepositAllowed: await tenantsDepositAtBank(client, { unitId: pmt.unit_id ?? null }),
     } })
   } catch (e) { next(e) } finally { client.release() }
 })

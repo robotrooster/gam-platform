@@ -34,7 +34,7 @@
  */
 import type { PoolClient } from 'pg'
 import { DateTime } from 'luxon'
-import { computeStayPrice, computeMonthlyStaySchedule, longCalendarDate, type StayTerms } from '@gam/shared'
+import { priceStay, priceStayBetween, stayLowerRateWords, longCalendarDate, STAY_LEASE_CHOICE_NIGHTS, type StayTerms, type StayTier } from '@gam/shared'
 import { AppError } from '../middleware/errorHandler'
 
 export interface StayLine {
@@ -327,13 +327,26 @@ export interface ReservationDue {
   /**
    * 10/3 (decisions #21): the property's short-term lodging tax, as a percent
    * (properties.short_term_tax_rate) — the rate the schedule prices a stay
-   * under 30 nights with (computeStayPrice). Its price has the tax in it; a
+   * under 30 nights with (priceStay). Its price has the tax in it; a
    * sale that takes it records that part as tax (stayTaxRate, taxInside).
    */
   taxPct: number
   /** The stay's own rates (the site's, else the property's) — for working out the tax rate inside its price (stayTaxRate). */
   rates: { nightly: number | null; weekly: number | null; monthly: number | null }
+  /** 10/6: the first month of a 30+ night stay booked online — untaxed (untaxedMonthStaySql). */
+  monthStay: boolean
 }
+
+/**
+ * 10/6 (review) — a booking-site stay asked for 30+ nights with no lease, of
+ * which only the first calendar month is booked and paid (R5,
+ * propertyBookingQuote firstStayMonth), as SQL for a unit_bookings alias. The
+ * stay asked for is 30+ nights, so its price carries no lodging tax even when
+ * the month booked is a 28-night February. The booking site stores these, and
+ * only these short of 30 nights, as month_to_month (propertyBooking
+ * bookingSiteLeaseType).
+ */
+export const untaxedMonthStaySql = (b: string) => `(${b}.source = 'public' AND ${b}.lease_type = 'month_to_month')`
 
 /**
  * 10/3 (decisions #33) — THE CHECK-OUT A STAY WAS SOLD FOR, as SQL, for a
@@ -356,16 +369,12 @@ export const soldCheckOutSql = (b: string): string =>
  */
 async function longStayDeposit(p: {
   booking_deposit_pct: string | number | null; booking_monthly_deposit: string | number | null
-  short_term_tax_rate: string | number | null
-  nightly_rate: number | null; weekly_rate: number | null; monthly_rate: number | null
+  monthly_rate: number | null
 }, total: number, nights: number): Promise<number> {
   const { depositForStay } = await import('./propertyBooking')
-  const price = computeStayPrice(
-    { nightly: p.nightly_rate, weekly: p.weekly_rate, monthly: p.monthly_rate },
-    Number(p.short_term_tax_rate || 0), nights)
   return depositForStay(
     { booking_deposit_pct: p.booking_deposit_pct ?? 0, booking_monthly_deposit: p.booking_monthly_deposit },
-    { tier: price.tier, total, monthlyRate: p.monthly_rate ?? null })
+    { total, nights, monthlyRate: p.monthly_rate ?? null })
 }
 
 /**
@@ -391,7 +400,7 @@ export async function reservationDue(
 ): Promise<ReservationDue | null> {
   if (!/^[0-9a-f-]{36}$/i.test(String(bookingId ?? ''))) return null
   const r = (await q.query<any>(
-    `SELECT b.id, b.status, b.unit_id, u.unit_number, b.source,
+    `SELECT b.id, b.status, b.unit_id, u.unit_number, b.source, ${untaxedMonthStaySql('b')} AS month_stay,
             to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
             to_char(${soldCheckOutSql('b')}, 'YYYY-MM-DD') AS booked_check_out,
             COALESCE(b.total_amount, 0)::float AS total, b.deposit_amount::float AS deposit_amount,
@@ -448,24 +457,35 @@ export async function reservationDue(
     depositDue,
     taxPct: Number(r.short_term_tax_rate || 0),
     rates: { nightly: r.nightly_rate ?? null, weekly: r.weekly_rate ?? null, monthly: r.monthly_rate ?? null },
+    monthStay: r.month_stay === true,
   }
 }
 
 /**
  * 10/3 (decisions #21) — THE TAX INSIDE A STAY'S PRICE.
  *
- * The schedule prices a stay with computeStayPrice: the site's rates (else the
- * property's), tiered by length, plus the property's short-term lodging tax on
- * a stay under 30 nights; a monthly-tier stay is priced on the calendar
- * schedule (computeMonthlyStaySchedule), untaxed. So the rate a stay's price
- * carries is the lodging tax for a nightly- or weekly-tier stay under 30
- * nights, and nothing otherwise. Returned as a fraction (0.12 for 12%).
+ * 10/6 (Nic): every door prices a stay with priceStay — the cheapest whole
+ * months, weeks and nights that cover it, at the site's rates (else the
+ * property's), plus the property's short-term lodging tax on a stay under 30
+ * nights that is not exactly whole calendar months. So the rate a stay's price
+ * carries is that lodging tax, or nothing. Returned as a fraction (0.12 for
+ * 12%). `at` is the stay's arrival and the price it carries: a stay priced
+ * before 10/6 (by length, prorated) whose price is not what priceStay gives
+ * now carries the tax it was priced with then — every stay under 30 nights,
+ * unless only a monthly rate priced it.
  */
 export function stayTaxRate(rates: { nightly: number | null; weekly: number | null; monthly: number | null },
-                            taxPct: number, nights: number): number {
+                            taxPct: number, nights: number, at?: { checkIn: string; total?: number | null; monthStay?: boolean }): number {
   if (!(taxPct > 0) || !(nights > 0) || nights >= 30) return 0
-  const price = computeStayPrice({ nightly: rates.nightly, weekly: rates.weekly, monthly: rates.monthly }, taxPct, nights)
-  return price.tier === 'monthly' ? 0 : taxPct / 100
+  // 10/6 (review): the first month of a 30+ night stay booked online is untaxed.
+  if (at?.monthStay) return 0
+  if (at?.checkIn) {
+    const price = priceStay(rates, taxPct, at.checkIn, nights)
+    const same = at.total == null || !(Number(at.total) > 0) || Math.abs(Number(at.total) - price.total) < 0.005
+    if (same) return price.taxRate
+  }
+  const priorRule = (rates.nightly != null && rates.nightly > 0) || (rates.weekly != null && rates.weekly > 0)
+  return priorRule ? taxPct / 100 : 0
 }
 
 /** How much of an amount that has its tax in it (at `rate`, a fraction) is that tax — to the cent. */
@@ -493,36 +513,31 @@ export function taxInsidePayment(paidBefore: number, amount: number, rate: numbe
 /**
  * 10/3 (decisions #9, #21) — what a stay costs by the schedule's own pricing,
  * from the rates it is priced from (the site's, else the property's) and the
- * property's short-term lodging tax (a percent): computeStayPrice tiers by
- * length (nightly, weekly, monthly) and adds the tax under 30 nights; a
- * monthly-tier stay prices on the calendar-aligned schedule
- * (computeMonthlyStaySchedule), untaxed. `total` is 0 when no rate prices it.
- * One function, so the schedule, a pay link, the counter and the register's
- * site list cannot price the same nights two ways.
+ * property's short-term lodging tax (a percent).
+ *
+ * 10/6 (Nic): "It should be charging them the price, the configuration that's
+ * going to be the cheapest option for them." The shared priceStay — the
+ * cheapest whole months (calendar months from arrival), weeks and nights that
+ * cover the nights, never prorated, the lodging tax under 30 nights exactly as
+ * before. `total` is 0 when no rate prices it. One function, so the schedule,
+ * the reservation form, the booking site, a pay link, the counter and the
+ * register's site list cannot price the same nights two ways.
  */
 export function scheduleStayPrice(
   rates: { nightly: number | string | null; weekly: number | string | null; monthly: number | string | null },
   taxPct: number | string | null, checkIn: string, checkOut: string,
-): { total: number; base: number; tax: number; taxRate: number; nights: number; tier: 'nightly' | 'weekly' | 'monthly' } {
-  const num = (x: number | string | null) => (x == null || x === '' ? null : Number(x))
+): { total: number; base: number; tax: number; taxRate: number; nights: number; tier: StayTier } {
+  const price = priceStayBetween(rates, taxPct, checkIn, checkOut)
   const nights = nightsBetween(checkIn, checkOut)
-  const monthlyRate = num(rates.monthly)
-  const pct = Number(taxPct || 0)
-  const price = computeStayPrice({ nightly: num(rates.nightly), weekly: num(rates.weekly), monthly: monthlyRate }, pct, nights)
-  const onSchedule = price.tier === 'monthly' && monthlyRate != null
-  const total = onSchedule ? computeMonthlyStaySchedule(checkIn, checkOut, monthlyRate!).total : price.total
-  // 10/3 (decisions #21): the tax in the price, exactly as the schedule added it.
-  const tax = onSchedule || !(total > 0) ? 0 : price.tax
-  const taxRate = tax > 0 ? pct / 100 : 0
-  return { total: total > 0 ? total : 0, base: Math.round(((total > 0 ? total : 0) - tax) * 100) / 100, tax, taxRate, nights, tier: price.tier }
+  if (!(price.total > 0)) return { total: 0, base: 0, tax: 0, taxRate: 0, nights, tier: price.tier }
+  return { total: price.total, base: price.base, tax: price.tax, taxRate: price.taxRate, nights, tier: price.tier }
 }
 
 /**
  * 10/3 (decisions #9, #21) — what a NEW stay costs by the SAME pricing the
  * schedule uses (routes/units PATCH bookings): the site's rates, else the
- * property's; computeStayPrice tiers by length (nightly, weekly, monthly) and
- * adds the property's short-term tax; a monthly-tier stay prices on the
- * calendar-aligned schedule (computeMonthlyStaySchedule). Used when a link for
+ * property's, priced by scheduleStayPrice (10/6: the cheapest whole months,
+ * weeks and nights that cover it, plus the short-term tax). Used when a link for
  * a stay is sent and when a stay is rung straight at the counter — never an
  * item's rate × nights. (decisions #23: a reservation already on the schedule
  * is never repriced here — it is charged what it owes, reservationDue.)
@@ -569,23 +584,36 @@ export const STAY_RATE_WORD: Record<StayUnit, string> = { night: 'nightly', week
 
 export interface WholeStayPrice {
   total: number; base: number; tax: number; taxRate: number; nights: number
-  tier: 'nightly' | 'weekly' | 'monthly'
+  /** 10/6: the biggest rate the stay is charged at (priceStay) — not always what it was rung as. */
+  tier: StayTier
   /** The rate one of these is sold at (the site's, else the property's); null when neither has one. */
   rate: number | null
   checkOut: string
+  /**
+   * 10/6 (Nic): "charged at the weekly rate, the lower price" — when the stay
+   * is charged at a bigger rate than it was rung up at (six nights rung as
+   * nights come to one week), so the ticket and the receipt say why. null
+   * otherwise.
+   */
+  lowerRateWords: string | null
 }
 
 /**
  * 10/5 (Nic, R5) — "point of sale cannot prorate a stay." The register (and a
- * link sent from it) sells a stay in WHOLE nights, weeks or months, each at the
- * rate for what one of them is: three nights are three times the nightly rate,
- * two weeks twice the weekly rate, a month the monthly rate — never a month cut
- * into calendar pieces, never a week priced as nights. The rate is the site's,
- * else the property's ("one price, and it is the site's", S652). The
- * property's short-term lodging tax is added to nights and weeks under 30
- * nights (decisions #21); a month is the monthly tier and is never taxed.
- * Prorating belongs to a lease, by the property's rent-due setting (R4).
- * `total` is 0 (and `rate` null) when nothing prices one of these.
+ * link sent from it) sells a stay in WHOLE nights, weeks or months: the
+ * quantity rung up says how long the stay is (three of "RV site — daily" is
+ * three nights; a month is a calendar month), never a month cut into calendar
+ * pieces. The rate is the site's, else the property's ("one price, and it is
+ * the site's", S652).
+ *
+ * 10/6 (Nic): what those nights COST is the one price every door charges for
+ * them (priceStay) — the cheapest whole months, weeks and nights that cover
+ * them: six nights rung as nights are charged the week's price when the week
+ * is cheaper, and the ticket says so (lowerRateWords). The property's
+ * short-term lodging tax is added under 30 nights, exactly as before; a stay
+ * that is whole calendar months (a month rung up) is never taxed. Prorating
+ * belongs to a lease, by the property's rent-due setting (R4). `total` is 0
+ * (and `rate` null) when nothing prices one of these.
  */
 export function wholeStayPrice(
   rates: { nightly: number | string | null; weekly: number | string | null; monthly: number | string | null },
@@ -595,13 +623,15 @@ export function wholeStayPrice(
   const nights = nightsBetween(checkIn, checkOut)
   const tier = TIER_OF[stayUnit]
   const raw = stayUnit === 'night' ? rates.nightly : stayUnit === 'week' ? rates.weekly : rates.monthly
-  const rate = raw == null || raw === '' ? null : Number(raw)
-  if (rate == null || !(rate > 0)) return { total: 0, base: 0, tax: 0, taxRate: 0, nights, tier, rate: null, checkOut }
-  const base = round2(rate * qty)
-  const pct = Number(taxPct || 0)
-  const taxRate = stayUnit !== 'month' && nights < 30 && pct > 0 ? pct / 100 : 0
-  const tax = round2(base * taxRate)
-  return { total: round2(base + tax), base, tax, taxRate, nights, tier, rate, checkOut }
+  const rate = raw == null || raw === '' || !(Number(raw) > 0) ? null : Number(raw)
+  // 10/6: a rate the site lacks is skipped, as at every other door — seven
+  // nights rung as a week on a site with no weekly rate are its nights.
+  const price = priceStay(rates, taxPct, checkIn, nights)
+  if (!(price.total > 0)) return { total: 0, base: 0, tax: 0, taxRate: 0, nights, tier, rate: null, checkOut, lowerRateWords: null }
+  return {
+    total: price.total, base: price.base, tax: price.tax, taxRate: price.taxRate, nights,
+    tier: price.tier, rate, checkOut, lowerRateWords: stayLowerRateWords(price, tier),
+  }
 }
 
 /** The site's rates (else the property's) and the property's lodging tax, read once. */
@@ -692,7 +722,11 @@ export async function stayExtensionQuote(
     `SELECT b.id, b.unit_id, b.status, b.landlord_id, u.property_id,
             to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
             b.guest_name, b.guest_email, b.tenant_id, b.stay_terms,
-            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id AND l.status IN ('pending', 'active')) AS has_lease
+            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id AND l.status IN ('pending', 'active')) AS has_lease,
+            -- 10/6 (Nic): a work trade made for the stay that covers its rent —
+            -- the month added costs the guest nothing (services/stayWorkTrade).
+            EXISTS (SELECT 1 FROM work_trade_agreements w
+                     WHERE w.booking_id = b.id AND w.status <> 'ended' AND 'rent' = ANY(w.covered_charges)) AS rent_traded
        FROM unit_bookings b JOIN units u ON u.id = b.unit_id
       WHERE b.id = $1${args.lock ? ' FOR UPDATE OF b' : ''}`, [args.bookingId])).rows[0]
   if (!b || b.property_id !== args.propertyId || b.landlord_id !== args.landlordId) throw new AppError(404, extendWords.gone(n))
@@ -710,7 +744,7 @@ export async function stayExtensionQuote(
     bookingId: b.id, unitId: b.unit_id, unitNumber: u.unit_number, propertyId: b.property_id,
     checkIn: b.check_in, fromCheckOut: b.check_out, checkOut,
     nights: nightsBetween(b.check_in, checkOut), addedNights: nightsBetween(b.check_out, checkOut),
-    price: round2(monthly), paidBefore: due.paid,
+    price: b.rent_traded ? 0 : round2(monthly), paidBefore: due.paid,
     guestName: b.guest_name ?? null, guestEmail: b.guest_email ?? null, tenantId: b.tenant_id ?? null,
     stayTerms: b.stay_terms ?? null,
   }
@@ -753,6 +787,10 @@ export async function extendStayByMonth(
       WHERE id = $1 AND check_out = $6::date RETURNING id`,
     [ext.bookingId, ext.checkOut, ext.nights, ext.price, ext.paidBefore, ext.fromCheckOut])
   if (!upd.rows.length) throw new AppError(409, `That stay changed a moment ago — nothing was ${n}. Pick the stay again.`)
+  // 10/6 (Nic): the stay's work trade follows it (services/stayWorkTrade).
+  await client.query(
+    `UPDATE work_trade_agreements SET end_date = $2::date, updated_at = NOW()
+      WHERE booking_id = $1 AND status <> 'ended'`, [ext.bookingId, ext.checkOut])
   return ext
 }
 
@@ -777,6 +815,12 @@ export async function undoStayExtension(
         AND COALESCE(deposit_amount, 0) <= total_amount - $4::numeric + 0.005
       RETURNING id`,
     [ext.bookingId, ext.fromCheckOut, ext.checkOut, round2(ext.price)])
+  if (r.rows.length > 0) {
+    // 10/6: and the stay's work trade goes back with it.
+    await client.query(
+      `UPDATE work_trade_agreements SET end_date = $2::date, updated_at = NOW()
+        WHERE booking_id = $1 AND status <> 'ended' AND end_date = $3::date`, [ext.bookingId, ext.fromCheckOut, ext.checkOut])
+  }
   return r.rows.length > 0
 }
 

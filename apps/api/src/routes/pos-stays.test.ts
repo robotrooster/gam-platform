@@ -262,22 +262,16 @@ describe('one price, and it is the site\'s', () => {
     expect(await query('SELECT 1 FROM unit_bookings')).toHaveLength(0)
   })
 
-  it('10/5 (Nic, R5): a month with no monthly rate is refused — never a month cut into nights or weeks, never the catalog price', async () => {
-    // "point of sale cannot prorate a stay": a month is sold at the monthly
-    // rate or not at all. (The schedule would tier 31 nights at the weekly
-    // rate — $885.71 — which is a prorated week.)
+  it('10/6 (Nic): a month on a site with no monthly rate is its whole weeks and nights — never refused, never prorated', async () => {
+    // "A rate the site lacks is skipped": 31 nights from Oct 1 are four weeks
+    // and three nights ($800 + $120), the cheapest whole pieces that cover
+    // them — never a prorated week ($885.71) and never the catalog's $589.
     const f = await seed('month', 589, { night: 40, week: 200, month: null })
     await query(`UPDATE properties SET monthly_rate = NULL WHERE id = $1`, [f.propertyId])
-    const res = await request(buildApp()).post('/api/pos/transactions')
+    const res = await request(buildApp()).get(`/api/pos/stays/available?propertyId=${f.propertyId}&checkIn=2026-10-01&stayUnit=month&qty=1`)
       .set('Authorization', `Bearer ${f.token}`)
-      .send({
-        items: [{ id: f.itemId, name: 'RV site', qty: 1, price: 589, tax: 0 }],
-        paymentMethod: 'cash', propertyId: f.propertyId,
-        stay: { unitId: f.unitId, checkIn: '2026-10-01', guestName: 'Dale Carter' },
-      })
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/^Site RV 01 has no monthly rate set/)
-    expect(await query('SELECT 1 FROM pos_transactions')).toHaveLength(0)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data.units[0]).toMatchObject({ lineTotal: 920, lodgingTax: 0 })
   })
 
   it('a cashier with no pricing permission can still ring a stay', async () => {

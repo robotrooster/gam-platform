@@ -9,7 +9,8 @@ import express from 'express'
 import request from 'supertest'
 import { db, getClient } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
-import { publicPropertyBookingRouter, computeStayTotal } from './publicPropertyBooking'
+import { publicPropertyBookingRouter } from './publicPropertyBooking'
+import { priceStay } from '@gam/shared'
 import { errorHandler } from '../middleware/errorHandler'
 import { todayIn, addDaysTo } from '../lib/timezone'
 import { DateTime } from 'luxon'
@@ -61,18 +62,34 @@ async function seedSite(opts: { enabled?: boolean; minStay?: number } = {}) {
   } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
 }
 
-// ── computeStayTotal (pure) ──────────────────────────────────
-describe('computeStayTotal', () => {
-  it('nightly = nights × rate', () => {
-    expect(computeStayTotal('nightly', 3, 100, 600)).toBe(300)
+// ── 10/6 (Nic): the booking site quotes the one price (shared priceStay) ──
+describe('stay pricing on the booking site', () => {
+  it('six nights at $100 a night and $600 a week are charged the week', () => {
+    expect(priceStay({ nightly: 100, weekly: 600 }, 0, '2027-05-01', 6).total).toBe(600)
+    expect(priceStay({ nightly: 100, weekly: 600 }, 0, '2027-05-01', 9).total).toBe(800) // 600 + 2×100
   })
-  it('weekly = whole weeks at weekly_rate + remainder nights at nightly', () => {
-    expect(computeStayTotal('weekly', 7, 100, 600)).toBe(600)
-    expect(computeStayTotal('weekly', 9, 100, 600)).toBe(800) // 600 + 2×100
+
+  // 10/6 (review): the stay's LENGTH decides lease_type, never the rate it was
+  // charged at — reports, the dashboard and payout triggers count nightly/weekly.
+  it('lease_type follows the length: 25 nights at the monthly price is still weekly; 6 at the week price is nightly', async () => {
+    const { bookingSiteLeaseType } = await import('../services/propertyBooking')
+    expect(bookingSiteLeaseType({ firstMonth: false, nights: 6 })).toBe('nightly')
+    expect(bookingSiteLeaseType({ firstMonth: false, nights: 7 })).toBe('weekly')
+    expect(bookingSiteLeaseType({ firstMonth: false, nights: 25 })).toBe('weekly')
+    expect(bookingSiteLeaseType({ firstMonth: false, nights: 30 })).toBe('month_to_month')
+    // A no-lease stay's first month — a February is 28 nights.
+    expect(bookingSiteLeaseType({ firstMonth: true, nights: 28 })).toBe('month_to_month')
   })
-  it('returns null when the chosen rate is missing', () => {
-    expect(computeStayTotal('nightly', 3, null, 600)).toBeNull()
-    expect(computeStayTotal('weekly', 7, 100, null)).toBeNull()
+
+  // 10/6 (review): a 30+ night stay is untaxed, so its first month is too —
+  // even a February where four weeks beat the month.
+  it('the first month of a 30+ night stay carries no lodging tax, even a February charged as four weeks', async () => {
+    const { firstStayMonth } = await import('../services/propertyBookingQuote')
+    const cheapWeeks = { nightly: 49, weekly: 100, monthly: 589 }
+    expect(firstStayMonth('2027-02-01', '2027-04-15', cheapWeeks, 10)).toEqual({ checkOut: '2027-03-01', nights: 28, amount: 400 })
+    expect(firstStayMonth('2027-01-31', '2027-04-15', cheapWeeks, 10)).toEqual({ checkOut: '2027-02-28', nights: 28, amount: 400 })
+    // The month itself, untaxed, when it is the cheaper.
+    expect(firstStayMonth('2027-02-01', '2027-04-15', { nightly: 49, weekly: 269, monthly: 589 }, 10).amount).toBe(589)
   })
 })
 

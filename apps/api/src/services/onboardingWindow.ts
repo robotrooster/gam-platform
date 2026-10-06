@@ -16,7 +16,7 @@
  * is no toggle to reopen it (admin-only extension lives elsewhere). See memory
  * `gam-screening-grandfather-onboarding-window`.
  */
-import { query, queryOne } from '../db'
+import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { MIGRATION_WINDOW_DAYS, ONBOARDING_LATE_MONTH_DAY, ONBOARDING_FIRST_BILL_NEAR_DAYS } from '@gam/shared'
 import { todayIn, addDaysTo } from '../lib/timezone'
@@ -227,18 +227,88 @@ export type ScreeningWaiveResult = { waived: boolean; reason: 'ok' | 'window_clo
  * waving everyone through shows up on the admin desk.
  */
 export const RETURNING_RESIDENT_ALLOWANCE = 0.25
+
+/**
+ * 10/6 (Nic): the PEOPLE attested as returning at a property in the last 365
+ * days — by an invite (pending_tenant_intents, waive_reason
+ * 'returning_resident') or by a reservation (unit_bookings.returning_guest_at,
+ * "Returning guest — they've stayed with us before"). One row per person: the
+ * resident account when the person has one (a reservation's guest email is
+ * matched to its account), otherwise the lowercased email. This is what the
+ * allowance counts — ONE COUNT PER PERSON PER PROPERTY PER ROLLING YEAR — so a
+ * person attested once is returning again for free all year, by either door.
+ * `$1` is the property id.
+ */
+const RETURNING_PEOPLE_SQL = `
+  SELECT i.tenant_id::text AS person
+    FROM pending_tenant_intents i
+   WHERE i.property_id = $1 AND i.waive_reason = 'returning_resident'
+     AND i.screening_waived_at > NOW() - INTERVAL '365 days'
+  UNION
+  SELECT COALESCE(rb.tenant_id::text,
+                  (SELECT rt.id::text FROM users ru JOIN tenants rt ON rt.user_id = ru.id
+                    WHERE LOWER(ru.email) = LOWER(rb.guest_email)
+                    ORDER BY rt.created_at LIMIT 1),
+                  LOWER(rb.guest_email), rb.id::text) AS person
+    FROM unit_bookings rb
+    JOIN units ru2 ON ru2.id = rb.unit_id
+   WHERE ru2.property_id = $1 AND rb.returning_guest_at > NOW() - INTERVAL '365 days'`
+
 /** How much of a property's rolling-year returning-resident allowance is left. */
 export async function returningResidentAllowance(propertyId: string): Promise<{ used: number; allowance: number; left: number }> {
   const row = await queryOne<{ used: string; units: string }>(
-    `SELECT (SELECT COUNT(*) FROM pending_tenant_intents i
-              WHERE i.property_id = $1 AND i.waive_reason = 'returning_resident'
-                AND i.screening_waived_at > NOW() - INTERVAL '365 days') AS used,
+    `SELECT (SELECT COUNT(*) FROM (${RETURNING_PEOPLE_SQL}) people) AS used,
             (SELECT COUNT(*) FROM units u WHERE u.property_id = $1 AND u.retired_at IS NULL) AS units`,
     [propertyId])
   const used = Number(row?.used ?? 0)
   const allowance = Math.max(1, Math.ceil(Number(row?.units ?? 0) * RETURNING_RESIDENT_ALLOWANCE))
   return { used, allowance, left: Math.max(0, allowance - used) }
 }
+
+/**
+ * 10/6 (Nic): has this person already been attested as returning at this
+ * property in the last 365 days (invite or reservation)? Then attesting them
+ * again is free — no new count. The person is known by their resident account
+ * or their email (either is enough; both are checked).
+ */
+export async function personReturningAt(propertyId: string, person: { tenantId?: string | null; email?: string | null }): Promise<boolean> {
+  let tenantId = person.tenantId ?? null
+  let email = (person.email ?? '').trim().toLowerCase() || null
+  if (tenantId && !email) {
+    email = (await queryOne<{ email: string | null }>(
+      `SELECT LOWER(u.email) AS email FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [tenantId]))?.email ?? null
+  }
+  if (!tenantId && email) {
+    tenantId = (await queryOne<{ id: string }>(
+      `SELECT t.id FROM users u JOIN tenants t ON t.user_id = u.id WHERE LOWER(u.email) = $1
+        ORDER BY t.created_at LIMIT 1`, [email]))?.id ?? null
+  }
+  if (!tenantId && !email) return false
+  const hit = await queryOne<{ one: number }>(
+    `SELECT 1 AS one FROM (${RETURNING_PEOPLE_SQL}) people
+      WHERE ($2::text IS NOT NULL AND people.person = $2::text)
+         OR ($3::text IS NOT NULL AND people.person = $3::text)
+      LIMIT 1`,
+    [propertyId, tenantId, email])
+  return !!hit
+}
+
+export interface ReturningAllowanceFor {
+  /** Already attested at this property this rolling year — returning again costs no count. */
+  free: boolean
+  /** The returning choice may be used for this person now (free, or the allowance has room). */
+  available: boolean
+  used: number
+  allowance: number
+  left: number
+}
+
+/** The returning-resident allowance as it stands for one person at one property. */
+export async function returningAllowanceFor(propertyId: string, person: { tenantId?: string | null; email?: string | null }): Promise<ReturningAllowanceFor> {
+  const [a, free] = await Promise.all([returningResidentAllowance(propertyId), personReturningAt(propertyId, person)])
+  return { ...a, free, available: free || a.left > 0 }
+}
+
 // S652 (Nic): over the allowance the option is simply DENIED — "they'll call us
 // to complain that they can't skip it, and that's when we have the talk."
 export const RETURNING_ALLOWANCE_USED_MESSAGE =
@@ -246,13 +316,32 @@ export const RETURNING_ALLOWANCE_USED_MESSAGE =
 export async function applyReturningResidentWaive(opts: {
   tenantId: string; landlordId: string; propertyId: string; unitId: string; byUserId: string
 }): Promise<{ waived: true; used: number; allowance: number }> {
-  const a = await returningResidentAllowance(opts.propertyId)
-  if (a.left <= 0) throw new AppError(409, RETURNING_ALLOWANCE_USED_MESSAGE)
-  // The waiver lives on THIS company's record only — see recordWaiver.
-  const rec = await recordWaiver(opts, 'returning_resident')
-  if (!rec) throw new AppError(409, WAIVER_NOT_RECORDED_MESSAGE)
-  // A waiver the account already held is not a new use of the allowance.
-  return { waived: true, used: a.used + (rec === 'recorded' ? 1 : 0), allowance: a.allowance }
+  // 10/6 (review): under the SAME lock a reservation's "Returning guest" takes
+  // (services/stayTerms attestReturningGuest) — an invite and a reservation
+  // using the property's last place at the same moment: one is refused.
+  const client = await getClient()
+  let a: Awaited<ReturnType<typeof returningAllowanceFor>>
+  let rec: Awaited<ReturnType<typeof recordWaiver>>
+  try {
+    await client.query('BEGIN')
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`returning_allowance:${opts.propertyId}`])
+    // 10/6 (Nic): one count per person per property per rolling year — a person
+    // already attested here (invite or reservation) is returning again for free.
+    // Read on the pool: the lock is what keeps two attestations apart, and
+    // whoever held it before has committed.
+    a = await returningAllowanceFor(opts.propertyId, { tenantId: opts.tenantId })
+    if (!a.available) throw new AppError(409, RETURNING_ALLOWANCE_USED_MESSAGE)
+    // The waiver lives on THIS company's record only — see recordWaiver.
+    rec = await recordWaiver(opts, 'returning_resident', client)
+    if (!rec) throw new AppError(409, WAIVER_NOT_RECORDED_MESSAGE)
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally { client.release() }
+  // A waiver the account already held, or a person already counted this year,
+  // is not a new use of the allowance.
+  return { waived: true, used: a.used + (rec === 'recorded' && !a.free ? 1 : 0), allowance: a.allowance }
 }
 
 export async function applyScreeningWaive(opts: {
@@ -313,9 +402,15 @@ export async function applyScreeningWaive(opts: {
 async function recordWaiver(
   opts: { tenantId: string; landlordId: string; propertyId: string; unitId: string; byUserId: string },
   waiveReason: 'returning_resident' | null,
+  /** 10/6 (review): the caller's transaction (the returning-resident lock), or none. */
+  client?: PoolClient,
 ): Promise<'recorded' | 'held_by_account' | false> {
+  const run = client
+    ? (sql: string, p: any[]) => client.query(sql, p).then(r => r.rows)
+    : (sql: string, p: any[]) => query(sql, p)
   try {
-    await query(
+    if (client) await client.query('SAVEPOINT record_waiver')
+    await run(
       `INSERT INTO pending_tenant_intents
          (landlord_id, tenant_id, parser_status, property_id, unit_id,
           screening_waived, screening_waived_by, screening_waived_at, screening_attested, screening_waived_unit_id, waive_reason)
@@ -333,8 +428,10 @@ async function recordWaiver(
          updated_at = NOW()`,
       [opts.landlordId, opts.tenantId, opts.propertyId, opts.byUserId, opts.unitId, waiveReason],
     )
+    if (client) await client.query('RELEASE SAVEPOINT record_waiver')
     return 'recorded'
   } catch (e: any) {
+    if (client) await client.query('ROLLBACK TO SAVEPOINT record_waiver').catch(() => {})
     // 23505 = the person's live no-unit row belongs to another company and the
     // old tenant-only index still stands (until the post-deploy step drops
     // it). Their row is never touched.
@@ -346,13 +443,13 @@ async function recordWaiver(
     // at the other park to "contact GAM support" for a waiver the account
     // already holds. Anything else (another account, or a sister row with no
     // waiver on it) is still refused.
-    const held = await queryOne<{ one: number }>(
+    const held = (await run(
       `SELECT 1 AS one FROM pending_tenant_intents
         WHERE tenant_id = $1 AND unit_id IS NULL AND cancelled_at IS NULL
           AND screening_waived = true
           AND landlord_id IN (SELECT public.account_companies($2::uuid))
         LIMIT 1`,
-      [opts.tenantId, opts.landlordId])
+      [opts.tenantId, opts.landlordId]))[0]
     return held ? 'held_by_account' : false
   }
 }

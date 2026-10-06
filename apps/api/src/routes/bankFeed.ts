@@ -234,6 +234,29 @@ bankFeedRouter.post('/deposits/:id/confirm', requireLandlord, async (req: any, r
   } catch (e) { next(e) }
 })
 
+// POST /api/bank-feed/deposits/:id/recorded-deposit — 10/6 (Nic, "Yes, build
+// it"): this bank line IS a deposit the office already logged by hand (Record
+// payment / Post a payment, "Bank deposit"). Body { receiptId }. No money moves
+// again — the line is tied to that receipt, and the bank's date decides: a late
+// fee the bank shows was never owed comes off (its late-fee credit withdrawn),
+// and the payment mark counts from the bank's day, on time if it was on time
+// (services/recordedDepositMatch). Undo (POST /deposits/:id/undo) puts it back.
+bankFeedRouter.post('/deposits/:id/recorded-deposit', requireLandlord, async (req: any, res, next) => {
+  try {
+    const { z } = await import('zod')
+    const body = z.object({ receiptId: z.string().uuid() }).parse(req.body)
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    const owned = await queryOne<{ id: string }>(
+      `SELECT id FROM bank_transactions WHERE id = $1 AND landlord_id = $2`, [req.params.id, landlordId])
+    if (!owned) throw new AppError(404, 'Deposit not found')
+    const { matchRecordedDeposit } = await import('../services/recordedDepositMatch')
+    const result = await matchRecordedDeposit({
+      bankTransactionId: req.params.id, receiptId: body.receiptId, confirmedByUserId: req.user.userId,
+    })
+    res.json({ success: true, data: result })
+  } catch (e) { next(e) }
+})
+
 // POST /api/bank-feed/deposits/:id/not-rent — it was not a tenant payment.
 //
 // Offering this explicitly matters: without it, a landlord facing a shortlist

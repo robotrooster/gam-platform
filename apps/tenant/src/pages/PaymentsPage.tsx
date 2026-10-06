@@ -686,7 +686,8 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                 <WaysToPay lease={combined} costs={payAllLines ? payAllCosts : undefined}
                   reports={declaredDeposits} onWithdrawn={refetchAll}
                   refusal={cardRefusal} onRefusal={setDepositRefusal} />
-                {payable.map((l) => (
+                {/* 10/6 (Nic): only where the landlord takes rent deposited at their bank. */}
+                {payable.filter((l) => l.bankDepositsTaken === true).map((l) => (
                   <button key={l.leaseId} className="btn-ghost"
                     onClick={() => setReportDepositFor({ leaseId: l.leaseId, outstanding: owedOf(l) })}
                     style={{ width: '100%', marginTop: 8, fontSize: '.78rem', padding: '8px 12px' }}>
@@ -739,8 +740,8 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                   lease={lg}
                   costs={singleLease?.leaseId === lg.leaseId ? singleCosts : undefined}
                   reports={declaredDeposits.filter((d: any) => d.leaseId === lg.leaseId)}
-                  onReportDeposit={() => setReportDepositFor({
-                    leaseId: lg.leaseId, outstanding: owedOf(lg) })}
+                  onReportDeposit={lg.bankDepositsTaken === true ? () => setReportDepositFor({
+                    leaseId: lg.leaseId, outstanding: owedOf(lg) }) : undefined}
                   onWithdrawn={refetchAll}
                   refusal={cardRefusal}
                   onRefusal={setDepositRefusal}

@@ -578,7 +578,11 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'bank is not connected tell them to let their landlord know they paid and keep their slip — never ' +
       'say GAM tells the landlord. A reply with alreadyReported means they reported this deposit before ' +
       'and nothing new was filed; its message says so, with the same next step — relay that too. ' +
-      'Ask for the deposit reference number from the bank\u2019s receipt — it is required.\n' +
+      'Ask for the deposit reference number from the bank\u2019s receipt — it is required. ' +
+      'Ask about what time they were at the bank — required too: it tells their deposit apart from ' +
+      'someone else\u2019s for the same amount. ' +
+      'Not every property takes rent deposited at the bank: when the reply refuses the report for that reason, ' +
+      'relay it as it is — they pay online or at the office.\n' +
       'declaredDate is the day THEY went to the bank, in their own timezone, which can legitimately ' +
       'be later than the date at the property. Never tell them a date they give you is in the future.',
     params: {
@@ -587,8 +591,13 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       declaredDate: { type: 'string', description: 'YYYY-MM-DD — the day they went to the bank.' },
       method: { type: 'string', description: 'cash, check, or money_order.' },
       reference: { type: 'string', description: 'The deposit reference number from the bank\u2019s receipt.' },
+      depositHour: {
+        type: 'string',
+        description: 'About what time they were at the bank: the hour from 8 to 18 on a 24-hour clock '
+          + '(8 = 8 AM, 15 = 3 PM, 18 = 6 PM), or after_hours for after hours or an ATM.',
+      },
     },
-    required: ['leaseId', 'amount', 'declaredDate', 'method', 'reference'],
+    required: ['leaseId', 'amount', 'declaredDate', 'method', 'reference', 'depositHour'],
     confirmFirst: true,
   },
   {

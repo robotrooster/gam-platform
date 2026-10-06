@@ -31,7 +31,7 @@ import {
   applyPaymentMapping, buildPaymentTemplateCsv, getPaymentPlatformConfig,
   type CsvImportPlatform,
 } from '../lib/csvImportMappings'
-import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT, occupancyRateFrom, WORK_TRADE_COVERABLE, timezoneForState, labelFor, FALLBACK_TIMEZONE } from '@gam/shared'
+import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT, occupancyRateFrom, timezoneForState, labelFor, FALLBACK_TIMEZONE } from '@gam/shared'
 import { emailPmPropertyInvitation, emailLandlordCoOwnerInvitation } from '../services/email'
 import { acceptCoOwnerInvitation } from '../services/coOwnerInvites'
 import { platformFeesByPropertyForEntities, periodMonths } from '../services/platformFee'
@@ -2752,6 +2752,15 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
     const { firstName, lastName, email, phone, unitId,
             isWorkTrade, workTradeHoursTarget, workTradeDuties,
             workTradeTracksHours } = req.body
+    // 10/6 (Nic): what the trade covers, from the invite's picker — the same
+    // rule a work trade on a reservation or an outstanding invite takes.
+    let workTradeCovered: string[] | null = null
+    if (isWorkTrade === true && req.body?.workTradeCoveredCharges != null) {
+      const { workTradeTermsSchema } = await import('../services/stayWorkTrade')
+      const parsed = workTradeTermsSchema.shape.coveredCharges.safeParse(req.body.workTradeCoveredCharges)
+      if (!parsed.success) throw new AppError(400, 'Pick at least one thing the work trade covers.')
+      workTradeCovered = parsed.data ?? null
+    }
 
     // S629: phone is optional on every resident door; blank is stored as none.
     if (!firstName || !lastName || !email) {
@@ -2880,8 +2889,9 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       `INSERT INTO pending_tenant_intents
          (landlord_id, tenant_id, parser_status, unit_id,
           is_work_trade, work_trade_hours_target, work_trade_duties,
-          work_trade_tracks_hours, home_sale_terms, package_template_ids, rent_due_day)
-       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7, $8, $9, $10)
+          work_trade_tracks_hours, home_sale_terms, package_template_ids, rent_due_day,
+          work_trade_covered_charges)
+       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7, $8, $9, $10, $11::text[])
        RETURNING id, parser_status, created_at, is_work_trade`,
       [landlordId, tenantId, unitId || null,
        isWorkTrade === true,
@@ -2894,7 +2904,8 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
        // S652: selling them the home on installments — decided on the invite.
        homeSaleTerms, packageTemplateIds,
        // S652: their own due day, when the landlord stated one.
-       unitId ? rentDueDay : null]
+       unitId ? rentDueDay : null,
+       workTradeCovered]
     ).catch(async (err: any) => {
       if (err?.code !== '23505') throw err
       await client.query('ROLLBACK TO SAVEPOINT pending_intent').catch(() => {})
@@ -5888,22 +5899,18 @@ landlordsRouter.post('/member-invite/:token/accept', async (req, res, next) => {
 landlordsRouter.patch('/me/pending-intents/:id/work-trade', requirePerm('tenants.create'),
   async (req, res, next) => {
     try {
-      const body = z.object({
-        isWorkTrade: z.boolean(),
-        hoursTarget: z.number().int().positive().max(400).nullable().optional(),
-        duties: z.string().max(2000).nullable().optional(),
-        // S635 (Nic): which charges the trade covers, decided WITH the invite —
-        // it is the same question the landlord answers on a live agreement, and
-        // leaving it until after signing means the first invoice is written
-        // against the all-inclusive default. Omitted/null keeps that default.
-        coveredCharges: z.array(z.enum(WORK_TRADE_COVERABLE))
-          .min(1).nullable().optional(),
-        // S637 (Nic): the parent switch — "do we track hours for this work
-        // trade? If yes, then set the hours. If no, no hours." Decided with the
-        // invite for the same reason coveredCharges is: the agreement is born at
-        // signing, and the first invoice is written against whatever it says.
-        tracksHours: z.boolean().optional(),
-      }).parse(req.body)
+      // S635 (Nic): which charges the trade covers, decided WITH the invite —
+      // it is the same question the landlord answers on a live agreement, and
+      // leaving it until after signing means the first invoice is written
+      // against the all-inclusive default. Omitted/null keeps that default.
+      // S637 (Nic): the parent switch — "do we track hours for this work
+      // trade? If yes, then set the hours. If no, no hours." Decided with the
+      // invite for the same reason coveredCharges is: the agreement is born at
+      // signing, and the first invoice is written against whatever it says.
+      // 10/6: the ONE set of work-trade rules (services/stayWorkTrade) — the
+      // same a work trade made on a reservation takes.
+      const { workTradeTermsSchema } = await import('../services/stayWorkTrade')
+      const body = workTradeTermsSchema.omit({ trusted: true }).extend({ isWorkTrade: z.boolean() }).parse(req.body)
 
       const intent = await queryOne<any>(
         `SELECT id, landlord_id, unit_id, resolved_at FROM pending_tenant_intents

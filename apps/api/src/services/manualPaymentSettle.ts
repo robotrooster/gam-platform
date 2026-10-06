@@ -58,7 +58,7 @@
 
 import type { PoolClient } from 'pg'
 import type { ManualPaymentMethod } from '@gam/shared'
-import { sortForAllocation, MANUAL_PAYMENT_METHOD_WORD, lateFeeCreditedTenantText } from '@gam/shared'
+import { sortForAllocation, MANUAL_PAYMENT_METHOD_WORD, lateFeeCreditedTenantText, BANK_DEPOSIT_METHOD_NOT_TAKEN } from '@gam/shared'
 import type { ReportClosedByRecording } from '../jobs/declaredDepositExpiry'
 import { AppError } from '../middleware/errorHandler'
 import { lockHousehold, payableRowSql } from './moneyPredicates'
@@ -110,6 +110,31 @@ export const PART_PAYABLE_TYPES: readonly string[] = ['rent']
 /** 10/5 (Nic): a bank deposit is told apart by the reference on the bank's receipt. */
 export const BANK_DEPOSIT_REFERENCE_REQUIRED =
   'Enter the deposit reference number from the bank\'s receipt — it tells this deposit apart from anyone else\'s for the same amount.'
+
+/**
+ * 10/6 (Nic): "Do you allow tenants to go into the bank and deposit their rent
+ * for this unit or for this property? We don't do that here at Mountain
+ * View." Does the property of this space (or lease) take rent its tenants
+ * deposit at the landlord's bank (properties.tenants_deposit_at_bank)? False
+ * when the space or its property is unknown.
+ */
+export async function tenantsDepositAtBank(
+  runner: Pick<PoolClient, 'query'>, at: { unitId?: string | null; leaseId?: string | null },
+): Promise<boolean> {
+  const r = await runner.query<{ ok: boolean }>(
+    `SELECT COALESCE(pr.tenants_deposit_at_bank, FALSE) AS ok
+       FROM units u JOIN properties pr ON pr.id = u.property_id
+      WHERE u.id = COALESCE($1::uuid, (SELECT l.unit_id FROM leases l WHERE l.id = $2::uuid))`,
+    [at.unitId ?? null, at.leaseId ?? null])
+  return r.rows[0]?.ok === true
+}
+
+/** 10/6: refuse a recorded "Bank deposit" where the property does not take them, in plain words. */
+export async function assertBankDepositTaken(
+  runner: Pick<PoolClient, 'query'>, at: { unitId?: string | null; leaseId?: string | null },
+): Promise<void> {
+  if (!(await tenantsDepositAtBank(runner, at))) throw new AppError(409, BANK_DEPOSIT_METHOD_NOT_TAKEN)
+}
 
 export interface ManualSettleInput {
   /** The charge the desk opened the window on (any open charge of the household). Caller has locked it. */
@@ -181,6 +206,12 @@ export interface ManualSettleInput {
    * checked who may (canDeleteLateFees).
    */
   deleteOnboardingLateFees?: boolean
+  /**
+   * 10/6 (Nic, "Yes, build it"): the bank-deposit match (row scope) — a bank
+   * line matched to the bill, so the payment-history mark counts from the
+   * bank's day (settleHooks bankValidated), on time if it was on time.
+   */
+  bankValidated?: boolean
 }
 
 export interface ManualSettleResult {
@@ -618,6 +649,7 @@ async function settleOneRow(client: PoolClient, input: ManualSettleInput): Promi
     attestationSource: 'landlord_self_reported_with_evidence',
     attestationEvidence: { manual_method: method, reference: input.reference ?? null },
     receipt: null,
+    bankValidated: input.bankValidated === true,
   })
   let done = false
   return {
@@ -809,6 +841,10 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   // happens to deposit the same amount" — required, like a check's number.
   if (method === 'bank_deposit' && !(input.reference ?? '').trim()) {
     throw new AppError(422, BANK_DEPOSIT_REFERENCE_REQUIRED)
+  }
+  // 10/6 (Nic): only where tenants deposit rent at the bank (the property setting).
+  if (method === 'bank_deposit') {
+    await assertBankDepositTaken(client, { unitId: payment.unit_id, leaseId: payment.lease_id })
   }
 
   await lockHousehold(client, tenantId, landlordId)

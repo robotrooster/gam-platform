@@ -37,6 +37,8 @@ export interface UnpaidHold {
   required_site_layout: string
   required_amp_service: string
   locked_to_unit: boolean
+  /** S653 / 10/6 (Nic): sites this guest asked not to be put on — never a destination. */
+  avoided_unit_ids: string[] | null
 }
 
 /**
@@ -53,7 +55,7 @@ export async function unpaidHoldsOn(
   const { rows } = await client.query<UnpaidHold>(
     `SELECT b.id, b.unit_id, u.unit_number, b.guest_name, b.guest_email, b.guest_phone,
             b.check_in::text AS check_in, b.check_out::text AS check_out,
-            b.required_site_layout, b.required_amp_service, b.locked_to_unit
+            b.required_site_layout, b.required_amp_service, b.locked_to_unit, b.avoided_unit_ids
        FROM unit_bookings b
        JOIN units u ON u.id = b.unit_id
       WHERE b.unit_id = $1
@@ -80,6 +82,11 @@ export async function unpaidHoldsOn(
  *
  * Excludes sites holding other unpaid reservations too — moving one guest onto
  * another guest's hold just moves the problem, and would cascade.
+ *
+ * 10/6 (Nic): never a site the guest asked not to be put on
+ * (unit_bookings.avoided_unit_ids) — "we need it to actually do something in
+ * the schedule." With nowhere else free, the hold is cancelled and the owner
+ * told, as when the park is full.
  */
 export async function equivalentSiteFor(
   client: PoolClient, hold: UnpaidHold, excludeUnitIds: string[],
@@ -106,7 +113,7 @@ export async function equivalentSiteFor(
         AND NOT unit_out_of_order_overlaps(u.id, $5::date, $6::date)
       ORDER BY u.unit_number
       LIMIT 1`,
-    [hold.unit_id, [hold.unit_id, ...excludeUnitIds], hold.required_site_layout,
+    [hold.unit_id, [hold.unit_id, ...excludeUnitIds, ...(hold.avoided_unit_ids ?? [])], hold.required_site_layout,
      hold.required_amp_service, hold.check_in, hold.check_out])
   return rows[0] ?? null
 }
@@ -281,6 +288,11 @@ export async function notifyDisplacedHolds(
   propertyId: string,
   outcomes: DisplacementOutcome[],
 ): Promise<void> {
+  // 10/6 (review): first, what follows a stay follows these too — a hold
+  // moved to another site, or cancelled, takes its work trade and its utility
+  // agreement with it (moved: onto the new site; cancelled: ended). Every
+  // caller tells the landlord after its commit, so this runs on what was saved.
+  await followDisplacedHolds(outcomes)
   const { createNotification } = await import('./notifications')
   const { emailBookingSiteChanged } = await import('./email')
   const { queryOne } = await import('../db')
@@ -328,5 +340,20 @@ export async function notifyDisplacedHolds(
           + (o.linkClosed ? ' Their unpaid pay link was closed, so it can no longer be paid.' : ''),
       }).catch(() => {})
     }
+  }
+}
+
+/**
+ * 10/6 (review): bring a displaced hold's work trade and utility agreement in
+ * step with where it went (services/stayTerms syncStayUtilityAgreement, which
+ * syncs the stay's work trade too). Best-effort, after the commit — the move or
+ * cancellation stands either way, and the next change to the stay syncs again.
+ */
+export async function followDisplacedHolds(outcomes: DisplacementOutcome[]): Promise<void> {
+  if (!outcomes.length) return
+  const { syncStayUtilityAgreement } = await import('./stayTerms')
+  for (const o of outcomes) {
+    await syncStayUtilityAgreement(o.holdId).catch(err =>
+      logger.error({ err, bookingId: o.holdId }, '[hold-displacement] the hold\'s work trade or utilities could not follow it'))
   }
 }

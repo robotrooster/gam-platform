@@ -80,6 +80,13 @@ async function openForm() {
   })
   await until(() => !!button(/^Report this deposit$/) && text().includes('watch'), 'the form')
   await act(async () => { (host.querySelector('input[type="checkbox"]') as HTMLInputElement).click() })
+  // 10/6 (Nic): about what time — required (ReportBankDeposit.hour.test.tsx).
+  await pickHour('15')
+}
+async function pickHour(v: string) {
+  const sel = host.querySelector('#report-deposit-hour') as HTMLSelectElement
+  const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!
+  await act(async () => { setter.call(sel, v); sel.dispatchEvent(new Event('change', { bubbles: true })) })
 }
 
 describe('reporting a bank deposit — the reference number', () => {

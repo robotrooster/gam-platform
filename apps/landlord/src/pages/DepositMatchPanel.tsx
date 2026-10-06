@@ -39,7 +39,8 @@ import { MakeDepositPanel } from './MakeDepositPanel'
 import '../styles/bank-reconciliation.css'
 import { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 import {
-  formatCurrency, DEPOSITABLE_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, declaredDateFlagText,
+  formatCurrency, DEPOSITABLE_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, declaredDateFlagText, monthDayLabel,
+  reportedTimeText,
   type ManualPaymentMethod, type DepositablePaymentMethod,
 } from '@gam/shared'
 
@@ -153,6 +154,22 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
       onError: failed('That deposit could not be recorded.'),
     })
 
+  // 10/6 (Nic, "Yes, build it"): this line IS a deposit the office already
+  // recorded by hand — tie it, and the bank's date decides its late fees.
+  const tieRecorded = useMutation(
+    (v: { id: string; name: string; receiptId: string }) =>
+      apiPost(`/bank-feed/deposits/${v.id}/recorded-deposit`, { receiptId: v.receiptId }),
+    {
+      onMutate: (v) => clearError(v.id),
+      onSuccess: () => {
+        qc.invalidateQueries('unmatched-deposits')
+        qc.invalidateQueries('bank-txns')
+        qc.invalidateQueries('cash-position')
+        qc.invalidateQueries('payments-ledger')
+      },
+      onError: failed('That deposit could not be tied to the one you recorded.'),
+    })
+
   const notRent = useMutation(
     (v: { id: string; name: string }) => apiPost(`/bank-feed/deposits/${v.id}/not-rent`, {}),
     {
@@ -199,7 +216,10 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
     )
   }
   const deposits: any[] = data?.deposits ?? []
-  const withCandidates = deposits.filter(d => d.candidates?.length > 0)
+  // 10/6 (Nic): a deposit tenants' reports conflict over is listed even when
+  // no bills add up to it (one deposit equal to what two reported together).
+  const withCandidates = deposits.filter(d => d.candidates?.length > 0 || d.recordedDeposits?.length > 0
+    || !!d.reportConflict)
   // Set aside as "Not a rent payment" and still waiting on the Bank feed, as
   // the server says — less any the × put away this session.
   const setAside = ((data?.setAside ?? []) as any[])
@@ -291,7 +311,10 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
         const cand = pick ? d.candidates.find((c: any) => c.leaseId === pick) : undefined
         const m = method[d.transactionId] ?? 'cash'
         const name = depositName(d)
-        const recordingThis = confirm.isLoading && confirm.variables?.id === d.transactionId
+        const recordingThis = (confirm.isLoading && confirm.variables?.id === d.transactionId)
+          || (tieRecorded.isLoading && tieRecorded.variables?.id === d.transactionId)
+        const recorded: any[] = d.recordedDeposits ?? []
+        const hasCandidates = (d.candidates?.length ?? 0) > 0
         const settingAsideThis = notRent.isLoading && notRent.variables?.id === d.transactionId
         const err = errors[d.transactionId]
         return (
@@ -304,6 +327,12 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
                 <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
                   Posted {d.postedDate}{d.description ? ` · ${d.description}` : ''}
                 </div>
+                {/* 10/6 (Nic): the time the bank wrote on its line, beside each tenant's hour. */}
+                {d.bankTime && (
+                  <div style={{ fontSize: '.74rem', color: 'var(--text-2)' }}>
+                    The bank's line shows {d.bankTime}.
+                  </div>
+                )}
               </div>
               <button type="button" className="btn btn-primary btn-sm"
                 disabled={settingAsideThis || recordingThis}
@@ -312,12 +341,87 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
               </button>
             </div>
 
+            {d.reportConflict && (
+              // 10/6 (Nic): reports GAM will not pick between — why, in plain
+              // words, and each report with its date, hour, reference and photo.
+              <div role="note" style={{
+                marginTop: 12, padding: '10px 12px', borderRadius: 8,
+                border: '1px solid var(--amber)', background: 'var(--amber-bg)',
+              }}>
+                <div style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-1)', lineHeight: 1.5 }}>
+                  {d.reportConflict.text}
+                </div>
+                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {(d.reportConflict.reports ?? []).map((r: any) => {
+                    const at = reportedTimeText({ hour: r.hour, afterHours: r.afterHours })
+                    return (
+                      <div key={r.id} style={{ fontSize: '.76rem', lineHeight: 1.5 }}>
+                        <strong>{r.tenantName}</strong>
+                        <span style={{ color: 'var(--text-3)' }}>
+                          {r.unitNumber ? ` · ${r.unitNumber}` : ''} · {formatCurrency(Number(r.amount))}
+                          {' · '}said {monthDayLabel(r.declaredDate)}{at ? `, ${at}` : ''}
+                          {' · '}{MANUAL_PAYMENT_METHOD_LABELS[r.method as ManualPaymentMethod] ?? 'Cash'}
+                          {r.reference ? ` · reference ${r.reference}` : ''}
+                        </span>
+                        {r.receiptPhotoUrl && (
+                          <BankReceiptPhoto receiptId={null} url={r.receiptPhotoUrl}
+                            canAdd={false} onAdded={() => {}} label="Tenant's photo of the bank receipt" />
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+                {/* 10/6 review: one deposit that is two residents' payments can't be
+                    recorded here (a confirm pays one household's bills). With nobody
+                    to pick, the step that works is recording each part by hand. */}
+                {d.reportConflict.kind === 'combined' && !hasCandidates && (
+                  <a href="/payments" className="btn btn-primary btn-sm" style={{ marginTop: 10, display: 'inline-flex' }}>
+                    Go to the payments screen
+                  </a>
+                )}
+              </div>
+            )}
             {d.transferMemo && (
               <div style={{ marginTop: 10, fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
                 The bank says this was a transfer between accounts — most often your own money.
                 Pick a tenant only if you know they sent it; otherwise press "Not a rent payment".
               </div>
             )}
+            {recorded.length > 0 && (
+              <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <div style={{ fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+                  You already recorded a bank deposit for this amount. If this is it, the bank's date decides its late fees:
+                  a late fee charged after the day the bank shows comes off, and the payment counts from that day.
+                </div>
+                {recorded.map((r: any) => (
+                  <div key={r.receiptId} style={{
+                    display: 'flex', gap: 10, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap',
+                    padding: '7px 9px', borderRadius: 8, border: '1px solid var(--border-1)',
+                  }}>
+                    <span style={{ fontSize: '.8rem', lineHeight: 1.5 }}>
+                      <strong>{r.tenantName}</strong>
+                      <span style={{ color: 'var(--text-3)' }}>
+                        {r.unitNumber ? ` · ${r.unitNumber}` : ''} · recorded {monthDayLabel(r.recordedOn)}
+                        {r.reference ? ` · reference ${r.reference}` : ''}
+                      </span>
+                      {r.referenceInMemo && (
+                        <div style={{ color: 'var(--text-3)', fontSize: '.72rem', marginTop: 2 }}>
+                          The reference number is on the bank's line.
+                        </div>
+                      )}
+                    </span>
+                    <button type="button" className="btn btn-primary btn-sm"
+                      disabled={recordingThis || settingAsideThis || confirm.isLoading || tieRecorded.isLoading}
+                      onClick={() => tieRecorded.mutate({ id: d.transactionId, name, receiptId: r.receiptId })}>
+                      {tieRecorded.isLoading && tieRecorded.variables?.receiptId === r.receiptId
+                        ? 'Checking…' : 'This is the deposit I recorded'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {hasCandidates && (<>
             <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
               {d.candidates.map((c: any) => (
                 <div key={c.leaseId}>
@@ -342,6 +446,12 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
                       the bank's receipt, and a plain flag when the bank shows a later day. */}
                   {c.declaration && (
                     <div style={{ fontSize: '.72rem', marginTop: 4, paddingLeft: 32 }}>
+                      {/* 10/6 (Nic): the day and about what time they said they were at the bank. */}
+                      <div style={{ color: 'var(--text-2)' }}>
+                        Said {monthDayLabel(c.declaration.declaredDate)}
+                        {reportedTimeText({ hour: c.declaration.hour, afterHours: c.declaration.afterHours })
+                          ? `, ${reportedTimeText({ hour: c.declaration.hour, afterHours: c.declaration.afterHours })}` : ''}
+                      </div>
                       {c.declaration.reference && (
                         <span style={{ color: 'var(--text-2)' }}>Deposit reference {c.declaration.reference}</span>
                       )}
@@ -391,6 +501,7 @@ export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
                 record it against their charges from the payments screen instead.
               </div>
             )}
+            </>)}
             {err && (
               <div role="alert" style={{ marginTop: 8, fontSize: '.8rem', color: 'var(--red)' }}>
                 {err.sentence}

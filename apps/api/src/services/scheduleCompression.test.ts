@@ -101,6 +101,36 @@ describe('compressPropertySchedule', () => {
     expect(await unitOf(b)).toBe(p.s2)   // RV 01 is the best fit, but it is on the list
   })
 
+  // 10/6 (Nic): "would anything inadvertently push her into spot 14 assuming it
+  // was open and that like that slot kind of became ideal?" No — and a guest a
+  // person did put there (confirmed) is moved off it when the packer can.
+  it('even when the avoided site becomes the ideal slot, the packer never uses it', async () => {
+    const p = await seedPark()
+    // Snug gap on RV 01 between two stays: the best fit by far — but avoided.
+    await booking(p.s1, p.landlordId, plusDays(2), plusDays(5), { site_reveal_sent_at: new Date() })
+    await booking(p.s1, p.landlordId, plusDays(8), plusDays(12), { site_reveal_sent_at: new Date() })
+    const her = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8), { avoided_unit_ids: [p.s1] })
+    await compressPropertySchedule(p.propertyId)
+    expect(await unitOf(her)).not.toBe(p.s1)
+    expect(await compressPropertySchedule(p.propertyId)).toEqual([])   // and stays off it, run after run
+    expect(await unitOf(her)).not.toBe(p.s1)
+  })
+
+  it('a stay sitting on a site it asked not to have is moved off it by the packer', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8), { avoided_unit_ids: [p.s1] })
+    const moves = await compressPropertySchedule(p.propertyId)
+    expect(moves).toHaveLength(1)
+    expect(await unitOf(b)).toBe(p.s2)
+  })
+
+  it('a stay whose every other site is avoided keeps its own', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8), { avoided_unit_ids: [p.s1, p.s2, p.s3] })
+    expect(await compressPropertySchedule(p.propertyId)).toEqual([])
+    expect(await unitOf(b)).toBe(p.s4)
+  })
+
   it('relocation for an extension skips the avoided sites too', async () => {
     const p = await seedPark()
     const extending = await booking(p.s1, p.landlordId, plusDays(1), plusDays(5), { site_reveal_sent_at: new Date() })
@@ -244,6 +274,13 @@ describe('out-of-order sites', () => {
     const b = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8))
     await markOoo(p, p.s1, plusDays(1), plusDays(20))
     expect(await unitOf(b)).not.toBe(p.s1)
+  })
+
+  it('a stay moved off an out-of-order site never lands on a site it asked not to have', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8), { avoided_unit_ids: [p.s2] })
+    await markOoo(p, p.s1, plusDays(1), plusDays(20))
+    expect(await unitOf(b)).toBe(p.s3)   // RV 02 is next in line, but on the list
   })
 
   it('a stay that cannot move is left in place and the landlord is told, once', async () => {

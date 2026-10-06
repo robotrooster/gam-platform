@@ -525,6 +525,19 @@ export interface DeskQuote {
    */
   onboardingLateFeesOff?: number
   canDeleteLateFees?: boolean
+  /**
+   * 10/6 (Nic): the property takes rent its tenants deposit at the bank
+   * ("Tenants may deposit rent directly at the bank") — only then is "Bank
+   * deposit" offered. Absent (an older server): offered, the server decides.
+   */
+  bankDepositAllowed?: boolean
+}
+
+/** 10/6 (Nic): the ways to record a payment here — "Bank deposit" only where the property takes them. */
+export function recordableMethods<M extends string>(
+  methods: readonly M[], q: { bankDepositAllowed?: boolean } | null | undefined,
+): M[] {
+  return methods.filter(m => m !== 'bank_deposit' || q?.bankDepositAllowed !== false)
 }
 
 /** 10/6 (Nic): does the window offer the onboarding box? A bank deposit dated back that takes a late fee off the onboarding bill, for someone who may tick it. */

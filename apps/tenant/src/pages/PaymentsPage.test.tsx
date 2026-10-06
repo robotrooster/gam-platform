@@ -142,3 +142,34 @@ describe('taking back a deposit report the server refuses, on the payments page'
     expect(button('I hadn’t paid')).toBeTruthy()
   })
 })
+
+describe('10/6 (Nic): "I paid at the bank" only where the landlord takes rent deposited at their bank', () => {
+  async function rerender() {
+    act(() => root.unmount())
+    root = createRoot(host)
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    await act(async () => {
+      root.render(<QueryClientProvider client={qc}><PaymentsPage /></QueryClientProvider>)
+    })
+    await until(() => text().includes('Outstanding balance'), 'the balance')
+  }
+  const withBank = (taken: boolean) => {
+    const b = owing(666.5)
+    b.leases[0] = { ...b.leases[0], bankDepositsTaken: taken } as any
+    return b
+  }
+
+  it('the property does not take them: no report button', async () => {
+    server.balance = withBank(false)
+    server.reports = []
+    await rerender()
+    expect(button('I paid at the bank — report a deposit')).toBeUndefined()
+  })
+
+  it('the property takes them: the report button is offered', async () => {
+    server.balance = withBank(true)
+    server.reports = []
+    await rerender()
+    expect(button('I paid at the bank — report a deposit')).toBeTruthy()
+  })
+})

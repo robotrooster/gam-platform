@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict qowTO42JLg0VcBp4K4yB6c0Pr5zVXOrCkB9WLRWT9obJNUxQxdP6MffM1sm5CnE
+\restrict C108lFCtKQIs94liXVBUk2gcEIjur9uIxMlifi7xW8fOr8c1pQDLcORPXsIyzbN
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9259,6 +9259,7 @@ CREATE TABLE public.properties (
     maintenance_note text,
     meter_photo_required boolean DEFAULT false NOT NULL,
     accept_partial_payments boolean DEFAULT false NOT NULL,
+    tenants_deposit_at_bank boolean DEFAULT false NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
@@ -9397,6 +9398,13 @@ COMMENT ON COLUMN public.properties.rent_due_mode IS 'S648: fixed_day = every le
 --
 
 COMMENT ON COLUMN public.properties.accept_partial_payments IS '10/5 (Nic): a payment RECORDED here (cash, check, money order, bank deposit) may be less than what is owed: it pays the oldest bills first, a rent bill it does not cover stays open for the rest, and late fees keep applying to it. Online payments still pay in full. Default off.';
+
+
+--
+-- Name: COLUMN properties.tenants_deposit_at_bank; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.tenants_deposit_at_bank IS '10/6 (Nic): tenants may deposit rent directly at the landlord''s bank. ON: the tenant may report a bank deposit, the landlord may record a "Bank deposit", and the bank feed matches bank lines to tenants'' bills here by itself (the bank''s date decides late fees). OFF (default): all three are refused; the office''s own deposit slips still match.';
 
 
 --
@@ -11462,9 +11470,13 @@ CREATE TABLE public.tenant_declared_deposits (
     receipt_photo_uploaded_at timestamp with time zone,
     bank_posted_date date,
     false_date_flagged_at timestamp with time zone,
+    declared_hour smallint,
+    declared_after_hours boolean DEFAULT false NOT NULL,
     CONSTRAINT tenant_declared_deposits_amount_positive CHECK ((amount > (0)::numeric)),
     CONSTRAINT tenant_declared_deposits_confirmed_has_txn CHECK (((status <> 'confirmed'::text) OR (bank_transaction_id IS NOT NULL))),
     CONSTRAINT tenant_declared_deposits_flag_has_bank_date CHECK (((false_date_flagged_at IS NULL) OR ((bank_posted_date IS NOT NULL) AND (bank_posted_date > declared_date)))),
+    CONSTRAINT tenant_declared_deposits_hour_or_after_hours CHECK ((NOT (declared_after_hours AND (declared_hour IS NOT NULL)))),
+    CONSTRAINT tenant_declared_deposits_hour_range CHECK (((declared_hour IS NULL) OR ((declared_hour >= 8) AND (declared_hour <= 18)))),
     CONSTRAINT tenant_declared_deposits_method_check CHECK ((method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text]))),
     CONSTRAINT tenant_declared_deposits_recorded_has_receipt CHECK (((status = 'recorded'::text) = (recorded_remittance_id IS NOT NULL))),
     CONSTRAINT tenant_declared_deposits_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'confirmed'::text, 'unconfirmed'::text, 'withdrawn'::text, 'recorded'::text])))
@@ -11504,6 +11516,20 @@ COMMENT ON COLUMN public.tenant_declared_deposits.bank_posted_date IS '10/5 (Nic
 --
 
 COMMENT ON COLUMN public.tenant_declared_deposits.false_date_flagged_at IS '10/5 (Nic): the bank posted this deposit later than the next business day after the reported date, so the reported date was false: the bank''s date decided the late fees, and this report counts as a strike toward the report button''s trust.';
+
+
+--
+-- Name: COLUMN tenant_declared_deposits.declared_hour; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_declared_deposits.declared_hour IS '10/6 (Nic): about what time the tenant says they were at the bank — the hour they picked, 8 (8 AM) through 18 (6 PM). NULL: after hours / ATM (declared_after_hours), or a report made before the time was asked.';
+
+
+--
+-- Name: COLUMN tenant_declared_deposits.declared_after_hours; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_declared_deposits.declared_after_hours IS '10/6 (Nic): the tenant says they deposited after banking hours or at an ATM.';
 
 
 --
@@ -11983,6 +12009,8 @@ CREATE TABLE public.unit_bookings (
     booked_check_out date,
     stay_terms text,
     screening_required boolean DEFAULT false NOT NULL,
+    returning_guest_at timestamp with time zone,
+    returning_guest_by uuid,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -12031,6 +12059,20 @@ COMMENT ON COLUMN public.unit_bookings.avoided_unit_ids IS 'S653: sites this gue
 --
 
 COMMENT ON COLUMN public.unit_bookings.booked_check_out IS '10/3 (decisions #33): the check-out the stay was sold for. Set on create and on every deliberate date change; an early check-out moves check_out only. Price, tax, deposit and revenue split read the later of this and check_out (empty = check_out): services/registerStay soldCheckOutSql.';
+
+
+--
+-- Name: COLUMN unit_bookings.returning_guest_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.returning_guest_at IS '10/6 (Nic): when the landlord attested the guest has stayed at this property before. A 22+ night stay carrying it needs no background check; it counts against the property''s rolling-year returning-resident allowance (one count per person per year).';
+
+
+--
+-- Name: COLUMN unit_bookings.returning_guest_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.returning_guest_by IS '10/6 (Nic): who attested the guest is returning (an owner or a staff member allowed to skip the background check).';
 
 
 --
@@ -13258,6 +13300,7 @@ CREATE TABLE public.work_trade_agreements (
     skills text[] DEFAULT '{}'::text[] NOT NULL,
     carry_forward_indefinite boolean DEFAULT false NOT NULL,
     field_permissions text[] DEFAULT '{}'::text[] NOT NULL,
+    booking_id uuid,
     CONSTRAINT work_trade_agreements_field_permissions_check CHECK ((field_permissions <@ ARRAY['read_meters'::text])),
     CONSTRAINT work_trade_agreements_skills_check CHECK ((skills <@ ARRAY['plumbing'::text, 'electrical'::text, 'hvac'::text, 'appliance'::text, 'roofing'::text, 'structural'::text, 'pool'::text, 'locksmith'::text])),
     CONSTRAINT work_trade_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
@@ -13301,6 +13344,13 @@ COMMENT ON COLUMN public.work_trade_agreements.carry_forward_months IS 'S624: ho
 --
 
 COMMENT ON COLUMN public.work_trade_agreements.tracks_hours IS 'S637: false = trusted trade. Covered charges clear each month with no hours logged; monthly_hours_target is retained but not asked for.';
+
+
+--
+-- Name: COLUMN work_trade_agreements.booking_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.work_trade_agreements.booking_id IS '10/6 (Nic): the stay this work trade was made for. Its dates and site follow the stay; a lease drafted from the stay takes it over (cleared).';
 
 
 --
@@ -22466,6 +22516,13 @@ CREATE UNIQUE INDEX ux_work_trade_settlements_agreement_start ON public.work_tra
 
 
 --
+-- Name: work_trade_agreements_booking_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX work_trade_agreements_booking_uniq ON public.work_trade_agreements USING btree (booking_id) WHERE (booking_id IS NOT NULL);
+
+
+--
 -- Name: application_pool audit_application_pool; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -30480,6 +30537,14 @@ ALTER TABLE ONLY public.unit_bookings
 
 
 --
+-- Name: unit_bookings unit_bookings_returning_guest_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_returning_guest_by_fkey FOREIGN KEY (returning_guest_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
 -- Name: unit_bookings unit_bookings_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -31136,6 +31201,14 @@ ALTER TABLE ONLY public.vehicles
 
 
 --
+-- Name: work_trade_agreements work_trade_agreements_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_agreements
+    ADD CONSTRAINT work_trade_agreements_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE SET NULL;
+
+
+--
 -- Name: work_trade_agreements work_trade_agreements_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -31211,5 +31284,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict qowTO42JLg0VcBp4K4yB6c0Pr5zVXOrCkB9WLRWT9obJNUxQxdP6MffM1sm5CnE
+\unrestrict C108lFCtKQIs94liXVBUk2gcEIjur9uIxMlifi7xW8fOr8c1pQDLcORPXsIyzbN
 

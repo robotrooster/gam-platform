@@ -64,6 +64,18 @@ export interface AfterRowsSettledContext {
    * which is when its rest is paid.
    */
   partPaidIds?: readonly string[]
+  /**
+   * 10/6 (Nic, "Yes, build it"): these rows were paid by a BANK LINE matched to
+   * the bill (services/bankDepositConfirm), so the bank's date decides: the
+   * mark counts from the row's settled day (the bank-validated date), on time
+   * if it was on time. The forced-late rule below does not apply. Only a late
+   * fee genuinely owed — one charged on or before that day, still on the bill
+   * — makes the mark late (and lifts the onboarding month's positive-only
+   * rule, as any late fee on the bill does): "If it was deposited on the 3rd,
+   * and the landlord chose to log it on the 5th or the 6th, we're not going
+   * to just waive the late fee and still show that they paid late."
+   */
+  bankValidated?: boolean
 }
 
 export interface AfterRowsSettledResult {
@@ -99,7 +111,9 @@ const PAYMENT_MARK_TYPES: readonly string[] = CREDIT_EVENT_TYPES.filter(t => t.s
  *      became of that mark since: a mark an admin later corrected stays
  *      corrected. 10/6 (Nic): a row whose bill has a late fee on it is
  *      marked LATE, from the day this runs (the day GAM recorded it), onboarding
- *      month or not.
+ *      month or not — except a row a matched BANK LINE paid
+ *      (ctx.bankValidated): it counts from the bank's day, and only a late fee
+ *      charged by that day makes it late.
  *   3. the receipt, queued for afterCommit().
  * Ids that are not settled (or do not exist) are ignored and logged. The rows
  * are locked, so two replays of one settle cannot both find no mark.
@@ -179,13 +193,21 @@ export async function afterRowsSettled(
   // landlord deleting the late fee, in the onboarding month, lifts it
   // (services/lateFeeDelete → reRateMarksWithoutLateFee).
   const toMark = markable.filter(r => !marked.has(r.id))
+  // 10/6: bank-validated — only a fee charged on or before the day the bank
+  // shows the money (the row's settled day, on the property's calendar) was
+  // owed; one charged after it was never owed (taken off, or refunded as
+  // credit when it was already paid) and says nothing about lateness.
   const withLateFee = new Set(toMark.length === 0 ? [] : (await client.query<{ id: string }>(
     `SELECT p.id FROM payments p
+       LEFT JOIN units u ON u.id = p.unit_id
+       LEFT JOIN properties pr ON pr.id = u.property_id
       WHERE p.id = ANY($1::uuid[]) AND p.invoice_id IS NOT NULL
         AND EXISTS (SELECT 1 FROM payments f
                      WHERE f.invoice_id = p.invoice_id AND f.type = 'late_fee'
-                       AND f.amount > 0 AND f.status <> 'voided')`,
-    [toMark.map(r => r.id)])).rows.map(r => r.id))
+                       AND f.amount > 0 AND f.status <> 'voided'
+                       AND (NOT $2::boolean
+                            OR f.due_date <= (COALESCE(p.settled_at, now()) AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date))`,
+    [toMark.map(r => r.id), ctx.bankValidated === true])).rows.map(r => r.id))
   const recordedAt = new Date()
 
   let eventsEmitted = 0
@@ -193,15 +215,18 @@ export async function afterRowsSettled(
     if (marked.has(r.id) || !r.tenant_id || !r.due_date || (r.type !== 'rent' && r.type !== 'utility')) continue
     const settledAt = r.settled_at ? new Date(r.settled_at) : recordedAt
     const lateFeeOnBill = withLateFee.has(r.id)
+    // Logged by hand: late from the day GAM recorded it. Bank-validated: from the bank's day.
+    const forced = lateFeeOnBill && !ctx.bankValidated && settledAt < recordedAt
     await emitPaymentSettledEvent(client, {
       tenantId:              r.tenant_id,
       paymentId:             r.id,
       paymentType:           r.type,
       amount:                r.amount,
       dueDate:               r.due_date,
-      settledAt:             lateFeeOnBill && settledAt < recordedAt ? recordedAt : settledAt,
+      settledAt:             forced ? recordedAt : settledAt,
       lateFeeOnBill,
-      moneyPaidAt:           lateFeeOnBill ? settledAt : null,
+      moneyPaidAt:           forced ? settledAt : null,
+      bankValidated:         ctx.bankValidated === true,
       graceDays:             r.late_fee_grace_days,
       // Only a Stripe settle vouches with its intent; a row an old, failed
       // intent once touched must not cite it when the desk or credit paid it.

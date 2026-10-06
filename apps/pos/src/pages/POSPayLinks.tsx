@@ -26,7 +26,9 @@ export interface PayLinkCartLine { id: string | null; name: string; qty: number;
  */
 export interface PayLinkStay { unitId: string; checkIn: string; guestName: string; guestPhone?: string | null
   guestEmail?: string | null; stayTerms?: 'lease' | 'stay' | null; extendBookingId?: string | null
-  screeningFee?: number | null; screeningLineName?: string | null; heldWords?: string | null }
+  screeningFee?: number | null; screeningLineName?: string | null; heldWords?: string | null
+  /** 10/6 (Nic): "Returning guest — they've stayed with us before" — no background check. */
+  returningGuest?: boolean | null }
 
 /** "Email a pay link" — the current cart, sent to one person to pay by card. */
 export function SendPayLinkModal({ propertyId, cart, stay = null, discountAmount, total, customerPaysFee = true, person: initialPerson = null, onClose, onSent }: {
@@ -60,9 +62,11 @@ export function SendPayLinkModal({ propertyId, cart, stay = null, discountAmount
     () => apiPost('/pos/pay-links', {
       propertyId, items: cart, discountAmount,
       ...(stay ? { stay: stay.extendBookingId
-        ? { extendBookingId: stay.extendBookingId, guestEmail: stay.guestEmail || null, stayTerms: stay.stayTerms || null, screeningFee: stay.screeningFee || null }
+        ? { extendBookingId: stay.extendBookingId, guestEmail: stay.guestEmail || null, stayTerms: stay.stayTerms || null, screeningFee: stay.screeningFee || null,
+            ...(stay.returningGuest ? { returningGuest: true } : {}) }
         : { unitId: stay.unitId, checkIn: stay.checkIn, guestName: stay.guestName, guestPhone: stay.guestPhone || null,
-            guestEmail: stay.guestEmail || null, stayTerms: stay.stayTerms || null, screeningFee: stay.screeningFee || null } } : {}),
+            guestEmail: stay.guestEmail || null, stayTerms: stay.stayTerms || null, screeningFee: stay.screeningFee || null,
+            ...(stay.returningGuest ? { returningGuest: true } : {}) } } : {}),
       customer: { name: name.trim() || undefined, email: email.trim(), phone: phone.trim() || undefined },
       // 10/2 (review): someone from outside this company goes as their sealed
       // pick — their record here is made with the link, never at the pick.

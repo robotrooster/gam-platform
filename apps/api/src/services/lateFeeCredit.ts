@@ -39,6 +39,15 @@ const toDollars = (c: number): number => Math.round(c) / 100
 /** The note a credited late fee carries (the date the rent was really paid follows). */
 export const CREDITED_LATE_FEE_NOTE = 'Late fee credited: rent was paid '
 
+/**
+ * 10/6 (Nic, "Yes, build it"): the note on a late fee a MATCHED BANK LINE
+ * showed was never owed — taken off at $0.00, not credited (the bank's date
+ * follows). Different from the pre-10/6 "Reversed: rent was paid" note on
+ * purpose: scripts/oct6_fix_reversed_late_fees converts only those, and must
+ * never turn a bank-validated fee back into a credited one.
+ */
+export const BANK_SHOWS_LATE_FEE_NOTE = 'Came off: the bank shows the deposit on '
+
 /** The credit's reason, in plain words (shown wherever the tenant's credits are listed). */
 export function lateFeeCreditReason(paidOn: string): string {
   // 10/6 (Nic): plain words — "Oct 2", never the stored date's ISO form.

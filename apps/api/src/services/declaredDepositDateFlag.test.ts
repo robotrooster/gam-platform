@@ -100,6 +100,12 @@ const report = async (id: string) => (await db.query(
      FROM tenant_declared_deposits WHERE id = $1`, [id])).rows[0]
 const settledOn = async (id: string) => (await db.query(
   `SELECT to_char(settled_at,'YYYY-MM-DD') AS d FROM payments WHERE id = $1`, [id])).rows[0].d
+/** The rent's live payment mark: its tier and the day it counts from (10/6: the bank-validated day). */
+const markOf = async (id: string) => (await db.query<{ event_type: string; paid_on: string; data: any }>(
+  `SELECT event_type, to_char((event_data->>'paid_at')::timestamptz AT TIME ZONE 'America/Phoenix', 'YYYY-MM-DD') AS paid_on,
+          event_data AS data
+     FROM credit_events WHERE event_type LIKE 'payment_received_%' AND event_data->>'payment_id' = $1
+      AND superseded_by IS NULL`, [id])).rows
 const confirm = (s: Stack) => confirmDepositMatch({
   bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'cash', declarationId: s.declarationId,
 })
@@ -151,18 +157,21 @@ describe('the bank posted it when the tenant said (or the next business day)', (
     expect(await declarationStrikes(s.tenantId)).toBe(0)
   })
 
-  it('posted the next business day: the late fee charged after the tenant’s date is credited', async () => {
+  it('posted the next business day: the tenant’s date holds — the late fee charged after it comes off and the payment counts ON TIME from it', async () => {
     const s = await buildStack({ declared: '2026-10-01', posted: '2026-10-02' })
     const after = await lateFee(s, '2026-10-02')
     const r = await confirm(s)
     expect(r.effectivePaidDate).toBe('2026-10-01')
     expect(r.lateFeesUnbilled).toBe(10)
-    expect(await fee(after)).toMatchObject({ amount: 10, status: 'settled', credited: 10 })
+    expect(await fee(after)).toMatchObject({ amount: 0, status: 'settled', credited: 0 })
     expect(await settledOn(s.rentId)).toBe('2026-10-01')
     expect(r.declaredDateFlag).toBeNull()
+    const [m] = await markOf(s.rentId)
+    expect(m).toMatchObject({ event_type: 'payment_received_on_time', paid_on: '2026-10-01' })
+    expect(m.data).toMatchObject({ bank_validated: true })
   })
 
-  it('Friday → Monday is honest: the weekend’s late fees are credited', async () => {
+  it('Friday → Monday is honest: the weekend’s late fees come off', async () => {
     const s = await buildStack({ declared: '2026-10-02', posted: '2026-10-05' })
     const sat = await lateFee(s, '2026-10-03')
     const sun = await lateFee(s, '2026-10-04')
@@ -170,8 +179,12 @@ describe('the bank posted it when the tenant said (or the next business day)', (
     const r = await confirm(s)
     expect(r.effectivePaidDate).toBe('2026-10-02')
     expect(r.lateFeesUnbilled).toBe(30)
-    for (const id of [sat, sun, mon]) expect(await fee(id)).toMatchObject({ amount: 10, credited: 10 })
+    for (const id of [sat, sun, mon]) expect(await fee(id)).toMatchObject({ amount: 0, credited: 0 })
     expect((await report(s.declarationId)).false_date_flagged_at).toBeNull()
+    // Counted from Friday, the day the tenant went — not Monday, and never late.
+    const [m] = await markOf(s.rentId)
+    expect(m.paid_on).toBe('2026-10-02')
+    expect(m.event_type).toMatch(/^payment_received_(on_time|late_grace)$/)
   })
 
   it('a bank holiday rolls forward too (Friday → Tuesday over Columbus Day)', async () => {
@@ -194,9 +207,14 @@ describe('the bank posted it later than that — the stated date was false', () 
     expect(await settledOn(s.rentId)).toBe('2026-10-06')
     expect(await fee(before1)).toMatchObject({ amount: 10, status: 'pending' })
     expect(await fee(before2)).toMatchObject({ amount: 10, status: 'pending' })
-    expect(await fee(afterBank)).toMatchObject({ amount: 10, credited: 10 })
+    expect(await fee(afterBank)).toMatchObject({ amount: 0, credited: 0 })
     expect(r.lateFeesUnbilled).toBe(10)
     expect(r.declaredDateFlag).toEqual({ declaredDate: '2026-10-01', bankPostedDate: '2026-10-06' })
+    // The late fees up to the bank's day stand, so the payment is late — counted from the bank's day.
+    const [m] = await markOf(s.rentId)
+    expect(m.paid_on).toBe('2026-10-06')
+    expect(m.event_type).toMatch(/^payment_received_late_(minor|major|severe)$/)
+    expect(m.data).toMatchObject({ bank_validated: true, late_fee_on_bill: true })
   })
 
   it('the flag and both dates are kept, it is a strike, and the tenant is told plainly', async () => {

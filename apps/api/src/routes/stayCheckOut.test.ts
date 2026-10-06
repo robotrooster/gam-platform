@@ -80,7 +80,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db, query } from '../db'
-import { PERMISSION_CATALOG, computeStayPrice, processingFeeFor, STAY_REFUND_PART_STATUSES } from '@gam/shared'
+import { PERMISSION_CATALOG, priceStay, processingFeeFor, STAY_REFUND_PART_STATUSES } from '@gam/shared'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
 import { errorHandler } from '../middleware/errorHandler'
 import { camelCaseKeys } from '../lib/caseConversion'
@@ -331,7 +331,7 @@ describe('the quote: one question, decided on the server', () => {
 
   it('a weekly stay cut short: the nights stayed at the nightly tier, lodging tax inside — and never more than the booked price (Q7)', async () => {
     const f = await seed({ taxPct: 10 })
-    const weekly = computeStayPrice({ nightly: 60, weekly: 350, monthly: 1500 }, 10, 7).total
+    const weekly = priceStay({ nightly: 60, weekly: 350, monthly: 1500 }, 10, '2026-09-28', 7).total
     expect(weekly).toBe(385)
     const b = await stay(f, { checkIn: '2026-09-28', checkOut: '2026-10-05', total: weekly, leaseType: 'weekly' })
     await paySale(f, b, { method: 'cash', toward: 385 })

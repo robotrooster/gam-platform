@@ -1598,6 +1598,44 @@ export async function emailUtilityServiceInvite(
   )
 }
 
+/**
+ * 10/6 (review): a work trade made on a reservation for a guest with no GAM
+ * login made them an account — this is its set-up link. It says what is true
+ * for a stay: no lease, no application; their account is where they see the
+ * trade (and, when hours are tracked, log them).
+ */
+export async function emailStayWorkTradeInvite(a: {
+  to: string; firstName: string; propertyName: string; siteLabel: string
+  logsHours: boolean; activationUrl: string
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo }
+}) {
+  await send(a.to, `Set up your account for your work trade at ${a.propertyName}`,
+    base(
+      h('Your work trade') +
+      p(`Hi ${a.firstName},`) +
+      p(`<strong style="color:#eef1f8">${a.propertyName}</strong> set up a work trade for your stay and made you an account on GAM, the system they use to run the park.`) +
+      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${a.propertyName}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${a.siteLabel}</div>
+      </div>` +
+      p(a.logsHours
+        ? 'Click below to set a password. Your account is where you see your work trade and log the hours you work.'
+        : 'Click below to set a password. Your account is where you see your stay and your work trade.') +
+      btnWithLink('Activate Your Account', a.activationUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">This link expires in 7 days. If it has, ask the office for a new one.</div>`
+    ),
+    {
+      category: 'tenant_invite',
+      landlordId: a.ctx?.landlordId ?? null,
+      relatedEntityType: a.ctx?.tenantId ? 'tenant' : null,
+      relatedEntityId: a.ctx?.tenantId ?? null,
+      metadata: { site_label: a.siteLabel, work_trade: true },
+      replyTo: a.ctx?.replyTo,
+    },
+    'support',
+  )
+}
+
 // S582 — reminder nudge for a tenant invite that hasn't been accepted and is
 // expiring soon. Sent by the daily invite-nudge job (jobs/inviteNudge.ts).
 export async function emailTenantInviteReminder(

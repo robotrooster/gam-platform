@@ -51,6 +51,8 @@ const DELIBERATE = new Map(Object.entries({
   // a bank-deposit match settles charges. Both are money decisions.
   'leases POST /:id/deposit-return/finalize':
     'finalizes a move-out: settles what is deducted and sends the GAM-held refund back the way it was paid (decisions #47a). The owner\'s press on the move-out page with the deposit, every deduction and the refund on screen, read fresh; the assistant makes no money decision (#38 Q6).',
+  'bankFeed POST /deposits/:id/recorded-deposit':
+    'says which deposit the office recorded by hand a bank line is, which lets the bank\'s date take late fees off and re-date the tenant\'s payment history (10/6). The owner\'s press on the Bank page with the line and each recorded deposit on screen; two residents with the same rent make an amount name nobody, and the assistant makes no money decision (#38 Q6).',
   'bankFeed POST /deposits/:id/confirm':
     'says which charges a bank deposit paid, which settles them. The owner\'s press on the Bank feed with the deposit and the shortlist on screen; in a park where every lot pays the same rent an amount names nobody, and the assistant makes no money decision (#38 Q6).',
   'leases POST /:id/deposit-return/send-back':
@@ -253,6 +255,8 @@ const DELIBERATE = new Map(Object.entries({
   'declaredDeposits POST /:id/receipt-photo': 'a photo of the bank\'s receipt is a file the tenant takes and uploads',
   // 10/5 (Nic): taking part payments has local-law weight; the landlord turns
   // it on beside the screen's "check your local laws" note.
+  'properties PATCH /:id/tenants-deposit-at-bank':
+    'whether tenants may deposit rent at the landlord\'s bank is the landlord\'s money policy for the property (10/6), set on the property screen beside the payment settings; it decides what the bank feed may match by itself',
   'properties PATCH /:id/partial-payments': 'accepting part of the rent is a landlord\'s money policy, set on the property screen beside its local-laws note',
   'landlords POST /me/pending-tenants/:intentId/document': 'the lease PDF is a file the landlord uploads',
 

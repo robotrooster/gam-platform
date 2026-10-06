@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, afterAll } from 'vitest'
 import { db, getClient } from '../db'
 import { declaredDepositsRouter } from './declaredDeposits'
 import { errorHandler } from '../middleware/errorHandler'
+import { DEPOSIT_HOUR_REQUIRED } from '@gam/shared'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease,
   seedLeaseTenant,
@@ -74,7 +75,7 @@ describe('a tenant reporting a deposit', () => {
     const f = await fixture()
     const res = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
     expect(res.status).toBe(200)
     // The single most important sentence on the screen: this did not pay anything.
     expect(res.body.data.message).toMatch(/balance stays the same/i)
@@ -98,7 +99,7 @@ describe('a tenant reporting a deposit', () => {
 
     await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
 
     const rent = (await db.query(
       `SELECT status, amount::float AS amount FROM payments WHERE lease_id=$1`,
@@ -117,7 +118,7 @@ describe('a tenant reporting a deposit', () => {
               // Two days out — one day of slack is allowed on purpose, for a
               // tenant east of the property who is already on tomorrow's date.
               declaredDate: phx(2),
-              method: 'cash', reference: 'DEP-1' })
+              method: 'cash', depositHour: 15, reference: 'DEP-1' })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/after you have made it/i)
   })
@@ -126,14 +127,14 @@ describe('a tenant reporting a deposit', () => {
     const f = await fixture()
     const res = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: daysAgo(60), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: daysAgo(60), method: 'cash', depositHour: 15, reference: 'DEP-1' })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/contact your landlord/i)
   })
 
   it('treats a double-tap as the same report, not a second deposit', async () => {
     const f = await fixture()
-    const body = { leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' }
+    const body = { leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' }
     const a = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`).send(body)
     const b = await request(buildApp()).post('/api/declared-deposits')
@@ -149,7 +150,7 @@ describe('a tenant reporting a deposit', () => {
     const theirs = await fixture()
     const res = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${mine.token}`)
-      .send({ leaseId: theirs.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: theirs.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
     expect(res.status).toBe(404)
   })
 
@@ -157,7 +158,7 @@ describe('a tenant reporting a deposit', () => {
     const f = await fixture()
     const res = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
     expect(res.status).toBe(403)
   })
 })
@@ -167,7 +168,7 @@ describe('withdrawing a report', () => {
     const f = await fixture()
     const made = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
     const res = await request(buildApp())
       .delete(`/api/declared-deposits/${made.body.data.id}`)
       .set('Authorization', `Bearer ${f.token}`)
@@ -183,7 +184,7 @@ describe('withdrawing a report', () => {
     const f = await fixture()
     const made = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
     await db.query(
       `UPDATE tenant_declared_deposits SET status='unconfirmed' WHERE id=$1`,
       [made.body.data.id])
@@ -198,7 +199,7 @@ describe('withdrawing a report', () => {
     const theirs = await fixture()
     const made = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${theirs.token}`)
-      .send({ leaseId: theirs.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: theirs.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
     const res = await request(buildApp())
       .delete(`/api/declared-deposits/${made.body.data.id}`)
       .set('Authorization', `Bearer ${mine.token}`)
@@ -212,10 +213,10 @@ describe('the landlord’s view', () => {
     const b = await fixture()
     await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${a.token}`)
-      .send({ leaseId: a.leaseId, amount: 250, declaredDate: today(), method: 'check', reference: 'DEP-1' })
+      .send({ leaseId: a.leaseId, amount: 250, declaredDate: today(), method: 'check', depositHour: 15, reference: 'DEP-1' })
     await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${b.token}`)
-      .send({ leaseId: b.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: b.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
 
     const res = await request(buildApp()).get('/api/declared-deposits/landlord/open')
       .set('Authorization', `Bearer ${a.landlordToken}`)
@@ -244,7 +245,7 @@ async function linkBank(landlordId: string, opts: { status?: string; synced?: bo
 describe('what the tenant is told depends on whether GAM is reading the landlord’s bank', () => {
   const report = (f: Fx) => request(buildApp()).post('/api/declared-deposits')
     .set('Authorization', `Bearer ${f.token}`)
-    .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+    .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
 
   it('no bank linked: the landlord checks by hand, the tenant is told to let them know, and no expiry is promised', async () => {
     const f = await fixture()
@@ -331,14 +332,14 @@ describe('the report window knows before submitting whether GAM can watch', () =
     const f = await fixture()
     const res = await ask(f)
     expect(res.status).toBe(200)
-    expect(res.body.data).toEqual({ leaseId: f.leaseId, bankFeedLinked: false })
+    expect(res.body.data).toEqual({ leaseId: f.leaseId, bankFeedLinked: false, depositsTaken: true })
   })
 
   it('a bank GAM reads: says so, with the 7-day window', async () => {
     const f = await fixture()
     await linkBank(f.landlordId)
     const res = await ask(f)
-    expect(res.body.data).toEqual({ leaseId: f.leaseId, bankFeedLinked: true, expiresInDays: 7 })
+    expect(res.body.data).toEqual({ leaseId: f.leaseId, bankFeedLinked: true, expiresInDays: 7, depositsTaken: true })
   })
 
   it('cannot ask about somebody else’s lease', async () => {
@@ -361,7 +362,7 @@ describe('the tenant’s list of reports', () => {
     const f = await fixture()
     await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
     const res = await request(buildApp()).get('/api/declared-deposits').set('Authorization', `Bearer ${f.token}`)
     expect(res.status).toBe(200)
     expect(res.body.data).toHaveLength(1)
@@ -372,7 +373,7 @@ describe('the tenant’s list of reports', () => {
     const f = await fixture()
     await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
     const get = () => request(buildApp()).get('/api/declared-deposits').set('Authorization', `Bearer ${f.token}`)
     expect((await get()).body.data[0].bank_feed_linked).toBe(false)
     await linkBank(f.landlordId)
@@ -392,7 +393,7 @@ describe('a report whose deposit match is undone', () => {
       [f.unitId, f.leaseId, f.tenantId, f.landlordId, today()])).rows[0].id
     const made = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-1' })
     expect(made.status, JSON.stringify(made.body)).toBe(200)
     const conn = (await db.query(
       `INSERT INTO bank_connections (landlord_id, provider, status) VALUES ($1,'stripe_fc','active') RETURNING id`, [f.landlordId])).rows[0].id
@@ -433,10 +434,48 @@ describe('10/5: the deposit reference number is required', () => {
     const f = await fixture()
     const res = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: '  DEP-77  ' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: '  DEP-77  ' })
     expect(res.status).toBe(200)
     expect((await db.query(`SELECT reference FROM tenant_declared_deposits WHERE id = $1`, [res.body.data.id])).rows[0].reference)
       .toBe('DEP-77')
+  })
+})
+
+describe('10/6 (Nic): about what time they were at the bank', () => {
+  it('is required, refused in plain words, and nothing is filed without it', async () => {
+    const f = await fixture()
+    for (const depositHour of [undefined, null, '', 7, 19, 'noon', 15.5]) {
+      const res = await request(buildApp()).post('/api/declared-deposits')
+        .set('Authorization', `Bearer ${f.token}`)
+        .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1', depositHour })
+      expect(res.status, String(depositHour)).toBe(400)
+      expect(res.body.error).toBe(DEPOSIT_HOUR_REQUIRED)
+    }
+    expect((await db.query(`SELECT 1 FROM tenant_declared_deposits WHERE tenant_id = $1`, [f.tenantId])).rowCount).toBe(0)
+  })
+
+  it('keeps the hour picked, or after hours / ATM, and both lists carry it', async () => {
+    const f = await fixture()
+    const three = await request(buildApp()).post('/api/declared-deposits')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-1', depositHour: 15 })
+    expect(three.status).toBe(200)
+    const atm = await request(buildApp()).post('/api/declared-deposits')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ leaseId: f.leaseId, amount: 120, declaredDate: today(), method: 'cash', reference: 'DEP-2', depositHour: 'after_hours' })
+    expect(atm.status).toBe(200)
+    const rows = (await db.query(
+      `SELECT id, declared_hour, declared_after_hours FROM tenant_declared_deposits WHERE tenant_id = $1`, [f.tenantId])).rows
+    expect(rows.find(r => r.id === three.body.data.id)).toMatchObject({ declared_hour: 15, declared_after_hours: false })
+    expect(rows.find(r => r.id === atm.body.data.id)).toMatchObject({ declared_hour: null, declared_after_hours: true })
+
+    const mine = await request(buildApp()).get('/api/declared-deposits').set('Authorization', `Bearer ${f.token}`)
+    const m3 = mine.body.data.find((r: any) => r.id === three.body.data.id)
+    expect(m3.deposit_hour ?? m3.depositHour).toBe(15)
+    const theirs = await request(buildApp()).get('/api/declared-deposits/landlord/open')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    const l3 = theirs.body.data.find((r: any) => r.id === atm.body.data.id)
+    expect(l3.after_hours ?? l3.afterHours).toBe(true)
   })
 })
 
@@ -450,7 +489,7 @@ describe('10/5: the tenant’s photo of the bank’s receipt — served per row,
   async function reportWithPhoto(f: Fx) {
     const made = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-9' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-9' })
     expect(made.status).toBe(200)
     const up = await request(buildApp()).post(`/api/declared-deposits/${made.body.data.id}/receipt-photo`)
       .set('Authorization', `Bearer ${f.token}`)
@@ -517,7 +556,7 @@ describe('10/5: the tenant’s photo of the bank’s receipt — served per row,
     const other = await fixture()
     const made = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', reference: 'DEP-9' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-9' })
     const theirs = await request(buildApp()).post(`/api/declared-deposits/${made.body.data.id}/receipt-photo`)
       .set('Authorization', `Bearer ${other.token}`)
       .attach('photo', tinyJpeg, { filename: 'x.jpg', contentType: 'image/jpeg' })
@@ -548,7 +587,7 @@ describe('10/5: a report the bank showed on a later day', () => {
     const f = await fixture()
     const made = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 250, declaredDate: daysAgo(10), method: 'cash', reference: 'DEP-3' })
+      .send({ leaseId: f.leaseId, amount: 250, declaredDate: daysAgo(10), method: 'cash', depositHour: 15, reference: 'DEP-3' })
     expect(made.status).toBe(200)
     // As the bank match leaves it (services/bankDepositConfirm).
     const conn = (await db.query(
@@ -570,7 +609,7 @@ describe('10/5: a report the bank showed on a later day', () => {
     // The next report is told it has a strike behind it.
     const next = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 120, declaredDate: today(), method: 'cash', reference: 'DEP-4' })
+      .send({ leaseId: f.leaseId, amount: 120, declaredDate: today(), method: 'cash', depositHour: 15, reference: 'DEP-4' })
     expect(next.body.data.priorUnconfirmed).toBe(1)
   })
 })

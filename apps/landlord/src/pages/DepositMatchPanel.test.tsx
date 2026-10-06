@@ -517,3 +517,118 @@ describe('a deposit a tenant reported', () => {
     expect(button(/^Tenant's photo of the bank receipt$/)).toBeUndefined()
   })
 })
+
+describe('10/6: a bank line that is a deposit the office recorded by hand', () => {
+  it('is listed with each recorded deposit it could be; "This is the deposit I recorded" ties it, and nothing else is offered for it', async () => {
+    server.deposits = [{
+      ...deposit({ id: 'txn9', description: 'BRANCH DEPOSIT 551203', transferMemo: false, candidates: [] }),
+      recordedDeposits: [{
+        receiptId: 'rem_9', tenantId: 't9', tenantName: 'Rae Tull', unitNumber: 'Lot 7', propertyName: 'Country Acres',
+        amount: 450, recordedOn: '2026-10-03', reference: '551203', referenceInMemo: true, depositsTaken: true,
+      }],
+    }]
+    await open()
+    expect(text()).toContain('You already recorded a bank deposit for this amount.')
+    expect(text()).toContain('Rae Tull')
+    expect(text()).toContain('reference 551203')
+    // A plain date, never the stored ISO day.
+    expect(text()).toContain('recorded Oct 3')
+    expect(text()).not.toContain('recorded 2026-10-03')
+    expect(text()).toContain("The reference number is on the bank's line.")
+    expect(radios()).toHaveLength(0)
+    expect(button(/Pick who paid this deposit/)).toBeUndefined()
+    const tie = button(/^This is the deposit I recorded$/)!
+    expect(tie.className).toContain('btn-primary')
+    await click(tie)
+    await until(() => server.posts.length === 1, 'the tie')
+    expect(server.posts[0]).toEqual({ url: '/bank-feed/deposits/txn9/recorded-deposit', body: { receiptId: 'rem_9' } })
+  })
+})
+
+describe('10/6 (Nic): reports GAM will not pick between', () => {
+  const report = (o: { id: string; leaseId: string; tenantName: string; unit: string; hour: number | null; afterHours?: boolean; reference: string; photo?: string | null }) => ({
+    id: o.id, leaseId: o.leaseId, tenantName: o.tenantName, unitNumber: o.unit, amount: 450, declaredDate: '2026-10-02',
+    hour: o.hour, afterHours: o.afterHours === true, method: 'cash', reference: o.reference, receiptPhotoUrl: o.photo ?? null,
+  })
+  const choice = (o: { leaseId: string; tenantName: string; unit: string; chargeIds: string[]; declarationId: string; hour: number | null }) => ({
+    ...cand({ ...o, confidence: 'amount_ambiguous', preselect: false }),
+    reason: `${o.tenantName} reported paying $450.00 at the bank on 2026-10-02.`,
+    declaration: { id: o.declarationId, declaredDate: '2026-10-02', reference: null, receiptPhotoUrl: null, dateHolds: true, hour: o.hour, afterHours: false },
+  })
+  const conflicted = () => ({
+    ...deposit({ id: 'txnC', description: 'DEPOSIT *4662', transferMemo: false, candidates: [
+      choice({ leaseId: 'l1', tenantName: 'Ana Bell', unit: 'Lot 1', chargeIds: ['c1'], declarationId: 'd1', hour: 15 }),
+      choice({ leaseId: 'l2', tenantName: 'Cy Dorn', unit: 'Lot 2', chargeIds: ['c2'], declarationId: 'd2', hour: 15 }),
+    ] }),
+    bankTime: null,
+    reportConflict: {
+      kind: 'fewer_deposits',
+      text: 'Two residents reported $450.00 on Oct 2 — pick which deposit is whose. Only one $450.00 deposit has shown up at the bank so far, and nothing tells the reports apart.',
+      reports: [
+        report({ id: 'd1', leaseId: 'l1', tenantName: 'Ana Bell', unit: 'Lot 1', hour: 15, reference: 'DEP-11', photo: '/api/declared-deposits/receipt-photos/a.jpg' }),
+        report({ id: 'd2', leaseId: 'l2', tenantName: 'Cy Dorn', unit: 'Lot 2', hour: null, afterHours: true, reference: 'DEP-12' }),
+      ],
+    },
+  })
+
+  it('says in plain words why GAM did not pick, with each report’s date, hour, reference and photo', async () => {
+    server.deposits = [conflicted()]
+    await open()
+    expect(text()).toContain('Two residents reported $450.00 on Oct 2 — pick which deposit is whose.')
+    expect(text()).toContain('Ana Bell · Lot 1 · $450.00 · said Oct 2, about 3 PM · Cash · reference DEP-11')
+    expect(text()).toContain('Cy Dorn · Lot 2 · $450.00 · said Oct 2, after hours or at an ATM · Cash · reference DEP-12')
+    expect(button(/^Tenant's photo of the bank receipt$/)).toBeTruthy()
+    // Nobody is picked for the landlord.
+    expect(radios().some(r => r.checked)).toBe(false)
+    expect(button(/Pick who paid this deposit/)!.disabled).toBe(true)
+    // Never a raw value.
+    expect(text()).not.toMatch(/fewer_deposits|after_hours/)
+  })
+
+  it('the landlord picks, and the deposit is tied to that report', async () => {
+    server.deposits = [conflicted()]
+    await open()
+    await click(radios()[1])
+    await until(() => !!button(/Record as paid by Cy Dorn/), 'the pick')
+    await click(button(/Record as paid by Cy Dorn/))
+    await until(() => server.posts.length === 1, 'the confirm')
+    expect(server.posts[0]).toEqual({
+      url: '/bank-feed/deposits/txnC/confirm', body: { chargeIds: ['c2'], method: 'cash', declarationId: 'd2' },
+    })
+  })
+
+  it('a deposit equal to what two reported together is listed even when no bills add up to it', async () => {
+    server.deposits = [{
+      ...deposit({ id: 'txnD', description: 'DEPOSIT *4662', transferMemo: false, candidates: [] }),
+      amount: 900, bankTime: null,
+      reportConflict: {
+        kind: 'combined',
+        text: 'This $900.00 deposit equals what two residents reported together ($450.00 each, on Oct 2). GAM can\'t split one deposit between residents — record each resident\'s part from the payments screen.',
+        reports: [
+          report({ id: 'd1', leaseId: 'l1', tenantName: 'Ana Bell', unit: 'Lot 1', hour: 11, reference: 'DEP-11' }),
+          report({ id: 'd2', leaseId: 'l2', tenantName: 'Cy Dorn', unit: 'Lot 2', hour: 11, reference: 'DEP-12' }),
+        ],
+      },
+    }]
+    await open()
+    expect(text()).toContain('This $900.00 deposit equals what two residents reported together')
+    expect(text()).not.toContain('No deposits are waiting to be matched to rent.')
+    // 10/6 review: with nobody to pick, the card offers the step that works.
+    const link = [...document.querySelectorAll('a')].find(a => /Go to the payments screen/.test(a.textContent ?? ''))
+    expect(link?.getAttribute('href')).toBe('/payments')
+    expect(link?.className).toContain('btn-primary')
+  })
+
+  it('the bank line’s own time and the hour a tenant gave are both shown on a report it matched', async () => {
+    server.deposits = [{
+      ...deposit({ id: 'txnT', description: 'eDeposit in Branch 10/02/26 03:04:10 PM', transferMemo: false, candidates: [{
+        ...cand({ leaseId: 'l1', tenantName: 'Rae Tull', unit: 'Lot 7', confidence: 'declared', preselect: true, chargeIds: ['c1'] }),
+        declaration: { id: 'dd1', declaredDate: '2026-10-02', reference: 'DEP-1', receiptPhotoUrl: null, dateHolds: true, hour: 15, afterHours: false },
+      }] }),
+      bankTime: '3:04 PM', reportConflict: null,
+    }]
+    await open()
+    expect(text()).toContain("The bank's line shows 3:04 PM.")
+    expect(text()).toContain('Said Oct 2, about 3 PM')
+  })
+})

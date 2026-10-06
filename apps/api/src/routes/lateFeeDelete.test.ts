@@ -10,11 +10,15 @@
  *    their bill and the late payment still shows on their payment history."
  *   Of a tenant who reported their deposit first: "No exceptions".
  *
- *   A. CREDIT, NEVER ZERO: the fee stays as charged, a late-fee credit is
- *      applied to it, the bill nets to zero. The bill's rent counts LATE, from
- *      the day it was recorded — onboarding month or not, reported first or
- *      not. A fee already paid is refunded as credit, still late. A part
- *      payment keeps the fee owed.
+ *   A. LOGGED BY HAND (no bank line): CREDIT, NEVER ZERO — the fee stays as
+ *      charged, a late-fee credit is applied to it, the bill nets to zero. The
+ *      bill's rent counts LATE, from the day it was recorded — onboarding month
+ *      or not, reported first or not. A fee already paid is refunded as
+ *      credit, still late. A part payment keeps the fee owed.
+ *      10/6 (Nic, "Yes, build it"): a BANK LINE matched to the bill is the
+ *      other way round — "It's determined by the matching transaction from the
+ *      bank log": the never-owed fee is zeroed and the payment counts from the
+ *      bank's day, on time if on time (routes/bankValidatedLateFees.test.ts).
  *   B. DELETE, ONBOARDING MONTH ONLY, the landlord's choice (owner or property
  *      manager; never the front desk or GAM staff): the box on Record payment
  *      deletes the fee outright with no credit and no late mark; "Delete this
@@ -47,6 +51,8 @@ import { paymentsRouter } from './payments'
 import { tenantsRouter } from './tenants'
 import { errorHandler } from '../middleware/errorHandler'
 import { confirmDepositMatch, undoDepositMatch, reverseLateFees } from '../services/bankDepositConfirm'
+import { matchRecordedDeposit } from '../services/recordedDepositMatch'
+import { BANK_SHOWS_LATE_FEE_NOTE } from '../services/lateFeeCredit'
 import { createIssuedCredit, applyCredit, holdCredit } from '../services/creditUse'
 import { generateLateFeesForInvoice } from '../jobs/lateFees'
 import {
@@ -184,7 +190,19 @@ async function bankRow(s: Stack, posted: string, amount = 600): Promise<string> 
     [conn, s.landlordId, randomUUID(), posted, amount.toFixed(2)])).rows[0].id
 }
 
-// ─── A. Credit, never zero ──────────────────────────────────────────────────
+/**
+ * 10/6 (Nic, "Yes, build it"): the office logs the tenant's bank deposit BY
+ * HAND, from the bank's receipt, before any bank line shows it — the
+ * never-owed late fee is credited and the payment counts late.
+ */
+async function handLogged(s: Stack, b: { rentId: string; dueDay: string }, token = s.token) {
+  const res = await record(s, b.rentId,
+    { method: 'bank_deposit', amountTendered: 600, reference: `DEP-H-${randomUUID().slice(0, 6)}`, depositedOn: b.dueDay }, token)
+  expect(res.status, JSON.stringify(res.body)).toBe(200)
+  return res.body.data
+}
+
+// ─── A. Logged by hand: credit, never zero. Matched to a bank line: the bank decides ─
 
 describe('A. a never-owed late fee is credited — the fee stays, the bill nets out, the payment counts late', () => {
   it('onboarding month, box left unticked: credited, and LATE from the day it was recorded — no onboarding pass', async () => {
@@ -283,15 +301,26 @@ describe('A. a never-owed late fee is credited — the fee stays, the bill nets 
     expect(await marksOn(b.rentId)).toEqual([{ event_type: 'payment_received_on_time', paid_on: b.dueDay }])
   })
 
-  it('the bank feed (a matched deposit) credits the same way, onboarding month or not — never deletes', async () => {
+  it('10/6 "Yes, build it": a bank line matched to the bill — the bank\'s date decides: the never-owed fee comes off at $0.00 (never credited, never deleted) and the payment counts ON TIME from the bank\'s day, onboarding month or not', async () => {
     for (const onboarding of [true, false]) {
       const s = await stack({ onboarding })
       const b = await lateBill(s)
       const txn = await bankRow(s, b.dueDay)
-      await confirmDepositMatch({ bankTransactionId: txn, chargeIds: [b.rentId], method: 'cash' })
-      expect(await row(b.feeId!)).toMatchObject({ amount: 25, status: 'settled', credited: 25 })
+      const r = await confirmDepositMatch({ bankTransactionId: txn, chargeIds: [b.rentId], method: 'cash' })
+      expect(r.lateFeesUnbilled).toBe(25)
+      expect(await row(b.feeId!)).toMatchObject({ amount: 0, status: 'settled', credited: 0 })
+      expect((await row(b.feeId!)).notes).toContain(`${BANK_SHOWS_LATE_FEE_NOTE}${b.dueDay}, before this fee was charged`)
+      expect(await lateFeeCredits(b.feeId!)).toEqual([])
       expect((await db.query(`SELECT 1 FROM audit_log WHERE action = 'late_fee_deleted'`)).rowCount).toBe(0)
-      await lateFromToday(b.rentId)
+      expect(await marksOn(b.rentId)).toEqual([{ event_type: 'payment_received_on_time', paid_on: b.dueDay }])
+      expect((await db.query<any>(`SELECT event_data FROM credit_events WHERE event_data->>'payment_id' = $1`, [b.rentId])).rows[0].event_data)
+        .toMatchObject({ bank_validated: true })
+      expect((await db.query<any>(`SELECT status FROM invoices WHERE id = $1`, [b.invoiceId])).rows[0].status).toBe('settled')
+      // The tenant's own history says why it is $0.00, in words.
+      const mine = await request(app()).get('/api/tenants/payments')
+        .set('Authorization', `Bearer ${sign(s.tenantUserId, 'tenant', { profileId: s.tenantId })}`)
+      const line = (mine.body.data as any[]).find(p => p.id === b.feeId)
+      expect(paidByLabel(line.paid_by ?? line.paidBy, null)).toBe('Came off — the bank\'s date')
       await cleanupAllSchema()
     }
   })
@@ -307,20 +336,19 @@ describe('A. a never-owed late fee is credited — the fee stays, the bill nets 
     expect(await row(b.feeId!)).toMatchObject({ amount: 25, credited: 25 })
   })
 
-  it('undoing a bank match takes the late-fee credit back exactly: the fee owed again, the credit withdrawn, no mark left', async () => {
+  it('undoing a bank match puts the zeroed fee back exactly: owed again at $25, no credit anywhere, no mark left', async () => {
     const s = await stack({ onboarding: false })
     const b = await lateBill(s)
+    const before = await row(b.feeId!)
     const txn = await bankRow(s, b.dueDay)
     await confirmDepositMatch({ bankTransactionId: txn, chargeIds: [b.rentId], method: 'cash', confirmedByUserId: s.ownerUserId })
-    const [lfc] = await lateFeeCredits(b.feeId!)
+    expect(await row(b.feeId!)).toMatchObject({ amount: 0, status: 'settled' })
     const u = await undoDepositMatch({ bankTransactionId: txn, landlordId: s.landlordId, undoneBy: s.ownerUserId })
     expect(u.lateFeesRestored).toBe(1)
-    expect(u.creditsWithdrawn).toContain(lfc.credit_id)
-    expect(await row(b.feeId!)).toMatchObject({ amount: 25, status: 'pending', credited: 0 })
+    expect(await row(b.feeId!)).toEqual(before)
     expect(await row(b.rentId)).toMatchObject({ status: 'pending' })
-    expect((await db.query<any>(`SELECT status, release_reason FROM credit_uses WHERE id = $1`, [lfc.use_id])).rows[0])
-      .toEqual({ status: 'released', release_reason: 'late_fee_credit_withdrawn' })
-    expect((await db.query<any>(`SELECT status FROM tenant_credits WHERE id = $1`, [lfc.credit_id])).rows[0].status).toBe('void')
+    expect(await lateFeeCredits(b.feeId!)).toEqual([])
+    expect(await credits(s.tenantId)).toEqual([])
     expect(await marksOn(b.rentId)).toEqual([])
     expect((await db.query<any>(`SELECT status FROM invoices WHERE id = $1`, [b.invoiceId])).rows[0].status).not.toBe('settled')
   })
@@ -433,8 +461,7 @@ describe('B. onboarding month: deleted only when the landlord chooses', () => {
   it('"Delete this late fee" on a credited onboarding fee: offered on its line, owner or property manager only — the fee AND its credit go, and the late mark is replaced by the deposit-date mark', async () => {
     const s = await stack({ onboarding: true })
     const b = await lateBill(s)
-    const txn = await bankRow(s, b.dueDay)
-    await confirmDepositMatch({ bankTransactionId: txn, chargeIds: [b.rentId], method: 'cash' })
+    await handLogged(s, b)
     await lateFromToday(b.rentId)
     const [lfc] = await lateFeeCredits(b.feeId!)
     const lateMark = (await db.query<{ id: string }>(
@@ -497,7 +524,7 @@ describe('B. onboarding month: deleted only when the landlord chooses', () => {
 
     const t = await stack({ onboarding: false })
     const c = await lateBill(t)
-    await confirmDepositMatch({ bankTransactionId: await bankRow(t, c.dueDay), chargeIds: [c.rentId], method: 'cash' })
+    await handLogged(t, c)
     const after = await deleteLine(c.feeId!, t.token)
     expect(after.status).toBe(409)
     expect(after.body.error).toMatch(/only on the onboarding month's bill\. This one stays credited/)
@@ -511,7 +538,7 @@ describe('B. onboarding month: deleted only when the landlord chooses', () => {
   it('a credited fee money is recorded against is refused: it stays credited', async () => {
     const s = await stack({ onboarding: true })
     const b = await lateBill(s)
-    await confirmDepositMatch({ bankTransactionId: await bankRow(s, b.dueDay), chargeIds: [b.rentId], method: 'cash' })
+    await handLogged(s, b)
     const rem = (await db.query<{ id: string }>(
       `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, status, payment_method, processing_fee_amount)
        VALUES ($1,$2,$3,25,25,0,'settled','cash',0) RETURNING id`, [s.tenantId, s.leaseId, s.landlordId])).rows[0].id
@@ -544,7 +571,7 @@ describe('B. onboarding month: deleted only when the landlord chooses', () => {
   it('GAM staff (admin) may not delete a landlord\'s late fee — the landlord\'s choice only', async () => {
     const s = await stack({ onboarding: true })
     const b = await lateBill(s)
-    await confirmDepositMatch({ bankTransactionId: await bankRow(s, b.dueDay), chargeIds: [b.rentId], method: 'cash' })
+    await handLogged(s, b)
     const adminId = (await db.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1,'x','admin','Gam','Admin',TRUE) RETURNING id`, [`adm-${randomUUID().slice(0, 8)}@test.dev`])).rows[0].id
@@ -565,29 +592,27 @@ describe('B. onboarding month: deleted only when the landlord chooses', () => {
     expect(await row(c.feeId!)).toMatchObject({ amount: 25, status: 'pending' })
   })
 
-  it('undoing the match after a delete puts the fee back exactly (same id, owed again, its credit still withdrawn) and leaves no mark — a new match marks it again', async () => {
+  it('a fee the landlord deleted in the onboarding month stays deleted when the bank later shows the deposit — and Undo of that match changes nothing on it', async () => {
     const s = await stack({ onboarding: true })
     const b = await lateBill(s)
-    const txn = await bankRow(s, b.dueDay)
-    await confirmDepositMatch({ bankTransactionId: txn, chargeIds: [b.rentId], method: 'cash', confirmedByUserId: s.ownerUserId })
+    const rec = await handLogged(s, b)
     const [lfc] = await lateFeeCredits(b.feeId!)
     expect((await deleteLine(b.feeId!, s.token)).status).toBe(200)
     expect(await row(b.feeId!)).toBeNull()
-    expect((await marksOn(b.rentId)).map(m => m.event_type)).toEqual(['payment_received_on_time'])
+    expect(await marksOn(b.rentId)).toEqual([{ event_type: 'payment_received_on_time', paid_on: b.dueDay }])
+
+    const txn = await bankRow(s, b.dueDay)
+    const m = await matchRecordedDeposit({ bankTransactionId: txn, receiptId: rec.receiptId, confirmedByUserId: s.ownerUserId })
+    expect(m).toMatchObject({ effectivePaidDate: b.dueDay, lateFeesOff: 0, marksCorrected: 0 })
+    expect(await row(b.feeId!)).toBeNull()
+    expect(await marksOn(b.rentId)).toEqual([{ event_type: 'payment_received_on_time', paid_on: b.dueDay }])
 
     const u = await undoDepositMatch({ bankTransactionId: txn, landlordId: s.landlordId, undoneBy: s.ownerUserId })
-    expect(u.lateFeesRestored).toBe(1)
-    expect(await row(b.feeId!)).toMatchObject({ id: b.feeId, amount: 25, status: 'pending', credited: 0 })
-    expect(await row(b.rentId)).toMatchObject({ status: 'pending' })
+    expect(u).toMatchObject({ kind: 'recorded_deposit', lateFeesRestored: 0 })
+    expect(await row(b.feeId!)).toBeNull()
+    expect(await row(b.rentId)).toMatchObject({ status: 'settled' })
     expect((await db.query<any>(`SELECT status FROM tenant_credits WHERE id = $1`, [lfc.credit_id])).rows[0].status).toBe('void')
-    // The bill is as it was before the match: no live mark on the rent.
-    expect(await marksOn(b.rentId)).toEqual([])
-    expect((await db.query(`SELECT 1 FROM audit_log WHERE action = 'late_fee_restored' AND entity_id = $1`, [b.invoiceId])).rowCount).toBe(1)
-
-    // Matched again: credited again, and marked again (late).
-    await confirmDepositMatch({ bankTransactionId: txn, chargeIds: [b.rentId], method: 'cash' })
-    expect(await row(b.feeId!)).toMatchObject({ amount: 25, credited: 25 })
-    await lateFromToday(b.rentId)
+    expect(await marksOn(b.rentId)).toEqual([{ event_type: 'payment_received_on_time', paid_on: b.dueDay }])
   })
 
   it('the late-fee engine never charges a deleted fee again', async () => {
@@ -618,7 +643,7 @@ describe('B. onboarding month: deleted only when the landlord chooses', () => {
     const q = await request(app()).get(`/api/payments/post-payment/quote?tenantId=${s.tenantId}&depositedOn=${b.dueDay}`)
       .set('Authorization', `Bearer ${s.token}`)
     expect(q.status, JSON.stringify(q.body)).toBe(200)
-    expect(q.body.data).toEqual({ lateFeesOffIfPaidInFull: 25, onboardingLateFeesOff: 25, canDeleteLateFees: true })
+    expect(q.body.data).toEqual({ lateFeesOffIfPaidInFull: 25, onboardingLateFeesOff: 25, canDeleteLateFees: true, bankDepositAllowed: true })
     expect(await row(b.feeId!)).toMatchObject({ amount: 25, status: 'pending' })   // a look changes nothing
     const posted = await request(app()).post('/api/payments/post-payment').set('Authorization', `Bearer ${s.token}`)
       .send({ tenantId: s.tenantId, method: 'bank_deposit', amount: 600, reference: 'D-POST', receivedAt: b.dueDay, deleteOnboardingLateFees: true })
@@ -691,7 +716,7 @@ describe('D. what the landlord is told matches what is left on the bill', () => 
     const s = await stack({ onboarding: true })
     const b = await lateBill(s)
     const paid = await secondPaidFee(s, b)
-    await confirmDepositMatch({ bankTransactionId: await bankRow(s, b.dueDay), chargeIds: [b.rentId], method: 'cash' })
+    await handLogged(s, b)
     await lateFromToday(b.rentId)
     const ok = await deleteLine(b.feeId!, s.token)
     expect(ok.status, JSON.stringify(ok.body)).toBe(200)
@@ -763,7 +788,7 @@ describe('D. what the landlord is told matches what is left on the bill', () => 
   it('the credited fee reads "Late fee credited" in the tenant\'s own history, and its credit\'s reason gives the day in plain words', async () => {
     const s = await stack({ onboarding: false })
     const b = await lateBill(s)
-    await confirmDepositMatch({ bankTransactionId: await bankRow(s, b.dueDay), chargeIds: [b.rentId], method: 'cash' })
+    await handLogged(s, b)
     const tenantToken = sign(s.tenantUserId, 'tenant', { profileId: s.tenantId })
     const res = await request(app()).get('/api/tenants/payments').set('Authorization', `Bearer ${tenantToken}`)
     expect(res.status, JSON.stringify(res.body)).toBe(200)

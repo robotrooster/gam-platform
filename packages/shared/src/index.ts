@@ -4164,39 +4164,16 @@ export const BOOKING_STATUS_LABEL: Record<BookingStatus, string> = {
   no_show: 'No-show',
 }
 
-// Master Schedule stay pricing (Nic 2026-06-27). The rate tier is implied by
-// the length of stay and prorated for odd lengths; short-term stays add a
-// lodging tax, 30+ nights are tax-exempt.
-//   < 7 nights  → nightly × nights
-//   7–29 nights → weekly  × nights/7   (a 10-night stay = weekly + 3/7·weekly)
-//   ≥ 30 nights → monthly × nights/30  (32 nights = monthly + 2/30·monthly), NO tax
-// Each tier falls back to whatever rate is configured if its own is unset.
-export interface StayRates { nightly?: number | null; weekly?: number | null; monthly?: number | null }
-export interface StayPrice { base: number; tax: number; total: number; tier: 'nightly' | 'weekly' | 'monthly'; taxable: boolean }
+// 10/6 (Nic): a stay is priced by ONE rule everywhere — the cheapest whole
+// months, weeks and nights that cover its nights (./stayPricing priceStay).
+// The old length-tiered, prorated rule (computeStayPrice: "a 10-night stay =
+// weekly + 3/7 weekly") is gone: six nights at $49 came to $312 while the week
+// was $269.
+export * from './stayPricing'
 
-export function computeStayPrice(rates: StayRates, taxRatePct: number, nights: number): StayPrice {
-  const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
-  if (nights <= 0) return { base: 0, tax: 0, total: 0, tier: 'nightly', taxable: false }
-  const nightly = rates.nightly != null ? Number(rates.nightly) : null
-  const weekly  = rates.weekly  != null ? Number(rates.weekly)  : null
-  const monthly = rates.monthly != null ? Number(rates.monthly) : null
-
-  let base = 0
-  let tier: 'nightly' | 'weekly' | 'monthly' = 'nightly'
-  if (nights >= 30 && monthly != null)      { base = monthly * nights / 30; tier = 'monthly' }
-  else if (nights >= 7 && weekly != null)   { base = weekly  * nights / 7;  tier = 'weekly' }
-  else if (nightly != null)                 { base = nightly * nights;      tier = 'nightly' }
-  // graceful fallbacks when the preferred-tier rate isn't configured
-  else if (monthly != null)                 { base = monthly * nights / 30; tier = 'monthly' }
-  else if (weekly != null)                  { base = weekly  * nights / 7;  tier = 'weekly' }
-
-  base = round2(base)
-  const taxable = nights < 30
-  const tax = taxable ? round2(base * (taxRatePct / 100)) : 0
-  return { base, tax, total: round2(base + tax), tier, taxable }
-}
-
-// ── S547: calendar-aligned monthly-stay billing (Nic) ──
+// ── S547: calendar-aligned monthly billing (Nic) ──
+// 10/6 (Nic): this is how a LEASE bills (services/bookingLeaseBilling) — a
+// stay without one is priced by priceStay above and never prorated.
 // A 30+ night stay bills like a resident, not a lump sum: the arrival month
 // is prorated from check-in to the 1st, every full
 // calendar month is the flat monthly rate invoiced on the 1st with all
@@ -5616,6 +5593,8 @@ export function paidByLabel(
     // 10/6 (Nic): "they get a credit against their bill" — a late fee netted
     // out by its own late-fee credit, and a line paid by account credit alone.
     case 'late_fee_credit':   return 'Late fee credited'
+    // 10/6 (Nic): a late fee a matched bank line showed was never owed — taken off.
+    case 'late_fee_off_bank': return 'Came off — the bank\'s date'
     case 'credit':            return 'Account credit'
     default:                  return null
   }
@@ -5666,6 +5645,8 @@ export function bankReceiptPhotoProblem(file: { type: string; size: number } | n
   }
   return null
 }
+// 10/6 (Nic): the hour a tenant reports and the time the bank wrote on its line.
+export * from './bankDepositTime'
 /** 10/5 (Nic): the box for a bank deposit's reference — the desk's and the tenant's report. */
 export const DEPOSIT_REFERENCE_LABEL = 'Deposit reference number — from the bank\'s receipt'
 
@@ -5743,6 +5724,61 @@ export function lateFeeCreditedTenantText(o: {
   return `Your landlord found your payment from ${monthDayLabel(o.depositedOn)} and ${what}. `
     + 'Because it wasn\'t recorded before the late fee posted, it still counts as a late payment on your payment history.'
 }
+// ── 10/6 (Nic): when the bank shows the deposit, the bank's date decides ──
+//
+// "When the bank transaction matches up to their invoice ... we are using the
+// date of the bank deposit as validation for whether or not a late fee is
+// there. If it was deposited on the 3rd, and the landlord chose to log it on
+// the 5th or the 6th, we're not going to just waive the late fee and still
+// show that they paid late. It's determined by the matching transaction from
+// the bank log. The only reason we have it any sort of different in the
+// onboarding window is because of the landlord's bank maybe not being fully
+// synced up yet."
+//
+//   Bank line matched to the bill → the bank's date decides (a tenant's report
+//     counts from its own date when the bank posted it that day or the next
+//     business day). A late fee charged after that day was never owed and
+//     comes OFF; the payment counts from that day — on time if it was on time.
+//   Logged by hand, no bank line → a late fee charged after the deposit's date
+//     is credited, and the payment still counts late (it was not recorded
+//     before the fee posted). In the onboarding month the landlord may delete
+//     the fee instead. If the bank feed later shows that deposit, the bank's
+//     date decides after all.
+
+/** 10/6 (Nic): the per-property setting (properties.tenants_deposit_at_bank, default off) and its one line. */
+export const TENANTS_DEPOSIT_AT_BANK_LABEL = 'Tenants may deposit rent directly at the bank'
+export const TENANTS_DEPOSIT_AT_BANK_HINT =
+  'Tenants deposit rent at your bank themselves. GAM matches each deposit to their bill using your bank feed.'
+/** 10/6: the tenant's "Report a bank deposit", refused where the property does not take bank deposits. */
+export const BANK_DEPOSIT_REPORT_NOT_TAKEN =
+  'Your landlord doesn\'t take rent deposited at their bank for this space. Pay online, or pay at the office.'
+/** 10/6: the landlord's "Bank deposit" method, refused where the property does not take bank deposits. */
+export const BANK_DEPOSIT_METHOD_NOT_TAKEN =
+  'Tenants at this property don\'t deposit rent at your bank, so a bank deposit can\'t be recorded for them. ' +
+  'To change that, turn on "Tenants may deposit rent directly at the bank" on the property\'s page.'
+
+/**
+ * 10/6 (Nic): what the tenant is told when a bank line matched to their bill
+ * shows the deposit was made before a late fee was charged: the fee came off
+ * and the payment counts from the bank's day.
+ *   amount — dollars of late fees that came off (unpaid ones removed, paid
+ *            ones given back as credit); count — how many (wording only).
+ */
+export function lateFeeOffBankDateTenantText(o: { depositedOn: string; amount: number; count?: number; refunded?: number }): string {
+  const amt = (Math.round(Number(o.amount || 0) * 100) / 100).toFixed(2).replace(/\.00$/, '')
+  const what = (o.count ?? 1) > 1 ? `$${amt} in late fees` : `$${amt} late fee`
+  const back = Math.round(Number(o.refunded || 0) * 100) / 100
+  return `The ${what} came off because the bank shows your deposit on ${monthDayLabel(o.depositedOn)}, `
+    + `before it was charged. Your payment counts from ${monthDayLabel(o.depositedOn)}.`
+    + (back > 0 ? ` The $${back.toFixed(2).replace(/\.00$/, '')} you had already paid is back as credit on your account.` : '')
+}
+/** 10/6 (Nic): the landlord's side of the same. */
+export function lateFeeOffBankDateLandlordText(o: { depositedOn: string; amount: number }): string {
+  const amt = (Math.round(Number(o.amount || 0) * 100) / 100).toFixed(2)
+  return `$${amt} in late fees charged after ${monthDayLabel(o.depositedOn)} came off — the bank shows the deposit that day, `
+    + 'so the payment counts from then.'
+}
+
 /** 10/6 (Nic): the landlord's Record payment / Post a payment result, when a late fee was credited. */
 export const LATE_FEE_CREDITED_LANDLORD_TEXT =
   'The late fee was credited. It still counts as a late payment on their history.'
@@ -7053,6 +7089,13 @@ export const WORK_TRADE_COVERABLE_LABEL: Record<WorkTradeCoverable, string> = {
   rent: 'Rent', electric: 'Electric', water: 'Water', sewer: 'Sewer',
   gas: 'Natural gas', trash: 'Trash', propane: 'Propane', fees: 'Fees',
 }
+
+// 10/6 (Nic): "I need a way when I'm manually adding a reservation by hand to
+// confirm that that person's been here before." The choice beside a stay's
+// background check, in one wording for the schedule, the register, a pay link
+// and the reservation's details.
+export const RETURNING_GUEST_LABEL = "Returning guest — they've stayed with us before"
+export const RETURNING_GUEST_DETAIL = 'Returning guest (you confirmed they stayed before)'
 
 // S652 — which skilled maintenance a work trader may see and take. Mirrors the
 // skilled half of the maintenance categories; the migration's CHECK lists the

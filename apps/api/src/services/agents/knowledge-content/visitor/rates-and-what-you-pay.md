@@ -7,13 +7,13 @@ Every rate on this site is set by this property's owner and read live, so what y
 ## The shape of a price
 
 - **Nightly, weekly and monthly rates** are published per site or unit type. Types differ by things like layout — back-in or pull-through — and the electrical service available.
-- **The weekly rate is a discount, not a multiplier.** On a stay of seven nights or more the weekly rate is charged instead of seven times the nightly, so a week costs less than seven separate nights.
+- **A stay is always charged its lowest price.** The total is the cheapest mix of whole months, whole weeks and nights that covers the stay, so a stay just short of a week costs no more than the week. Lodging tax is on stays under 30 nights only, so a stay just short of a month that is charged the monthly rate pays the tax on top, and can cost more than a full month of 30 nights or more.
 - **A deposit** is taken as a share of the booking. The percentage is this property's setting.
 - **Short-term lodging tax** applies on top, at the rate this property is subject to.
 
 ## Getting a real number
 
-A rate card is not a quote. Give your actual check-in and check-out dates and you get a firm total for those dates — the stay at its nightly, weekly or monthly rate (stays are never prorated), the deposit, and the tax, all for the type you're looking at.
+A rate card is not a quote. Give your actual check-in and check-out dates and you get a firm total for those dates — the stay at its lowest price from the nightly, weekly and monthly rates (stays are never prorated), the deposit, and the tax, all for the type you're looking at.
 
 That's the number to book on. Anything before it is an estimate.
 

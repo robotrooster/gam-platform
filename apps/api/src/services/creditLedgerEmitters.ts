@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg'
 import { appendEvent, supersedeEvent } from './creditLedger'
-import type { CreditEventType, CreditAttestationSource, CreditScoreDimension } from '@gam/shared'
+import type { CreditEventType, CreditAttestationSource, CreditScoreDimension, CreditNetworkVisibility } from '@gam/shared'
 import { getClient } from '../db'
 import { recomputeAndSnapshot } from './creditScore'
 import { dateIn, addDaysTo } from '../lib/timezone'
@@ -223,6 +223,12 @@ export async function emitPaymentSettledEvent(
     lateFeeOnBill?: boolean
     /** 10/6: the day the record says the money moved (a bank deposit's date), when the mark counts from a later day. */
     moneyPaidAt?: Date | null
+    /**
+     * 10/6 (Nic, "Yes, build it"): a bank line matched to the bill dated this
+     * payment — settledAt is the bank-validated day. Kept on the mark
+     * (bank_validated) so a later correction knows the bank already decided.
+     */
+    bankValidated?: boolean
   },
 ): Promise<void> {
   const rated = await ratePaymentMark(client, {
@@ -256,6 +262,7 @@ export async function emitPaymentSettledEvent(
           ...(args.moneyPaidAt && args.moneyPaidAt.getTime() !== args.settledAt.getTime()
             ? { money_paid_at: args.moneyPaidAt.toISOString() } : {}),
         } : {}),
+        ...(args.bankValidated ? { bank_validated: true } : {}),
       },
       occurredAt: args.settledAt,
       attestationSource: args.attestationSource ?? 'stripe_attested',
@@ -386,6 +393,183 @@ export async function reRateMarksWithoutLateFee(client: PoolClient, invoiceId: s
       client,
     )
     await supersedeEvent(client, e.id, corrected.eventId, 'data_entry_error_corrected')
+  }
+  return [...subjects]
+}
+
+/** One mark reRateMarksFromBankDate changed, so an Undo can put it back exactly. */
+export interface BankDateMarkCorrection {
+  paymentId: string
+  /** The mark it replaced (null: the row had no mark at all, and one was written). */
+  replacedEventId: string | null
+  /** The mark it wrote. */
+  eventId: string
+  was: CreditEventType | null
+  now: CreditEventType
+  subjectId: string
+}
+
+/**
+ * 10/6 (Nic, "Yes, build it") — the bank feed now shows a deposit the
+ * landlord logged by hand (services/recordedDepositMatch). "If it was
+ * deposited on the 3rd, and the landlord chose to log it on the 5th or the
+ * 6th, we're not going to just waive the late fee and still show that they
+ * paid late. It's determined by the matching transaction from the bank log."
+ *
+ * For each settled rent and utility row the deposit paid, the mark the
+ * payment earns from the BANK-VALIDATED day (`paidOn`) is worked out by the
+ * emitter's own rule — a late fee counts only when it was charged on or
+ * before that day (one charged after it was never owed: the caller has taken
+ * it off). When that mark is ON TIME (or within grace) and the row's live
+ * mark is not that, the live mark is replaced through the correction
+ * mechanism (a corrected mark appended with corrects_event_id and
+ * bank_validated, the old one superseded 'data_entry_error_corrected'); a row
+ * with no mark ever written (the onboarding month's positive-only rule) gets
+ * one. When the bank's day shows the payment was LATE: a late mark already
+ * there stands as it is; a live ON-TIME (or grace) mark — a receipt the desk
+ * dated on time that the bank contradicts — is replaced the same way by the
+ * late mark the bank's day earns (the bank's date decides both ways); a row
+ * with no mark gets none (late in the onboarding month earns nothing). A row
+ * whose marks were all withdrawn is left alone. Never an edit of an event in
+ * place. Run twice, the second run changes nothing. Inside the caller's
+ * transaction.
+ */
+export async function reRateMarksFromBankDate(
+  client: PoolClient, a: { paymentIds: readonly string[]; paidOn: string },
+): Promise<BankDateMarkCorrection[]> {
+  const out: BankDateMarkCorrection[] = []
+  if (a.paymentIds.length === 0) return out
+  const paidAt = new Date(`${a.paidOn}T12:00:00Z`)
+  const rows = (await client.query<{
+    id: string; type: 'rent' | 'utility'; tenant_id: string; amount: string; due_date: string; grace: number | null
+    timezone: string | null; fee_by_then: boolean
+  }>(
+    `SELECT p.id, p.type, p.tenant_id, p.amount::text AS amount, p.due_date::text AS due_date,
+            l.late_fee_grace_days AS grace, pr.timezone,
+            EXISTS (SELECT 1 FROM payments f
+                     WHERE p.invoice_id IS NOT NULL AND f.invoice_id = p.invoice_id AND f.type = 'late_fee'
+                       AND f.amount > 0 AND f.status <> 'voided' AND f.due_date <= $2::date) AS fee_by_then
+       FROM payments p
+       LEFT JOIN leases l ON l.id = p.lease_id
+       LEFT JOIN units u ON u.id = p.unit_id
+       LEFT JOIN properties pr ON pr.id = u.property_id
+      WHERE p.id = ANY($1::uuid[]) AND p.status = 'settled' AND p.type IN ('rent', 'utility')
+        AND p.tenant_id IS NOT NULL AND p.due_date IS NOT NULL AND p.reversal_id IS NULL
+      ORDER BY p.id`, [[...a.paymentIds], a.paidOn])).rows
+  for (const p of rows) {
+    const events = (await client.query<{
+      id: string; event_type: CreditEventType; event_data: Record<string, unknown>; superseded_by: string | null
+      attestation_source: CreditAttestationSource; attestation_evidence: Record<string, unknown>
+      dimension_tags: string[]; subject_id: string
+    }>(
+      `SELECT e.id, e.event_type, e.event_data, e.superseded_by, e.attestation_source, e.attestation_evidence,
+              e.dimension_tags, e.subject_id
+         FROM credit_events e
+        WHERE e.event_type LIKE 'payment_received_%' AND e.event_data->>'payment_id' = $1
+        ORDER BY e.recorded_at, e.id
+          FOR UPDATE OF e`, [p.id])).rows
+    const live = events.filter(e => !e.superseded_by)
+    if (live.length === 0 && events.length > 0) continue   // withdrawn or corrected away by someone else
+    const current = live[live.length - 1] ?? null
+    const graceRaw = Number(current?.event_data.grace_days)
+    const graceDays = Number.isFinite(graceRaw) ? graceRaw : (p.grace ?? DEFAULT_GRACE_DAYS)
+    const rated = await ratePaymentMark(client, {
+      paymentId: p.id, dueDate: p.due_date, settledAt: paidAt, graceDays, propertyTz: p.timezone,
+      lateFeeOnBill: p.fee_by_then,
+    })
+    // Earns no mark from the bank's day (late in the onboarding month): left as it is.
+    if (!rated) continue
+    const positive = isPositivePaymentTier(rated.eventType)
+    // The bank's day shows it LATE: a late mark stands as it is (its tier
+    // included); only an on-time mark the bank contradicts is corrected.
+    if (!positive && (!current || !isPositivePaymentTier(current.event_type))) continue
+    if (current && current.event_type === rated.eventType && current.event_data.late_fee_on_bill !== true) continue
+    const base = current
+      ? (({ late_fee_on_bill: _l, money_paid_at: _m, billed_on: _b, late_fee_deleted: _d, corrects_event_id: _c, ...rest }) => rest)(current.event_data)
+      : {}
+    const appended = await appendEvent(
+      {
+        subjectType: 'tenant',
+        subjectRefId: p.tenant_id,
+        eventType: rated.eventType,
+        eventData: {
+          ...base,
+          payment_id: p.id,
+          payment_type: p.type,
+          amount: current?.event_data.amount ?? p.amount,
+          due_date: rated.dueDay,
+          ...(rated.billedOn ? { billed_on: rated.billedOn } : {}),
+          paid_at: paidAt.toISOString(),
+          grace_days: graceDays,
+          bank_validated: true,
+          ...(current ? { corrects_event_id: current.id } : {}),
+        },
+        occurredAt: paidAt,
+        attestationSource: current?.attestation_source ?? 'landlord_self_reported_with_evidence',
+        attestationEvidence: current?.attestation_evidence ?? {},
+        dimensionTags: (current?.dimension_tags as CreditScoreDimension[] | undefined) ?? ['payment_reliability'],
+        // As the emitter: a good mark the current landlord sees; an adverse one the network does.
+        networkVisibility: positive ? 'visible_to_current_landlord' : 'visible_to_gam_network',
+      },
+      client,
+    )
+    if (current) await supersedeEvent(client, current.id, appended.eventId, 'data_entry_error_corrected')
+    out.push({
+      paymentId: p.id, replacedEventId: current?.id ?? null, eventId: appended.eventId,
+      was: current?.event_type ?? null, now: rated.eventType, subjectId: appended.subjectId,
+    })
+  }
+  return out
+}
+
+/**
+ * Undo of reRateMarksFromBankDate (the bank match it ran for was undone): each
+ * mark it wrote is replaced, through the correction mechanism, by a copy of
+ * the mark it had replaced (corrects_event_id: the mark it wrote); a mark it
+ * wrote where there was none is withdrawn (it points at itself,
+ * 'attestation_invalidated'). A mark someone corrected since is followed to
+ * the end of its chain only if that is still the mark this wrote; otherwise it
+ * is left alone. Inside the caller's transaction; returns the credit subjects
+ * changed.
+ */
+export async function undoBankDateMarks(
+  client: PoolClient, corrections: readonly BankDateMarkCorrection[],
+): Promise<string[]> {
+  const subjects = new Set<string>()
+  for (const c of corrections) {
+    const mine = (await client.query<{ superseded_by: string | null; subject_id: string }>(
+      `SELECT superseded_by, subject_id FROM credit_events WHERE id = $1 FOR UPDATE`, [c.eventId])).rows[0]
+    if (!mine || mine.superseded_by) continue
+    subjects.add(mine.subject_id)
+    if (!c.replacedEventId) {
+      await supersedeEvent(client, c.eventId, c.eventId, 'attestation_invalidated')
+      continue
+    }
+    const old = (await client.query<{
+      event_type: CreditEventType; event_data: Record<string, unknown>; occurred_at: Date
+      attestation_source: CreditAttestationSource; attestation_evidence: Record<string, unknown>
+      dimension_tags: string[]; network_visibility: string; tenant_id: string
+    }>(
+      `SELECT e.event_type, e.event_data, e.occurred_at, e.attestation_source, e.attestation_evidence,
+              e.dimension_tags, e.network_visibility, s.subject_ref_id AS tenant_id
+         FROM credit_events e JOIN credit_subjects s ON s.id = e.subject_id
+        WHERE e.id = $1`, [c.replacedEventId])).rows[0]
+    if (!old) continue
+    const back = await appendEvent(
+      {
+        subjectType: 'tenant',
+        subjectRefId: old.tenant_id,
+        eventType: old.event_type,
+        eventData: { ...old.event_data, corrects_event_id: c.eventId },
+        occurredAt: old.occurred_at,
+        attestationSource: old.attestation_source,
+        attestationEvidence: old.attestation_evidence,
+        dimensionTags: old.dimension_tags as CreditScoreDimension[],
+        networkVisibility: old.network_visibility as CreditNetworkVisibility,
+      },
+      client,
+    )
+    await supersedeEvent(client, c.eventId, back.eventId, 'data_entry_error_corrected')
   }
   return [...subjects]
 }

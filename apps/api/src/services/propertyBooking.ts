@@ -9,7 +9,7 @@ import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
 import {
-  WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT,
+  WAITLIST_CLAIM_WINDOW_MINUTES, priceStay, BOOKING_MONTHLY_DEPOSIT_DEFAULT,
   SHORT_STAY_LOCKED_UNIT_TYPES, processingFeeFor, stayHeldWords, longCalendarDate,
   STAY_LEASE_CHOICE_NIGHTS, type CardFeePayer, type StayTerms,
 } from '@gam/shared'
@@ -59,29 +59,6 @@ export function storefrontUrl(slug: string, path = ''): string {
           ? 'https://{slug}.gam.biz'
           : 'http://localhost:3015/{slug}')
   return template.replace('{slug}', slug) + path
-}
-
-/**
- * Stay pricing for a unit over [checkIn, checkOut). 'weekly' bills whole weeks
- * at weekly_rate plus remainder nights at nightly_rate; 'nightly' bills
- * nights × nightly_rate. Returns null when the chosen rate isn't configured.
- */
-export function computeStayTotal(
-  stayType: 'nightly' | 'weekly',
-  nights: number,
-  nightlyRate: number | null,
-  weeklyRate: number | null,
-): number | null {
-  if (nights <= 0) return null
-  if (stayType === 'weekly') {
-    if (weeklyRate == null) return null
-    const weeks = Math.floor(nights / 7)
-    const rem = nights % 7
-    const remCost = rem > 0 ? (nightlyRate ?? weeklyRate / 7) * rem : 0
-    return Math.round((weeks * weeklyRate + remCost) * 100) / 100
-  }
-  if (nightlyRate == null) return null
-  return Math.round(nightlyRate * nights * 100) / 100
 }
 
 interface PropertyRow {
@@ -139,12 +116,14 @@ function stayRates(unit: UnitRow, prop: PropertyRow): { nightly: number | null; 
 }
 
 /** Validate the requested stay against the unit's rules and price it + the deposit.
- *  Pricing is AUTO-TIERED by length (guest does not pick a billing type — Nic
- *  2026-06-27): <7 nights nightly, 7–29 weekly, 30+ monthly, prorated. Rates pull
- *  from the UNIT, falling back to the PROPERTY default. Short-term lodging tax
- *  (property-level `short_term_tax_rate`, landlord-set for their city/state) is
- *  added to every stay under 30 nights; 30+ is tax-exempt. The deposit % then
- *  applies to the taxed total. */
+ *  The guest does not pick a billing type (Nic 2026-06-27). 10/6 (Nic): the
+ *  price is the one every door charges for these nights — the cheapest whole
+ *  months, weeks and nights that cover them (shared priceStay), never
+ *  prorated. Rates pull from the UNIT, falling back to the PROPERTY default.
+ *  Short-term lodging tax (property-level `short_term_tax_rate`, landlord-set
+ *  for their city/state) is added to a stay under 30 nights; 30+ is
+ *  tax-exempt. The deposit % then applies to the taxed total (a 30+ night
+ *  stay owes the flat monthly deposit instead). */
 function quoteStay(unit: UnitRow, prop: PropertyRow, checkIn: string, checkOut: string): StayQuote {
   const ci = DateTime.fromISO(checkIn), co = DateTime.fromISO(checkOut)
   if (!ci.isValid || !co.isValid) throw new AppError(400, 'Invalid dates')
@@ -161,27 +140,21 @@ function quoteStay(unit: UnitRow, prop: PropertyRow, checkIn: string, checkOut: 
   // separate site-type tier that used to sit in front of this is gone, along
   // with the chance of the two tiers disagreeing.
   const rates = stayRates(unit, prop)
-  const monthlyRate = rates.monthly
-  const price = computeStayPrice(rates, Number(prop.short_term_tax_rate || 0), nights)
+  const price = priceStay(rates, prop.short_term_tax_rate, checkIn, nights)
   if (price.total <= 0) throw new AppError(400, 'No rate is configured for this unit')
-  // S547 (Nic): monthly-tier stays bill calendar-aligned (prorated arrival →
-  // flat months on the 1st → prorated departure); the booking total is the
-  // schedule sum so it always matches what will actually be invoiced.
-  if (price.tier === 'monthly' && monthlyRate != null) {
-    const sched = computeMonthlyStaySchedule(checkIn, checkOut, monthlyRate)
-    const deposit = depositForStay(prop, { tier: 'monthly', total: sched.total, monthlyRate })
-    return { nights, base: sched.total, tax: 0, total: sched.total, deposit, tier: 'monthly' }
-  }
-  const deposit = depositForStay(prop, { tier: price.tier, total: price.total, monthlyRate })
+  const deposit = depositForStay(prop, { total: price.total, nights, monthlyRate: rates.monthly })
   return { nights, base: price.base, tax: price.tax, total: price.total, deposit, tier: price.tier }
 }
 
 /**
  * The deposit on a stay, from the property's own two settings.
  *
- * A flat amount for monthly-tier stays — the percentage never applies there —
- * hard-capped at one month's rent regardless of what the flat setting says.
- * Everything shorter is a percentage of the taxed total.
+ * A flat amount for a stay of 30+ nights (S547: the percentage is for short
+ * stays only) — hard-capped at one month's rent regardless of what the flat
+ * setting says. Everything shorter is a percentage of the taxed total.
+ * 10/6: decided by the stay's LENGTH, not by the rate it is charged at — a
+ * 25-night stay charged at the monthly rate (the lower price) is still a short
+ * stay and owes the percentage.
  *
  * S652: pulled out of quoteStay so a reservation taken at the COUNTER quotes
  * the same deposit the booking site would have. A guest who phones and a guest
@@ -190,9 +163,9 @@ function quoteStay(unit: UnitRow, prop: PropertyRow, checkIn: string, checkOut: 
  */
 export function depositForStay(
   prop: { booking_deposit_pct: string | number; booking_monthly_deposit: string | number | null },
-  stay: { tier: 'nightly' | 'weekly' | 'monthly'; total: number; monthlyRate: number | null },
+  stay: { total: number; nights: number; monthlyRate: number | null },
 ): number {
-  if (stay.tier === 'monthly' && stay.monthlyRate != null) {
+  if (stay.nights >= STAY_LEASE_CHOICE_NIGHTS && stay.monthlyRate != null && stay.monthlyRate > 0) {
     const flat = prop.booking_monthly_deposit != null
       ? Number(prop.booking_monthly_deposit) : BOOKING_MONTHLY_DEPOSIT_DEFAULT
     return Math.round(Math.min(flat, stay.monthlyRate) * 100) / 100
@@ -222,15 +195,12 @@ export async function quoteStayDeposit(
   const monthlyRate = num(row.monthly_rate) ?? num(row.p_monthly)
   const nights = Math.round(
     DateTime.fromISO(checkOut).startOf('day').diff(DateTime.fromISO(checkIn).startOf('day'), 'days').days)
-  const price = computeStayPrice(
+  const price = priceStay(
     { nightly: num(row.nightly_rate) ?? num(row.p_nightly),
       weekly:  num(row.weekly_rate)  ?? num(row.p_weekly),
       monthly: monthlyRate },
-    Number(row.short_term_tax_rate || 0), nights)
-  const total = price.tier === 'monthly' && monthlyRate != null
-    ? computeMonthlyStaySchedule(checkIn, checkOut, monthlyRate).total
-    : price.total
-  return depositForStay(row, { tier: price.tier, total, monthlyRate })
+    row.short_term_tax_rate, checkIn, nights)
+  return depositForStay(row, { total: price.total, nights, monthlyRate })
 }
 
 /** Landlord's Connect account for destination charges; null if not onboarded. */
@@ -331,6 +301,8 @@ interface StayPlan {
   checkOut: string
   nights: number
   tier: 'nightly' | 'weekly' | 'monthly'
+  /** R5: this charge is a no-lease 30+ night stay's first month (not a deposit). */
+  firstMonth: boolean
   /** The stay's part of the charge: a deposit, or a no-lease stay's first month. */
   stayPart: number
   /** What the booking covers. */
@@ -378,11 +350,22 @@ async function planStay(
     needs, terms, checkOut,
     nights: first ? first.nights : quote.nights,
     tier: first ? 'monthly' : quote.tier,
+    firstMonth: first != null,
     stayPart,
     total: first ? first.amount : quote.total,
     due: dueNowFor(stayPart, screening, prop.booking_card_fee_payer),
     heldWords: terms === 'stay' ? stayHeldWords(checkOut) : null,
   }
+}
+
+/**
+ * 10/6: a booking-site stay's lease_type from its length (as the schedule's
+ * new-reservation form decides it): a no-lease stay's first month or 30+
+ * nights is month_to_month, 7+ weekly, else nightly.
+ */
+export function bookingSiteLeaseType(plan: { firstMonth: boolean; nights: number }): 'nightly' | 'weekly' | 'month_to_month' {
+  if (plan.firstMonth || plan.nights >= STAY_LEASE_CHOICE_NIGHTS) return 'month_to_month'
+  return plan.nights >= 7 ? 'weekly' : 'nightly'
 }
 
 /**
@@ -472,7 +455,10 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
       // month_to_month (pre-existing gap: monthly-tier public bookings always
       // violated the CHECK; surfaced by the S547 long-stay flow). A month of a
       // no-lease stay is one too, whatever its nights (a February is 28).
-      [unit.id, prop.landlord_id, plan.tier === 'monthly' ? 'month_to_month' : plan.tier, opts.checkIn, plan.checkOut, plan.nights,
+      // 10/6: the stay's LENGTH decides it, never the rate it was charged at —
+      // a 25-night stay charged the monthly price is still a short stay
+      // (occupancy, the dashboard and payout triggers count nightly/weekly).
+      [unit.id, prop.landlord_id, bookingSiteLeaseType(plan), opts.checkIn, plan.checkOut, plan.nights,
        opts.guestName, opts.guestEmail, opts.guestPhone ?? null,
        unit.nightly_rate, unit.weekly_rate, plan.total, plan.stayPart, holdExpires,
        opts.requiredSiteLayout ?? 'none', opts.requiredAmpService ?? 'none',
@@ -519,7 +505,7 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
     // check-in and the nightly packer may move it before then.
     const checkout = await createSiteCheckoutSession({
       lines: [
-        { name: plan.terms === 'stay' && plan.tier === 'monthly'
+        { name: plan.firstMonth
             ? `First month — ${prop.name}, through ${longCalendarDate(plan.checkOut)}`
             : `Stay deposit — ${prop.name}`,
           cents: Math.round(plan.due.stay * 100) },

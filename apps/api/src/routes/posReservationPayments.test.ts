@@ -1525,8 +1525,10 @@ describe('10/3 (review, decisions #21) a deposit or balance link toward a short 
 })
 
 // 10/5 (Nic, R5): "point of sale cannot prorate a stay" — the register and a link sent from it
-// sell whole nights at the nightly rate (7 × $40 + 12% lodging tax = $313.60), never the schedule's
-// weekly tier for those nights. The link and the counter still charge one figure.
+// sell whole nights, weeks and months. 10/6 (Nic): "six nights for $312. Well, our weekly price is
+// $269. It should be charging them ... the cheapest option." Seven nights rung as nights are charged
+// the week ($231 + 12% lodging tax = $258.72), never 7 × $40 ($313.60) — the same figure the
+// schedule, the booking site and a link charge.
 describe('10/3 (review, decisions #9) the same nights cost the same on a link and at the counter (10/5 R5: whole nights, never prorated)', () => {
   /** Mountain View's shape: $40 a night, $231 a week, 12% lodging tax — and a stay ITEM taxed 10%. */
   async function park(f: F) {
@@ -1535,16 +1537,16 @@ describe('10/3 (review, decisions #9) the same nights cost the same on a link an
   }
   const stayCartLine = (f: F, extra: any = {}) => ({ id: f.stayItem, name: 'RV site — nightly', qty: 7, price: 40, tax: 0.1, ...extra })
 
-  it('seven nights: $313.60 on Send link, on Charge and in the site list — recorded as $280.00 + $33.60 lodging tax (the schedule tiers them to a week)', async () => {
+  it('seven nights: $258.72 (the week) on Send link, on Charge, in the site list and on the schedule — recorded as $231.00 + $27.72 lodging tax', async () => {
     const f = await seed()
     await park(f)
     const { priceStayBySchedule } = await import('../services/registerStay')
     const schedule = await priceStayBySchedule(db, f.sites[1], '2027-06-01', '2027-06-08')
-    expect(schedule).toMatchObject({ total: 258.72, base: 231, tax: 27.72 })   // the schedule's own tiering — not the register's (R5)
+    expect(schedule).toMatchObject({ total: 258.72, base: 231, tax: 27.72 })   // 10/6: the register charges the same
 
     // Send link (site 1).
     const link = (await stayLink(f, 7)).body.data
-    expect(Number(link.total)).toBe(313.6)
+    expect(Number(link.total)).toBe(258.72)
 
     // The register's site list prices each site the same way. (10/3, S652: the
     // site the link holds unpaid is still offered — last, flagged — because a
@@ -1552,21 +1554,22 @@ describe('10/3 (review, decisions #9) the same nights cost the same on a link an
     const list = await request(app()).get(`/api/pos/stays/available?propertyId=${f.propertyId}&checkIn=2027-06-01&stayUnit=night&qty=7`).set(auth(f))
     expect(list.status, JSON.stringify(list.body)).toBe(200)
     expect(list.body.data.units).toEqual([
-      expect.objectContaining({ id: f.sites[1], rate: 40, lineTotal: 313.6, lodgingTax: 33.6, heldByUnpaidHold: false }),
-      expect.objectContaining({ id: f.sites[0], rate: 40, lineTotal: 313.6, lodgingTax: 33.6, heldByUnpaidHold: true })])
+      expect.objectContaining({ id: f.sites[1], rate: 40, lineTotal: 258.72, lodgingTax: 27.72, heldByUnpaidHold: false,
+                                lowerRateWords: 'charged at the weekly rate, the lower price' }),
+      expect.objectContaining({ id: f.sites[0], rate: 40, lineTotal: 258.72, lodgingTax: 27.72, heldByUnpaidHold: true })])
 
     // The quote, with the site and arrival riding on the stay's own line (as the reader's calls carry them).
-    const onLine = stayCartLine(f, { stayUnitId: f.sites[1], stayCheckIn: '2027-06-01', stayTotal: 313.6 })
+    const onLine = stayCartLine(f, { stayUnitId: f.sites[1], stayCheckIn: '2027-06-01', stayTotal: 258.72 })
     const quote = await request(app()).post('/api/pos/cart-quote').set(auth(f))
       .send({ propertyId: f.propertyId, paymentMethod: 'cash', items: [onLine, propaneLine(f)] })
     expect(quote.status, JSON.stringify(quote.body)).toBe(200)
-    expect(quote.body.data).toMatchObject({ subtotal: 300, taxAmount: 35.6, total: 335.6 })   // + $20 propane and its $2
+    expect(quote.body.data).toMatchObject({ subtotal: 251, taxAmount: 29.72, total: 280.72 })   // + $20 propane and its $2
 
     // A cart showing the stay at another figure is refused before any money moves.
     const stale = await request(app()).post('/api/pos/cart-quote').set(auth(f))
-      .send({ propertyId: f.propertyId, paymentMethod: 'cash', items: [{ ...onLine, stayTotal: 308 }] })
+      .send({ propertyId: f.propertyId, paymentMethod: 'cash', items: [{ ...onLine, stayTotal: 313.6 }] })
     expect(stale.status).toBe(409)
-    expect(stale.body.error).toBe('This stay — 7 nights at site RV 02 (Jun 1 → Jun 8) — comes to $313.60 — the cart shows something else, and nothing was charged. '
+    expect(stale.body.error).toBe('This stay — 7 nights at site RV 02 (Jun 1 → Jun 8) — charged at the weekly rate, the lower price — comes to $258.72 — the cart shows something else, and nothing was charged. '
       + 'Tap the site and dates above Charge, press Use this site, then press Charge again.')
 
     // The card reader is never asked to charge a stay with no site.
@@ -1578,23 +1581,24 @@ describe('10/3 (review, decisions #9) the same nights cost the same on a link an
     const intent = await request(app()).post('/api/pos/terminal/payment-intents').set(auth(f))
       .send({ propertyId: f.propertyId, items: [onLine] })
     expect(intent.status, JSON.stringify(intent.body)).toBe(201)
-    expect(h.createIntentMock.mock.calls[0][0].amountCents).toBe(Math.round(payLinkCharge(313.6).charged * 100))
+    expect(h.createIntentMock.mock.calls[0][0].amountCents).toBe(Math.round(payLinkCharge(258.72).charged * 100))
 
     // Charge (site 2): the same figure, recorded split, and the booking at that price.
     const sale = await settleAtCounter(f, { items: [onLine], stay: { unitId: f.sites[1], checkIn: '2027-06-01', guestName: 'Walk In' } })
     expect(sale.status, JSON.stringify(sale.body)).toBe(201)
-    expect(sale.body.data).toMatchObject({ subtotal: '280.00', taxAmount: '33.60', total: '313.60' })
-    expect(sale.body.data.taxBreakdown).toEqual([{ name: 'Lodging tax', rate: 0.12, amount: 33.6 }])
+    expect(sale.body.data).toMatchObject({ subtotal: '231.00', taxAmount: '27.72', total: '258.72' })
+    expect(sale.body.data.taxBreakdown).toEqual([{ name: 'Lodging tax', rate: 0.12, amount: 27.72 }])
     const lines = await saleLines(sale.body.data.id)
-    expect(lines).toEqual([{ item_name: 'RV site — nightly — 7 nights at site RV 02 (Jun 1 → Jun 8)', price: 280, rate: 0.12, subtotal: 280 }])
+    // The receipt says why it is less than seven nights.
+    expect(lines).toEqual([{ item_name: 'RV site — nightly — 7 nights at site RV 02 (Jun 1 → Jun 8) — charged at the weekly rate, the lower price', price: 231, rate: 0.12, subtotal: 231 }])
     const [bk] = await query<any>(`SELECT total_amount::float AS total, nights, source FROM unit_bookings WHERE id = $1`, [sale.body.data.stayBooking.bookingId])
-    expect(bk).toEqual({ total: 313.6, nights: 7, source: 'register' })
+    expect(bk).toEqual({ total: 258.72, nights: 7, source: 'register' })
   })
 
   it('a stay line priced for one site or day, rung with another picked, is refused before any money moves', async () => {
     const f = await seed()
     await park(f)
-    const line = stayCartLine(f, { stayUnitId: f.sites[1], stayCheckIn: '2027-06-01', stayTotal: 313.6 })
+    const line = stayCartLine(f, { stayUnitId: f.sites[1], stayCheckIn: '2027-06-01', stayTotal: 258.72 })
     const words = 'The stay in the cart was priced for another site or arrival date than the one picked — nothing was charged. '
       + 'Tap the site and dates above Charge, press Use this site, then press Charge again.'
     const otherSite = await settleAtCounter(f, { items: [line], stay: { unitId: f.sites[0], checkIn: '2027-06-01', guestName: 'Walk In' } })
@@ -1610,15 +1614,15 @@ describe('10/3 (review, decisions #9) the same nights cost the same on a link an
     expect(await query(`SELECT 1 FROM unit_bookings WHERE landlord_id = $1`, [f.landlordId])).toHaveLength(0)
     const ok = await settleAtCounter(f, { items: [line], stay: { unitId: f.sites[1], checkIn: '2027-06-01', guestName: 'Walk In' } })
     expect(ok.status, JSON.stringify(ok.body)).toBe(201)
-    expect(Number(ok.body.data.total)).toBe(313.6)
+    expect(Number(ok.body.data.total)).toBe(258.72)
   })
 
-  it('a sale that sends the stay with no figure of its own is charged whole nights at the site\'s rate, never the browser\'s', async () => {
+  it('a sale that sends the stay with no figure of its own is charged the site\'s price for those nights, never the browser\'s', async () => {
     const f = await seed()
     await park(f)
     const sale = await settleAtCounter(f, { items: [stayCartLine(f, { price: 49 })], stay: { unitId: f.sites[1], checkIn: '2027-06-01', guestName: 'Walk In' } })
     expect(sale.status, JSON.stringify(sale.body)).toBe(201)
-    expect(Number(sale.body.data.total)).toBe(313.6)
+    expect(Number(sale.body.data.total)).toBe(258.72)
   })
 })
 
@@ -1792,7 +1796,7 @@ describe('10/3 (review) a stay rung at the counter: no discount, nothing unprice
     await query(`UPDATE properties SET short_term_tax_rate = 12 WHERE id = $1`, [f.propertyId])
   }
   const stayCartLine = (f: F, extra: any = {}) => ({ id: f.stayItem, name: 'RV site — nightly', qty: 7, price: 40, tax: 0.1, ...extra })
-  const onSite = (f: F) => stayCartLine(f, { stayUnitId: f.sites[1], stayCheckIn: '2027-06-01', stayTotal: 313.6 })
+  const onSite = (f: F) => stayCartLine(f, { stayUnitId: f.sites[1], stayCheckIn: '2027-06-01', stayTotal: 258.72 })
   const NO_DISCOUNT = 'A stay is charged at the schedule\'s price — take the discount off, then press Charge again. '
     + 'To charge less for the stay, change its price on the schedule; to discount other items, ring them on a sale of their own.'
 
@@ -1818,7 +1822,7 @@ describe('10/3 (review) a stay rung at the counter: no discount, nothing unprice
     // Without the discount it goes through at the schedule's price; propane alone still takes one.
     const ok = await settleAtCounter(f, { items: [onSite(f)], stay: { unitId: f.sites[1], checkIn: '2027-06-01', guestName: 'Walk In' } })
     expect(ok.status, JSON.stringify(ok.body)).toBe(201)
-    expect(Number(ok.body.data.total)).toBe(313.6)
+    expect(Number(ok.body.data.total)).toBe(258.72)
     const propane = await request(app()).post('/api/pos/cart-quote').set(auth(f))
       .send({ propertyId: f.propertyId, paymentMethod: 'cash', items: [propaneLine(f)], discountAmount: 5 })
     expect(propane.status, JSON.stringify(propane.body)).toBe(200)
@@ -1854,7 +1858,7 @@ describe('10/3 (review) a stay rung at the counter: no discount, nothing unprice
 
     // Picked: the stay shows at what its nights cost.
     const picked = await put([onSite(f)])
-    expect(picked.body.data).toMatchObject({ shown: true, totalCents: Math.round(payLinkCharge(313.6).charged * 100) })
+    expect(picked.body.data).toMatchObject({ shown: true, totalCents: Math.round(payLinkCharge(258.72).charged * 100) })
     expect((show.mock.calls[0][0] as any).lines[0].description).toMatch(/^RV site — nightly — 7 nights at site RV 02/)
   })
 
@@ -1864,17 +1868,17 @@ describe('10/3 (review) a stay rung at the counter: no discount, nothing unprice
     const send = (stayTotal: number) => sendLink(f, {
       items: [stayCartLine(f, { stayTotal })],
       stay: { unitId: f.sites[1], checkIn: '2027-06-01', guestName: 'Gina Guest', guestEmail: 'gina@t.dev' } })
-    // The register showed $280 (an old screen); the stay is $313.60 now.
-    const stale = await send(280)
+    // The register showed $313.60 (a screen from before 10/6); the stay is $258.72 now.
+    const stale = await send(313.6)
     expect(stale.status).toBe(409)
-    expect(stale.body.error).toBe('This stay — 7 nights at site RV 02 (Jun 1 → Jun 8) — comes to $313.60 now — the register shows something else, and nothing was sent. '
+    expect(stale.body.error).toBe('This stay — 7 nights at site RV 02 (Jun 1 → Jun 8) — charged at the weekly rate, the lower price — comes to $258.72 now — the register shows something else, and nothing was sent. '
       + 'Press Cancel, tap the site and dates above Charge, press Use this site, then press Email a pay link again.')
     expect(await query(`SELECT 1 FROM pos_pay_links WHERE landlord_id = $1`, [f.landlordId])).toHaveLength(0)
     expect(await query(`SELECT 1 FROM unit_bookings WHERE landlord_id = $1`, [f.landlordId])).toHaveLength(0)
     expect(h.emailPayLinkMock).not.toHaveBeenCalled()
-    const ok = await send(313.6)
+    const ok = await send(258.72)
     expect(ok.status, JSON.stringify(ok.body)).toBe(201)
-    expect(Number(ok.body.data.total)).toBe(313.6)
+    expect(Number(ok.body.data.total)).toBe(258.72)
   })
 })
 

@@ -486,6 +486,8 @@ export async function processLeaseEnds() {
             `UPDATE work_trade_agreements
                 SET status='paused', updated_at=NOW()
               WHERE unit_id=$1 AND status='active'
+                -- 10/6: a work trade made for a STAY follows the stay, not a lease.
+                AND booking_id IS NULL
                 AND tenant_id IN (SELECT tenant_id FROM lease_tenants WHERE lease_id=$2)
               RETURNING id`,
             [lease.unit_id, lease.id])

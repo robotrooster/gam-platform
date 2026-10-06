@@ -41,7 +41,7 @@
 //     "covers $X of $Y owed"; what is over the lines it pays becomes paid-ahead
 //     money when the landlord records it (services/bankDepositConfirm).
 
-import { sortForAllocation, declaredDateHolds } from '@gam/shared'
+import { sortForAllocation, declaredDateHolds, reportedTimeText } from '@gam/shared'
 
 export interface OpenCharge {
   id: string
@@ -96,6 +96,12 @@ export interface TenantDeclaredDeposit {
   reference?: string | null
   /** 10/5 (Nic): the tenant's photo of the bank's receipt (an authed URL), if they added one. */
   receiptPhotoUrl?: string | null
+  /**
+   * 10/6 (Nic): about what time they were at the bank — the hour they picked
+   * (8–18), or after hours / ATM. Null on a report made before it was asked.
+   */
+  hour?: number | null
+  afterHours?: boolean
 }
 
 /**
@@ -183,6 +189,10 @@ export interface DepositMatch {
     reference: string | null
     receiptPhotoUrl: string | null
     dateHolds: boolean
+    /** 10/6 (Nic): the hour the tenant picked (8–18), or null. */
+    hour: number | null
+    /** 10/6 (Nic): they picked after hours / ATM. */
+    afterHours: boolean
   }
 }
 
@@ -572,7 +582,16 @@ function noTieOut(depositCents: number, fit: readonly OpenCharge[], owedCents: n
 export function matchDeposit(
   deposit: DepositToMatch,
   openCharges: OpenCharge[],
-  opts: { declarations?: TenantDeclaredDeposit[]; limit?: number } = {},
+  opts: {
+    declarations?: TenantDeclaredDeposit[]; limit?: number
+    /**
+     * 10/6 (Nic): the reports GAM will not pick between for this deposit
+     * (services/declaredDepositAssign) — why, in the landlord's words. Every
+     * report candidate is then a choice for the landlord, never pre-selected
+     * and never settled by itself, and none is dropped for its instrument.
+     */
+    conflict?: string | null
+  } = {},
 ): DepositMatch[] {
   const limit = opts.limit ?? 8
   if (!(deposit.amount > 0) || openCharges.length === 0) return []
@@ -605,7 +624,7 @@ export function matchDeposit(
   // When two tenants declare the same figure, the one whose stated instrument
   // agrees with the bank memo is the better answer — this is the tiebreaker Nic
   // asked for. If it separates them cleanly, the ambiguity disappears entirely.
-  const agreeing = declared.filter(d => !methodContradicts(d.method, deposit.description))
+  const agreeing = opts.conflict ? [] : declared.filter(d => !methodContradicts(d.method, deposit.description))
   // 10/5: one report per lease — the one this deposit bears out first, then
   // the nearest date. A report now reaches a week back (DECLARATION_POSTED_
   // LATE_DAYS), so a weekly payer's last week's report and this week's can
@@ -628,7 +647,9 @@ export function matchDeposit(
     const head = inAllocationOrder(charges)[0]
     if (!head) continue
     const owedCents = owedOf(charges)
-    const said = `${head.tenantName} reported paying $${d.amount.toFixed(2)} at the bank on ${d.declaredDate}`
+    // 10/6 (Nic): and about what time, when they said.
+    const at = reportedTimeText({ hour: d.hour ?? null, afterHours: d.afterHours ?? false })
+    const said = `${head.tenantName} reported paying $${d.amount.toFixed(2)} at the bank on ${d.declaredDate}${at ? `, ${at}` : ''}`
     // S655 (decisions #11): the report settles only charges that add up to
     // it exactly — never the whole balance for a smaller deposit. Anything
     // else is shown for review, never pre-selected or settled by itself.
@@ -655,6 +676,7 @@ export function matchDeposit(
         declaration: {
           id: d.id, declaredDate: d.declaredDate, reference: d.reference ?? null,
           receiptPhotoUrl: d.receiptPhotoUrl ?? null, dateHolds,
+          hour: d.hour ?? null, afterHours: d.afterHours === true,
         },
       },
     })
@@ -721,7 +743,19 @@ export function matchDeposit(
   // uniform-rent park. It is still a vastly smaller question than before — a
   // choice between the two who say they paid, not among everyone who owes.
   const declaredHits = cands.filter(c => c.m.confidence === 'declared')
-  if (declaredHits.length > 1) {
+  if (opts.conflict && declaredHits.length > 0) {
+    // 10/6 (Nic): a real conflict between reports — the landlord picks.
+    for (const c of declaredHits) {
+      c.rank = 1
+      c.m.confidence = 'amount_ambiguous'
+      c.m.rivals = declaredHits.length - 1
+      // The card says once why GAM did not pick; each choice says what was reported.
+      const dcl = c.m.declaration
+      const at = dcl ? reportedTimeText({ hour: dcl.hour, afterHours: dcl.afterHours }) : null
+      c.m.reason = `${c.m.tenantName} reported paying $${deposit.amount.toFixed(2)} at the bank`
+        + `${dcl ? ` on ${dcl.declaredDate}` : ''}${at ? `, ${at}` : ''}.`
+    }
+  } else if (declaredHits.length > 1) {
     for (const c of declaredHits) {
       c.rank = 1
       c.m.confidence = 'amount_ambiguous'

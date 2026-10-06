@@ -6,6 +6,42 @@ import { ensureBillsForUnit } from '../services/utilityBilling'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 import { registerEngine } from './timezoneCronManager'
 import { dueDatesInRange } from './invoiceGeneration'
+import { hourRateFor } from '../services/workTradeSettlement'
+import { emitPaymentSettledEvent } from '../services/creditLedgerEmitters'
+
+/**
+ * 10/6 (Nic): "the stay's utility agreement bills nothing for covered
+ * utilities". A work trade made for a stay (services/stayWorkTrade) covers its
+ * utilities the way a lease's does in the monthly run (invoiceGeneration): a
+ * covered charge rides on the invoice as a SUSPENDED line — worked off, not
+ * owed — and the invoice is exempt from late fees while the hours are worked.
+ * A bill is covered when the payer's work trade on that space ran on the day
+ * the bill was read (its cycle month when it has no read) and lists the
+ * utility. A trade that tracks hours opens its month's settlement period over
+ * the covered amount, so the month-close run settles it like any other.
+ */
+const WT_SUSPENDED_NOTE = 'work trade, suspended until month close'
+const WT_COVERED_NOTE = 'Covered by work trade'
+interface CoveringTrade {
+  id: string; status: string; covered_charges: string[] | null; tracks_hours: boolean; monthly_hours_target: number
+  start_date: string; end_date: string | null
+}
+/**
+ * 10/6 (review): how a covered line is written. A LIVE trade's line is
+ * suspended and its month's settlement period is opened, so the month-close run
+ * settles it. A trade that has already ENDED (the stay's last utility bill is
+ * usually cut after check-out, when the trade ended and its own end settlement
+ * already ran) has no close left to release a suspended line — it would sit
+ * pending forever. Its covered line is settled as covered outright.
+ */
+type CoveredAs = 'suspended' | 'covered' | null
+function tradeCovering(trades: CoveringTrade[], bill: { utility_type: string; read_end: string | null; cycle: string }): CoveringTrade | null {
+  const day = (bill.read_end ?? bill.cycle).slice(0, 10)
+  return trades.find(w =>
+    w.start_date.slice(0, 7) <= day.slice(0, 7) && (w.start_date <= day || !bill.read_end)
+    && (w.end_date == null || w.end_date >= day)
+    && (!w.covered_charges || w.covered_charges.length === 0 || w.covered_charges.includes(String(bill.utility_type)))) ?? null
+}
 
 // ============================================================
 // S615 (Nic, LAUNCH-CRITICAL) — the invoice for a space with no lease.
@@ -128,8 +164,12 @@ async function runServiceGeneration(
         reading_start_date: string | null
         reading_end_date: string | null
         digits: number | null
+        cycle: string
+        read_end: string | null
       }>(
         `SELECT ub.id, (ub.charge_amount + ub.tax_amount)::text AS charge_amount,
+                to_char(ub.billing_cycle_month, 'YYYY-MM-DD') AS cycle,
+                to_char(ub.reading_end_date, 'YYYY-MM-DD') AS read_end,
                 ub.utility_type, ub.allocation_method, ub.allocation_basis,
                 ub.rate_per_unit, ub.usage_amount,
                 ub.reading_start, ub.reading_end,
@@ -151,6 +191,21 @@ async function runServiceGeneration(
       if (bills.length === 0) continue
 
       const total = bills.reduce((s, b) => s + Number(b.charge_amount), 0)
+      // 10/6: the payer's work trade on this space, if any (a stay's).
+      const trades = await query<CoveringTrade>(
+        `SELECT id, status, covered_charges, tracks_hours, monthly_hours_target,
+                to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(end_date, 'YYYY-MM-DD') AS end_date
+           FROM work_trade_agreements
+          WHERE unit_id = $1 AND tenant_id = $2 AND status <> 'paused'
+          ORDER BY created_at DESC`, [sa.unit_id, sa.tenant_id])
+      const covering = bills.map(b => tradeCovering(trades, b))
+      const coveredAs: CoveredAs[] = covering.map(w => !w ? null : w.status === 'active' ? 'suspended' : 'covered')
+      const coveredTotal = bills.reduce((s, b, i) => s + (covering[i] ? Number(b.charge_amount) : 0), 0)
+      // The live trade whose month-close settles the suspended lines.
+      const liveTrade = covering.find((w, i) => w && coveredAs[i] === 'suspended') ?? null
+      const suspendedTotal = bills.reduce((s, b, i) => s + (coveredAs[i] === 'suspended' ? Number(b.charge_amount) : 0), 0)
+      const trade = liveTrade ?? covering.find(Boolean) ?? null
+      const owed = Math.round((total - coveredTotal) * 100) / 100
 
       const client = await getClient()
       try {
@@ -163,8 +218,9 @@ async function runServiceGeneration(
              landlord_id, tenant_id, lease_id, unit_id, service_agreement_id,
              invoice_number, due_date,
              subtotal_rent, subtotal_fees, subtotal_utilities, total_amount,
-             work_trade_credit_amount, work_trade_credit_hours, work_trade_agreement_id
-           ) VALUES ($1, $2, NULL, $3, $4, $5, $6, 0, 0, $7, $7, 0, 0, NULL)
+             work_trade_credit_amount, work_trade_credit_hours, work_trade_agreement_id,
+             late_fee_exempt
+           ) VALUES ($1, $2, NULL, $3, $4, $5, $6, 0, 0, $7, $8, 0, 0, $9, $9::uuid IS NOT NULL)
            -- The predicate is REQUIRED: this is a partial unique index, and
            -- Postgres will not infer one for ON CONFLICT unless the statement
            -- repeats it. Without it this raises 42P10 rather than de-duping.
@@ -173,7 +229,7 @@ async function runServiceGeneration(
              DO NOTHING
            RETURNING id`,
           [sa.landlord_id, sa.tenant_id, sa.unit_id, sa.id,
-           invoiceNumber, dueDate, total.toFixed(2)],
+           invoiceNumber, dueDate, total.toFixed(2), owed.toFixed(2), trade?.id ?? null],
         )
         // Already invoiced this cycle. Roll back so the reserved invoice
         // number is released rather than burned on a document that does not
@@ -181,9 +237,9 @@ async function runServiceGeneration(
         if (invRes.rows.length === 0) { await client.query('ROLLBACK'); continue }
         const invoiceId = invRes.rows[0].id
 
-        for (const b of bills) {
+        for (const [i, b] of bills.entries()) {
           const paymentId = await insertUtilityRow(client, {
-            invoiceId, sa, dueDate, bill: b,
+            invoiceId, sa, dueDate, bill: b, coveredAs: coveredAs[i],
           })
           await client.query(
             `UPDATE utility_bills
@@ -193,6 +249,26 @@ async function runServiceGeneration(
             [paymentId, b.id],
           )
           utilitiesInserted++
+        }
+
+        // 10/6: a live trade opens its month's settlement period over what it
+        // covered here — the month-close run settles it. 10/6 (review): ALWAYS,
+        // whether or not it tracks hours (S637, jobs/moveInBundle): the period is
+        // the only thing that clears a suspended line. A trade that does not
+        // track hours (trusted, or Track hours off) asks 0 hours, and the close
+        // credits the whole basis.
+        if (liveTrade && suspendedTotal > 0) {
+          const monthStart = DateTime.fromISO(dueDate).startOf('month')
+          const target = liveTrade.tracks_hours ? (Number(liveTrade.monthly_hours_target) || 0) : 0
+          await client.query(
+            `INSERT INTO work_trade_settlements
+               (agreement_id, invoice_id, period_month, target_hours,
+                hour_rate, basis_amount, period_start, period_end)
+             VALUES ($1, $2, $3::date, $4, $5, $6, $3::date, $7::date)
+             ON CONFLICT (agreement_id, period_start) DO NOTHING`,
+            [liveTrade.id, invoiceId, monthStart.toISODate(), target.toFixed(2),
+             hourRateFor(suspendedTotal, target).toFixed(4), suspendedTotal.toFixed(2),
+             monthStart.endOf('month').toISODate()])
         }
 
         // NO CREDIT APPLICATION HERE, deliberately. tenant_credits is keyed to
@@ -230,7 +306,7 @@ async function runServiceGeneration(
  */
 async function insertUtilityRow(
   client: PoolClient,
-  args: { invoiceId: string; sa: ActiveAgreement; dueDate: string; bill: any },
+  args: { invoiceId: string; sa: ActiveAgreement; dueDate: string; bill: any; coveredAs?: CoveredAs },
 ): Promise<string> {
   const { invoiceId, sa, dueDate, bill: b } = args
   const UNIT_LABEL: Record<string, string> = {
@@ -249,16 +325,37 @@ async function insertUtilityRow(
       ? `${Number(b.allocation_basis)} × $${Number(b.rate_per_unit || 0).toFixed(2)}`
       : null
 
+  const covered = args.coveredAs === 'covered'
+  const suspended = args.coveredAs === 'suspended'
   const res = await client.query<{ id: string }>(
     `INSERT INTO payments (
        invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-       type, amount, status, due_date, entry_description, notes
-     ) VALUES ($1, $2, NULL, $3, $4, 'utility', $5, 'pending', $6, 'UTILITY', $7)
+       type, amount, status, due_date, entry_description, notes, work_trade_suspended_at, settled_at
+     ) VALUES ($1, $2, NULL, $3, $4, 'utility', $5, $9, $6, 'UTILITY', $7, $8, CASE WHEN $9 = 'settled' THEN NOW() END)
      RETURNING id`,
     [invoiceId, sa.unit_id, sa.tenant_id, sa.landlord_id,
-     Number(b.charge_amount).toFixed(2), dueDate, note],
+     // 10/6 (review): covered by a trade that has ended — settled as covered,
+     // the same way the month-close settles a covered line (amount 0).
+     covered ? '0.00' : Number(b.charge_amount).toFixed(2), dueDate,
+     // 10/6: a utility the payer's work trade covers — worked off, not owed.
+     suspended ? [note, WT_SUSPENDED_NOTE].filter(Boolean).join(' — ')
+       : covered ? [note, `${WT_COVERED_NOTE} (${'$' + Number(b.charge_amount).toFixed(2)})`].filter(Boolean).join(' — ')
+       : note,
+     suspended ? new Date().toISOString() : null,
+     covered ? 'settled' : 'pending'],
   )
-  return res.rows[0].id
+  const paymentId = res.rows[0].id
+  // S652 (Nic): work trade counts as on time — the credit history says so, as
+  // the month-close does for the lines it covers.
+  if (covered && sa.tenant_id) {
+    await emitPaymentSettledEvent(client, {
+      tenantId: sa.tenant_id, paymentId, paymentType: 'utility', amount: Number(b.charge_amount),
+      dueDate, settledAt: new Date(`${dueDate}T12:00:00Z`), graceDays: null,
+      stripePaymentIntentId: null, attestationSource: 'gam_workflow_auto',
+      attestationEvidence: { covered_by: 'work_trade', invoice_id: invoiceId },
+    })
+  }
+  return paymentId
 }
 
 // S616: an agreement whose space is LINKED to another landlord's leased unit

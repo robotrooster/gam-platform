@@ -1284,6 +1284,26 @@ propertiesRouter.patch('/:id/partial-payments', requirePerm('properties.edit'), 
   } catch (e) { next(e) }
 })
 
+// PATCH /api/properties/:id/tenants-deposit-at-bank — 10/6 (Nic): "Do you
+// allow tenants to go into the bank and deposit their rent for this unit or
+// for this property? We don't do that here at Mountain View." Body
+// { allowed: boolean }. Default off. On: tenants may report a bank deposit,
+// Record payment / Post a payment offer "Bank deposit", and the bank feed
+// matches a bank line to a tenant's bill here by itself — the bank's date
+// then decides late fees. Off: all three are refused; the office's own
+// deposit slips still match.
+propertiesRouter.patch('/:id/tenants-deposit-at-bank', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { allowed } = z.object({ allowed: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE properties SET tenants_deposit_at_bank = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, allowed])
+    res.json({ success: true, data: { propertyId: req.params.id, tenantsDepositAtBank: allowed } })
+  } catch (e) { next(e) }
+})
+
 /**
  * S655 — record a change to a property's owner-signing routing and re-route
  * the owner's open signing seats. Runs on the CALLER's transaction — the same

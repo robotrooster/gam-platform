@@ -567,16 +567,24 @@ export async function seedProperty(
     ownerUserId: string
     managedByUserId: string
     state?: string
+    /**
+     * 10/6 (Nic): properties.tenants_deposit_at_bank. Production starts every
+     * property OFF; test properties start ON so the bank-deposit suites (the
+     * tenant's report, the "Bank deposit" method, bank-feed matching) run the
+     * paths they were written for. Pass false to test a property that does
+     * not take bank deposits from tenants.
+     */
+    tenantsDepositAtBank?: boolean
   }
 ): Promise<string> {
   const res = await client.query<{ id: string }>(
     `INSERT INTO properties
        (landlord_id, name, street1, city, state, zip,
-        owner_user_id, managed_by_user_id)
-     VALUES ($1, 'Test Property', '1 Test St', 'Phoenix', $2, '85001', $3, $4)
+        owner_user_id, managed_by_user_id, tenants_deposit_at_bank)
+     VALUES ($1, 'Test Property', '1 Test St', 'Phoenix', $2, '85001', $3, $4, $5)
      RETURNING id`,
     [params.landlordId, params.state || 'AZ',
-     params.ownerUserId, params.managedByUserId]
+     params.ownerUserId, params.managedByUserId, params.tenantsDepositAtBank !== false]
   )
   return res.rows[0].id
 }

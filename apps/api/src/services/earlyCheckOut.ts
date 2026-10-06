@@ -76,7 +76,7 @@ import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { todayIn, addDaysTo } from '../lib/timezone'
-import { scheduleStayPrice, nightsBetween, stayTaxRate, taxInside, reservationDue } from './registerStay'
+import { scheduleStayPrice, nightsBetween, stayTaxRate, taxInside, reservationDue, untaxedMonthStaySql } from './registerStay'
 import { recordHeldItem } from './heldPayouts'
 import { recordBookingEvent } from './bookingEvents'
 
@@ -113,6 +113,8 @@ export interface StayRow {
   check_in: string; check_out: string; sold_check_out: string
   total: number; balance_paid: boolean; deposit_paid: boolean; deposit_amount: number | null
   tax_pct: number; nightly: number | null; weekly: number | null; monthly: number | null
+  /** 10/6: the first month of a 30+ night stay booked online — untaxed. */
+  month_stay?: boolean
   lease_id: string | null; lease_status: string | null; lease_end: string | null
 }
 
@@ -125,7 +127,7 @@ export async function loadStay(q: Q, bookingId: string, opts: { lock?: boolean }
             COALESCE(b.total_amount, 0)::float AS total,
             (b.balance_paid_at IS NOT NULL) AS balance_paid, (b.deposit_paid_at IS NOT NULL) AS deposit_paid,
             b.deposit_amount::float AS deposit_amount,
-            COALESCE(p.short_term_tax_rate, 0)::float AS tax_pct,
+            COALESCE(p.short_term_tax_rate, 0)::float AS tax_pct, ${untaxedMonthStaySql('b')} AS month_stay,
             COALESCE(u.nightly_rate, p.nightly_rate)::float AS nightly,
             COALESCE(u.weekly_rate, p.weekly_rate)::float AS weekly,
             COALESCE(u.monthly_rate, p.monthly_rate)::float AS monthly,
@@ -245,7 +247,7 @@ export const livePartSql = (p: string) => `(${p}.reversed_at IS NULL AND ${p}.st
 /** The stay's own payments (stay_payments), newest first, with what is left to give back on each. */
 async function staySources(q: Q, s: StayRow): Promise<MoneySource[]> {
   const taxRate = stayTaxRate({ nightly: s.nightly, weekly: s.weekly, monthly: s.monthly }, s.tax_pct,
-    nightsBetween(s.check_in, s.sold_check_out))
+    nightsBetween(s.check_in, s.sold_check_out), { checkIn: s.check_in, total: s.total, monthStay: s.month_stay === true })
   const rows = (await q.query<any>(
     `SELECT sp.id, sp.kind, sp.method, sp.pos_transaction_id, sp.stripe_payment_intent_id,
             sp.toward_stay::float AS toward, sp.card_fee::float AS card_fee, sp.landlord_card_fee::float AS landlord_card_fee,

@@ -92,6 +92,17 @@ export interface CompressionMove {
   checkIn: string
 }
 
+/**
+ * 10/6 (review): a stay moved to another site takes its work trade and its
+ * utility agreement with it (services/stayTerms syncStayUtilityAgreement, which
+ * syncs the stay's work trade too). Best-effort — the move stands either way.
+ */
+async function followMovedStay(bookingId: string): Promise<void> {
+  const { syncStayUtilityAgreement } = await import('./stayTerms')
+  await syncStayUtilityAgreement(bookingId).catch(err =>
+    logger.error({ err, bookingId }, '[compress] the moved stay\'s work trade or utilities could not follow it'))
+}
+
 export async function compressPropertySchedule(propertyId: string): Promise<CompressionMove[]> {
   // Sites that can host a stay — same predicate as the public booking site.
   const siteRows = await query<any>(`
@@ -182,6 +193,7 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
       await query(
         `UPDATE unit_bookings SET unit_id = $1, updated_at = NOW() WHERE id = $2`,
         [placed.id, b.id])
+      await followMovedStay(b.id)
     }
   }
   if (moves.length) {
@@ -329,6 +341,7 @@ export async function relocateBlockingBookings(
     }
     const target = candidates.find((c: any) => c.id === ranked[0])
     await query(`UPDATE unit_bookings SET unit_id = $1, updated_at = NOW() WHERE id = $2`, [ranked[0], blk.id])
+    await followMovedStay(blk.id)
     moves.push({
       bookingId: blk.id, guestName: blk.guest_name,
       fromUnit: blk.unit_number, toUnit: target?.unit_number ?? ranked[0],

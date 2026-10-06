@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
-import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, PARTIAL_PAYMENTS_LAW_NOTE, type ProcessingFeeChoice } from '@gam/shared'
+import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, PARTIAL_PAYMENTS_LAW_NOTE, TENANTS_DEPOSIT_AT_BANK_LABEL, TENANTS_DEPOSIT_AT_BANK_HINT, type ProcessingFeeChoice } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { toast } from '../components/dialogs'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
@@ -221,6 +221,7 @@ export function PropertyDetailPage() {
       <MoveInCollectionCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <CardFeePayerCard property={property} onSaved={() => { qc.invalidateQueries(['property', id]); qc.invalidateQueries('properties') }} />
       <PartialPaymentsCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <TenantsDepositAtBankCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <PropertyFeeScheduleSection propertyId={property.id}
         unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
       <PropertyOfficeEmailSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
@@ -787,6 +788,29 @@ export function PartialPaymentsCard({ property, onSaved }: { property: any; onSa
           : 'Off: a payment you record here has to cover everything owed. Turn it on if tenants can pay part of their rent — for example by depositing less than the bill at your bank.'}
       </div>
       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>{PARTIAL_PAYMENTS_LAW_NOTE}</div>
+    </div>
+  )
+}
+
+// 10/6 (Nic): "Do you allow tenants to go into the bank and deposit their rent
+// for this unit or for this property? We don't do that here at Mountain View."
+// Default off. On: tenants may report a bank deposit, Record payment offers
+// "Bank deposit", and the bank feed matches each deposit to the tenant's bill
+// (the bank's date decides late fees). Off: none of those; the office's own
+// deposit slips still match.
+export function TenantsDepositAtBankCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (allowed: boolean) => apiPatch(`/properties/${property.id}/tenants-deposit-at-bank`, { allowed }),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the bank deposit setting') })
+  const on = !!property.tenantsDepositAtBank
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, color: 'var(--text-0)', marginBottom: 4, cursor: 'pointer' }}>
+        <input type="checkbox" checked={on} disabled={save.isLoading}
+          onChange={e => save.mutate(e.target.checked)} />
+        {TENANTS_DEPOSIT_AT_BANK_LABEL}
+      </label>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>{TENANTS_DEPOSIT_AT_BANK_HINT}</div>
     </div>
   )
 }

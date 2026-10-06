@@ -352,9 +352,49 @@ describe('Step 12: a deposit nobody reported settles a tenant’s whole bill by 
 
     const t = await deposit(p, 250, 'BRANCH DEPOSIT')
     expect(await autoSettleByAmount(p.landlordId)).toBe(0)
-    expect((await reconcileDeposits(p.landlordId)).autoSettled).toBe(0)
-    expect(await rentStatus(lot.rentId)).toBe('pending')
     expect((await txnStatus(t)).status).toBe('needs_review')
+    // 10/6 review fix: the household's next month is still open for exactly
+    // this amount, so the line could as well be a second deposit of theirs —
+    // with no reference number on it GAM does not tie it by itself (and never
+    // pays it onto that bill); a person picks.
+    const r0 = await reconcileDeposits(p.landlordId)
+    expect(r0).toMatchObject({ autoSettled: 0, recorded: 0 })
+    expect((await txnStatus(t)).status).toBe('needs_review')
+    // 10/6 (Nic, "Yes, build it"): the receipt's reference number on the bank's
+    // line says which deposit it is — tied to it (no money moves again), never
+    // paid onto another bill.
+    await db.query(`UPDATE bank_transactions SET description = 'BRANCH DEPOSIT BR-1001' WHERE id = $1`, [t])
+    const r = await reconcileDeposits(p.landlordId)
+    expect(r).toMatchObject({ autoSettled: 0, recorded: 1 })
+    expect(await rentStatus(lot.rentId)).toBe('pending')
+    const tied = (await db.query<any>(`SELECT status, auto_settle_undo FROM bank_transactions WHERE id = $1`, [t])).rows[0]
+    expect(tied.status).toBe('matched')
+    expect(tied.auto_settle_undo).toMatchObject({ kind: 'recorded_deposit', auto: true, paymentIds: [sep] })
+  })
+
+  it('a bank line two recorded deposits could be waits for a person — nothing is tied or paid by itself', async () => {
+    const p = await buildPark(2)
+    for (const lot of p.lots) {
+      const client = await getClient()
+      try {
+        await client.query('BEGIN')
+        const { settleManualRentPayment } = await import('./manualPaymentSettle')
+        await settleManualRentPayment(client, {
+          payment: { id: lot.rentId, landlord_id: p.landlordId, tenant_id: lot.tenantId, unit_id: lot.unitId, lease_id: lot.leaseId, due_date: null as any },
+          method: 'bank_deposit', settledAt: null, reference: `BR-${lot.unitId.slice(0, 4)}`, settleHousehold: true,
+          amountTendered: 250, sendReceipt: false,
+        } as any)
+        await client.query('COMMIT')
+      } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+    }
+    const t = await deposit(p, 250, 'BRANCH DEPOSIT')
+    expect(await reconcileDeposits(p.landlordId)).toMatchObject({ recorded: 0, autoSettled: 0 })
+    expect((await txnStatus(t)).status).toBe('needs_review')
+    // The landlord sees both on the deposit review, to pick the one it is.
+    const { candidatesForDeposit } = await import('./bankDepositCandidates')
+    const row = (await db.query<any>(
+      `SELECT id, landlord_id, amount::float AS amount, to_char(posted_date,'YYYY-MM-DD') AS posted_date, description FROM bank_transactions WHERE id = $1`, [t])).rows[0]
+    expect((await candidatesForDeposit(row)).recordedDeposits).toHaveLength(2)
   })
 
   it('a deposit made before the bill existed never pays it by itself', async () => {

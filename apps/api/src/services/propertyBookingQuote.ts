@@ -16,8 +16,8 @@ import { DateTime } from 'luxon'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import {
-  computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, processingFeeFor, cardFeeSplit,
-  STAY_LEASE_CHOICE_NIGHTS, STAY_SCREENING_NIGHTS, stayHeldWords, leaseDueDay, dueDayLabel, type CardFeePayer,
+  priceStay, BOOKING_MONTHLY_DEPOSIT_DEFAULT, processingFeeFor, cardFeeSplit,
+  STAY_LEASE_CHOICE_NIGHTS, STAY_SCREENING_NIGHTS, stayHeldWords, stayPlanWords, leaseDueDay, dueDayLabel, type CardFeePayer,
 } from '@gam/shared'
 import { stayNeeds } from './stayTerms'
 
@@ -175,10 +175,12 @@ export function dueNowFor(stay: number, screening: number, payer: CardFeePayer):
 /**
  * 10/5 (Nic, R5): a stay of 30+ nights with no lease is paid one month at a
  * time online. The booking covers the first calendar month only — the 4th to
- * the 4th, never past the check-out asked for — at the monthly rate, never
- * prorated. Later months are added at the counter, on a pay link or on the
- * schedule ("Add a month"). With no monthly rate set, those nights are priced
- * by length like any stay.
+ * the 4th, never past the check-out asked for — never prorated. Later months
+ * are added at the counter, on a pay link or on the schedule ("Add a month").
+ * 10/6 (Nic): those nights cost what every door charges for them (priceStay —
+ * the cheapest whole months, weeks and nights that cover them): a whole
+ * calendar month is the monthly rate; with no monthly rate set, the weeks and
+ * nights.
  */
 export function firstStayMonth(
   checkIn: string, checkOut: string,
@@ -188,9 +190,12 @@ export function firstStayMonth(
   const monthOut = DateTime.fromISO(checkIn).plus({ months: 1 }).toISODate()!
   const out = checkOut < monthOut ? checkOut : monthOut
   const nights = Math.round(DateTime.fromISO(out).diff(DateTime.fromISO(checkIn), 'days').days)
-  const amount = rates.monthly != null
-    ? round2(Number(rates.monthly))
-    : computeStayPrice(rates, taxRatePct, nights).total
+  // 10/6 (review): the stay asked for is 30+ nights, and a stay of 30+ nights
+  // carries no lodging tax — so neither does its first month, even a 28-night
+  // February charged as four weeks (registerStay untaxedMonthStaySql reads it
+  // back the same way). `taxRatePct` is kept for the callers; it never applies.
+  void taxRatePct
+  const amount = priceStay(rates, 0, checkIn, nights).total
   return { checkOut: out, nights, amount }
 }
 
@@ -268,9 +273,10 @@ export async function typeAvailability(
     if (!conflict) { freeUnit = u; break }
   }
 
-  // Auto-tiered pricing (guest does not pick a billing type — Nic 2026-06-27):
-  // length decides nightly/weekly/monthly, prorated, with short-term lodging
-  // tax on stays under 30 nights.
+  // The guest does not pick a billing type (Nic 2026-06-27). 10/6 (Nic): the
+  // price is the one every door charges for these nights — the cheapest whole
+  // months, weeks and nights that cover them (shared priceStay), never
+  // prorated — with short-term lodging tax on stays under 30 nights.
   //
   // S630 DIRECTIVE (Nic): rates come from the UNIT, else the property. NEVER the
   // subtype — "subtypes should not price the unit... maybe one spot's bigger and
@@ -284,22 +290,21 @@ export async function typeAvailability(
     weekly:  rep.weekly_rate  ?? prop.weekly_rate,
     monthly: rep.monthly_rate ?? prop.monthly_rate,
   }
-  const price = computeStayPrice(rates, Number(prop.short_term_tax_rate || 0), nights)
-  // S547: a 30+ night stay's total is priced on the calendar months it spans.
-  // 10/5 (R5): that is the whole stay asked for, as an estimate — nothing bills
-  // it as a lump. A lease bills by the property's rent-due setting; a stay is
-  // paid a month at a time (longStay below).
-  const monthlyBilling = price.tier === 'monthly' && rates.monthly != null
-    ? computeMonthlyStaySchedule(checkIn, checkOut, Number(rates.monthly))
-    : null
-  const total = monthlyBilling ? monthlyBilling.total : (price.total > 0 ? price.total : null)
+  const price = priceStay(rates, prop.short_term_tax_rate, checkIn, nights)
+  // 10/5 (R5): a 30+ night stay's total is the whole stay asked for, as an
+  // estimate — nothing bills it as a lump. A lease bills by the property's
+  // rent-due setting; a stay is paid a month at a time (longStay below).
+  const total = price.total > 0 ? price.total : null
   const depositPct = Number(prop.booking_deposit_pct)
-  // Deposit rule (S547, Nic): % of total for short stays only; monthly-tier
-  // stays owe a flat deposit (per-property, default utility-bill-sized),
-  // hard-capped at one month's rent.
+  // Deposit rule (S547, Nic): % of total for short stays only; a stay of 30+
+  // nights owes a flat deposit (per-property, default utility-bill-sized),
+  // hard-capped at one month's rent. (10/6: by the stay's length, as
+  // propertyBooking depositForStay — never by the rate it is charged at.)
+  const monthlyRateNum = rates.monthly != null && Number(rates.monthly) > 0 ? Number(rates.monthly) : null
+  const flatDeposit = nights >= STAY_LEASE_CHOICE_NIGHTS && monthlyRateNum != null
   const monthlyFlat = prop.booking_monthly_deposit != null ? Number(prop.booking_monthly_deposit) : BOOKING_MONTHLY_DEPOSIT_DEFAULT
   const depositAmount = total == null ? null
-    : monthlyBilling ? Math.round(Math.min(monthlyFlat, Number(rates.monthly)) * 100) / 100
+    : flatDeposit ? Math.round(Math.min(monthlyFlat, monthlyRateNum!) * 100) / 100
     : Math.round(total * (depositPct / 100) * 100) / 100
 
   // 10/5 (R1/R8, R2/R5): the background check and the lease-or-stay choice.
@@ -371,9 +376,13 @@ export async function typeAvailability(
       : total == null ? 'rate_unavailable'
       : null,
     tier: price.tier,
-    base: monthlyBilling ? monthlyBilling.total : price.base,
-    tax: monthlyBilling ? 0 : price.tax,
-    taxable: monthlyBilling ? false : price.taxable,
+    // 10/6: what the stay is charged as, in words ("1 week + 1 night").
+    chargedAs: price.total > 0 ? stayPlanWords(price.plan) : null,
+    // 10/6 (review): "the lower price" only when the smaller rates cost more.
+    chargedLower: price.total > 0 && price.lowerPrice,
+    base: price.base,
+    tax: price.tax,
+    taxable: price.taxable,
     total, depositPct, depositAmount,
     // S648 (Nic): deposits are card only; the card fee is added on top unless
     // the landlord absorbs it (then this is 0). The deposit's own fee — what a

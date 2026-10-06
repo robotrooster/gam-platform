@@ -1668,19 +1668,16 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       // stated" and creates a normal tracked agreement, so invites written
       // before this behave exactly as they did.
       const tracksHours = wtIntent.rows[0].work_trade_tracks_hours !== false
-      await client.query(
-        `INSERT INTO work_trade_agreements
-           (unit_id, tenant_id, landlord_id, duties, start_date, monthly_hours_target,
-            tracks_hours, covered_charges)
-         VALUES ($1, $2, $3, $4, $5, $6, $7,
-                 COALESCE($8::text[], ARRAY['rent','fees','water','sewer','electric','gas','trash','propane']))`,
-        [doc.unit_id, primarySigner.tenant_id, doc.landlord_id,
-         wtIntent.rows[0].work_trade_duties || null,
-         startDate,
-         wtIntent.rows[0].work_trade_hours_target
-           ?? propDefault.rows[0]?.work_trade_hours_target ?? 80,
-         tracksHours,
-         covers])
+      // 10/6: the ONE insert of an agreement's terms (services/stayWorkTrade) —
+      // the hours default to the property's setting, the covered charges to
+      // everything — shared with the Work Trade page and a work trade on a stay.
+      const { insertWorkTradeAgreement } = await import('../services/stayWorkTrade')
+      await insertWorkTradeAgreement(client, {
+        unitId: doc.unit_id, tenantId: primarySigner.tenant_id, landlordId: doc.landlord_id,
+        duties: wtIntent.rows[0].work_trade_duties || null, startDate, endDate: null,
+        hoursTarget: wtIntent.rows[0].work_trade_hours_target ?? propDefault.rows[0]?.work_trade_hours_target ?? null,
+        tracksHours, coveredCharges: covers,
+      })
     }
   }
 

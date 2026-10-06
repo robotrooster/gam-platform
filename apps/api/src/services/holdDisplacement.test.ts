@@ -75,6 +75,30 @@ describe('an unpaid hold yields to somebody who paid', () => {
     expect(b.displaced_at).toBeTruthy()
   })
 
+  // 10/6 (Nic): "Does avoiding 14 actually do anything...? We need it to
+  // actually do something in the schedule."
+  it('never moves a held guest onto a site they asked not to have', async () => {
+    const f = await seed({ sites: 3 })
+    const held = await hold(f.unitIds[0], f.landlordId)
+    await query(`UPDATE unit_bookings SET avoided_unit_ids = ARRAY[$2]::uuid[] WHERE id=$1`, [held, f.unitIds[1]])
+
+    const out = await withTx((c) => clearUnpaidHolds(c, f.unitIds[0], '2027-03-06', '2027-03-13'))
+    expect(out[0]).toMatchObject({ outcome: 'moved', toUnitNumber: 'RV 03' })   // RV 02 is the first free, but on the list
+    const [b] = await query<any>(`SELECT unit_id FROM unit_bookings WHERE id=$1`, [held])
+    expect(b.unit_id).toBe(f.unitIds[2])
+  })
+
+  it('with only an avoided site free, the hold is not put there — it is let go as when the park is full', async () => {
+    const f = await seed({ sites: 2 })
+    const held = await hold(f.unitIds[0], f.landlordId)
+    await query(`UPDATE unit_bookings SET avoided_unit_ids = ARRAY[$2]::uuid[] WHERE id=$1`, [held, f.unitIds[1]])
+
+    const out = await withTx((c) => clearUnpaidHolds(c, f.unitIds[0], '2027-03-06', '2027-03-13'))
+    expect(out[0].outcome).toBe('displaced')
+    const [b] = await query<any>(`SELECT unit_id, status FROM unit_bookings WHERE id=$1`, [held])
+    expect(b).toEqual({ unit_id: f.unitIds[0], status: 'cancelled' })
+  })
+
   it('only bumps them when the park genuinely has nothing else', async () => {
     const f = await seed({ sites: 1 })
     const held = await hold(f.unitIds[0], f.landlordId)

@@ -9,7 +9,7 @@ import { AppError } from '../middleware/errorHandler'
 import { todayIn } from '../lib/timezone'
 import { STAY_TERMS, stayHeldWords, type StayTerms } from '@gam/shared'
 import {
-  computeStayTotal, bookStay, joinWaitlist, getWaitlistClaim, claimWaitlistSpot, claimQuote, UnitFullError,
+  bookStay, joinWaitlist, getWaitlistClaim, claimWaitlistSpot, claimQuote, UnitFullError,
   StayTermsNeededError, storefrontUrl,
 } from '../services/propertyBooking'
 import {
@@ -18,9 +18,8 @@ import {
 } from '../services/propertyBookingQuote'
 import { rankUnitsBestFit } from '../services/scheduleCompression'
 
-// Re-exported for tests that import the legacy pure pricing helper from the
-// route. (Pricing now auto-tiers via the shared computeStayPrice — see below.)
-export { computeStayTotal }
+// 10/6 (Nic): pricing is the shared priceStay — the cheapest whole months,
+// weeks and nights that cover the stay — via services/propertyBookingQuote.
 
 // ============================================================
 // S517 / Walkthrough #11 — public per-property booking site (read APIs).

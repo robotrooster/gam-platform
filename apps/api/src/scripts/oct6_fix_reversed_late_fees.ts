@@ -31,6 +31,33 @@
  * Every change is printed. Run twice, the second run finds nothing (the fees
  * are no longer at $0).
  *
+ * 10/6 (Nic, "Yes, build it") — the confirmed table: when a BANK LINE was
+ * matched to the bill, the bank's date decides — a late fee charged after it
+ * is ZEROED and the payment counts from that day, on time if on time. "If it
+ * was deposited on the 3rd, and the landlord chose to log it on the 5th or
+ * the 6th, we're not going to just waive the late fee and still show that
+ * they paid late. It's determined by the matching transaction from the bank
+ * log." So:
+ *   A. Only fees zeroed by a deposit LOGGED BY HAND are put into the credited
+ *      form above. A fee a bank match zeroed (listed in a matched bank line's
+ *      undo record, or on a bill a bank line is tied to through
+ *      bank_deposit_allocations) is the bank's decision and stays at $0.00
+ *      (skipped, with why).
+ *   B. correctBankMatchedCreditedFees — for the case this ran before that
+ *      rule, and for bank matches made while 0763a6b was live (they credited
+ *      the fee and marked the payment late): each fee a bank match CREDITED
+ *      as never owed (a matched bank line's undo record lists it under
+ *      lateFeesCredited, it carries no other credit) has its late-fee credit
+ *      withdrawn and is zeroed with the bank's note
+ *      (lateFeeCredit.BANK_SHOWS_LATE_FEE_NOTE), the undo record lists it as
+ *      zeroed (Undo puts it back as it was before the match), and the marks of
+ *      the rows that bank line paid are re-rated from the bank-validated day
+ *      (bank_deposit_allocations.effective_paid_date) through the correction
+ *      chain (creditLedgerEmitters.reRateMarksFromBankDate). A bank line tied
+ *      to a deposit logged by hand (kind 'recorded_deposit') is never touched:
+ *      the fees it credited could not be zeroed. Run twice, the second run
+ *      finds nothing.
+ *
  * DRY RUN BY DEFAULT — everything runs in one transaction that is rolled back.
  * --apply commits. Scores of the tenants whose marks changed are recomputed
  * after the commit.
@@ -39,8 +66,10 @@
  */
 import type { PoolClient } from 'pg'
 import { lockHousehold } from '../services/moneyPredicates'
-import { creditLateFee } from '../services/lateFeeCredit'
-import { correctMarkForLateFeeOnBill, type LateFeeMarkCorrection } from '../services/creditLedgerEmitters'
+import { creditLateFee, withdrawLateFeeCredit, BANK_SHOWS_LATE_FEE_NOTE, type CreditedLateFee } from '../services/lateFeeCredit'
+import {
+  correctMarkForLateFeeOnBill, reRateMarksFromBankDate, type LateFeeMarkCorrection, type BankDateMarkCorrection,
+} from '../services/creditLedgerEmitters'
 import { REVERSED_LATE_FEE_NOTE } from '../services/lateFeeDelete'
 
 export const FIX_SINCE = '2026-10-05'
@@ -114,6 +143,15 @@ export async function fixReversedLateFees(client: PoolClient, since: string = FI
     try {
       await lockHousehold(client, f.tenant_id, f.landlord_id)
       const prior = await priorOf(client, f.id)
+      // A. A bank match zeroed it: the bank's date decided, and it stays at $0.00.
+      const bankTied = prior?.undoTxnId ? true : f.invoice_id ? ((await client.query(
+        `SELECT 1 FROM bank_deposit_allocations bda JOIN payments p ON p.id = bda.payment_id
+          WHERE p.invoice_id = $1 AND bda.reversed_at IS NULL LIMIT 1`, [f.invoice_id])).rowCount ?? 0) > 0 : false
+      if (bankTied) {
+        await client.query('ROLLBACK TO SAVEPOINT fix_fee')
+        report.skipped.push({ paymentId: f.id, why: 'a bank line matched to its bill zeroed it — the bank\'s date decides, so it stays at $0.00' })
+        continue
+      }
       if (!prior || !(toCents(prior.amount) > 0)) {
         await client.query('ROLLBACK TO SAVEPOINT fix_fee')
         report.skipped.push({ paymentId: f.id, why: 'what it was charged before it was zeroed is not on record' })
@@ -188,6 +226,134 @@ export async function fixReversedLateFees(client: PoolClient, since: string = FI
   return report
 }
 
+/** One late fee a bank match had credited, zeroed now (part B). */
+export interface ZeroedBankFee {
+  paymentId: string
+  bankTransactionId: string
+  tenantId: string
+  amount: number
+  /** The bank-validated day the fee was judged by. */
+  paidOn: string
+  creditsWithdrawn: string[]
+  marks: BankDateMarkCorrection[]
+}
+
+export interface BankCorrectionReport {
+  zeroed: ZeroedBankFee[]
+  skipped: Array<{ paymentId: string; bankTransactionId: string; why: string }>
+  subjects: string[]
+}
+
+/**
+ * Part B (see the header): every late fee a bank match CREDITED as never owed
+ * is zeroed instead, the match's undo record rewritten, and the marks of the
+ * rows that bank line paid re-rated from the bank-validated day. Inside the
+ * caller's transaction; each bank line in its own savepoint.
+ */
+export async function correctBankMatchedCreditedFees(client: PoolClient): Promise<BankCorrectionReport> {
+  const txns = (await client.query<{ id: string; landlord_id: string; undo: any }>(
+    `SELECT id, landlord_id, auto_settle_undo AS undo FROM bank_transactions
+      WHERE status = 'matched'
+        AND jsonb_typeof(auto_settle_undo->'lateFeesCredited') = 'array'
+        AND jsonb_array_length(auto_settle_undo->'lateFeesCredited') > 0
+        AND auto_settle_undo->>'kind' IS DISTINCT FROM 'recorded_deposit'
+        AND jsonb_typeof(auto_settle_undo->'rows') = 'array'
+      ORDER BY id`)).rows
+  const report: BankCorrectionReport = { zeroed: [], skipped: [], subjects: [] }
+  const subjects = new Set<string>()
+  for (const t of txns) {
+    const credited: CreditedLateFee[] = t.undo.lateFeesCredited ?? []
+    const rowIds: string[] = (t.undo.rows ?? []).map((r: { paymentId: string }) => r.paymentId)
+    await client.query('SAVEPOINT fix_bank')
+    try {
+      const day = (await client.query<{ d: string | null }>(
+        `SELECT to_char(MIN(effective_paid_date), 'YYYY-MM-DD') AS d FROM bank_deposit_allocations
+          WHERE bank_transaction_id = $1 AND reversed_at IS NULL`, [t.id])).rows[0]?.d ?? null
+      const tenantId = (await client.query<{ tenant_id: string | null }>(
+        `SELECT tenant_id FROM tenant_remittances WHERE id = $1`, [t.undo.receiptId ?? null])).rows[0]?.tenant_id ?? null
+      if (!day || !tenantId) {
+        await client.query('ROLLBACK TO SAVEPOINT fix_bank')
+        for (const c of credited) {
+          report.skipped.push({ paymentId: c.paymentId, bankTransactionId: t.id,
+            why: !day ? 'the bank line\'s day is not on record (no live bank allocation)' : 'the match\'s receipt has no resident' })
+        }
+        continue
+      }
+      await lockHousehold(client, tenantId, t.landlord_id)
+      const zeroedHere: Array<{ c: CreditedLateFee; amount: number; withdrawn: string[] }> = []
+      const keep: CreditedLateFee[] = []
+      for (const c of credited) {
+        const f = (await client.query<{ amount: string; status: string; type: string; credited: boolean; other: boolean }>(
+          `SELECT p.amount::text AS amount, p.status, p.type,
+                  EXISTS (SELECT 1 FROM credit_uses u WHERE u.payment_id = p.id AND u.source = 'late_fee_credit'
+                             AND u.status = 'applied') AS credited,
+                  EXISTS (SELECT 1 FROM credit_uses u WHERE u.payment_id = p.id AND u.status IN ('held','applied')
+                             AND u.source IS DISTINCT FROM 'late_fee_credit') AS other
+             FROM payments p WHERE p.id = $1 FOR UPDATE`, [c.paymentId])).rows[0]
+        const why = !f ? 'it is no longer there'
+          : f.type !== 'late_fee' || f.status !== 'settled' || !(toCents(f.amount) > 0) ? 'it is no longer a credited late fee'
+          : !f.credited ? 'its late-fee credit was taken back since'
+          : f.other ? 'other credit is on it, so it cannot go to $0.00 (it stays credited)'
+          : null
+        if (why) { keep.push(c); report.skipped.push({ paymentId: c.paymentId, bankTransactionId: t.id, why }); continue }
+        const w = await withdrawLateFeeCredit(client, c.paymentId)
+        const z = await client.query(
+          `UPDATE payments
+              SET amount = 0, next_retry_at = NULL,
+                  notes = COALESCE(notes || ' — ', '') || $2 || $3::text || ', before this fee was charged'
+            WHERE id = $1 AND status = 'settled' AND issued_credit_amount = 0`,
+          [c.paymentId, BANK_SHOWS_LATE_FEE_NOTE, day])
+        if ((z.rowCount ?? 0) !== 1) throw new Error(`late fee ${c.paymentId} changed while it was being zeroed`)
+        zeroedHere.push({ c, amount: Number(f!.amount), withdrawn: w.creditIds })
+      }
+      if (zeroedHere.length === 0) { await client.query('RELEASE SAVEPOINT fix_bank'); continue }
+      // The undo record: each zeroed fee listed as zeroed — Undo puts it back
+      // as it was before the match (owed, its notes as they were).
+      const undo = {
+        ...t.undo,
+        lateFeesCredited: keep,
+        lateFeesZeroed: [
+          ...(t.undo.lateFeesZeroed ?? []),
+          ...zeroedHere.map(x => ({
+            paymentId: x.c.paymentId, priorAmount: x.amount,
+            priorStatus: x.c.priorStatus === 'settled' ? 'pending' : x.c.priorStatus, priorNotes: x.c.priorNotes,
+          })),
+        ],
+      }
+      await client.query(`UPDATE bank_transactions SET auto_settle_undo = $2::jsonb, updated_at = NOW() WHERE id = $1`,
+        [t.id, JSON.stringify(undo)])
+      // The marks: from the bank-validated day, through the correction chain
+      // (the match's Undo follows the chain to the newest mark and withdraws it).
+      const marks = await reRateMarksFromBankDate(client, { paymentIds: rowIds, paidOn: day })
+      for (const m of marks) subjects.add(m.subjectId)
+      await client.query('RELEASE SAVEPOINT fix_bank')
+      for (const x of zeroedHere) {
+        report.zeroed.push({
+          paymentId: x.c.paymentId, bankTransactionId: t.id, tenantId, amount: x.amount, paidOn: day,
+          creditsWithdrawn: x.withdrawn, marks: marks,
+        })
+      }
+    } catch (e) {
+      await client.query('ROLLBACK TO SAVEPOINT fix_bank')
+      for (const c of credited) {
+        report.skipped.push({ paymentId: c.paymentId, bankTransactionId: t.id, why: e instanceof Error ? e.message : String(e) })
+      }
+    }
+  }
+  report.subjects = [...subjects]
+  return report
+}
+
+export function printBankCorrectionReport(r: BankCorrectionReport, log: (s: string) => void = console.log): void {
+  log(`${r.zeroed.length} late fee(s) a bank match had credited are zeroed — the bank's date decides; ${r.skipped.length} left as they were.`)
+  for (const z of r.zeroed) {
+    log(`  late fee ${z.paymentId} (bank line ${z.bankTransactionId}, tenant ${z.tenantId}): $${z.amount.toFixed(2)} zeroed — ` +
+      `the bank shows the deposit on ${z.paidOn}; credit(s) withdrawn: ${z.creditsWithdrawn.join(', ') || 'none'}`)
+    for (const m of z.marks) log(`      payment ${m.paymentId}: mark ${m.was ?? 'none'} → ${m.now}`)
+  }
+  for (const s of r.skipped) log(`  SKIPPED ${s.paymentId} (bank line ${s.bankTransactionId}): ${s.why}`)
+}
+
 export function printFixReport(r: FixReport, log: (s: string) => void = console.log): void {
   log(`${r.fixed.length} zeroed late fee(s) put back and credited; ${r.skipped.length} left as they were.`)
   for (const f of r.fixed) {
@@ -212,7 +378,9 @@ if (require.main === module) {
       await c.query('BEGIN')
       const r = await fixReversedLateFees(c)
       printFixReport(r)
-      if (apply) { await c.query('COMMIT'); subjects = r.subjects; console.log('COMMITTED') }
+      const b = await correctBankMatchedCreditedFees(c)
+      printBankCorrectionReport(b)
+      if (apply) { await c.query('COMMIT'); subjects = [...new Set([...r.subjects, ...b.subjects])]; console.log('COMMITTED') }
       else { await c.query('ROLLBACK'); console.log('DRY RUN — rolled back. --apply to commit.') }
     } catch (e) {
       await c.query('ROLLBACK').catch(() => {})

@@ -31,7 +31,7 @@ import { MANUAL_PAYMENT_METHOD_WORD } from '@gam/shared'
 import { AppError } from '../middleware/errorHandler'
 import { lockHousehold } from './moneyPredicates'
 import { createPaidAhead, runWholeBillCheckAfterCommit } from './creditUse'
-import { settleManualRentPayment, deskQuote, BANK_DEPOSIT_REFERENCE_REQUIRED, type StillOwedRow } from './manualPaymentSettle'
+import { settleManualRentPayment, deskQuote, BANK_DEPOSIT_REFERENCE_REQUIRED, assertBankDepositTaken, type StillOwedRow } from './manualPaymentSettle'
 import { activateBillingForMoneyMoved } from './billingActivation'
 
 export interface PostPaymentInput {
@@ -99,6 +99,8 @@ export async function postTenantPayment(client: PoolClient, input: PostPaymentIn
       ORDER BY l.status = 'active' DESC, l.start_date DESC, l.id LIMIT 1`,
     [input.tenantId, input.landlordIds])).rows[0]
   if (!lease) throw new AppError(409, 'This tenant has no active lease with you to hold a payment on.')
+  // 10/6 (Nic): a bank deposit only where tenants deposit rent at the bank.
+  if (input.method === 'bank_deposit') await assertBankDepositTaken(client, { leaseId: lease.id })
   // Accepting landlord-bound money during an eviction can reset its timeline.
   if (lease.payment_block) {
     throw new AppError(409, 'This space is in eviction mode — recording a payment is paused. Contact the landlord.')

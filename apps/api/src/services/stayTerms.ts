@@ -27,7 +27,7 @@
 import type { PoolClient } from 'pg'
 import crypto from 'crypto'
 import {
-  STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGHTS, leaseDueDay, longCalendarDate,
+  STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGHTS, leaseDueDay, longCalendarDate, RETURNING_GUEST_LABEL,
   type StayTerms,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
@@ -124,6 +124,12 @@ export interface StayChain {
   /** The person the chain was walked for (from the saved stay when the caller passed nobody). */
   tenantId: string | null
   email: string | null
+  /**
+   * 10/6 (Nic): a stay of the chain carries the landlord's "Returning guest —
+   * they've stayed with us before" (unit_bookings.returning_guest_at). Every
+   * later leg of the same continuous stay inherits it: no background check.
+   */
+  returning: boolean
 }
 
 /**
@@ -153,14 +159,17 @@ export async function continuousStayNights(args: {
   // A saved stay is the same person whatever the caller passed.
   let selfCreatedAt: string | null = null
   let selfTerms: StayTerms | null = null
+  let selfReturning = false
   if (args.bookingId) {
-    const self = await queryOne<{ tenant_id: string | null; guest_email: string | null; created_at: Date; stay_terms: StayTerms | null }>(
-      `SELECT tenant_id, guest_email, created_at, stay_terms FROM unit_bookings WHERE id = $1`, [args.bookingId])
+    const self = await queryOne<{ tenant_id: string | null; guest_email: string | null; created_at: Date; stay_terms: StayTerms | null; returning: boolean }>(
+      `SELECT tenant_id, guest_email, created_at, stay_terms, (returning_guest_at IS NOT NULL) AS returning
+         FROM unit_bookings WHERE id = $1`, [args.bookingId])
     if (self) {
       tenantId = tenantId ?? self.tenant_id
       email = email ?? normEmail(self.guest_email)
       selfCreatedAt = new Date(self.created_at).toISOString()
       selfTerms = self.stay_terms
+      selfReturning = self.returning === true
     }
   }
   if (tenantId && !email) email = (await resolvePerson(tenantId, null)).email
@@ -174,11 +183,13 @@ export async function continuousStayNights(args: {
     terms: args.bookingId ? [selfTerms] : [],
     earliestCreatedAt: selfCreatedAt,
     tenantId, email,
+    returning: selfReturning,
   }
   if (!tenantId && !email) return out
 
-  const others = await query<{ id: string; check_in: string; check_out: string; created_at: Date; stay_terms: StayTerms | null }>(
-    `SELECT b.id, b.check_in::text AS check_in, b.check_out::text AS check_out, b.created_at, b.stay_terms
+  const others = await query<{ id: string; check_in: string; check_out: string; created_at: Date; stay_terms: StayTerms | null; returning: boolean }>(
+    `SELECT b.id, b.check_in::text AS check_in, b.check_out::text AS check_out, b.created_at, b.stay_terms,
+            (b.returning_guest_at IS NOT NULL) AS returning
        FROM unit_bookings b
        JOIN units u ON u.id = b.unit_id
       WHERE u.property_id = $1
@@ -203,6 +214,7 @@ export async function continuousStayNights(args: {
         if (o.check_out > end) end = o.check_out
         out.bookingIds.push(o.id)
         out.terms.push(o.stay_terms)
+        if (o.returning) out.returning = true
         const created = new Date(o.created_at).toISOString()
         if (!out.earliestCreatedAt || created < out.earliestCreatedAt) out.earliestCreatedAt = created
         left.splice(i, 1)
@@ -334,13 +346,50 @@ export interface ScreeningFee {
 
 export interface StayNeeds {
   nights: number
-  screening: 'not_needed' | 'on_file' | 'fee_due'
+  /**
+   * 'returning' (10/6, Nic): the landlord attests the guest has stayed at this
+   * property before — no fee, no check link, check-in never waits on screening.
+   */
+  screening: 'not_needed' | 'on_file' | 'fee_due' | 'returning'
   leaseChoice: 'not_asked' | 'needed' | 'lease' | 'stay'
   screeningFee: ScreeningFee | null
   /** Why screening reads 'on_file' (for the counter's wording). */
   onFile: ScreeningOnFile | null
   chain: StayChain
+  /**
+   * 10/6: the counter chose "Returning guest" just now and it is what waives
+   * the check — the door records the attestation on the stay when it saves it
+   * (attestReturningGuest). False when an earlier leg already carries it.
+   */
+  returningAttestNow: boolean
+  /**
+   * 10/6: the third choice beside the check-fee choices, for a landlord-side
+   * door that asked (offerReturning) and a stay whose check fee is due: may it
+   * be used (free = this person was already attested here this year), or is
+   * the property's allowance used up (message — never the count).
+   */
+  returningOffer: { available: boolean; free: boolean; message: string | null } | null
 }
+
+/** 10/6 (Nic): the returning-guest choice, in the counter's words (@gam/shared). */
+export const RETURNING_GUEST_CHOICE = RETURNING_GUEST_LABEL
+
+/**
+ * 10/6 (Nic): "Owner and property managers only." The returning-guest choice
+ * skips a background check, so it needs the permission that already lets an
+ * invite skip one (tenants.invite — "skip the background check for someone who
+ * already lives there"); owners always may. Front-desk staff without it never
+ * see it. Never on the public booking site (that door never offers it).
+ */
+export function canAttestReturningGuest(user: { role?: string; permissions?: Record<string, unknown> | null } | null | undefined): boolean {
+  if (!user) return false
+  if (['landlord', 'admin', 'super_admin'].includes(String(user.role))) return true
+  return (user.permissions as any)?.['tenants.invite'] === true
+}
+
+/** The refusal a desk without that permission gets for the returning-guest choice. */
+export const RETURNING_GUEST_NOT_ALLOWED =
+  'Marking a guest as returning skips their background check, so only the owner or a manager allowed to invite tenants can do it. Nothing was saved.'
 
 /**
  * The ONE function every door calls before it sells, books or extends a stay
@@ -356,6 +405,15 @@ export async function stayNeeds(args: {
   checkIn: string
   checkOut: string
   stayTerms?: StayTerms | null
+  /**
+   * 10/6 (Nic): the counter chose "Returning guest — they've stayed with us
+   * before" (a landlord-side door, permission checked by the caller). Used
+   * only when the stay needs a check and none is on file; refused with
+   * RETURNING_ALLOWANCE_USED_MESSAGE when the property's allowance is used up.
+   */
+  returning?: boolean
+  /** 10/6: a landlord-side door whose desk may use the choice — returningOffer is filled in. */
+  offerReturning?: boolean
 }): Promise<StayNeeds> {
   const chain = await continuousStayNights(args)
   const nights = chain.nights
@@ -363,7 +421,13 @@ export async function stayNeeds(args: {
   let screening: StayNeeds['screening'] = 'not_needed'
   let onFile: ScreeningOnFile | null = null
   let screeningFee: ScreeningFee | null = null
-  if (nights >= STAY_SCREENING_NIGHTS) {
+  let returningAttestNow = false
+  let returningOffer: StayNeeds['returningOffer'] = null
+  // 10/6 (Nic): a continuous stay that already carries the landlord's
+  // returning attestation needs no check — its later legs inherit it.
+  if (nights >= STAY_SCREENING_NIGHTS && chain.returning) {
+    screening = 'returning'
+  } else if (nights >= STAY_SCREENING_NIGHTS) {
     onFile = await screeningOnFile({
       landlordId: args.landlordId, propertyId: args.propertyId,
       tenantId: chain.tenantId, email: chain.email, stay: chain,
@@ -379,6 +443,19 @@ export async function stayNeeds(args: {
         amount: Math.round((fee.screening + fee.gamFee + fee.tax) * 100) / 100,
         screening: fee.screening, gamFee: fee.gamFee, tax: fee.tax, intakeTotal: fee.total,
       }
+      // 10/6 (Nic): the third choice. One count per person per property per
+      // rolling year — the same allowance invites draw on.
+      if (args.returning || args.offerReturning) {
+        const { returningAllowanceFor, RETURNING_ALLOWANCE_USED_MESSAGE } = await import('./onboardingWindow')
+        const a = await returningAllowanceFor(args.propertyId, { tenantId: chain.tenantId, email: chain.email })
+        returningOffer = { available: a.available, free: a.free, message: a.available ? null : RETURNING_ALLOWANCE_USED_MESSAGE }
+        if (args.returning) {
+          if (!a.available) throw new AppError(409, RETURNING_ALLOWANCE_USED_MESSAGE)
+          screening = 'returning'
+          screeningFee = null
+          returningAttestNow = true
+        }
+      }
     }
   }
 
@@ -391,14 +468,202 @@ export async function stayNeeds(args: {
     leaseChoice = args.stayTerms ?? own ?? inherited ?? 'needed'
   }
 
-  return { nights, screening, leaseChoice, screeningFee, onFile, chain }
+  return { nights, screening, leaseChoice, screeningFee, onFile, chain, returningAttestNow, returningOffer }
+}
+
+/**
+ * 10/6 (Nic): record the landlord's "Returning guest — they've stayed with us
+ * before" on a stay — who and when — inside the door's own transaction, after
+ * the stay is written. The property's allowance is checked again under a lock
+ * (two desks attesting the last place at once: one is refused, and its save
+ * with it). A person already attested here this rolling year costs no count.
+ * The stay no longer waits on screening (screening_required cleared).
+ * Idempotent: a stay that already carries it is left as it is.
+ */
+export interface ReturningAttested {
+  attested: boolean
+  free: boolean
+  /** What the check's fee was taken off (dropScreeningFeeForReturning). */
+  feeDropped: ScreeningFeeDropped
+  /** Closes the card pages of links whose fee was taken off. Call after COMMIT; never throws. */
+  afterCommit: () => Promise<void>
+}
+
+export async function attestReturningGuest(client: PoolClient | null, p: {
+  bookingId: string; propertyId: string; byUserId: string
+  /** 10/6 (review): the continuous stay's other legs (stayNeeds().chain.bookingIds) — their sent fee comes off too. */
+  chainBookingIds?: string[]
+}): Promise<ReturningAttested> {
+  if (!client) {
+    const own = await getClient()
+    let r: ReturningAttested
+    try {
+      await own.query('BEGIN')
+      r = await attestReturningGuest(own, p)
+      await own.query('COMMIT')
+    } catch (e) {
+      await own.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { own.release() }
+    await r.afterCommit()
+    return { ...r, afterCommit: async () => {} }
+  }
+  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`returning_allowance:${p.propertyId}`])
+  const b = (await client.query<{ tenant_id: string | null; guest_email: string | null; returning_guest_at: Date | null }>(
+    `SELECT tenant_id, guest_email, returning_guest_at FROM unit_bookings WHERE id = $1 FOR UPDATE`, [p.bookingId])).rows[0]
+  if (!b) throw new AppError(404, 'Booking not found')
+  if (b.returning_guest_at) return { attested: false, free: true, feeDropped: NO_FEE_DROPPED, afterCommit: async () => {} }
+  const { returningAllowanceFor, RETURNING_ALLOWANCE_USED_MESSAGE } = await import('./onboardingWindow')
+  // Read on the pool: the lock above is what keeps two attestations apart.
+  const a = await returningAllowanceFor(p.propertyId, { tenantId: b.tenant_id, email: b.guest_email })
+  if (!a.available) throw new AppError(409, RETURNING_ALLOWANCE_USED_MESSAGE)
+  await client.query(
+    `UPDATE unit_bookings
+        SET returning_guest_at = NOW(), returning_guest_by = $2, screening_required = false, updated_at = NOW()
+      WHERE id = $1`, [p.bookingId, p.byUserId])
+  // 10/6 (review): the check's fee already sent for this stay comes off — a
+  // returning guest is never charged for a check nobody will run.
+  const dropped = await dropScreeningFeeForReturning(client, [...new Set([p.bookingId, ...(p.chainBookingIds ?? [])])])
+  logger.info({ bookingId: p.bookingId, propertyId: p.propertyId, free: a.free, feeDropped: dropped.counts },
+    '[stay-terms] returning guest attested — no background check for this stay')
+  return { attested: true, free: a.free, feeDropped: dropped.counts, afterCommit: dropped.afterCommit }
+}
+
+export interface ScreeningFeeDropped { linksChanged: number; linksClosed: number; ticketsChanged: number; ticketsVoided: number }
+const NO_FEE_DROPPED: ScreeningFeeDropped = { linksChanged: 0, linksClosed: 0, ticketsChanged: 0, ticketsVoided: 0 }
+
+/**
+ * 10/6 (review): "Returning guest" chosen for a stay whose background-check fee
+ * was already sent — on an unpaid pay link (a deposit link carrying the fee, or
+ * a link for the fee alone) or an open register ticket. That fee is GAM's
+ * screening money for a check that will now never run: paid, it would record a
+ * prepaid check the landlord just waived and charge the guest for nothing.
+ * Inside the attestation's transaction:
+ *   - a ticket loses its check line ('screening': true). A ticket left with
+ *     nothing — or, for a stay whose rent a work trade covers, nothing but its
+ *     $0 stay — is voided;
+ *   - a link loses its check line and asks that much less. A link left with
+ *     nothing to ask (a fee-only link, or a work-trade stay's $0 + fee link) is
+ *     closed. Its card page, if the payer opened one at the old figure, is
+ *     closed after the commit (afterCommit); a payment that lands on it anyway
+ *     is held and the landlord told (routes/posPayLinks finalizePayLink).
+ * A stay that was only waiting on that payment (tentative, nothing paid, no
+ * other link or ticket left for it) is confirmed — there is nothing left to pay.
+ * The link's own address is unchanged: opened again, it asks the new figure.
+ */
+async function dropScreeningFeeForReturning(client: PoolClient, bookingIds: string[]): Promise<{
+  counts: ScreeningFeeDropped; afterCommit: () => Promise<void>
+}> {
+  const counts = { ...NO_FEE_DROPPED }
+  const pages: { linkId: string; landlordId: string; sessionId: string }[] = []
+  const touched = new Set<string>()
+  if (!bookingIds.length) return { counts, afterCommit: async () => {} }
+  // The mark the server writes on a check line (routes/units SCREENING_FEE_LINE_FLAG,
+  // routes/posPayLinks isScreeningLine): a typed line, never a register item.
+  const isCheckLine = (i: any) => !!i && !i.id && i.screening === true
+  const round2 = (n: number) => Math.round(n * 100) / 100
+  const { stayItemIdsIn } = await import('./registerStay')
+
+  const tickets = (await client.query<{ id: string; landlord_id: string; booking_id: string; items: any }>(
+    `SELECT id, landlord_id, booking_id, items FROM pos_open_tickets
+      WHERE booking_id = ANY($1::uuid[]) AND status = 'open' FOR UPDATE`, [bookingIds])).rows
+  for (const t of tickets) {
+    const items = Array.isArray(t.items) ? t.items : []
+    const rest = items.filter((i: any) => !isCheckLine(i))
+    if (rest.length === items.length) continue
+    touched.add(t.booking_id)
+    const stays = await stayItemIdsIn(client, t.landlord_id, rest)
+    const onlyCoveredStay = rest.every((i: any) => stays.has(String(i?.id ?? '').trim().toLowerCase()))
+      && (await stayRentCoveredOn(client, t.booking_id))
+    if (!rest.length || onlyCoveredStay) {
+      await client.query(
+        `UPDATE pos_open_tickets SET status = 'voided', voided_at = NOW(), updated_at = NOW(), void_reason = $2
+          WHERE id = $1 AND status = 'open'`,
+        [t.id, 'Returning guest — no background check, so its fee came off and nothing is left to pay'])
+      counts.ticketsVoided++
+    } else {
+      await client.query(
+        `UPDATE pos_open_tickets
+            SET items = $2::jsonb, updated_at = NOW(),
+                note = TRIM(BOTH ' ·' FROM COALESCE(note, '') || ' · ' || $3)
+          WHERE id = $1 AND status = 'open'`,
+        [t.id, JSON.stringify(rest), 'returning guest — the background check\'s fee came off'])
+      counts.ticketsChanged++
+    }
+  }
+
+  const links = (await client.query<{ id: string; landlord_id: string; booking_id: string | null; items: any
+                                      subtotal: string; total: string; last_checkout_session_id: string | null }>(
+    `SELECT l.id, l.landlord_id, l.booking_id, l.items, l.subtotal, l.total, l.last_checkout_session_id
+       FROM pos_pay_links l
+      WHERE l.status = 'open'
+        AND (l.booking_id = ANY($1::uuid[])
+             OR (l.booking_id IS NULL AND EXISTS (
+                   SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(l.items) = 'array' THEN l.items ELSE '[]'::jsonb END) i
+                    WHERE i->>'screening' = 'true' AND i->>'bookingId' = ANY($1::text[]))))
+      FOR UPDATE`, [bookingIds])).rows
+  for (const l of links) {
+    const items = Array.isArray(l.items) ? l.items : []
+    const fee = round2(items.filter(isCheckLine).reduce((s: number, i: any) => s + (Number(i.price) || 0) * (Number(i.qty) || 1), 0))
+    if (!(fee > 0)) continue
+    const rest = items.filter((i: any) => !isCheckLine(i))
+    const total = round2(Number(l.total) - fee)
+    if (l.booking_id) touched.add(l.booking_id)
+    if (!rest.length || !(total > 0)) {
+      await client.query(`UPDATE pos_pay_links SET status = 'cancelled', updated_at = NOW() WHERE id = $1 AND status = 'open'`, [l.id])
+      counts.linksClosed++
+    } else {
+      await client.query(
+        `UPDATE pos_pay_links
+            SET items = $2::jsonb, subtotal = GREATEST(0, subtotal - $3), total = $4,
+                last_checkout_session_id = NULL, updated_at = NOW()
+          WHERE id = $1 AND status = 'open'`,
+        [l.id, JSON.stringify(rest), fee.toFixed(2), total.toFixed(2)])
+      counts.linksChanged++
+    }
+    if (l.last_checkout_session_id) pages.push({ linkId: l.id, landlordId: l.landlord_id, sessionId: l.last_checkout_session_id })
+  }
+
+  // Nothing left to pay: a stay held only for that payment is confirmed.
+  for (const id of touched) {
+    await client.query(
+      `UPDATE unit_bookings b SET status = 'confirmed', updated_at = NOW()
+        WHERE b.id = $1 AND b.status = 'tentative'
+          AND b.deposit_paid_at IS NULL AND b.pos_transaction_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM pos_pay_links l WHERE l.booking_id = b.id AND l.status = 'open')
+          AND NOT EXISTS (SELECT 1 FROM pos_open_tickets t WHERE t.booking_id = b.id AND t.status = 'open')`, [id])
+  }
+
+  return {
+    counts,
+    afterCommit: async () => {
+      for (const pg of pages) {
+        try {
+          const { expirePayLinkCheckoutSession } = await import('./stripeConnect')
+          await expirePayLinkCheckoutSession(pg.landlordId, pg.sessionId)
+        } catch (err) {
+          // Already paid or already gone — a payment that lands is held and the landlord told.
+          logger.warn({ err, payLinkId: pg.linkId }, '[stay-terms] could not close the card page of a link whose check fee came off')
+        }
+      }
+    },
+  }
+}
+
+/** Does a live work trade tied to this stay cover its rent? (In the caller's transaction.) */
+async function stayRentCoveredOn(client: PoolClient, bookingId: string): Promise<boolean> {
+  const r = (await client.query<{ one: number }>(
+    `SELECT 1 AS one FROM work_trade_agreements
+      WHERE booking_id = $1 AND status <> 'ended' AND 'rent' = ANY(covered_charges) LIMIT 1`, [bookingId])).rows[0]
+  return !!r
 }
 
 /** Mark a stay as one whose check-in waits on a background check (R9). */
 export async function markScreeningRequired(client: PoolClient | null, bookingId: string): Promise<void> {
+  // 10/6 (Nic): a stay the landlord attested as a returning guest never waits.
   await runnerFor(client)(
     `UPDATE unit_bookings SET screening_required = true, updated_at = NOW()
-      WHERE id = $1 AND screening_required = false`, [bookingId])
+      WHERE id = $1 AND screening_required = false AND returning_guest_at IS NULL`, [bookingId])
 }
 
 // ── R8: THE PREPAID SCREENING ────────────────────────────────────────────────
@@ -666,7 +931,7 @@ export async function restorePrepaidScreening(checkId: string): Promise<{ restor
 
 // ── R2 / R4: LEASE OR STAY ───────────────────────────────────────────────────
 
-interface BookingFacts {
+export interface BookingFacts {
   id: string; unit_id: string; landlord_id: string; status: string
   check_in: string; check_out: string; guest_name: string | null; guest_email: string | null
   guest_phone: string | null; tenant_id: string | null; stay_terms: StayTerms | null
@@ -676,7 +941,7 @@ interface BookingFacts {
   rent_due_mode: string | null; rent_due_day: number | null
 }
 
-async function bookingFacts(bookingId: string): Promise<BookingFacts | null> {
+export async function bookingFacts(bookingId: string): Promise<BookingFacts | null> {
   return queryOne<BookingFacts>(
     `SELECT b.id, b.unit_id, b.landlord_id, b.status, b.check_in::text AS check_in, b.check_out::text AS check_out,
             b.guest_name, b.guest_email, b.guest_phone, b.tenant_id, b.stay_terms, b.screening_required,
@@ -906,6 +1171,12 @@ export type StayUtilityResult =
 export async function syncStayUtilityAgreement(bookingId: string, opts: { byUserId?: string | null } = {}): Promise<StayUtilityResult> {
   const b = await bookingFacts(bookingId)
   if (!b) return { action: 'none' }
+  // 10/6 (Nic): a work trade made for the stay follows it from every place the
+  // stay's utilities do (its dates, its site, its check-out, a cancellation,
+  // a lease chosen) — services/stayWorkTrade.
+  await import('./stayWorkTrade')
+    .then(m => m.syncStayWorkTrade(bookingId, { byUserId: opts.byUserId ?? null }))
+    .catch(err => logger.error({ err, bookingId }, '[stay-terms] the stay\'s work trade could not follow it'))
   const existing = await queryOne<{ id: string; status: string; unit_id: string; start_date: string; end_date: string | null }>(
     `SELECT id, status, unit_id, start_date::text AS start_date, end_date::text AS end_date
        FROM utility_service_agreements WHERE booking_id = $1`, [bookingId])
@@ -1001,8 +1272,91 @@ async function noticeStayUtilitiesNotBilled(b: BookingFacts): Promise<void> {
   }
 }
 
-async function createStayAgreement(b: BookingFacts, byUserId: string | null): Promise<StayUtilityResult> {
+/**
+ * 10/5 (Nic, A4) — WHICH ACCOUNT A STAY GUEST IS, for an agreement made for
+ * the stay (its utilities, R11; its work trade, 10/6). The stay's own tenant
+ * when it has one; otherwise the login the guest's email already has — a
+ * resident's login from ANY company; otherwise a placeholder account made
+ * when the agreement is written (stayGuestTenant). An email that is a
+ * landlord's or staff member's login is not a resident and is refused.
+ */
+export type StayGuestPlan =
+  | { ok: true; tenantId: string | null; emailNorm: string | null
+      existingUser: { id: string; tenant_id: string | null; role: string; email: string; needs_setup: boolean } | null
+      sendInvite: boolean }
+  | { ok: false; reason: 'no_email' | 'not_a_resident_account' }
+
+export async function planStayGuestAccount(b: Pick<BookingFacts, 'tenant_id' | 'guest_email' | 'landlord_id'>): Promise<StayGuestPlan> {
   const emailNorm = normEmail(b.guest_email)
+  if (b.tenant_id) return { ok: true, tenantId: b.tenant_id, emailNorm, existingUser: null, sendInvite: false }
+  if (!emailNorm) return { ok: false, reason: 'no_email' }
+  const existingUser = await queryOne<{ id: string; tenant_id: string | null; role: string; email: string; needs_setup: boolean }>(
+    `SELECT u.id, t.id AS tenant_id, u.role, u.email,
+            (u.password_hash = $2 AND u.tenant_invite_accepted_at IS NULL) AS needs_setup
+       FROM users u LEFT JOIN tenants t ON t.user_id = u.id
+      WHERE lower(u.email) = $1
+      ORDER BY t.created_at NULLS LAST LIMIT 1`, [emailNorm, PLACEHOLDER_HASH])
+  if (existingUser && existingUser.role !== 'tenant') return { ok: false, reason: 'not_a_resident_account' }
+  let sendInvite = false
+  if (!existingUser) {
+    sendInvite = true
+  } else if (existingUser.needs_setup) {
+    // S654: a password link only for an account still to be set up that no
+    // other company has. Anyone else already has their way in.
+    const { accountTiedElsewhere } = await import('../jobs/leaseParser/resolveIntent')
+    const own = await query<{ id: string }>(`SELECT public.account_companies($1) AS id`, [b.landlord_id])
+    sendInvite = !(await accountTiedElsewhere(existingUser.id, [b.landlord_id, ...own.map(r => r.id)]))
+  }
+  return { ok: true, tenantId: existingUser?.tenant_id ?? null, emailNorm, existingUser, sendInvite }
+}
+
+/**
+ * The resident account (tenants.id) a planned stay guest is, made here inside
+ * the caller's transaction when it does not exist yet. Returns the invite to
+ * send after the commit (a placeholder account's set-up link), when one is due.
+ */
+export async function stayGuestTenant(client: PoolClient, b: Pick<BookingFacts, 'tenant_id' | 'guest_name' | 'guest_phone'>,
+                                      plan: Extract<StayGuestPlan, { ok: true }>): Promise<{
+  tenantId: string; invite: { token: string; to: string; firstName: string } | null
+}> {
+  if (b.tenant_id) return { tenantId: b.tenant_id, invite: null }
+  const [first, ...rest] = String(b.guest_name || 'Guest').trim().split(/\s+/)
+  let userId: string
+  if (plan.existingUser) {
+    userId = plan.existingUser.id
+  } else {
+    const u = await client.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
+       VALUES ($1, $5, 'tenant', $2, $3, $4) RETURNING id`,
+      [plan.emailNorm, first || 'Guest', rest.join(' '), b.guest_phone, PLACEHOLDER_HASH])
+    userId = u.rows[0].id
+  }
+  let invite: { token: string; to: string; firstName: string } | null = null
+  if (plan.sendInvite) {
+    // S654: a live token is kept, not replaced — another email may already
+    // carry it. Only an account still to be set up gets one.
+    const stored = await client.query<{ tenant_invite_token: string }>(
+      `UPDATE users
+          SET tenant_invite_token = CASE
+                WHEN tenant_invite_token IS NOT NULL AND tenant_invite_expires_at > NOW()
+                THEN tenant_invite_token ELSE $1 END,
+              tenant_invite_expires_at = CASE
+                WHEN tenant_invite_token IS NOT NULL AND tenant_invite_expires_at > NOW()
+                THEN tenant_invite_expires_at ELSE NOW() + INTERVAL '7 days' END,
+              updated_at = NOW()
+        WHERE id = $2 AND password_hash = $3 AND tenant_invite_accepted_at IS NULL
+        RETURNING tenant_invite_token`, [crypto.randomBytes(32).toString('hex'), userId, PLACEHOLDER_HASH])
+    if (stored.rows.length) {
+      invite = { token: stored.rows[0].tenant_invite_token, to: plan.existingUser?.email ?? plan.emailNorm!, firstName: first || 'there' }
+    }
+  }
+  const t = await client.query<{ id: string }>(`SELECT id FROM tenants WHERE user_id = $1`, [userId])
+  const tenantId = t.rows[0]?.id ?? (await client.query<{ id: string }>(
+    `INSERT INTO tenants (user_id, onboarding_source) VALUES ($1, 'onboarded') RETURNING id`, [userId])).rows[0].id
+  return { tenantId, invite }
+}
+
+async function createStayAgreement(b: BookingFacts, byUserId: string | null): Promise<StayUtilityResult> {
   const property = await queryOne<any>(
     `SELECT late_fee_enabled, late_fee_grace_days,
             late_fee_initial_amount, late_fee_initial_type,
@@ -1013,30 +1367,13 @@ async function createStayAgreement(b: BookingFacts, byUserId: string | null): Pr
   // Which account pays (A4). The stay's own tenant when it has one; otherwise
   // the login the guest's email already has, from any company; otherwise a
   // placeholder account made here.
-  let existingUser: { id: string; tenant_id: string | null; role: string; email: string; needs_setup: boolean } | null = null
-  let sendInvite = false
-  if (!b.tenant_id) {
-    if (!emailNorm) return { action: 'skipped', reason: 'no_email' }
-    existingUser = await queryOne(
-      `SELECT u.id, t.id AS tenant_id, u.role, u.email,
-              (u.password_hash = $2 AND u.tenant_invite_accepted_at IS NULL) AS needs_setup
-         FROM users u LEFT JOIN tenants t ON t.user_id = u.id
-        WHERE lower(u.email) = $1
-        ORDER BY t.created_at NULLS LAST LIMIT 1`, [emailNorm, PLACEHOLDER_HASH])
-    if (existingUser && existingUser.role !== 'tenant') {
+  const plan = await planStayGuestAccount(b)
+  if (!plan.ok) {
+    if (plan.reason === 'not_a_resident_account') {
       logger.warn({ bookingId: b.id }, '[stay-terms] the guest\'s email is a landlord or staff login — stay utilities not billed')
       await noticeStayUtilitiesNotBilled(b)
-      return { action: 'skipped', reason: 'not_a_resident_account' }
     }
-    if (!existingUser) {
-      sendInvite = true
-    } else if (existingUser.needs_setup) {
-      // S654: a password link only for an account still to be set up that no
-      // other company has. Anyone else already has their way in.
-      const { accountTiedElsewhere } = await import('../jobs/leaseParser/resolveIntent')
-      const own = await query<{ id: string }>(`SELECT public.account_companies($1) AS id`, [b.landlord_id])
-      sendInvite = !(await accountTiedElsewhere(existingUser.id, [b.landlord_id, ...own.map(r => r.id)]))
-    }
+    return { action: 'skipped', reason: plan.reason }
   }
 
   const insertAgreement = async (client: PoolClient, tenantId: string) => (await client.query<{ id: string }>(
@@ -1066,42 +1403,9 @@ async function createStayAgreement(b: BookingFacts, byUserId: string | null): Pr
   let invite: { token: string; to: string; firstName: string } | null = null
   try {
     await client.query('BEGIN')
-    if (b.tenant_id) {
-      tenantId = b.tenant_id
-    } else {
-      const [first, ...rest] = String(b.guest_name || 'Guest').trim().split(/\s+/)
-      let userId: string
-      if (existingUser) {
-        userId = existingUser.id
-      } else {
-        const u = await client.query<{ id: string }>(
-          `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
-           VALUES ($1, $5, 'tenant', $2, $3, $4) RETURNING id`,
-          [emailNorm, first || 'Guest', rest.join(' '), b.guest_phone, PLACEHOLDER_HASH])
-        userId = u.rows[0].id
-      }
-      if (sendInvite) {
-        // S654: a live token is kept, not replaced — another email may already
-        // carry it. Only an account still to be set up gets one.
-        const stored = await client.query<{ tenant_invite_token: string }>(
-          `UPDATE users
-              SET tenant_invite_token = CASE
-                    WHEN tenant_invite_token IS NOT NULL AND tenant_invite_expires_at > NOW()
-                    THEN tenant_invite_token ELSE $1 END,
-                  tenant_invite_expires_at = CASE
-                    WHEN tenant_invite_token IS NOT NULL AND tenant_invite_expires_at > NOW()
-                    THEN tenant_invite_expires_at ELSE NOW() + INTERVAL '7 days' END,
-                  updated_at = NOW()
-            WHERE id = $2 AND password_hash = $3 AND tenant_invite_accepted_at IS NULL
-            RETURNING tenant_invite_token`, [crypto.randomBytes(32).toString('hex'), userId, PLACEHOLDER_HASH])
-        if (stored.rows.length) {
-          invite = { token: stored.rows[0].tenant_invite_token, to: existingUser?.email ?? emailNorm!, firstName: first || 'there' }
-        }
-      }
-      const t = await client.query<{ id: string }>(`SELECT id FROM tenants WHERE user_id = $1`, [userId])
-      tenantId = t.rows[0]?.id ?? (await client.query<{ id: string }>(
-        `INSERT INTO tenants (user_id, onboarding_source) VALUES ($1, 'onboarded') RETURNING id`, [userId])).rows[0].id
-    }
+    const guest = await stayGuestTenant(client, b, plan)
+    tenantId = guest.tenantId
+    invite = guest.invite
 
     // The property's late-fee policy is STAMPED on, as on every agreement
     // (S558: the instrument is the charge).
@@ -1191,6 +1495,9 @@ export async function checkInBlock(bookingId: string): Promise<CheckInBlock | nu
   // A continuous stay shortened (or a back-to-back leg cancelled) below 22
   // nights needs no check any more (R1), whatever was marked when it was longer.
   if (chain.nights < STAY_SCREENING_NIGHTS) return null
+  // 10/6 (Nic): the landlord attested the guest has stayed here before — on
+  // this stay or an earlier leg of it. Check-in never waits on screening.
+  if (chain.returning) return null
   // A7: only a stay marked when it was sold (screening_required) waits — this
   // one, or another leg of the same continuous stay, so a first leg booked
   // short is not checked in unscreened only for the guest to be stopped when

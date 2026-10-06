@@ -236,20 +236,30 @@ describe('what a reservation still owes', () => {
 
 // 10/5 (Nic, R5): "point of sale cannot prorate a stay."
 describe('a stay at the register is sold whole', () => {
-  it('nights, weeks and months each at their own rate — never a week or a month cut into pieces', () => {
+  it('never a week or a month cut into pieces — and (10/6) the one price every door charges for those nights', () => {
     const rates = { nightly: 40, weekly: 210, monthly: 900 }
     // Ten nights rung as nights are ten nights — never the weekly tier × 10/7.
-    expect(wholeStayPrice(rates, 10, 'night', 10, '2027-01-12')).toMatchObject({ total: 440, base: 400, tax: 40, taxRate: 0.1, nights: 10, checkOut: '2027-01-22', rate: 40 })
-    expect(wholeStayPrice(rates, 10, 'week', 2, '2027-01-12')).toMatchObject({ total: 462, base: 420, tax: 42, nights: 14, tier: 'weekly' })
+    // 10/6 (Nic): charged the cheapest whole weeks and nights that cover them:
+    // a week and three nights ($330), not ten nights ($400) — and it says so.
+    expect(wholeStayPrice(rates, 10, 'night', 10, '2027-01-12')).toMatchObject({
+      total: 363, base: 330, tax: 33, taxRate: 0.1, nights: 10, checkOut: '2027-01-22', rate: 40, tier: 'weekly',
+      lowerRateWords: 'charged at the weekly rate, the lower price' })
+    expect(wholeStayPrice(rates, 10, 'night', 3, '2027-01-12')).toMatchObject({ total: 132, tier: 'nightly', lowerRateWords: null })
+    expect(wholeStayPrice(rates, 10, 'week', 2, '2027-01-12')).toMatchObject({ total: 462, base: 420, tax: 42, nights: 14, tier: 'weekly', lowerRateWords: null })
     // A month is the monthly rate — 31 nights from Mar 5, never the calendar
     // schedule's two prorated pieces — and the monthly tier is never taxed.
     expect(wholeStayPrice(rates, 10, 'month', 1, '2027-03-05')).toMatchObject({ total: 900, base: 900, tax: 0, nights: 31, checkOut: '2027-04-05', tier: 'monthly' })
     expect(wholeStayPrice(rates, 10, 'month', 1, '2027-02-01')).toMatchObject({ total: 900, nights: 28, tax: 0 })
-    expect(wholeStayPrice(rates, 10, 'month', 2, '2027-01-15')).toMatchObject({ total: 1800, nights: 59 })
-    // 30 nights rung as nights: whole nights, untaxed at 30+.
-    expect(wholeStayPrice(rates, 10, 'night', 30, '2027-01-01')).toMatchObject({ total: 1200, tax: 0 })
-    // No rate for what one of these is: nothing prices it.
-    expect(wholeStayPrice({ nightly: 40, weekly: 210, monthly: null }, 10, 'month', 1, '2027-03-05')).toMatchObject({ total: 0, rate: null })
+    // Two months from Jan 15 are 59 nights: a month and four weeks ($1,740)
+    // cost less than two months ($1,800) at these rates.
+    expect(wholeStayPrice(rates, 10, 'month', 2, '2027-01-15')).toMatchObject({ total: 1740, nights: 59 })
+    // 30 nights rung as nights: the month (Jan 1 → Feb 1) covers them for less, untaxed at 30+.
+    expect(wholeStayPrice(rates, 10, 'night', 30, '2027-01-01')).toMatchObject({ total: 900, tax: 0, tier: 'monthly',
+      lowerRateWords: 'charged at the monthly rate, the lower price' })
+    // A rate the site lacks is skipped: a month with no monthly rate is its weeks and nights.
+    expect(wholeStayPrice({ nightly: 40, weekly: 210, monthly: null }, 10, 'month', 1, '2027-03-05')).toMatchObject({ total: 960, rate: null })
+    // No rate at all: nothing prices it.
+    expect(wholeStayPrice({ nightly: null, weekly: null, monthly: null }, 10, 'month', 1, '2027-03-05')).toMatchObject({ total: 0, rate: null })
   })
 
   it('reads the site\'s rate, else the property\'s, and refuses a site with none in plain words', async () => {
@@ -257,7 +267,11 @@ describe('a stay at the register is sold whole', () => {
     await query(`UPDATE properties SET short_term_tax_rate = 12, monthly_rate = 950 WHERE id = $1`, [propertyId])
     expect(await priceWholeStay(db, unitId, 'night', 3, '2027-06-01')).toMatchObject({ total: 134.4, base: 120, tax: 14.4, unitNumber: 'RV 01' })
     expect(await priceWholeStay(db, unitId, 'month', 1, '2027-06-01')).toMatchObject({ total: 950, tax: 0, checkOut: '2027-07-01' })
+    // 10/6: no monthly rate — the month's 30 nights are priced by the rates there are.
     await query(`UPDATE properties SET monthly_rate = NULL WHERE id = $1`, [propertyId])
+    expect(await priceWholeStay(db, unitId, 'month', 1, '2027-06-01')).toMatchObject({ total: 1200, tax: 0 })
+    await query(`UPDATE units SET nightly_rate = NULL, weekly_rate = NULL WHERE id = $1`, [unitId])
+    await query(`UPDATE properties SET nightly_rate = NULL, weekly_rate = NULL WHERE id = $1`, [propertyId])
     await expect(priceWholeStay(db, unitId, 'month', 1, '2027-06-01'))
       .rejects.toThrow('Site RV 01 has no monthly rate set, and neither does the property, so this stay cannot be priced — nothing was charged. Set the site\'s monthly rate (or the property\'s), then press Charge again.')
   })
@@ -384,6 +398,10 @@ describe('the lodging tax inside a stay\'s price', () => {
     expect(stayTaxRate(rates, 10, 30)).toBe(0)
     expect(stayTaxRate({ nightly: null, weekly: null, monthly: 900 }, 10, 10)).toBe(0)   // priced on the monthly schedule, untaxed
     expect(stayTaxRate(rates, 0, 2)).toBe(0)
+    // 10/6 (review): the first month of a 30+ night stay booked online is untaxed,
+    // even a February charged as four weeks.
+    expect(stayTaxRate({ nightly: 40, weekly: 100, monthly: 900 }, 10, 28, { checkIn: '2027-02-01', total: 400, monthStay: true })).toBe(0)
+    expect(stayTaxRate({ nightly: 40, weekly: 100, monthly: 900 }, 10, 28, { checkIn: '2027-02-01', total: 440 })).toBe(0.1)
     expect(taxInside(88, 0.1)).toBe(8)
     expect(taxInside(254.1, 0.1)).toBe(23.1)
     expect(taxInside(50, 0)).toBe(0)
