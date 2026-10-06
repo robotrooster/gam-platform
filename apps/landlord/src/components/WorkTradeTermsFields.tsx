@@ -58,11 +58,12 @@ export function workTradeEditPayload(o: {
 /** Terms as a stay's work trade reads back from the schedule. */
 export function workTradeTermsFrom(row: any): WorkTradeTerms {
   if (!row) return defaultWorkTradeTerms()
-  const covered = (row.coveredCharges ?? row.covered_charges ?? []) as string[]
+  // The API camelizes every response, so the camelCase field is the only one.
+  const covered = (row.coveredCharges ?? []) as string[]
   return {
     coveredCharges: WORK_TRADE_COVERABLE.filter(k => covered.includes(k)),
-    tracksHours: (row.tracksHours ?? row.tracks_hours) !== false,
-    hoursTarget: String(row.monthlyHoursTarget ?? row.monthly_hours_target ?? ''),
+    tracksHours: row.tracksHours !== false,
+    hoursTarget: String(row.monthlyHoursTarget ?? ''),
     duties: row.duties ?? '',
     trusted: row.trusted === true,
   }
@@ -75,9 +76,9 @@ export function workTradeCoversWords(covered: readonly string[]): string {
 }
 
 /** "Work trade — covers: Rent, Electric, trusted" */
-export function workTradeLine(row: { coveredCharges?: string[]; covered_charges?: string[]; trusted?: boolean } | null | undefined): string | null {
+export function workTradeLine(row: { coveredCharges?: string[]; trusted?: boolean } | null | undefined): string | null {
   if (!row) return null
-  const covered = (row.coveredCharges ?? row.covered_charges ?? []) as string[]
+  const covered = (row.coveredCharges ?? []) as string[]
   return `Work trade — covers: ${workTradeCoversWords(covered)}, ${row.trusted ? 'trusted' : 'monitored'}`
 }
 
