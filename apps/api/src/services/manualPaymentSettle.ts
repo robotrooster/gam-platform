@@ -69,6 +69,7 @@ import { executeRentAllocation, ALLOCATABLE_PAYMENT_TYPES } from './allocation'
 import { afterRowsSettled } from './settleHooks'
 import { reconcileSettledDepositPayment, type DepositRecordRaised } from './leaseFeesSync'
 import { logger } from '../lib/logger'
+import { activateBillingForMoneyMoved } from './billingActivation'
 
 /**
  * What became of cash handed over beyond the bill (and the old balance).
@@ -752,6 +753,10 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
        method, input.settledAt, input.reference || null,
        [input.notes, handed].filter(Boolean).join(' ') || null, input.takenBy ?? null])
     receiptId = rem.rows[0].id
+    // 10/5 (Nic): "money movement is the end of onboarding" — cash, a check or
+    // a money order taken at the desk ends the free onboarding window, even
+    // when all of it is kept as credit and no bill settles.
+    await activateBillingForMoneyMoved(client, [landlordId])
   }
 
   // Credit next (applied: the money is already here), then the rows.

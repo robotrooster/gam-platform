@@ -74,7 +74,7 @@ const { nightOrder, topUpSpy, payoutSpy, payoutSyncSpy } = vi.hoisted(() => {
     nightOrder,
     topUpSpy: vi.fn(async () => {
       nightOrder.push('top-up')
-      return { monthScanned: '2026-10-01', monthNotYetBilled: false, propertiesRaised: 0,
+      return { monthScanned: '2026-10-01', monthNotYetBilled: false, graceEndedByMoney: 0, propertiesRaised: 0,
                propertiesCreated: 0, amountCharged: 0, tenantPayerSkipped: [], errors: [] }
     }),
     payoutSpy: vi.fn(async () => {

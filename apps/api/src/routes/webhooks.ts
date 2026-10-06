@@ -23,6 +23,7 @@ import { emitPaymentFailedEvent } from '../services/creditLedgerEmitters'
 // S655 (Step 10): the one post-settle routine (going live, the on-time mark,
 // the receipt) every settle path shares.
 import { afterRowsSettled } from '../services/settleHooks'
+import { activateBillingForMoneyMoved } from '../services/billingActivation'
 import type { PoolClient } from 'pg'
 import {
   ACH_RETURN_CONFIG, CARD_DECLINE_FEE, FLEXPAY_PULL_MAX_RETRIES, FLEXPAY_PULL_RETRY_DAYS,
@@ -1300,6 +1301,10 @@ async function settleSucceededIntent(stripe: Stripe, pi: Stripe.PaymentIntent, e
                 applied_amount = $2, unapplied_amount = $3
           WHERE id = $1`,
         [rem.id, dollars(Math.max(0, onRows)).toFixed(2), dollars(Math.max(0, surplus)).toFixed(2)])
+      // 10/5 (Nic): "money movement is the end of onboarding" — the receipt
+      // itself, so money paid ahead with nothing yet owed (no row settles) ends
+      // the landlord's free onboarding window too.
+      await activateBillingForMoneyMoved(client, [rem.landlord_id])
       // The receipt's lines are the rows it paid. A line it was planned for
       // and did not pay (settled another way meanwhile, or never claimed) is
       // not one: its planned application goes, in this transaction, so the

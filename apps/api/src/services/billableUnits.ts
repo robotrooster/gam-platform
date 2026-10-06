@@ -30,7 +30,8 @@
  *     and would otherwise be free to run.
  *   - a UTILITY-SERVICE space next door (S615/S616) — occupied by him, because
  *     of the utilities.
- *   - a MONTH STAY with no lease (10/5, Nic) — a space, up front, like a lease.
+ *   - a MONTH STAY with no lease (10/5, Nic) — a space, up front, like a lease,
+ *     whether or not its guest has paid yet: on the schedule is what counts.
  *   - NIGHTLY AND WEEKLY STAYS, as nights ÷ 30. A reservation sitting in a spot
  *     is that spot being occupied, and the aggregate is how a nightly park is
  *     billed without charging $2 for a one-night stay.
@@ -151,8 +152,24 @@ export function feeCountedStaySql(b: string, month: string): string {
  * as one occupied space for every calendar month it overlaps, exactly as a
  * lease does.
  *
- *   - Somebody holds the site: not a 'tentative' booking (an unpaid hold), and
- *     not one cancelled before arrival. A stay cancelled ON or after arrival
+ *   - It is ON THE SCHEDULE, paid or not. 10/5 (Nic), on RV 10 and RV 11 —
+ *     month stays sold by pay link whose guests had not paid the link yet, so
+ *     still 'tentative': "We've invoiced for that spot and it's on the
+ *     schedule. So we are billing Mountain View for it either way." A
+ *     tentative (held, invoiced, unpaid) month stay counts exactly like a
+ *     confirmed one. (This reverses the first 10/5 cut, which skipped
+ *     tentative stays as unpaid holds.) The one hold that is NOT on the
+ *     schedule is a booking-site checkout hold (hold_expires_at set): a guest
+ *     partway through paying on the booking page, held for a few minutes and
+ *     never invoiced. Paying clears the timer (services/propertyBooking
+ *     confirmBookingDeposit, routes/posPayLinks), so the stay counts from the
+ *     moment it is paid; an abandoned checkout is cancelled by the sweep
+ *     before it ever arrives. Counting it would bill the month for a guest
+ *     who was only looking at the card page during the 1st's run or a
+ *     nightly top-up, and the bill is never lowered after. Pay-link, counter
+ *     and schedule holds never set the timer (routes/units), so Nic's
+ *     invoiced-but-unpaid stays all still count.
+ *   - Not cancelled before arrival. A stay cancelled ON or after arrival
  *     still held the site, the same S652 rule the nights follow
  *     (feeCountedNightsStatusSql) — otherwise a month stay cancelled the day
  *     after it arrived would be a free month for the asking, and would drop out
@@ -170,7 +187,9 @@ export function feeCountedMonthStaySql(b: string, month: string): string {
   const m = `(${month})::date`
   const monthEnd = `(${m} + INTERVAL '1 month' - INTERVAL '1 day')`
   return `(${b}.lease_type = 'month_to_month'
-       AND ${b}.status <> 'tentative'
+       -- 10/5 (Nic): tentative counts — "it's on the schedule" — unless it is
+       -- a booking-site checkout hold (a timer: nothing invoiced yet).
+       AND NOT (${b}.status = 'tentative' AND ${b}.hold_expires_at IS NOT NULL)
        AND ${feeCountedNightsStatusSql(b)}
        AND NOT EXISTS (
              SELECT 1 FROM leases ms_l

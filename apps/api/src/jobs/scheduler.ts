@@ -2386,7 +2386,7 @@ export function schedulerInit() {
     try {
       const { processPlatformFeeTopUp } = await import('./platformFeeAccrual')
       const topUp = await processPlatformFeeTopUp()
-      if (topUp.propertiesRaised || topUp.propertiesCreated
+      if (topUp.propertiesRaised || topUp.propertiesCreated || topUp.graceEndedByMoney
           || topUp.errors.length || topUp.tenantPayerSkipped.length) {
         logger.info(topUp, '[platform-fee-topup]')
       }

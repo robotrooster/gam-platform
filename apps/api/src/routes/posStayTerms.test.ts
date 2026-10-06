@@ -486,7 +486,11 @@ describe('links the schedule sends for the background check (A2)', () => {
     expect(link).toMatchObject({ booking_id: null, kind: 'one_time', status: 'open', expires_at: null })
     expect(link.items).toEqual([{ id: null, name: SCREENING_LINE_NAME, qty: 1, price: 42.94, tax: 0, screening: true, bookingId: b }])
 
+    // 10/5 (review): the check alone is GAM's money, not the company's
+    // payers' — paying it does not end the landlord's free onboarding.
+    await query(`UPDATE landlords SET billing_starts_at = NULL WHERE id = $1`, [f.landlordId])
     expect(await paidOnline(link, 'pi_fee_only')).toEqual({ recorded: true })
+    expect((await query<any>(`SELECT billing_starts_at FROM landlords WHERE id = $1`, [f.landlordId]))[0].billing_starts_at).toBeNull()
     const [sp] = await query<any>(`SELECT amount::float AS amount, source, source_id, landlord_charge_id FROM screening_prepayments WHERE booking_id = $1`, [b])
     expect(sp).toEqual({ amount: 42.94, source: 'schedule', source_id: link.id, landlord_charge_id: null })
     // Nothing of it is the landlord's: no payout share, no charge line, no income.
@@ -510,7 +514,10 @@ describe('links the schedule sends for the background check (A2)', () => {
     expect(link).toMatchObject({ booking_id: b, total: '192.94', label: 'Reservation deposit and background check' })
     expect(link.items).toEqual([{ id: null, name: 'Reservation deposit', qty: 1, price: 150, tax: 0 },
                                 { id: null, name: SCREENING_LINE_NAME, qty: 1, price: 42.94, tax: 0, screening: true }])
+    await query(`UPDATE landlords SET billing_starts_at = NULL WHERE id = $1`, [f.landlordId])
     expect(await paidOnline(link, 'pi_dep_fee')).toEqual({ recorded: true })
+    // 10/5: the deposit is the company's payer's money — onboarding ends.
+    expect((await query<any>(`SELECT billing_starts_at = date_trunc('month', now())::date AS ok FROM landlords WHERE id = $1`, [f.landlordId]))[0].ok).toBe(true)
     expect(await reservationDue(db, b)).toMatchObject({ paid: 150, owed: 290 })
     const [sp] = await query<any>(`SELECT source, source_id, landlord_charge_id FROM screening_prepayments WHERE booking_id = $1`, [b])
     expect(sp).toEqual({ source: 'pay_link', source_id: link.id, landlord_charge_id: null })

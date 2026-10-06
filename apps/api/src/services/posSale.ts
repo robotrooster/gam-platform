@@ -8,6 +8,7 @@
  */
 import type { PoolClient } from 'pg'
 import { recordHeldItem } from './heldPayouts'
+import { activateBillingForMoneyMoved } from './billingActivation'
 import { recordPlatformRevenueOnceCommitted, type CommittedBookingOutcome } from './platformRevenue'
 import { query } from '../db'
 import { logger } from '../lib/logger'
@@ -36,6 +37,13 @@ export interface PosSaleInput {
   items: Array<{ id?: string | null; name: string; cat?: string; category?: string; qty: number; price: number; tax?: number; tax_rate?: number }>
   /** S650: the taxes charged, by name — "Lodging tax $3.11", not one "Tax" line. */
   taxBreakdown?: { name: string; rate: number; amount: number }[] | null
+  /**
+   * 10/5: a pay link for a stay's background check alone — GAM's screening
+   * money, not the company's payers', so it does not end the landlord's free
+   * onboarding window (billingActivation feeOnlyPayLinkSql is the backstop's
+   * twin of this).
+   */
+  screeningOnly?: boolean
 }
 
 /**
@@ -91,6 +99,14 @@ export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promis
      s.taxBreakdown && s.taxBreakdown.length ? JSON.stringify(s.taxBreakdown) : null,
      s.paidOnline === true])
   const tx = txRes.rows[0]
+  // 10/5 (Nic): "money movement is the end of onboarding" — a register sale or
+  // a pay link paid, cash or card, ends the landlord's free onboarding window.
+  // A store-account ('charge') sale moves no money now; it ends the window
+  // when the account is paid, as a payment. A background check alone is GAM's
+  // money, not the company's payers' (screeningOnly).
+  if (s.paymentMethod !== 'charge' && Number(s.total) > 0 && !s.screeningOnly) {
+    await activateBillingForMoneyMoved(client, [s.landlordId])
+  }
   const needsPO: any[] = []
   // S648: a card sale's money is GAM's to hold until the weekly payout.
   const owed = cardPayoutOwed(s)

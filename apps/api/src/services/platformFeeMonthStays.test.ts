@@ -105,8 +105,33 @@ describe('10/5 — the bill counts a month stay as a space, up front', () => {
     expect(b.shortStayNights).toBe(0)
   })
 
-  it('an unpaid hold (tentative) is not occupancy', async () => {
-    await stay(w.siteId, '2026-09-05', '2026-11-05', { status: 'tentative' })
+  // 10/5 (Nic), on RV 10 and RV 11 — month stays sold by pay link, not paid
+  // yet: "We've invoiced for that spot and it's on the schedule. So we are
+  // billing Mountain View for it either way."
+  it('RV 10 and RV 11: a month stay on the schedule whose guest has not paid (tentative) is a space all the same', async () => {
+    await stay(w.siteId, '2026-10-01', '2026-11-01', { status: 'tentative' })
+    await stay(w.site2Id, '2026-09-15', '2026-11-15', { status: 'tentative' })
+    const b = await octoberBill()
+    expect(b.monthStays).toBe(2)
+    expect(b.total).toBe(2)
+  })
+
+  // 10/5 (review): a booking-site checkout hold is a guest on the card page,
+  // nothing invoiced — counting it would bill the month for a checkout that
+  // may be abandoned, and the bill is never lowered after.
+  it('a booking-site checkout hold is not on the schedule — in progress or lapsed — until the guest pays', async () => {
+    const s = await stay(w.siteId, '2026-10-01', '2026-11-01', { status: 'tentative' })
+    await db.query(`UPDATE unit_bookings SET hold_expires_at = now() - INTERVAL '5 minutes' WHERE id = $1`, [s])
+    expect((await octoberBill()).total).toBe(0)
+    await db.query(`UPDATE unit_bookings SET hold_expires_at = now() + INTERVAL '20 minutes' WHERE id = $1`, [s])
+    expect((await octoberBill()).total).toBe(0)
+    // Paid: the timer is cleared and the stay is confirmed — a space.
+    await db.query(`UPDATE unit_bookings SET hold_expires_at = NULL, status = 'confirmed', deposit_paid_at = now() WHERE id = $1`, [s])
+    expect((await octoberBill()).total).toBe(1)
+  })
+
+  it('a tentative month stay cancelled before its arrival day is not counted', async () => {
+    await stay(w.siteId, '2026-10-10', '2026-11-10', { status: 'cancelled', cancelledAt: '2026-10-02T12:00:00Z' })
     expect((await octoberBill()).total).toBe(0)
   })
 
@@ -274,6 +299,17 @@ describe('the landlord\'s estimate reads the same rule as the bill', () => {
       const b = await billableUnitsForProperty(c2, w.propertyId, '2026-09-01', '2026-08-01', NIGHTS_AGGREGATION_UNIT_TYPES)
       expect(b.total).toBe(6)                      // the bill agrees
     } finally { c2.release() }
+  })
+
+  it('an unpaid (tentative) month stay is in the estimate, as it is on the bill', async () => {
+    const c = await getClient()
+    const units: string[] = []
+    try {
+      for (let i = 0; i < 6; i++) units.push(await seedUnit(c, { propertyId: w.propertyId, landlordId: w.landlordId, unitType: 'rv_spot' }))
+    } finally { c.release() }
+    for (const u of units) await stay(u, '2026-09-01', '2026-10-01', { status: 'tentative' })
+    const fees = await platformFeesByProperty(w.landlordId, ['2026-09-01'])
+    expect(fees.get(w.propertyId)).toBe(12)      // six spaces at $2, above the floor
   })
 
   it('a lease and a month stay on one site are one space in the estimate too', async () => {

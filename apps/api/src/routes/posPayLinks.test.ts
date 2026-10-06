@@ -255,6 +255,29 @@ describe('when it is paid', () => {
     expect((await db.query(`SELECT 1 FROM notifications WHERE landlord_id = $1`, [f.landlordId])).rows).toHaveLength(1)
   })
 
+  // 10/5 (Nic): "money movement is the end of onboarding."
+  it('a paid link ends the landlord\'s free onboarding window; so does a payment that lands and is held', async () => {
+    const startsThisMonth = async (landlordId: string) => (await db.query(
+      `SELECT COALESCE(billing_starts_at = date_trunc('month', now())::date, false) AS ok FROM landlords WHERE id = $1`,
+      [landlordId])).rows[0].ok
+    const f = await seed()
+    await db.query(`UPDATE landlords SET billing_starts_at = NULL WHERE id = $1`, [f.landlordId])
+    const link = (await create(f, { items: [{ id: f.itemId, name: 'Propane', qty: 1, price: 20 }],
+      customer: { email: 'pat@example.com' } })).body.data
+    expect(await startsThisMonth(f.landlordId)).toBe(false)
+    expect((await finalizePayLink(paid(link.id, payLinkCharge(20).charged))).recorded).toBe(true)
+    expect(await startsThisMonth(f.landlordId)).toBe(true)
+
+    // A second company (each payout account belongs to one).
+    await db.query(`UPDATE landlords SET stripe_connect_account_id = 'acct_test_paylink_first' WHERE id = $1`, [f.landlordId])
+    const g = await seed()
+    await db.query(`UPDATE landlords SET billing_starts_at = NULL WHERE id = $1`, [g.landlordId])
+    const other = (await create(g, { items: [{ id: g.itemId, name: 'Propane', qty: 1, price: 20 }],
+      customer: { email: 'sam@example.com' } })).body.data
+    expect(await finalizePayLink(paid(other.id, 1, 'pi_test_held'))).toMatchObject({ recorded: false, reason: 'amount mismatch' })
+    expect(await startsThisMonth(g.landlordId)).toBe(true)
+  })
+
   it('a standing link stays open and records every payment', async () => {
     const f = await seed()
     const link = (await create(f, { kind: 'standing', label: 'Dump station',

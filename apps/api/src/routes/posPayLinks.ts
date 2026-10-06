@@ -29,6 +29,7 @@ import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { computeCartTotals } from '../services/posTax'
 import { insertPosSale } from '../services/posSale'
+import { activateBillingForMoneyMoved } from '../services/billingActivation'
 import { recordSaleTowardStay } from '../services/stayPayments'
 import { logger } from '../lib/logger'
 import { replyToProperty } from '../services/replyRouting'
@@ -2381,6 +2382,12 @@ async function holdPayment(q: Q, o: { link: any; paymentIntentId: string; amount
      ON CONFLICT (stripe_payment_intent_id) DO NOTHING RETURNING id`,
     [o.link.landlord_id, o.link.property_id, o.link.id, o.link.booking_id ?? null, o.paymentIntentId, o.reason,
      round2(o.amount), o.payer, o.note.slice(0, 500)])
+  // 10/5 (Nic): "money movement is the end of onboarding" — a payment that
+  // landed and is held is still money through GAM. Not a link for the
+  // background check alone: that is GAM's screening money.
+  if (ins.rows[0] && !(!o.link.booking_id && isFeeOnlyLink(o.link))) {
+    await activateBillingForMoneyMoved(q, [o.link.landlord_id])
+  }
   if (ins.rows[0]) return ins.rows[0].id
   return (await q.query<{ id: string }>(`SELECT id FROM pos_held_payments WHERE stripe_payment_intent_id = $1`, [o.paymentIntentId])).rows[0].id
 }
@@ -2614,6 +2621,9 @@ export async function finalizePayLink(session: {
       paidOnline: true,   // S653: paid by the customer on the link, not at the counter
       discountAmount: reservationPart ? 0 : Number(link.discount_amount), discountReason: null,
       items: saleItems, taxBreakdown,
+      // 10/5: a link for the background check alone is GAM's screening money —
+      // it does not end the landlord's free onboarding window.
+      screeningOnly: !link.booking_id && isFeeOnlyLink(link),
     })
     await client.query(`UPDATE pos_transactions SET pay_link_id = $2 WHERE id = $1`, [tx.id, link.id])
     if (link.kind === 'one_time') {

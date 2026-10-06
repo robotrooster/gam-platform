@@ -64,6 +64,7 @@ import { supersedeEvent } from './creditLedger'
 import { createNotification } from './notifications'
 import { logger } from '../lib/logger'
 import type { ManualPaymentMethod } from '@gam/shared'
+import { activateBillingForMoneyMoved } from './billingActivation'
 
 export interface ConfirmDepositInput {
   bankTransactionId: string
@@ -660,6 +661,9 @@ export async function confirmDepositMatch(
        `Bank deposit posted ${txn.posted_date}${txn.description ? ` (${String(txn.description).slice(0, 120)})` : ''}`,
        input.confirmedByUserId ?? null])
     const receiptId = rem.rows[0].id
+    // 10/5 (Nic): "money movement is the end of onboarding" — a bank deposit
+    // matched to what tenants owe, including any part kept as credit.
+    await activateBillingForMoneyMoved(client, [txn.landlord_id])
     for (const c of toSettle) {
       const m = toCents(c.money_part)
       if (m <= 0) continue

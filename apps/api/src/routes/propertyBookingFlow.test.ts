@@ -123,6 +123,12 @@ describe('POST /book', () => {
     expect(arg.payment_intent_data.transfer_data).toBeUndefined()
     expect(arg.metadata.gam_purpose).toBe('booking_deposit')
     expect(arg.metadata.gam_booking_id).toBe(res.body.data.bookingId)
+    // 10/5 (review): the card page closes with the hold (Stripe's minimum is
+    // 30 minutes; the hold is 30, the page a minute more) — never Stripe's
+    // 24-hour default, which let a guest pay for a hold the sweep had dropped.
+    const left = arg.expires_at - Math.floor(Date.now() / 1000)
+    expect(left).toBeGreaterThanOrEqual(30 * 60)
+    expect(left).toBeLessThanOrEqual(31 * 60 + 5)
   })
 
   it('no landlord Connect → 409 in production', async () => {
@@ -228,6 +234,21 @@ describe('deposit confirmation', () => {
     expect(Number(held[0].amount)).toBe(Math.round((60 - processingFeeFor({ amount: 60, paymentMethod: 'card' })) * 100) / 100)
   })
 
+  // 10/5 (Nic): "money movement is the end of onboarding."
+  it('a deposit paid on the booking site ends the landlord\'s free onboarding window', async () => {
+    const s = await seedSite()
+    await db.query(`UPDATE landlords SET billing_starts_at = NULL WHERE id = $1`, [s.landlordId])
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
+    const id = res.body.data.bookingId
+    const sess = (await db.query<any>('SELECT stripe_checkout_session_id FROM unit_bookings WHERE id=$1', [id])).rows[0].stripe_checkout_session_id
+    const charged = Math.round((60 + processingFeeFor({ amount: 60, paymentMethod: 'card' })) * 100)
+    await confirmBookingDeposit(id, sess, { paymentIntentId: 'pi_onboard', amountTotalCents: charged })
+    const l = (await db.query<any>(
+      `SELECT COALESCE(billing_starts_at = date_trunc('month', now())::date, false) AS ok FROM landlords WHERE id = $1`,
+      [s.landlordId])).rows[0]
+    expect(l.ok).toBe(true)
+  })
+
   it('S648: a paid deposit is held for the landlord, less the card fee, once', async () => {
     const s = await seedSite()
     const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
@@ -240,6 +261,36 @@ describe('deposit confirmation', () => {
     expect(held).toEqual([{ amount: '60.00' }])
     const bk = (await db.query<any>('SELECT stripe_payment_intent_id FROM unit_bookings WHERE id=$1', [id])).rows[0]
     expect(bk.stripe_payment_intent_id).toBe('pi_dep')
+    // A second delivery of a confirmed booking is not a payment after the hold.
+    expect((await db.query(`SELECT 1 FROM admin_notifications WHERE category = 'booking_paid_after_hold'`)).rows).toHaveLength(0)
+  })
+
+  // 10/5 (review): a guest who paid after the sweep dropped the hold. The money
+  // is on GAM's account all the same: the landlord's free onboarding ends, and
+  // a person is told to refund or rebook — never a silent no-op.
+  it('a payment that lands after the hold was dropped ends onboarding and tells a person, once', async () => {
+    const s = await seedSite()
+    await db.query(`UPDATE landlords SET billing_starts_at = NULL WHERE id = $1`, [s.landlordId])
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
+    const id = res.body.data.bookingId
+    const sess = (await db.query<any>('SELECT stripe_checkout_session_id FROM unit_bookings WHERE id=$1', [id])).rows[0].stripe_checkout_session_id
+    await db.query(`UPDATE unit_bookings SET hold_expires_at = now() - INTERVAL '1 minute' WHERE id = $1`, [id])
+    await sweepBookingHoldsAndClaims()
+    const charged = Math.round((60 + processingFeeFor({ amount: 60, paymentMethod: 'card' })) * 100)
+    await confirmBookingDeposit(id, sess, { paymentIntentId: 'pi_late', amountTotalCents: charged })
+    await confirmBookingDeposit(id, sess, { paymentIntentId: 'pi_late', amountTotalCents: charged })
+    const bk = (await db.query<any>('SELECT status, deposit_paid_at FROM unit_bookings WHERE id=$1', [id])).rows[0]
+    expect(bk).toMatchObject({ status: 'cancelled', deposit_paid_at: null })
+    expect((await db.query<any>(
+      `SELECT COALESCE(billing_starts_at = date_trunc('month', now())::date, false) AS ok FROM landlords WHERE id = $1`,
+      [s.landlordId])).rows[0].ok).toBe(true)
+    const told = (await db.query<any>(
+      `SELECT body, context FROM admin_notifications WHERE category = 'booking_paid_after_hold'`)).rows
+    expect(told).toHaveLength(1)
+    expect(told[0].context).toMatchObject({ booking_id: id, stripe_checkout_session_id: sess, stripe_payment_intent_id: 'pi_late' })
+    expect(told[0].body).toMatch(/Refund it in Stripe \(pi_late\)/)
+    // Nothing was recorded as the landlord's.
+    expect((await db.query(`SELECT 1 FROM held_payout_items WHERE landlord_id = $1`, [s.landlordId])).rows).toHaveLength(0)
   })
 })
 
@@ -440,6 +491,23 @@ describe('10/5 long stays on the booking site', () => {
     expect(pay).toEqual([{ toward_stay: '150.00' }])
     const held = (await db.query<any>(`SELECT amount::text FROM held_payout_items WHERE landlord_id = $1`, [s.landlordId])).rows
     expect(held).toEqual([{ amount: '150.00' }])
+  })
+
+  // 10/5 (review): a checkout that carried nothing for the stay — the check
+  // alone — is GAM's screening money, not the company's payers', so it does
+  // not end free onboarding (the line billingActivation draws).
+  it('a checkout for the background check alone does not end the landlord\'s free onboarding', async () => {
+    const s = await seedLongSite()
+    await db.query(`UPDATE properties SET booking_monthly_deposit = 0 WHERE id = $1`, [s.propertyId])
+    await db.query(`UPDATE landlords SET billing_starts_at = NULL WHERE id = $1`, [s.landlordId])
+    const res = await request(buildApp()).post('/api/public/property/sunny/book')
+      .send({ ...guest(plusDays(10), plusDays(75)), stayTerms: 'lease' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data).toMatchObject({ depositAmount: 0, screeningFee: await checkFee() })
+    const id = res.body.data.bookingId
+    await confirmBookingDeposit(id, await sessionOf(id), { paymentIntentId: 'pi_check_only', amountTotalCents: cents(res.body.data.dueNow) })
+    expect((await db.query<any>('SELECT status FROM unit_bookings WHERE id=$1', [id])).rows[0].status).toBe('confirmed')
+    expect((await db.query<any>('SELECT billing_starts_at FROM landlords WHERE id = $1', [s.landlordId])).rows[0].billing_starts_at).toBeNull()
   })
 
   it('a stay of 22–29 nights carries the check but asks nothing', async () => {

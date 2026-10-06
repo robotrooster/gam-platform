@@ -63,7 +63,7 @@
 import { randomUUID } from 'crypto'
 import { getClient, query } from '../db'
 import { chargeLandlord } from '../services/landlordGamAccount'
-import { activateBillingForOccupancy } from '../services/billingActivation'
+import { activateBillingForMoneyMovedIn, activateBillingForOccupancy, moneyMovedMomentsSql } from '../services/billingActivation'
 import { billableUnitsForProperty, feeCountedStaySql, type BillableUnits } from '../services/billableUnits'
 import { stayRevenueInMonthSql } from '../services/platformFee'
 import { NIGHTS_AGGREGATION_UNIT_TYPES, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
@@ -79,6 +79,11 @@ interface AccrualResult {
   skippedPreBilling: number
   /** S637: landlords whose onboarding grace ended because they had occupancy. */
   graceEndedByOccupancy: number
+  /**
+   * 10/5 (Nic): landlords whose onboarding grace ended because money moved
+   * through GAM for them last month or this month and no door had ended it.
+   */
+  graceEndedByMoney: number
   /** S630: payout groups that needed a top-up to reach the monthly floor. */
   connectMinimumsApplied: number
   errors: { property_id: string; error: string }[]
@@ -151,6 +156,7 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
     skippedAlreadyAccrued: 0,
     skippedPreBilling: 0,
     graceEndedByOccupancy: 0,
+    graceEndedByMoney: 0,
     connectMinimumsApplied: 0,
     errors: [],
   }
@@ -164,6 +170,21 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
   // S637: a landlord who had somebody in a spot last month is live, whatever
   // way they were paid. Runs BEFORE the per-property gate below, so the month
   // that proves occupancy is the month that gets billed.
+  //
+  // 10/5 (Nic): "money movement is the end of onboarding." Every door where
+  // money lands ends the window itself (services/billingActivation); this is
+  // the backstop for one that did not, over the two months this bill covers —
+  // last month's nights and this month's spaces. It runs FIRST: money that
+  // moved last month dates the start to last month, earlier than occupancy
+  // this month would.
+  try {
+    const c = await getClient()
+    try {
+      result.graceEndedByMoney = await activateBillingForMoneyMovedIn(c, arrearsIso, addMonth(monthIso))
+    } finally { c.release() }
+  } catch (e: any) {
+    result.errors.push({ property_id: 'money_activation', error: e?.message ?? String(e) })
+  }
   try {
     const c = await getClient()
     try {
@@ -399,9 +420,10 @@ export async function applyConnectAccountMinimums(monthIso: string): Promise<num
  * Cap = billing_grace_until, falling back to first-of-month(created_at) +
  * PLATFORM_FEE_GRACE_CYCLES months when unset (covers any landlord created
  * before the app-code that stamps billing_grace_until at signup). Idempotent:
- * only NULL rows whose cap month has arrived flip. Activation via first settled
- * rent (webhooks.ts) always wins the race — it fills billing_starts_at earlier,
- * so this sweep never touches an already-live landlord.
+ * only NULL rows whose cap month has arrived flip. Activation by money moving
+ * through GAM (10/5: any payment, sale, pay link or booking deposit —
+ * services/billingActivation) always wins the race — it fills billing_starts_at
+ * earlier, so this sweep never touches an already-live landlord.
  *
  * S631 (Nic): the cap now skips a landlord who never STARTED. It used to stamp
  * every account whose window ran out, including someone who signed up, typed a
@@ -431,10 +453,11 @@ export async function applyBillingGraceCaps(now: Date = new Date()): Promise<num
            FROM landlords
           WHERE billing_starts_at IS NULL
             -- S631: never operated → never stamped. Either signal counts.
+            -- 10/5 (Nic): any money through GAM, not only settled rent —
+            -- "money movement is the end of onboarding"
+            -- (services/billingActivation moneyMovedMomentsSql).
             AND (
-              EXISTS (SELECT 1 FROM payments pay
-                       WHERE pay.landlord_id = landlords.id
-                         AND pay.type = 'rent' AND pay.status = 'settled')
+              EXISTS (${moneyMovedMomentsSql('landlords.id', null, null)})
               OR EXISTS (SELECT 1 FROM leases le
                            JOIN units u ON u.id = le.unit_id
                            JOIN properties pr ON pr.id = u.property_id
@@ -703,20 +726,28 @@ async function accrueOneProperty(
 
     // ── No-double-bill onboarding grace (S600) ───────────────────────────
     // A landlord isn't billed until they GO LIVE. billing_starts_at is NULL
-    // during setup/preview (in grace), then set to the current cycle on their
-    // first settled rent (activation), or to the grace cap by the daily
-    // grace-cap cron — whichever fires first. Bill only cycles on/after it.
-    const gate = await client.query<{ ok: boolean }>(
-      `SELECT (billing_starts_at IS NOT NULL AND billing_starts_at <= $2::date) AS ok
+    // during setup/preview (in grace), then set to the month money first moves
+    // through GAM for them (10/5, any kind — services/billingActivation), to
+    // the month they first had occupancy (S637), or to the grace cap by the
+    // daily grace-cap cron — whichever fires first. Bill only cycles on/after it.
+    const gate = await client.query<{ ok: boolean; arrears_ok: boolean }>(
+      `SELECT (billing_starts_at IS NOT NULL AND billing_starts_at <= $2::date) AS ok,
+              (billing_starts_at IS NOT NULL AND billing_starts_at <= $3::date) AS arrears_ok
          FROM landlords WHERE id = $1`,
-      [landlordId, monthIso]
+      [landlordId, monthIso, arrearsIso]
     )
     if (!gate.rows[0]?.ok) {
       await client.query('ROLLBACK')
       return 'pre_billing'
     }
 
-    const f = await figureAccrual(client, propertyId, landlordId, monthIso, arrearsIso)
+    // 10/5: last month's nights ride on this bill only if last month was a
+    // billed month. A landlord whose onboarding ended THIS month (occupancy on
+    // the 1st, or money that moved today) is billed from this month on, never
+    // for the free month before it — the rule the nightly top-up already
+    // applied to a row it creates. This run used to bill those nights anyway.
+    const f = await figureAccrual(client, propertyId, landlordId, monthIso, arrearsIso,
+      gate.rows[0].arrears_ok === true)
 
     // S630: no floor here. A property that earned nothing accrues nothing, and
     // the Connect-account group's minimum is settled once, later, across all of
@@ -783,6 +814,11 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100
 }
 
+/** "2026-10-01" → "2026-11-01". */
+function addMonth(monthIso: string): string {
+  return monthStartOf(addDaysTo(monthStartOf(monthIso), 32))
+}
+
 /** "2026-10-01" → "October 2026", for words a landlord reads. */
 function monthLabel(monthIso: string): string {
   return new Date(`${monthIso.slice(0, 10)}T00:00:00Z`)
@@ -815,6 +851,8 @@ export interface PlatformFeeTopUpResult {
   monthScanned: string
   /** The month's monthly run has not happened yet, so nothing was touched. */
   monthNotYetBilled: boolean
+  /** 10/5: landlords whose onboarding the backstop ended tonight (money moved, no door ended it). */
+  graceEndedByMoney: number
   propertiesRaised: number
   propertiesCreated: number
   /** What was added to landlords' bills tonight, in dollars. */
@@ -836,9 +874,25 @@ export async function processPlatformFeeTopUp(now: Date = new Date()): Promise<P
   const monthIso   = monthStartOf(dateIn(null, now))
   const arrearsIso = monthStartOf(addDaysTo(monthIso, -1))
   const result: PlatformFeeTopUpResult = {
-    monthScanned: monthIso, monthNotYetBilled: false,
+    monthScanned: monthIso, monthNotYetBilled: false, graceEndedByMoney: 0,
     propertiesRaised: 0, propertiesCreated: 0, amountCharged: 0,
     tenantPayerSkipped: [], errors: [],
+  }
+
+  // 10/5 (Nic): "money movement is the end of onboarding." Each door where
+  // money lands ends the window itself (services/billingActivation); this is
+  // the backstop for one that did not, so a landlord whose payers' money moved
+  // through GAM this month (or last, if the 1st's run missed it) is in the
+  // groups below tonight and billed for this month's spaces. It never reaches
+  // further back than last month, and a row this creates carries last month's
+  // nights only when that month is the one the money dates them to.
+  try {
+    const c = await getClient()
+    try {
+      result.graceEndedByMoney = await activateBillingForMoneyMovedIn(c, arrearsIso, addMonth(monthIso))
+    } finally { c.release() }
+  } catch (e: any) {
+    result.errors.push({ property_id: 'money_activation', error: e?.message ?? String(e) })
   }
 
   // Never before the month's monthly run (1:30 am Phoenix on the 1st). The run

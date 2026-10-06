@@ -132,15 +132,37 @@ describe('the nightly top-up bills a space occupied after the 1st, for this mont
     }])
   })
 
-  it('RV 10 and RV 11: two month stays that arrive mid-month are two more spaces', async () => {
+  it('RV 10 and RV 11: month stays that arrive mid-month are more spaces — paid or not', async () => {
     const p = await park(6)
     await processPlatformFeeAccrual(OCT_RUN)
     await addMonthStay(p, '2026-10-03', '2026-11-03')
     await addMonthStay(p, '2026-10-04', '2026-12-04')
-    await addMonthStay(p, '2026-10-04', '2026-11-04', 'tentative')   // an unpaid hold is not occupancy
+    // 10/5 (Nic): sold by pay link, the link not paid yet — "We've invoiced
+    // for that spot and it's on the schedule. So we are billing Mountain View
+    // for it either way."
+    await addMonthStay(p, '2026-10-04', '2026-11-04', 'tentative')
     const r = await processPlatformFeeTopUp(OCT_5_NIGHT)
-    expect(r.amountCharged).toBe(4)
-    expect((await rowsFor(p.propertyId))[0]).toMatchObject({ total_billable: 8, total_amount: '16.00' })
+    expect(r.amountCharged).toBe(6)
+    expect((await rowsFor(p.propertyId))[0]).toMatchObject({ total_billable: 9, total_amount: '18.00' })
+  })
+
+  it('a tentative month stay on the schedule on the 1st is on the 1st\'s bill', async () => {
+    const p = await park(6)
+    await addMonthStay(p, '2026-09-20', '2026-11-20', 'tentative')
+    await processPlatformFeeAccrual(OCT_RUN)
+    expect((await rowsFor(p.propertyId))[0]).toMatchObject({ total_billable: 7, total_amount: '14.00' })
+    const r = await processPlatformFeeTopUp(OCT_5_NIGHT)
+    expect(r.amountCharged).toBe(0)                     // counted once
+  })
+
+  it('a month stay cancelled before its arrival day adds nothing', async () => {
+    const p = await park(6)
+    await processPlatformFeeAccrual(OCT_RUN)
+    await addMonthStay(p, '2026-10-10', '2026-11-10', 'cancelled')
+    await db.query(`UPDATE unit_bookings SET cancelled_at = '2026-10-04T12:00:00Z' WHERE landlord_id = $1`, [p.landlordId])
+    const r = await processPlatformFeeTopUp(OCT_5_NIGHT)
+    expect(r.amountCharged).toBe(0)
+    expect((await rowsFor(p.propertyId))[0]).toMatchObject({ total_billable: 6, total_amount: '12.00' })
   })
 
   it('running every night, or twice in a night, adds nothing new', async () => {
@@ -363,6 +385,134 @@ describe('onboarding grace', () => {
       `SELECT long_term_unit_count, short_stay_nights, total_billable FROM platform_fee_accruals
         WHERE property_id = $1`, [g.propertyId])).rows[0]
     expect(row).toEqual({ long_term_unit_count: 1, short_stay_nights: 0, total_billable: 1 })
+  })
+})
+
+// 10/5 (Nic): "The onboarding period is until money processes through the
+// system... money movement is the end of onboarding." Every door where money
+// lands ends the window itself (services/billingActivation); these are the
+// backstop in the two runs, for a door the code missed.
+describe('money moving through GAM ends onboarding — the backstop in the runs', () => {
+  async function inGrace(): Promise<Park> {
+    const g = await park(0)
+    await db.query(`UPDATE landlords SET billing_starts_at = NULL WHERE id = $1`, [g.landlordId])
+    return g
+  }
+  /** A register sale written straight to the table — as if its door had been missed. */
+  async function saleAt(g: Park, at: string, o: { method?: string; status?: string; total?: number } = {}): Promise<void> {
+    await db.query(
+      `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, total, status, property_id, created_at)
+       VALUES ($1, $2, $3, $4, $4, $5, $6, $7::timestamptz)`,
+      [g.landlordId, g.ownerUserId, o.method ?? 'cash', o.total ?? 25, o.status ?? 'completed', g.propertyId, at])
+  }
+  async function nightsIn(g: Park, checkIn: string, checkOut: string): Promise<void> {
+    const c = await getClient()
+    try {
+      const unitId = await seedUnit(c, { propertyId: g.propertyId, landlordId: g.landlordId, unitType: 'rv_spot' })
+      await c.query(
+        `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, check_in, check_out, status, lease_type, total_amount)
+         VALUES ($1, $2, 'Night Guest', $3, $4, 'checked_out', 'nightly', 800)`,
+        [unitId, g.landlordId, checkIn, checkOut])
+    } finally { c.release() }
+  }
+  const startsOf = async (g: Park) => (await db.query<{ s: string | null }>(
+    `SELECT to_char(billing_starts_at, 'YYYY-MM-DD') AS s FROM landlords WHERE id = $1`, [g.landlordId])).rows[0].s
+
+  it('the nightly top-up: money this month ends the window and bills this month\'s spaces — never the free month before', async () => {
+    await park(6)                                       // opens the month
+    const g = await inGrace()
+    await nightsIn(g, '2026-09-05', '2026-09-25')       // September, still free
+    await processPlatformFeeAccrual(OCT_RUN)
+    expect(await rowsFor(g.propertyId)).toEqual([])
+    await addLease(g, '2026-10-02')
+    await saleAt(g, '2026-10-03T17:00:00Z')             // a utility or register payment on Oct 3
+    const r = await processPlatformFeeTopUp(OCT_5_NIGHT)
+    expect(r.graceEndedByMoney).toBe(1)
+    expect(await startsOf(g)).toBe('2026-10-01')
+    expect(r.propertiesCreated).toBe(1)
+    const row = (await db.query<{ long_term_unit_count: number; short_stay_nights: number }>(
+      `SELECT long_term_unit_count, short_stay_nights FROM platform_fee_accruals WHERE property_id = $1`,
+      [g.propertyId])).rows[0]
+    expect(row).toEqual({ long_term_unit_count: 1, short_stay_nights: 0 })
+    expect(sum(await chargesFor(g.landlordId))).toBe(10) // one space, at the payout account's floor
+    // Idempotent: tomorrow ends nothing again and adds nothing.
+    const again = await processPlatformFeeTopUp(OCT_6_NIGHT)
+    expect(again.graceEndedByMoney).toBe(0)
+    expect(sum(await chargesFor(g.landlordId))).toBe(10)
+  })
+
+  it('the monthly run: money last month dates the start to last month; nothing before it is billed', async () => {
+    const g = await inGrace()
+    await nightsIn(g, '2026-08-05', '2026-08-25')       // August: free, never billed
+    await nightsIn(g, '2026-09-02', '2026-09-12')       // September: 10 nights
+    await saleAt(g, '2026-09-20T17:00:00Z')
+    await addLease(g, '2026-09-01')
+    const r = await processPlatformFeeAccrual(OCT_RUN)
+    expect(r.graceEndedByMoney).toBe(1)
+    expect(await startsOf(g)).toBe('2026-09-01')
+    const rows = (await db.query<{ month: string; long_term_unit_count: number; short_stay_nights: number }>(
+      `SELECT to_char(accrual_month, 'YYYY-MM-DD') AS month, long_term_unit_count, short_stay_nights
+         FROM platform_fee_accruals WHERE property_id = $1`, [g.propertyId])).rows
+    // October's space, and September's nights (a month past onboarding) — no
+    // September or August row, and no August nights.
+    expect(rows).toEqual([{ month: '2026-10-01', long_term_unit_count: 1, short_stay_nights: 10 }])
+  })
+
+  it('money from before last month is not the runs\' to date; voided, store-account and zero sales never count', async () => {
+    const g = await inGrace()
+    await saleAt(g, '2026-08-20T17:00:00Z')             // too far back for the backstop
+    await saleAt(g, '2026-10-01T15:00:00Z', { status: 'voided' })
+    await saleAt(g, '2026-10-01T15:00:00Z', { method: 'charge' })
+    const r = await processPlatformFeeAccrual(OCT_RUN)
+    expect(r.graceEndedByMoney).toBe(0)
+    expect(await startsOf(g)).toBeNull()
+  })
+
+  it('a reopened row paid again, a prior-arrangement mark, an imported payment and a bill paid with credit do not end it', async () => {
+    await park(1)                                       // opens the month
+    const g = await inGrace()
+    const c = await getClient()
+    try {
+      const unitId = await seedUnit(c, { propertyId: g.propertyId, landlordId: g.landlordId })
+      let day = 0
+      const row = (extra: string, vals: string) => c.query(
+        `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at${extra})
+         VALUES ($1, $2, $3, 'rent', 500, 'settled', 'RENT', DATE '2026-10-01' + $4::int, '2026-10-02T17:00:00Z'${vals}) RETURNING id`,
+        [unitId, g.tenantId, g.landlordId, day++])
+      const original = (await row('', '')).rows[0].id
+      await c.query(`UPDATE payments SET status = 'returned', settled_at = NULL WHERE id = $1`, [original])
+      const rev = (await c.query<{ id: string }>(
+        `INSERT INTO payment_reversals (payment_id, reversal_type, reversed_amount, stripe_event_id, raw_event)
+         VALUES ($1, 'card_dispute', 500, 'evt_backstop', '{}'::jsonb) RETURNING id`, [original])).rows[0].id
+      await row(', reversal_id', `, '${rev}'`)
+      await row(', manual_method', `, 'prior_arrangement'`)
+      await row(', import_source', `, 'buildium'`)
+      await row(', issued_credit_amount', `, 500`)
+    } finally { c.release() }
+    expect((await processPlatformFeeAccrual(OCT_RUN)).graceEndedByMoney).toBe(0)
+    expect((await processPlatformFeeTopUp(OCT_5_NIGHT)).graceEndedByMoney).toBe(0)
+    expect(await startsOf(g)).toBeNull()
+  })
+
+  it('a park whose only occupancy is month stays — paid or not — leaves onboarding on the 1st', async () => {
+    const g = await inGrace()
+    await addMonthStay(g, '2026-09-15', '2026-11-15', 'tentative')
+    const r = await processPlatformFeeAccrual(OCT_RUN)
+    expect(r.graceEndedByOccupancy).toBe(1)
+    expect(await startsOf(g)).toBe('2026-10-01')
+    expect((await rowsFor(g.propertyId))[0]).toMatchObject({ month: '2026-10-01', total_billable: 1, total_amount: '10.00' })
+  })
+
+  it('a landlord whose onboarding ends on the 1st by occupancy is not billed the free month\'s nights', async () => {
+    const g = await inGrace()
+    await nightsIn(g, '2026-09-05', '2026-09-25')
+    await addLease(g, '2026-09-28')
+    await processPlatformFeeAccrual(OCT_RUN)
+    expect(await startsOf(g)).toBe('2026-10-01')
+    const row = (await db.query<{ long_term_unit_count: number; short_stay_nights: number }>(
+      `SELECT long_term_unit_count, short_stay_nights FROM platform_fee_accruals WHERE property_id = $1`,
+      [g.propertyId])).rows[0]
+    expect(row).toEqual({ long_term_unit_count: 1, short_stay_nights: 0 })
   })
 })
 

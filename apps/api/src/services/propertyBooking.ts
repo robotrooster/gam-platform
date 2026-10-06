@@ -17,6 +17,7 @@ import {
   stayNeeds, chooseStayTerms, recordScreeningPrepayment, type StayNeeds, type RecordedPrepayment,
 } from './stayTerms'
 import { LEASE_OR_STAY_WORDS, dueNowFor, firstStayMonth, leaseFromStay, type DueNow } from './propertyBookingQuote'
+import { activateBillingForMoneyMoved } from './billingActivation'
 
 // ============================================================
 // S517 / Walkthrough #11 — public property booking + waitlist.
@@ -413,6 +414,14 @@ async function createSiteCheckoutSession(o: {
     customer_email: o.guestEmail,
     success_url: o.successUrl,
     cancel_url: o.cancelUrl,
+    // 10/5: the card page closes when the hold does. Stripe's default is 24
+    // hours, while the sweep cancels the hold after HOLD_MINUTES — a guest who
+    // paid after that was charged on GAM's account for a booking that no
+    // longer existed, and nothing recorded the money. Stripe needs at least 30
+    // minutes, so this is the hold plus a minute; a payment in that last
+    // minute (or a webhook that arrives after the sweep) is caught by
+    // confirmBookingDeposit's paid-after-the-hold path.
+    expires_at: Math.floor(Date.now() / 1000) + HOLD_MINUTES * 60 + 60,
   })
   if (!session.url) throw new AppError(500, 'Stripe returned a Checkout Session with no URL')
   return { sessionId: session.id, hostedUrl: session.url }
@@ -619,6 +628,51 @@ async function screeningCarried(
 }
 
 /**
+ * 10/5 — a booking-site payment that landed after its hold was gone: the sweep
+ * cancelled the booking (the guest paid after HOLD_MINUTES), or it was
+ * cancelled another way, before the webhook arrived. The guest's money is on
+ * GAM's account all the same, so (Nic: "money movement is the end of
+ * onboarding") the landlord's free window ends when any of it was for the
+ * stay, and a person is told to give it back or rebook the guest — the money
+ * is never left without a word. A booking already confirmed (a webhook
+ * delivered twice) is not this, and nothing happens.
+ */
+async function paidAfterTheHold(
+  client: PoolClient, bookingId: string, sessionId: string,
+  paymentIntentId: string | null, chargedCents: number,
+): Promise<void> {
+  const r = (await client.query<{ landlord_id: string; status: string; deposit_paid: boolean; deposit_amount: string | null; guest_name: string | null; guest_email: string | null }>(
+    `SELECT landlord_id, status, deposit_paid_at IS NOT NULL AS deposit_paid, deposit_amount::text AS deposit_amount,
+            guest_name, guest_email
+       FROM unit_bookings WHERE id = $1 AND stripe_checkout_session_id = $2`, [bookingId, sessionId])).rows[0]
+  if (!r || r.deposit_paid || r.status === 'confirmed') return
+  // Part of it was for the stay (a checkout for the background check alone
+  // carries no stay part, and that money is GAM's).
+  if (Number(r.deposit_amount ?? 0) > 0) {
+    await activateBillingForMoneyMoved(client, [r.landlord_id])
+  }
+  const seen = await client.query(
+    `SELECT 1 FROM admin_notifications WHERE category = 'booking_paid_after_hold' AND context->>'stripe_checkout_session_id' = $1
+     UNION ALL
+     SELECT 1 FROM admin_notifications_archive WHERE category = 'booking_paid_after_hold' AND context->>'stripe_checkout_session_id' = $1
+     LIMIT 1`, [sessionId])
+  logger.error({ bookingId, sessionId, paymentIntentId, chargedCents, status: r.status },
+    '[propertyBooking] a booking-site payment landed after the hold was gone — nothing recorded; a person must refund or rebook')
+  if (seen.rows.length) return
+  const { createAdminNotification } = await import('./adminNotifications')
+  await createAdminNotification({
+    severity: 'warn',
+    category: 'booking_paid_after_hold',
+    title: `A guest paid for a booking that was already ${r.status === 'cancelled' ? 'cancelled' : r.status}`,
+    body: `${r.guest_name ?? 'A guest'}${r.guest_email ? ` (${r.guest_email})` : ''} paid $${(chargedCents / 100).toFixed(2)} on the booking site ` +
+      `after the hold on their dates was gone. The money is on GAM's account and nothing was recorded for it. ` +
+      `Refund it in Stripe (${paymentIntentId ?? sessionId}), or book the guest and record the payment.`,
+    context: { booking_id: bookingId, stripe_checkout_session_id: sessionId, stripe_payment_intent_id: paymentIntentId,
+               landlord_id: r.landlord_id, charged: (chargedCents / 100).toFixed(2) },
+  })
+}
+
+/**
  * Mark a booking's deposit paid + confirm it (webhook-driven, idempotent).
  * S648: the deposit is GAM's to hold until the landlord's weekly payout; the
  * held item is written with the confirmation so neither happens without the
@@ -661,6 +715,9 @@ export async function confirmBookingDeposit(
                   b.guest_email, b.tenant_id, u.property_id`,
       [bookingId, sessionId, paid?.paymentIntentId ?? null])).rows[0]
     confirmed = b ?? null
+    if (!b && paid && chargedCents > 0) {
+      await paidAfterTheHold(client, bookingId, sessionId, paid.paymentIntentId, chargedCents)
+    }
     if (b && paid) {
       const deposit = Number(b.deposit_amount ?? 0)
       const charged = chargedCents / 100
@@ -674,6 +731,14 @@ export async function confirmBookingDeposit(
         logger.error({ bookingId, deposit, screening, cardFee, got: chargedCents }, '[propertyBooking] deposit amount mismatch — holding what was charged, less the card fee')
       }
       const held = round2(charged - cardFee - screening)
+      // 10/5 (Nic): "money movement is the end of onboarding" — a guest's
+      // payment toward a stay on the booking site ends the landlord's free
+      // onboarding window. Only the stay's share: a checkout that carried
+      // nothing but the background check is GAM's screening money, not the
+      // company's payers' (the same line billingActivation draws).
+      if (held > 0) {
+        await activateBillingForMoneyMoved(client, [b.landlord_id])
+      }
       if (held > 0) {
         await recordHeldItem({
           landlordId: b.landlord_id, sourceType: 'booking_deposit', sourceId: bookingId,

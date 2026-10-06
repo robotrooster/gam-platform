@@ -25,6 +25,7 @@ import { AppError } from '../middleware/errorHandler'
 import { lockHousehold } from './moneyPredicates'
 import { createPaidAhead, runWholeBillCheckAfterCommit } from './creditUse'
 import { settleManualRentPayment, deskQuote } from './manualPaymentSettle'
+import { activateBillingForMoneyMoved } from './billingActivation'
 
 export interface PostPaymentInput {
   tenantId: string
@@ -124,6 +125,9 @@ export async function postTenantPayment(client: PoolClient, input: PostPaymentIn
     [input.tenantId, lease.id, lease.landlord_id, toDollars(amount).toFixed(2),
      input.method, input.receivedAt ?? null, input.reference || null, input.notes || null, input.postedBy])
   const remittanceId = rem.rows[0].id
+  // 10/5 (Nic): "money movement is the end of onboarding" — money posted
+  // ahead with nothing owed yet still moved through GAM.
+  await activateBillingForMoneyMoved(client, [lease.landlord_id])
   const creditId = await createPaidAhead(client, {
     leaseId: lease.id, tenantId: input.tenantId, amount: toDollars(amount), fundedBy: 'landlord',
     receivedAt: input.receivedAt ?? new Date(), sourceRemittanceId: remittanceId,

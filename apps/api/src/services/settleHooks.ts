@@ -3,8 +3,9 @@
 //
 // The Stripe webhook and the desk (services/manualPaymentSettle) each grew their
 // own copy of "what happens once money has landed": the landlord goes live on
-// their first settled rent (S600/S637), the tenant's payment history gets its
-// on-time or late mark (S652), and the person who paid gets a receipt (S637).
+// their first money through GAM (S600/S637; 10/5 any kind, not only rent), the
+// tenant's payment history gets its on-time or late mark (S652), and the person
+// who paid gets a receipt (S637).
 // The money plan adds five more settle paths (credit-only, whole-bill, FlexPay
 // cover, bank-deposit match, posted payment); a seventh copy of each step would
 // drift the way the first two already had (the desk marked reopened rows, the
@@ -35,7 +36,7 @@
 import type { PoolClient } from 'pg'
 import { CREDIT_EVENT_TYPES } from '@gam/shared'
 import type { CreditAttestationSource } from '@gam/shared'
-import { activateBillingForSettledRent } from './billingActivation'
+import { activateBillingForSettledPayments } from './billingActivation'
 import { emitPaymentSettledEvent } from './creditLedgerEmitters'
 import type { ReceiptOpts } from './paymentReceipt'
 import { logger } from '../lib/logger'
@@ -61,7 +62,7 @@ export interface AfterRowsSettledContext {
 export interface AfterRowsSettledResult {
   /** The passed rows that are settled; everything below ran for these only. */
   settledIds: string[]
-  /** Landlords whose billing this settle started (their first settled rent). */
+  /** Landlords whose billing this settle started (10/5: their first money through GAM, any kind). */
   billingActivated: number
   /** payment_received_* marks written (rent and utility rows, reopened rows excluded). */
   eventsEmitted: number
@@ -77,9 +78,12 @@ const PAYMENT_MARK_TYPES: readonly string[] = CREDIT_EVENT_TYPES.filter(t => t.s
 /**
  * Run the post-settle steps for rows the caller just settled in this
  * transaction (see THE CONTRACT above):
- *   1. activateBillingForSettledRent: the landlord's first settled rent ends
- *      their onboarding grace (S600). Reopened rows are skipped: their landlord
- *      went live when the original row settled. Starts a landlord only once.
+ *   1. activateBillingForSettledPayments: the landlord's first money through
+ *      GAM ends their onboarding grace — 10/5 (Nic), any kind of payment, not
+ *      only rent ("Somebody's only paying utilities, that's the landlord
+ *      doesn't have free onboarding"). Reopened rows are skipped: their
+ *      landlord went live when the original row settled. So is a row paid
+ *      wholly by account credit (no new money). Starts a landlord only once.
  *   2. emitPaymentSettledEvent for each rent and utility row with a tenant: the
  *      on-time / late mark (S652), on the property's calendar, with the
  *      attestation the caller names. Reopened rows (paid again after a dispute
@@ -124,8 +128,8 @@ export async function afterRowsSettled(
   }
 
   const fresh = rows.filter(r => !r.reversal_id)
-  const billingActivated = await activateBillingForSettledRent(
-    client, fresh.filter(r => r.type === 'rent').map(r => r.id))
+  // 10/5 (Nic): "money movement is the end of onboarding" — every type.
+  const billingActivated = await activateBillingForSettledPayments(client, fresh.map(r => r.id))
 
   const markable = fresh.filter(r => r.tenant_id && r.due_date && (r.type === 'rent' || r.type === 'utility'))
   const marked = new Set(markable.length === 0 ? [] : (await client.query<{ payment_id: string }>(
