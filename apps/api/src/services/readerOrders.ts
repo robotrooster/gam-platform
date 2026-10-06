@@ -325,5 +325,10 @@ export async function reconcileReaderOrders(propertyId: string, seen: Map<string
       logger.info({ orderId: o.id, readerId: reader.stripe_reader_id, inUse }, '[reader-order] matched to its reader')
     }
   }
+  // 10/5: an order matched after a month has turned owes that month's piece now
+  // ("the first of each month following shipment", Nic) — the monthly job only
+  // runs on the 1st, so without this a reader that shipped in September and was
+  // matched in October waited until November and was charged two pieces at once.
+  if (moved) await raiseDueInstallments()
   return moved
 }

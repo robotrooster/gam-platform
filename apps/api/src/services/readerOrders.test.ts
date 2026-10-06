@@ -148,6 +148,20 @@ describe('the order finds its reader — nobody types a serial', () => {
     expect(await raiseDueInstallments(next)).toBe(1)
   })
 
+  it('an order matched after its ship month charges the piece already due at once — not two on the next 1st', async () => {
+    const w = await world(); const o = await placed(w)
+    // Ordered and shipped last month; the reader is first matched now.
+    await db.query(`UPDATE pos_reader_orders SET ordered_at = date_trunc('month', NOW()) - interval '20 days',
+                                                created_at = date_trunc('month', NOW()) - interval '20 days' WHERE id = $1`, [o.id])
+    await db.query(`INSERT INTO pos_terminal_readers (landlord_id, property_id, stripe_reader_id, nickname, created_at)
+                    VALUES ($1,$2,'tmr_mv','Desk', date_trunc('month', NOW()) - interval '15 days')`, [w.landlordId, w.propertyId])
+    stripeReaders.mockImplementation(async () => ({ data: [{ id: 'tmr_mv', serial_number: 'S1', label: null, status: null, last_seen_at: null }] }))
+    await syncReadersFromStripe(w.landlordId, w.propertyId)
+    expect((await orderRow(o.id)).installments_raised).toBe(1)
+    const { rows } = await db.query(`SELECT amount::text AS amount FROM landlord_gam_charges WHERE landlord_id = $1 AND kind = 'device_installment'`, [w.landlordId])
+    expect(rows.map((r: any) => r.amount)).toEqual(['87.50'])
+  })
+
   it('once Stripe has seen it switched on, the order is done and the morning email stays quiet', async () => {
     const w = await world(); const o = await placed(w)
     stripeReaders.mockImplementation(async () => ({ data: [{ id: 'tmr_mv', serial_number: 'S1', label: 'Front desk', status: 'online', last_seen_at: Date.now() }] }))
