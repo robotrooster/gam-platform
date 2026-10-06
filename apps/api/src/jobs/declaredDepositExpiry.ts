@@ -15,11 +15,13 @@
 // that they did not make it, because we genuinely cannot tell those apart.
 
 import { DateTime } from 'luxon'
+import type { PoolClient } from 'pg'
 import { query } from '../db'
 import { createNotification } from '../services/notifications'
 import { logger } from '../lib/logger'
 import { DECLARATION_EXPIRY_DAYS } from '../routes/declaredDeposits'
 import { tellLandlordAtStrikeLimit } from '../services/declaredDepositTrust'
+import { declarationReachesSql } from '../services/bankDepositMatch'
 
 export interface ExpirySweepResult {
   expired: number
@@ -176,35 +178,144 @@ export async function resolveReportsRecordedByLandlord(
   for (const p of pairs) {
     if (doneReports.has(p.declaration_id) || usedReceipts.has(p.remittance_id)) continue
     try {
-      const word = p.payment_method === 'money_order' ? 'money order'
-        : p.payment_method === 'bank_deposit' ? 'bank deposit' : p.payment_method
+      const word = receiptMethodWord(p.payment_method)
       const row = await query<{ id: string }>(
         `UPDATE tenant_declared_deposits
             SET status = 'recorded', recorded_remittance_id = $2, confirmed_at = NOW(),
                 resolution_note = $3, updated_at = NOW()
           WHERE id = $1 AND status = 'pending'
           RETURNING id`,
-        [p.declaration_id, p.remittance_id,
-         `Recorded by your landlord: a $${Number(p.receipt_amount).toFixed(2)} ${word} payment on ${p.recorded_on}.`])
+        [p.declaration_id, p.remittance_id, recordedReportNote(p.receipt_amount, word, p.recorded_on)])
       doneReports.add(p.declaration_id)
       usedReceipts.add(p.remittance_id)
       if (row.length === 0) continue
       out.recorded++
-      const t = await query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id = $1`, [p.tenant_id])
-      if (t[0]?.user_id) {
-        await createNotification({
-          userId: t[0].user_id,
-          type: 'payment_recorded',
-          title: 'Your landlord recorded your payment',
-          body: `Your landlord recorded a $${Number(p.receipt_amount).toFixed(2)} ${word} payment on ${p.recorded_on}, which covers the $${Number(p.amount).toFixed(2)} deposit you reported on ${p.declared_date}. Your report is closed — there is nothing else to do.`,
-          actionUrl: '/payments',
-        })
-      }
+      await tellTenantReportRecorded({
+        tenantId: p.tenant_id, receiptAmount: p.receipt_amount, word, recordedOn: p.recorded_on,
+        reportAmount: p.amount, declaredDate: p.declared_date,
+      })
     } catch (e) {
       out.errors.push(e instanceof Error ? e.message : String(e))
     }
   }
   return out
+}
+
+/** How a receipt was paid, in words (never the raw value). */
+function receiptMethodWord(m: string): string {
+  return m === 'money_order' ? 'money order' : m === 'bank_deposit' ? 'bank deposit' : m
+}
+
+/** The note a report closed by the landlord's recorded payment carries. */
+function recordedReportNote(receiptAmount: string | number, word: string, recordedOn: string): string {
+  return `Recorded by your landlord: a $${Number(receiptAmount).toFixed(2)} ${word} payment on ${recordedOn}.`
+}
+
+/** The tenant hears their report was closed by the landlord's recorded payment. */
+export async function tellTenantReportRecorded(a: {
+  tenantId: string; receiptAmount: string | number; word: string; recordedOn: string
+  reportAmount: string | number; declaredDate: string
+}): Promise<void> {
+  const t = await query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id = $1`, [a.tenantId])
+  if (!t[0]?.user_id) return
+  await createNotification({
+    userId: t[0].user_id,
+    type: 'payment_recorded',
+    title: 'Your landlord recorded your payment',
+    body: `Your landlord recorded a $${Number(a.receiptAmount).toFixed(2)} ${a.word} payment on ${a.recordedOn}, which covers the $${Number(a.reportAmount).toFixed(2)} deposit you reported on ${a.declaredDate}. Your report is closed — there is nothing else to do.`,
+    actionUrl: '/payments',
+  })
+}
+
+/** A report closed by a landlord's recorded bank deposit (closeReportForRecordedBankDeposit). */
+export interface ReportClosedByRecording {
+  declarationId: string
+  tenantId: string
+  /** When the tenant made the report. */
+  reportedAt: Date
+  reportAmount: string
+  declaredDate: string
+  receiptAmount: string
+  recordedOn: string
+  /**
+   * The report is for THIS deposit: its date reaches the deposit's date by the
+   * bank-feed match's own reach (bankDepositMatch.declarationReaches). A report
+   * for another deposit can still be closed by this receipt (the sweep's rule),
+   * but it is not this deposit reported the right way.
+   */
+  forThisDeposit: boolean
+  /** The report had expired as "not found" (a strike) before the landlord recorded its deposit. */
+  wasUnconfirmed: boolean
+}
+
+/**
+ * 10/6 (Nic): a BANK DEPOSIT the landlord records closes the tenant's report
+ * of it at once, inside the recording's own transaction — the same rule the
+ * sweep above applies (recordedReceiptMatchSql; a bank deposit closes a report
+ * whether or not GAM reads the bank), done there and then because the
+ * recording has to know whether the tenant reported this deposit themselves
+ * (services/manualPaymentSettle: a deposit the tenant reported before the late
+ * fee posted counts from its own date; one they did not, from the day it was
+ * recorded). Null when there is none. The caller tells the tenant after its
+ * commit (tellTenantReportRecorded).
+ *
+ * WHICH report: the report FOR THIS DEPOSIT first — its date within the
+ * bank-feed match's reach of the deposit's date (declarationReachesSql), the
+ * one closest to it — then the sweep's order (exactly this amount, then the
+ * oldest). A September report the landlord never recorded is not October's
+ * deposit reported (forThisDeposit tells the caller which it was).
+ *
+ * A report for this deposit that already EXPIRED as "not found" (status
+ * 'unconfirmed': GAM reads the company's bank, the feed never showed it within
+ * the week) is this deposit too, now the landlord has found it: it closes as
+ * recorded like a pending one, which also takes back its strike (a strike is
+ * an 'unconfirmed' report — services/declaredDepositTrust). An expired report
+ * for any other deposit is left as it is.
+ */
+export async function closeReportForRecordedBankDeposit(
+  client: PoolClient, receiptId: string, rule: RecordedByLandlordRule = RECORDED_BY_LANDLORD_RULE,
+): Promise<ReportClosedByRecording | null> {
+  const recordedOn = `(r.settled_at AT TIME ZONE ${REPORT_TZ_SQL('d')})::date`
+  const reaches = declarationReachesSql('d.declared_date', recordedOn)
+  const p = (await client.query<{
+    declaration_id: string; tenant_id: string; created_at: Date; amount: string; declared_date: string
+    receipt_amount: string; recorded_on: string; for_this_deposit: boolean; status: string
+  }>(
+    `SELECT d.id AS declaration_id, d.tenant_id, d.created_at, d.amount::text AS amount, d.status,
+            to_char(d.declared_date,'YYYY-MM-DD') AS declared_date,
+            r.amount::text AS receipt_amount,
+            to_char(${recordedOn}, 'YYYY-MM-DD') AS recorded_on,
+            (${reaches}) AS for_this_deposit
+       FROM tenant_declared_deposits d
+       JOIN tenant_remittances r ON ${recordedReceiptMatchSql(rule)}
+      WHERE r.id = $1 AND r.payment_method = 'bank_deposit'
+        AND (d.status = 'pending' OR (d.status = 'unconfirmed' AND ${reaches}))
+      ORDER BY (${reaches}) DESC,
+               (r.amount = d.amount) DESC,
+               CASE WHEN ${reaches} THEN d.declared_date END DESC NULLS LAST,
+               (d.status = 'pending') DESC,
+               d.declared_date, d.created_at, d.id
+      LIMIT 1
+        FOR UPDATE OF d`,
+    [receiptId])).rows[0]
+  if (!p) return null
+  const done = await client.query(
+    `UPDATE tenant_declared_deposits
+        SET status = 'recorded', recorded_remittance_id = $2, confirmed_at = NOW(),
+            resolution_note = $3, updated_at = NOW()
+      WHERE id = $1 AND status = $4`,
+    [p.declaration_id, receiptId, recordedReportNote(p.receipt_amount, receiptMethodWord('bank_deposit'), p.recorded_on),
+     p.status])
+  if ((done.rowCount ?? 0) !== 1) return null
+  if (p.status === 'unconfirmed') {
+    logger.info({ declarationId: p.declaration_id, receiptId },
+      '[declared-deposit] an expired report closed as recorded: the landlord recorded its bank deposit')
+  }
+  return {
+    declarationId: p.declaration_id, tenantId: p.tenant_id, reportedAt: new Date(p.created_at),
+    reportAmount: p.amount, declaredDate: p.declared_date, receiptAmount: p.receipt_amount, recordedOn: p.recorded_on,
+    forThisDeposit: p.for_this_deposit === true, wasUnconfirmed: p.status === 'unconfirmed',
+  }
 }
 
 export async function sweepExpiredDeclarations(

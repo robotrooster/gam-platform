@@ -28,6 +28,7 @@ import {
   type LateFeeAccrualFrom,
 } from '@gam/shared'
 import { registerEngine } from './timezoneCronManager'
+import { deletedLateFeeDates } from '../services/lateFeeDelete'
 import { logger } from '../lib/logger'
 import { lockHousehold } from '../services/moneyPredicates'
 import { settleWholeBillIfCovered, billHouseholdTenant, type WholeBillResult } from '../services/creditUse'
@@ -409,6 +410,10 @@ async function processInvoice(
   `, [inv.invoice_id])
   let existingSum = existingFees.reduce((s, r) => s + Number(r.amount), 0)
   const existingDates = new Set(existingFees.map(r => r.due_date))
+  // 10/6 (Nic): a late fee the landlord deleted on the onboarding bill
+  // (services/lateFeeDelete) is never charged again — its day counts as
+  // charged, at $0, exactly as a zeroed fee's does.
+  for (const d of await deletedLateFeeDates(client, String(inv.invoice_id), inv.due_date)) existingDates.add(d)
 
   // Cap = the lease's OWN stamped cap (late_fee_cap_*), part of the signed doc.
   const capKind = inv.late_fee_cap_type

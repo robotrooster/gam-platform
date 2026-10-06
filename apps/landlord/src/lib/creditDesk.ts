@@ -18,7 +18,7 @@
  */
 import {
   ACH_RETURN_CONFIG, PAYMENT_REVERSAL_TYPE_VALUES, PAYMENT_STATUS_LABEL, MANUAL_PAYMENT_METHOD_WORD,
-  bankReceiptPhotoProblem, DEPOSIT_REFERENCE_LABEL, monthDayLabel,
+  bankReceiptPhotoProblem, DEPOSIT_REFERENCE_LABEL, monthDayLabel, UNREPORTED_DEPOSIT_LATE_LANDLORD_TEXT,
   type ManualPaymentMethod, type PaymentReversalType, type PaymentStatus,
 } from '@gam/shared'
 
@@ -518,6 +518,20 @@ export interface DeskQuote {
   lateFeesOffIfPaidInFull?: number
   /** 10/5: the same, bill by bill — a bill the deposit pays only in part keeps its own. */
   lateFeesOffByBill?: Array<{ invoiceId: string; amount: number }>
+  /**
+   * 10/6 (Nic): how much of lateFeesOffIfPaidInFull is on the onboarding
+   * month's bill — where "Delete the late fee completely (onboarding month)"
+   * applies — and whether this person may tick it (owner / property manager).
+   */
+  onboardingLateFeesOff?: number
+  canDeleteLateFees?: boolean
+}
+
+/** 10/6 (Nic): does the window offer the onboarding box? A bank deposit dated back that takes a late fee off the onboarding bill, for someone who may tick it. */
+export function onboardingLateFeeBoxApplies(
+  q: Pick<DeskQuote, 'onboardingLateFeesOff' | 'canDeleteLateFees'> | null | undefined,
+): boolean {
+  return !!q && q.canDeleteLateFees === true && toCents(q.onboardingLateFeesOff) > 0
 }
 
 /** The desk's answer to "credit available $X": Use, Save, or not asked yet. */
@@ -910,6 +924,10 @@ export function recordedMessage(name: string, r: {
   stillOwed?: number; stillOwedNames?: string[]
   /** 10/5 (Nic): a bank deposit dated back — late fees charged after that day that came off. */
   depositedOn?: string | null; lateFeesUnbilled?: number; lateFeesRefunded?: number
+  /** 10/6 (Nic): the tenant never reported that deposit — the late fee came off, the payment still counts late. */
+  unreportedDepositCountsLate?: boolean
+  /** 10/6 (Nic): the onboarding box was ticked but a late fee could not be deleted — why (it stays at $0.00). */
+  lateFeeDeleteRefusals?: string[]
 }): string {
   const parts: string[] = []
   const settled = toCents(r.amountSettled)
@@ -921,7 +939,21 @@ export function recordedMessage(name: string, r: {
   else if (toCents(r.surplus) > 0 && r.creditId) parts.push(`${money(r.surplus)} kept on their account as credit`)
   if (toCents(r.stillOwed) > 0) return `${parts.join(' — ')} — ${stillOwedText(toCents(r.stillOwed), r.stillOwedNames ?? [])}`
   const feesOff = r.depositedOn ? lateFeesOffText(r.depositedOn, r.lateFeesUnbilled ?? 0, r.lateFeesRefunded ?? 0) : null
-  return parts.join(' — ') + '.' + (feesOff ? ` ${feesOff}` : '')
+  // 10/6 (Nic): said in one line when the tenant never reported the deposit.
+  const said = feesOff && r.unreportedDepositCountsLate ? UNREPORTED_DEPOSIT_LATE_LANDLORD_TEXT : feesOff
+  const refused = lateFeeDeleteRefusalText(r.lateFeeDeleteRefusals)
+  return parts.join(' — ') + '.' + (said ? ` ${said}` : '') + (refused ? ` ${refused}` : '')
+}
+
+/**
+ * 10/6 (Nic): the onboarding box was ticked but the server could not delete a
+ * late fee (most often money is recorded against it). Its own reasons, in its
+ * own plain words, once each; null when nothing was refused.
+ */
+export function lateFeeDeleteRefusalText(refusals: unknown): string | null {
+  const said = [...new Set((Array.isArray(refusals) ? refusals : [])
+    .filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map(x => x.trim()))]
+  return said.length > 0 ? said.join(' ') : null
 }
 
 /**

@@ -5708,6 +5708,30 @@ export function bankDateUsedText(declaredDate: string, bankPostedDate: string): 
     + 'A deposit counts from the day you made it only when the bank shows it that day or the next business day, '
     + `so your payment counts from ${monthDayLabel(bankPostedDate)}, and any late fees up to then stay.`
 }
+/**
+ * 10/6 (Nic): "if the tenant forgets to log the payment and gets a late fee it
+ * counts as late because of recording not that payment was late. The landlord
+ * has to spend their time going to remove the late fee. It needs to just zero
+ * it out, but still count against their on-time payment history because of
+ * that waste of time." What the tenant is told when the landlord found an
+ * unreported deposit and took the late fee off, but the payment still counts
+ * late (services/manualPaymentSettle).
+ */
+export function unreportedDepositLateTenantText(depositedOn: string): string {
+  return `Your landlord found your deposit from ${monthDayLabel(depositedOn)} and took off the late fee. `
+    + 'Because it wasn\'t reported in GAM, it still counts as a late payment on your payment history. '
+    + 'Report your bank deposits in the portal to have them count on time.'
+}
+/** 10/6 (Nic): the same, in one line on the landlord's Record payment result. */
+export const UNREPORTED_DEPOSIT_LATE_LANDLORD_TEXT =
+  'The late fee came off. They didn\'t report this deposit, so it still counts as late on their payment history.'
+/**
+ * 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's
+ * discretion." The box on Record payment / Post a payment (off by default) and
+ * the line under it.
+ */
+export const DELETE_ONBOARDING_LATE_FEE_LABEL = 'Delete the late fee completely (onboarding month)'
+export const DELETE_ONBOARDING_LATE_FEE_HINT = 'Leaves no late fee on their record. Only for the onboarding month.'
 export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> = {
   cash: 'Cash',
   // S607 (Nic): a cashier's check is a CHECK. Deliberately NOT its own value —

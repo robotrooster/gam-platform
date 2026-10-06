@@ -293,8 +293,12 @@ export async function reverseLateFees(
      */
     refundPaid?: boolean
   },
-): Promise<{ unbilled: number; refunded: number; zeroed: DepositSettleUndo['lateFeesZeroed']; refundCreditId: string | null }> {
-  const none = { unbilled: 0, refunded: 0, zeroed: [], refundCreditId: null }
+): Promise<{
+  unbilled: number; refunded: number; zeroed: DepositSettleUndo['lateFeesZeroed']; refundCreditId: string | null
+  /** 10/6: the late fees already paid that this refunded (empty when refundPaid is false). */
+  refundedIds: string[]
+}> {
+  const none = { unbilled: 0, refunded: 0, zeroed: [], refundCreditId: null, refundedIds: [] }
   const cutoff = await lateFeeCutoffDate(client, invoiceId, effectivePaidDate, o.settlingIds)
   if (cutoff === null) return none
 
@@ -353,6 +357,7 @@ export async function reverseLateFees(
     refunded: o.refundPaid === false ? 0 : out.refundAmount,
     zeroed,
     refundCreditId,
+    refundedIds: o.refundPaid === false ? [] : out.reversedTicks.filter(t => t.settled).map(t => t.paymentId),
   }
 }
 
@@ -1140,6 +1145,21 @@ export async function undoDepositMatch(input: {
     const rowIds = snap.rows.map(r => r.paymentId)
     const feeIds = (snap.lateFeesZeroed ?? []).map(z => z.paymentId)
     await lockPaymentRowsById(client, [...rowIds, ...feeIds])
+
+    // 10/6 (Nic): a late fee this match zeroed that the landlord then deleted
+    // (onboarding month only, at their choice — services/lateFeeDelete) is put
+    // back first, exactly as it was deleted (same id, every column), so the
+    // checks and the restore below treat it like any other zeroed fee and give
+    // it back its amount. A delete never touched a payment-history mark: the
+    // marks this match wrote are withdrawn below, as for any undo. Inside this
+    // transaction: a refusal below takes it back out.
+    if (feeIds.length > 0) {
+      const invoiceIds = (await client.query<{ invoice_id: string }>(
+        `SELECT DISTINCT invoice_id::text AS invoice_id FROM payments
+          WHERE id = ANY($1::uuid[]) AND invoice_id IS NOT NULL ORDER BY 1`, [[...rowIds, ...feeIds]])).rows.map(r => r.invoice_id)
+      const { restoreDeletedLateFees } = await import('./lateFeeDelete')
+      await restoreDeletedLateFees(client, { paymentIds: feeIds, invoiceIds, restoredBy: input.undoneBy })
+    }
 
     // ── Has anything changed since? ──────────────────────────────────────────
     const changed = (why: string) => new AppError(409, `${why} Nothing was undone — the match stays as it is.`)

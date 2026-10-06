@@ -530,8 +530,12 @@ describe('a bank deposit dated before a late fee', () => {
     expect(fee).toMatchObject({ amount: 0, status: 'settled' })
     expect(fee.notes).toContain(`Reversed: rent was paid ${dueDay}, before this fee accrued`)
     expect(await row(b.ids[0])).toMatchObject({ status: 'settled', manual_method: 'bank_deposit' })
-    // And the bill counts as paid on time — the deposit's day.
-    expect((await marksOn([b.ids[0]])).map(m => m.event_type)).toEqual(['payment_received_on_time'])
+    // 10/6 (Nic): the tenant never reported this deposit and the fee had
+    // already posted, so the landlord had to find it — the fee is still
+    // zeroed, but the bill counts from the day it was recorded (late), not the
+    // deposit's day (routes/lateFeeDelete.test.ts has the reported case).
+    expect((await marksOn([b.ids[0]])).map(m => m.event_type)).toEqual([expect.stringMatching(/^payment_received_late_/)])
+    expect(res.body.data.unreportedDepositCountsLate).toBe(true)
   })
 
   it('a late fee the tenant already paid comes back as a late-fee refund credit', async () => {

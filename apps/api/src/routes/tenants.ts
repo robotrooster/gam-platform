@@ -2579,6 +2579,25 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
       ORDER BY p.due_date DESC
       LIMIT 36`, [req.params.id, scope, propScope])
 
+    // 10/6 (Nic): "Delete this late fee" on the line of a late fee a reversal
+    // zeroed on the onboarding month's bill — said per line, and only to a
+    // viewer who may delete one (the owner or a property manager:
+    // services/lateFeeDelete). Everyone else gets no flag at all.
+    const zeroedFees = payments.filter((p: any) => p.type === 'late_fee' && Number(p.amount) === 0 && p.status === 'settled')
+    if (scoped && zeroedFees.length > 0) {
+      const { canDeleteLateFees, deletableLateFeeIds } = await import('../services/lateFeeDelete')
+      const owners = await query<{ id: string; landlord_id: string }>(
+        `SELECT id, landlord_id FROM payments WHERE id = ANY($1::uuid[])`, [zeroedFees.map((p: any) => p.id)])
+      const mayFor = owners.filter(o => canDeleteLateFees(req.user, o.landlord_id)).map(o => o.id)
+      if (mayFor.length > 0) {
+        const c = await getClient()
+        try {
+          const ok = await deletableLateFeeIds(c, mayFor)
+          for (const p of payments) if (ok.has(p.id)) p.can_delete_late_fee = true
+        } finally { c.release() }
+      }
+    }
+
     // Lifetime payment stats. S652 (Nic): lateCount is the number of charges
     // the credit ledger recorded as paid past grace — once per charge, the
     // same events the score reads. The old tenants.late_payment_count column

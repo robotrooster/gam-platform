@@ -227,6 +227,63 @@ describe('Bank deposit in the desk window', () => {
     expect(onRecorded.mock.calls[0][0]).toContain('$25.00 in late fees charged after Oct 1 came off — the money was in the bank that day.')
   })
 
+  // 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's discretion."
+  const lateFeeRow = { id: 'f1', leaseId: 'L1', type: 'late_fee', entryDescription: 'LATEFEE', amount: 25, dueDate: '2026-10-06',
+                       creditAlreadyApplied: 0, creditIfUsed: 0, notes: null, unitNumber: 'Lot 7', propertyName: 'Country Acres' }
+  const withFee = () => quote({ rows: [quote().rows[0], lateFeeRow], currentTotal: 625, owedIfUsed: 625, owedIfSaved: 625, fullBalance: 625 })
+  const box = () => [...host.querySelectorAll('label.cd-check')].find(l => /Delete the late fee completely/.test(l.textContent ?? ''))
+
+  it('10/6: on the onboarding bill the box is offered, OFF by default, with its one line — ticked, it is sent', async () => {
+    server.quote = withFee()
+    server.datedQuote = quote({ lateFeesOffIfPaidInFull: 25, onboardingLateFeesOff: 25, canDeleteLateFees: true })
+    server.recordResult = { amountSettled: 600, creditUsed: 0, receiptId: 'rem_1', lateFeesUnbilled: 25, lateFeesDeleted: 1 }
+    await openDesk()
+    await press(/^Bank deposit$/)
+    expect(box()).toBeUndefined()                      // dated today: nothing comes off, no box
+    await type(field(/^Date deposited$/)!, '2026-10-01')
+    await until(() => !!box(), 'the onboarding box')
+    expect(box()!.textContent).toBe('Delete the late fee completely (onboarding month)Leaves no late fee on their record. Only for the onboarding month.')
+    const input = box()!.querySelector('input') as HTMLInputElement
+    expect(input.checked).toBe(false)
+    await act(async () => { input.click() })
+    await type(field(/^Amount deposited$/)!, '600')
+    await type(field(/^Deposit reference number/)!, 'DEP-ONB')
+    await press(/^Record \$600\.00/)
+    await until(() => onRecorded.mock.calls.length === 1, 'the payment recorded')
+    expect(server.posts.filter(p => p.url.endsWith('/record-manual')).map(p => p.body)).toEqual([
+      { method: 'bank_deposit', amountTendered: 600, reference: 'DEP-ONB', depositedOn: '2026-10-01', deleteOnboardingLateFees: true },
+    ])
+    expect(onRecorded.mock.calls[0][0]).toContain('came off')
+    expect(onRecorded.mock.calls[0][0]).not.toMatch(/still counts as late/)
+  })
+
+  it('10/6: no box after onboarding, or for someone who may not delete a late fee — and nothing extra is sent', async () => {
+    server.quote = withFee()
+    server.datedQuote = quote({ lateFeesOffIfPaidInFull: 25, onboardingLateFeesOff: 25, canDeleteLateFees: false })
+    await openDesk()
+    await press(/^Bank deposit$/)
+    await type(field(/^Date deposited$/)!, '2026-10-01')
+    await until(() => text().includes('Deposited before $25.00 in late fees were charged'), 'the note')
+    expect(box()).toBeUndefined()
+  })
+
+  it('10/6: a deposit the tenant never reported — the result says, in one line, that it still counts late', async () => {
+    server.quote = withFee()
+    server.datedQuote = quote({ lateFeesOffIfPaidInFull: 25, onboardingLateFeesOff: 0, canDeleteLateFees: true })
+    server.recordResult = { amountSettled: 600, creditUsed: 0, receiptId: 'rem_1', lateFeesUnbilled: 25, unreportedDepositCountsLate: true }
+    await openDesk()
+    await press(/^Bank deposit$/)
+    await type(field(/^Date deposited$/)!, '2026-10-01')
+    await until(() => text().includes('Deposited before $25.00 in late fees were charged'), 'the note')
+    expect(box()).toBeUndefined()
+    await type(field(/^Amount deposited$/)!, '600')
+    await type(field(/^Deposit reference number/)!, 'DEP-LATE')
+    await press(/^Record \$600\.00/)
+    await until(() => onRecorded.mock.calls.length === 1, 'the payment recorded')
+    expect(onRecorded.mock.calls[0][0]).toBe(
+      'Recorded $600.00 from Rae Tull. The late fee came off. They didn\'t report this deposit, so it still counts as late on their payment history.')
+  })
+
   it('cash, a check and a money order have no photo field and no deposit date', async () => {
     server.quote = quote()
     await openDesk()

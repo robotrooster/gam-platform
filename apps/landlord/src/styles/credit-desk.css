@@ -83,6 +83,10 @@
 .cd-field-label { font-size: .75rem; color: var(--text-3); }
 .cd-field .form-input, .cd-field .form-select { width: 100%; }
 .cd-inline { display: flex; gap: 8px; align-items: center; }
+/* 10/6 (Nic): "Delete the late fee completely (onboarding month)" — a box with its one line under it. */
+.cd-check { display: flex; gap: 8px; align-items: flex-start; font-size: .8rem; color: var(--text-0); cursor: pointer; }
+.cd-check input { margin-top: 3px; accent-color: var(--gold); }
+.cd-check-sub { display: block; font-size: .72rem; color: var(--text-3); line-height: 1.4; }
 
 .cd-confirm {
   border: 1px solid rgba(245,158,11,.35); background: var(--amber-bg);

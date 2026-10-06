@@ -86,7 +86,13 @@ export function lateCountsFrom(dueDay: string, writtenOn: string | null, paidDay
   return writtenOn != null && writtenOn > dueDay && writtenOn <= paidDay ? writtenOn : dueDay
 }
 
-async function isOnboardingMonthCharge(client: PoolClient, paymentId: string): Promise<boolean> {
+/**
+ * S652 (Nic): the onboarding month — the month of the first rent charge on an
+ * existing-tenancy lease (a household moved onto GAM mid-tenancy). Positive
+ * marks only there. 10/6 (Nic): exported so the late-fee delete
+ * (services/lateFeeDelete) judges "the onboarding bill" by this same rule.
+ */
+export async function isOnboardingMonthCharge(client: Pick<PoolClient, 'query'>, paymentId: string): Promise<boolean> {
   const { rows } = await client.query<{ onboarding: boolean }>(
     `SELECT l.is_existing_tenancy
             AND date_trunc('month', p.due_date) = (

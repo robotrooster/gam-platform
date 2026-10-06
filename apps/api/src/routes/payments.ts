@@ -23,7 +23,8 @@ import { releaseUnconfirmedCardCharges, releaseUnconfirmedChargeDetailed, CARD_R
          confirmedOnScreen, heldForCardholder } from '../jobs/paymentReconcile'
 import { getClient } from '../db'
 import { payableRowSql, lockHousehold } from '../services/moneyPredicates'
-import { settleManualRentPayment, deskQuote, zeroLateFeesAfterDeposit, DESK_SURPLUS_HANDLING, DESK_SURPLUS_HANDLING_LABEL } from '../services/manualPaymentSettle'
+import { settleManualRentPayment, deskQuote, backdatedLateFeesPreview, DESK_SURPLUS_HANDLING, DESK_SURPLUS_HANDLING_LABEL } from '../services/manualPaymentSettle'
+import { canDeleteLateFees, deleteZeroedLateFee, LATE_FEE_DELETE_NOT_ALLOWED } from '../services/lateFeeDelete'
 import { runWholeBillCheckAfterCommit, supersedeScheduledRetry, cancelSupersededIntents,
          usablePaidAheadSql, disputeClaimJoinSql } from '../services/creditUse'
 import { logger } from '../lib/logger'
@@ -1686,7 +1687,55 @@ const postPaymentSchema = z.object({
   reference:  z.string().max(120).optional().nullable(),
   notes:      z.string().max(500).optional().nullable(),
   receivedAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  // 10/6 (Nic): the onboarding box — "Delete the late fee completely
+  // (onboarding month)". Off unless ticked; owner or property manager only.
+  deleteOnboardingLateFees: z.boolean().optional(),
 })
+
+/** 10/6 (Nic): the household a posted payment goes to — its newest active lease with one of these companies. */
+async function postPaymentLease(tenantId: string, landlordIds: string[]) {
+  return queryOne<{ landlord_id: string; property_id: string | null }>(
+    `SELECT l.landlord_id, u.property_id
+       FROM leases l JOIN lease_tenants lt ON lt.lease_id = l.id
+       LEFT JOIN units u ON u.id = l.unit_id
+      WHERE lt.tenant_id = $1 AND lt.status = 'active' AND l.status IN ('active', 'pending')
+        AND l.landlord_id = ANY($2::uuid[])
+      ORDER BY l.status = 'active' DESC, l.start_date DESC, l.id LIMIT 1`,
+    [tenantId, landlordIds])
+}
+
+// GET /api/payments/post-payment/quote?tenantId=&depositedOn= — 10/6 (Nic):
+// what "Post a payment" is told about a BANK DEPOSIT dated back: the late fees
+// that come off when it pays the bill in full, how much of that is on the
+// onboarding month's bill (where the box "Delete the late fee completely"
+// applies), and whether this person may tick it. A look: nothing changes.
+paymentsRouter.get('/post-payment/quote', requirePerm('take_payment'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const q = z.object({
+      tenantId: z.string().uuid(),
+      depositedOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    }).parse(req.query)
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(403, 'Landlord scope required')
+    const lease = await postPaymentLease(q.tenantId, landlordIds)
+    if (!lease) throw new AppError(409, 'This tenant has no active lease with you to hold a payment on.')
+    await assertChargeInStaffScope(req.user, lease.property_id)
+    depositedOnAsSettledAt('bank_deposit', q.depositedOn, await propertyToday(lease.property_id))
+    let out = { lateFeesOffIfPaidInFull: 0, onboardingLateFeesOff: 0 }
+    await client.query('BEGIN')
+    try {
+      await lockHousehold(client, q.tenantId, lease.landlord_id)
+      const q0 = await deskQuote(client, { tenantId: q.tenantId, landlordId: lease.landlord_id, lock: true })
+      const z0 = await backdatedLateFeesPreview(client, q0, q.depositedOn)
+      out = { lateFeesOffIfPaidInFull: z0.unbilled, onboardingLateFeesOff: z0.onboardingOff }
+    } finally {
+      await client.query('ROLLBACK').catch(() => {})
+    }
+    res.json({ success: true, data: { ...out, canDeleteLateFees: canDeleteLateFees(req.user, lease.landlord_id) } })
+  } catch (e) { next(e) } finally { client.release() }
+})
+
 paymentsRouter.post('/post-payment', requirePerm('take_payment'), async (req: any, res, next) => {
   const client = await getClient()
   try {
@@ -1706,6 +1755,12 @@ paymentsRouter.post('/post-payment', requirePerm('take_payment'), async (req: an
         [body.tenantId, landlordIds])
       depositedOnAsSettledAt(body.method, body.receivedAt, await propertyToday(where?.property_id))
     }
+    // 10/6 (Nic): "the late fee is only deleted during onboarding at
+    // landlord's discretion" — the owner or a property manager.
+    if (body.deleteOnboardingLateFees === true) {
+      const lease = await postPaymentLease(body.tenantId, landlordIds)
+      if (!lease || !canDeleteLateFees(req.user, lease.landlord_id)) throw new AppError(403, LATE_FEE_DELETE_NOT_ALLOWED)
+    }
     // decisions.md #48.4: an expired card hold on the household is released
     // before the payment is posted against its bill (before BEGIN — the
     // release takes the household lock on its own connection).
@@ -1720,6 +1775,7 @@ paymentsRouter.post('/post-payment', requirePerm('take_payment'), async (req: an
       receivedAt: body.receivedAt ? new Date(body.receivedAt + 'T12:00:00Z') : null,
       // 10/5 (Nic): a bank deposit dated back takes off the late fees charged after it, paid in full.
       depositedOn: body.method === 'bank_deposit' ? (body.receivedAt ?? null) : null,
+      deleteOnboardingLateFees: body.method === 'bank_deposit' && body.deleteOnboardingLateFees === true,
       postedBy: req.user!.userId,
     })
     // A staffer assigned to one property posts only for a resident there.
@@ -1786,6 +1842,12 @@ const recordManualSchema = z.object({
   // after today). The payment counts from that day (its on-time or late mark),
   // never from the day the office typed it in. Bank deposits only; absent = today.
   depositedOn:      z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  // 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's
+  // discretion" — the box "Delete the late fee completely (onboarding month)",
+  // off unless ticked. A late fee this deposit's date takes off an ONBOARDING
+  // bill is deleted outright instead of left at $0 (services/lateFeeDelete).
+  // The owner or a property manager only — like waiving a late fee.
+  deleteOnboardingLateFees: z.boolean().optional(),
 })
 
 /** 10/5: the property's own calendar day today (its timezone; America/Phoenix when unknown). */
@@ -1834,6 +1896,9 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     // 10/5 (Nic): a bank deposit's date cannot be after today where the property is.
     const depositedAt = body.depositedOn == null ? null
       : depositedOnAsSettledAt(body.method, body.depositedOn, await propertyToday(pre.property_id))
+    if (body.deleteOnboardingLateFees === true && !canDeleteLateFees(req.user, pre.landlord_id)) {
+      throw new AppError(403, LATE_FEE_DELETE_NOT_ALLOWED)
+    }
     if (pre.tenant_id) await releaseExpiredCardHolds(pre.tenant_id, 'record-manual', [pre.landlord_id])
     await client.query('BEGIN')
 
@@ -1923,6 +1988,8 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       source: 'desk',
       // 10/5 (Nic): paid in full, late fees charged after the deposit come off.
       depositedOn: body.method === 'bank_deposit' ? (body.depositedOn ?? null) : null,
+      deleteOnboardingLateFees: body.method === 'bank_deposit' && body.deleteOnboardingLateFees === true,
+      lateFeeDeleteVia: 'record_payment',
     })
 
     await client.query('COMMIT')
@@ -1962,6 +2029,14 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
         // off because it paid the bill in full (unbilled, and refunded as credit).
         lateFeesUnbilled: result.lateFeesReversed.unbilled,
         lateFeesRefunded: result.lateFeesReversed.refunded,
+        // 10/6 (Nic): late fees deleted from the onboarding bill (the box) —
+        // and whether a late fee came off a deposit the tenant never
+        // reported, so the payment still counts late on their history.
+        lateFeesDeleted: result.lateFeesDeleted.count,
+        // The box was ticked but a fee could not be deleted: why, in plain
+        // words (it stays at $0.00). [] when nothing was refused.
+        lateFeeDeleteRefusals: result.lateFeeDeleteRefusals,
+        unreportedDepositCountsLate: result.unreportedDepositCountsLate,
       },
     })
   } catch (e) {
@@ -2005,6 +2080,9 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
       ? req.query.depositedOn : null
     if (depositedOn) depositedOnAsSettledAt('bank_deposit', depositedOn, await propertyToday(pmt.property_id))
     let lateFeesOffIfPaidInFull = 0
+    // 10/6 (Nic): how much of that is on the onboarding month's bill — where
+    // the window offers "Delete the late fee completely (onboarding month)".
+    let onboardingLateFeesOff = 0
     // 10/5: the same, bill by bill — a bill a part payment pays only in part
     // keeps its own late fees (manualPaymentSettle judges each bill).
     const lateFeesOffByBill = new Map<string, number>()
@@ -2014,12 +2092,10 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
       try {
         await lockHousehold(client, pmt.tenant_id, pmt.landlord_id)
         const q0 = await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, lock: true })
-        const z = await zeroLateFeesAfterDeposit(client, q0, depositedOn, { createdBy: null })
+        const z = await backdatedLateFeesPreview(client, q0, depositedOn)
         lateFeesOffIfPaidInFull = z.unbilled
-        for (const r of q0.rows) {
-          if (!r.invoiceId || !z.zeroedIds.includes(r.id)) continue
-          lateFeesOffByBill.set(r.invoiceId, Math.round(((lateFeesOffByBill.get(r.invoiceId) ?? 0) + r.amount) * 100) / 100)
-        }
+        for (const [invoiceId, amount] of z.byBill) lateFeesOffByBill.set(invoiceId, amount)
+        onboardingLateFeesOff = z.onboardingOff
         q = z.zeroedIds.length > 0 ? await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, lock: true }) : q0
       } finally {
         await client.query('ROLLBACK').catch(() => {})
@@ -2090,8 +2166,46 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
       // that come off when the deposit pays this bill in full (0: none).
       lateFeesOffIfPaidInFull,
       lateFeesOffByBill: [...lateFeesOffByBill].map(([invoiceId, amount]) => ({ invoiceId, amount })),
+      // 10/6 (Nic): the box applies when this is above 0 and this person may tick it.
+      onboardingLateFeesOff,
+      canDeleteLateFees: canDeleteLateFees(req.user, pmt.landlord_id),
     } })
   } catch (e) { next(e) } finally { client.release() }
+})
+
+// POST /api/payments/:id/delete-late-fee — 10/6 (Nic): "the late fee is only
+// deleted during onboarding at landlord's discretion." "Delete this late fee"
+// on a late fee's line in the landlord's Payments history, for a fee a
+// reversal already zeroed (it shows $0.00) on the onboarding month's bill —
+// covers the ones zeroed before this shipped. Deleted outright, with the full
+// row kept in the audit log (services/lateFeeDelete). The owner or a property
+// manager only (the people who may waive a late fee); refused in plain words
+// for any other fee, and for one money is recorded against.
+paymentsRouter.post('/:id/delete-late-fee', async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    if (!z.string().uuid().safeParse(req.params.id).success) throw new AppError(404, 'Late fee not found')
+    const head = await queryOne<{ tenant_id: string | null; landlord_id: string; property_id: string | null }>(
+      `SELECT p.tenant_id, p.landlord_id, u.property_id
+         FROM payments p LEFT JOIN units u ON u.id = p.unit_id WHERE p.id = $1`, [req.params.id])
+    if (!head) throw new AppError(404, 'Late fee not found')
+    if (!canDeleteLateFees(req.user, head.landlord_id)) {
+      throw new AppError(403, 'Only the owner or a property manager can delete a late fee.')
+    }
+    await assertChargeInStaffScope(req.user, head.property_id)
+    await client.query('BEGIN')
+    if (head.tenant_id) await lockHousehold(client, head.tenant_id, head.landlord_id)
+    const r = await deleteZeroedLateFee(client, req.params.id, { deletedBy: req.user!.userId, via: 'history_line' })
+    if (!r.deleted) {
+      await client.query('ROLLBACK')
+      throw new AppError(r.refusal === 'not_found' ? 404 : 409, r.message ?? 'This late fee can\'t be deleted.')
+    }
+    await client.query('COMMIT')
+    res.json({ success: true, data: { deleted: true, message: 'The late fee is gone from their record.' } })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally { client.release() }
 })
 
 // POST /api/payments/:id/record-prior-arrangement — S568 (Nic).

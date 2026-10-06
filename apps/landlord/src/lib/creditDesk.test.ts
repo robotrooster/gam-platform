@@ -13,7 +13,7 @@ import { describe, it, expect } from 'vitest'
 import {
   money, parseAmount, monthTitle, monthWord, dayWord, daysLateText,
   creditBesideText, monthsOwedText, sliceByProperty, serverTotals, folderTotal, deskBalanceSentence,
-  creditChoiceNeeded, creditToUseFor, deskOwedCents, oldBalanceOwedCents, postAnchor, planTender, recordedMessage,
+  creditChoiceNeeded, creditToUseFor, deskOwedCents, oldBalanceOwedCents, postAnchor, planTender, recordedMessage, lateFeeDeleteRefusalText,
   serverMessage, serverStatus, readerChoiceParams, readerQuoteQuery, readerReady, readerLeases, withReaderTaken, readerFinishedMessage,
   postConfirmQuestion, numberRequired, tenantCreditLines, tenantCreditHeadline,
   readShowLineItems, writeShowLineItems, ledgerMatches, stillOweLine,
@@ -418,6 +418,15 @@ describe('the desk window self-heals', () => {
     expect(recordedMessage('Todd', { amountSettled: 460, surplus: 460, creditId: 'c' }))
       .toBe('Recorded $460.00 from Todd — $460.00 kept on their account as credit.')
     expect(recordedMessage('Todd', { amountSettled: 0, creditUsed: 460 })).toBe("Paid Todd's bill with their credit.")
+  })
+  it('10/6: a ticked onboarding box the server could not carry out is said plainly, once', () => {
+    const money = 'Money is recorded against this late fee, so it can\'t be deleted. It stays at $0.00 — it no longer counts toward what they owe.'
+    expect(recordedMessage('Rae Tull', {
+      amountSettled: 600, depositedOn: '2026-10-01', lateFeesUnbilled: 25, lateFeeDeleteRefusals: [money, money],
+    })).toMatch(new RegExp(`came off.* ${money.replace(/[.$()]/g, '\\$&')}$`))
+    expect(recordedMessage('Rae Tull', { amountSettled: 600, lateFeeDeleteRefusals: [] })).toBe('Recorded $600.00 from Rae Tull.')
+    expect(lateFeeDeleteRefusalText(undefined)).toBeNull()
+    expect(lateFeeDeleteRefusalText([money, ' ', 3])).toBe(money)
   })
 })
 

@@ -26,17 +26,22 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, MANUAL_PAYMENT_METHOD_WORD, type ManualPaymentMethod } from '@gam/shared'
+import {
+  humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, MANUAL_PAYMENT_METHOD_WORD,
+  DELETE_ONBOARDING_LATE_FEE_LABEL, DELETE_ONBOARDING_LATE_FEE_HINT, UNREPORTED_DEPOSIT_LATE_LANDLORD_TEXT,
+  type ManualPaymentMethod,
+} from '@gam/shared'
 import { api, apiGet, apiPost } from '../lib/api'
 import { TAP_WINDOW_SECONDS } from '../lib/terminal'
 import {
   money, toCents, toDollars, parseAmount, dayWord, localToday,
-  creditChoiceNeeded, oldBalanceOwedCents, postAnchor, planTender, recordedMessage,
+  creditChoiceNeeded, oldBalanceOwedCents, postAnchor, planTender, recordedMessage, lateFeeDeleteRefusalText,
   serverMessage, serverStatus, readerChoiceParams, readerQuoteQuery, readerReady, readerLeases,
   postConfirmQuestion, numberRequired, deskFigures, sameFigures, figuresMovedMessage, CREDIT_USE_RULE,
   chargeMonthsRange, readChargesById, CHARGE_PAGE_SIZE, withReaderTaken, readerFinishedMessage,
   deskOnItsWay, nextAwaitingRereadAt, awaitingOpensAtWord,
   AMOUNT_FIELD_LABEL, NUMBER_FIELD_LABEL, numberMissingMessage, depositPhotoProblem, billName, stillOwedText, lateFeesOffText, lateFeesBackOnShortBills,
+  onboardingLateFeeBoxApplies,
   type CreditChoice, type DeskFigures, type DeskQuote, type DeskQuoteRow, type ReaderQuote, type ReaderSpace,
 } from '../lib/creditDesk'
 import '../styles/credit-desk.css'
@@ -157,6 +162,25 @@ function BillLines({ title, rows, labels, sub }: {
   )
 }
 
+/**
+ * 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's
+ * discretion." Off by default; shown only when a bank deposit dated back takes
+ * a late fee off the onboarding month's bill and this person may tick it.
+ */
+export function OnboardingLateFeeBox({ checked, onChange, disabled = false }: {
+  checked: boolean; onChange: (v: boolean) => void; disabled?: boolean
+}) {
+  return (
+    <label className="cd-check">
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={e => onChange(e.target.checked)} />
+      <span>
+        {DELETE_ONBOARDING_LATE_FEE_LABEL}
+        <span className="cd-check-sub">{DELETE_ONBOARDING_LATE_FEE_HINT}</span>
+      </span>
+    </label>
+  )
+}
+
 // ─── The window ───────────────────────────────────────────────────────────────
 
 export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, onRecorded }: {
@@ -222,6 +246,9 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   const [reference, setReference] = useState('')
   // 10/5 (Nic): a bank deposit's optional photo of the bank's receipt.
   const [photo, setPhoto] = useState<File | null>(null)
+  // 10/6 (Nic): the onboarding box — off unless the desk ticks it.
+  const [deleteOnboardingFee, setDeleteOnboardingFee] = useState(false)
+  const onboardingBox = mode === 'bank_deposit' && !!backdatedTo && onboardingLateFeeBoxApplies(quote)
   const [towardOld, setTowardOld] = useState('')
   const [surplusHandling, setSurplusHandling] = useState<'change' | 'credit' | null>(null)
   const [writtenConfirmed, setWrittenConfirmed] = useState(false)
@@ -365,6 +392,8 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
         reference: reference.trim() || undefined,
         // Today is the default: sent only when the deposit was made earlier.
         ...(method === 'bank_deposit' && depositedOn && depositedOn !== deskToday ? { depositedOn } : {}),
+        // 10/6 (Nic): sent only when the box is shown and ticked.
+        ...(onboardingBox && deleteOnboardingFee ? { deleteOnboardingLateFees: true } : {}),
       })
       const d = r?.data ?? {}
       // 10/5: a part payment says what stays owed, and on which bills.
@@ -652,6 +681,10 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                     Deposited before {money(quote!.lateFeesOffIfPaidInFull!)} in late fees were charged: they are left
                     off this bill, and come off each bill this deposit pays in full. A bill it pays only in part keeps its late fees.
                   </div>
+                )}
+                {onboardingBox && (
+                  <OnboardingLateFeeBox checked={deleteOnboardingFee} disabled={saving}
+                    onChange={v => { setDeleteOnboardingFee(v); clearMsg() }} />
                 )}
                 {/* 10/5 (Nic): "maybe ... add a picture of the receipt" — a bank deposit only. */}
                 {method === 'bank_deposit' && (
@@ -1279,6 +1312,15 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
   // 10/5 (Nic): a bank deposit's optional photo of the bank's receipt.
   const [photo, setPhoto] = useState<File | null>(null)
   const [receivedAt, setReceivedAt] = useState(today)
+  // 10/6 (Nic): a bank deposit dated back — the server says whether it takes a
+  // late fee off the onboarding month's bill, where the box applies.
+  const backdated = method === 'bank_deposit' && /^\d{4}-\d{2}-\d{2}$/.test(receivedAt) && receivedAt < today ? receivedAt : null
+  const { data: postQuote } = useQuery<{ lateFeesOffIfPaidInFull: number; onboardingLateFeesOff: number; canDeleteLateFees: boolean }>(
+    ['post-payment-quote', tenantId, backdated],
+    () => apiGet(`/payments/post-payment/quote?tenantId=${tenantId}&depositedOn=${backdated}`),
+    { enabled: !!backdated, retry: false, staleTime: 0, cacheTime: 0 })
+  const onboardingBox = !!backdated && onboardingLateFeeBoxApplies(postQuote)
+  const [deleteOnboardingFee, setDeleteOnboardingFee] = useState(false)
   const [notes, setNotes] = useState('')
   const [confirming, setConfirming] = useState(false)
   const [msg, setMsg] = useState<Msg>(null)
@@ -1295,6 +1337,8 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
       const r: any = await apiPost('/payments/post-payment', {
         tenantId, method, amount: toDollars(cents), reference: reference.trim() || null,
         notes: notes.trim() || null, receivedAt,
+        // 10/6 (Nic): sent only when the box is shown and ticked.
+        ...(onboardingBox && deleteOnboardingFee ? { deleteOnboardingLateFees: true } : {}),
       })
       const d = r?.data ?? {}
       const parts = [`Posted ${money(toDollars(cents))} from ${name}`]
@@ -1309,7 +1353,10 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
       // 10/5 (Nic): a bank deposit dated back — late fees charged after it came off.
       const feesOff = method === 'bank_deposit' && receivedAt
         ? lateFeesOffText(receivedAt, Number(d.lateFeesUnbilled ?? 0), Number(d.lateFeesRefunded ?? 0)) : null
-      if (feesOff) parts.push(feesOff.replace(/\.$/, ''))
+      // 10/6 (Nic): a deposit the tenant never reported still counts late — said in one line.
+      if (feesOff) parts.push((d.unreportedDepositCountsLate ? UNREPORTED_DEPOSIT_LATE_LANDLORD_TEXT : feesOff).replace(/\.$/, ''))
+      // 10/6 (Nic): the box was ticked but a late fee could not be deleted — said plainly (it stays at $0.00).
+      const refused = lateFeeDeleteRefusalText(d.lateFeeDeleteRefusals)
       // 10/5 (Nic): the photo of the bank's receipt goes on the payment just posted.
       const photoNote = method === 'bank_deposit' ? await sendDepositPhoto(d.remittanceId, photo) : null
       qc.invalidateQueries('outstanding-balances')
@@ -1318,7 +1365,7 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
       // A payment posted by hand is cash for the bank deposit too.
       qc.invalidateQueries('undeposited-cash')
       qc.invalidateQueries('deposit-slips')
-      onPosted(parts.join(' — ') + '.' + (photoNote ? ` ${photoNote}` : ''))
+      onPosted(parts.join(' — ') + '.' + (refused ? ` ${refused}` : '') + (photoNote ? ` ${photoNote}` : ''))
     } catch (e) {
       setConfirming(false)
       setMsg({ kind: 'error', text: serverMessage(e, 'That payment could not be posted. Nothing was recorded — try again.') })
@@ -1372,6 +1419,9 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
             <span className="cd-field-label">{method === 'bank_deposit' ? 'Date deposited' : 'Date received'}</span>
             <input className="form-input" type="date" value={receivedAt} max={today} onChange={e => setReceivedAt(e.target.value)} />
           </label>
+          {onboardingBox && (
+            <OnboardingLateFeeBox checked={deleteOnboardingFee} disabled={saving} onChange={setDeleteOnboardingFee} />
+          )}
           <label className="cd-field">
             <span className="cd-field-label">Note (yours; the tenant does not see it)</span>
             <textarea className="form-input" rows={2} value={notes} maxLength={500} onChange={e => setNotes(e.target.value)} />

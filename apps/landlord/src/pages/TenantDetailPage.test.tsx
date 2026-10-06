@@ -41,6 +41,7 @@ vi.mock('../components/dialogs', () => ({
 }))
 
 import { TenantDetailPage } from './TenantDetailPage'
+import { appConfirm } from '../components/dialogs'
 import { localToday } from '../lib/creditDesk'
 
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
@@ -169,5 +170,30 @@ describe('Add a charge', () => {
     await until(() => !host.querySelector('.modal-overlay'), 'the window closed by its result')
     expect(server.posts.filter(p => p.url === '/one-off-charges')).toHaveLength(1)
     expect(server.posts[0].body).toMatchObject({ tenantId: 't1', chargeType: 'violation', amount: 50, incidentDate: localToday() })
+  })
+})
+
+describe('10/6 (Nic): "Delete this late fee" on the Payment History', () => {
+  it('shows a gold button only on a line the server marks, asks in-app first, then deletes it', async () => {
+    server.profile = profile({
+      payments: [
+        { id: 'lf1', type: 'late_fee', dueDate: '2026-10-06', propertyName: 'Oak Park', unitNumber: 'MH 04', amount: 0, status: 'settled', canDeleteLateFee: true },
+        { id: 'lf2', type: 'late_fee', dueDate: '2026-09-06', propertyName: 'Oak Park', unitNumber: 'MH 04', amount: 0, status: 'settled' },
+      ],
+    })
+    ;(appConfirm as any).mockClear()
+    await render()
+    const buttons = [...host.querySelectorAll('button')].filter(b => b.textContent === 'Delete this late fee')
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0].className).toContain('btn-primary')
+    // Declined: nothing is sent.
+    await act(async () => { buttons[0].click() })
+    expect(appConfirm).toHaveBeenCalledTimes(1)
+    expect(server.posts).toEqual([])
+    // Confirmed: deleted.
+    ;(appConfirm as any).mockImplementationOnce(async () => true)
+    await act(async () => { btn(/^Delete this late fee$/)!.click() })
+    await until(() => server.posts.length === 1, 'the delete')
+    expect(server.posts[0].url).toBe('/payments/lf1/delete-late-fee')
   })
 })

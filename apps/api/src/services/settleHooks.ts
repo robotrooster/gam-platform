@@ -64,6 +64,14 @@ export interface AfterRowsSettledContext {
    * which is when its rest is paid.
    */
   partPaidIds?: readonly string[]
+  /**
+   * 10/6 (Nic): rows whose on-time or late mark counts from another day than
+   * the day they settled — a landlord's recorded bank deposit that took off a
+   * late fee the tenant never reported: the mark counts from the day the
+   * landlord recorded it, not the day of the deposit
+   * (services/manualPaymentSettle). The row's settled day is unchanged.
+   */
+  markSettledAt?: ReadonlyMap<string, Date>
 }
 
 export interface AfterRowsSettledResult {
@@ -166,7 +174,7 @@ export async function afterRowsSettled(
       paymentType:           r.type,
       amount:                r.amount,
       dueDate:               r.due_date,
-      settledAt:             r.settled_at ? new Date(r.settled_at) : new Date(),
+      settledAt:             ctx.markSettledAt?.get(r.id) ?? (r.settled_at ? new Date(r.settled_at) : new Date()),
       graceDays:             r.late_fee_grace_days,
       // Only a Stripe settle vouches with its intent; a row an old, failed
       // intent once touched must not cite it when the desk or credit paid it.

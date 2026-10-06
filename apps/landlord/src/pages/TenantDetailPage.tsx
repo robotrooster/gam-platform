@@ -9,7 +9,7 @@ import { usePerms } from '../lib/permissions'
 import { PostPaymentForm } from '../components/RecordPaymentWindow'
 import {
   money, tenantCreditHeadline, tenantCreditLines, toCents, localToday, dayWord, monthTitle, calendarDay, chargeTimeliness,
-  CREDIT_USE_RULE, type TenantCredit,
+  CREDIT_USE_RULE, serverMessage, type TenantCredit,
 } from '../lib/creditDesk'
 import '../styles/credit-desk.css'
 
@@ -39,6 +39,8 @@ export function TenantDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
   const [showPaymentDetail, setShowPaymentDetail] = useState(false)
+  // 10/6 (Nic): the late fee being deleted from the Payment History (one at a time).
+  const [deletingFee, setDeletingFee] = useState<string | null>(null)
   // S252: per-tenant FlexCharge query removed alongside the legacy
   // panel. New flex_charge_accounts schema is (customer, property)
   // keyed; consult the FlexCharge dashboard (S254) for per-property
@@ -75,6 +77,29 @@ export function TenantDetailPage() {
     )
   }
   const { tenant, units, payments, maintenance, stats } = data
+  /**
+   * 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's
+   * discretion." A late fee that already came off ($0.00) on the onboarding
+   * month's bill: the server marks the line (canDeleteLateFee) only for the
+   * owner or a property manager, and refuses anything else in plain words.
+   */
+  const deleteLateFee = async (p: any) => {
+    const ok = await appConfirm(
+      `The ${dayWord(p.dueDate, '')} late fee already came off their bill. Deleting it removes it from their record completely — ` +
+      'only for the onboarding month.',
+      { title: 'Delete this late fee', confirmLabel: 'Delete this late fee' })
+    if (!ok) return
+    setDeletingFee(p.id)
+    try {
+      const r: any = await apiPost(`/payments/${p.id}/delete-late-fee`, {})
+      toast(r?.data?.message ?? 'The late fee is gone from their record.')
+      refetch()
+    } catch (e) {
+      toast.error(serverMessage(e, 'The late fee could not be deleted. Nothing changed — try again.'))
+    } finally {
+      setDeletingFee(null)
+    }
+  }
   // S641: staff without the payment permissions get no payment history or
   // money figures from the server; the payment cards are left out for them.
   const paymentsHidden = !!data.paymentsHidden
@@ -217,7 +242,15 @@ export function TenantDetailPage() {
                       <td style={{ fontSize: '.78rem' }}>{p.propertyName}</td>
                       <td className="mono">{p.unitNumber}</td>
                       <td className="mono">{fmt(p.amount)}</td>
-                      <td><span className={`badge ${PAYMENT_STATUS_BADGE[p.status as PaymentStatus] ?? 'badge-muted'}`}>{PAYMENT_STATUS_LABEL[p.status as PaymentStatus] ?? humanize(p.status)}</span></td>
+                      <td>
+                        <span className={`badge ${PAYMENT_STATUS_BADGE[p.status as PaymentStatus] ?? 'badge-muted'}`}>{PAYMENT_STATUS_LABEL[p.status as PaymentStatus] ?? humanize(p.status)}</span>
+                        {p.canDeleteLateFee && (
+                          <button className="btn btn-primary btn-sm" style={{ marginLeft: 8 }}
+                            disabled={deletingFee !== null} onClick={() => deleteLateFee(p)}>
+                            {deletingFee === p.id ? 'Deleting…' : 'Delete this late fee'}
+                          </button>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
