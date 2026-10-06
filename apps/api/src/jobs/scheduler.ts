@@ -2377,6 +2377,22 @@ export function schedulerInit() {
   }, { timezone: 'UTC' })
 
   cron.schedule('0 1 * * 1-5', async () => {
+    // 10/5 (Nic): a space occupied after the 1st is billed for THAT month on
+    // the next weeknight — first, so the payout run right after nets it
+    // (jobs/platformFeeAccrual processPlatformFeeTopUp). Its own try: a failed
+    // top-up is logged and the payouts still go out. This schedule (6 pm
+    // Phoenix, Sunday through Thursday) is also written into
+    // services/billableUnits lastTopUpOfMonthSql — change both together.
+    try {
+      const { processPlatformFeeTopUp } = await import('./platformFeeAccrual')
+      const topUp = await processPlatformFeeTopUp()
+      if (topUp.propertiesRaised || topUp.propertiesCreated
+          || topUp.errors.length || topUp.tenantPayerSkipped.length) {
+        logger.info(topUp, '[platform-fee-topup]')
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[platform-fee-topup] fatal')
+    }
     try {
       const { processAutoPayouts } = await import('./autoPayouts')
       const result = await processAutoPayouts()

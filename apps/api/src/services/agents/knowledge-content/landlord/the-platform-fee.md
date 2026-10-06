@@ -16,9 +16,15 @@ GAM adds up the fee for every property that pays into the same payout account an
 
 When you onboard, GAM doesn't start charging the platform fee until you go live — that is, until your first rent payment settles through the platform (up to a two-billing-cycle grace). If you're switching from another platform, that means you won't pay both at once during the transition.
 
-## Short-term stays
+## Month stays, nightly stays, and weekly stays
 
-For nightly or weekly bookings — and monthly stays with no lease — the fee is counted a little differently and added to your occupied-unit total (under the same per-payout-account minimum): space-only sites — RV spots, campsites, and boat slips — count at **$2 per 30 booked nights**, while furnished short stays — apartments, condos, motel/hotel rooms, and similar — are billed **3% of booking revenue**, pro-rated to the month. A monthly stay that has a lease is counted as an occupied unit through the lease instead, never both.
+- **A month stay is billed like a lease, up front.** A stay sold by the month counts as one occupied space for each calendar month it covers — $2, the same as a leased unit. If the guest chooses a lease, the stay counts until the lease takes effect, and then the space is counted once, through the lease — never both.
+- **Nightly and weekly stays are billed by their nights, after the month ends.** Nobody knows the total until the month is over, so space-only sites — RV spots, campsites, and boat slips — count at **$2 per 30 booked nights**, and furnished short stays — apartments, condos, motel/hotel rooms, and similar — are billed **3% of booking revenue**, pro-rated to the month. Both are added to your occupied-space total, under the same per-payout-account minimum.
+- **A space counts once a month.** However many leases, month stays, or utility arrangements one space has in a month, it is one occupied space.
+
+## Spaces that fill up after the 1st
+
+The fee for the month is figured on the 1st. If a space fills up later in the month — a lease is signed, or a month stay arrives — it is usually added to that month's bill the next weeknight evening, and comes out of your next payout. A space filled in the last day or two of the month may start on the next month's bill instead. Only the current month is ever added; an earlier month that was only partly occupied is not billed after the fact. A space that empties mid-month does not lower that month's bill. If your payout account is still under the $10 minimum, a newly filled space adds nothing until your occupied spaces pass it.
 
 ## Lowering your per-unit fee with FlexVault
 

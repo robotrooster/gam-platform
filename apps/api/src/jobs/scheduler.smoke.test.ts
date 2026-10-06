@@ -66,6 +66,37 @@ vi.mock('../services/depositRefundSend', async (importOriginal) => ({
   resumeStaleDepositRefunds: resumeStaleSpy,
 }))
 
+// 10/5 (Nic): the weeknight payout cron tops up the platform fee FIRST, so the
+// payout right after nets it.
+const { nightOrder, topUpSpy, payoutSpy, payoutSyncSpy } = vi.hoisted(() => {
+  const nightOrder: string[] = []
+  return {
+    nightOrder,
+    topUpSpy: vi.fn(async () => {
+      nightOrder.push('top-up')
+      return { monthScanned: '2026-10-01', monthNotYetBilled: false, propertiesRaised: 0,
+               propertiesCreated: 0, amountCharged: 0, tenantPayerSkipped: [], errors: [] }
+    }),
+    payoutSpy: vi.fn(async () => {
+      nightOrder.push('payouts')
+      return { candidatesScanned: 0, errors: [] }
+    }),
+    payoutSyncSpy: vi.fn(async () => ({ created: 0, updated: 0 })),
+  }
+})
+vi.mock('./platformFeeAccrual', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  processPlatformFeeTopUp: topUpSpy,
+}))
+vi.mock('./autoPayouts', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  processAutoPayouts: payoutSpy,
+}))
+vi.mock('../services/connectPayoutSync', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  syncConnectPayouts: payoutSyncSpy,
+}))
+
 // Quiet the per-request DB chatter the init path doesn't care about.
 import { schedulerInit } from './scheduler'
 import { getStripe } from '../lib/stripe'
@@ -171,5 +202,26 @@ describe('schedulerInit: a deposit refund left sending goes out by itself (decis
     await expect(run()).resolves.toBeUndefined()
     await run()
     expect(resumeStaleSpy).toHaveBeenCalledTimes(3)
+  })
+})
+
+describe('schedulerInit: the weeknight payout run tops up the platform fee first (10/5)', () => {
+  const nightOf = () => scheduleSpy.mock.calls.filter((c) => c[0] === '0 1 * * 1-5')
+
+  it('bills spaces occupied since the 1st BEFORE the payouts, so tonight\'s payout nets them', async () => {
+    schedulerInit()
+    expect(nightOf()).toHaveLength(1)
+    expect(nightOf()[0][2]).toEqual({ timezone: 'UTC' })
+    nightOrder.length = 0
+    await (nightOf()[0][1] as () => Promise<void>)()
+    expect(nightOrder).toEqual(['top-up', 'payouts'])
+  })
+
+  it('a failed top-up is logged and never stops the payouts', async () => {
+    schedulerInit()
+    nightOrder.length = 0
+    topUpSpy.mockRejectedValueOnce(new Error('db down'))
+    await expect((nightOf()[0][1] as () => Promise<void>)()).resolves.toBeUndefined()
+    expect(nightOrder).toEqual(['payouts'])
   })
 })

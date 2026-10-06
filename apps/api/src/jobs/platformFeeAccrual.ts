@@ -16,16 +16,22 @@
  *     bill str_fee_pct (default 3% — S616, down from 5%) of booking revenue pro-rated to
  *     the month instead. total = MAX(rate × billable + str_fee, min).
  *
- * Long-term unit count: distinct units on the property with an active
- * lease (leases.status='active') whose [start_date, end_date OR ∞] range
- * overlaps any day of the billing month.
+ * Occupied spaces (up front, for the month starting): every unit on the
+ * property with an active lease, a month stay with no lease (10/5, Nic), owner
+ * use, or a utility-service arrangement overlapping the month — each unit ONCE
+ * (services/billableUnits occupiedSpacesSql).
  *
- * Short-stay nights: SUM of all nights from unit_bookings on the property
- * where lease_type IN ('nightly','weekly') — and, since 10/5 (R12), a month
- * stay with no lease (services/billableUnits feeCountedStaySql) — clamped to
- * the billing month via LEAST(check_out, month_end+1d) - GREATEST(check_in,
- * month_start). EVERY nightly/weekly night counts — no exclusion for units
- * that also had a lease.
+ * Short-stay nights (in arrears, for the month just ended): SUM of all nights
+ * from NIGHTLY and WEEKLY unit_bookings on the property (feeCountedStaySql),
+ * clamped to the month via LEAST(check_out, month_end+1d) -
+ * GREATEST(check_in, month_start). EVERY nightly/weekly night counts — no
+ * exclusion for units that also had a lease. 10/5 (Nic): "arrears is only for
+ * short term stays where we dont know the aggregate total nights."
+ *
+ * 10/5 (Nic): a space occupied AFTER the 1st is billed for that month on the
+ * next weeknight, by processPlatformFeeTopUp below, so that night's payout
+ * nets it. Only ever the current month — "the extra nights in september
+ * balance with the late arrivals for october."
  *
  * Per-property fee = rate × total_billable + STR fee. NO per-property floor.
  *
@@ -54,10 +60,11 @@
  * platform_fee_accruals (S114). Re-running the job is safe.
  */
 
+import { randomUUID } from 'crypto'
 import { getClient, query } from '../db'
 import { chargeLandlord } from '../services/landlordGamAccount'
 import { activateBillingForOccupancy } from '../services/billingActivation'
-import { billableUnitsForProperty, feeCountedStaySql } from '../services/billableUnits'
+import { billableUnitsForProperty, feeCountedStaySql, type BillableUnits } from '../services/billableUnits'
 import { stayRevenueInMonthSql } from '../services/platformFee'
 import { NIGHTS_AGGREGATION_UNIT_TYPES, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
 import type { PoolClient } from 'pg'
@@ -335,14 +342,14 @@ export async function applyConnectAccountMinimums(monthIso: string): Promise<num
             SET connect_min_topup = $2, total_amount = total_amount + $2, updated_at = now()
           WHERE id = $1`, [accrualId, shortfall])
 
-      const anchor = await client.query<{ payer: string; property_id: string }>(
-        `SELECT payer, property_id FROM platform_fee_accruals WHERE id = $1`,
+      const anchor = await client.query<{ payer: string; property_id: string; landlord_id: string }>(
+        `SELECT payer, property_id, landlord_id FROM platform_fee_accruals WHERE id = $1`,
         [accrualId])
       // Tenant-payer accruals are picked up by the next rent charge; only the
       // landlord-payer case posts revenue now, exactly as the per-property path.
       if (anchor.rows[0]?.payer === 'landlord') {
         await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('platform_revenue', 0))`)
-        await client.query(
+        const floorLine = await client.query<{ id: string }>(
           `INSERT INTO platform_revenue_ledger
              (type, amount, balance_after, reference_id, reference_type, property_id, notes)
            SELECT 'platform_fee_subscription', $1,
@@ -353,9 +360,27 @@ export async function applyConnectAccountMinimums(monthIso: string): Promise<num
                   -- distinct line beside the earned fee instead of colliding
                   -- with it — and a re-run cannot double-post.
                   $2, 'platform_fee_min_topup', $3,
-                  $4`,
+                  $4
+           RETURNING id`,
           [shortfall, accrualId, anchor.rows[0].property_id,
            `Connect-account minimum top-up for ${monthIso} (group earned ${earned.toFixed(2)} of ${min.toFixed(2)})`])
+        // 10/5 (Nic): the floor was booked as GAM's revenue here and never
+        // charged to the landlord — the same disease S650 cured for the earned
+        // fee: a payout nets only what landlord_gam_charges says is owed, so
+        // the $8 that brings a $2 month to $10 was on the books and never
+        // collected. Charge it, idempotent on the accrual (a re-run finds no
+        // shortfall, and the source key stops a second charge regardless).
+        if (floorLine.rows[0]) {
+          await chargeLandlord(client, {
+            landlordId: anchor.rows[0].landlord_id,
+            propertyId: anchor.rows[0].property_id,
+            kind: 'subscription',
+            amount: shortfall,
+            sourceType: 'platform_fee_min_topup',
+            sourceId: accrualId,
+            notes: `Monthly minimum for ${monthLabel(monthIso)} — brings this payout account to $${min.toFixed(2)}`,
+          })
+        }
       }
       await client.query('COMMIT')
       applied++
@@ -427,6 +452,227 @@ export async function applyBillingGraceCaps(now: Date = new Date()): Promise<num
 
 type AccrualOutcome = 'accrued' | 'zero' | 'already_accrued' | 'pre_billing'
 
+/**
+ * What one property's bill for a month comes to: its spaces, its arrears
+ * nights, its stay-revenue share, its rate and who pays. One calculation for
+ * the monthly accrual and for the nightly top-up when it creates a property's
+ * first row of the month (10/5), so the two cannot bill a property differently.
+ */
+interface AccrualFigures {
+  billable: BillableUnits
+  totalBillable: number
+  strRevenue: number
+  strFeePct: number
+  strFeeAmount: number
+  ratePerUnit: number
+  minPerGroup: number
+  /** rate × spaces + the stay-revenue share. Never floored here (S630). */
+  totalAmount: number
+  payer: 'landlord' | 'tenant'
+  pmCompanyId: string | null
+}
+
+async function figureAccrual(
+  client: PoolClient,
+  propertyId: string,
+  landlordId: string,
+  monthIso: string,
+  arrearsIso: string,
+  /**
+   * Whether the month just ended is billed on this row — its nightly and
+   * weekly nights and its stay-revenue share. False when that month was still
+   * inside the landlord's onboarding grace (10/5 top-up: a landlord who went
+   * live mid-month is billed for the spaces of the month he went live in,
+   * never for the free month before it).
+   */
+  withArrears = true,
+): Promise<AccrualFigures> {
+  // S652: the count lives in services/billableUnits so the admin estimate and
+  // this bill cannot disagree. See that file for what counts and why.
+  const counted = await billableUnitsForProperty(
+    client, propertyId, monthIso, arrearsIso, NIGHTS_AGGREGATION_UNIT_TYPES)
+  const billable: BillableUnits = withArrears ? counted : {
+    ...counted, shortStayNights: 0, shortStayEquivalent: 0,
+    total: counted.longTerm + counted.utilityService,
+  }
+  const totalBillable = billable.longTerm + billable.shortStayEquivalent + billable.utilityService
+
+  // ── STR revenue (S538) ───────────────────────────────────────────────
+  // Bookings on any NON-aggregation unit type (everything but rv_spot)
+  // bill a percentage of revenue instead of nights/30. Revenue
+  // attributes to the month pro-rata by nights:
+  // total_amount × in-month / full-stay.
+  // 10/3 (decisions #33): "full-stay" is the length SOLD, and an early
+  // check-out's unstayed nights count in the month the guest left
+  // (services/platformFee stayRevenueInMonthSql — one formula for the bill
+  // and the landlord's fee estimate).
+  const strRes = await client.query<{ revenue: string | null }>(`
+    SELECT COALESCE(SUM(${stayRevenueInMonthSql('b', '$2::date')}), 0) AS revenue
+      FROM unit_bookings b
+      JOIN units u ON u.id = b.unit_id
+     WHERE u.property_id = $1
+       AND u.unit_type <> ALL($3::text[])
+       -- 10/5 (Nic): nightly and weekly stays only — a month stay is a space,
+       -- billed up front (services/billableUnits), never a revenue share too.
+       AND ${feeCountedStaySql('b', '$2::date')}
+       AND b.status NOT IN ('cancelled', 'no_show')
+       AND b.check_in  <  $2::date + INTERVAL '1 month'
+       AND b.check_out >  $2::date
+  `, [propertyId, arrearsIso  /* S650: arrears, like the nights above */, [...NIGHTS_AGGREGATION_UNIT_TYPES]])
+  const strRevenue = withArrears ? round2(parseFloat(strRes.rows[0].revenue ?? '0')) : 0
+
+  // ── S645: IS THIS PROPERTY RUN BY A MANAGER? ───────────────────
+  //
+  // Nic (S644, DIRECTIVE): GAM bills "the PM company - one bill" for every
+  // occupied unit across all their owners. So for a managed property the
+  // INVOICE goes to the manager. What the OWNER pays their manager is the
+  // manager's own fee plan and has nothing to do with this - Nic (S646):
+  // "the owner's statement would not see our contract between the property
+  // manager and the platform."
+  //
+  // Read before the rate, because the manager's rate is the one that applies:
+  // 11,000 units under one contract is not the list price, and that deal
+  // follows the MANAGER across every owner they bring.
+  const pmRes = await client.query<{ pm_company_id: string }>(`
+    SELECT p.pm_company_id
+      FROM properties p
+     WHERE p.id = $1 AND p.pm_company_id IS NOT NULL
+  `, [propertyId])
+  const pmCompanyId = pmRes.rows[0]?.pm_company_id ?? null
+
+  // ── Rate + minimum ────────────────────────────────────────────────────
+  //
+  // Cascade: the MANAGER's negotiated rate when one runs this property, else
+  // the owner's own override, else the platform default. A managed property
+  // is the manager's line of business and is priced on their contract.
+  const rateRes = await client.query<{
+    rate_per_unit: string
+    min_per_connect_account: string
+    str_fee_pct: string
+  }>(`
+    SELECT
+      COALESCE(pmo.rate_per_unit, o.rate_per_unit, pfc.rate_per_unit) AS rate_per_unit,
+      COALESCE(pmo.min_per_connect_account, o.min_per_connect_account,
+               pfc.min_per_connect_account) AS min_per_connect_account,
+      COALESCE(o.str_fee_pct, pfc.str_fee_pct) AS str_fee_pct
+    FROM platform_fee_config pfc
+    LEFT JOIN landlord_platform_fee_overrides o
+           ON o.landlord_id = $1
+          AND o.effective_until IS NULL
+    LEFT JOIN pm_company_platform_fee_overrides pmo
+           ON pmo.pm_company_id = $2::uuid
+          AND pmo.effective_until IS NULL
+    WHERE pfc.effective_until IS NULL
+    LIMIT 1
+  `, [landlordId, pmCompanyId])
+  if (rateRes.rowCount === 0) throw new Error(`No active platform_fee_config row found`)
+  const ratePerUnit  = parseFloat(rateRes.rows[0].rate_per_unit)
+  const minPerGroup  = parseFloat(rateRes.rows[0].min_per_connect_account)
+  const strFeePct    = parseFloat(rateRes.rows[0].str_fee_pct)
+  const strFeeAmount = round2(strFeePct * strRevenue)
+
+  // ── Resolve platform_fee_payer at accrual time ──────────────────────
+  const payerRes = await client.query<{ platform_fee_payer: 'landlord' | 'tenant' | null }>(`
+    SELECT platform_fee_payer FROM property_allocation_rules WHERE property_id = $1
+  `, [propertyId])
+  const payer = (payerRes.rows[0]?.platform_fee_payer ?? 'landlord') as 'landlord' | 'tenant'
+
+  return {
+    billable, totalBillable, strRevenue, strFeePct, strFeeAmount,
+    ratePerUnit, minPerGroup,
+    totalAmount: round2(ratePerUnit * totalBillable + strFeeAmount),
+    payer, pmCompanyId,
+  }
+}
+
+/** Insert a property's accrual row for the month; returns its id. */
+async function insertAccrualRow(
+  client: PoolClient,
+  landlordId: string,
+  propertyId: string,
+  monthIso: string,
+  f: AccrualFigures,
+  /** What the row bills — the figures' total unless the floor already covered part of it (10/5 top-up). */
+  totalAmount: number,
+  connectMinTopup = 0,
+  connectGroupKey: string | null = null,
+): Promise<string> {
+  const accrualRes = await client.query<{ id: string }>(`
+    INSERT INTO platform_fee_accruals
+      (landlord_id, property_id, accrual_month,
+       long_term_unit_count, short_stay_nights, short_stay_equivalent, total_billable,
+       utility_service_unit_count,
+       rate_per_unit, min_per_connect_account, total_amount,
+       str_revenue, str_fee_amount,
+       payer,
+       billed_pm_company_id,
+       connect_min_topup, connect_group_key)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $14, $8, $9, $10, $11, $12, $13, $15, $16, $17)
+    RETURNING id
+  `, [
+    landlordId, propertyId, monthIso,
+    f.billable.longTerm, f.billable.shortStayNights, f.billable.shortStayEquivalent, f.totalBillable,
+    f.ratePerUnit, f.minPerGroup, totalAmount,
+    f.strRevenue, f.strFeeAmount,
+    f.payer,
+    f.billable.utilityService,
+    f.pmCompanyId,
+    connectMinTopup, connectGroupKey,
+  ])
+  return accrualRes.rows[0].id
+}
+
+/**
+ * Post one line of GAM's platform-fee revenue. The caller is inside a
+ * transaction; the ledger's one lock is taken here.
+ */
+async function postPlatformFeeRevenue(
+  client: PoolClient,
+  amount: number,
+  referenceId: string,
+  referenceType: string,
+  propertyId: string,
+  notes: string,
+): Promise<string> {
+  await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('platform_revenue', 0))`)
+  const prev = await client.query<{ balance_after: string }>(
+    `SELECT balance_after FROM platform_revenue_ledger
+      ORDER BY created_at DESC, id DESC LIMIT 1`
+  )
+  const prevBal = (prev.rowCount && prev.rowCount > 0)
+    ? parseFloat(prev.rows[0].balance_after)
+    : 0
+  const ledgerRes = await client.query<{ id: string }>(`
+    INSERT INTO platform_revenue_ledger
+      (type, amount, balance_after, reference_id, reference_type,
+       property_id, notes)
+    VALUES ('platform_fee_subscription', $1, $2, $3, $4, $5, $6)
+    RETURNING id
+  `, [amount, round2(prevBal + amount), referenceId, referenceType, propertyId, notes])
+  return ledgerRes.rows[0].id
+}
+
+/**
+ * The words on a monthly accrual's revenue line, which a landlord reading his
+ * fee can check against his own count.
+ */
+function accrualLedgerNotes(monthIso: string, f: AccrualFigures): string {
+  const b = f.billable
+  return `Platform fee for ${monthIso} (${f.totalBillable} billable units` +
+    (b.shortStayEquivalent > 0
+      ? `, ${b.longTerm} long-term + CEIL(${b.shortStayNights}/30)=${b.shortStayEquivalent} short-stay`
+      : '') +
+    // 10/5: say so when month stays are among the spaces, so a park reading
+    // its line sees why RV 10 is on it with no lease.
+    (b.monthStays > 0 ? `, ${b.monthStays} month stay${b.monthStays === 1 ? '' : 's'}` : '') +
+    // S615: name them, so a landlord reading his fee line can see that the
+    // extra $2 is the space next door he supplies and not a miscount.
+    (b.utilityService > 0 ? `, ${b.utilityService} utility-service` : '') +
+    (f.strFeeAmount > 0
+      ? `, +${(f.strFeePct * 100).toFixed(1)}% of ${f.strRevenue.toFixed(2)} STR revenue = ${f.strFeeAmount.toFixed(2)}`
+      : '') + `)`
+}
+
 async function accrueOneProperty(
   propertyId: string,
   landlordId: string,
@@ -441,7 +687,7 @@ async function accrueOneProperty(
     // Per-(property, month) advisory lock — same key shape as S111.
     await client.query(
       `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
-      [`platform_fee_accrual:${propertyId}:${monthIso}`]
+      [accrualLockKey(propertyId, monthIso)]
     )
 
     // Idempotency: already accrued?
@@ -470,174 +716,29 @@ async function accrueOneProperty(
       return 'pre_billing'
     }
 
-    // S652: the count lives in services/billableUnits so the admin estimate and
-    // this bill cannot disagree. See that file for what counts and why.
-    const billable = await billableUnitsForProperty(
-      client, propertyId, monthIso, arrearsIso, NIGHTS_AGGREGATION_UNIT_TYPES)
-    const longTermUnitCount = billable.longTerm
-    const utilityServiceUnitCount = billable.utilityService
-    const shortStayNights = billable.shortStayNights
-    const shortStayEquivalent = billable.shortStayEquivalent
-
-    const totalBillable = longTermUnitCount + shortStayEquivalent + utilityServiceUnitCount
-
-    // ── STR revenue (S538) ───────────────────────────────────────────────
-    // Bookings on any NON-aggregation unit type (everything but rv_spot)
-    // bill a percentage of revenue instead of nights/30. Revenue
-    // attributes to the month pro-rata by nights:
-    // total_amount × in-month / full-stay.
-    // 10/3 (decisions #33): "full-stay" is the length SOLD, and an early
-    // check-out's unstayed nights count in the month the guest left
-    // (services/platformFee stayRevenueInMonthSql — one formula for the bill
-    // and the landlord's fee estimate).
-    const strRes = await client.query<{ revenue: string | null }>(`
-      SELECT COALESCE(SUM(${stayRevenueInMonthSql('b', '$2::date')}), 0) AS revenue
-        FROM unit_bookings b
-        JOIN units u ON u.id = b.unit_id
-       WHERE u.property_id = $1
-         AND u.unit_type <> ALL($3::text[])
-         -- 10/5 (Nic, R12): a month stay with no lease bills like any stay
-         -- (services/billableUnits — the same rule as the nights above).
-         AND ${feeCountedStaySql('b', '$2::date')}
-         AND b.status NOT IN ('cancelled', 'no_show')
-         AND b.check_in  <  $2::date + INTERVAL '1 month'
-         AND b.check_out >  $2::date
-    `, [propertyId, arrearsIso  /* S650: arrears, like the nights above */, [...NIGHTS_AGGREGATION_UNIT_TYPES]])
-    const strRevenue = round2(parseFloat(strRes.rows[0].revenue ?? '0'))
-
-    // ── S645: IS THIS PROPERTY RUN BY A MANAGER? ───────────────────
-    //
-    // Nic (S644, DIRECTIVE): GAM bills "the PM company - one bill" for every
-    // occupied unit across all their owners. So for a managed property the
-    // INVOICE goes to the manager. What the OWNER pays their manager is the
-    // manager's own fee plan and has nothing to do with this - Nic (S646):
-    // "the owner's statement would not see our contract between the property
-    // manager and the platform." 
-    //
-    // Read before the rate, because the manager's rate is the one that applies:
-    // 11,000 units under one contract is not the list price, and that deal
-    // follows the MANAGER across every owner they bring.
-    const pmRes = await client.query<{ pm_company_id: string }>(`
-      SELECT p.pm_company_id
-        FROM properties p
-       WHERE p.id = $1 AND p.pm_company_id IS NOT NULL
-    `, [propertyId])
-    const pm = pmRes.rows[0] ?? null
-
-    // ── Rate + minimum ────────────────────────────────────────────────────
-    //
-    // Cascade: the MANAGER's negotiated rate when one runs this property, else
-    // the owner's own override, else the platform default. A managed property
-    // is the manager's line of business and is priced on their contract.
-    const rateRes = await client.query<{
-      rate_per_unit: string
-      min_per_connect_account: string
-      str_fee_pct: string
-    }>(`
-      SELECT
-        COALESCE(pmo.rate_per_unit, o.rate_per_unit, pfc.rate_per_unit) AS rate_per_unit,
-        COALESCE(pmo.min_per_connect_account, o.min_per_connect_account,
-                 pfc.min_per_connect_account) AS min_per_connect_account,
-        COALESCE(o.str_fee_pct, pfc.str_fee_pct) AS str_fee_pct
-      FROM platform_fee_config pfc
-      LEFT JOIN landlord_platform_fee_overrides o
-             ON o.landlord_id = $1
-            AND o.effective_until IS NULL
-      LEFT JOIN pm_company_platform_fee_overrides pmo
-             ON pmo.pm_company_id = $2::uuid
-            AND pmo.effective_until IS NULL
-      WHERE pfc.effective_until IS NULL
-      LIMIT 1
-    `, [landlordId, pm?.pm_company_id ?? null])
-    if (rateRes.rowCount === 0) {
-      await client.query('ROLLBACK')
-      throw new Error(`No active platform_fee_config row found`)
-    }
-    const ratePerUnit  = parseFloat(rateRes.rows[0].rate_per_unit)
-    const minPerGroup   = parseFloat(rateRes.rows[0].min_per_connect_account)
-    const strFeePct    = parseFloat(rateRes.rows[0].str_fee_pct)
-    const strFeeAmount = round2(strFeePct * strRevenue)
+    const f = await figureAccrual(client, propertyId, landlordId, monthIso, arrearsIso)
 
     // S630: no floor here. A property that earned nothing accrues nothing, and
     // the Connect-account group's minimum is settled once, later, across all of
     // them — so four properties on one payout setup no longer pay four floors.
-    if (totalBillable === 0 && strFeeAmount === 0) {
+    if (f.totalBillable === 0 && f.strFeeAmount === 0) {
       await client.query('ROLLBACK')
       return 'zero'
     }
 
-    const totalAmount = round2(ratePerUnit * totalBillable + strFeeAmount)
-
-    // ── Resolve platform_fee_payer at accrual time ──────────────────────
-    const payerRes = await client.query<{ platform_fee_payer: 'landlord' | 'tenant' | null }>(`
-      SELECT platform_fee_payer FROM property_allocation_rules WHERE property_id = $1
-    `, [propertyId])
-    const payer = (payerRes.rows[0]?.platform_fee_payer ?? 'landlord') as 'landlord' | 'tenant'
-
-    // ── Insert accrual row ──────────────────────────────────────────────
-    const accrualRes = await client.query<{ id: string }>(`
-      INSERT INTO platform_fee_accruals
-        (landlord_id, property_id, accrual_month,
-         long_term_unit_count, short_stay_nights, short_stay_equivalent, total_billable,
-         utility_service_unit_count,
-         rate_per_unit, min_per_connect_account, total_amount,
-         str_revenue, str_fee_amount,
-         payer,
-         billed_pm_company_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $14, $8, $9, $10, $11, $12, $13, $15)
-      RETURNING id
-    `, [
-      landlordId, propertyId, monthIso,
-      longTermUnitCount, shortStayNights, shortStayEquivalent, totalBillable,
-      ratePerUnit, minPerGroup, totalAmount,
-      strRevenue, strFeeAmount,
-      payer,
-      utilityServiceUnitCount,
-      pm?.pm_company_id ?? null,
-    ])
-    const accrualId = accrualRes.rows[0].id
+    const accrualId = await insertAccrualRow(client, landlordId, propertyId, monthIso, f, f.totalAmount)
 
     // ── Post platform_revenue_ledger entry when payer='landlord' ────────
     // When payer='tenant', the accrual row stands alone and the
-    // tenant-rent-charge code (future session) picks it up to add to
-    // application_fee_amount on the next rent payment.
-    if (payer === 'landlord') {
-      await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('platform_revenue', 0))`)
-      const prev = await client.query<{ balance_after: string }>(
-        `SELECT balance_after FROM platform_revenue_ledger
-          ORDER BY created_at DESC, id DESC LIMIT 1`
-      )
-      const prevBal = (prev.rowCount && prev.rowCount > 0)
-        ? parseFloat(prev.rows[0].balance_after)
-        : 0
-      const newBal = round2(prevBal + totalAmount)
-
-      const ledgerRes = await client.query<{ id: string }>(`
-        INSERT INTO platform_revenue_ledger
-          (type, amount, balance_after, reference_id, reference_type,
-           property_id, notes)
-        VALUES ('platform_fee_subscription', $1, $2, $3, 'platform_fee_accrual', $4,
-                $5)
-        RETURNING id
-      `, [
-        totalAmount, newBal, accrualId, propertyId,
-        `Platform fee for ${monthIso} (${totalBillable} billable units` +
-        (shortStayEquivalent > 0
-          ? `, ${longTermUnitCount} long-term + CEIL(${shortStayNights}/30)=${shortStayEquivalent} short-stay`
-          : '') +
-        // S615: name them, so a landlord reading his fee line can see that the
-        // extra $2 is the space next door he supplies and not a miscount.
-        (utilityServiceUnitCount > 0
-          ? `, ${utilityServiceUnitCount} utility-service`
-          : '') +
-        (strFeeAmount > 0
-          ? `, +${(strFeePct * 100).toFixed(1)}% of ${strRevenue.toFixed(2)} STR revenue = ${strFeeAmount.toFixed(2)}`
-          : '') + `)`,
-      ])
+    // tenant-rent-charge code picks it up to add to the next rent payment.
+    if (f.payer === 'landlord') {
+      const ledgerId = await postPlatformFeeRevenue(
+        client, f.totalAmount, accrualId, 'platform_fee_accrual', propertyId,
+        accrualLedgerNotes(monthIso, f))
 
       await client.query(
         `UPDATE platform_fee_accruals SET platform_revenue_ledger_id=$1, updated_at=NOW() WHERE id=$2`,
-        [ledgerRes.rows[0].id, accrualId]
+        [ledgerId, accrualId]
       )
 
       // ── S650 (Nic): AND ACTUALLY CHARGE FOR IT ────────────────────────────
@@ -656,10 +757,10 @@ async function accrueOneProperty(
         landlordId,
         propertyId,
         kind: 'subscription',
-        amount: totalAmount,
+        amount: f.totalAmount,
         sourceType: 'platform_fee_accrual',
         sourceId: accrualId,
-        notes: `Platform fee for ${monthIso} (${totalBillable} billable units)`,
+        notes: `Platform fee for ${monthIso} (${f.totalBillable} billable units)`,
       })
     }
 
@@ -673,8 +774,375 @@ async function accrueOneProperty(
   }
 }
 
+/** The per-(property, month) lock the monthly accrual and the top-up share. */
+function accrualLockKey(propertyId: string, monthIso: string): string {
+  return `platform_fee_accrual:${propertyId}:${monthIso}`
+}
+
 function round2(n: number): number {
   return Math.round(n * 100) / 100
+}
+
+/** "2026-10-01" → "October 2026", for words a landlord reads. */
+function monthLabel(monthIso: string): string {
+  return new Date(`${monthIso.slice(0, 10)}T00:00:00Z`)
+    .toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
+}
+
+// ── 10/5 (Nic): THE NIGHTLY TOP-UP ──────────────────────────────────────────
+//
+//   "rv 10 and 11 and 15 and 47 are active stays in october. they get billed
+//    for october. arrears is only for short term stays where we dont know the
+//    aggregate total nights. we know all 4 stays will be here the entire month"
+//
+// The monthly run on the 1st bills the spaces occupied THEN. A lease signed on
+// the 5th, or a month stay that arrives on the 12th, was billed by nobody: the
+// 1st had already passed and the next 1st bills the next month. Nic chose: a
+// space occupied after the 1st is billed for THAT month on the next weeknight,
+// just before the payout run, so the same night's payout nets it.
+//
+// Only the CURRENT month, ever. Nic, on a lease that started Sept 24 and was
+// signed Oct 5: "bill for the month of october. the extra nights in september
+// balance with the late arrivals for october." So nothing here back-bills an
+// earlier month.
+//
+// It only ever RAISES a bill — someone leaving mid-month does not refund the
+// month — and only by the spaces (leases, month stays, owner use, utility
+// spaces). The nightly and weekly nights on the row are last month's, counted
+// in arrears on the 1st, and are left as they were.
+
+export interface PlatformFeeTopUpResult {
+  monthScanned: string
+  /** The month's monthly run has not happened yet, so nothing was touched. */
+  monthNotYetBilled: boolean
+  propertiesRaised: number
+  propertiesCreated: number
+  /** What was added to landlords' bills tonight, in dollars. */
+  amountCharged: number
+  /**
+   * Properties whose fee their TENANTS pay, where the month's fee has already
+   * been added to a rent charge — a raise could not reach anyone, so it is
+   * left for a person to look at.
+   */
+  tenantPayerSkipped: string[]
+  errors: { property_id: string; error: string }[]
+}
+
+export async function processPlatformFeeTopUp(now: Date = new Date()): Promise<PlatformFeeTopUpResult> {
+  // Named exactly as the monthly run names it (Phoenix calendar, S654). The
+  // payout cron fires at 01:00 UTC, which is 6 pm the evening BEFORE in
+  // Phoenix — so the run at 01:00 UTC on Nov 1 is still Oct 31 and tops up
+  // October, the month that is actually still running.
+  const monthIso   = monthStartOf(dateIn(null, now))
+  const arrearsIso = monthStartOf(addDaysTo(monthIso, -1))
+  const result: PlatformFeeTopUpResult = {
+    monthScanned: monthIso, monthNotYetBilled: false,
+    propertiesRaised: 0, propertiesCreated: 0, amountCharged: 0,
+    tenantPayerSkipped: [], errors: [],
+  }
+
+  // Never before the month's monthly run (1:30 am Phoenix on the 1st). The run
+  // leaves a row for every property it billed, and nothing else writes a row
+  // for a month (this function only writes once one exists), so a row for the
+  // month is the proof it ran. By the clock alone it always has — 01:00 UTC is
+  // 6 pm Phoenix, after 1:30 am — but a missed or failed monthly run must not
+  // be stood in for by this one: the 1st's floor and grace sweeps never ran.
+  const opened = await query<{ ok: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM platform_fee_accruals WHERE accrual_month = $1::date) AS ok`,
+    [monthIso])
+  if (!opened[0]?.ok) {
+    result.monthNotYetBilled = true
+    return result
+  }
+
+  // Every payout group, past onboarding grace for this month exactly as the
+  // monthly run applies it (billing_starts_at set and on or before the month)
+  // — the same groups and the same floor as applyConnectAccountMinimums. A
+  // Connect account belongs to one landlord (landlords_stripe_connect_account_id
+  // _uniq), so a group is always one landlord's properties, all keyed by his
+  // account today: a change of account mid-month moves the whole group, and
+  // what it already paid toward the floor moves with it.
+  const groups = await query<{
+    group_key: string; min_amount: string; property_ids: string[]; landlord_ids: string[]
+    arrears_billable: boolean[]
+  }>(`
+    SELECT COALESCE(l.stripe_connect_account_id, 'entity:' || l.id::text) AS group_key,
+           MIN(COALESCE(o.min_per_connect_account, pfc.min_per_connect_account))::text AS min_amount,
+           ARRAY_AGG(p.id::text ORDER BY p.id) AS property_ids,
+           ARRAY_AGG(l.id::text ORDER BY p.id) AS landlord_ids,
+           -- Was the month just ended a billed month for this landlord? Only
+           -- then may a row the top-up creates carry that month's nights.
+           ARRAY_AGG(l.billing_starts_at <= $2::date ORDER BY p.id) AS arrears_billable
+      FROM properties p
+      JOIN landlords l ON l.id = p.landlord_id
+      CROSS JOIN LATERAL (
+        SELECT min_per_connect_account FROM platform_fee_config
+         WHERE effective_until IS NULL LIMIT 1) pfc
+      LEFT JOIN landlord_platform_fee_overrides o
+             ON o.landlord_id = l.id AND o.effective_until IS NULL
+     WHERE l.is_system = FALSE
+       AND l.billing_starts_at IS NOT NULL
+       AND l.billing_starts_at <= $1::date
+     GROUP BY 1`, [monthIso, arrearsIso])
+
+  for (const g of groups) {
+    try {
+      await topUpGroup(g, monthIso, arrearsIso, result)
+    } catch (e: any) {
+      result.errors.push({ property_id: g.property_ids.join(','), error: e?.message ?? String(e) })
+    }
+  }
+  result.amountCharged = round2(result.amountCharged)
+  return result
+}
+
+interface TopUpRaise {
+  propertyId: string
+  landlordId: string
+  /** An existing row raised, or a property's first row of the month. */
+  row: AccrualRowForTopUp | null
+  figures: AccrualFigures | null
+  newLongTerm: number
+  newUtilityService: number
+  /** Spaces added (raise) — or every space on a new row. */
+  moreSpaces: number
+  spacesInAll: number
+  /** What those spaces earn at the row's rate (the figures' whole total for a new row). */
+  value: number
+  payer: 'landlord' | 'tenant'
+  /** What tonight actually adds to this row, after the floor (set below). */
+  share: number
+}
+
+interface AccrualRowForTopUp {
+  id: string
+  property_id: string
+  landlord_id: string
+  payer: 'landlord' | 'tenant'
+  tenant_charge_id: string | null
+  rate_per_unit: string
+  long_term_unit_count: number
+  utility_service_unit_count: number
+  total_amount: string
+  connect_min_topup: string
+}
+
+/**
+ * One payout group, one transaction: every property's lock, the recount, the
+ * group's floor, and the bookings land together or not at all.
+ *
+ * THE FLOOR (S630, per Connect account). After tonight the group's total must
+ * be max(floor, earned) — what it would have been had the 1st seen these
+ * spaces. Tonight's charge is that total less what the month already charged,
+ * so a space added while the group is under the floor adds $0 (the floor
+ * already paid for it), one that lifts it over adds only the excess, and the
+ * floor is never charged twice. Nothing already charged is ever lowered: a
+ * raise the floor absorbed is written on its row as a negative
+ * connect_min_topup, so each row still reads total = earned + top-up and the
+ * group's top-ups still add to exactly floor − earned.
+ */
+async function topUpGroup(
+  g: {
+    group_key: string; min_amount: string; property_ids: string[]; landlord_ids: string[]
+    arrears_billable: boolean[]
+  },
+  monthIso: string,
+  arrearsIso: string,
+  result: PlatformFeeTopUpResult,
+): Promise<void> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    // The payout run waits on this one (jobs/scheduler). A group stuck behind
+    // somebody else's lock is given up on and logged, never left to hold every
+    // landlord's payout for the night.
+    await client.query(`SET LOCAL lock_timeout = '5s'`)
+    await client.query(`SET LOCAL statement_timeout = '60s'`)
+    // Same lock as the monthly run's, in a fixed order so two runs can never
+    // deadlock on one group.
+    for (const pid of g.property_ids) {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [accrualLockKey(pid, monthIso)])
+    }
+
+    const rows = (await client.query<AccrualRowForTopUp>(
+      `SELECT id, property_id, landlord_id, payer, tenant_charge_id,
+              rate_per_unit::text, long_term_unit_count, utility_service_unit_count,
+              total_amount::text, connect_min_topup::text
+         FROM platform_fee_accruals
+        WHERE property_id = ANY($1::uuid[]) AND accrual_month = $2::date
+        ORDER BY property_id
+        FOR UPDATE`,
+      [g.property_ids, monthIso])).rows
+    const rowByProperty = new Map(rows.map(r => [r.property_id, r]))
+    const chargedBefore = round2(rows.reduce((n, r) => n + parseFloat(r.total_amount), 0))
+    const earnedBefore = round2(rows.reduce(
+      (n, r) => n + parseFloat(r.total_amount) - parseFloat(r.connect_min_topup), 0))
+
+    const raises: TopUpRaise[] = []
+    for (let i = 0; i < g.property_ids.length; i++) {
+      const propertyId = g.property_ids[i]
+      const landlordId = g.landlord_ids[i]
+      const row = rowByProperty.get(propertyId)
+      if (row) {
+        const b = await billableUnitsForProperty(
+          client, propertyId, monthIso, arrearsIso, NIGHTS_AGGREGATION_UNIT_TYPES)
+        const before = row.long_term_unit_count + row.utility_service_unit_count
+        const after = b.longTerm + b.utilityService
+        if (after <= before) continue          // never lowers; nothing new
+        if (row.payer === 'tenant' && row.tenant_charge_id) {
+          // The tenant-paid fee rides on the next rent charge, which picks up
+          // the row's whole total once (services/rentCharge). This month's has
+          // already been picked up, so a raise would reach nobody.
+          result.tenantPayerSkipped.push(propertyId)
+          continue
+        }
+        const more = after - before
+        raises.push({
+          propertyId, landlordId: row.landlord_id, row, figures: null,
+          newLongTerm: b.longTerm, newUtilityService: b.utilityService,
+          moreSpaces: more, spacesInAll: after,
+          value: round2(parseFloat(row.rate_per_unit) * more),
+          payer: row.payer, share: 0,
+        })
+      } else {
+        // Nothing was billable here on the 1st. Its first row is figured
+        // exactly as the monthly run would have figured it — except the month
+        // just ended, when that month was still the landlord's onboarding
+        // grace (he went live this month): it was never a billed month.
+        const f = await figureAccrual(
+          client, propertyId, landlordId, monthIso, arrearsIso, g.arrears_billable[i] === true)
+        if (f.totalBillable === 0 && f.strFeeAmount === 0) continue
+        raises.push({
+          propertyId, landlordId, row: null, figures: f,
+          newLongTerm: f.billable.longTerm, newUtilityService: f.billable.utilityService,
+          moreSpaces: f.billable.longTerm + f.billable.utilityService,
+          spacesInAll: f.billable.longTerm + f.billable.utilityService,
+          value: f.totalAmount, payer: f.payer, share: 0,
+        })
+      }
+    }
+    if (raises.length === 0) { await client.query('ROLLBACK'); return }
+
+    const floor = parseFloat(g.min_amount)
+    const earnedAfter = round2(earnedBefore + raises.reduce((n, r) => n + r.value, 0))
+    const target = round2(Math.max(floor, earnedAfter))
+    let remaining = Math.max(round2(target - chargedBefore), 0)
+    for (const r of raises) {
+      r.share = round2(Math.min(remaining, r.value))
+      remaining = round2(remaining - r.share)
+    }
+    // Only when the group was under its floor before tonight with nothing
+    // charged toward it (a group billed nothing on the 1st): the floor itself.
+    const floorLeft = remaining
+
+    const label = monthLabel(monthIso)
+    const createdIds = new Map<string, string>()
+    for (const r of raises) {
+      const absorbed = round2(r.value - r.share)
+      const covered = absorbed > 0
+        ? `; $${absorbed.toFixed(2)} of it was already covered by the $${floor.toFixed(2)} monthly minimum`
+        : ''
+      const spaces = (n: number) => `${n} occupied space${n === 1 ? '' : 's'}`
+      let accrualId: string
+      let note: string
+      if (r.row) {
+        accrualId = r.row.id
+        await client.query(
+          `UPDATE platform_fee_accruals
+              SET long_term_unit_count = $2,
+                  utility_service_unit_count = $3,
+                  total_billable = total_billable + $4,
+                  total_amount = total_amount + $5,
+                  connect_min_topup = connect_min_topup - $6,
+                  connect_group_key = $7,
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [accrualId, r.newLongTerm, r.newUtilityService, r.moreSpaces,
+           r.share, absorbed, g.group_key])
+        note = `Platform fee for ${label} — ${r.moreSpaces} more occupied space${r.moreSpaces === 1 ? '' : 's'} (${r.spacesInAll} in all)${covered}`
+        result.propertiesRaised++
+      } else {
+        const f = r.figures!
+        accrualId = await insertAccrualRow(
+          client, r.landlordId, r.propertyId, monthIso, f, r.share, round2(r.share - f.totalAmount), g.group_key)
+        createdIds.set(r.propertyId, accrualId)
+        const nights = f.billable.shortStayEquivalent > 0
+          ? `, ${f.billable.shortStayEquivalent} more for ${f.billable.shortStayNights} nights stayed in ${monthLabel(arrearsIso)}`
+          : ''
+        const str = f.strFeeAmount > 0
+          ? `, $${f.strFeeAmount.toFixed(2)} for ${(f.strFeePct * 100).toFixed(1)}% of stay revenue`
+          : ''
+        note = `Platform fee for ${label} — ${spaces(r.spacesInAll)}${nights}${str}${covered}`
+        result.propertiesCreated++
+      }
+
+      // Booked exactly as the monthly fee is (accrueOneProperty): GAM's revenue
+      // line and the landlord's 'subscription' charge, which the payout nets.
+      // A tenant-paid fee is left on the row for the next rent charge instead.
+      if (r.payer === 'landlord' && r.share > 0) {
+        // A property's FIRST row of the month books its revenue like the
+        // monthly fee — one 'platform_fee_accrual' line per accrual, the key
+        // services/platformRevenue also books by. A raise is its own line with
+        // its own key, so each night's raise is a separate, unrepeatable one.
+        const ref = r.row ? randomUUID() : accrualId
+        const ledgerType = r.row ? 'platform_fee_topup' : 'platform_fee_accrual'
+        const ledgerId = await postPlatformFeeRevenue(client, r.share, ref, ledgerType, r.propertyId, note)
+        if (!r.row) {
+          await client.query(
+            `UPDATE platform_fee_accruals SET platform_revenue_ledger_id = $1 WHERE id = $2`,
+            [ledgerId, accrualId])
+        }
+        // The CHARGE is always a top-up, even a property's first of the month.
+        // The portal-lock sweep (services/portalLockSweep) counts the 1st's
+        // 'platform_fee_accrual' charges as billing cycles, one a month; a
+        // first bill raised at 6 pm on the 31st would otherwise count as a
+        // whole cycle hours before the next 1st's, and lock a landlord after
+        // one day of patience instead of a month's.
+        await chargeLandlord(client, {
+          landlordId: r.landlordId, propertyId: r.propertyId, kind: 'subscription',
+          amount: r.share, sourceType: 'platform_fee_topup', sourceId: ref, notes: note,
+        })
+        result.amountCharged += r.share
+      }
+    }
+
+    if (floorLeft > 0) {
+      // The largest earner carries the floor, as on the 1st — among the rows a
+      // charge can still reach.
+      const candidates = (await client.query<{ id: string; property_id: string; landlord_id: string; payer: string }>(
+        `SELECT id, property_id, landlord_id, payer FROM platform_fee_accruals
+          WHERE property_id = ANY($1::uuid[]) AND accrual_month = $2::date
+            AND (payer = 'landlord' OR tenant_charge_id IS NULL)
+          ORDER BY (total_amount - connect_min_topup) DESC, property_id
+          LIMIT 1`,
+        [g.property_ids, monthIso])).rows
+      const anchor = candidates[0]
+      if (!anchor) throw new Error(`No row can carry the $${floorLeft.toFixed(2)} monthly minimum for ${g.group_key}`)
+      await client.query(
+        `UPDATE platform_fee_accruals
+            SET total_amount = total_amount + $2, connect_min_topup = connect_min_topup + $2,
+                connect_group_key = $3, updated_at = NOW()
+          WHERE id = $1`,
+        [anchor.id, floorLeft, g.group_key])
+      if (anchor.payer === 'landlord') {
+        const note = `Monthly minimum for ${label} — brings this payout account to $${floor.toFixed(2)}`
+        const ref = randomUUID()
+        await postPlatformFeeRevenue(client, floorLeft, ref, 'platform_fee_topup', anchor.property_id, note)
+        await chargeLandlord(client, {
+          landlordId: anchor.landlord_id, propertyId: anchor.property_id, kind: 'subscription',
+          amount: floorLeft, sourceType: 'platform_fee_topup', sourceId: ref, notes: note,
+        })
+        result.amountCharged += floorLeft
+      }
+    }
+
+    await client.query('COMMIT')
+  } catch (e) {
+    try { await client.query('ROLLBACK') } catch {}
+    throw e
+  } finally {
+    client.release()
+  }
 }
 
 // ── S552: SCREENING FEE SWEEP ────────────────────────────────────────────
