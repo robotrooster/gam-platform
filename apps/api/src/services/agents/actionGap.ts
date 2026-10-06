@@ -248,6 +248,8 @@ const DELIBERATE = new Map(Object.entries({
   'tenants POST /avatar': 'a profile photo is a file the tenant chooses',
   // 10/5 (Nic): photos of a bank's deposit receipt are files taken of paper.
   'payments POST /remittances/:id/deposit-photo': 'a photo of the bank\'s receipt is a file the landlord takes and uploads',
+  // 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's discretion."
+  'payments POST /:id/delete-late-fee': 'deleting an onboarding late fee is the landlord\'s own discretion, done by a person from Payment History — never by the assistant',
   'declaredDeposits POST /:id/receipt-photo': 'a photo of the bank\'s receipt is a file the tenant takes and uploads',
   // 10/5 (Nic): taking part payments has local-law weight; the landlord turns
   // it on beside the screen's "check your local laws" note.
