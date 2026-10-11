@@ -1755,7 +1755,7 @@ function CashFlow(){
   const now=new Date()
   const[startDate,setStartDate]=useState(`${now.getFullYear()}-01-01`)
   const[endDate,setEndDate]=useState(localToday(now))
-  const{data,isLoading}=useQuery(['cf',startDate,endDate],()=>get<any>(`/books/reports/cash-flow?startDate=${startDate}&endDate=${endDate}`))
+  const{data,isLoading,error}=useQuery(['cf',startDate,endDate],()=>get<any>(`/books/reports/cash-flow?startDate=${startDate}&endDate=${endDate}`))
 
   const op=(data as any)?.operating
   const fin=(data as any)?.financing
@@ -1772,6 +1772,9 @@ function CashFlow(){
         </div>
       </div>
 
+      {/* 10/11: a refused report (a bookkeeper kept to some of the company's
+          properties) says why — never a page of $0 that reads as real. */}
+      {!!error?<div className="alert aw">{loadErrorText(error,'Could not load the cash flow.')}</div>:<>
       <div className="grid4" style={{marginBottom:16}}>
         <div className="kpi"><div className="kl">Money In</div><div className="kv g">{formatCurrency(op?.inflows?.total||0)}</div><div className="ks">By the day it arrived</div></div>
         <div className="kpi"><div className="kl">Operating Outflows</div><div className="kv r">{formatCurrency(op?.outflows?.total||0)}</div><div className="ks">Expenses + payroll + bills</div></div>
@@ -1841,6 +1844,7 @@ function CashFlow(){
           </div>
         </div>
       )}
+      </>}
     </div>
   )
 }
@@ -2205,8 +2209,8 @@ function ProfitLoss(){
         </div>
       </div>
       {!isBusiness&&<BasisNote basis={basis}/>}
-      {!!error&&<div className="alert aw">{loadErrorText(error,'Could not load the profit and loss.')}</div>}
-
+      {/* 10/11: a refused report says why — never "$0.00 Profitable" under it. */}
+      {!!error?<div className="alert aw">{loadErrorText(error,'Could not load the profit and loss.')}</div>:<>
       <div className="grid4" style={{marginBottom:16}}>
         <div className="kpi"><div className="kl">Ledger Income</div><div className="kv g">{formatCurrency(totalIncome)}</div><div className="ks">{income.length} income accounts</div></div>
         {!isBusiness&&<div className="kpi"><div className="kl">GAM Income · {word}</div><div className="kv gold">{formatCurrency(gamRent)}</div><div className="ks">From your GAM properties</div></div>}
@@ -2296,6 +2300,7 @@ function ProfitLoss(){
           </div>
         </div>
       )}
+      </>}
     </div>
   )
 }

@@ -174,6 +174,7 @@ const STATIC_ALLOWED_ORIGINS = [
   'http://localhost:3102', // tenant preview
   'http://localhost:3103', // admin preview
   'http://localhost:3105', // pos preview
+  'http://localhost:3106', // books preview
   // S558: the real local dev servers (30xx). In prod-mode the *_APP_URL vars
   // above resolve to the prod domains, so the localhost fallbacks drop out and
   // a local dev portal hitting this API gets a CORS block ("login failed").
