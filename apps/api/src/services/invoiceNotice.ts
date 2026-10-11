@@ -284,13 +284,31 @@ export function chargeDetail(row: ChargeLabelRow): string | null {
 /** @deprecated name kept for existing callers: chargeLabel. */
 export const labelFor = (row: ChargeLabelRow): string => chargeLabel(row)
 
-/** Why a line on the bill is not owed: a tag beside it, never its name. */
+/**
+ * Why a line on the bill is not owed: a tag beside it, never its name. Only
+ * for a line money paid (or is paying): 10/6 (Nic), credit is never a tag on a
+ * line — it is one "Credit applied" figure under the lines (creditOnBill).
+ */
 function coveredHow(l: { status: string; amount: string; credit_applied: string; open: boolean }): string {
   if (l.status === 'processing' || (l.status === 'pending' && !l.open)) return 'payment clearing'
   if (l.status === 'paid_via_deposit') return 'taken from the deposit'
-  const amt = Math.round(Number(l.amount) * 100)
-  if (amt > 0 && Math.round(Number(l.credit_applied) * 100) >= amt) return 'paid with your account credit'
   return 'already paid'
+}
+
+/**
+ * 10/6 (Nic): "Credits need to not settle by line item. It needs to be a
+ * credit against the entire balance." A line money paid (or is paying) is
+ * listed as covered; every other line is listed at what it is, and the credit
+ * applied to them is ONE figure under the lines — so the lines, less that
+ * figure, are exactly what is still owed. Cents in, cents out.
+ */
+export function creditOnBill(lines: ReadonlyArray<{ amount: string | number; credit_applied: string | number; open: boolean }>): {
+  struck: boolean[]; creditApplied: number
+} {
+  const c = (v: string | number) => Math.round(Number(v) * 100)
+  const struck = lines.map(l => !l.open && c(l.credit_applied) < c(l.amount))
+  const creditApplied = lines.reduce((t, l, i) => t + (struck[i] ? 0 : Math.min(c(l.amount), c(l.credit_applied))), 0)
+  return { struck, creditApplied }
 }
 
 /**
@@ -382,9 +400,12 @@ export async function sendPendingInvoiceNotices(
       // owes — every line that is open, at what it still owes — with nothing
       // taken off for credit: "credit auto-applies only when it covers the
       // WHOLE bill; otherwise the tenant is asked" when they pay. A line that
-      // was already paid (a check that beat the email, a bill the account
-      // credit paid in full) is listed as covered, not due.
+      // was already paid with money (a check that beat the email) is listed as
+      // covered, not due. 10/6 (Nic): credit already applied to the bill —
+      // money paid ahead goes on by itself, whole or in part — is one "Credit
+      // applied" figure under the lines (creditOnBill), never a line's tag.
       const total = Math.round(lines.reduce((s, l) => s + (l.open ? Math.round(Number(l.open_amount) * 100) : 0), 0)) / 100
+      const onBill = creditOnBill(lines)
 
       // The credit Pay Now will offer them for this bill: the household plan's
       // share for this lease (oldest bill first, eligible lines only, within a
@@ -403,13 +424,14 @@ export async function sendPendingInvoiceNotices(
         invoiceNumber: inv.invoice_number,
         dueDateLabel: inv.due_label,
         total,
-        lines: lines.map(l => ({
+        lines: lines.map((l, i) => ({
           label: chargeLabel(l),
           detail: chargeDetail(l),
           amount: Number(l.amount),
-          covered: !l.open,
+          covered: onBill.struck[i],
           coveredHow: coveredHow(l),
         })),
+        creditApplied: onBill.creditApplied / 100,
         workTradeCredit: Number(inv.work_trade_credit_amount) || 0,
         creditAvailable,
         portalUrl: payNowLink(inv),

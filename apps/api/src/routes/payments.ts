@@ -1737,6 +1737,12 @@ paymentsRouter.get('/post-payment/quote', requirePerm('take_payment'), async (re
     // 10/6 (Nic): "Bank deposit" is offered only where tenants deposit rent at the bank.
     const bankDepositAllowed = await tenantsDepositAtBank(client, { leaseId: lease.lease_id })
     let out = { lateFeesOffIfPaidInFull: 0, onboardingLateFeesOff: 0 }
+    // Review fix (10/6, Nic: never talk about credit that is not there): what
+    // they owe now, so the window speaks of money kept ahead only when the
+    // amount typed is more than that. A look: nothing is locked or changed.
+    const now = await deskQuote(client, { tenantId: q.tenantId, landlordId: lease.landlord_id })
+    const owedNow = [...now.rows, ...now.carried]
+      .reduce((t, r) => t + Math.max(0, Math.round(Number(r.amount) * 100) - Math.round(Number(r.appliedCredit) * 100)), 0) / 100
     if (q.depositedOn && bankDepositAllowed) {
       depositedOnAsSettledAt('bank_deposit', q.depositedOn, await propertyToday(lease.property_id))
       await client.query('BEGIN')
@@ -1749,7 +1755,7 @@ paymentsRouter.get('/post-payment/quote', requirePerm('take_payment'), async (re
         await client.query('ROLLBACK').catch(() => {})
       }
     }
-    res.json({ success: true, data: { ...out, bankDepositAllowed, canDeleteLateFees: canDeleteLateFees(req.user, lease.landlord_id) } })
+    res.json({ success: true, data: { ...out, owedNow, bankDepositAllowed, canDeleteLateFees: canDeleteLateFees(req.user, lease.landlord_id) } })
   } catch (e) { next(e) } finally { client.release() }
 })
 
@@ -2041,6 +2047,9 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
         // owed after it, and on which bills. 0 / [] when paid in full.
         partial:      result.stillOwed > 0,
         stillOwed:    result.stillOwed,
+        // 10/6 (Nic): what a part payment could not place, gone on the rest
+        // of what they owe (never said as credit while the balance is owed).
+        leftoverOnBalance: result.leftoverOnBalance,
         stillOwedRows: result.stillOwedRows,
         // 10/5 (Nic): late fees charged after a bank deposit's date that came
         // off because it paid the bill in full — 10/6: credited (unbilled),

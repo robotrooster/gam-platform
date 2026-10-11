@@ -1,10 +1,10 @@
 import { Router } from 'express'
 import { collectedRentMtd, incomeCardFrom } from '../lib/rentCollected'
-import { occupancyRateFrom, INCOME_CATEGORY_LABEL, MANUAL_PAYMENT_METHOD_LABELS, type IncomeBasis } from '@gam/shared'
+import { occupancyRateFrom, INCOME_CATEGORY_LABEL, MANUAL_PAYMENT_METHOD_LABELS, MAINTENANCE_CATEGORY_LABEL, type IncomeBasis, type MaintenanceCategory } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
+import { landlordScopeIds, resolveLandlordTarget, isEntityMember } from '../lib/landlordScope'
 import { platformFeesByPropertyForEntities, periodMonths } from '../services/platformFee'
 import { computeLandlordPL, landlordPLExpenses, landlordIncomeSql, landlordDepositSql } from '../services/landlordPL'
 import { seesGrandTotals } from '../services/openBalances'
@@ -23,6 +23,26 @@ export const reportsRouter = Router()
 // All reports require auth; specific perms gate per endpoint below.
 // Owners auto-pass requirePerm via OWNER_ROLES short-circuit.
 reportsRouter.use(requireAuth)
+
+// 10/11 (Nic): the Reports page is one of the financial pages GAM Books shows
+// too (apps/{landlord,books}/src/financials). Books has ONE company open at a
+// time and names it with X-Client-Id; an owner's reports there read that
+// company, the way every other Books page does. The landlord portal sends no
+// header and keeps reading every company the account owns. (A bookkeeper's
+// company is already pinned by requireAuth.)
+reportsRouter.use(async (req: any, _res, next) => {
+  try {
+    const header = req.headers?.['x-client-id']
+    const named = Array.isArray(header) ? header[0] : header
+    if (req.user?.role === 'landlord' && named) {
+      if (!/^[0-9a-f-]{36}$/i.test(String(named)) || !(await isEntityMember(req.user, String(named), query))) {
+        throw new AppError(403, 'That company is not yours.')
+      }
+      req.user = { ...req.user, landlordIds: [String(named)] }
+    }
+    next()
+  } catch (e) { next(e) }
+})
 
 // S654: report periods follow GAM's home calendar — Phoenix, the zone
 // todayIn(null) reads and the database's CURRENT_DATE uses — never the UTC
@@ -913,8 +933,11 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
     // maintenance onto units. Joining two one-to-many tables to the same unit
     // fans out (P payments × M maintenance rows), which multiplied each money
     // SUM by the other table's row count whenever a unit had both.
+    // 10/11 (Nic): only what the By Property table shows. `p.*` sent every
+    // property's lease signer, office email and phone, owner ids and fee
+    // settings to whoever opened the report — a bookkeeper included.
     const properties = await query<any>(`
-      SELECT p.*,
+      SELECT p.id, p.name, p.city, p.state, p.type, p.landlord_id,
         -- S616: a service point carries a neighbor's utility bill and is not
         -- this landlord's inventory. Every other count here names a status,
         -- which is why this bare one was the place it still leaked in.
@@ -1063,7 +1086,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
     const feeMap = await platformFeesByPropertyForEntities(landlordIds, periodMonths(year, month), propertyId)
     const platformFee = round2(feeMap.get(propertyId) ?? 0)
     const maintenance = await query<any>(`
-      SELECT mr.id, mr.title, mr.status, mr.actual_cost, mr.completed_at,
+      SELECT mr.id, mr.title, mr.category, mr.status, mr.actual_cost, mr.completed_at,
         u.unit_number
       FROM maintenance_requests mr
       JOIN units u ON u.id = mr.unit_id
@@ -1086,7 +1109,8 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
     const net = round2(breakdown.total - expensesTotal)
 
     // The lists, after the breakdown.
-    const units = await query<any>(`
+    const isBookkeeper = req.user?.role === 'bookkeeper'
+    const units = isBookkeeper ? [] : await query<any>(`
       SELECT u.id, u.unit_number, u.status, u.bedrooms, u.bathrooms, u.rent_amount,
         vuo.is_occupied,
         vuo.primary_first_name AS tenant_first, vuo.primary_last_name AS tenant_last
@@ -1120,18 +1144,28 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
       net,
       // Kept for the existing screen: collected = the breakdown's total under the basis.
       summary: { collected: breakdown.total, maintCost, platformFee, net, depositsHeld },
-      units: units.map((u: any) => ({
+      // 10/11 (Nic): a bookkeeper never sees who lives where or what a unit
+      // rents for — the property's rent roll stays on the server. The counts
+      // above (totalUnits, occupiedUnits, occupancyRate) carry the figures.
+      units: isBookkeeper ? [] : units.map((u: any) => ({
         id: u.id, unitNumber: u.unit_number, status: u.status,
         bedrooms: u.bedrooms, bathrooms: parseFloat(u.bathrooms),
         rent: parseFloat(u.rent_amount || 0), isOccupied: !!u.is_occupied,
         tenantName: [u.tenant_first, u.tenant_last].filter(Boolean).join(' ') || null,
       })),
       payments: paymentRows,
-      maintenance: maintenance.map((m: any) => ({
-        id: m.id, title: m.title, status: m.status,
-        actualCost: parseFloat(m.actual_cost || 0),
-        completedAt: m.completed_at, unitNumber: m.unit_number ?? null,
-      })),
+      // 10/11 (Nic): "They don't need to see all the maintenance reports" — a
+      // bookkeeper gets the cost and its kind, never the request's own words
+      // (a title often names the resident or the problem in their home).
+      maintenance: maintenance.map((m: any) => {
+        const categoryLabel = MAINTENANCE_CATEGORY_LABEL[m.category as MaintenanceCategory] ?? 'General / Other'
+        const cost = {
+          id: m.id, categoryLabel, status: m.status,
+          actualCost: parseFloat(m.actual_cost || 0),
+          completedAt: m.completed_at, unitNumber: m.unit_number ?? null,
+        }
+        return isBookkeeper ? cost : { ...cost, title: m.title }
+      }),
       monthlyTrend: trend,
       meta: { basis: basisMeta(basis), listsAfterBreakdown: true },
     } })

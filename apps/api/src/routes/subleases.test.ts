@@ -674,11 +674,11 @@ describe('GET /subleases — list scoping', () => {
     expect(res.body.data).toEqual([])
   })
 
-  it('unknown role (bookkeeper) gets empty list', async () => {
+  it('unknown role (business staff) gets empty list', async () => {
     const f = await seedFixture()
     await seedActiveSublease(f)
     const bkToken = jwt.sign(
-      { userId: randomUUID(), role: 'bookkeeper', email: 'bk@test.dev', profileId: randomUUID(), permissions: {} },
+      { userId: randomUUID(), role: 'business_staff', email: 'bs@test.dev', profileId: randomUUID(), permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
     const res = await request(buildApp())
@@ -686,6 +686,17 @@ describe('GET /subleases — list scoping', () => {
       .set('Authorization', `Bearer ${bkToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data).toEqual([])
+  })
+
+  it('a bookkeeper is refused outright (10/11, lib/bookkeeperAccess)', async () => {
+    const bkToken = jwt.sign(
+      { userId: randomUUID(), role: 'bookkeeper', email: 'bk@test.dev', profileId: randomUUID(), permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' },
+    )
+    const res = await request(buildApp())
+      .get('/api/subleases')
+      .set('Authorization', `Bearer ${bkToken}`)
+    expect(res.status).toBe(403)
   })
 })
 

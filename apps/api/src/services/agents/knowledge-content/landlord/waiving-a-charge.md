@@ -10,7 +10,7 @@ The charge itself stays on the record. That is deliberate: the history shows the
 
 ## What the credit does next
 
-A credit clears a bill **by itself only when it covers the whole bill.** Credit $50 against a tenant whose whole open bill is a $50 late fee, and that bill is marked paid right away and the tenant gets a receipt saying it was paid with their account credit.
+A credit you give clears a bill **by itself only when it covers the whole bill.** (Money a tenant paid ahead is different: it goes on their balance by itself, oldest bill first, part of a bill when it cannot pay all of it.) Credit $50 against a tenant whose whole open bill is a $50 late fee, and that bill is marked paid right away and the tenant gets a receipt saying it was paid with their account credit.
 
 When the credit is smaller than what they owe, nothing is paid on its own. Their balance still shows in full, with "credit available $X" beside it, on your Outstanding Balances page, on their tenant page and in their bill email. When they pay, they choose **Use all $X** (the credit comes off and they pay the rest) or **Save it for later**. The front desk asks the same question before recording a cash or check payment. So crediting part of a late fee does not take part of the fee off their screen; it gives them credit they can use toward it.
 

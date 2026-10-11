@@ -218,9 +218,13 @@ describe('Bank deposit in the desk window', () => {
     expect(text()).toContain('625')
     await type(field(/^Date deposited$/)!, '2026-10-01')
     await until(() => server.gets.some(u => u === '/payments/r1/record-manual/quote?depositedOn=2026-10-01'), 'the bill as of the deposit')
-    await until(() => text().includes('Deposited before $25.00 in late fees were charged'), 'the note')
-    expect(text()).toContain('each bill this deposit pays in full gets them credited, and the payment still counts as late on their history. A bill it pays only in part keeps its late fees.')
+    // 10/6 (Nic): nothing hypothetical — no word about late fees until an
+    // amount is typed that pays the bill in full.
+    expect(text()).not.toContain('late fees were charged')
     await type(field(/^Amount deposited$/)!, '600')
+    await until(() => text().includes('Deposited Oct 1, before $25.00 in late fees were charged.'), 'the note')
+    expect(text()).toContain('This pays the bill in full, so those late fees are credited; the payment still counts as late on their history.')
+    expect(text()).not.toContain('only in part')
     await type(field(/^Deposit reference number/)!, 'DEP-OCT1')
     await press(/^Record \$600\.00/)
     await until(() => onRecorded.mock.calls.length === 1, 'the payment recorded')
@@ -245,12 +249,14 @@ describe('Bank deposit in the desk window', () => {
     await press(/^Bank deposit$/)
     expect(box()).toBeUndefined()                      // dated today: nothing comes off, no box
     await type(field(/^Date deposited$/)!, '2026-10-01')
+    // 10/6: offered only once the amount typed pays that bill in full.
+    expect(box()).toBeUndefined()
+    await type(field(/^Amount deposited$/)!, '600')
     await until(() => !!box(), 'the onboarding box')
     expect(box()!.textContent).toBe('Delete the late fee completely (onboarding month)Leaves no late fee on their record. Unchecked, the late fee is credited and still counts as a late payment.')
     const input = box()!.querySelector('input') as HTMLInputElement
     expect(input.checked).toBe(false)
     await act(async () => { input.click() })
-    await type(field(/^Amount deposited$/)!, '600')
     await type(field(/^Deposit reference number/)!, 'DEP-ONB')
     await press(/^Record \$600\.00/)
     await until(() => onRecorded.mock.calls.length === 1, 'the payment recorded')
@@ -266,7 +272,8 @@ describe('Bank deposit in the desk window', () => {
     await openDesk()
     await press(/^Bank deposit$/)
     await type(field(/^Date deposited$/)!, '2026-10-01')
-    await until(() => text().includes('Deposited before $25.00 in late fees were charged'), 'the note')
+    await type(field(/^Amount deposited$/)!, '600')
+    await until(() => text().includes('Deposited Oct 1, before $25.00 in late fees were charged.'), 'the note')
     expect(box()).toBeUndefined()
   })
 
@@ -277,9 +284,9 @@ describe('Bank deposit in the desk window', () => {
     await openDesk()
     await press(/^Bank deposit$/)
     await type(field(/^Date deposited$/)!, '2026-10-01')
-    await until(() => text().includes('Deposited before $25.00 in late fees were charged'), 'the note')
-    expect(box()).toBeUndefined()
     await type(field(/^Amount deposited$/)!, '600')
+    await until(() => text().includes('Deposited Oct 1, before $25.00 in late fees were charged.'), 'the note')
+    expect(box()).toBeUndefined()
     await type(field(/^Deposit reference number/)!, 'DEP-LATE')
     await press(/^Record \$600\.00/)
     await until(() => onRecorded.mock.calls.length === 1, 'the payment recorded')
@@ -374,8 +381,10 @@ describe('part payments at the desk', () => {
     await press(/^Bank deposit$/)
     await type(field(/^Amount deposited$/)!, '500')
     await type(field(/^Deposit reference number/)!, 'DEP-3')
-    await until(() => text().includes('Part payment. $100.00 stays owed on October rent — late fees still apply.'), 'the part-payment line')
+    // 10/6 (Nic): exactly what will happen — owed, paying, stays owed — and nothing else.
+    await until(() => text().includes('Part paymentOwed $600.00Paying $500.00Stays owed $100.00 on October rent — late fees still apply.'), 'the part-payment line')
     expect(text()).not.toContain('Rent is paid in full')
+    expect(text()).not.toMatch(/credit/i)
     await press(/^Record \$500\.00/)
     await until(() => onRecorded.mock.calls.length === 1, 'the payment recorded')
     expect(server.posts.find(p => p.url.endsWith('/record-manual'))!.body).toEqual({ method: 'bank_deposit', amountTendered: 500, reference: 'DEP-3' })
@@ -393,12 +402,13 @@ describe('part payments at the desk', () => {
     await openDesk()
     await press(/^Bank deposit$/)
     await type(field(/^Date deposited$/)!, '2026-10-01')
-    await until(() => text().includes('Deposited before $50.00 in late fees were charged'), 'the note')
     await type(field(/^Amount deposited$/)!, '900')
     await type(field(/^Deposit reference number/)!, 'DEP-2B')
     // September is paid in full (its fee stays off); October is paid in part and keeps its own $25.
-    await until(() => text().includes('Part payment. $325.00 stays owed on October rent — late fees still apply. That includes $25.00 in late fees, which stay on a bill paid only in part.'),
+    await until(() => text().includes('Owed $1,225.00Paying $900.00Stays owed $325.00 on October rent — late fees still apply.'),
       'the part-payment line with October\'s fee back on it')
+    // Said only for the bill this pays in full: September's $25.
+    expect(text()).toContain('Deposited Oct 1, before $25.00 in late fees were charged. This pays the bill those fees are on in full')
   })
 
   it('pays the oldest bill first: with September and October open, $800 leaves $400 owed on October rent', async () => {
@@ -406,8 +416,80 @@ describe('part payments at the desk', () => {
     await openDesk()
     await press(/^Cash$/)
     await type(field(/^Cash handed over$/)!, '800')
-    await until(() => text().includes('$400.00 stays owed on October rent — late fees still apply.'), 'the part-payment line')
+    await until(() => text().includes('Stays owed $400.00 on October rent — late fees still apply.'), 'the part-payment line')
     expect(text()).not.toContain('September rent — late')
+  })
+})
+
+describe('10/6 (Nic): the Bowmans — "why is it talking about credit when they didn\'t even make a full payment?"', () => {
+  // Country Acres MH 30: $100 home payment, $450 rent, $39.60 water and a $50
+  // late fee; no credit on file. A $500 bank deposit dated before the late fee.
+  const row = (id: string, type: string, amount: number, dueDate = '2026-10-01') => ({
+    id, leaseId: 'L1', invoiceId: 'INV-OCT', type, entryDescription: type.toUpperCase(), amount, dueDate,
+    creditAlreadyApplied: 0, creditIfUsed: 0, notes: null, unitNumber: 'MH 30', propertyName: 'Country Acres - Mattoon',
+  })
+  const rows = [row('r1', 'rent', 450), row('w1', 'utility', 39.60), row('h1', 'home_payment', 100), row('f1', 'late_fee', 50, '2026-10-06')]
+  const base = (rs: any[], extra: any = {}) => {
+    const total = Math.round(rs.reduce((t, r) => t + r.amount * 100, 0)) / 100
+    return quote({ rows: rs, currentTotal: total, owedIfUsed: total, owedIfSaved: total, fullBalance: total,
+      partialPaymentsAllowed: true, bankDepositAllowed: true, ...extra })
+  }
+
+  it('a $500 part payment shows owed, paying and what stays owed — no credit wording at all', async () => {
+    server.quote = base(rows)
+    server.datedQuote = base(rows.slice(0, 3), { lateFeesOffIfPaidInFull: 50, lateFeesOffByBill: [{ invoiceId: 'INV-OCT', amount: 50 }] })
+    await openDesk()
+    await press(/^Bank deposit$/)
+    await type(field(/^Date deposited$/)!, '2026-10-05')
+    await type(field(/^Amount deposited$/)!, '500')
+    await type(field(/^Deposit reference number/)!, 'DEP-BOWMAN')
+    await until(() => text().includes('Owed $639.60Paying $500.00Stays owed $139.60 on October rent — late fees still apply.'), 'the part-payment line')
+    expect(text()).not.toMatch(/credit/i)
+    expect(text()).not.toContain('pays in full')
+    expect(text()).not.toContain('late fees were charged')
+  })
+
+  it('today\'s date: the same — and nothing kept for them, nothing hypothetical', async () => {
+    server.quote = base(rows)
+    await openDesk()
+    await press(/^Bank deposit$/)
+    await type(field(/^Amount deposited$/)!, '500')
+    await type(field(/^Deposit reference number/)!, 'DEP-BOWMAN')
+    await until(() => text().includes('Owed $639.60Paying $500.00Stays owed $139.60 on October rent — late fees still apply.'), 'the part-payment line')
+    expect(text()).not.toMatch(/credit/i)
+    expect(text()).not.toContain('kept')
+  })
+})
+
+describe('10/6 (Nic): credit is mentioned only when they have it, as one question', () => {
+  it('credit on file: "Credit available $X — use it on this bill, or save it?" — and Use can apply it alone, nothing taken', async () => {
+    server.quote = quote({ creditAvailable: 100, creditOnFile: 100, owedIfUsed: 500, owedIfSaved: 600,
+      rows: [{ ...quote().rows[0], creditIfUsed: 100 }] })
+    server.recordResult = { amountSettled: 0, creditUsed: 100, stillOwed: 500,
+      stillOwedRows: [{ id: 'r1', restOf: null, type: 'rent', dueDate: '2026-10-01', amount: 500 }] }
+    await openDesk()
+    expect(text()).toContain('Credit available $100.00 — use it on this bill, or save it?')
+    await press(/^Use \$100\.00/)
+    await press(/^Apply the credit only — nothing taken now$/)
+    await until(() => text().includes('Owed $600.00Credit applied −$100.00Stays owed $500.00 on October rent — late fees still apply.'), 'the credit-only lines')
+    await press(/^Apply \$100\.00 credit — nothing taken$/)
+    await until(() => onRecorded.mock.calls.length === 1, 'the credit applied')
+    expect(server.posts.find(p => p.url.endsWith('/record-manual'))!.body).toEqual({ method: 'cash', amountTendered: 0, creditToUse: 100 })
+  })
+
+  it('no credit on file: the word is never on the window', async () => {
+    server.quote = quote()
+    await openDesk()
+    expect(text()).not.toMatch(/credit/i)
+  })
+
+  it('credit already on the bill reads as one balance: charges, credit applied, still owed — never per line', async () => {
+    server.quote = quote({ rows: [{ ...quote().rows[0], amount: 300, creditAlreadyApplied: 282.36 }],
+      currentTotal: 300, creditAlreadyApplied: 282.36, owedIfUsed: 17.64, owedIfSaved: 17.64, fullBalance: 300 })
+    await openDesk()
+    expect(text()).toContain('Charges$300.00Credit applied−$282.36Still owed$17.64')
+    expect(text()).toContain('Full balance$17.64')
+    expect(text()).not.toContain('credit already on it')
   })
 })
 

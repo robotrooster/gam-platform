@@ -1,0 +1,34 @@
+/* 10/11 (Nic): the shared financial pages' own pieces. Same bytes in the
+   landlord portal and GAM Books (financials-parity.test.ts). Colors are the
+   landlord portal's tokens; GAM Books maps its own onto them for these pages
+   (apps/books/src/financialsHost.css). */
+
+.fin-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 18px; }
+.fin-period { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-end; }
+.fin-field { display: flex; flex-direction: column; gap: 4px; font-size: .72rem; color: var(--text-3); }
+.fin-field-label { font-size: .68rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); }
+.fin-select { width: auto; min-width: 200px; }
+.fin-date { width: auto; min-width: 140px; }
+.fin-notice { padding: 16px 18px; color: var(--text-2); font-size: .84rem; line-height: 1.55; margin-bottom: 16px; }
+.fin-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 18px; }
+.fin-kpi { background: var(--bg-2); border: 1px solid var(--border-1); border-radius: 10px; padding: 14px 16px; }
+.fin-kpi-label { font-size: .68rem; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 600; }
+.fin-kpi-value { font-size: 1.35rem; font-weight: 800; color: var(--text-0); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.fin-kpi-sub { font-size: .72rem; color: var(--text-3); margin-top: 2px; }
+.fin-in { color: var(--green); }
+.fin-out { color: var(--red); }
+.fin-card { padding: 0; margin-bottom: 18px; overflow-x: auto; }
+.fin-card-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 14px 16px 10px; }
+.fin-card-title { font-weight: 700; color: var(--text-0); font-size: .9rem; }
+.fin-card-note { font-size: .74rem; color: var(--text-3); }
+.fin-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.fin-total td { font-weight: 700; color: var(--text-0); border-top: 1px solid var(--border-1); }
+.fin-empty { padding: 24px; text-align: center; color: var(--text-3); font-size: .84rem; }
+.fin-muted { color: var(--text-3); font-size: .78rem; }
+.fin-form { display: grid; gap: 10px; }
+.fin-form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+.fin-form label { display: flex; flex-direction: column; gap: 4px; font-size: .75rem; color: var(--text-3); }
+.fin-error { font-size: .78rem; color: var(--red); }
+.fin-row-actions { display: flex; gap: 6px; justify-content: flex-end; white-space: nowrap; }
+.fin-bar { height: 6px; border-radius: 3px; background: var(--gold); min-width: 2px; }
+.fin-bar-cell { width: 30%; min-width: 80px; }

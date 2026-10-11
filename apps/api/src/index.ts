@@ -70,6 +70,7 @@ import { homeSaleRouter }     from './routes/homeSale'
 import { homeOwnershipRouter } from './routes/homeOwnership'
 import { lotRentRouter }      from './routes/lotRent'
 import { expensesRouter }     from './routes/expenses'
+import { financialsRouter }   from './routes/financials'
 import { bankReconciliationRouter } from './routes/bankReconciliation'
 import { bankFeedRouter }     from './routes/bankFeed'
 import { featureRequestsRouter } from './routes/featureRequests'
@@ -398,6 +399,8 @@ app.use('/api/home-sales',    homeSaleRouter)
 app.use('/api/home-ownerships', homeOwnershipRouter)
 app.use('/api/lot-rent',      lotRentRouter)
 app.use('/api/expenses',      expensesRouter)
+// 10/11: the shared financial pages (landlord portal + GAM Books), owner and bookkeeper.
+app.use('/api/financials',    financialsRouter)
 app.use('/api/bank-reconciliations', bankReconciliationRouter)
 app.use('/api/bank-feed',         bankFeedRouter)
 app.use('/api/feature-requests',  featureRequestsRouter)

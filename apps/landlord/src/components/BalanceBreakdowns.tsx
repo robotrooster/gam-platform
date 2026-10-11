@@ -276,13 +276,11 @@ export function InvoiceBreakdown({ tenantId }: { tenantId: string }) {
                 due {new Date(String(inv.dueDate).slice(0, 10) + 'T00:00:00').toLocaleDateString()}
               </span>
             </div>
+            {/* 10/6 (Nic): one balance — what is still owed. The credit and the
+                money paid are their own lines under the charges, never "paid
+                $14.70 of $344.70" when credit covers more than that. */}
             <div style={{ fontSize: '.8rem', color: 'var(--gold)', fontWeight: 700 }}>
               {fmtMoney(Number(inv.balance))} owed
-              {Number(inv.amountPaid) > 0 && (
-                <span style={{ color: 'var(--text-3)', fontWeight: 400, marginLeft: 8 }}>
-                  ({fmtMoney(Number(inv.amountPaid))} paid of {fmtMoney(Number(inv.totalAmount))})
-                </span>
-              )}
             </div>
           </div>
           <table className="data-table" style={{ width: '100%' }}>
@@ -292,11 +290,10 @@ export function InvoiceBreakdown({ tenantId }: { tenantId: string }) {
                   <td style={{ fontSize: '.78rem', width: 110, color: 'var(--text-2)' }}>
                     {LINE_LABEL[l.type] || l.type}
                   </td>
+                  {/* The line's own words (meter read, period) — never a payment tag
+                      such as "covered by prepaid credit", and no per-line "settled". */}
                   <td style={{ fontSize: '.78rem' }}>
-                    {l.notes || l.entryDescription || '—'}
-                    {l.status && l.status !== 'pending' && (
-                      <span style={{ marginLeft: 8, fontSize: '.68rem', color: 'var(--text-3)' }}>· {l.status}</span>
-                    )}
+                    {[l.label && l.label !== LINE_LABEL[l.type] ? l.label : null, l.detail].filter(Boolean).join(' · ') || '—'}
                   </td>
                   <td style={{ fontSize: '.78rem', textAlign: 'right', fontWeight: 600, whiteSpace: 'nowrap' }}>
                     {fmtMoney(Number(l.amount))}
@@ -308,6 +305,42 @@ export function InvoiceBreakdown({ tenantId }: { tenantId: string }) {
                   No line detail on this invoice.
                 </td></tr>
               )}
+              {/* 10/6 (Nic): the bill as one balance — charges, then what paid
+                  them, then what is still owed. */}
+              {(Number(inv.amountPaid) > 0 || Number(inv.creditApplied) > 0) && (<>
+                <tr>
+                  <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>Charges</td>
+                  <td />
+                  <td style={{ fontSize: '.78rem', textAlign: 'right', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                    {fmtMoney(Number(inv.totalAmount))}
+                  </td>
+                </tr>
+                {Number(inv.amountPaid) > 0 && (
+                  <tr>
+                    <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>Paid</td>
+                    <td />
+                    <td style={{ fontSize: '.78rem', textAlign: 'right', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                      −{fmtMoney(Number(inv.amountPaid))}
+                    </td>
+                  </tr>
+                )}
+                {Number(inv.creditApplied) > 0 && (
+                  <tr>
+                    <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>Credit applied</td>
+                    <td />
+                    <td style={{ fontSize: '.78rem', textAlign: 'right', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                      −{fmtMoney(Number(inv.creditApplied))}
+                    </td>
+                  </tr>
+                )}
+                <tr>
+                  <td style={{ fontSize: '.78rem', color: 'var(--text-0)', fontWeight: 700 }}>Still owed</td>
+                  <td />
+                  <td style={{ fontSize: '.78rem', textAlign: 'right', fontWeight: 700, color: 'var(--gold)', whiteSpace: 'nowrap' }}>
+                    {fmtMoney(Number(inv.balance))}
+                  </td>
+                </tr>
+              </>)}
               {Number(inv.workTradeCreditAmount) > 0 && (
                 <tr>
                   <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>Work trade</td>

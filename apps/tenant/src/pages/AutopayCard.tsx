@@ -251,7 +251,7 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
               <span style={{ display: 'block', fontSize: '.72rem', color: 'var(--t3)', marginTop: 2, lineHeight: 1.5 }}>
                 {useCredit
                   ? 'Any account credit pays its part of the bill and we charge the rest.'
-                  : 'Off: we charge the whole bill and your credit waits until you choose to use it. Credit is applied by itself only when it covers a whole bill.'}
+                  : 'Off: we charge the whole bill and your credit waits until you choose to use it. Money you paid ahead goes on your bill by itself; other credit is applied by itself only when it covers a whole bill.'}
               </span>
             </span>
           </label>

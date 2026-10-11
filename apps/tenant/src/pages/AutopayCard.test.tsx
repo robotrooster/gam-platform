@@ -83,7 +83,7 @@ describe('autopay and account credit', () => {
     expect(text()).toContain('we charge the whole bill and your credit waits until you choose to use it')
     // The bill run skips a bill with a GAM charge, a neighbor's utility or a
     // scheduled retry on it — the copy never promises "always".
-    expect(text()).toContain('Credit is applied by itself only when it covers a whole bill.')
+    expect(text()).toContain('Money you paid ahead goes on your bill by itself; other credit is applied by itself only when it covers a whole bill.')
     expect(text()).not.toMatch(/always pays it by itself/)
     await press('Turn on autopay')
     expect(server.puts).toEqual([{ url: '/autopay', body: { leaseId: 'L1', enabled: true, pullDay: null, paymentMethodId: null, useCredit: false } }])

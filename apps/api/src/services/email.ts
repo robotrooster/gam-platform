@@ -2946,6 +2946,12 @@ export async function emailInvoiceReady(
     lines: Array<{ label: string; detail?: string | null; amount: number; covered?: boolean; coveredHow?: string }>
     /** Work traded off this cycle — owed by nobody, but it belongs on the bill. */
     workTradeCredit?: number
+    /**
+     * 10/6 (Nic): credit already applied against this bill (money paid ahead
+     * goes on by itself) — one "Credit applied" line under the charges, then
+     * "Still owed". Never a tag on a line.
+     */
+    creditApplied?: number
     /** S655: the credit Pay Now will offer for this bill — said beside it, never netted. */
     creditAvailable?: number
     portalUrl?: string
@@ -2993,9 +2999,10 @@ export async function emailInvoiceReady(
          <div style="font-size:.72rem;color:#7a8aaa;margin-bottom:10px">Invoice ${escapeHtml(args.invoiceNumber)} &middot; due ${escapeHtml(args.dueDateLabel)}</div>
          ${rows}` +
       (args.workTradeCredit && args.workTradeCredit > 0 ? deduction('Work trade', args.workTradeCredit) : '') +
+      (args.creditApplied && args.creditApplied > 0 ? deduction('Credit applied', args.creditApplied) : '') +
       `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
                      border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
-           <span>${settled ? 'Balance' : 'Total due'}</span><span>${money(Math.max(0, args.total))}</span>
+           <span>${settled ? 'Balance' : (args.creditApplied && args.creditApplied > 0 ? 'Still owed' : 'Total due')}</span><span>${money(Math.max(0, args.total))}</span>
          </div>
        </div>` +
       // S655 (Nic, 10/2): credit is used when they pay — they choose "Use all"

@@ -1,15 +1,15 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { apiGet, apiPatch, apiPost } from '../lib/api'
+import { apiGet, apiPatch, apiPost, apiDel } from '../lib/api'
 import {
   LANDLORD_ASSIGNABLE_ROLE_LABEL,
   LandlordAssignableRole,
-  BOOKKEEPER_ACCESS_LEVELS,
-  humanize,
+  BOOKKEEPER_ACCESS_SUMMARY,
 } from '@gam/shared'
 import { PermissionCatalogEditor } from '../components/PermissionCatalogEditor'
 import { EntityPicker, useEntities } from '../components/EntityPicker'
+import { appConfirm, toast } from '../components/dialogs'
 
 // S526: the old expandable-row permission grid (SUB_PERMISSIONS_BY_ROLE
 // checkboxes + inline ScopePicker) is RETIRED — the dedicated per-user page at
@@ -66,11 +66,14 @@ export function TeamPage() {
   const qc = useQueryClient()
   const navigate = useNavigate()
   const { data, isLoading } = useQuery<TeamPayload>('team', () => apiGet('/scopes/team'))
+  // 10/11: a bookkeeper's row names the properties they keep.
+  const { data: properties = [] } = useQuery<any[]>('properties-for-invite', () => apiGet('/properties'))
+  const [editingBookkeeper, setEditingBookkeeper] = useState<Member | null>(null)
 
-  const updateBookkeeperLevel = useMutation(
-    (args: { userId: string; accessLevel: string }) =>
-      apiPatch(`/scopes/bookkeeper/${args.userId}`, { accessLevel: args.accessLevel }),
-    { onSuccess: () => qc.invalidateQueries('team') }
+  const removeBookkeeper = useMutation(
+    (m: Member) => apiDel(`/scopes/bookkeeper/${m.userId}`),
+    { onSuccess: () => { qc.invalidateQueries('team'); toast('Bookkeeper removed. Their access ends now.') },
+      onError: (e: any) => toast(e?.response?.data?.error || e?.message || 'Could not remove the bookkeeper.') }
   )
 
   const members = data?.members || []
@@ -131,18 +134,28 @@ export function TeamPage() {
                       <td><span className={`badge ${ROLE_BADGE[m.role]}`}>{LANDLORD_ASSIGNABLE_ROLE_LABEL[m.role]}</span></td>
                       {multiCompany && <td style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>{m.companyName || '—'}</td>}
                       <td style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>
-                        {isBookkeeper ? (
-                          <select
-                            value={(m.permissions as any)?.accessLevel || 'read_only'}
-                            onClick={e => e.stopPropagation()}
-                            onChange={e => updateBookkeeperLevel.mutate({ userId: m.userId, accessLevel: e.target.value })}
-                            disabled={updateBookkeeperLevel.isLoading}
-                            style={{ background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 6, color: 'var(--text-0)', padding: '4px 8px', fontSize: '.78rem' }}>
-                            {BOOKKEEPER_ACCESS_LEVELS.map(lv => <option key={lv} value={lv}>{humanize(lv)}</option>)}
-                          </select>
-                        ) : `${enabledCount} permission${enabledCount === 1 ? '' : 's'} granted`}
+                        {isBookkeeper
+                          ? bookkeeperPropertiesText(m, properties as any[])
+                          : `${enabledCount} permission${enabledCount === 1 ? '' : 's'} granted`}
                       </td>
                       <td style={{ textAlign: 'right', color: 'var(--text-3)', fontSize: '.82rem', whiteSpace: 'nowrap' }}>
+                        {isBookkeeper && (
+                          <span style={{ display: 'inline-flex', gap: 6 }}>
+                            <button className="btn btn-primary btn-sm" style={{ fontSize: '.74rem' }}
+                              onClick={(e) => { e.stopPropagation(); setEditingBookkeeper(m) }}>
+                              Change properties
+                            </button>
+                            <button className="btn btn-ghost btn-sm" style={{ fontSize: '.74rem' }}
+                              disabled={removeBookkeeper.isLoading}
+                              onClick={async (e) => {
+                                e.stopPropagation()
+                                if (await appConfirm(`Remove ${m.firstName} ${m.lastName} as your bookkeeper? They lose access right away.`,
+                                  { danger: true, confirmLabel: 'Remove' })) removeBookkeeper.mutate(m)
+                              }}>
+                              Remove
+                            </button>
+                          </span>
+                        )}
                         {!isBookkeeper && (
                           <button
                             className="btn btn-ghost btn-sm"
@@ -159,6 +172,15 @@ export function TeamPage() {
               </tbody>
             </table>
           </div>
+
+          {editingBookkeeper && (
+            <BookkeeperPropertiesEditor
+              member={editingBookkeeper}
+              properties={(properties as any[]).filter(p => p.landlordId === editingBookkeeper.landlordId)}
+              onClose={() => setEditingBookkeeper(null)}
+              onSaved={() => { setEditingBookkeeper(null); qc.invalidateQueries('team') }}
+            />
+          )}
 
           {/* Direct-deposit summary KPI: visible count of managers opted in
               but not yet ready in Stripe. Helps the landlord notice
@@ -380,20 +402,28 @@ function InviteForm({ onSent }: { onSent: () => void }) {
 
 // S592 (Nic): landlords invite their OWN bookkeeper here, via the same
 // canonical email-link flow (POST /api/scopes/bookkeeper/invite → accept page
-// where the bookkeeper sets their OWN password). Bookkeepers are books-only and
-// portfolio-wide, so — unlike staff — there's no property binding and no
-// permission catalog, just a read-only vs read-write access level. GAM admins
-// no longer create bookkeeper accounts.
+// where the bookkeeper sets their OWN password). GAM admins no longer create
+// bookkeeper accounts.
+//
+// 10/11 (Nic): "I need to invite somebody to be a bookkeeper for the Mountain
+// View property. They don't need to see anything with Oak Park." A bookkeeper
+// keeps ONE company's books — and, when that company has several properties,
+// only the ones ticked here (none ticked = all of them). Their access is fixed:
+// look, and add expenses ("Look + add expenses" — Nic's choice), so there is
+// no access level to pick.
 function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
   const [firstName, setFirstName] = useState('')
   const [lastName, setLastName] = useState('')
   const [email, setEmail] = useState('')
-  const [accessLevel, setAccessLevel] = useState<string>(BOOKKEEPER_ACCESS_LEVELS[0])
   // S654 (Nic, DIRECTIVE): no default company. A bookkeeper keeps one
   // company's books; an account with several names which.
   const [entityId, setEntityId] = useState('')
+  const [propertyIds, setPropertyIds] = useState<string[]>([])
   const { data: entities = [] } = useEntities()
+  const { data: properties = [] } = useQuery<any[]>('properties-for-invite', () => apiGet('/properties'))
   const severalCompanies = entities.length >= 2
+  const company = entityId || (entities.length === 1 ? entities[0].id : '')
+  const companyProperties = (properties as any[]).filter(p => !company || p.landlordId === company)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
 
@@ -403,13 +433,16 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
       email: email.trim(),
       firstName: firstName.trim() || undefined,
       lastName: lastName.trim() || undefined,
-      scope: { accessLevel },
+      scope: { propertyIds: propertyIds.length ? propertyIds : null },
     }),
     {
       onSuccess: () => {
         setError(null)
-        setSuccess(`Invitation emailed to ${email.trim()}. They set their own password from the link, then land with ${humanize(accessLevel)} access to your books.`)
-        setFirstName(''); setLastName(''); setEmail(''); setAccessLevel(BOOKKEEPER_ACCESS_LEVELS[0])
+        const where = propertyIds.length
+          ? companyProperties.filter(p => propertyIds.includes(p.id)).map(p => p.name).join(', ')
+          : 'every property of the company'
+        setSuccess(`Invitation emailed to ${email.trim()}. They set their own password from the link, then see the money for ${where}.`)
+        setFirstName(''); setLastName(''); setEmail(''); setPropertyIds([])
         onSent()
         setTimeout(() => setSuccess(null), 6000)
       },
@@ -436,11 +469,14 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
     <div className="card" style={{ padding: 16, marginBottom: 20 }}>
       <div style={{ fontSize: '.95rem', fontWeight: 600, marginBottom: 4 }}>Invite a bookkeeper</div>
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
-        A bookkeeper gets access to GAM Books — accounts, payroll, and reports — {severalCompanies ? 'for the company you choose' : 'across all your properties'}. They set their own password from the email link. You can change their access level or remove them anytime below.
+        {BOOKKEEPER_ACCESS_SUMMARY} They set their own password from the email link, and you can change their properties or remove them anytime below.
       </div>
       <form onSubmit={submit} style={{ display: 'grid', gap: 10 }}>
-        <EntityPicker value={entityId} onChange={setEntityId} label="Books of"
-          note="They see this company's books and no other." />
+        <EntityPicker value={entityId} onChange={id => { setEntityId(id); setPropertyIds([]) }} label="Books of"
+          note="They see this company's money and no other company's." />
+        {company && companyProperties.length > 1 && (
+          <PropertyChecklist properties={companyProperties} value={propertyIds} onChange={setPropertyIds} />
+        )}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
           <div>
             <label style={labelStyle}>First name</label>
@@ -451,17 +487,9 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
             <input type="text" required value={lastName} onChange={e => setLastName(e.target.value)} placeholder="Doe" style={inputStyle} />
           </div>
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 10 }}>
-          <div>
-            <label style={labelStyle}>Email</label>
-            <input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="name@example.com" style={inputStyle} />
-          </div>
-          <div>
-            <label style={labelStyle}>Access</label>
-            <select value={accessLevel} onChange={e => setAccessLevel(e.target.value)} style={inputStyle}>
-              {BOOKKEEPER_ACCESS_LEVELS.map(lv => <option key={lv} value={lv}>{humanize(lv)}</option>)}
-            </select>
-          </div>
+        <div>
+          <label style={labelStyle}>Email</label>
+          <input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="name@example.com" style={inputStyle} />
         </div>
         {error && (<div style={{ padding: '8px 12px', borderRadius: 6, background: 'rgba(220,76,76,.08)', border: '1px solid rgba(220,76,76,.25)', color: 'var(--red, #dc4c4c)', fontSize: '.78rem' }}>{error}</div>)}
         {success && (<div style={{ padding: '8px 12px', borderRadius: 6, background: 'rgba(46,163,90,.08)', border: '1px solid rgba(46,163,90,.25)', color: 'var(--green, #2ea35a)', fontSize: '.78rem' }}>{success}</div>)}
@@ -471,6 +499,67 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
           </button>
         </div>
       </form>
+    </div>
+  )
+}
+
+/** 10/11: which of a company's properties a bookkeeper keeps. None ticked = all of them. */
+function PropertyChecklist({ properties, value, onChange }: {
+  properties: any[]; value: string[]; onChange: (ids: string[]) => void
+}) {
+  const toggle = (id: string) => onChange(value.includes(id) ? value.filter(x => x !== id) : [...value, id])
+  return (
+    <div>
+      <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>
+        Properties <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(none ticked = every property of the company)</span>
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px' }}>
+        {properties.map(p => (
+          <label key={p.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: '.84rem', color: 'var(--text-1)', cursor: 'pointer' }}>
+            <input type="checkbox" checked={value.includes(p.id)} onChange={() => toggle(p.id)} />
+            {p.name}
+          </label>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/** 10/11: the properties a bookkeeper keeps, in words, for their row. */
+function bookkeeperPropertiesText(m: Member, properties: any[]): string {
+  const ids: string[] | null = (m.scope as any)?.propertyIds ?? null
+  if (!ids || !ids.length) return 'Every property of the company'
+  const names = ids.map(id => properties.find(p => p.id === id)?.name).filter(Boolean)
+  return names.length ? names.join(', ') : `${ids.length} propert${ids.length === 1 ? 'y' : 'ies'}`
+}
+
+/** 10/11: change which of the company's properties a bookkeeper keeps. */
+function BookkeeperPropertiesEditor({ member, properties, onClose, onSaved }: {
+  member: Member; properties: any[]; onClose: () => void; onSaved: () => void
+}) {
+  const [ids, setIds] = useState<string[]>(((member.scope as any)?.propertyIds ?? []) as string[])
+  const [error, setError] = useState<string | null>(null)
+  const save = useMutation(
+    () => apiPatch(`/scopes/bookkeeper/${member.userId}`, { landlordId: member.landlordId, propertyIds: ids.length ? ids : null }),
+    { onSuccess: () => { toast('Their properties are updated. It takes effect on their next click.'); onSaved() },
+      onError: (e: any) => setError(e?.response?.data?.error || e?.message || 'Could not save.') },
+  )
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Properties {member.firstName} {member.lastName} keeps</div>
+        <div style={{ fontSize: '.78rem', color: 'var(--text-3)', margin: '6px 0 14px', lineHeight: 1.5 }}>{BOOKKEEPER_ACCESS_SUMMARY}</div>
+        {properties.length > 1
+          ? <PropertyChecklist properties={properties} value={ids} onChange={setIds} />
+          : <div style={{ fontSize: '.84rem', color: 'var(--text-2)' }}>This company has one property, and they keep it.</div>}
+        {error && <div style={{ color: 'var(--red)', fontSize: '.78rem', marginTop: 10 }}>{error}</div>}
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 18 }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={save.isLoading || properties.length < 2} onClick={() => save.mutate()}>
+            {save.isLoading ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }

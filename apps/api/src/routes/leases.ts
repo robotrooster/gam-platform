@@ -2887,12 +2887,12 @@ async function leaseInScope(req: any, leaseId: string) {
 // Null clears it. Read by the bill run, the tenant's Pay Now and the desk alike
 // (creditUse.householdQuote caps the plan with it).
 //
-// S655 (Nic, 10/2): credit pays a bill by itself only when it covers the WHOLE
-// bill. Raising or clearing the cap can make the paid-ahead money cover this
-// month's whole bill, so the whole-bill check runs for the household right
-// after the change (its own transaction; it never undoes the change) — the same
-// check the bill run and the late-fee run make. The answer says what the credit
-// covers now, and whether it just paid the bill.
+// S655 (Nic, 10/2) → 10/6 (Nic): money paid ahead goes on the bill by itself,
+// whole or in part ("a credit against the entire balance"), within the month's
+// draw. After the change the household's check runs right away (its own
+// transaction; it never undoes the change) — the same check the bill run and
+// the late-fee run make. The answer says what credit is still available now,
+// and how many charges it just paid in full.
 //
 // Because the change can spend the tenant's money, a team member is held to
 // the parks they work at, as for the leaving mark beside it (leaseInScope): a
@@ -2917,12 +2917,12 @@ leasesRouter.patch('/:id/prepaid-draw', requirePerm('leases.edit', 'take_payment
         WHERE lease_id = $1 AND status IN ('active','pending_add','pending_remove')
         ORDER BY tenant_id`, [lease.id])).map(m => m.tenant_id)
 
-    // More room than before (raised or cleared): the money may now cover the
-    // whole bill. A lower cap never makes a bill payable from credit.
-    const before = lease.cap == null ? null : Number(lease.cap)
-    const raised = body.monthlyDraw == null ? before != null : (before != null && body.monthlyDraw > before)
+    // 10/6 (Nic): money paid ahead goes on the balance by itself, whole or in
+    // part, within the month's draw — so after any change the household's
+    // bill takes whatever the new limit lets it (the same check the bill run
+    // makes; a lower limit never takes back what was already applied).
     let paidByCredit: string[] = []
-    if (raised) {
+    {
       const { runWholeBillCheckAfterCommit } = await import('../services/creditUse')
       for (const tenantId of members) {
         const r = await runWholeBillCheckAfterCommit({ tenantId, landlordId: lease.landlord_id, onlyLeaseIds: [lease.id] })

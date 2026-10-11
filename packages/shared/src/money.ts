@@ -195,6 +195,22 @@ export const INCOME_CATEGORY_LABEL: Record<IncomeCategory, string> = {
   stays_and_pay_links: 'Stays and pay links',
   other_income:        'Other income',
 }
+/**
+ * 10/11 (Nic): "incoming income type pools, monthly, daily, electric bill back,
+ * etc." Lot/space rent split by HOW the space is rented — a lease's own rent,
+ * or the rent of a stay drafted from a nightly, weekly or monthly reservation
+ * (unit_bookings.lease_type of the lease's source booking). The other pools are
+ * INCOME_CATEGORIES as they are. Read by the shared Income page.
+ */
+export const RENT_POOLS = ['monthly_rent', 'nightly_stays', 'weekly_stays', 'month_stays'] as const
+export type RentPool = typeof RENT_POOLS[number]
+export const RENT_POOL_LABEL: Record<RentPool, string> = {
+  monthly_rent:  'Monthly rent',
+  nightly_stays: 'Nightly stays',
+  weekly_stays:  'Weekly stays',
+  month_stays:   'Month stays',
+}
+
 /** The utility categories, in report order. A utility type outside this list is utility_other. */
 export const INCOME_UTILITY_CATEGORIES = ['electric', 'water', 'sewer', 'gas', 'trash', 'propane', 'utility_other'] as const satisfies readonly IncomeCategory[]
 

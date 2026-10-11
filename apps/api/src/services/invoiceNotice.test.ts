@@ -275,7 +275,7 @@ describe('the full bill, with the credit Pay Now will offer beside it', () => {
     expect(lastSend().html).not.toContain('credit available')
   })
 
-  it('a line the account credit already paid is listed as covered, not due', async () => {
+  it('10/6 (Nic): credit already applied is one "Credit applied" figure under the lines, never a line tagged covered by it', async () => {
     const f = await seedInvoice({ rent: 589 })
     const inv = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
     // a $60 water line the bill run paid from paid-ahead money (credit_uses, applied)
@@ -296,9 +296,34 @@ describe('the full bill, with the credit Pay Now will offer beside it', () => {
     expect(r.sent).toBe(1)
     const mail = lastSend()
     expect(mail.subject).toContain('$589.00')            // the water is not owed
-    expect(mail.html).toContain('covered (paid with your account credit)')
-    // the tag is beside the name, never the name
+    // The water is listed at what it is; the credit is one line under the charges.
+    expect(mail.html).not.toContain('covered (paid with your account credit)')
+    expect(mail.html).toContain('Credit applied')
+    expect(mail.html).toContain('-$60.00')
+    expect(mail.html).toContain('Still owed')
     expect(mail.html).not.toContain('covered by prepaid credit')
+  })
+
+  it('10/6 (Nic): credit on PART of a line — the line at its amount, "Credit applied", and what is still owed', async () => {
+    // Marc Renspurger: $282.36 paid ahead on $300 rent leaves $17.64 owed.
+    const f = await seedInvoice({ rent: 300 })
+    const inv = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
+    const rent = (await db.query<{ id: string }>(`SELECT id FROM payments WHERE invoice_id = $1 AND type = 'rent'`, [f.invoiceId])).rows[0].id
+    const c = await db.query<{ id: string }>(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by)
+       VALUES ($1,$2,282.36,282.36,'landlord') RETURNING id`, [inv.lease_id, f.tenantId])
+    await db.query(
+      `INSERT INTO credit_uses (prepaid_credit_id, payment_id, lease_id, amount, billing_month, source, status, applied_at)
+       VALUES ($1,$2,$3,282.36,date_trunc('month', CURRENT_DATE)::date,'whole_bill','applied',NOW())`,
+      [c.rows[0].id, rent, inv.lease_id])
+    const r = await sendPendingInvoiceNotices()
+    expect(r.sent).toBe(1)
+    const mail = lastSend()
+    expect(mail.subject).toContain('$17.64')
+    expect(mail.html).toContain('$300.00')
+    expect(mail.html).toContain('-$282.36')
+    expect(mail.html).toContain('Still owed')
+    expect(mail.html).not.toContain('covered (')
   })
 
   it('a late fee already on the bill is part of what it owes', async () => {

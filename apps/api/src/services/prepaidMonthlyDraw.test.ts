@@ -88,19 +88,24 @@ describe('a monthly draw on paid-ahead credit', () => {
   })
 
   // S655 (Nic 10/2): this used to settle the $60 water line by itself and leave
-  // the $589 rent open — credit picking off part of a bill. Credit now applies
-  // by itself only when it covers the WHOLE bill; a $200 cap cannot cover $649,
-  // so nothing settles and the $200 is offered to the tenant when they pay.
-  it('with a $200 cap, the invoice run leaves a $589 rent and a $60 water line both open — whole bills only', async () => {
+  // the $589 rent open — credit picking off a line. 10/6 (Nic): "It needs to
+  // be a credit against the entire balance." The month's $200 goes on the bill
+  // by itself, oldest line first (rent before water on the same day), part of
+  // a line where it runs out: nothing settles, $449 is still owed — "she would
+  // still get a partial bill each month" (S653).
+  it('with a $200 cap, the invoice run puts $200 on the $649 bill — rent first, nothing settled, $449 still owed', async () => {
     const f = await fixture(200)
     const inv = await invoiceFor(f, '2026-11-01', [
       { type: 'rent', amount: 589, entry: 'RENT' }, { type: 'utility', amount: 60, entry: 'UTILITY' }])
     const r = await release(f, inv.invoiceId)
-    expect(r.consumed).toBe(0)
+    expect(r.consumed).toBe(200)
+    expect(r.rowsCovered).toBe(0)
     expect(await status(inv.paymentIds[0])).toBe('pending')
     expect(await status(inv.paymentIds[1])).toBe('pending')
+    const uses = (await db.query(`SELECT amount::float AS a, payment_id FROM credit_uses WHERE lease_id=$1`, [f.leaseId])).rows
+    expect(uses).toEqual([{ a: 200, payment_id: inv.paymentIds[0] }])
     expect(await prepaidDrawAvailable(db as any, f.leaseId, '2026-11-01'))
-      .toMatchObject({ remaining: 2000, cap: 200, drawnThisMonth: 0, available: 200 })
+      .toMatchObject({ remaining: 1800, cap: 200, drawnThisMonth: 200, available: 0 })
   })
 
   it('a bill the month\'s draw does cover settles by itself and counts toward the month', async () => {

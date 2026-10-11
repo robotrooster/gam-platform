@@ -58,7 +58,10 @@
 
 import type { PoolClient } from 'pg'
 import type { ManualPaymentMethod } from '@gam/shared'
-import { sortForAllocation, MANUAL_PAYMENT_METHOD_WORD, lateFeeCreditedTenantText, BANK_DEPOSIT_METHOD_NOT_TAKEN } from '@gam/shared'
+import {
+  sortForAllocation, MANUAL_PAYMENT_METHOD_WORD, lateFeeCreditedTenantText, BANK_DEPOSIT_METHOD_NOT_TAKEN,
+  PART_PAYABLE_TYPES, placePartPayment, paidAheadGoesOn,
+} from '@gam/shared'
 import type { ReportClosedByRecording } from '../jobs/declaredDepositExpiry'
 import { AppError } from '../middleware/errorHandler'
 import { lockHousehold, payableRowSql } from './moneyPredicates'
@@ -96,16 +99,11 @@ const methodWord = (m: ManualPaymentMethod) => MANUAL_PAYMENT_METHOD_WORD[m]
 export { PART_PAYMENT_REST_NOTE }
 
 /**
- * 10/5 (Nic): the kinds of charge a part payment may leave partly paid. Rent
- * only: its rest row is exempt from the one-rent-row-a-month indexes
- * (is_remainder), and its late fees are based on the month's whole rent
- * however it is split (jobs/lateFees). A late fee or a lease fee cannot be
- * split (their one-row-per-day indexes), a utility bill follows its one
- * payment row (utility_bills.payment_id), and a security deposit raises its
- * deposit record from the row — so money that cannot pay one of those in full
- * passes it by and pays the next bill.
+ * 10/5 (Nic): the kinds of charge a part payment may leave partly paid (rent
+ * only) — one definition, in @gam/shared beside placePartPayment, so the
+ * Record payment window places money exactly as the settle does.
  */
-export const PART_PAYABLE_TYPES: readonly string[] = ['rent']
+export { PART_PAYABLE_TYPES }
 
 /** 10/5 (Nic): a bank deposit is told apart by the reference on the bank's receipt. */
 export const BANK_DEPOSIT_REFERENCE_REQUIRED =
@@ -244,6 +242,13 @@ export interface ManualSettleResult {
    * rent bill paid in part, and any bill the money did not reach.
    */
   stillOwed: number
+  /**
+   * 10/6 (Nic): money a part payment could not place that goes on the rest of
+   * what they owe by itself right after the commit (money paid ahead, drawn by
+   * the route's whole-bill check). Already taken out of `stillOwed`; its rows
+   * in `stillOwedRows` still show what they owe before it lands.
+   */
+  leftoverOnBalance: number
   stillOwedRows: StillOwedRow[]
   /** Rows this settle paid in part (each has a rest row among stillOwedRows). */
   partPaidIds: string[]
@@ -657,7 +662,7 @@ async function settleOneRow(client: PoolClient, input: ManualSettleInput): Promi
     amountSettled: toDollars(settled.rows.reduce((s, r) => s + toCents(r.amount), 0)),
     creditUsed: 0, surplus: 0, changeGiven: 0, towardOldBalance: 0,
     creditId: null, receiptId: null, depositRecords,
-    stillOwed: 0, stillOwedRows: [], partPaidIds: [],
+    stillOwed: 0, leftoverOnBalance: 0, stillOwedRows: [], partPaidIds: [],
     lateFeesReversed: { unbilled: 0, refunded: 0, refundCreditIds: [] },
     lateFeesDeleted: { count: 0, amount: 0 },
     lateFeeDeleteRefusals: [],
@@ -778,7 +783,10 @@ function owedOnRows(q: DeskQuote, useCredit: boolean): Map<string, number> {
  * 10/5 (Nic): how a part payment walks the bills — oldest first, each row in
  * full; a rent row it cannot cover in full is paid in part (PART_PAYABLE_TYPES)
  * and the money stops there; any other row it cannot cover is passed by and
- * stays open whole. The settle places the money this way, and the bank-deposit
+ * stays open whole. 10/6 (Nic): money is never left over as credit while the
+ * balance is owed — the newest rent paid in full is paid last instead and takes
+ * the rest in part (@gam/shared placePartPayment, which the Record payment
+ * window calls too). The settle places the money this way, and the bank-deposit
  * backdate judges each bill by it.
  */
 function splitPartPayment(rows: readonly DeskRow[], owedOn: ReadonlyMap<string, number>, tendered: number): {
@@ -787,25 +795,13 @@ function splitPartPayment(rows: readonly DeskRow[], owedOn: ReadonlyMap<string, 
   notReached: DeskRow[]
   left: number
 } {
-  let left = tendered
-  const paid: { paymentId: string; cents: number }[] = []
-  const partSplits: { row: DeskRow; take: number; owedOnRow: number }[] = []
-  const notReached: DeskRow[] = []
-  for (const r of rows) {
-    const m = owedOn.get(r.id) ?? 0
-    if (m === 0) continue
-    if (left >= m) {
-      paid.push({ paymentId: r.id, cents: m })
-      left -= m
-    } else if (left > 0 && PART_PAYABLE_TYPES.includes(r.type)) {
-      paid.push({ paymentId: r.id, cents: left })
-      partSplits.push({ row: r, take: left, owedOnRow: m })
-      left = 0
-    } else {
-      notReached.push(r)
-    }
+  const p = placePartPayment(rows, r => owedOn.get(r.id) ?? 0, tendered)
+  return {
+    paid: p.paid.map(x => ({ paymentId: x.row.id, cents: x.cents })),
+    partSplits: p.partSplits,
+    notReached: p.notReached,
+    left: p.left,
   }
-  return { paid, partSplits, notReached, left }
 }
 
 /**
@@ -959,7 +955,14 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   // into the bank and making a partial ... We need that to log that and still
   // be able to charge late fees to the people that didn't pay in full.").
   const partial = tendered < owed
-  if (partial && !q.partialAllowed) {
+  // 10/6 (Nic): "the credit needs to be applied to the entire balance." The
+  // pay-in-full rule governs the tenant's own money handed over — it never
+  // keeps their credit off the bill. The desk may apply the credit alone
+  // ("Use", nothing handed over) even when it pays only part of the bill: it
+  // goes on the oldest lines first (the plan), part of a line where it runs
+  // out, and the rest stays owed.
+  const creditOnlyPart = partial && tendered === 0 && useCredit && creditUsed > 0
+  if (partial && !q.partialAllowed && !creditOnlyPart) {
     throw new AppError(422,
       `That is ${money(owed - tendered)} short — ${money(tendered)} against ${money(owed)} owed. Rent is paid in full.`)
   }
@@ -974,7 +977,7 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   let notReached: DeskRow[] = []
   let over: number
   if (partial) {
-    if (tendered === 0) {
+    if (tendered === 0 && !creditOnlyPart) {
       throw new AppError(422, 'Enter the amount they paid — with nothing paid there is nothing to record.')
     }
     if (input.towardOldBalance != null && toCents(input.towardOldBalance) > 0) {
@@ -1140,7 +1143,16 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
       amount: toDollars(owedOn.get(r.id) ?? 0), restOf: null,
     })),
   ].sort((a, b) => a.dueDate.localeCompare(b.dueDate))
-  const stillOwedC = stillOwedRows.reduce((s, r) => s + toCents(r.amount), 0)
+  // 10/6 (Nic): money a part payment could not place (no rent on that bill
+  // to take it) is kept as money paid ahead, and that goes on the rest of what
+  // they owe by itself right after this commit (creditUse.drawPaidAheadOnBalance,
+  // via the route's whole-bill check) — so it is said that way, never as
+  // "credit" while the balance is owed. Only what no open line can take
+  // (a home payment is never paid with it) waits for their next bill.
+  const leftoverOnBalanceC = partial && keepAsCredit
+    ? Math.min(surplus, notReached.filter(paidAheadGoesOn).reduce((s, r) => s + (owedOn.get(r.id) ?? 0), 0))
+    : 0
+  const stillOwedC = stillOwedRows.reduce((s, r) => s + toCents(r.amount), 0) - leftoverOnBalanceC
 
   // The old balance, oldest first; only the last row it reaches may be paid in part.
   const carriedPaid: string[] = []
@@ -1189,7 +1201,9 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
         ? `Deposited ${money(tendered)} at the bank${partial ? '' : ' (amount confirmed)'}`
         : `Handed over a ${methodWord(method)} for ${money(tendered)}${partial ? '' : ' (amount confirmed)'}`
     const handed = partial
-      ? `${handedOver}${oldPart}${keepAsCredit ? `; ${money(surplus)} kept as credit` : ''}. ` +
+      ? `${handedOver}${oldPart}` +
+        `${leftoverOnBalanceC > 0 ? `; ${money(leftoverOnBalanceC)} goes on the rest of what they owe` : ''}` +
+        `${keepAsCredit && surplus > leftoverOnBalanceC ? `; ${money(surplus - leftoverOnBalanceC)} kept toward their next bill` : ''}. ` +
         `Part payment: ${money(stillOwedC)} still owed.`
       : changeGiven > 0
       ? `Handed over ${money(tendered)}${oldPart}; ${money(changeGiven)} given back as change.`
@@ -1368,6 +1382,7 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
     receiptId,
     depositRecords,
     stillOwed: toDollars(stillOwedC),
+    leftoverOnBalance: toDollars(leftoverOnBalanceC),
     stillOwedRows,
     partPaidIds,
     lateFeesReversed: {

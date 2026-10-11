@@ -10,6 +10,19 @@ import '@fontsource/dm-sans/600.css'
 import '@fontsource/dm-mono/400.css'
 import '@fontsource/dm-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
+// 10/11 (Nic): "a bookkeeper in the bookkeeper portal scoped to certain
+// properties should see those properties in the bookkeeper portal as well...
+// It's kind of like the point of sale where it's byte identical." The landlord
+// portal's financial pages, the same files (src/financials,
+// financials-parity.test.ts), shown here for the company that is open.
+import { IncomePage } from './financials/IncomePage'
+import { ExpensesPage } from './financials/ExpensesPage'
+import { MaintenanceCostsPage } from './financials/MaintenanceCostsPage'
+import { ReportsPage } from './financials/ReportsPage'
+import { BankActivityPage } from './financials/BankActivityPage'
+import { PayoutsPage } from './financials/PayoutsPage'
+import { FinancialsViewerContext } from './financials/adapter'
+import './financialsHost.css'
 import React, { createContext, useContext, useState } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
@@ -39,7 +52,7 @@ const api = axios.create({ baseURL: `${API}/api` })
 const TOKEN = 'gam_books_token'
 const getToken = () => localStorage.getItem(TOKEN)
 api.interceptors.request.use(c => { const t=getToken(); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
-api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401&&!e.config.url.includes('/auth/')){ localStorage.removeItem(TOKEN); window.location.href='/login' } return Promise.reject(e) })
+api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401&&!e.config.url.includes('/auth/')){ localStorage.removeItem(TOKEN); window.location.href='/login' } noteClientGone(e); return Promise.reject(e) })
 // Inject active client header for bookkeepers
 api.interceptors.request.use(c=>{ let cid:string|null=null; try{ cid=localStorage.getItem('gam_books_client') }catch{ /* blocked storage */ } if(cid) c.headers['X-Client-Id']=cid; return c })
 // S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
@@ -74,6 +87,15 @@ const useAuth=()=>useContext(Ctx)
 const CLIENT_KEY='gam_books_client', CLIENT_NAME_KEY='gam_books_client_name', CLIENT_OWNER_KEY='gam_books_client_user'
 const readStore=(k:string)=>{ try{ return localStorage.getItem(k) }catch{ return null } }
 const forgetClient=()=>{ try{ localStorage.removeItem(CLIENT_KEY); localStorage.removeItem(CLIENT_NAME_KEY); localStorage.removeItem(CLIENT_OWNER_KEY) }catch{ /* blocked storage */ } }
+// 10/11: a bookkeeper whose access to the open client was removed is answered
+// "You are not assigned to …". The remembered client is forgotten and the app
+// told, so the client picker comes back instead of every page erroring.
+// (The shared financial pages' adapter sends the same event.)
+const CLIENT_GONE='gam-books-client-gone'
+function noteClientGone(e:any){
+  const said=String(e?.response?.data?.error||'')
+  if(e?.response?.status===403&&/^You are not assigned to (that company's books|this client)/.test(said)){ forgetClient(); window.dispatchEvent(new Event(CLIENT_GONE)) }
+}
 // A choice saved before choices were remembered per person has no owner: it is
 // taken as this person's (the server still checks it, and a landlord's company
 // picker forgets one that is not theirs), so nobody has to pick again.
@@ -176,6 +198,11 @@ function AuthProvider({children}:{children:React.ReactNode}){
     setUser(u=>u?{...u,activeClientId:id,activeClientName:name}:u)
   }
   const clearActiveClient=React.useCallback(()=>{ forgetClient(); setActiveClientId(null); wipeCache() },[])
+  React.useEffect(()=>{
+    const gone=()=>{ setActiveClientId(null); wipeCache() }
+    window.addEventListener(CLIENT_GONE,gone)
+    return()=>window.removeEventListener(CLIENT_GONE,gone)
+  },[])
   const activeClientName=readStore(CLIENT_NAME_KEY)
   return<Ctx.Provider value={{user,loading,activeClientId,activeClientName,setActiveClient,clearActiveClient,login,loginWithTotp,loginWithEmailOtp,resendEmailOtp,logout}}>{children}</Ctx.Provider>
 }
@@ -307,6 +334,14 @@ function Layout(){
   const{user,logout}=useAuth()
   const navigate=useNavigate()
   const isAdmin=user?.role==='admin'||user?.role==='super_admin'
+  // 10/11: the shared financial pages are about a landlord company's money —
+  // its owner and its bookkeeper; business accounts keep their own Books.
+  const isBookkeeper=user?.role==='bookkeeper'
+  const showFinancials=user?.role==='landlord'||isBookkeeper
+  // 10/11: the bank account and payouts are company-wide; a bookkeeper kept to
+  // some of a company's properties is refused both, so the tabs are not shown.
+  const{data:finScope}=useQuery<{wholeCompany:boolean}>('financials-scope',()=>get<{wholeCompany:boolean}>('/financials/scope'),{enabled:isBookkeeper,staleTime:60_000})
+  const showCompanyWide=!isBookkeeper||finScope?.wholeCompany!==false
   return(
     <div className="shell">
       <aside className="sidebar">
@@ -318,6 +353,15 @@ function Layout(){
           <div className="nl">Overview</div>
           <NavLink to="/dashboard" className={({isActive})=>`ni${isActive?' active':''}`}>📊 Dashboard</NavLink>
           {(user?.role==='bookkeeper'||isAdmin)&&<NavLink to="/clients" className={({isActive})=>`ni${isActive?' active':''}`}>🏢 My Clients</NavLink>}
+          {showFinancials&&<>
+            <div className="nl" style={{marginTop:8}}>Financials</div>
+            <NavLink to="/financials/income"            className={({isActive})=>`ni${isActive?' active':''}`}>💵 Money In</NavLink>
+            <NavLink to="/financials/expenses"          className={({isActive})=>`ni${isActive?' active':''}`}>🧾 Expenses</NavLink>
+            <NavLink to="/financials/maintenance-costs" className={({isActive})=>`ni${isActive?' active':''}`}>🛠 Maintenance Costs</NavLink>
+            <NavLink to="/financials/reports"           className={({isActive})=>`ni${isActive?' active':''}`}>📊 Reports</NavLink>
+            {showCompanyWide&&<NavLink to="/financials/bank-activity" className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Bank Activity</NavLink>}
+            {showCompanyWide&&<NavLink to="/financials/payouts"       className={({isActive})=>`ni${isActive?' active':''}`}>💸 Payouts</NavLink>}
+          </>}
           <div className="nl" style={{marginTop:8}}>Payroll</div>
           <NavLink to="/payroll/employees"   className={({isActive})=>`ni${isActive?' active':''}`}>👥 Employees (W-2)</NavLink>
           <NavLink to="/payroll/contractors" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Contractors (1099)</NavLink>
@@ -331,8 +375,8 @@ function Layout(){
           <NavLink to="/books/transactions" className={({isActive})=>`ni${isActive?' active':''}`}>💳 Transactions</NavLink>
           <NavLink to="/books/reconcile"    className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Bank Reconciliation</NavLink>
           <div className="nl" style={{marginTop:8}}>Property Finance</div>
-          <NavLink to="/rent-roll"     className={({isActive})=>`ni${isActive?' active':''}`}>🏘 Rent Roll</NavLink>
-          <NavLink to="/disbursements" className={({isActive})=>`ni${isActive?' active':''}`}>💸 Owner Disbursements</NavLink>
+          {/* 10/11 (Nic): the rent roll names every tenant — never a bookkeeper's. */}
+          {!isBookkeeper&&<NavLink to="/rent-roll"     className={({isActive})=>`ni${isActive?' active':''}`}>🏘 Rent Roll</NavLink>}
           <NavLink to="/bills"         className={({isActive})=>`ni${isActive?' active':''}`}>📄 Bills & AP</NavLink>
           <div className="nl" style={{marginTop:8}}>Reports</div>
           <NavLink to="/reports/pl"               className={({isActive})=>`ni${isActive?' active':''}`}>📈 P&amp;L</NavLink>
@@ -348,7 +392,7 @@ function Layout(){
         <div className="sfooter">
           <div style={{padding:'6px 10px',marginBottom:4}}>
             <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{user?.firstName} {user?.lastName}</div>
-            <div style={{marginTop:3}}><span className={`badge ${isAdmin?'br':'bgold'}`} style={{fontSize:'.6rem'}}>{isAdmin?'Admin':'Landlord'}</span></div>
+            <div style={{marginTop:3}}><span className={`badge ${isAdmin?'br':'bgold'}`} style={{fontSize:'.6rem'}}>{isAdmin?'Admin':isBookkeeper?'Bookkeeper':'Landlord'}</span></div>
           </div>
           {isAdmin&&<a href={ADMIN_URL} className="ni" style={{color:'var(--t3)',fontSize:'.75rem'}}>← Admin Console</a>}
           <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}>🚪 Sign out</button>
@@ -2381,6 +2425,40 @@ function CompanyGate({children}:{children:React.ReactNode}){
   const state=companyChoiceState(companies,activeClientId)
   // A remembered company that is no longer this account's is forgotten.
   React.useEffect(()=>{ if(isLandlord&&companies&&state.staleChoice) clearActiveClient() },[isLandlord,companies,state.staleChoice,clearActiveClient])
+  // 10/11: a bookkeeper, the same way. With no client named, the server falls
+  // back to their oldest assignment, so with several clients the pages would
+  // show one client's money under "Select Client". One client opens by itself;
+  // several are asked which; a remembered client they no longer keep is forgotten.
+  const isBookkeeper=user?.role==='bookkeeper'
+  const{data:bkClients,isLoading:bkLoading,error:bkError,refetch:bkRefetch,isFetching:bkFetching}=useQuery<any[]>('bk-clients',()=>get<any[]>('/books/bookkeeper/clients'),{enabled:isBookkeeper})
+  const bkChoices:CompanyChoice[]|undefined=bkClients?.map((c:any)=>({landlordId:c.landlordId,businessName:c.businessName||[c.firstName,c.lastName].filter(Boolean).join(' ')||null,propertyNames:null}))
+  const bkState=companyChoiceState(bkChoices,activeClientId)
+  const bkOnly=bkChoices&&bkChoices.length===1?bkChoices[0]:null
+  React.useEffect(()=>{ if(isBookkeeper&&bkChoices&&bkState.staleChoice) clearActiveClient() },[isBookkeeper,bkChoices,bkState.staleChoice,clearActiveClient])
+  React.useEffect(()=>{ if(isBookkeeper&&bkOnly&&!activeClientId) setActiveClient(bkOnly.landlordId,companyName(bkOnly,0)) },[isBookkeeper,bkOnly,activeClientId,setActiveClient])
+  if(isBookkeeper){
+    if(bkLoading||(bkChoices&&(bkState.staleChoice||(bkOnly&&!activeClientId))))return<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>
+    if(bkError)return(
+      <div className="alert ae" style={{alignItems:'center'}}>
+        <span style={{flex:1}}>{loadErrorText(bkError,'Could not load your clients.')}</span>
+        <button className="btn bp bsm" disabled={bkFetching} onClick={()=>bkRefetch()}>{bkFetching?'Loading…':'Load again'}</button>
+      </div>
+    )
+    if(bkState.mustChoose&&bkChoices)return(
+      <div className="card company-pick">
+        <h2 className="pt" style={{fontSize:'1.15rem'}}>Which client's books?</h2>
+        <p className="ps" style={{marginTop:6,lineHeight:1.5}}>You keep the books for more than one client. Choose one to open — you can switch at the top of the page any time.</p>
+        <div className="company-pick-list">
+          {bkChoices.map((c,i)=>(
+            <button key={c.landlordId} type="button" className="btn bp" onClick={()=>setActiveClient(c.landlordId,companyName(c,i))}>
+              <span>{companyName(c,i)}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    )
+    return<>{children}</>
+  }
   if(!isLandlord)return<>{children}</>
   if(isLoading||(companies&&state.staleChoice))return<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>
   if(error)return(
@@ -2647,16 +2725,32 @@ function LoginPage(){
   )
 }
 
+// ── SHARED FINANCIAL PAGES ────────────────────────────────────────────
+// 10/11: the landlord portal's financial pages, inside Books' shell. They read
+// who is looking from here, and draw in the landlord portal's look
+// (financialsHost.css, scoped to .fin-host).
+function FinancialsHost(){
+  const{user}=useAuth()
+  if(user?.role!=='landlord'&&user?.role!=='bookkeeper')return<Navigate to="/dashboard" replace/>
+  return(
+    <FinancialsViewerContext.Provider value={{role:user.role}}>
+      <div className="fin-host"><Outlet/></div>
+    </FinancialsViewerContext.Provider>
+  )
+}
+
 // ── APP ───────────────────────────────────────────────────────────────
 function App(){
   const{user,loading}=useAuth()
   if(loading)return<div className="loading-pg"><span className="spinner" style={{marginRight:10}}/>Loading GAM Books…</div>
   const authed=!!user&&ALLOWED_ROLES.includes(user.role)
+  // 10/11: a bookkeeper opens on money in; everyone else on the dashboard.
+  const home=user?.role==='bookkeeper'?'/financials/income':'/dashboard'
   return(
     <Routes>
-      <Route path="/login" element={authed?<Navigate to="/dashboard" replace/>:<LoginPage/>}/>
+      <Route path="/login" element={authed?<Navigate to={home} replace/>:<LoginPage/>}/>
       <Route path="/" element={authed?<Layout/>:<Navigate to="/login" replace/>}>
-        <Route index element={<Navigate to="/dashboard" replace/>}/>
+        <Route index element={<Navigate to={home} replace/>}/>
         <Route path="dashboard"          element={<Dashboard/>}/>
         <Route path="clients"            element={<MyClients/>}/>
         <Route path="payroll/employees"  element={<Employees/>}/>
@@ -2669,8 +2763,18 @@ function App(){
         <Route path="books/journal"      element={<JournalEntries/>}/>
         <Route path="books/transactions" element={<Transactions/>}/>
         <Route path="books/reconcile"    element={<BankReconcile/>}/>
-        <Route path="rent-roll"          element={<RentRoll/>}/>
-        <Route path="disbursements"      element={<ComingSoon title="Owner Disbursements" icon="💸" description="Disbursement history synced from GAM"/>}/>
+        <Route path="rent-roll"          element={user?.role==='bookkeeper'?<Navigate to="/financials/income" replace/>:<RentRoll/>}/>
+        {/* 10/11: was a "coming soon" placeholder; the payouts are real now. */}
+        <Route path="disbursements"      element={<Navigate to="/financials/payouts" replace/>}/>
+        <Route path="financials" element={<FinancialsHost/>}>
+          <Route index element={<Navigate to="/financials/income" replace/>}/>
+          <Route path="income"            element={<IncomePage/>}/>
+          <Route path="expenses"          element={<ExpensesPage/>}/>
+          <Route path="maintenance-costs" element={<MaintenanceCostsPage/>}/>
+          <Route path="reports"           element={<ReportsPage/>}/>
+          <Route path="bank-activity"     element={<BankActivityPage/>}/>
+          <Route path="payouts"           element={<PayoutsPage/>}/>
+        </Route>
         <Route path="bills"              element={<BillsAP/>}/>
         <Route path="reports/pl"              element={<ProfitLoss/>}/>
         <Route path="reports/balance-sheet"   element={<BalanceSheet/>}/>

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { NotificationBell } from '../NotificationBell'
 import { ChatWidget } from '../ChatWidget'
 import { apiGet } from '../../lib/api'
-import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom'
+import { Outlet, NavLink, Navigate, useNavigate, useLocation } from 'react-router-dom'
 import { DialogHost } from '../dialogs'
 import { useQuery } from 'react-query'
 import { useAuth } from '../../context/AuthContext'
@@ -37,6 +37,11 @@ const NAV_ITEMS: Array<{
   section: string | null
   category?: string
   hub?: 'financials' | 'screening'
+  // 10/11 (Nic): the shared financial pages a bookkeeper sees — and the only
+  // ones. 'only' = the bookkeeper's read-only view of something the owner
+  // already has a fuller page for (Bank, Disbursements), so the owner's hub
+  // does not carry it twice.
+  bookkeeper?: true | 'only'
 }> = [
   // Overview
   { to: '/dashboard',     icon: LayoutDashboard, label: 'Dashboard',        section: 'Overview',    category: 'dashboard' },
@@ -78,9 +83,15 @@ const NAV_ITEMS: Array<{
   // W-2 (S531): owner-only — matches the API canViewLandlordFinances gate.
   { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null, hub: 'financials' },
   { to: '/disbursements', icon: ArrowDownToLine,  label: 'Disbursements',    section: null, hub: 'financials', category: 'disbursements' },
-  { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null, hub: 'financials', category: 'reports' },
+  // 10/11 (Nic): money in by type — by month and by day, no names.
+  { to: '/income',        icon: BarChart2,        label: 'Money In',         section: null, hub: 'financials', bookkeeper: true },
+  { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null, hub: 'financials', category: 'reports', bookkeeper: true },
   // S568: landlord expense entry (feeds the P&L). Owner-level.
-  { to: '/expenses',      icon: ArrowDownToLine,  label: 'Expenses',         section: null, hub: 'financials' },
+  { to: '/expenses',      icon: ArrowDownToLine,  label: 'Expenses',         section: null, hub: 'financials', bookkeeper: true },
+  // 10/11 (Nic): "maintenance... the maintenance costs." Cost lines only.
+  { to: '/maintenance-costs', icon: Wrench,       label: 'Maintenance Costs', section: null, hub: 'financials', bookkeeper: true },
+  { to: '/bank-activity', icon: Landmark,         label: 'Bank Activity',    section: null, hub: 'financials', bookkeeper: 'only' },
+  { to: '/payouts',       icon: ArrowDownToLine,  label: 'Payouts',          section: null, hub: 'financials', bookkeeper: 'only' },
   // S645 (Nic): an owner whose book is split between managers reads it here,
   // in one place, with the managers side by side. Owner-level like the rest of
   // the financials hub — it is a judgment about the people they hired.
@@ -151,7 +162,7 @@ const OWNER_ROLES = new Set(['admin','super_admin','landlord'])
 // (main.tsx) so staff always LAND on a page they can actually see. Owners see
 // everything; staff see an item iff they hold ANY catalog key in its category
 // (plus the S168 banking special case). Items with no category are owner-only.
-export function visibleNavItemsFor(user: { role?: string; permissions?: Record<string, any> | null; directDepositEnabled?: boolean; hasMobileHomeUnits?: boolean } | null | undefined) {
+export function visibleNavItemsFor(user: { role?: string; permissions?: Record<string, any> | null; directDepositEnabled?: boolean; hasMobileHomeUnits?: boolean; allProperties?: boolean } | null | undefined) {
   const role = user?.role || 'landlord'
   const perms = (user?.permissions || {}) as Record<string, boolean | string>
   const isOwner = OWNER_ROLES.has(role)
@@ -159,6 +170,16 @@ export function visibleNavItemsFor(user: { role?: string; permissions?: Record<s
   const hasMobileHomeUnits = (user as any)?.hasMobileHomeUnits === true
   return NAV_ITEMS.filter(item => {
     if (LAUNCH_HIDDEN.has(item.to)) return false  // S512 launch hide
+    // 10/11 (Nic): a bookkeeper sees the shared financial pages and nothing
+    // else — "money coming in, money going out... the maintenance costs".
+    // The API refuses them everything else too (lib/bookkeeperAccess).
+    // The bank account and payouts are company-wide: a bookkeeper kept to some
+    // of the company's properties is refused both, so they are not offered.
+    if (role === 'bookkeeper') {
+      if (item.bookkeeper === 'only' && user?.allProperties === false) return false
+      return !!item.bookkeeper
+    }
+    if (item.bookkeeper === 'only') return false
     // S575: Lot Rent & Net is a mobile-home concept (lot rent + investor-operator
     // net for homes-only parks). Landlords see it only once they have a
     // mobile-home unit; admin/super_admin (platform oversight) always see it;
@@ -268,6 +289,7 @@ const LL_FONTS: Record<string, { imp: string; family: string; display: string }>
 
 const ROLE_BADGE: Record<string, string> = {
   landlord:         '',
+  bookkeeper:       'Bookkeeper',
   property_manager: 'PM',
   onsite_manager:   'On-Site',
   maintenance:      'Maintenance',
@@ -391,10 +413,20 @@ export function Layout() {
   }
 
   const handleLogout = () => { logout(); navigate('/login') }
+  // 10/11: a bookkeeper's portal is the financial pages alone — no signing
+  // queue, notifications, assistant or settings (each would only be refused).
+  const isBookkeeper = role === 'bookkeeper'
 
   // Visibility rule lives in visibleNavItemsFor (shared with RoleRedirect); the
   // sidebar collapses the Financials/Screening clusters into one item each (S575).
   const visibleItems = sidebarNavItemsFor(user)
+
+  // 10/11: a bookkeeper who follows an old link or types a path lands back on
+  // their pages rather than on a screen the API will refuse piece by piece.
+  if (isBookkeeper) {
+    const theirs = visibleNavItemsFor(user).map(i => i.to)
+    if (!theirs.includes(layoutLocation.pathname)) return <Navigate to={theirs[0] ?? '/income'} replace />
+  }
 
   // Track section headers without side effects
   const renderedSections = new Set<string>()
@@ -472,11 +504,11 @@ export function Layout() {
       </aside>
 
       <div className="main-content">
-        <PendingSignBanner />
+        {!isBookkeeper && <PendingSignBanner />}
         <header className="topbar" style={{ position:'sticky', top:0, zIndex:100 }}>
           <AnnouncementBar />
           <div style={{ flex:1 }} />
-          <NotificationBell />
+          {!isBookkeeper && <NotificationBell />}
           <button
             className="btn btn-ghost btn-sm"
             style={{ padding:'6px' }}
@@ -486,16 +518,18 @@ export function Layout() {
           >
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
-          <button className="btn btn-ghost btn-sm" style={{ padding:'6px' }}>
-            <Settings size={16} style={{ cursor:'pointer' }} onClick={() => window.location.href='/settings'} />
-          </button>
+          {!isBookkeeper && (
+            <button className="btn btn-ghost btn-sm" style={{ padding:'6px' }}>
+              <Settings size={16} style={{ cursor:'pointer' }} onClick={() => window.location.href='/settings'} />
+            </button>
+          )}
         </header>
         <div className={"page-content" + (fullBleed ? " page-content-wide" : "")}>
           <Outlet />
           <DialogHost />
         </div>
       </div>
-      <ChatWidget />
+      {!isBookkeeper && <ChatWidget />}
     </div>
   )
 }

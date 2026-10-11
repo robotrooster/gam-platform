@@ -30,18 +30,20 @@ If you have balances on more than one lease (say, an overlap while moving betwee
 
 ## Credit on your account
 
-Credit on your account — money you paid ahead, a credit from your landlord, or statutory interest on your deposit — pays a bill **by itself only when it covers the whole bill**. Then the bill is marked paid and you get a receipt saying it was paid with your account credit; nothing is charged to you.
+**Money you paid ahead goes on your balance by itself**, against everything you owe on the lease, oldest bill first. When it can't cover a whole line, it pays part of that line and the rest stays owed. Your bill then shows the charges, "Credit applied", and what is still owed. If it pays everything, the bill is marked paid and you get a receipt; nothing is charged to you.
 
-When your credit is less than the bill, nothing happens on its own. Your bill shows in full, with "You have $X credit available" beside it, and when you pay you choose:
+Other credit — a credit from your landlord, or statutory interest on your deposit — pays a bill **by itself only when it covers the whole bill**. Then the bill is marked paid and you get a receipt saying it was paid with your account credit; nothing is charged to you.
+
+When that other credit is less than the bill, nothing happens on its own. Your bill shows in full, with "You have $X credit available" beside it, and when you pay you choose:
 
 - **Use all $X** — your credit comes off and you pay the rest.
 - **Save it for later** — you pay the whole bill and keep the credit.
 
 If your credit covers everything you owe, you'll see **Pay with credit** instead, and nothing is charged.
 
-A few things credit can't pay: a home or trailer payment, a GAM fee, or another landlord's charge on your bill. Credit tied to one lease pays only that lease, and if your landlord set a monthly limit on how much paid-ahead money a month may use, it stops there. Saved credit doesn't stop a late fee unless it covers the whole bill, so a bill you haven't paid can still be late.
+A few things credit can't pay: a home or trailer payment, a GAM fee, or another landlord's charge on your bill. Credit tied to one lease pays only that lease, and if your landlord set a monthly limit on how much paid-ahead money a month may use, it stops there. Saved credit doesn't stop a late fee unless it covers the whole bill, so a bill you haven't paid can still be late — whatever is still owed after your paid-ahead money goes on can be late too.
 
-**Autopay** has a setting, "Use my account credit first", that is off unless you turn it on. Off, autopay charges the whole bill and your credit waits for you. On, autopay uses all the credit it can and charges the rest.
+**Autopay** has a setting, "Use my account credit first", that is off unless you turn it on. Money you paid ahead has already gone on the bill by itself. Off, autopay charges what is still owed and any other credit waits for you. On, autopay uses all the credit it can and charges the rest.
 
 ## Seeing where every dollar went
 

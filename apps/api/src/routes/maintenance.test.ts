@@ -560,10 +560,11 @@ describe('GET /maintenance — list scoping', () => {
   it('unknown role gets empty list, not 500', async () => {
     const f = await seedFixture()
     await createBaseRequest(f)
-    // bookkeeper hits the explicit-branches code path and falls through
-    // to the "empty rather than leak" guard.
+    // A role with no branch of its own falls through to the "empty
+    // rather than leak" guard. (10/11: this used a bookkeeper, which the
+    // bookkeeper gate in requireAuth now refuses outright — see below.)
     const bkToken = jwt.sign(
-      { userId: randomUUID(), role: 'bookkeeper', email: 'bk@test.dev', profileId: randomUUID(), permissions: {} },
+      { userId: randomUUID(), role: 'business_staff', email: 'bs@test.dev', profileId: randomUUID(), permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
     const res = await request(buildApp())
@@ -571,6 +572,17 @@ describe('GET /maintenance — list scoping', () => {
       .set('Authorization', `Bearer ${bkToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data).toEqual([])
+  })
+
+  it('a bookkeeper is refused outright (10/11, lib/bookkeeperAccess)', async () => {
+    const bkToken = jwt.sign(
+      { userId: randomUUID(), role: 'bookkeeper', email: 'bk@test.dev', profileId: randomUUID(), permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' },
+    )
+    const res = await request(buildApp())
+      .get('/api/maintenance')
+      .set('Authorization', `Bearer ${bkToken}`)
+    expect(res.status).toBe(403)
   })
 })
 

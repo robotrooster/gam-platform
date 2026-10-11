@@ -287,6 +287,9 @@ balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (r
              (m.work_trade_suspended_at IS NOT NULL) AS work_trade,
              ${openBalanceSql('m')} AS open,
              CASE WHEN ${openBalanceSql('m')} THEN ${openAmountSql('m')} ELSE 0 END AS open_amount,
+             -- 10/6 (Nic): credit already applied to the line (whole or part).
+             (SELECT COALESCE(SUM(cu.amount), 0) FROM credit_uses cu
+               WHERE cu.payment_id = m.id AND cu.status = 'applied') AS credit_applied,
              ${chargeLabelColumnsSql('m')}
         FROM mine m
        WHERE m.invoice_id IN (SELECT invoice_id FROM open_bills)
@@ -313,29 +316,47 @@ balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (r
        WHERE i.id = ANY($1::uuid[])
        ORDER BY i.due_date ASC, i.invoice_number ASC`, [invoiceIds])
 
+    // 10/6 (Nic): "Credits need to not settle by line item. It needs to be a
+    // credit against the entire balance." A line is shown at what it is; the
+    // credit on the bill is ONE figure under the lines (credit_applied), and
+    // money paid is another (amount_paid) — never a line marked "covered by
+    // prepaid credit … collected by the landlord" (the raw note is not the
+    // line's words: label and detail are, payment tags stripped).
     const shape = (l: any) => ({
       id: l.id, type: l.type, entry_description: l.entry_description,
       amount: l.amount, status: l.status, due_date: l.due_date, notes: l.notes,
       label: chargeLabel(l), detail: chargeDetail(l),
       open: l.open === true,
+      credit_applied: Number(l.credit_applied ?? 0),
+      // Money (not credit) that paid it: settled, clearing, or taken from the deposit.
+      paid: Math.round(moneyPaidOf(l) * 100) / 100,
     })
     const visible = (l: any) => seesWorkTrade || !l.work_trade
     const money = (xs: any[], f: (l: any) => number) =>
       Math.round(xs.reduce((s, l) => s + Math.round(f(l) * 100), 0)) / 100
     // Money that came in on it: settled, still clearing, or taken from the deposit.
     const paidOf = (l: any) => (!l.work_trade && ['settled', 'processing', 'paid_via_deposit'].includes(l.status)) ? Number(l.amount) : 0
+    // Of that, what money paid (credit applied to a paid line is not money paid).
+    const moneyPaidOf = (l: any) => paidOf(l) > 0 ? Math.max(0, paidOf(l) - Number(l.credit_applied ?? 0)) : 0
+    // Credit applied to the line, whether the line is paid or still open in part.
+    const creditOf = (l: any) => l.work_trade ? 0 : Number(l.credit_applied ?? 0)
 
     const data: any[] = invoices.map((i: any) => {
       const mine = lines.filter((l: any) => l.invoice_id === i.id)
       const balance = money(mine, l => Number(l.open_amount))
-      const amountPaid = money(mine, paidOf)
+      const amountPaid = money(mine, moneyPaidOf)
+      const creditApplied = money(mine, creditOf)
       const row: any = {
         ...i,
+        // Money paid on it (cash, check, card, bank) — never the credit.
         amount_paid: amountPaid,
+        // 10/6 (Nic): the credit applied against this bill, as one figure.
+        credit_applied: creditApplied,
         balance,
-        // What this bill comes to now: what was paid on it plus what it still
-        // owes (late fees included, which the invoice's own total never was).
-        total_amount: Math.round((amountPaid + balance) * 100) / 100,
+        // What this bill comes to now: what was paid on it, the credit applied,
+        // and what it still owes (late fees included, which the invoice's own
+        // total never was).
+        total_amount: Math.round((amountPaid + creditApplied + balance) * 100) / 100,
         lines: mine.filter(visible).map(shape),
       }
       if (!seesWorkTrade) {
@@ -353,7 +374,8 @@ balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (r
         due_date: loose[0].due_date,
         status: 'pending',
         unit_number_then: null, unit_number: null, property_name: null,
-        amount_paid: 0, balance, total_amount: balance,
+        amount_paid: money(loose, moneyPaidOf), credit_applied: money(loose, creditOf), balance,
+        total_amount: Math.round((money(loose, moneyPaidOf) + money(loose, creditOf) + balance) * 100) / 100,
         lines: loose.filter(visible).map(shape),
       })
     }

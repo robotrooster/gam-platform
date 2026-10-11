@@ -242,6 +242,9 @@ const DELIBERATE = new Map(Object.entries({
   'documents POST /': 'a document is a file the person uploads',
   'tenantWalkthroughs POST /media': 'walkthrough photos and video are files taken on site',
   'expenses POST /:id/receipt': 'a receipt is a file the landlord uploads',
+  // 10/11: correcting an expense (the owner's, or a bookkeeper's own) is done
+  // with the row and its receipt in front of you; the agent logs new ones.
+  'expenses PATCH /:id': 'correcting an expense is done looking at the row and its receipt',
   'maintenance POST /:id/media': 'photos of the job are files taken on site',
   'maintenance POST /:id/receipts': 'a receipt is a file the worker uploads',
   'inspections POST /:id/photos': 'inspection photos are taken on site and uploaded there',

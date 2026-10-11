@@ -419,10 +419,10 @@ describe('the card reader asks about credit once', () => {
       ifUsed: { balance: 410, cardFee: 14.90, total: 424.90 }, ifSaved: { balance: 460, cardFee: 16.65, total: 476.65 },
     }
     await open()
-    expect(times('Ask them: use their credit on this bill, or save it for later?')).toBe(1)
+    expect(times('Credit available $50.00 — use it on this bill, or save it?')).toBe(1)
     await press(/^Card on the reader$/)
     await until(() => text().includes('Ask them before sending the amount'), 'the reader’s own question')
-    expect(times('Ask them: use their credit on this bill, or save it for later?')).toBe(0)
+    expect(times('Credit available $50.00 — use it on this bill, or save it?')).toBe(0)
     expect(times('Ask them before sending the amount: use their credit, or save it?')).toBe(1)
   })
 

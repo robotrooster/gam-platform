@@ -254,10 +254,12 @@ export async function generateLateFeesForTimezone(
  *      invoice was picked by a scan that ran before this transaction, so a
  *      tenant may have paid, or a credit landed, in between.
  *   2. The whole-bill rule, right before the fee: a credit that covers the
- *      whole bill pays it now, and a bill paid in full is not late. Saved
- *      credit that covers less settles nothing and does NOT stop the fee
- *      (Nic: "saved credit doesn't stop a late fee unless it covers the whole
- *      bill"). Savepoint-guarded: if the credit step fails, the bill stays
+ *      whole bill pays it now, and a bill paid in full is not late. 10/6
+ *      (Nic): money paid ahead also goes on the balance, part of a bill when
+ *      it cannot pay all of it (creditUse.drawPaidAheadOnBalance); other
+ *      saved credit that covers less settles nothing. Whatever is still owed
+ *      after that does NOT stop the fee (Nic: "saved credit doesn't stop a
+ *      late fee unless it covers the whole bill"). Savepoint-guarded: if the credit step fails, the bill stays
  *      open and the fee is raised exactly as before.
  *   3. The invoice is asked again, fresh, under the lock: the fee is raised
  *      only if it still qualifies (anything paid since the scan — by credit

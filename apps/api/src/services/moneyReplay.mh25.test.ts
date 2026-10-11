@@ -3,12 +3,15 @@
  *
  * Oak Park MH 25 handed over a $470 check against $460 rent. The $10 over is
  * money the LANDLORD took (paid ahead, funded_by 'landlord'). Nic's rules
- * (decisions.md, 10/2 credit decisions + plan §0.0 OWNER CORRECTION):
+ * (decisions.md, 10/2 credit decisions + plan §0.0 OWNER CORRECTION, and 10/6):
  *
- *   - credit applies by itself only when it covers the WHOLE bill; $10 < $460,
- *     so the bill run applies nothing and the tenant is asked "Use all $10" /
- *     "Save it for later" when they pay;
- *   - saved credit does not stop a late fee;
+ *   - 10/6 (Nic): "Credits need to not settle by line item. It needs to be a
+ *     credit against the entire balance." Money paid ahead goes on the next
+ *     bill by itself, whole or in part: July's bill run puts the $10 on the
+ *     $460 rent, $450 is still owed, and nobody is asked "Use" or "Save";
+ *     (it replaces 10/2's "only when it covers the whole bill" for money paid
+ *     ahead — credit the landlord gives still waits for the payer's choice);
+ *   - a bill not paid by the grace day takes its late fee;
  *   - the payout carries only money GAM holds — never the $10 the landlord
  *     already has in hand;
  *   - "Money received" is the day money ARRIVED: the $10 counts in the check's
@@ -17,8 +20,8 @@
  *     the part the $10 paid shown as "covered by money paid ahead".
  *
  * Months are fixed past dates (the bill run and the reports take explicit
- * days): the check month is June 2026, the "Save" month July, the "Use" month
- * August. Every step runs the real service (bill run, desk settle, portal
+ * days): the check month is June 2026, the month the $10 goes on the bill
+ * July, a month with no credit at all August. Every step runs the real service (bill run, desk settle, portal
  * quote, portal charge with Stripe mocked, the real webhook, the late-fee
  * engine, the reports) and checks the money invariants I1–I9 after it.
  */
@@ -210,7 +213,7 @@ beforeEach(async () => {
   process.env.STRIPE_WEBHOOK_SECRET = 'whsec_mocked'
 })
 
-describe('MH 25 replay: the $10 waits for the tenant, the landlord is never paid twice', () => {
+describe('MH 25 replay: the $10 goes on the next bill by itself, the landlord is never paid twice', () => {
   // One scripted history, step by step (each `it` continues the one before).
   let p: Park
   let creditId: string
@@ -260,80 +263,76 @@ describe('MH 25 replay: the $10 waits for the tenant, the landlord is never paid
     await invariantsHold('June check')
   })
 
-  it('July 1 bill run: the bill is $460 with "$10 available" beside it, and nothing is applied by itself', async () => {
+  it('July 1 bill run: the $10 goes on the $460 rent by itself — $450 still owed, the row never cut in two', async () => {
     await generateInvoices(new Date('2026-07-01T15:00:00Z'))
     const july = await billFor(p, '2026-07-01')
     expect(Number(july.total_amount)).toBe(460)
     const rows = await rowsOn(july.id)
     julyRowIds = rows.map(r => r.id)
     expect(rows.map(r => [r.type, Number(r.amount), r.status])).toEqual([['rent', 460, 'pending']])
-    expect(Number((await theTen(p))[0].amount_remaining)).toBe(10)
-    expect(await usesOf(creditId)).toEqual([])
+    expect(Number((await theTen(p))[0].amount_remaining)).toBe(0)
+    expect((await usesOf(creditId)).map(u => [u.status, Number(u.amount), u.source, u.payment_id]))
+      .toEqual([['applied', 10, 'whole_bill', rows[0].id]])
 
     emailInvoiceReady.mockClear()
     const sent = await sendPendingInvoiceNotices({ invoiceId: july.id })
     expect(sent.sent).toBe(1)
     const args = emailInvoiceReady.mock.calls[0][1]
-    expect(args.total).toBe(460)                       // the full bill, never netted
-    expect(args.creditAvailable).toBe(10)              // said beside it
+    expect(args.total).toBe(450)                       // still owed, after the credit applied
+    expect(args.creditApplied).toBe(10)                // one "Credit applied" line under the charges
+    expect(args.creditAvailable).toBe(0)               // nothing left to offer
+    expect(args.lines).toEqual([expect.objectContaining({ label: 'Rent', amount: 460, covered: false })])
     await invariantsHold('July bill run')
   })
 
-  it('July, Pay Now offers [Use all $10 — pay $450] and [Save it for later — pay $460], each with the card fee on its own money', async () => {
-    const save = await quoteLeaseCharge({ tenantId: p.tenantId, leaseId: p.leaseId, useCredit: false, paymentMethodType: 'card' })
-    const use = await quoteLeaseCharge({ tenantId: p.tenantId, leaseId: p.leaseId, useCredit: true, paymentMethodType: 'card' })
-    expect(save.usableCredit).toBe(10)
-    expect(save.landing.dueCents).toBe(46000)
-    expect(use.landing.dueCents).toBe(45000)
-    expect(save.fee).toBe(cardFee(460))
-    expect(use.fee).toBe(cardFee(450))
-    expect(save.total).toBeCloseTo(460 + cardFee(460), 2)
-    expect(use.total).toBeCloseTo(450 + cardFee(450), 2)
+  it('July, Pay Now asks nothing about credit: $450 plus the card fee on $450', async () => {
+    const q = await quoteLeaseCharge({ tenantId: p.tenantId, leaseId: p.leaseId, useCredit: false, paymentMethodType: 'card' })
+    expect(q.usableCredit).toBe(0)
+    expect(q.landing.dueCents).toBe(45000)
+    expect(q.fee).toBe(cardFee(450))
+    expect(q.total).toBeCloseTo(450 + cardFee(450), 2)
   })
 
-  it('July, the tenant picks Save: the card is charged $460 plus the fee on $460, the $10 stays, and the payout carries $460 — never the $10', async () => {
+  it('July, the card pays the $450: the payout carries $450 — never the $10 the landlord already holds', async () => {
     ;(stripeConnect.createRentPlatformCharge as any).mockClear()
     const r = await chargeLeaseBalance({
       tenantId: p.tenantId, leaseId: p.leaseId, chargeEverything: true,
       paymentMethodId: 'pm_card', paymentMethodType: 'card', source: 'portal',
-      credit: { use: false, expected: 10 },
     })
     expect(r.creditUsed).toBe(0)
     const sent = (stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount
-    expect(sent).toBeCloseTo(460 + cardFee(460), 2)
+    expect(sent).toBeCloseTo(450 + cardFee(450), 2)
     await cardCleared(r.paymentIntentId, r.remittanceId)
     await settledOn(r.paymentIntentId, '2026-07-02T18:00:00Z')
 
     const rows = await rowsOn((await billFor(p, '2026-07-01')).id)
     expect(rows.map(x => x.status)).toEqual(['settled'])
     expect(rows[0].platform_held).toBe(true)
-    expect(Number((await theTen(p))[0].amount_remaining)).toBe(10)
-    expect(await usesOf(creditId)).toEqual([])
-    expect(await ownerShares(julyRowIds)).toBe(460)
-    expect(await heldOwnerShareForUser(p.landlordUserId)).toBe(460)
-    await invariantsHold('July Save')
+    expect(await ownerShares(julyRowIds)).toBe(450)
+    expect(await heldOwnerShareForUser(p.landlordUserId)).toBe(450)
+    await invariantsHold('July card')
   })
 
-  it('reports after July: June received $470 (incl. $10 paid ahead), July received $460; July billed $460, all paid', async () => {
+  it('reports after July: June received $470 (incl. $10 paid ahead), July received $450; July billed $460 — $450 paid, $10 covered by money paid ahead', async () => {
     const jun = await received(p, '2026-06-01', '2026-06-30')
     expect(jun.total).toBe(470)
     expect(jun.lines.rent).toBe(460)
     expect(jun.lines.paidAhead).toBe(10)
     const jul = await received(p, '2026-07-01', '2026-07-31')
-    expect(jul.total).toBe(460)
+    expect(jul.total).toBe(450)
     expect(jul.lines.paidAhead).toBe(0)
     const julB = await billed(p, '2026-07-01', '2026-07-31')
     expect(julB.total).toBe(460)
-    expect(julB.parts.paid).toBe(460)
-    expect(julB.parts.coveredByPaidAhead).toBe(0)
+    expect(julB.parts.paid).toBe(450)
+    expect(julB.parts.coveredByPaidAhead).toBe(10)
     expect(julB.parts.stillOwed).toBe(0)
   })
 
-  it('August: unpaid after the grace days, so the $25 late fee posts even though $10 is saved', async () => {
+  it('August: nothing paid ahead is left; unpaid after the grace days, the $25 late fee posts', async () => {
     await generateInvoices(new Date('2026-08-01T15:00:00Z'))
     const aug = await billFor(p, '2026-08-01')
     expect(Number(aug.total_amount)).toBe(460)
-    expect(await usesOf(creditId)).toEqual([])        // still nothing applied by itself
+    expect(await usesOf(creditId)).toHaveLength(1)    // July's $10 only
 
     const lf = await generateLateFeesForInvoice(aug.id)
     expect(lf.errors).toEqual([])
@@ -341,62 +340,47 @@ describe('MH 25 replay: the $10 waits for the tenant, the landlord is never paid
     augRowIds = rows.map(r => r.id)
     const fee = rows.filter(r => r.type === 'late_fee')
     expect(fee.map(r => Number(r.amount))).toEqual([LATE_FEE])
-    expect(Number((await theTen(p))[0].amount_remaining)).toBe(10)
-    // Saved credit is not payment: the space reads late.
     expect((await db.query<{ status: string }>(`SELECT status FROM units WHERE id = $1`, [p.unitId])).rows[0].status).toBe('delinquent')
     await invariantsHold('August late fee')
   })
 
-  it('August, the tenant picks Use: the card is charged $450 + $25 plus the fee on $475; the $10 is spent; the owner share is $475', async () => {
-    const q = await quoteLeaseCharge({ tenantId: p.tenantId, leaseId: p.leaseId, useCredit: true, paymentMethodType: 'card' })
-    expect(q.usableCredit).toBe(10)
-    expect(q.landing.dueCents).toBe((450 + LATE_FEE) * 100)
+  it('August, the card pays $460 + $25 plus the fee on $485; the owner share is $485', async () => {
+    const q = await quoteLeaseCharge({ tenantId: p.tenantId, leaseId: p.leaseId, useCredit: false, paymentMethodType: 'card' })
+    expect(q.usableCredit).toBe(0)
+    expect(q.landing.dueCents).toBe((460 + LATE_FEE) * 100)
 
     ;(stripeConnect.createRentPlatformCharge as any).mockClear()
     const r = await chargeLeaseBalance({
       tenantId: p.tenantId, leaseId: p.leaseId, chargeEverything: true,
       paymentMethodId: 'pm_card', paymentMethodType: 'card', source: 'portal',
-      credit: { use: true, expected: 10 },
     })
-    expect(r.creditUsed).toBe(10)
     const sent = (stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount
-    expect(sent).toBeCloseTo(450 + LATE_FEE + cardFee(450 + LATE_FEE), 2)
-    // Set aside on the charge while the card clears.
-    expect((await usesOf(creditId)).map(u => [u.status, Number(u.amount), u.source])).toEqual([['held', 10, 'portal']])
-    await invariantsHold('August Use, clearing')
-
+    expect(sent).toBeCloseTo(460 + LATE_FEE + cardFee(460 + LATE_FEE), 2)
     await cardCleared(r.paymentIntentId, r.remittanceId)
     await settledOn(r.paymentIntentId, '2026-08-10T18:00:00Z')
 
-    const uses = await usesOf(creditId)
-    expect(uses.map(u => [u.status, Number(u.amount)])).toEqual([['applied', 10]])
-    const rent = (await rowsOn((await billFor(p, '2026-08-01')).id)).find(x => x.type === 'rent')!
-    expect(uses[0].payment_id).toBe(rent.id)            // oldest first: rent before its late fee
-    expect(Number(rent.issued_credit_amount)).toBe(0)  // paid-ahead money is not a credit the landlord gave
-    expect(Number((await theTen(p))[0].amount_remaining)).toBe(0)
-    expect(await ownerShares(augRowIds)).toBe(450 + LATE_FEE)
-    // Everything GAM owes this landlord: July's $460 + August's $475. Never the $10.
-    expect(await heldOwnerShareForUser(p.landlordUserId)).toBe(460 + 450 + LATE_FEE)
-    await invariantsHold('August Use, settled')
+    expect(await ownerShares(augRowIds)).toBe(460 + LATE_FEE)
+    // Everything GAM owes this landlord: July's $450 + August's $485. Never the $10.
+    expect(await heldOwnerShareForUser(p.landlordUserId)).toBe(450 + 460 + LATE_FEE)
+    await invariantsHold('August card')
   })
 
-  it('reports after August: received $475 new money (the $10 counts $0 now); billed $485 with $10 covered by money paid ahead', async () => {
+  it('reports after August: received $485; every dollar counts once across the history; nothing paid ahead is unused', async () => {
     const aug = await received(p, '2026-08-01', '2026-08-31')
-    expect(aug.total).toBe(450 + LATE_FEE)
+    expect(aug.total).toBe(460 + LATE_FEE)
     expect(aug.lines.paidAhead).toBe(0)
-    // Month the check came in is unchanged by the later use.
     expect((await received(p, '2026-06-01', '2026-06-30')).total).toBe(470)
-    // Across the whole history every dollar counts once: $470 + $460 + $475.
-    expect((await received(p, '2026-06-01', '2026-08-31')).total).toBe(470 + 460 + 450 + LATE_FEE)
+    // $470 + $450 + $485.
+    expect((await received(p, '2026-06-01', '2026-08-31')).total).toBe(470 + 450 + 460 + LATE_FEE)
 
     const augB = await billed(p, '2026-08-01', '2026-08-31')
     expect(augB.total).toBe(460 + LATE_FEE)
-    expect(augB.parts.paid).toBe(450 + LATE_FEE)
-    expect(augB.parts.coveredByPaidAhead).toBe(10)
+    expect(augB.parts.paid).toBe(460 + LATE_FEE)
+    expect(augB.parts.coveredByPaidAhead).toBe(0)
     expect(augB.parts.stillOwed).toBe(0)
     const today = new Date().toISOString().slice(0, 10)
     expect(await paidAheadUnusedAt({ landlordIds: [p.landlordId], end: today })).toBe(0)
-    // Before any of it was spent, the $10 was on hand at the end of every month.
+    // Before any of it was spent, the $10 was on hand at the end of June.
     expect((await received(p, '2026-06-01', '2026-06-30')).paidAheadUnused).toBe(10)
   })
 })

@@ -174,7 +174,11 @@ async function leftoverPaysOctoberThenGuestLeaves(): Promise<R & { leftover: str
   await backfillInvoices({ from: '2026-10-01', to: '2026-10-01', leaseId: r.leaseId })
   const oct = (await rentRows(r)).find(p => p.due === '2026-10-01')!
   expect(oct.amount).toBe(950)
-  await spend({ prepaid: leftover[0].id, paymentId: oct.id, leaseId: r.leaseId, amount: 410, at: '2026-10-01T10:00:00-07:00' })
+  // 10/6 (Nic): the bill run puts the $410 paid ahead on October's rent by
+  // itself, though it pays only part of it (credit against the whole balance).
+  expect((await db.query<{ amount: number; source: string }>(
+    `SELECT amount::float AS amount, source FROM credit_uses WHERE prepaid_credit_id = $1 AND payment_id = $2 AND status = 'applied'`,
+    [leftover[0].id, oct.id])).rows).toEqual([{ amount: 410, source: 'whole_bill' }])
   await settleCash(oct.id, '2026-10-01T10:00:00-07:00')
   await leaveEarly(r, '2026-10-05', '2026-10-05')
   const shortened = (await db.query<{ id: string; amount: number; source_payment_id: string }>(
@@ -508,11 +512,14 @@ describe('two shortenings of one stay each come off their own month', () => {
 
     // The totals are what they were: Money billed's months add up to the same
     // $1,259 (the $1,081 of credit not used yet is paid ahead), and Money
-    // received counts the $2,340 of cash on the days it arrived.
+    // received counts the cash on the days it arrived: $1,910 — 10/6 (Nic):
+    // the Nov 1 bill run put the $430 left of A on the rest of October's rent
+    // by itself (credit against the whole balance, part of a line allowed), so
+    // only $50 of that $480 row was cash.
     expect((await tot(r, 'billed', '2026-09-01', '2026-12-31')).total).toBe(1259)
     expect(cents(oct.total + nov.total)).toBe(1259)
     const rx = await tot(r, 'received', '2026-09-01', '2026-12-31')
-    expect(rx.total).toBe(2340)
+    expect(rx.total).toBe(1910)
     expect(rx.lines.stayShortened ?? 0).toBe(0)
   })
 })

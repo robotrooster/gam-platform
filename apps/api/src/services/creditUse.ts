@@ -30,8 +30,15 @@
 // THE RULES THIS FILE KEEPS (Nic, 10/2 decisions and standing directives):
 //   - Credit applies by itself only when it covers the whole bill. Otherwise
 //     the payer chooses "Use all $X" or "Save it for later".
-//   - No path splits a charge. Credit may pay PART of a charge (the card pays
-//     the rest of the same row); a row is never cut in two.
+//     10/6 (Nic): "Credits need to not settle by line item. It needs to be a
+//     credit against the entire balance." Money PAID AHEAD goes on the open
+//     balance by itself whatever it covers — oldest bill first, part of a line
+//     when it cannot pay all of it, the rest left owed (drawPaidAheadOnBalance).
+//     The rent pay-in-full rule governs a tenant's own money handed over; it
+//     never keeps a credit from being applied.
+//   - No path splits a charge. Credit may pay PART of a charge (the card, the
+//     desk or the rest of the month pays the rest of the same row); a row is
+//     never cut in two.
 //   - Order: money paid ahead first (oldest credit first, within the month's
 //     draw cap), then credit tied to the lease and deposit interest, then the
 //     tenant's general credit. Each pays the oldest eligible bills in the one
@@ -1590,8 +1597,10 @@ export interface SettleResult {
 }
 
 /**
- * Settle every required row of one lease from credit the plan lines spend.
- * The caller has checked the lines cover each row in full and holds the lock.
+ * Spend the plan lines and settle `requiredIds` — the rows they (with credit
+ * already on them) now cover in full. The caller has checked that and holds
+ * the lock. 10/6: a line may pay part of a row not in `requiredIds`; that row
+ * stays open for the rest (drawPaidAheadOnBalance).
  */
 async function settleRowsFromCredit(
   client: PoolClient,
@@ -1793,7 +1802,12 @@ export async function settleFromCredit(
 export interface WholeBillResult {
   /** Every row settled, all leases. */
   settledIds: string[]
-  leases: Array<{ leaseId: string; settledIds: string[]; creditUsed: number; ownerShareBooked: number }>
+  /**
+   * Per lease: `whole_bill` — the credit covered the whole bill and settled it;
+   * `paid_ahead_draw` (10/6) — money paid ahead went on the balance, whole or
+   * in part (settledIds: the rows it paid in full; may be none).
+   */
+  leases: Array<{ leaseId: string; settledIds: string[]; creditUsed: number; ownerShareBooked: number; kind: 'whole_bill' | 'paid_ahead_draw' }>
   /** Call once after COMMIT: the "paid with your account credit" receipts. Never throws. */
   afterCommit: () => Promise<void>
 }
@@ -1838,12 +1852,97 @@ async function alertPastStayEndRentHeldBack(
 }
 
 /**
+ * 10/6 (Nic): money paid ahead goes on the household's open balance by itself,
+ * whole or in part. `quote` is the household as it stands after the whole-bill
+ * rule (read under the lock, free credit only — includeReleasable false). For
+ * each lease the paid-ahead lines of the household plan are spent: oldest bill
+ * first, a row the money cannot cover in full paid in part with the rest left
+ * owed, the month's draw cap kept (buildCreditPlan). A row the money now covers
+ * in full is settled, with the receipt; a row paid in part stays open for the
+ * rest. Leases the whole-bill rule leaves alone are left alone here too: a
+ * scheduled bank retry (that pull is the payer's), credit a payment set aside,
+ * rent past a stay's end (GAM was told when the stay was shortened —
+ * stay_shortened_rent_kept; nothing more is said here). A stay's rent for a
+ * month not yet due is never paid in part (below). Each lease in its own
+ * savepoint: a failure leaves that lease's money untouched and an admin is
+ * told (unless alerts is false).
+ */
+async function drawPaidAheadOnBalance(
+  client: PoolClient,
+  quote: HouseholdQuote,
+  opts: { tenantId: string; landlordId: string; onlyLeaseIds?: readonly string[]; receipt?: boolean; skipLeaseIds?: ReadonlySet<string>; alerts?: boolean },
+): Promise<{ leases: WholeBillResult['leases']; receipts: Array<() => Promise<void>> }> {
+  const leases: WholeBillResult['leases'] = []
+  const receipts: Array<() => Promise<void>> = []
+  let n = 0
+  for (const lq of quote.leases) {
+    if (opts.onlyLeaseIds && !opts.onlyLeaseIds.includes(lq.leaseId)) continue
+    if (opts.skipLeaseIds?.has(lq.leaseId)) continue
+    if (lq.pastStayEndRentIds.length > 0 || lq.scheduledRetries.length > 0) continue
+    if (lq.rows.some(r => r.payable && toCents(r.heldOnRow) > 0)) continue
+    let lines = quote.plan.filter(l => l.leaseId === lq.leaseId && l.creditKind === 'paid_ahead' && toCents(l.amount) > 0)
+    if (lines.length === 0) continue
+    const covered = new Map<string, number>()
+    for (const l of lines) covered.set(l.paymentId, (covered.get(l.paymentId) ?? 0) + toCents(l.amount))
+    const paidInFull = lq.rows
+      .filter(r => r.required && covered.has(r.id) && covered.get(r.id)! + toCents(r.appliedOnRow) >= toCents(r.amount))
+      .map(r => r.id)
+    // 10/6 (Nic): a stay's rent for a month not yet due is never paid in PART
+    // from money paid ahead. If the stay is later shortened, a partly paid,
+    // still-unpaid month past the new end would keep that money on rent the
+    // lease no longer owes (a credit use on an unpaid row is history, and only
+    // money on a SETTLED row is banked back as paid ahead). Paid in full, the
+    // row settles and a shortening banks it back (bankOverpayment); paid in
+    // part, the money waits as paid ahead until that month is due.
+    const partIds = [...covered.keys()].filter(id => !paidInFull.includes(id))
+    if (partIds.length > 0) {
+      const notYetDue = new Set((await client.query<{ id: string }>(
+        `SELECT p.id FROM payments p
+           JOIN leases l ON l.id = p.lease_id
+           LEFT JOIN units un ON un.id = l.unit_id
+           LEFT JOIN properties pr ON pr.id = un.property_id
+          WHERE p.id = ANY($1::uuid[]) AND p.type = 'rent'
+            AND l.lease_source = 'booking_draft' AND l.end_date IS NOT NULL
+            AND p.due_date > (NOW() AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date`,
+        [partIds])).rows.map(r => r.id))
+      if (notYetDue.size > 0) lines = lines.filter(l => !notYetDue.has(l.paymentId))
+      if (lines.length === 0) continue
+    }
+    const sp = `paid_ahead_draw_${++n}`
+    await client.query(`SAVEPOINT ${sp}`)
+    try {
+      const r = await settleRowsFromCredit(client, {
+        leaseId: lq.leaseId, requiredIds: paidInFull, lines,
+        source: 'whole_bill', receipt: opts.receipt !== false && paidInFull.length > 0,
+      })
+      await client.query(`RELEASE SAVEPOINT ${sp}`)
+      leases.push({ leaseId: r.leaseId, settledIds: r.settledIds, creditUsed: r.creditUsed, ownerShareBooked: r.ownerShareBooked, kind: 'paid_ahead_draw' })
+      receipts.push(r.afterReceipt)
+    } catch (e) {
+      await client.query(`ROLLBACK TO SAVEPOINT ${sp}`)
+      logger.error({ err: e, leaseId: lq.leaseId, tenantId: opts.tenantId }, '[paid-ahead] could not put paid-ahead money on the balance — left as it was')
+      if (opts.alerts !== false) await createAdminNotification({
+        severity: 'warn',
+        category: 'whole_bill_credit_failed',
+        title: `Money paid ahead could not go on the tenant's balance (lease ${lq.leaseId})`,
+        body: `The tenant has money paid ahead that should go on their open balance, but applying it failed (${e instanceof Error ? e.message : String(e)}). The balance stays as it was and the money is untouched. Usually a property missing its payout setup; once fixed, the next bill run or credit applies it.`,
+        context: { lease_id: lq.leaseId, tenant_id: opts.tenantId, landlord_id: opts.landlordId },
+      }).catch(() => {})
+    }
+  }
+  return { leases, receipts }
+}
+
+/**
  * THE WHOLE-BILL RULE (Nic, 10/2): credit applies by itself only when it
  * covers the whole bill. For each of the household's leases: when every
  * required row is credit-eligible and the lease's share of the household's
  * usable credit pays every one of them in full, the bill is settled from
- * credit, with no click. Anything less settles nothing and the credit waits
- * for the payer's choice (MH 25's $10 against $460). A bill carrying a GAM fee
+ * credit, with no click. 10/6 (Nic): after that, money PAID AHEAD goes on the
+ * rest of the balance by itself even when it covers less — oldest bill first,
+ * part of a line where it runs out (drawPaidAheadOnBalance). Other credit
+ * (landlord-given, deposit interest) that covers less settles nothing and
+ * waits for the payer's choice (MH 25's $10 against $460). A bill carrying a GAM fee
  * or a neighbor landlord's utility therefore never settles itself, and a lease
  * with a scheduled bank retry is skipped (that pull is the payer's). Neither
  * does a bill carrying rent the lease no longer owes (rent past a shortened
@@ -1859,7 +1958,16 @@ async function alertPastStayEndRentHeldBack(
  */
 export async function settleWholeBillIfCovered(
   client: PoolClient,
-  opts: { tenantId: string; landlordId: string; source?: 'whole_bill'; onlyLeaseIds?: readonly string[]; receipt?: boolean },
+  opts: {
+    tenantId: string; landlordId: string; source?: 'whole_bill'; onlyLeaseIds?: readonly string[]; receipt?: boolean
+    /**
+     * Review fix (10/6): false writes no admin alert. Alerts go through the
+     * shared pool, outside the caller's transaction, so a rolled-back run (the
+     * data-fix script's dry run) would otherwise leave them behind — and the
+     * past-stay-end alert dedupes on them, silencing a later real one.
+     */
+    alerts?: boolean
+  },
 ): Promise<WholeBillResult> {
   await lockHousehold(client, opts.tenantId, opts.landlordId)
   const done: WholeBillResult['leases'] = []
@@ -1890,12 +1998,12 @@ export async function settleWholeBillIfCovered(
         source: 'whole_bill', receipt: opts.receipt !== false,
       })
       await client.query(`RELEASE SAVEPOINT ${sp}`)
-      done.push({ leaseId: r.leaseId, settledIds: r.settledIds, creditUsed: r.creditUsed, ownerShareBooked: r.ownerShareBooked })
+      done.push({ leaseId: r.leaseId, settledIds: r.settledIds, creditUsed: r.creditUsed, ownerShareBooked: r.ownerShareBooked, kind: 'whole_bill' })
       receipts.push(r.afterReceipt)
     } catch (e) {
       await client.query(`ROLLBACK TO SAVEPOINT ${sp}`)
       logger.error({ err: e, leaseId: lq.leaseId, tenantId: opts.tenantId }, '[whole-bill] credit covers the bill but it could not be settled — bill left open')
-      await createAdminNotification({
+      if (opts.alerts !== false) await createAdminNotification({
         severity: 'warn',
         category: 'whole_bill_credit_failed',
         title: `A bill the tenant's credit covers could not be paid from it (lease ${lq.leaseId})`,
@@ -1905,10 +2013,26 @@ export async function settleWholeBillIfCovered(
     }
   }
   for (const l of quote.leases) {
+    if (opts.alerts === false) break
     if (!l.heldBackByPastStayEnd || (opts.onlyLeaseIds && !opts.onlyLeaseIds.includes(l.leaseId))) continue
     if (l.scheduledRetries.length > 0) continue
     await alertPastStayEndRentHeldBack(client, { lease: l, tenantId: opts.tenantId, landlordId: opts.landlordId })
   }
+  // 10/6 (Nic): "Credits need to not settle by line item. It needs to be a
+  // credit against the entire balance." Money the tenant PAID AHEAD is theirs
+  // already on account, so it goes on the balance by itself even when it
+  // cannot pay all of it: oldest bill first (the plan's one allocation order),
+  // a line it cannot cover in full paid in PART (a credit use for what it
+  // covers — the row is never cut in two) and the rest left owed. Marc
+  // Renspurger's $282.36 against $300 rent leaves $17.64 owed, not $300.
+  // The rent pay-in-full rule is about a tenant's own money handed over; it
+  // never holds a credit back. Other credit (issued, deposit interest) keeps
+  // the payer's "Use" or "Save" unless it covers the whole bill (above).
+  // A lease the whole-bill rule already tried (settled, or failed and an admin
+  // was told) is not tried again here.
+  const drawn = await drawPaidAheadOnBalance(client, quote, { ...opts, skipLeaseIds: tried })
+  done.push(...drawn.leases)
+  receipts.push(...drawn.receipts)
   let sent = false
   return {
     settledIds: done.flatMap(d => d.settledIds),

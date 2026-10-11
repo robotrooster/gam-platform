@@ -41,7 +41,7 @@ import {
   chargeMonthsRange, readChargesById, CHARGE_PAGE_SIZE, withReaderTaken, readerFinishedMessage,
   deskOnItsWay, nextAwaitingRereadAt, awaitingOpensAtWord,
   AMOUNT_FIELD_LABEL, NUMBER_FIELD_LABEL, numberMissingMessage, depositPhotoProblem, billName, stillOwedText, lateFeeOutcomeText, lateFeesBackOnShortBills,
-  onboardingLateFeeBoxApplies, recordableMethods,
+  onboardingLateFeeBoxApplies, recordableMethods, partPaymentLines, backdatedLateFeeText, deskBillBalance, postAheadText,
   type CreditChoice, type DeskFigures, type DeskQuote, type DeskQuoteRow, type ReaderQuote, type ReaderSpace,
 } from '../lib/creditDesk'
 import '../styles/credit-desk.css'
@@ -150,12 +150,10 @@ function BillLines({ title, rows, labels, sub }: {
             {lineName(r, labels)}
             <span className="cd-line-meta"> · due {dayWord(r.dueDate)}{r.unitNumber ? ` · ${r.unitNumber}` : ''}</span>
           </span>
-          <span className="mono">
-            {money(r.amount)}
-            {toCents(r.creditAlreadyApplied) > 0 && (
-              <span className="cd-line-meta"> ({money(r.creditAlreadyApplied)} credit already on it)</span>
-            )}
-          </span>
+          {/* 10/6 (Nic): a charge is shown at what it is; credit already on the
+              bill is one line under the charges ("Credit applied"), never a
+              line marked as covered by it. */}
+          <span className="mono">{money(r.amount)}</span>
         </div>
       ))}
     </div>
@@ -238,6 +236,8 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   }, [invoices])
 
   const [choice, setChoice] = useState<CreditChoice>(null)
+  // 10/6 (Nic): "Apply the credit only — nothing taken now" was pressed.
+  const [creditAlone, setCreditAlone] = useState(false)
   // The credit figure on screen (cents) when the desk said Use or Save — the
   // figure sent back, so a credit that moved afterwards is the server's 409,
   // never a different amount spent without asking.
@@ -337,6 +337,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   const answered = () => { if (figures) setAnsweredOn(prev => prev ?? figures) }
   const clearAnswers = () => {
     setChoice(null); setShownCredit(null); setSurplusHandling(null); setWrittenConfirmed(false); setAnsweredOn(null)
+    setCreditAlone(false)
   }
   /** The desk did something: the last message has been read. One message at a time. */
   const clearMsg = () => { setMsg(null); refusal.current = null }
@@ -350,8 +351,11 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
 
   // The credit pays the whole bill: nothing is taken, and no method is asked.
   const creditOnly = !!quote && liveChoice === 'use' && creditChoiceNeeded(quote) && toCents(quote.owedIfUsed) === 0
-  const method: ManualPaymentMethod | null = mode && mode !== 'reader' ? mode : (creditOnly && mode === null ? 'cash' : null)
-  const tenderedCents = parseAmount(tendered)
+  // 10/6 (Nic): the desk applies the credit alone, though it pays only part of the bill.
+  const creditOnlyPart = !!quote && liveChoice === 'use' && creditChoiceNeeded(quote) && toCents(quote.owedIfUsed) > 0
+    && creditAlone && mode === null
+  const method: ManualPaymentMethod | null = mode && mode !== 'reader' ? mode : ((creditOnly || creditOnlyPart) && mode === null ? 'cash' : null)
+  const tenderedCents = creditOnlyPart ? 0 : parseAmount(tendered)
   const towardOldCents = parseAmount(towardOld)
   // "Rent", "Water" — what each line of the bill is called (for "stays owed on October rent").
   const labelOf = (id: string, type: string) => labels.get(id)?.label ?? humanize(type)
@@ -364,6 +368,15 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   // late fees left off that bill go back on it (the server judges each bill).
   const feesBackCents = quote && plan && method === 'bank_deposit' && backdatedTo
     ? lateFeesBackOnShortBills(quote, plan.shortInvoiceIds) : 0
+  // 10/6 (Nic): only what WILL happen with the amount typed.
+  const backdateText = method === 'bank_deposit'
+    ? backdatedLateFeeText(quote, plan, backdatedTo, tenderedCents) : null
+  // 10/6 (Nic): the bill as one balance, and the whole balance as owed now.
+  const bill = quote ? deskBillBalance(quote) : null
+  const fullOwedCents = quote
+    ? Math.max(0, toCents(quote.fullBalance) - toCents(quote.creditAlreadyApplied)
+      - (quote.oldBalance ?? []).reduce((t, r) => t + toCents(r.creditAlreadyApplied), 0))
+    : 0
   const needNumber = !!method && numberRequired(method)
   const oldOwed = quote ? oldBalanceOwedCents(quote) : 0
   const anchor = quote ? postAnchor(quote) : null
@@ -472,6 +485,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   }, [allTapped, readAfterTake])   // eslint-disable-line react-hooks/exhaustive-deps
 
   const pickMode = (m: ManualPaymentMethod | 'reader') => {
+    setCreditAlone(false)
     setMode(m); setTendered(''); setReference(''); setPhoto(null); setDepositedOn(deskToday); setTowardOld('')
     setSurplusHandling(null); setWrittenConfirmed(false); clearMsg()
   }
@@ -540,7 +554,12 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
             {/* ── The whole balance, the way the desk takes it ── */}
             <div className="cd-bill">
               <BillLines title="This bill" rows={quote.rows} labels={labels} />
-              {quote.rows.length > 0 && (
+              {quote.rows.length > 0 && bill && bill.creditApplied > 0 && (<>
+                <div className="cd-line"><span>Charges</span><span className="mono">{money(toDollars(bill.charges))}</span></div>
+                <div className="cd-line"><span>Credit applied</span><span className="mono">{money(-toDollars(bill.creditApplied))}</span></div>
+                <div className="cd-line cd-line-total"><span>Still owed</span><span className="mono">{money(toDollars(bill.stillOwed))}</span></div>
+              </>)}
+              {quote.rows.length > 0 && bill && bill.creditApplied === 0 && (
                 <div className="cd-line cd-line-total"><span>This bill</span><span className="mono">{money(quote.currentTotal)}</span></div>
               )}
               <BillLines title="Old balance" sub="paid last, from whatever is over this bill" rows={quote.oldBalance} labels={labels} />
@@ -571,7 +590,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                   <span className="mono">{money(onItsWay.clearing)}</span>
                 </div>
               )}
-              <div className="cd-line cd-line-total"><span>Full balance</span><span className="mono">{money(quote.fullBalance)}</span></div>
+              <div className="cd-line cd-line-total"><span>Full balance</span><span className="mono">{money(toDollars(fullOwedCents))}</span></div>
             </div>
 
             {/* Fix pass 2: a space taken on the reader is off the bill above (it was
@@ -599,14 +618,15 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                   never the same question twice, one answer of which does nothing). ── */}
               {creditChoiceNeeded(quote) && mode !== 'reader' && (
                 <div className="cd-credit">
+                  {/* 10/6 (Nic): credit is mentioned only when they have it, and only
+                      as this one question. */}
                   <div className="cd-credit-head">
-                    Credit available <span className="mono">{money(quote.creditAvailable)}</span>
+                    Credit available <span className="mono">{money(quote.creditAvailable)}</span> — use it on this bill, or save it?
                     {toCents(quote.creditOnFile) > usable && (
                       <span className="cd-line-meta"> ({money(quote.creditOnFile)} on file)</span>
                     )}
                   </div>
                   {liveChoice === null ? (<>
-                    <div className="cd-credit-ask">Ask them: use their credit on this bill, or save it for later?</div>
                     <div className="cd-choice">
                       <button className="btn btn-primary" onClick={() => answerCredit('use')}>
                         Use {money(quote.creditAvailable)} — they owe {money(quote.owedIfUsed)}
@@ -616,13 +636,35 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                       </button>
                     </div>
                   </>) : (
-                    <div className="cd-chosen">
-                      <span>
-                        {liveChoice === 'use'
-                          ? <>Using {money(toDollars(shownCredit ?? usable))} of credit — they owe <strong className="mono">{money(quote.owedIfUsed)}</strong></>
-                          : <>Saving the credit — they owe <strong className="mono">{money(quote.owedIfSaved)}</strong></>}
-                      </span>
-                      <button className="btn btn-ghost btn-sm" onClick={() => { clearAnswers(); clearMsg() }}>Change</button>
+                    <div className="cd-stack">
+                      <div className="cd-chosen">
+                        <span>
+                          {liveChoice === 'use'
+                            ? <>Using {money(toDollars(shownCredit ?? usable))} of credit — they owe <strong className="mono">{money(quote.owedIfUsed)}</strong></>
+                            : <>Saving the credit — they owe <strong className="mono">{money(quote.owedIfSaved)}</strong></>}
+                        </span>
+                        <button className="btn btn-ghost btn-sm" onClick={() => { clearAnswers(); clearMsg() }}>Change</button>
+                      </div>
+                      {/* 10/6 (Nic): the credit goes on the bill even when nothing is
+                          handed over and it pays only part — the pay-in-full rule is
+                          about their own money, never their credit. */}
+                      {liveChoice === 'use' && toCents(quote.owedIfUsed) > 0 && mode === null && !creditAlone && (
+                        <div>
+                          <button className="btn btn-primary btn-sm" onClick={() => { setCreditAlone(true); clearMsg() }}>
+                            Apply the credit only — nothing taken now
+                          </button>
+                        </div>
+                      )}
+                      {creditOnlyPart && plan && plan.stop === null && (
+                        <div className="alert alert-warn cd-msg" role="status">
+                          <div>Owed {money(quote.owedIfSaved)}</div>
+                          <div>Credit applied {money(-toDollars(usable))}</div>
+                          <div>{partPaymentLines({
+                            owedCents: toCents(quote.owedIfSaved), payingCents: 0,
+                            stillOwedCents: plan.stillOwedCents, names: plan.stillOwedNames,
+                          })[2]}</div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -676,16 +718,10 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                       onChange={e => { setDepositedOn(e.target.value); clearMsg() }} />
                   </label>
                 )}
-                {/* 10/5 (Nic): late fees go by the day the money went into the bank. */}
-                {method === 'bank_deposit' && backdatedTo && toCents(quote?.lateFeesOffIfPaidInFull) > 0 && (
-                  <div className="cd-note" role="status">
-                    Deposited before {money(quote!.lateFeesOffIfPaidInFull!)} in late fees were charged: each bill this deposit
-                    pays in full gets them credited, and the payment still counts as late on their history. A bill it pays only in
-                    part keeps its late fees. When your bank feed shows this deposit, the bank's date decides: a late fee charged
-                    after it comes off, and the payment counts from that day.
-                  </div>
-                )}
-                {onboardingBox && (
+                {/* 10/5 (Nic): late fees go by the day the money went into the bank —
+                    10/6: said only for the bills the amount typed pays in full. */}
+                {backdateText && <div className="cd-note" role="status">{backdateText}</div>}
+                {onboardingBox && backdateText && (
                   <OnboardingLateFeeBox checked={deleteOnboardingFee} disabled={saving}
                     onChange={v => { setDeleteOnboardingFee(v); clearMsg() }} />
                 )}
@@ -698,11 +734,13 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                 {/* 10/5 (Nic): the property takes part payments — what stays owed after this one. */}
                 {plan && plan.stop === null && plan.stillOwedText && (
                   <div className="alert alert-warn cd-msg" role="status">
-                    Part payment. {feesBackCents > 0
-                      ? `${stillOwedText(plan.stillOwedCents + feesBackCents, plan.stillOwedNames)} That includes ${money(toDollars(feesBackCents))} in late fees, which stay on a bill paid only in part.`
-                      : plan.stillOwedText}
-                    {plan.toOldCents > 0 ? ` ${money(toDollars(plan.toOldCents))} goes to the old balance.` : ''}
-                    {plan.keptAsCreditCents > 0 ? ` ${money(toDollars(plan.keptAsCreditCents))} is kept on their account as credit.` : ''}
+                    <div><strong>Part payment</strong></div>
+                    {partPaymentLines({
+                      // A bill paid only in part keeps its late fees (they are owed).
+                      owedCents: plan.owedCents + feesBackCents, payingCents: tenderedCents ?? 0,
+                      stillOwedCents: plan.stillOwedCents + feesBackCents, names: plan.stillOwedNames,
+                      toOldCents: plan.toOldCents, keptCents: plan.keptAsCreditCents, keptOnBalanceCents: plan.keptOnBalanceCents,
+                    }).map((t, i) => <div key={i}>{t}</div>)}
                   </div>
                 )}
 
@@ -849,6 +887,8 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
               {saving ? 'Recording…'
                 : creditOnly && (tenderedCents ?? 0) === 0
                   ? 'Pay with credit — nothing taken'
+                  : creditOnlyPart
+                    ? `Apply ${money(toDollars(usable))} credit — nothing taken`
                   : `Record ${tenderedCents != null ? money(toDollars(tenderedCents)) : 'payment'}`}
             </button>
           )}
@@ -1323,7 +1363,7 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
     () => apiGet(`/payments/post-payment/quote?tenantId=${tenantId}&depositedOn=${backdated}`),
     { enabled: !!backdated, retry: false, staleTime: 0, cacheTime: 0 })
   // 10/6 (Nic): "Bank deposit" is offered only where tenants deposit rent at the bank.
-  const { data: postPlace } = useQuery<{ bankDepositAllowed?: boolean }>(
+  const { data: postPlace } = useQuery<{ bankDepositAllowed?: boolean; owedNow?: number }>(
     ['post-payment-place', tenantId],
     () => apiGet(`/payments/post-payment/quote?tenantId=${tenantId}`),
     { retry: false, staleTime: 0, cacheTime: 0 })
@@ -1394,8 +1434,7 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
             )}
           </div>
           <div className="cd-sub">
-            Money that arrived before its bill. It pays what is open first, oldest bill first; anything over what
-            is owed is kept on their account as paid ahead. {CREDIT_USE_RULE}
+            Money that arrived before its bill. It pays what is open first, oldest bill first.
           </div>
         </div>
         <div className="cd-window-body">
@@ -1412,6 +1451,12 @@ export function PostPaymentForm({ tenantId, name, onClose, onPosted, onChangePer
             <input className="form-input mono" inputMode="decimal" placeholder="0.00" value={amount}
               onChange={e => { setAmount(e.target.value); setConfirming(false) }} />
           </label>
+          {/* Review fix (10/6, Nic: never talk about credit that is not there):
+              money kept ahead is mentioned only when the amount typed is more
+              than they owe now. */}
+          {postAheadText(cents, postPlace?.owedNow) && (
+            <div className="cd-note" role="status">{postAheadText(cents, postPlace?.owedNow)}</div>
+          )}
           {needNumber && method && (
             <label className="cd-field">
               <span className="cd-field-label">{NUMBER_FIELD_LABEL[method]}</span>

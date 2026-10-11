@@ -177,13 +177,15 @@ describe('S609 prepaid release', () => {
   // so they are billed $600 and the $400 is spent settling the rest in the same
   // transaction. The landlord is paid when the month is actually covered, not
   // for a fraction of it.
-  it('S637: a month the prepaid cannot cover in full is left whole, and stays banked', async () => {
+  it('S637 + 10/6: a month the prepaid cannot cover in full takes it against the bill — nothing settled, nothing split', async () => {
     await bankPrepaid(f, 400)
     const { invoiceId, paymentId } = await makeInvoiceWithRent(f, 1000)
     const r = await release(f, invoiceId)
 
-    // Nothing consumed, nothing settled, nothing split.
-    expect(r.consumed).toBeCloseTo(0, 2)
+    // 10/6 (Nic): "a credit against the entire balance" — the $400 goes on the
+    // $1,000 rent (a credit use on the row); nothing settled, nothing split.
+    expect(r.consumed).toBeCloseTo(400, 2)
+    expect(r.rowsCovered).toBe(0)
     const charge = await db.query<{ amount: string; status: string }>(
       `SELECT amount::text, status FROM payments WHERE id = $1`, [paymentId])
     expect(Number(charge.rows[0].amount)).toBeCloseTo(1000, 2)
@@ -194,12 +196,12 @@ describe('S609 prepaid release', () => {
       [f.leaseId])
     expect(Number(remainder.rows[0].n)).toBe(0)
 
-    // Still the tenant's money, still held, and the landlord has earned nothing
-    // from a month nobody has paid for.
+    // On the bill now; the landlord has earned nothing from a month that is
+    // not paid yet (their share is booked when the row is paid in full).
     const left = await db.query<{ remaining: string }>(
       `SELECT SUM(amount_remaining)::text AS remaining FROM lease_prepaid_credits WHERE lease_id = $1`,
       [f.leaseId])
-    expect(Number(left.rows[0].remaining)).toBeCloseTo(400, 2)
+    expect(Number(left.rows[0].remaining)).toBeCloseTo(0, 2)
     expect(await ownerShare(paymentId)).toBeCloseTo(0, 2)
   })
 

@@ -213,6 +213,17 @@ describe('S655 credit is described the way it works', () => {
     expect(article('tenant/how-payments-are-applied.md')).toMatch(/Use my account credit first", that is off unless you turn it on/)
   })
 
+  it('10/6 (Nic): money paid ahead is taught as going on the whole balance by itself, part of a line allowed', () => {
+    for (const path of ['tenant/how-payments-are-applied.md', 'tenant/paying-rent.md']) {
+      expect(article(path), path).toMatch(/[Mm]oney you paid ahead goes on your balance by itself/)
+      expect(article(path), path).toMatch(/oldest bill first/)
+    }
+    expect(article('landlord/waiving-a-charge.md')).toMatch(/Money a tenant paid ahead is different: it goes on their balance by itself/)
+    // Never the old line-by-line rule for paid-ahead money.
+    const OLD = /money you paid ahead, a credit from your landlord, or statutory interest on your deposit — pays a bill \*\*by itself only when/i
+    expect(ARTICLES.filter((a) => OLD.test(a.text)).map((a) => a.path)).toEqual([])
+  })
+
   it('saved credit is never said to stop a late fee', () => {
     expect(article('landlord/waiving-a-charge.md')).toMatch(/Saved credit does not stop a late fee unless it covers the whole bill/)
     expect(article('tenant/how-payments-are-applied.md')).toMatch(/Saved credit doesn't stop a late fee unless it covers the whole bill/)

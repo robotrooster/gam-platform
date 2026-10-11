@@ -685,6 +685,13 @@ export type BankConnectionStatus = typeof BANK_CONNECTION_STATUSES[number]
 // became a landlord_expenses row; ignored = dismissed by the landlord.
 export const BANK_TXN_STATUSES = ['needs_review', 'matched', 'categorized', 'ignored'] as const
 export type BankTxnStatus = typeof BANK_TXN_STATUSES[number]
+// 10/11: the words for each, for the shared Bank activity page.
+export const BANK_TXN_STATUS_LABEL: Record<BankTxnStatus, string> = {
+  needs_review: 'Not filed yet',
+  matched:      'Matched',
+  categorized:  'Filed',
+  ignored:      'Ignored',
+}
 
 // S655 (Nic, Oak Park PNC relink): WHY an ignored row is ignored. One status
 // could not tell "the landlord dismissed it" from "it is before the books start"
@@ -2359,9 +2366,18 @@ export interface BookkeeperScope {
   userId:      string
   landlordId:  string
   accessLevel: BookkeeperAccessLevel
+  /** 10/11: the company's properties they keep; null = all of them. */
+  propertyIds: string[] | null
   createdAt:   Date
   updatedAt:   Date
 }
+
+/**
+ * 10/11 (Nic): what a bookkeeper gets, said once — the Team page's invite and
+ * the accept page both show it. "Look + add expenses" was Nic's choice.
+ */
+export const BOOKKEEPER_ACCESS_SUMMARY =
+  'Sees money in (by type), money out, receipts and maintenance costs. Can add expenses. Never sees tenants or leases.'
 
 // ── INVITATIONS & PLATFORM EVENTS ──────────────────────────
 // The platform-wide audit trail. Every meaningful state change
@@ -5977,6 +5993,29 @@ export function chargeLabel(entryDescription?: string | null, notes?: string | n
 
 export const DISBURSEMENT_STATUSES = ['pending', 'processing', 'settled', 'failed'] as const
 export type DisbursementStatus = typeof DISBURSEMENT_STATUSES[number]
+// 10/11: the words for a payout's state, for the shared Payouts page (owner and
+// bookkeeper alike). A payout Stripe is still moving is money on its way.
+export const DISBURSEMENT_STATUS_LABEL: Record<DisbursementStatus, string> = {
+  pending:    'Pending',
+  processing: 'On its way',
+  settled:    'Settled',
+  failed:     'Failed',
+}
+
+// 10/11: what GAM charged a company. Mirrors landlord_gam_charges_kind_check.
+// manual_payment_fee is history only (cash and check are free since S654) but
+// old rows still carry it, so it keeps a name.
+export const LANDLORD_GAM_CHARGE_KINDS = [
+  'subscription', 'manual_payment_fee', 'bank_debit_cost', 'device_installment', 'screening_fee',
+] as const
+export type LandlordGamChargeKind = typeof LANDLORD_GAM_CHARGE_KINDS[number]
+export const LANDLORD_GAM_CHARGE_KIND_LABEL: Record<LandlordGamChargeKind, string> = {
+  subscription:       'Platform fee',
+  manual_payment_fee: 'Cash or check fee (no longer charged)',
+  bank_debit_cost:    'Bank transfer cost',
+  device_installment: 'Card reader installment',
+  screening_fee:      'Background check',
+}
 
 // trigger_type is nullable in DB; null = legacy row pre-S64.
 // 'otp_legacy' is reserved for the pre-16a OTP cycle and isn't actively

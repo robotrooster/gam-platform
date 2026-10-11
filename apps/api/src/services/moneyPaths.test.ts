@@ -580,7 +580,7 @@ describe('the bank', () => {
 // ─── Credit that pays a whole bill by itself ───────────────────────────────
 
 describe('the whole-bill rule', () => {
-  it('whole-bill bill run: money paid ahead that covers the whole bill pays it at the 7 AM run (Todd); less than the bill pays nothing (MH 25)', async () => {
+  it('whole-bill bill run: money paid ahead that covers the whole bill pays it at the 7 AM run (Todd); 10/6: less than the bill goes on it in part (MH 25)', async () => {
     const todd = await household({ name: 'Todd Ahead' })
     const ll = { userId: todd.landlordUserId, landlordId: todd.landlordId, propertyId: todd.propertyId }
     const mh25 = await household({ landlord: ll, name: 'Mae Ten' })
@@ -597,7 +597,8 @@ describe('the whole-bill rule', () => {
     expect(t.status).toBe('settled')
     expect((await usesOn([t.id])).map(u => [u.status, u.source, u.amount])).toEqual([['applied', 'whole_bill', 460]])
     expect(m.status).toBe('pending')
-    expect(await usesOn([m.id])).toEqual([])
+    // 10/6 (Nic): "a credit against the entire balance" — $10 on the $460 rent, $450 still owed.
+    expect((await usesOn([m.id])).map(u => [u.status, u.source, u.amount])).toEqual([['applied', 'whole_bill', 10]])
     // Money the landlord already holds: no payout for Todd's month.
     expect(await ownerShare([t.id])).toBe(0)
     await invariantsHold('whole-bill bill run')

@@ -144,15 +144,18 @@ describe('S655: late fees and account credit', () => {
     Number((await db.query<{ r: string }>(`SELECT amount_remaining::text AS r FROM lease_prepaid_credits WHERE id = $1`, [creditId])).rows[0].r)
   const statusOf = async (id: string) => (await db.query<{ status: string }>(`SELECT status FROM payments WHERE id = $1`, [id])).rows[0].status
 
-  it('saved credit smaller than the bill does not stop a late fee', async () => {
+  it('money paid ahead smaller than the bill goes on it (10/6), and the rest still owed still takes the late fee', async () => {
     const f = await seedRetroLease('grace_end', { grace: 3, accrual: 5, initial: 25, daysOverdue: 10, withTenant: true })
     const credit = await paidAhead(f, 10)
     await generateLateFeesForTimezone(TZ)
     const fees = await lateFeeRows(f.invoiceId)
     expect(fees.reduce((s, r) => s + Number(r.amount), 0)).toBe(60)
-    // The $10 is still there for the tenant to use or save; nothing was spent.
-    expect(await left(credit)).toBe(10)
+    // 10/6 (Nic): "a credit against the entire balance" — the $10 is on the
+    // rent (nothing settled, the row never cut in two); the rest is still owed.
+    expect(await left(credit)).toBe(0)
     expect(await statusOf(f.rentId)).toBe('pending')
+    expect((await db.query<{ a: number }>(
+      `SELECT SUM(amount)::float AS a FROM credit_uses WHERE payment_id = $1 AND status = 'applied'`, [f.rentId])).rows[0].a).toBe(10)
     expect(sendPaymentReceipt).not.toHaveBeenCalled()
   })
 

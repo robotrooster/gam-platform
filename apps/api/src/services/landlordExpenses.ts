@@ -79,10 +79,15 @@ export async function createLandlordExpense(input: CreateExpenseInput, client?: 
  * company, choose which" — correct when creating an expense, a 400 that blanks
  * the Expenses tab when merely opening it.
  */
-export async function listLandlordExpenses(landlordId: string | string[], opts: { from?: string; to?: string; propertyId?: string; unitId?: string } = {}) {
+export async function listLandlordExpenses(landlordId: string | string[], opts: {
+  from?: string; to?: string; propertyId?: string; unitId?: string
+  /** 10/11: a bookkeeper kept to some properties reads only theirs (null = all). */
+  propertyIds?: string[] | null
+} = {}) {
   const ids = Array.isArray(landlordId) ? landlordId : [landlordId]
   const conds = ['e.landlord_id = ANY($1::uuid[])', `e.status = 'active'`]
   const params: any[] = [ids]
+  if (opts.propertyIds) { params.push(opts.propertyIds); conds.push(`e.property_id = ANY($${params.length}::uuid[])`) }
   if (opts.from) { params.push(opts.from); conds.push(`e.expense_date >= $${params.length}`) }
   if (opts.to)   { params.push(opts.to);   conds.push(`e.expense_date <= $${params.length}`) }
   if (opts.propertyId) { params.push(opts.propertyId); conds.push(`e.property_id = $${params.length}`) }
@@ -91,6 +96,9 @@ export async function listLandlordExpenses(landlordId: string | string[], opts: 
     `SELECT e.id, e.category, e.amount::float AS amount, e.description, e.vendor, e.expense_date,
             e.is_common, e.allocate_per_unit, e.unit_id, e.property_id,
             e.receipt_url, e.receipt_name, e.receipt_mime, e.receipt_size,
+            e.utility_type, e.created_by, e.landlord_id, to_char(e.expense_date, 'YYYY-MM-DD') AS expense_day,
+            -- 10/11: an expense the bank feed filed keeps the bank's amount and day.
+            EXISTS (SELECT 1 FROM bank_transactions bt WHERE bt.expense_id = e.id) AS from_bank,
             u.unit_number, p.name AS property_name
        FROM landlord_expenses e
        LEFT JOIN units u ON u.id = e.unit_id
@@ -115,6 +123,74 @@ export async function attachExpenseReceipt(
     [id, landlordId, receipt.url, receipt.name, receipt.mime, receipt.size])
   if (!row) throw new AppError(404, 'Expense not found')
   return row
+}
+
+export interface UpdateExpenseInput {
+  category?: string
+  amount?: number
+  description?: string | null
+  vendor?: string | null
+  expenseDate?: string
+  utilityType?: string | null
+  /** Re-file it: on a unit, or on the property (common). Omitted = where it is. */
+  unitId?: string | null
+  propertyId?: string | null
+}
+
+/**
+ * 10/11 (Nic): edit an expense — an owner any of their company's, a
+ * bookkeeper the ones they entered (the route decides who may). Scoped by
+ * company like every other write here. The same placement rules as create: on
+ * a unit (its property follows) or on a property (common, split per unit).
+ * An expense the bank feed filed keeps the bank's amount and day — changing
+ * them would leave the bank row saying one thing and the P&L another.
+ */
+export async function updateLandlordExpense(id: string, landlordId: string, patch: UpdateExpenseInput) {
+  const cur = await queryOne<any>(
+    `SELECT e.*, to_char(e.expense_date, 'YYYY-MM-DD') AS expense_day,
+            EXISTS (SELECT 1 FROM bank_transactions bt WHERE bt.expense_id = e.id) AS from_bank
+       FROM landlord_expenses e WHERE e.id = $1 AND e.landlord_id = $2 AND e.status = 'active'`, [id, landlordId])
+  if (!cur) throw new AppError(404, 'Expense not found')
+  const category = patch.category ?? cur.category
+  if (!(EXPENSE_CATEGORIES as readonly string[]).includes(category)) {
+    throw new AppError(400, `Invalid expense category '${category}'`)
+  }
+  const amount = patch.amount ?? Number(cur.amount)
+  const expenseDate = patch.expenseDate ?? cur.expense_day
+  if (cur.from_bank) {
+    const sameAmount = Math.abs(amount - Number(cur.amount)) < 0.005
+    if (!sameAmount || expenseDate !== cur.expense_day) {
+      throw new AppError(409, 'This expense came from your bank feed, so its amount and date come from the bank.')
+    }
+  }
+  let unitId: string | null = cur.unit_id
+  let propertyId: string | null = cur.property_id
+  if (patch.unitId !== undefined || patch.propertyId !== undefined) {
+    unitId = patch.unitId ?? null
+    propertyId = patch.propertyId ?? null
+    if (unitId) {
+      const u = await queryOne<any>('SELECT property_id, landlord_id FROM units WHERE id=$1', [unitId])
+      if (!u || u.landlord_id !== landlordId) throw new AppError(400, 'Unit does not belong to you')
+      propertyId = u.property_id
+    } else if (propertyId) {
+      const p = await queryOne<any>('SELECT landlord_id FROM properties WHERE id=$1', [propertyId])
+      if (!p || p.landlord_id !== landlordId) throw new AppError(400, 'Property does not belong to you')
+    }
+  }
+  const isCommon = !unitId && !!propertyId
+  const utilityType = category === 'utilities'
+    ? (patch.utilityType !== undefined ? patch.utilityType : cur.utility_type)
+    : null
+  return queryOne<any>(
+    `UPDATE landlord_expenses
+        SET category=$3, amount=$4, description=$5, vendor=$6, expense_date=$7,
+            unit_id=$8, property_id=$9, is_common=$10, allocate_per_unit=$10, utility_type=$11, updated_at=NOW()
+      WHERE id=$1 AND landlord_id=$2 AND status='active'
+      RETURNING *`,
+    [id, landlordId, category, amount.toFixed(2),
+     patch.description !== undefined ? patch.description : cur.description,
+     patch.vendor !== undefined ? patch.vendor : cur.vendor,
+     expenseDate, unitId, propertyId, isCommon, utilityType])
 }
 
 export async function voidLandlordExpense(id: string, landlordId: string) {

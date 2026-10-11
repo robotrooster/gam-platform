@@ -83,7 +83,13 @@ import { RentRollPage }    from './pages/RentRollPage'
 import { UtilityMetersPage } from './pages/UtilityMetersPage'
 import { DisbursementsPage } from './pages/DisbursementsPage'
 import { LotRentPage } from './pages/LotRentPage'
-import { ExpensesPage } from './pages/ExpensesPage'
+// 10/11 (Nic): the shared financial pages — the same files in GAM Books
+// (src/financials, financials-parity.test.ts).
+import { ExpensesPage } from './financials/ExpensesPage'
+import { IncomePage } from './financials/IncomePage'
+import { MaintenanceCostsPage } from './financials/MaintenanceCostsPage'
+import { BankActivityPage } from './financials/BankActivityPage'
+import { PayoutsPage } from './financials/PayoutsPage'
 import { MyManagersPage } from './pages/MyManagersPage'
 import { BankPage } from './pages/BankPage'
 import { BankingPage }      from './pages/BankingPage'
@@ -94,7 +100,7 @@ import { OnboardingPage }  from './pages/OnboardingPage'
 import { TenantOnboardingPage } from './pages/TenantOnboardingPage'
 import { PropertyOnboardingPage } from './pages/PropertyOnboardingPage'
 import { PaymentHistoryOnboardingPage } from './pages/PaymentHistoryOnboardingPage'
-import { ReportsPage } from './pages/ReportsPage'
+import { ReportsPage } from './financials/ReportsPage'
 import { ESignPage } from './pages/ESignPage'
 import { BackgroundChecksPage } from './pages/BackgroundChecksPage'
 import { SignPage } from './pages/SignPage'
@@ -160,7 +166,8 @@ function RoleRedirect() {
   // same visibility rule as the sidebar (was: hardcoded /pos, which dumped a
   // front-desk user with no POS access on an empty register). Zero grants →
   // /welcome explains what's missing.
-  if (user.role === 'onsite_manager' || user.role === 'maintenance' || user.role === 'property_manager') {
+  // 10/11: a bookkeeper lands on the financial pages (Money in first).
+  if (user.role === 'onsite_manager' || user.role === 'maintenance' || user.role === 'property_manager' || user.role === 'bookkeeper') {
     const first = visibleNavItemsFor(user)[0]
     return <Navigate to={first ? first.to : '/welcome'} replace />
   }
@@ -300,8 +307,12 @@ function App() {
                 <Route path="balances"       element={<BalancesPage />} />
                 <Route path="rent-roll"      element={<RentRollPage />} />
                 <Route path="disbursements"  element={<DisbursementsPage />} />
+                <Route path="income"         element={<IncomePage />} />
                 <Route path="reports"        element={<ReportsPage />} />
                 <Route path="expenses"       element={<ExpensesPage />} />
+                <Route path="maintenance-costs" element={<MaintenanceCostsPage />} />
+                <Route path="bank-activity"  element={<BankActivityPage />} />
+                <Route path="payouts"        element={<PayoutsPage />} />
                 <Route path="my-managers"    element={<MyManagersPage />} />
                 {/* S605: one Bank tab. The old paths redirect so existing
                     links and bookmarks don't 404. */}

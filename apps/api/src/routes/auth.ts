@@ -81,9 +81,18 @@ async function getScopeForUser(userId: string, role: string):
   }
   if (role === 'bookkeeper') {
     const r = await queryOne<any>(
-      `SELECT landlord_id, access_level FROM bookkeeper_scopes WHERE user_id = $1 LIMIT 1`,
+      // 10/11: oldest assignment first, so the company on the pass is the same
+      // one requireAuth falls back to (middleware/auth bookkeeperScopeFor).
+      `SELECT landlord_id, access_level, property_ids FROM bookkeeper_scopes
+        WHERE user_id = $1 ORDER BY created_at, id LIMIT 1`,
       [userId])
-    return r ? { landlordId: r.landlord_id, permissions: { access_level: r.access_level } } : null
+    // property_ids NULL = the whole company (allProperties); else only these.
+    return r ? {
+      landlordId: r.landlord_id,
+      permissions: { access_level: r.access_level },
+      propertyIds: r.property_ids ?? [],
+      allProperties: r.property_ids == null,
+    } : null
   }
   return null
 }

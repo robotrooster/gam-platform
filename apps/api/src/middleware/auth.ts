@@ -4,6 +4,10 @@ import { UserRole, LandlordAssignableRole } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { AppError } from './errorHandler'
 import { isPosLimitedRequestAllowed } from '../lib/posLock'
+import {
+  isBookkeeperRequestAllowed, bookkeeperResponseIsScrubbed, scrubPersonFields,
+  BOOKKEEPER_REFUSAL, BOOKKEEPER_GRANTED_PERMS,
+} from '../lib/bookkeeperAccess'
 
 export interface AuthPayload {
   userId:      string
@@ -39,6 +43,11 @@ export interface AuthPayload {
   // requireAuth constrains such sessions to the register surface (see
   // isPosLimitedRequestAllowed). Absent/false on every normal session.
   posLimited?: boolean
+  // 10/11 (Nic): a bookkeeper's properties within their company, read fresh
+  // from bookkeeper_scopes by requireAuth on every request. null = every
+  // property the company owns; [] = no scope row (sees nothing). Absent on
+  // every other role. See lib/bookkeeperAccess.ts.
+  bookkeeperPropertyIds?: string[] | null
   // S655: 'fixed' — ends SESSION_TTL_SECONDS after sign-in, never extended;
   // 'rolling' — renewed while in use. Absent on a pass minted before S655 (read
   // through policyOfPass in lib/sessionToken.ts). Type only: requireAuth does
@@ -97,6 +106,36 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       }
     }
     req.user = payload
+    // 10/11 (Nic): a bookkeeper sees money in, money out, receipts and
+    // maintenance costs — nothing else. Deny by default, the cashier's rule
+    // (lib/bookkeeperAccess.ts), then pin the request to their company and
+    // properties as the scope table says NOW (a revoke or a narrowed scope
+    // takes effect on the next request, not at the next sign-in).
+    if (payload.role === 'bookkeeper') {
+      if (!isBookkeeperRequestAllowed(req.method, req.originalUrl)) {
+        return res.status(403).json({ success: false, error: BOOKKEEPER_REFUSAL })
+      }
+      const scoped = await bookkeeperScopeFor(payload, req.headers['x-client-id'])
+      // Their own sign-in, and the list of clients they keep, answer even when
+      // Books remembers a company they no longer keep: the client list is how
+      // they pick again, so refusing it would strand them with no switcher.
+      const path = (req.originalUrl || '').split('?')[0]
+      const pickAgain = /^\/api\/auth(\/|$)/.test(path) || /^\/api\/books\/bookkeeper\/clients\/?$/.test(path)
+      if (scoped === 'not_theirs' && !pickAgain) {
+        return res.status(403).json({ success: false, error: 'You are not assigned to that company\'s books.' })
+      }
+      const row = scoped === 'not_theirs' ? null : scoped
+      req.user = {
+        ...payload,
+        landlordId: row?.landlord_id ?? null,
+        bookkeeperPropertyIds: row ? (row.property_ids ?? null) : [],
+      }
+      if (bookkeeperResponseIsScrubbed(req.originalUrl)) {
+        const send = res.json.bind(res)
+        res.json = (body: any) => send(scrubPersonFields(body))
+      }
+      return next()
+    }
     // S629 (CRITICAL) — ENTITY MEMBERSHIP IS REFRESHED FROM THE DATABASE.
     //
     // `landlordIds` is minted at login and then frozen for the life of the
@@ -139,6 +178,26 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   } catch {
     return res.status(401).json({ success: false, error: 'Invalid or expired token' })
   }
+}
+
+/**
+ * 10/11: the bookkeeper_scopes row a bookkeeper's request acts under.
+ *
+ * GAM Books names the company with X-Client-Id (a bookkeeper may keep more
+ * than one client's books there); a header naming a company they do not keep
+ * is 'not_theirs'. With no header: the company on their pass, else their
+ * oldest assignment. null = no assignment at all (they see nothing).
+ */
+async function bookkeeperScopeFor(
+  payload: AuthPayload,
+  header: string | string[] | undefined,
+): Promise<{ landlord_id: string; property_ids: string[] | null } | null | 'not_theirs'> {
+  const named = Array.isArray(header) ? header[0] : header
+  const rows = await query<{ landlord_id: string; property_ids: string[] | null }>(
+    `SELECT landlord_id, property_ids FROM bookkeeper_scopes
+      WHERE user_id = $1 ORDER BY created_at, id`, [payload.userId])
+  if (named) return rows.find(r => r.landlord_id === named) ?? 'not_theirs'
+  return rows.find(r => r.landlord_id === payload.landlordId) ?? rows[0] ?? null
 }
 
 /**
@@ -298,6 +357,13 @@ export async function assertPropertyInScope(
 ): Promise<void> {
   if (!user) throw new AppError(401, 'Unauthenticated')
   if (OWNER_ROLES.includes(user.role)) return
+  if (user.role === 'bookkeeper') {
+    const ids = await bookkeeperPropertyIdsOf(user)
+    if (ids === null) return
+    if (!propertyId) throw new AppError(400, 'A property must be selected for this action')
+    if (!ids.includes(propertyId)) throw new AppError(403, 'You are not assigned to this property')
+    return
+  }
   const table = WORKER_SCOPE_TABLE[user.role]
   if (!table) throw new AppError(403, 'Not authorized for property-scoped actions')
   const rows = await query<{ property_ids: string[]; all_properties: boolean }>(
@@ -322,6 +388,10 @@ export async function getScopedPropertyIds(
 ): Promise<string[] | null> {
   if (!user) throw new AppError(401, 'Unauthenticated')
   if (OWNER_ROLES.includes(user.role)) return null
+  // 10/11: a bookkeeper narrowed to some of the company's properties reads
+  // those properties' money only — every report that already honors this
+  // (S655 audience isolation) narrows for them with no change of its own.
+  if (user.role === 'bookkeeper') return bookkeeperPropertyIdsOf(user)
   const table = WORKER_SCOPE_TABLE[user.role]
   if (!table) return null
   const rows = await query<{ property_ids: string[] | null; all_properties: boolean }>(
@@ -332,6 +402,20 @@ export async function getScopedPropertyIds(
   if (!row) return []
   if (row.all_properties) return null
   return row.property_ids || []
+}
+
+/**
+ * 10/11: a bookkeeper's properties. requireAuth puts them on the request; a
+ * caller holding a bare pass (a job, a test) reads the scope row instead.
+ * null = the whole company; [] = no assignment.
+ */
+export async function bookkeeperPropertyIdsOf(user: AuthPayload): Promise<string[] | null> {
+  if (user.bookkeeperPropertyIds !== undefined) return user.bookkeeperPropertyIds
+  const row = await queryOne<{ property_ids: string[] | null }>(
+    `SELECT property_ids FROM bookkeeper_scopes
+      WHERE user_id = $1 AND ($2::uuid IS NULL OR landlord_id = $2::uuid)
+      ORDER BY created_at, id LIMIT 1`, [user.userId, user.landlordId ?? null])
+  return row ? (row.property_ids ?? null) : []
 }
 
 // requirePerm — gate a worker route by sub-permission key. Owner roles
@@ -354,6 +438,7 @@ export async function getScopedPropertyIds(
 export function userHasPerm(user: Request['user'], ...keys: string[]): boolean {
   if (!user) return false
   if (OWNER_ROLES.includes(user.role)) return true
+  if (user.role === 'bookkeeper') return keys.some(k => BOOKKEEPER_GRANTED_PERMS.has(k))
   const perms = user.permissions || {}
   return keys.some(k => perms[k] === true)
 }
@@ -362,6 +447,9 @@ export function requirePerm(...keys: string[]) {
   return (req: Request, res: Response, next: NextFunction) => {
     if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
     if (OWNER_ROLES.includes(req.user.role)) return next()
+    // 10/11: a bookkeeper holds a fixed set (lib/bookkeeperAccess); requireAuth
+    // has already kept them to the routes those keys may open.
+    if (req.user.role === 'bookkeeper' && keys.some(k => BOOKKEEPER_GRANTED_PERMS.has(k))) return next()
     const perms = req.user.permissions || {}
     for (const k of keys) if (perms[k] === true) return next()
     return res.status(403).json({ success: false, error: 'Insufficient permissions' })

@@ -718,7 +718,7 @@ export async function syncLeaseWithBookingDates(bookingId: string): Promise<void
       if (ownRepricedPull.length > 0) bits.push(`the bank payment GAM was going to try again for that rent was canceled, because it would have pulled the old amount; they have been asked to pay ${money2(sumOwed(ownRepricedPull))} now (${owedLines(ownRepricedPull)})`)
       if (longer.creditTakenBack > 0) bits.push(`${money2(longer.creditTakenBack)} of money paid ahead from when the stay was shortened was taken back, because those days are part of the stay again`)
       if (longer.billed.length > 0) bits.push(`${money2(longerBilledTotal)} more rent is billed for the longer stay (${longerLines}) and they have been asked to pay it`)
-      if (creditInUseTotal > 0) bits.push(`${money2(creditInUseTotal)} of that is stay-shortened credit that could not be taken back because part of it was already used; they keep the ${money2(round2(longer.creditInUse.reduce((s, c) => s + c.left, 0)))} still unused to pay with, and GAM has been told`)
+      if (creditInUseTotal > 0) bits.push(`${money2(creditInUseTotal)} of that is stay-shortened credit that could not be taken back because part of it was already used; the ${money2(round2(longer.creditInUse.reduce((s, c) => s + c.left, 0)))} still unused goes toward it (10/6: money paid ahead goes on the bill by itself), and GAM has been told`)
       if (longer.notBilled.length > 0) bits.push(`${money2(round2(longer.notBilled.reduce((s, n) => s + n.amount, 0)))} of rent the new dates add could not be billed (${longer.notBilled.map(n => monthName(n.dueDate)).join(', ')}); GAM has been told and will sort it out with you`)
       if (startMoved) bits.push(`the signed lease still starts ${lease.start_date} — amend the document if the ${lease.check_in} arrival is right`)
       await createNotification({
@@ -849,7 +849,8 @@ async function notifyLongerStay(a: {
       if (inUse > 0) {
         const left = round2(a.result.creditInUse.reduce((s, c) => s + c.left, 0))
         parts.push(`${money2(inUse)} of it is the credit from when your stay was shortened: part of that credit was already used, so it could not simply be taken back.`
-          + (left > 0 ? ` The ${money2(left)} of it you still have can go toward this bill.` : ''))
+          // 10/6 (Nic): money paid ahead goes on the bill by itself, whole or in part.
+          + (left > 0 ? ` The ${money2(left)} of it you still have goes toward this bill.` : ''))
       }
       parts.push('Please pay it with a bank account or a card.')
     }

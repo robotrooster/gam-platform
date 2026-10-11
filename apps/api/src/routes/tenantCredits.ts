@@ -112,18 +112,25 @@ tenantCreditsRouter.post('/', async (req, res, next) => {
     // nothing charged and no "$0 beside an open bill". Never throws: the
     // credit is already saved; a failure here only leaves the bill open.
     const wb = await runWholeBillCheckAfterCommit({ tenantId: lease.tenant_id, landlordId: lease.landlord_id })
-    const paidCents = wb ? wb.leases.reduce((s, l) => s + cents(l.creditUsed), 0) : 0
-    const paidBill = wb && wb.settledIds.length > 0
-      ? { charges: wb.settledIds.length, creditUsed: paidCents / 100 }
+    // Review fix (10/6): only a bill the whole-bill rule settled is "paid by the
+    // credit". Money they paid ahead going on the balance (the 10/6 draw, whole
+    // or in part) is its own figure, never counted as this credit.
+    const wholeBill = wb ? wb.leases.filter(l => l.kind === 'whole_bill' && l.settledIds.length > 0) : []
+    const paidCents = wholeBill.reduce((s, l) => s + cents(l.creditUsed), 0)
+    const paidBill = wholeBill.length > 0
+      ? { charges: wholeBill.reduce((n, l) => n + l.settledIds.length, 0), creditUsed: paidCents / 100 }
       : null
+    const paidAheadCents = wb ? wb.leases.filter(l => l.kind === 'paid_ahead_draw').reduce((s, l) => s + cents(l.creditUsed), 0) : 0
 
     const row = await queryOne<any>(
       `SELECT id, amount_original, amount_remaining, category, reason, status, created_at
          FROM tenant_credits WHERE id = $1`, [creditId])
     const credit = await householdCredit(lease.tenant_id, lease.landlord_id)
-    const message = paidBill
+    const aheadSaid = paidAheadCents > 0 ? ` Money they paid ahead also went on their balance (${money(paidAheadCents / 100)}).` : ''
+    const message = (paidBill
       ? `The credit paid the tenant's whole open bill (${money(paidBill.creditUsed)}). ${money(credit.onAccount)} of credit is left on their account.`
-      : `The credit is on the tenant's account: ${money(credit.onAccount)} in all. It pays a bill by itself only when it covers the whole bill; until then the tenant can use it when they pay.`
+      : `The credit is on the tenant's account: ${money(credit.onAccount)} in all. It pays a bill by itself only when it covers the whole bill; until then the tenant can use it when they pay.`)
+      + aheadSaid
 
     res.status(201).json({
       success: true,

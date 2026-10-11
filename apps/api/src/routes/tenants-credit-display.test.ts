@@ -222,7 +222,7 @@ describe('PATCH /api/leases/:id/prepaid-draw', () => {
     expect(res.body.data.creditAvailable).toBe(0)            // nothing left owing for it to pay
   })
 
-  it('a lower cap settles nothing and says what the credit would pay now', async () => {
+  it('10/6: a lower cap puts that month\'s draw on the bill — part of it, nothing settled', async () => {
     const h = await household()
     await db.query(`INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by)
                     VALUES ($1,$2,2000,2000,'landlord')`, [h.leaseId, h.tenantId])
@@ -230,9 +230,11 @@ describe('PATCH /api/leases/:id/prepaid-draw', () => {
     const res = await setDraw(h, 150)
     expect(res.status).toBe(200)
     expect(res.body.data.paidByCredit).toBe(0)
-    expect(res.body.data.creditAvailable).toBe(150)
-    const row = await db.query(`SELECT status FROM payments WHERE id = $1`, [h.rent])
-    expect(row.rows[0].status).toBe('pending')
+    expect(res.body.data.creditAvailable).toBe(0)
+    const row = await db.query(`SELECT status, issued_credit_amount::float AS i,
+      (SELECT SUM(amount)::float FROM credit_uses WHERE payment_id = payments.id AND status = 'applied') AS on_it
+      FROM payments WHERE id = $1`, [h.rent])
+    expect(row.rows[0]).toMatchObject({ status: 'pending', on_it: 150 })
   })
 
   it('a front desk locked to one property cannot change the monthly draw of a lease at another, and nothing is settled', async () => {
@@ -268,15 +270,17 @@ describe('PATCH /api/leases/:id/prepaid-draw', () => {
     expect(res.body.data.monthlyDraw).toBe(150)
   })
 
-  it('a raised cap that still does not cover the whole bill settles nothing (credit never pays part of a bill by itself)', async () => {
+  it('10/6: a raised cap that still does not cover the whole bill puts that much on it — nothing settled, never split', async () => {
     const h = await household()
     await db.query(`INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by)
                     VALUES ($1,$2,2000,2000,'landlord')`, [h.leaseId, h.tenantId])
     await db.query(`UPDATE leases SET prepaid_monthly_draw = 100 WHERE id = $1`, [h.leaseId])
     const res = await setDraw(h, 400)
     expect(res.body.data.paidByCredit).toBe(0)
-    expect(res.body.data.creditAvailable).toBe(400)
-    const row = await db.query(`SELECT status FROM payments WHERE id = $1`, [h.rent])
-    expect(row.rows[0].status).toBe('pending')
+    expect(res.body.data.creditAvailable).toBe(0)
+    const row = await db.query(`SELECT status, amount::float AS amount,
+      (SELECT SUM(amount)::float FROM credit_uses WHERE payment_id = payments.id AND status = 'applied') AS on_it
+      FROM payments WHERE id = $1`, [h.rent])
+    expect(row.rows[0]).toEqual({ status: 'pending', amount: 589, on_it: 400 })
   })
 })

@@ -125,6 +125,17 @@ describe('account credit on the Payments page', () => {
     expect(text()).not.toContain('$485.45')
   })
 
+  it('10/6 (Nic): credit already on the bill reads as one balance — charges, credit applied, still owed (Marc: $17.64)', async () => {
+    server.balance = { totalOutstanding: 17.64, paymentBlocked: false, rows: [], leases: [lease({
+      outstanding: 300, requiredNow: 17.64, usableCredit: 0, creditOnFile: 0, payIfUsed: 17.64, payIfSaved: 17.64,
+      methodCosts: [{ method: 'ach', label: 'Bank account', fee: 6, total: 23.64 }],
+    })] }
+    await render()
+    await until(() => text().includes('Outstanding balance'), 'the balance card')
+    expect(text()).toContain('Charges$300.00Credit applied−$282.36Still owed$17.64')
+    expect(text()).not.toMatch(/covered by|collected by the landlord/i)
+  })
+
   it('Pay opens the credit question on that lease (the modal reads the live bill)', async () => {
     server.balance = { totalOutstanding: 935.45, paymentBlocked: false, rows: [], leases: [lease()] }
     await render()
@@ -157,7 +168,8 @@ describe('account credit on the Payments page', () => {
     await render()
     await until(() => text().includes('Account credit'), 'the credit card')
     expect(text()).toContain('$60.10')
-    expect(text()).toContain('Use it when you pay. It is applied by itself only when it covers a whole bill.')
+    // 10/6 (Nic): money paid ahead goes on the balance by itself, whole or in part.
+    expect(text()).toContain('Money you paid ahead goes on your bill by itself, oldest bill first. Other credit you can use when you pay; it is applied by itself only when it covers a whole bill.')
     expect(text()).toContain('Statutory interest on your deposit$12.50')
     expect(text()).toContain('Paid ahead$37.60')
     expect(text()).toContain('Credit from your landlord$10.00')

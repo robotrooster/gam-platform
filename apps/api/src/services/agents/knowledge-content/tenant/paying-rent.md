@@ -46,9 +46,9 @@ Open your payments screen and choose **Pay now**. Pick your saved bank account o
 
 ## If you have credit on your account
 
-Your bill always shows in full. If you have credit — money you paid ahead, or a credit from your landlord — you'll see "You have $X credit available" beside it, and two buttons: **Use all $X** (your credit comes off and you pay the rest) or **Save it for later** (you pay the whole bill and keep the credit). If your credit covers everything, you'll see **Pay with credit**, and nothing is charged. If your credit changed since the screen loaded, you'll be shown the new figure and asked again.
+Money you paid ahead goes on your balance by itself, oldest bill first — part of a line when it can't cover all of it — so your bill shows the charges, "Credit applied", and what is still owed. If you have other credit — a credit from your landlord — you'll see "You have $X credit available" beside it, and two buttons: **Use all $X** (your credit comes off and you pay the rest) or **Save it for later** (you pay the whole bill and keep the credit). If your credit covers everything, you'll see **Pay with credit**, and nothing is charged. If your credit changed since the screen loaded, you'll be shown the new figure and asked again.
 
-Credit pays a bill by itself only when it covers the whole bill. Your bill email says the same thing: the full amount, with your available credit beside it.
+Other credit pays a bill by itself only when it covers the whole bill. Your bill email says the same thing: each charge, any credit already applied, and what is still owed, with your available credit beside it.
 
 A note on roles: GAM is the platform that moves your payment — it is not your landlord and does not set your rent. The rent amount, due date, and any late fees come from your lease with your landlord.
 

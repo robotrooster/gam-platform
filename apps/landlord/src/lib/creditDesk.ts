@@ -17,7 +17,7 @@
  * Record click, in the same words the server would refuse with.
  */
 import {
-  ACH_RETURN_CONFIG, PAYMENT_REVERSAL_TYPE_VALUES, PAYMENT_STATUS_LABEL, MANUAL_PAYMENT_METHOD_WORD,
+  ACH_RETURN_CONFIG, PAYMENT_REVERSAL_TYPE_VALUES, PAYMENT_STATUS_LABEL, MANUAL_PAYMENT_METHOD_WORD, placePartPayment, paidAheadGoesOn,
   bankReceiptPhotoProblem, DEPOSIT_REFERENCE_LABEL, LATE_FEE_CREDITED_LANDLORD_TEXT, LATE_FEE_DELETED_LANDLORD_TEXT, LATE_FEE_DELETED_STILL_LATE_LANDLORD_TEXT,
   type ManualPaymentMethod, type PaymentReversalType, type PaymentStatus,
 } from '@gam/shared'
@@ -711,6 +711,90 @@ export function stillOwedText(cents: number, names: string[]): string {
   return `${money(toDollars(cents))} stays owed${names.length ? ` on ${andList(names)}` : ''} — late fees still apply.`
 }
 
+/**
+ * 10/6 (Nic): "why is it talking about credit when they didn't even make a
+ * full payment to begin with? ... The landlord should never see something that
+ * stupid." On a part payment the window says exactly what WILL happen with the
+ * amount typed — what is owed, what is being paid, what stays owed, and that
+ * late fees still apply — and nothing hypothetical: no "if this pays in full",
+ * no credit. Cents in; the lines to show, in order.
+ */
+export function partPaymentLines(p: {
+  owedCents: number; payingCents: number; stillOwedCents: number; names: string[]
+  /** Money that could go on nothing left (only when no rent line can take it): the old balance first, then kept. */
+  toOldCents?: number; keptCents?: number
+  /**
+   * Of `keptCents`, what goes on the rest of what they owe by itself (money
+   * paid ahead goes on an open late fee, utility or fee right after the
+   * record). Already out of `stillOwedCents`.
+   */
+  keptOnBalanceCents?: number
+}): string[] {
+  const out = [
+    `Owed ${money(toDollars(p.owedCents))}`,
+    `Paying ${money(toDollars(p.payingCents))}`,
+    `Stays owed ${money(toDollars(p.stillOwedCents))}${p.names.length ? ` on ${andList(p.names)}` : ''} — late fees still apply.`,
+  ]
+  if ((p.toOldCents ?? 0) > 0) out.push(`${money(toDollars(p.toOldCents!))} of it goes to the old balance.`)
+  const onBalance = Math.min(p.keptCents ?? 0, p.keptOnBalanceCents ?? 0)
+  // Review fix (10/6): it is not "kept toward their next bill" when an open
+  // line here takes it — it goes on the rest of what they owe.
+  if (onBalance > 0) out.push(`${money(toDollars(onBalance))} of it goes on the rest of what they owe.`)
+  const waits = (p.keptCents ?? 0) - onBalance
+  if (waits > 0) {
+    out.push(`${money(toDollars(waits))} of it cannot go on what is left (only rent can be paid in part), so it is kept toward their next bill.`)
+  }
+  return out
+}
+
+/**
+ * Review fix (10/6, Nic: "why is it talking about credit when they didn't even
+ * make a full payment"): "Post a payment" speaks of money kept ahead only when
+ * the amount typed is more than they owe now — never before an amount is typed,
+ * never for an amount that only pays what is open. Null: nothing to say.
+ */
+export function postAheadText(typedCents: number | null | undefined, owedNow: number | null | undefined): string | null {
+  if (typedCents == null || typedCents <= 0 || owedNow == null) return null
+  const over = typedCents - toCents(owedNow)
+  if (over <= 0) return null
+  return toCents(owedNow) > 0
+    ? `They owe ${money(owedNow)} now. That is paid first; the other ${money(toDollars(over))} is kept as paid ahead and goes on their bills by itself as they come.`
+    : `They owe nothing now. The ${money(toDollars(over))} is kept as paid ahead and goes on their bills by itself as they come.`
+}
+
+/**
+ * 10/6 (Nic): a bank deposit dated back — the late fees charged after the day
+ * it was deposited come off ONLY the bills the amount typed pays in full (the
+ * server judges each bill). Said only when that will happen: nothing while no
+ * amount is typed, nothing on a bill paid only in part. Null: nothing to say.
+ */
+export function backdatedLateFeeText(
+  q: Pick<DeskQuote, 'lateFeesOffIfPaidInFull' | 'lateFeesOffByBill'> | null | undefined,
+  plan: Pick<TenderPlan, 'stop' | 'shortInvoiceIds'> | null | undefined,
+  depositedOn: string | null,
+  typedCents: number | null,
+): string | null {
+  if (!q || !plan || !depositedOn || typedCents == null || typedCents <= 0 || plan.stop !== null) return null
+  const off = toCents(q.lateFeesOffIfPaidInFull) - lateFeesBackOnShortBills(q, plan.shortInvoiceIds)
+  if (off <= 0) return null
+  return `Deposited ${dayWord(depositedOn)}, before ${money(toDollars(off))} in late fees were charged. This pays `
+    + `${plan.shortInvoiceIds.length > 0 ? 'the bill those fees are on' : 'the bill'} in full, so those late fees are credited; `
+    + 'the payment still counts as late on their history. When your bank feed shows this deposit, the bank\'s date decides.'
+}
+
+/**
+ * 10/6 (Nic): the bill as ONE balance — its charges, then the credit already
+ * applied against it, then what is still owed. Never a line marked "covered by
+ * credit". Cents.
+ */
+export function deskBillBalance(q: Pick<DeskQuote, 'currentTotal' | 'creditAlreadyApplied'>): {
+  charges: number; creditApplied: number; stillOwed: number
+} {
+  const charges = toCents(q.currentTotal)
+  const creditApplied = Math.min(charges, toCents(q.creditAlreadyApplied))
+  return { charges, creditApplied, stillOwed: charges - creditApplied }
+}
+
 export interface TenderInput {
   method: ManualPaymentMethod
   /** What was handed over, cents; null = nothing typed. */
@@ -742,6 +826,8 @@ export interface TenderPlan {
   surplusCents: number
   changeCents: number
   keptAsCreditCents: number
+  /** 10/6: of a part payment's kept money, what goes on the rest of what they owe by itself (already out of stillOwedCents). */
+  keptOnBalanceCents?: number
   creditUsedCents: number
   /** Choices the cash buttons offer: [change to hand back, old balance if kept, credit if kept]. */
   ifChange: { changeCents: number; toOldCents: number }
@@ -764,35 +850,42 @@ export interface TenderPlan {
 
 /**
  * 10/5 (Nic): a part payment, as services/manualPaymentSettle takes it — the
- * money pays the oldest bills first, each in full; a RENT bill it cannot cover
- * in full is paid in part (the rest stays owed); any other bill it cannot cover
- * is passed by and stays owed whole; money left after that (rare) is kept —
- * the old balance first, then credit.
+ * one placement both call (@gam/shared placePartPayment): the money pays the
+ * oldest bills first, each in full; a RENT bill it cannot cover in full is
+ * paid in part (the rest stays owed); any other bill it cannot cover is passed
+ * by and stays owed whole. 10/6 (Nic): money is never left over as credit
+ * while the balance is owed — the newest rent paid in full is paid last and
+ * takes what is left. Only when no rent can take it is anything kept (rare):
+ * the old balance first, then their account.
  */
 export function partialPlan(q: DeskQuote, choice: CreditChoice, tenderedC: number, nameOf?: (r: DeskQuoteRow) => string): {
-  stillOwedCents: number; names: string[]; toOldCents: number; keptCents: number; shortInvoiceIds: string[]
+  stillOwedCents: number; names: string[]; toOldCents: number; keptCents: number; keptOnBalanceCents: number; shortInvoiceIds: string[]
 } {
   const useCredit = choice === 'use' && creditChoiceNeeded(q)
-  let left = tenderedC
+  const owed = (r: DeskQuoteRow) =>
+    Math.max(0, toCents(r.amount) - toCents(r.creditAlreadyApplied) - (useCredit ? toCents(r.creditIfUsed) : 0))
+  const name = (r: DeskQuoteRow) => billName(r.dueDate, nameOf ? nameOf(r) : r.type)
+  const placed = placePartPayment(q.rows ?? [], owed, tenderedC)
   let stillOwed = 0
+  const short: DeskQuoteRow[] = []
+  for (const s of placed.partSplits) { stillOwed += s.owedOnRow - s.take; short.push(s.row) }
+  for (const r of placed.notReached) { stillOwed += owed(r); short.push(r) }
+  // Named in the bill's own order, oldest first.
+  const ordered = (q.rows ?? []).filter(r => short.includes(r))
   const names: string[] = []
   const shortInvoiceIds: string[] = []
-  const name = (r: DeskQuoteRow) => billName(r.dueDate, nameOf ? nameOf(r) : r.type)
-  for (const r of q.rows ?? []) {
-    const m = Math.max(0, toCents(r.amount) - toCents(r.creditAlreadyApplied) - (useCredit ? toCents(r.creditIfUsed) : 0))
-    if (m === 0) continue
-    if (left >= m) { left -= m; continue }
-    if (left > 0 && r.type === 'rent') {
-      stillOwed += m - left
-      left = 0
-    } else {
-      stillOwed += m
-    }
+  for (const r of ordered) {
     names.push(name(r))
     if (r.invoiceId && !shortInvoiceIds.includes(r.invoiceId)) shortInvoiceIds.push(r.invoiceId)
   }
-  const toOld = Math.min(left, oldBalanceOwedCents(q))
-  return { stillOwedCents: stillOwed, names, toOldCents: toOld, keptCents: left - toOld, shortInvoiceIds }
+  const toOld = Math.min(placed.left, oldBalanceOwedCents(q))
+  const kept = placed.left - toOld
+  // What is kept goes on an open line money paid ahead may pay, by itself
+  // (services/manualPaymentSettle leftoverOnBalance — the same figure).
+  const onBalance = Math.min(kept, placed.notReached.filter(paidAheadGoesOn).reduce((t, r) => t + owed(r), 0))
+  return {
+    stillOwedCents: stillOwed - onBalance, names, toOldCents: toOld, keptCents: kept, keptOnBalanceCents: onBalance, shortInvoiceIds,
+  }
 }
 
 /**
@@ -837,14 +930,17 @@ export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
       `They have ${money(toDollars(usableC))} of credit that can pay part of this bill. Choose Use or Save first.`)
   }
   if (tenderedC === null) return stop('amount', null)
-  if (tenderedC < owedC && !q.partialPaymentsAllowed) {
+  // 10/6 (Nic): the credit goes on the bill even when it pays only part of it
+  // and nothing is handed over — the pay-in-full rule is about their own money.
+  const creditOnlyPart = tenderedC === 0 && creditUsedC > 0 && tenderedC < owedC
+  if (tenderedC < owedC && !q.partialPaymentsAllowed && !creditOnlyPart) {
     return stop('short',
       `That is ${money(toDollars(owedC - tenderedC))} short — ${money(toDollars(tenderedC))} against ${money(toDollars(owedC))} owed. Rent is paid in full.`)
   }
   // 10/5 (Nic): the property takes part payments — "there's really no way to
   // stop somebody from going into the bank and making a partial".
   if (tenderedC < owedC) {
-    if (tenderedC === 0) return stop('amount', null)
+    if (tenderedC === 0 && !creditOnlyPart) return stop('amount', null)
     const part = partialPlan(q, input.choice, tenderedC, input.nameOf)
     if (part.keptCents > 0 && creditUsedC > 0) {
       return stop('credit_and_keep',
@@ -854,7 +950,8 @@ export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
     const creditToUse = creditToUseFor(q, input.choice, input.answeredCreditCents)
     if (creditToUse !== undefined) body.creditToUse = creditToUse
     return {
-      ...blank, toOldCents: part.toOldCents, surplusCents: part.keptCents, keptAsCreditCents: part.keptCents, body,
+      ...blank, toOldCents: part.toOldCents, surplusCents: part.keptCents, keptAsCreditCents: part.keptCents,
+      keptOnBalanceCents: part.keptOnBalanceCents, body,
       stillOwedCents: part.stillOwedCents, stillOwedText: stillOwedText(part.stillOwedCents, part.names),
       shortInvoiceIds: part.shortInvoiceIds, stillOwedNames: part.names,
     }
@@ -947,6 +1044,8 @@ export function recordedMessage(name: string, r: {
   changeGiven?: number; surplus?: number; creditId?: string | null
   /** 10/5: a part payment — what is still owed after it, and the words for where. */
   stillOwed?: number; stillOwedNames?: string[]
+  /** 10/6: what a part payment could not place, gone on the rest of what they owe. */
+  leftoverOnBalance?: number
   /** 10/5 (Nic): a bank deposit dated back — late fees charged after that day that came off. */
   depositedOn?: string | null; lateFeesUnbilled?: number; lateFeesRefunded?: number
   /** 10/6 (Nic): late fees deleted from the onboarding bill (the box), and whether a late fee left on a bill still counts late. */
@@ -957,12 +1056,21 @@ export function recordedMessage(name: string, r: {
   const parts: string[] = []
   const settled = toCents(r.amountSettled)
   const credit = toCents(r.creditUsed)
-  parts.push(settled > 0 ? `Recorded ${money(toDollars(settled))} from ${name}` : `Paid ${name}'s bill with their credit`)
+  const stillOwedC = toCents(r.stillOwed)
+  // Review fix (10/6): credit that paid only part of the bill did not "pay the bill".
+  parts.push(settled > 0 ? `Recorded ${money(toDollars(settled))} from ${name}`
+    : stillOwedC > 0 ? `Applied ${money(toDollars(credit))} of ${name}'s credit` : `Paid ${name}'s bill with their credit`)
   if (credit > 0 && settled > 0) parts.push(`${money(toDollars(credit))} of their credit used`)
   if (toCents(r.towardOldBalance) > 0) parts.push(`${money(r.towardOldBalance)} went to the old balance`)
+  const onBalanceC = Math.min(toCents(r.surplus), toCents(r.leftoverOnBalance))
   if (toCents(r.changeGiven) > 0) parts.push(`give ${money(r.changeGiven)} change`)
+  else if (toCents(r.surplus) > 0 && r.creditId && stillOwedC > 0) {
+    // 10/6 (Nic): a part payment is never said as credit while the balance is owed.
+    if (onBalanceC > 0) parts.push(`${money(toDollars(onBalanceC))} went on the rest of what they owe`)
+    if (toCents(r.surplus) > onBalanceC) parts.push(`${money(toDollars(toCents(r.surplus) - onBalanceC))} kept toward their next bill`)
+  }
   else if (toCents(r.surplus) > 0 && r.creditId) parts.push(`${money(r.surplus)} kept on their account as credit`)
-  if (toCents(r.stillOwed) > 0) return `${parts.join(' — ')} — ${stillOwedText(toCents(r.stillOwed), r.stillOwedNames ?? [])}`
+  if (stillOwedC > 0) return `${parts.join(' — ')} — ${stillOwedText(stillOwedC, r.stillOwedNames ?? [])}`
   const said = r.depositedOn ? lateFeeOutcomeText(r) : null
   const refused = lateFeeDeleteRefusalText(r.lateFeeDeleteRefusals)
   return parts.join(' — ') + '.' + (said ? ` ${said}` : '') + (refused ? ` ${refused}` : '')
@@ -1176,7 +1284,9 @@ export function tenantCreditHeadline(c: TenantCredit | null | undefined): string
 
 /** The one sentence on how credit is used, everywhere a landlord reads about it (decisions, 10/2). */
 export const CREDIT_USE_RULE =
-  'It is offered when they pay ("Use" or "Save it for later") and pays a bill by itself only when it covers that whole bill.'
+  // 10/6 (Nic): "a credit against the entire balance", not line by line.
+  'Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay all of it. '
+  + 'Credit you give them is offered when they pay ("Use" or "Save it for later") and pays a bill by itself only when it covers that whole bill.'
 
 // ─── The Payments ledger (decisions #26, #29, #35.1, #36.A) ──────────────────
 

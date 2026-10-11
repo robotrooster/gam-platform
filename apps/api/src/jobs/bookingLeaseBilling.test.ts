@@ -955,7 +955,7 @@ describe('Master Schedule → lease sync', () => {
     })
   })
 
-  it('stay-shortened credit already used when the stay gets longer: the used part is billed, GAM is told, the rest stays to pay with', async () => {
+  it('stay-shortened credit already used when the stay gets longer: the used part is billed, GAM is told, the rest goes on the bill', async () => {
     await atDate('2026-10-10', async () => {
       const s = await seedStack()
       await db.query(
@@ -980,19 +980,21 @@ describe('Master Schedule → lease sync', () => {
       // and the $520.97 it should have given back is billed as October rent.
       const credit = (await db.query<any>(
         `SELECT amount_original::float AS a, amount_remaining::float AS r, voided_at FROM lease_prepaid_credits WHERE lease_id=$1`, [s.leaseId])).rows
-      expect(credit).toEqual([{ a: 520.97, r: 480.97, voided_at: null }])
+      // 10/6 (Nic): the $480.97 still unused goes on the new rent by itself.
+      expect(credit).toEqual([{ a: 520.97, r: 0, voided_at: null }])
       const rest = (await db.query<any>(
         `SELECT id, amount::float AS a, status, is_remainder, notes FROM payments
           WHERE lease_id=$1 AND type='rent' AND due_date='2026-10-01' AND is_remainder`, [s.leaseId])).rows
       expect(rest).toHaveLength(1)
       expect(rest[0]).toMatchObject({ a: 520.97, status: 'pending', notes: 'Stay now ends January 28, 2027: the rest of October 2026' })
-      // Net, the guest owes the $40 the water took: $520.97 billed, $480.97 of credit to pay it with.
+      // Net, the guest owes the $40 the water took: $520.97 billed, $480.97 of credit applied against it.
       const c = await getClient()
       try {
         const q = await householdQuote(c, { tenantId: s.tenantId, landlordId: s.landlordId })
         const lq = q.leases.find(l => l.leaseId === s.leaseId)!
         expect(lq.requiredTotal).toBe(520.97)
-        expect(lq.usableCredit).toBe(480.97)
+        expect(lq.creditAlreadyApplied).toBe(480.97)
+        expect(lq.usableCredit).toBe(0)
       } finally { c.release() }
       // GAM is told what could not be taken back.
       const admin = (await db.query<any>(`SELECT title, body FROM admin_notifications WHERE category='stay_lengthened_credit_in_use'`)).rows
@@ -1002,9 +1004,9 @@ describe('Master Schedule → lease sync', () => {
       expect(admin[0].body).toContain('So $520.97 was billed to the guest as rent instead (the rest of October 2026 $520.97)')
       const userId = (await db.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [s.tenantId])).rows[0].user_id
       const tn = (await db.query<any>(`SELECT body FROM notifications WHERE user_id=$1 AND type='stay_lengthened_rent_billed'`, [userId])).rows
-      expect(tn[0].body).toContain('$520.97 of it is the credit from when your stay was shortened: part of that credit was already used, so it could not simply be taken back. The $480.97 of it you still have can go toward this bill.')
+      expect(tn[0].body).toContain('$520.97 of it is the credit from when your stay was shortened: part of that credit was already used, so it could not simply be taken back. The $480.97 of it you still have goes toward this bill.')
       const ll = (await db.query<any>(`SELECT body FROM notifications WHERE type='booking_lease_sync' AND landlord_id=$1 ORDER BY created_at DESC LIMIT 1`, [s.landlordId])).rows
-      expect(ll[0].body).toContain('$520.97 of that is stay-shortened credit that could not be taken back because part of it was already used; they keep the $480.97 still unused to pay with, and GAM has been told')
+      expect(ll[0].body).toContain('$520.97 of that is stay-shortened credit that could not be taken back because part of it was already used; the $480.97 still unused goes toward it (10/6: money paid ahead goes on the bill by itself), and GAM has been told')
     })
   })
 
@@ -1416,7 +1418,7 @@ describe('Master Schedule → lease sync', () => {
       .toEqual([{ source: 'whole_bill', status: 'applied', a: 40 }])
   })
 
-  it('S637: a credit too small for the rent leaves the charge whole', async () => {
+  it('S637 + 10/6: a credit too small for the rent goes against it — the charge is never cut in two', async () => {
     const s = await seedStack()
     await db.query(
       `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
@@ -1430,12 +1432,14 @@ describe('Master Schedule → lease sync', () => {
     // settled slice plus a 650 remainder — a partial payment, banned
     // platform-wide, and a settled row no money arrived for.
     //
-    // A $300 credit cannot clear $950, so the charge is left whole and the
-    // credit keeps waiting for one it can cover.
+    // 10/6 (Nic): "It needs to be a credit against the entire balance." The
+    // $300 goes on the $950 rent as a credit use — no settled slice, no
+    // remainder row; $650 of the same row is still owed.
     expect(pay.rows.find((p: any) => p.status === 'settled')).toBeFalsy()
+    expect(pay.rows.find((p: any) => p.is_remainder)).toBeFalsy()
     const credit = await db.query<any>(
       `SELECT amount_remaining::numeric AS r FROM lease_prepaid_credits WHERE lease_id=$1`, [s.leaseId])
-    expect(Number(credit.rows[0].r)).toBe(300)
+    expect(Number(credit.rows[0].r)).toBe(0)
   })
 })
 

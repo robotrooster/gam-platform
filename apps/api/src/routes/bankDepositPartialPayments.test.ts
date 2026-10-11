@@ -379,15 +379,21 @@ describe('Accept partial payments (per property, default off)', () => {
     expect((await rowsOfInvoice(oct.invoiceId)).map(r => [r.amount, r.status, r.is_remainder])).toEqual([[200, 'settled', false], [400, 'pending', true]])
   })
 
-  it('passes by a bill that cannot be paid in part and keeps what is left as credit', async () => {
+  it('10/6 (Nic): never keeps money as credit while the bill is owed — the water is paid and the rent takes the rest in part', async () => {
+    // "Why is it talking about credit when they didn't even make a full
+    // payment to begin with?" $620 against $600 rent + $50 water: the water
+    // (which cannot be paid in part) is paid, the rent takes $570 and $30 of
+    // it stays owed. Nothing becomes credit.
     const s = await stack({ partial: true })
     const b = await bill(s, [{ type: 'rent', amount: 600 }, { type: 'utility', amount: 50 }], 0)
     const res = await record(s, b.ids[0], { method: 'check', amountTendered: 620, reference: '1042' })
     expect(res.status).toBe(200)
-    expect(res.body.data).toMatchObject({ partial: true, stillOwed: 50, amountSettled: 600, surplus: 20, surplusHandling: 'credit' })
-    expect((await row(b.ids[0])).status).toBe('settled')
-    expect(await row(b.ids[1])).toMatchObject({ status: 'pending', amount: 50 })
-    expect(res.body.data.stillOwedRows).toEqual([expect.objectContaining({ id: b.ids[1], amount: 50, restOf: null })])
+    expect(res.body.data).toMatchObject({ partial: true, stillOwed: 30, amountSettled: 620, surplus: 0 })
+    expect(res.body.data.creditId).toBeNull()
+    expect(await row(b.ids[0])).toMatchObject({ status: 'settled', amount: 570 })
+    expect(await row(b.ids[1])).toMatchObject({ status: 'settled', amount: 50 })
+    expect(res.body.data.stillOwedRows).toEqual([expect.objectContaining({ amount: 30, restOf: b.ids[0] })])
+    expect((await db.query(`SELECT 1 FROM lease_prepaid_credits WHERE tenant_id = $1`, [s.tenantId])).rowCount).toBe(0)
   })
 
   it('late fees keep applying to the rest, on the whole month\'s rent as the lease says', async () => {

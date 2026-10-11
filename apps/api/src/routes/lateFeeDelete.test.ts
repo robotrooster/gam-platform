@@ -643,7 +643,9 @@ describe('B. onboarding month: deleted only when the landlord chooses', () => {
     const q = await request(app()).get(`/api/payments/post-payment/quote?tenantId=${s.tenantId}&depositedOn=${b.dueDay}`)
       .set('Authorization', `Bearer ${s.token}`)
     expect(q.status, JSON.stringify(q.body)).toBe(200)
-    expect(q.body.data).toEqual({ lateFeesOffIfPaidInFull: 25, onboardingLateFeesOff: 25, canDeleteLateFees: true, bankDepositAllowed: true })
+    // owedNow (review fix 10/6): what they owe now — $600 rent + the $25 fee — so the
+    // window speaks of money kept ahead only for an amount over it.
+    expect(q.body.data).toEqual({ lateFeesOffIfPaidInFull: 25, onboardingLateFeesOff: 25, canDeleteLateFees: true, bankDepositAllowed: true, owedNow: 625 })
     expect(await row(b.feeId!)).toMatchObject({ amount: 25, status: 'pending' })   // a look changes nothing
     const posted = await request(app()).post('/api/payments/post-payment').set('Authorization', `Bearer ${s.token}`)
       .send({ tenantId: s.tenantId, method: 'bank_deposit', amount: 600, reference: 'D-POST', receivedAt: b.dueDay, deleteOnboardingLateFees: true })

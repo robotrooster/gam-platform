@@ -186,6 +186,24 @@ function servedAsIs(c: PricedCharge): boolean {
   return (c.lease.methodCosts ?? []).length > 0 && Math.abs(c.amount - requiredOf(c.lease)) < 0.005
 }
 
+/**
+ * 10/6 (Nic): "It needs to be a credit against the entire balance." When credit
+ * is already on the bill, the balance reads as one: the charges, the credit
+ * applied, and what is still owed — never a line marked as covered by it.
+ */
+function CreditAppliedLines({ charges, owed }: { charges: number; owed: number }) {
+  const applied = Math.round((charges - owed) * 100) / 100
+  if (!(applied > 0)) return null
+  const line = { display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: '.78rem', padding: '2px 0' } as const
+  return (
+    <div style={{ marginTop: 8, maxWidth: 360 }}>
+      <div style={line}><span style={{ color: 'var(--t2)' }}>Charges</span><span className="mono">{formatCurrency(charges)}</span></div>
+      <div style={line}><span style={{ color: 'var(--t2)' }}>Credit applied</span><span className="mono" style={{ color: 'var(--green)' }}>−{formatCurrency(applied)}</span></div>
+      <div style={{ ...line, fontWeight: 700 }}><span style={{ color: 'var(--t0)' }}>Still owed</span><span className="mono">{formatCurrency(owed)}</span></div>
+    </div>
+  )
+}
+
 /** S655 (Nic, 10/2): the credit sentence beside a balance. The choice is made at Pay. */
 function CreditBeside({ usable }: { usable: number }) {
   if (!(usable > 0)) return null
@@ -603,11 +621,13 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
           {other > 0 && (
             <CreditKindRow label="Credit from your landlord" amount={other} />
           )}
-          {/* S655 (Nic, 10/2): credit is the tenant's to use or save. It pays a
-              bill by itself only when it covers the whole bill; otherwise Pay
-              asks "Use all" or "Save it for later". */}
+          {/* S655 (Nic, 10/2): other credit is the tenant's to use or save — it
+              pays a bill by itself only when it covers the whole bill. 10/6
+              (Nic): money paid ahead goes on the balance by itself, whole or in
+              part, oldest bill first. */}
           <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 8, lineHeight: 1.5 }}>
-            Use it when you pay. It is applied by itself only when it covers a whole bill.
+            {prepaid > 0 ? 'Money you paid ahead goes on your bill by itself, oldest bill first. ' : ''}
+            {interest > 0 || other > 0 ? 'Other credit you can use when you pay; it is applied by itself only when it covers a whole bill.' : ''}
           </div>
         </div>)
       })()}
@@ -669,6 +689,9 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                     isn&apos;t in this payment — you can pay it down once this one goes through.
                   </div>
                 )}
+                <CreditAppliedLines
+                  charges={Math.round(payable.reduce((t, l) => t + l.outstanding, 0) * 100) / 100}
+                  owed={Math.round(payable.reduce((t, l) => t + owedOf(l), 0) * 100) / 100} />
                 <CreditBeside usable={payableCredit} />
                 <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--bd)' }}>
                   <div style={{ fontSize: '.7rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
@@ -728,6 +751,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                   Rent is paid in full — this covers your entire balance on this lease,
                   oldest charges first.
                 </div>
+                <CreditAppliedLines charges={lg.outstanding} owed={owedOf(lg)} />
                 <CreditBeside usable={lg.usableCredit ?? 0} />
                 {/* Priced at what the Pay button names. With no credit question
                     the button names the whole balance; the bill's own figures
@@ -961,7 +985,7 @@ function RemittancesCard({ remittances, prepaidRemaining, prepaidMonthlyDraw, wa
                   or by itself only when it covers a whole bill. */}
               {prepaidMonthlyDraw
                 ? `Paid-ahead credit — up to ${formatCurrency(prepaidMonthlyDraw)} of it can go on each month's bill`
-                : 'Paid-ahead credit — use it when you pay; it is applied by itself only when it covers a whole bill'}
+                : 'Paid-ahead credit — it goes on your bill by itself, oldest bill first'}
             </div>
           </div>
         )}

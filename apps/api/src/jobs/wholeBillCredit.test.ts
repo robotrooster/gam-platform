@@ -111,7 +111,7 @@ beforeEach(async () => {
 })
 
 describe('the bill run and the whole-bill rule', () => {
-  it('bug 3: the bill run settles a whole eligible bill from credit (Todd) and nothing less (MH 25: $10 < $460)', async () => {
+  it('bug 3: the bill run settles a whole eligible bill from credit (Todd); 10/6: $10 paid ahead goes on a $460 bill by itself (MH 25)', async () => {
     const todd = await house()
     const mh25 = await house({ landlordId: todd.landlordId, userId: todd.userId })
     const toddCredit = await paidAhead(todd, 460)   // the second month of a two-month check
@@ -128,12 +128,14 @@ describe('the bill run and the whole-bill rule', () => {
     expect(await prepaidLeft(toddCredit)).toBe(0)
     expect(await usesOn(t.id)).toEqual([{ source: 'whole_bill', status: 'applied', amount: '460.00' }])
 
-    // MH 25: $10 does not cover $460, so nothing is spent and the bill is whole.
+    // MH 25 — 10/6 (Nic): "a credit against the entire balance". The $10 they
+    // paid ahead goes on the $460 bill by itself; $450 is still owed on the
+    // same row (never cut in two).
     const m = await mayRent(mh25)
     expect(m.status).toBe('pending')
     expect(Number(m.amount)).toBe(460)
-    expect(await prepaidLeft(mh25Credit)).toBe(10)
-    expect(await usesOn(m.id)).toEqual([])
+    expect(await prepaidLeft(mh25Credit)).toBe(0)
+    expect(await usesOn(m.id)).toEqual([{ source: 'whole_bill', status: 'applied', amount: '10.00' }])
   })
 
   it('older open rows on the lease are part of the whole bill', async () => {
@@ -159,14 +161,16 @@ describe('the bill run and the whole-bill rule', () => {
   })
 
   it('the bill run never touches a neighbor\'s utility, GAM rows or work-trade rows', async () => {
-    // A GAM fee on the bill: the bill never settles itself, whatever the credit.
+    // A GAM fee on the bill: credit never pays it. 10/6 (Nic): money paid
+    // ahead still goes on the landlord's lines of the balance by itself.
     const g = await house()
     const gamFee = await olderRow(g, { amount: 25, type: 'fee', owner: 'gam' })
     const gCredit = await paidAhead(g, 1000)
     await generateInvoices(NOW)
-    expect((await mayRent(g)).status).toBe('pending')
+    expect((await mayRent(g)).status).toBe('settled')
     expect(await statusOf(gamFee)).toBe('pending')
-    expect(await prepaidLeft(gCredit)).toBe(1000)
+    expect(await usesOn(gamFee)).toEqual([])
+    expect(await prepaidLeft(gCredit)).toBe(540)
 
     // A neighbor landlord's utility on this household's bill (S616): same.
     const n = await house()
@@ -178,9 +182,10 @@ describe('the bill run and the whole-bill rule', () => {
     const theirs = await olderRow(n, { amount: 40, landlordId: neighbor.landlordId, leaseId: null, invoiceId: inv })
     const nCredit = await paidAhead(n, 1000)
     await generateInvoices(NOW)
-    expect((await mayRent(n)).status).toBe('pending')
+    expect((await mayRent(n)).status).toBe('settled')
     expect(await statusOf(theirs)).toBe('pending')
-    expect(await prepaidLeft(nCredit)).toBe(1000)
+    expect(await usesOn(theirs)).toEqual([])
+    expect(await prepaidLeft(nCredit)).toBe(540)
 
     // A work-trade row is being paid by labor: not part of the bill, untouched.
     const w = await house()
@@ -242,7 +247,7 @@ describe('the bill run and the whole-bill rule', () => {
     expect(seen).toEqual(['settled'])
   })
 
-  it('a bill nobody\'s credit covers sends no receipt', async () => {
+  it('a bill nobody\'s credit covers sends no receipt (10/6: $10 paid ahead goes on it in part, nothing settles)', async () => {
     const h = await house()
     await paidAhead(h, 10)
     await generateInvoices(NOW)

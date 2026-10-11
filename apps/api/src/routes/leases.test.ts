@@ -364,7 +364,23 @@ describe('GET /leases — list scoping', () => {
     expect(names).toEqual(new Set(['Oak Park Motel and RV', 'Mountain View RV Ranch']))
   })
 
-  it('unknown role (bookkeeper) gets empty list, not 500', async () => {
+  // A role with no branch of its own falls through to the "empty rather than
+  // leak" guard. (10/11: this used a bookkeeper, which the bookkeeper gate in
+  // requireAuth now refuses outright — the next test.)
+  it('unknown role (business staff) gets empty list, not 500', async () => {
+    await seedFixture()
+    const token = jwt.sign(
+      { userId: randomUUID(), role: 'business_staff', email: 'bs@test.dev', profileId: randomUUID(), permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' },
+    )
+    const res = await request(buildApp())
+      .get('/api/leases')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual([])
+  })
+
+  it('a bookkeeper is refused outright (10/11, lib/bookkeeperAccess)', async () => {
     await seedFixture()
     const bkToken = jwt.sign(
       { userId: randomUUID(), role: 'bookkeeper', email: 'bk@test.dev', profileId: randomUUID(), permissions: {} },
@@ -373,8 +389,7 @@ describe('GET /leases — list scoping', () => {
     const res = await request(buildApp())
       .get('/api/leases')
       .set('Authorization', `Bearer ${bkToken}`)
-    expect(res.status).toBe(200)
-    expect(res.body.data).toEqual([])
+    expect(res.status).toBe(403)
   })
 })
 

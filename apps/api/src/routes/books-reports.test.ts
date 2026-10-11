@@ -405,15 +405,17 @@ describe('GET /rent-roll', () => {
     expect(res.body.data.totalExpected).toBe(1500)
   })
 
-  it('S387 fix: bookkeeper with X-Client-Id sees client rent roll (was: empty)', async () => {
+  // 10/11 (Nic): "maybe not even necessarily people's names." The rent roll is
+  // one row per tenant, so it is no longer a bookkeeper's (S387 had fixed it
+  // showing them an EMPTY roll; now it is refused in words). Money in by type
+  // is the Income page (routes/financials).
+  it('a bookkeeper with X-Client-Id is refused the rent roll (it names every tenant)', async () => {
     const f = await seedPortfolio()
     const res = await request(buildApp())
       .get('/api/books/rent-roll')
       .set('Authorization', `Bearer ${f.bkAToken}`)
       .set('X-Client-Id', f.landlordAId)
-    expect(res.status).toBe(200)
-    expect(res.body.data.units).toHaveLength(1)  // pre-fix: 0
-    expect(res.body.data.units[0].property_name).toBe('Test Property')
+    expect(res.status).toBe(403)
   })
 
   it('admin sees rent roll across all landlords', async () => {

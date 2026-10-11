@@ -1453,9 +1453,13 @@ async function runGeneration(
         // Harland's $450 Move In Special was chopped into a water row, a trash
         // row and five late fees. Now credit of every kind — paid ahead,
         // landlord-issued, deposit interest — settles a lease's bill only when it
-        // covers every row the tenant owes on it (older open rows included), and
-        // otherwise settles nothing: MH 25's $10 waits for the tenant's
-        // "Use all $10" or "Save it for later". A bill carrying a GAM fee, a
+        // covers every row the tenant owes on it (older open rows included).
+        // 10/6 (Nic): "a credit against the entire balance" — money PAID AHEAD
+        // then goes on the balance even when it covers less, oldest bill
+        // first, part of a line where it runs out, the rest left owed
+        // (creditUse.drawPaidAheadOnBalance). Other credit that covers less
+        // settles nothing and waits for the payer's "Use" or "Save it for
+        // later" (MH 25's landlord-given $10). A bill carrying a GAM fee, a
         // neighbor landlord's utility or a scheduled bank retry never settles
         // itself (creditUse.settleWholeBillIfCovered). The check covers the
         // whole household with this landlord, so a credit that already covers

@@ -68,9 +68,29 @@ const mwScopeSchema = z.object({
   allProperties: z.boolean().default(false),
 })
 
+// 10/11 (Nic): a bookkeeper keeps one company's books, narrowed to some of its
+// properties when the owner picks them ("a bookkeeper for the Mountain View
+// property... They don't need to see anything with Oak Park"). No properties
+// named, or an empty list, = every property of the company (stored NULL). The
+// access level now governs only the GAM Books ledger tools; the financial
+// pages give every bookkeeper the same "look + add expenses", so the Team page
+// no longer asks and a new invite takes the ledger's read-only default.
 const bkScopeSchema = z.object({
-  accessLevel: z.enum(BOOKKEEPER_ACCESS_LEVELS),
+  accessLevel: z.enum(BOOKKEEPER_ACCESS_LEVELS).default('read_only'),
+  propertyIds: z.array(z.string().uuid()).nullable().optional(),
 })
+
+/** 10/11: the properties named must be the company's own; [] → null (all). */
+async function bookkeeperPropertyIds(landlordId: string, ids: string[] | null | undefined): Promise<string[] | null> {
+  const uniq = Array.from(new Set(ids ?? []))
+  if (!uniq.length) return null
+  const rows = await query<{ id: string }>(
+    `SELECT id FROM properties WHERE id = ANY($1::uuid[]) AND landlord_id = $2`, [uniq, landlordId])
+  if (rows.length !== uniq.length) {
+    throw new AppError(400, "Pick properties that belong to the company whose books they keep.")
+  }
+  return uniq
+}
 
 function validateScopePayload(role: LandlordAssignableRole, raw: unknown): any {
   switch (role) {
@@ -175,11 +195,22 @@ async function insertScopeRow(
       return rows[0]
     }
     case 'bookkeeper': {
+      // 10/11: the properties were checked against the company at invite time;
+      // a property sold since cannot be in a company's list, so re-check here.
+      const named: string[] = Array.isArray(payload.propertyIds) ? payload.propertyIds : []
+      let propertyIds: string[] | null = null
+      if (named.length) {
+        const { rows: ok } = await client.query(
+          `SELECT id FROM properties WHERE id = ANY($1::uuid[]) AND landlord_id = $2`, [named, landlordId])
+        const kept: string[] = ok.map((r: any) => r.id)
+        propertyIds = kept
+        if (!kept.length) throw new AppError(409, 'The properties on this invitation no longer belong to that company. Ask for a new invitation.')
+      }
       const { rows } = await client.query(
         `INSERT INTO bookkeeper_scopes
-           (user_id, landlord_id, access_level)
-         VALUES ($1,$2,$3) RETURNING *`,
-        [userId, landlordId, payload.accessLevel])
+           (user_id, landlord_id, access_level, property_ids)
+         VALUES ($1,$2,$3,$4) RETURNING *`,
+        [userId, landlordId, payload.accessLevel || 'read_only', propertyIds])
       return rows[0]
     }
   }
@@ -272,7 +303,7 @@ scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'),
     const bkRows = await query<any>(
       `SELECT 'bookkeeper' AS role, s.user_id, s.landlord_id, la.business_name AS company_name,
               jsonb_build_object('access_level', s.access_level) AS permissions,
-              jsonb_build_object('accessLevel', s.access_level) AS scope,
+              jsonb_build_object('accessLevel', s.access_level, 'propertyIds', s.property_ids) AS scope,
               s.created_at, s.updated_at,
               u.email, u.first_name, u.last_name, u.phone
          FROM bookkeeper_scopes s JOIN users u ON u.id = s.user_id JOIN landlords la ON la.id = s.landlord_id
@@ -447,6 +478,9 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
       phone:     z.string().trim().optional(),
     }).parse(req.body)
     const scope = validateScopePayload(role, body.scope)
+    if (role === 'bookkeeper') {
+      scope.propertyIds = await bookkeeperPropertyIds(landlordId, scope.propertyIds)
+    }
 
     // W-10 (S529): staff are PERMANENTLY locked to the property they are
     // added to — so the property must be chosen at invite time.
@@ -604,13 +638,30 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
           [scope.propertyIds, scope.unitIds, scope.jobCategories,
            scope.allProperties, req.params.userId, landlordIds])
         break
-      case 'bookkeeper':
+      case 'bookkeeper': {
+        // 10/11: change which properties they keep (and, for the Books ledger,
+        // the access level — left as it is when not sent). Their company
+        // cannot change: a bookkeeper for another company is a new invitation.
+        const raw = (req.body ?? {}) as { accessLevel?: string; propertyIds?: string[] | null; landlordId?: string }
+        // The row the Team page names (one per company they keep), else their oldest.
+        const target = typeof raw.landlordId === 'string' && landlordIds.includes(raw.landlordId)
+          ? [raw.landlordId] : landlordIds
+        const existing = await queryOne<{ landlord_id: string; access_level: string; property_ids: string[] | null }>(
+          `SELECT landlord_id, access_level, property_ids FROM bookkeeper_scopes
+            WHERE user_id = $1 AND landlord_id = ANY($2::uuid[])
+            ORDER BY created_at LIMIT 1`, [req.params.userId, target])
+        if (!existing) throw new AppError(404, 'Scope row not found')
+        const propertyIds = raw.propertyIds !== undefined
+          ? await bookkeeperPropertyIds(existing.landlord_id, scope.propertyIds)
+          : existing.property_ids
         updated = await queryOne<any>(
           `UPDATE bookkeeper_scopes SET
-             access_level = $1, updated_at = NOW()
-           WHERE user_id = $2 AND landlord_id = ANY($3::uuid[]) RETURNING *`,
-          [scope.accessLevel, req.params.userId, landlordIds])
+             access_level = $1, property_ids = $2, updated_at = NOW()
+           WHERE user_id = $3 AND landlord_id = $4 RETURNING *`,
+          [raw.accessLevel ? scope.accessLevel : existing.access_level, propertyIds,
+           req.params.userId, existing.landlord_id])
         break
+      }
     }
     if (!updated) throw new AppError(404, 'Scope row not found')
     res.json({ success: true, data: updated })

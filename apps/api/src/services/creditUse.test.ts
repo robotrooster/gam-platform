@@ -298,13 +298,28 @@ describe('the whole-bill rule', () => {
     expect(await uses()).toMatchObject([{ status: 'applied', source: 'whole_bill', amount: 460, month: '2026-10-01' }])
   })
 
-  it("MH 25: $10 saved against a $460 bill settles nothing and is offered to the tenant", async () => {
+  it("10/6 (Nic): $10 PAID AHEAD against a $460 bill goes on it by itself — $450 still owed, the row never cut in two", async () => {
     const h = await house()
     const credit = await paidAhead(h, 10)
     const rent = await charge(h, { amount: 460 })
     expect((await wholeBill(h)).settledIds).toEqual([])
     expect(await statusOf(rent)).toBe('pending')
-    expect(await remainingPaidAhead(credit)).toBe(10)
+    expect(await remainingPaidAhead(credit)).toBe(0)
+    const q = await quote(h)
+    expect(q.leases[0].usableCredit).toBe(0)
+    expect(q.leases[0].requiredTotal).toBe(460)
+    expect(q.leases[0].creditAlreadyApplied).toBe(10)
+    expect(await uses()).toMatchObject([{ status: 'applied', source: 'whole_bill', amount: 10 }])
+    expect(Number((await db.query<{ a: string }>(`SELECT amount::text AS a FROM payments WHERE id = $1`, [rent])).rows[0].a)).toBe(460)
+  })
+
+  it("MH 25: $10 of credit the landlord GAVE against a $460 bill settles nothing and is offered to the tenant", async () => {
+    const h = await house()
+    const credit = await issued(h, 10)
+    const rent = await charge(h, { amount: 460 })
+    expect((await wholeBill(h)).settledIds).toEqual([])
+    expect(await statusOf(rent)).toBe('pending')
+    expect(Number((await db.query<{ r: string }>(`SELECT amount_remaining::text AS r FROM tenant_credits WHERE id = $1`, [credit])).rows[0].r)).toBe(10)
     const q = await quote(h)
     expect(q.leases[0].usableCredit).toBe(10)
     expect(q.leases[0].requiredTotal).toBe(460)

@@ -1861,6 +1861,13 @@ booksRouter.get('/tax/summary', requireBooksRead, blockBusinessOwner, async (req
 // Rent roll — sync from GAM
 booksRouter.get('/rent-roll', requireBooksRead, blockBusinessOwner, async (req, res, next) => {
   try {
+    // 10/11 (Nic): a bookkeeper never sees who lives where — "maybe not even
+    // necessarily people's names." The rent roll is one row per tenant. (The
+    // bookkeeper allowlist in requireAuth refuses it first; this is the route
+    // saying so itself.) Money in by type is on the Income page.
+    if (req.user?.role === 'bookkeeper') {
+      throw new AppError(403, 'The rent roll lists tenants by name, so it is not part of a bookkeeper\'s access. Money in by type is on the Income page.')
+    }
     const basis = parseIncomeBasis(req.query.basis)
     const lid = landlordScope(req.user)
     // S655 (gam-audience-data-isolation): a team member assigned to some

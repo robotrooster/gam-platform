@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 2SKIscFJ8GjRtM1DNAHyS04dWl5CUG56js68ef1U3uWiOxwRrbOH2cjowk3n71A
+\restrict 7xHEYD1FSKeDLBneyec4Pdcax1bHr1ey8ZxWYFcl1XL49pl6gxw2opeScvKQ3p6
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -2529,7 +2529,9 @@ CREATE TABLE public.bookkeeper_scopes (
     access_level text DEFAULT 'read_only'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT bookkeeper_scopes_access_level_check CHECK ((access_level = ANY (ARRAY['read_only'::text, 'read_write'::text])))
+    property_ids uuid[],
+    CONSTRAINT bookkeeper_scopes_access_level_check CHECK ((access_level = ANY (ARRAY['read_only'::text, 'read_write'::text]))),
+    CONSTRAINT bookkeeper_scopes_property_ids_not_empty CHECK (((property_ids IS NULL) OR (cardinality(property_ids) > 0)))
 );
 
 
@@ -31284,5 +31286,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 2SKIscFJ8GjRtM1DNAHyS04dWl5CUG56js68ef1U3uWiOxwRrbOH2cjowk3n71A
+\unrestrict 7xHEYD1FSKeDLBneyec4Pdcax1bHr1ey8ZxWYFcl1XL49pl6gxw2opeScvKQ3p6
 

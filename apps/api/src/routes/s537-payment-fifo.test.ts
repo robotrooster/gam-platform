@@ -234,7 +234,7 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
     expect(full.status).toBe(200)
   })
 
-  it('S637: a credit too small for the rent leaves the charge whole', async () => {
+  it('S637 + 10/6: a credit too small for the rent goes against the balance — the charge is never cut in two', async () => {
     // Was: "consumes prepaid credit oldest-first", asserting a $100 credit
     // split the $440 rent into a $100 settled slice and a $340 remainder.
     //
@@ -265,9 +265,18 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
       `SELECT amount::float AS amount FROM payments
         WHERE lease_id=$1 AND type='rent' AND status='pending' AND is_remainder`, [f.leaseId])
     expect(remainder.rows).toHaveLength(0)
-    // The credit is still there, waiting for a charge it can actually clear.
+    // 10/6 (Nic): "It needs to be a credit against the entire balance." The
+    // $100 paid ahead goes on the rent by itself (a credit use, no slice), and
+    // the rest of the same row is still owed.
     const credit = await db.query<any>(`SELECT amount_remaining::float AS r FROM lease_prepaid_credits WHERE lease_id=$1`, [f.leaseId])
-    expect(credit.rows[0].r).toBe(100)
+    expect(credit.rows[0].r).toBe(0)
+    const rent = await db.query<any>(
+      `SELECT p.amount::float AS amount, p.status,
+              (SELECT COALESCE(SUM(u.amount), 0) FROM credit_uses u WHERE u.payment_id = p.id AND u.status = 'applied')::float AS on_it
+         FROM payments p WHERE p.lease_id=$1 AND p.type='rent'`, [f.leaseId])
+    const withCredit = rent.rows.filter((r: any) => r.on_it > 0)
+    expect(withCredit).toEqual([{ amount: 440, status: 'pending', on_it: 100 }])
+    expect(rent.rows.every((r: any) => r.status === 'pending')).toBe(true)
   })
 })
 

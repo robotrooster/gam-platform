@@ -2710,20 +2710,34 @@ describe('decisions #48.6: finalize waits while ANY payment on the tenancy is st
 
   it('a bank payment clears in five business days from the day it was made — never a weekend day counted', async () => {
     const stack = await buildLeaseStack({ depositTotal: 500, heldBy: 'landlord' })
-    // Made on a Friday (2026-10-02): five business days later is Friday 2026-10-09.
+    // 10/11: made on the most recent Friday (never more than six days ago, so it
+    // is still clearing and not yet "stuck"). It was pinned to 2026-10-02 and
+    // went stale once that week passed — the check reads the database clock.
+    const now = new Date()
+    const friday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+    friday.setUTCDate(friday.getUTCDate() - ((friday.getUTCDay() + 2) % 7))
+    const madeOn = friday.toISOString().slice(0, 10)
     await db.query(
       `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description,
                              stripe_payment_intent_id, created_at)
-       VALUES ($1,$2,$3,$4,'utility',80,'processing','2026-10-01','UTILITY','pi_util_clearing', '2026-10-02T18:00:00Z')`,
-      [stack.unitId, stack.leaseId, stack.tenantId, stack.landlordId])
+       VALUES ($1,$2,$3,$4,'utility',80,'processing',$5::date,'UTILITY','pi_util_clearing', $6::timestamptz)`,
+      [stack.unitId, stack.leaseId, stack.tenantId, stack.landlordId, madeOn, `${madeOn}T18:00:00Z`])
     await db.query(
       `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, payment_method, stripe_payment_intent_id, created_at)
-       VALUES ($1,$2,$3,80,80,0,'ach','pi_util_clearing', '2026-10-02T18:00:00Z')`,
-      [stack.tenantId, stack.leaseId, stack.landlordId])
-    const { tenancyPaymentsClearing } = await import('./depositReturn')
+       VALUES ($1,$2,$3,80,80,0,'ach','pi_util_clearing', $4::timestamptz)`,
+      [stack.tenantId, stack.leaseId, stack.landlordId, `${madeOn}T18:00:00Z`])
+    const { tenancyPaymentsClearing, addBusinessDays } = await import('./depositReturn')
+    const clearBy = addBusinessDays(madeOn, 5)
+    // Five business days from a Friday is never a weekend day, and is at least
+    // the following Friday (later only when a bank holiday falls in that week).
+    expect([0, 6]).not.toContain(new Date(`${clearBy}T12:00:00Z`).getUTCDay())
+    const nextFriday = new Date(`${madeOn}T12:00:00Z`); nextFriday.setUTCDate(nextFriday.getUTCDate() + 7)
+    expect(clearBy >= nextFriday.toISOString().slice(0, 10)).toBe(true)
+    const words = (ymd: string) => new Date(`${ymd}T12:00:00Z`)
+      .toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
     const said = await tenancyPaymentsClearing((t, v) => db.query(t, v), stack.leaseId)
-    expect(said!.words).toBe('A $80.00 bank payment toward a utility bill, made Oct 2, 2026, is still clearing, so the move-out can’t be finalized yet. ' +
-      'It should clear by Oct 9, 2026. Finalize once it clears or fails.')
+    expect(said!.words).toBe(`A $80.00 bank payment toward a utility bill, made ${words(madeOn)}, is still clearing, so the move-out can’t be finalized yet. ` +
+      `It should clear by ${words(clearBy)}. Finalize once it clears or fails.`)
   })
 
   it('two payments clearing on the tenancy (one a deposit payment set to be tried again): both named, with the last day either should clear', async () => {

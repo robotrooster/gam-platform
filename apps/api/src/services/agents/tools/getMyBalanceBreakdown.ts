@@ -114,9 +114,11 @@ export const getMyBalanceBreakdown: AgentTool = {
       })),
       note:
         'Payments always apply to the OLDEST open charge first (never chosen per charge), so a payment can ' +
-        'settle an old balance while a newer charge stays open. totalOwed is the full balance. Credit is used ' +
-        'by itself only when it covers a whole bill; otherwise the tenant chooses "Use all" or "Save it for ' +
-        'later" when they pay, so creditAvailable is beside the balance, not taken off it.',
+        'settle an old balance while a newer charge stays open. totalOwed is the full balance. Money the tenant ' +
+        'paid ahead goes on the balance by itself (10/6): oldest bill first, part of a line when it cannot pay all ' +
+        'of it, the rest still owed — it is already off totalOwed. Other credit (from the landlord, deposit ' +
+        'interest) is used by itself only when it covers a whole bill; otherwise the tenant chooses "Use all" or ' +
+        '"Save it for later" when they pay, so creditAvailable is beside the balance, not taken off it.',
     }
   },
 }

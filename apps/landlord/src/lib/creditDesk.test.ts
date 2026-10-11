@@ -772,7 +772,7 @@ describe('10/5: part payments, where the property takes them', () => {
       { id: 'o', type: 'rent', amount: 600, dueDate: '2026-10-01' },
     ], { partialPaymentsAllowed: true })
     // $620: September rent in full; September water ($50) cannot be paid in part — passed by; $20 to October rent.
-    expect(partialPlan(q, null, 62000, r => (r.type === 'rent' ? 'Rent' : 'Water'))).toEqual({ stillOwedCents: 63000, names: ['September water', 'October rent'], toOldCents: 0, keptCents: 0, shortInvoiceIds: [] })
+    expect(partialPlan(q, null, 62000, r => (r.type === 'rent' ? 'Rent' : 'Water'))).toEqual({ stillOwedCents: 63000, names: ['September water', 'October rent'], toOldCents: 0, keptCents: 0, keptOnBalanceCents: 0, shortInvoiceIds: [] })
     expect(tender105(q, 'cash', 62000).stillOwedText).toBe('$630.00 stays owed on September water and October rent — late fees still apply.')
   })
   it('with Use, the credit the plan spends on each charge comes off it first', () => {
@@ -803,5 +803,161 @@ describe('10/5: part payments, where the property takes them', () => {
     expect(billName('2026-10-01', 'Rent')).toBe('October rent')
     expect(billName('2026-09-15', 'Water · Aug 1–31')).toBe('September water')
     expect(stillOwedText(2500, [])).toBe('$25.00 stays owed — late fees still apply.')
+  })
+})
+
+// ─── 10/6 (Nic): credit against the whole balance; no credit talk on a part payment ──
+
+import {
+  partPaymentLines, backdatedLateFeeText, deskBillBalance, CREDIT_USE_RULE,
+} from './creditDesk'
+import { placePartPayment } from '@gam/shared'
+
+describe('10/6 (Nic): a part payment never turns into credit while the balance is owed', () => {
+  // The Bowmans (Country Acres MH 30): $450 rent, $39.60 water, $100 home payment, $50 late fee.
+  const bowmans = bill105([
+    { id: 'r', type: 'rent', amount: 450, dueDate: '2026-10-01', invoiceId: 'INV-OCT' } as any,
+    { id: 'w', type: 'utility', amount: 39.60, dueDate: '2026-10-01', invoiceId: 'INV-OCT' } as any,
+    { id: 'h', type: 'home_payment', amount: 100, dueDate: '2026-10-01', invoiceId: 'INV-OCT' } as any,
+    { id: 'f', type: 'late_fee', amount: 50, dueDate: '2026-10-06', invoiceId: 'INV-OCT' } as any,
+  ], { partialPaymentsAllowed: true })
+
+  it('the Bowmans\' $500: the lines that cannot be paid in part are paid, the rent takes the rest — $139.60 stays owed, nothing kept', () => {
+    const p = tender105(bowmans, 'bank_deposit', 50000)
+    expect(p.stop).toBeNull()
+    expect(p.stillOwedCents).toBe(13960)
+    expect(p.keptAsCreditCents).toBe(0)
+    expect(p.toOldCents).toBe(0)
+    expect(p.stillOwedNames).toEqual(['October rent'])
+    expect(p.body).toEqual({ method: 'bank_deposit', amountTendered: 500 })
+  })
+
+  it('what the window says: owed, paying, what stays owed, late fees still apply — and never "credit"', () => {
+    const p = tender105(bowmans, 'bank_deposit', 50000)
+    const lines = partPaymentLines({ owedCents: p.owedCents, payingCents: 50000, stillOwedCents: p.stillOwedCents, names: p.stillOwedNames,
+      toOldCents: p.toOldCents, keptCents: p.keptAsCreditCents })
+    expect(lines).toEqual(['Owed $639.60', 'Paying $500.00', 'Stays owed $139.60 on October rent — late fees still apply.'])
+    expect(lines.join(' ')).not.toMatch(/credit/i)
+  })
+
+  it('placePartPayment: the rent on the bill a line was passed on is paid last on that bill; with no rent to take it, the rest is left', () => {
+    const rows = [{ id: 'r', type: 'rent', invoiceId: 'OCT' }, { id: 'w', type: 'utility', invoiceId: 'OCT' }, { id: 'h', type: 'home_payment', invoiceId: 'OCT' }]
+    const owed: Record<string, number> = { r: 45000, w: 3960, h: 10000 }
+    const p = placePartPayment(rows, r => owed[r.id], 50000)
+    expect(p.left).toBe(0)
+    expect(p.partSplits).toEqual([{ row: rows[0], take: 36040, owedOnRow: 45000 }])
+    expect(p.paid.map(x => [x.row.id, x.cents])).toEqual([['w', 3960], ['h', 10000], ['r', 36040]])
+    expect(p.notReached).toEqual([])
+    const noRent = placePartPayment(rows.slice(1), r => owed[r.id], 5000)
+    expect(noRent).toMatchObject({ left: 1040, notReached: [rows[2]] })
+  })
+
+  it('placePartPayment (review fix): oldest bill first — an older bill\'s rent is never moved behind a newer bill', () => {
+    // September rent paid in full, then October's utility and late fee. The
+    // late fee cannot be paid in part, but September's rent is on another
+    // bill: it is never left owing so October can be paid. What is left over
+    // is left (it goes on the rest of the balance as money paid ahead).
+    const rows = [
+      { id: 'sepRent', type: 'rent', invoiceId: 'SEP' },
+      { id: 'octUtil', type: 'utility', invoiceId: 'OCT' },
+      { id: 'octFee', type: 'late_fee', invoiceId: 'OCT' },
+    ]
+    const owed: Record<string, number> = { sepRent: 45000, octUtil: 2000, octFee: 5000 }
+    const p = placePartPayment(rows, r => owed[r.id], 48000)
+    expect(p.paid.map(x => [x.row.id, x.cents])).toEqual([['sepRent', 45000], ['octUtil', 2000]])
+    expect(p.partSplits).toEqual([])
+    expect(p.notReached).toEqual([rows[2]])
+    expect(p.left).toBe(1000)
+  })
+
+  it('placePartPayment (review fix): a moved rent goes last on its OWN bill, before any newer bill', () => {
+    // October: rent, home payment, late fee. November: a utility. The rent is
+    // paid last on October's bill — never after November's utility.
+    const rows = [
+      { id: 'octRent', type: 'rent', invoiceId: 'OCT' },
+      { id: 'octHome', type: 'home_payment', invoiceId: 'OCT' },
+      { id: 'octFee', type: 'late_fee', invoiceId: 'OCT' },
+      { id: 'novUtil', type: 'utility', invoiceId: 'NOV' },
+    ]
+    const owed: Record<string, number> = { octRent: 45000, octHome: 10000, octFee: 5000, novUtil: 2000 }
+    const p = placePartPayment(rows, r => owed[r.id], 48000)
+    expect(p.paid.map(x => [x.row.id, x.cents])).toEqual([['octHome', 10000], ['octFee', 5000], ['octRent', 33000]])
+    expect(p.notReached).toEqual([rows[3]])
+    expect(p.left).toBe(0)
+  })
+
+  it('a backdated deposit says nothing about late fees until the amount typed pays that bill in full', () => {
+    const q = { ...bowmans, lateFeesOffIfPaidInFull: 50, lateFeesOffByBill: [{ invoiceId: 'INV-OCT', amount: 50 }] }
+    const part = tender105(q, 'bank_deposit', 50000)
+    expect(backdatedLateFeeText(q, part, '2026-10-05', 50000)).toBeNull()       // paid only in part: nothing
+    expect(backdatedLateFeeText(q, part, '2026-10-05', null)).toBeNull()        // nothing typed: nothing
+    const full = tender105({ ...q, rows: q.rows.filter(r => r.type !== 'late_fee'), currentTotal: 589.60, owedIfSaved: 589.60, owedIfUsed: 589.60 },
+      'bank_deposit', 58960)
+    expect(backdatedLateFeeText(q, full, '2026-10-05', 58960)).toBe(
+      `Deposited ${dayWord('2026-10-05')}, before $50.00 in late fees were charged. This pays the bill in full, so those late fees are credited; `
+      + 'the payment still counts as late on their history. When your bank feed shows this deposit, the bank\'s date decides.')
+  })
+})
+
+describe('10/6 (Nic): credit goes on the bill, never held back by the pay-in-full rule', () => {
+  const oct = { id: 'r1', type: 'rent', amount: 300, dueDate: '2026-10-01' }
+  it('"Use" with nothing handed over applies credit that pays only part, even where part payments are off', () => {
+    const q = bill105([{ ...oct, creditIfUsed: 100 }], { partialPaymentsAllowed: false, creditAvailable: 100, owedIfUsed: 200, owedIfSaved: 300 })
+    const p = planTender105(q, { method: 'cash', tenderedCents: 0, choice: 'use', towardOldCents: null, surplusHandling: null,
+      writtenConfirmed: false, answeredCreditCents: 10000, nameOf: () => 'Rent' })
+    expect(p.stop).toBeNull()
+    expect(p.stillOwedCents).toBe(20000)
+    expect(p.body).toEqual({ method: 'cash', amountTendered: 0, creditToUse: 100 })
+  })
+  it('their own short cash is still refused where part payments are off', () => {
+    const q = bill105([{ ...oct, creditIfUsed: 100 }], { partialPaymentsAllowed: false, creditAvailable: 100, owedIfUsed: 200, owedIfSaved: 300 })
+    const p = planTender105(q, { method: 'cash', tenderedCents: 15000, choice: 'use', towardOldCents: null, surplusHandling: null,
+      writtenConfirmed: false, answeredCreditCents: 10000, nameOf: () => 'Rent' })
+    expect(p.stop).toBe('short')
+  })
+  it('the bill as one balance: charges, credit applied, still owed (Marc: $300, −$282.36, $17.64)', () => {
+    expect(deskBillBalance({ currentTotal: 300, creditAlreadyApplied: 282.36 })).toEqual({ charges: 30000, creditApplied: 28236, stillOwed: 1764 })
+    expect(deskBillBalance({ currentTotal: 460, creditAlreadyApplied: 0 })).toEqual({ charges: 46000, creditApplied: 0, stillOwed: 46000 })
+  })
+  it('the rule as landlords read it: paid-ahead money goes on by itself, part of a bill allowed', () => {
+    expect(CREDIT_USE_RULE).toMatch(/^Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay all of it\./)
+  })
+})
+
+import { postAheadText } from './creditDesk'
+
+describe('review fix (10/6): no credit talk while a balance is owed, and no "paid the bill" for part of one', () => {
+  it('credit that pays only part of the bill is "applied", never "paid the bill"', () => {
+    expect(recordedMessage('Marc', { amountSettled: 0, creditUsed: 282.36, stillOwed: 17.64, stillOwedNames: ['October rent'] }))
+      .toBe("Applied $282.36 of Marc's credit — $17.64 stays owed on October rent — late fees still apply.")
+    // Paid in full by credit: still "paid the bill".
+    expect(recordedMessage('Todd', { amountSettled: 0, creditUsed: 460 })).toBe("Paid Todd's bill with their credit.")
+  })
+
+  it('a part payment\'s leftover is said as going on the rest of what they owe — never "kept as credit"', () => {
+    const msg = recordedMessage('Pat', {
+      amountSettled: 470, surplus: 10, creditId: 'c', leftoverOnBalance: 10, stillOwed: 40, stillOwedNames: ['October late fee'],
+    })
+    expect(msg).toBe('Recorded $470.00 from Pat — $10.00 went on the rest of what they owe — $40.00 stays owed on October late fee — late fees still apply.')
+    expect(msg).not.toMatch(/credit/i)
+    // Nothing open can take it (only a home payment is left): kept toward the next bill, still not "credit".
+    const kept = recordedMessage('Pat', { amountSettled: 470, surplus: 10, creditId: 'c', leftoverOnBalance: 0, stillOwed: 100, stillOwedNames: ['October home payment'] })
+    expect(kept).toBe('Recorded $470.00 from Pat — $10.00 kept toward their next bill — $100.00 stays owed on October home payment — late fees still apply.')
+  })
+
+  it('partPaymentLines: leftover an open line takes goes on the rest of what they owe', () => {
+    expect(partPaymentLines({ owedCents: 52000, payingCents: 48000, stillOwedCents: 4000, names: ['October late fee'], keptCents: 1000, keptOnBalanceCents: 1000 }))
+      .toEqual(['Owed $520.00', 'Paying $480.00', 'Stays owed $40.00 on October late fee — late fees still apply.', '$10.00 of it goes on the rest of what they owe.'])
+    expect(partPaymentLines({ owedCents: 52000, payingCents: 48000, stillOwedCents: 5000, names: ['October home payment'], keptCents: 1000, keptOnBalanceCents: 0 })[3])
+      .toBe('$10.00 of it cannot go on what is left (only rent can be paid in part), so it is kept toward their next bill.')
+  })
+
+  it('Post a payment speaks of money kept ahead only when the amount is more than they owe', () => {
+    expect(postAheadText(null, 300)).toBeNull()
+    expect(postAheadText(30000, 300)).toBeNull()
+    expect(postAheadText(20000, 300)).toBeNull()
+    expect(postAheadText(40000, 300)).toBe('They owe $300.00 now. That is paid first; the other $100.00 is kept as paid ahead and goes on their bills by itself as they come.')
+    expect(postAheadText(40000, 0)).toBe('They owe nothing now. The $400.00 is kept as paid ahead and goes on their bills by itself as they come.')
+    expect(postAheadText(40000, undefined)).toBeNull()
   })
 })
