@@ -14,7 +14,7 @@ GAM's production backend today is a single Mac Studio: Express API (:4000, launc
 4. **No container story.** No Dockerfile; Node version unpinned (launchd = 22, CI = 20); `playwright` is a prod dep used only by ingest scrapers; `pdfjs-dist` needs intact `node_modules`; `@napi-rs/canvas` prebuilts (avoid musl). Health check is a shallow `/health` with no DB probe. `db/migrate.ts` shells out to `pg_dump` post-migration (warn-only).
 5. **Per-replica in-memory state:** express-rate-limit MemoryStore, agent LRU caches, turn-gate semaphore, LLM endpoint pool breakers, metrics ring buffer. `trust proxy = 1` tuned for exactly one cloudflared hop.
 6. **Domains hardcoded:** `goldassetmanagement.com` / `gam.biz` suffix-matched in CORS (`index.ts:174-177`) and auth reset flow (`routes/auth.ts:795`); 12 frontends silently fall back to `http://localhost:4000` when `VITE_API_URL` is unset; Cloudflare tunnel config lives entirely outside the repo.
-7. **DB:** extensions pgcrypto, uuid-ossp, pgvector — all supported by Cloud SQL. The checksummed migration runner (564 migrations) is solid and should be reused as-is.
+7. **DB:** extensions pgcrypto, uuid-ossp, pgvector — all supported by Cloud SQL. The checksummed migration runner (564 migrations at drafting; 795 files as of 2026-10-11) is solid and should be reused as-is.
 8. **LLM coupling:** client is generic OpenAI-compatible `fetch` but sends no `Authorization` header; agent routes 500 (not degrade) when LLM env unset; embeddings locked to 1024-dim `vector(1024)` (provider change at another dim ⇒ re-embed the knowledge store); second independent LLM config path in `services/autoFieldPlacement.ts`.
 9. **Deploy/CI:** manual `deploy.sh` from the Mac; CI tests 2 of 16 apps, no lint. `apps/property-api` (:4001) appears orphaned (own lockfile, localhost-only CORS, in no deploy script) — confirm and delete or migrate deliberately.
 10. **Webhooks** (Stripe raw-body, Resend/Svix, Checkr HMAC) all land on `api.goldassetmanagement.com` through the tunnel — must be re-pointed at cutover.
@@ -26,6 +26,21 @@ GAM's production backend today is a single Mac Studio: Express API (:4000, launc
 - LLM + embeddings move to hosted APIs.
 - Frontends remain on Vercel.
 - **AI privacy rule override:** the documented hard rule "no third-party AI API, no tenant data leaving GAM-controlled hardware" (`apps/api/src/services/agents/config.ts` header) is deliberately overridden. The plan includes updating that documentation, reviewing tenant-facing privacy disclosures, and signing a vendor DPA.
+
+## Status & re-assessment (2026-10-11)
+
+Re-checked after merging 442 commits of `main` (S637–S655, through 10/11) into `gcp-migration`. **The plan still holds** — target architecture and phases are unchanged. What moved:
+
+- **Done on `gcp-migration`:** A1 storage seam (all writers incl. those added on main since), A2 scheduler gate + SIGTERM, A3 portable config (dotenv path, `DATABASE_URL`/socket, `PROPERTIES_DB_*`, `TRUST_PROXY_HOPS`), A4 hosted-LLM `Authorization` headers, A5 Cloud Run warning. **Not yet:** `/health/ready`, A4 route-level 503 + policy docs, A6, Phase B–E.
+- **Merged & fixed during the merge:** five new disk writers from main (bank-deposit receipt photos, tenant declared-deposit receipt photos, utility meter photos, sleeve/disclosure detection, two lease scripts) now go through the storage driver.
+- **Logging (new since the plan):** S652 moved prod logs to daily files under `~/Library/Logs/gam`. On Cloud Run (`K_SERVICE`) or `LOG_TO_STDOUT=1` they now go to stdout as JSON with a Cloud Logging `severity`. The Phase C log-based alerts depend on this.
+- **Scheduler flags:** main added `GAM_DISABLE_SCHEDULER=1` (S650 demo instance). Crons run unless `RUN_SCHEDULER=0` **or** `GAM_DISABLE_SCHEDULER=1`. `gam-api` sets `RUN_SCHEDULER=0`; `gam-scheduler` sets neither.
+- **Crons grew 74 → 95** (all in `jobs/scheduler.ts`). Advisory locks grew 22 → 71 across the API, but the A2 item "lock every notification job" must be re-audited against the new jobs before the Mac/GCP overlap.
+- **Migrations:** 186 new since the plan; use `migrate --status` (all applied, zero checksum mismatches) as the cutover check, never a fixed count. New `apps/api/src/db/post-deploy/` holds **manual contract steps** run after a deploy is live — not by the migrate job. The cutover runbook must list any pending ones.
+- **New integrations/env:** Column bank (`COLUMN_API_KEY/BASE/AUTH_STYLE`, read-only, dormant without a key — confirm whether Column needs a fixed egress IP; if so, Cloud NAT + static IP is required and the "no VPC connector" rule changes). `LOG_DIR`, `LOG_TO_STDOUT`, `AGENT_PRERUN_LOOKUPS`.
+- **Image contents:** `services/flexsuiteAcceptance.ts` reads repo-root `legal/*.md` at runtime — the Dockerfile must ship `legal/`.
+- **Mac-only one-off scripts** (`scripts/disclosures/fixMountainViewLeases.ts`, `stockLibrary.ts`, `scripts/mattoon/load9_*`) still write to `uploads/leases` directly. They are historical imports; port them before re-running any against GCP.
+- **Admin health panel** (`services/platformHealth.ts`) now also checks Cloudflare tunnel, Vercel and `~/gam-backups` — part of the Phase E cleanup.
 
 ## Target architecture
 
@@ -52,7 +67,7 @@ New `apps/api/src/lib/storage.ts` with a driver interface (`save`, `stream`, `ex
 ### A3. Env/config consolidation
 - `apps/api/src/db/index.ts:3`: replace the hardcoded `/Users/nicholasrhoades/...` dotenv path with `path.resolve(__dirname, '../../.env')` (env vars always win; CLI scripts keep working).
 - Both pools: support `DATABASE_URL` / Cloud SQL unix socket (`host=/cloudsql/PROJECT:REGION:INSTANCE` — no SSL config or connector lib needed). `db/propertiesDb.ts`: add `PROPERTIES_DB_*` vars falling back to main vars.
-- Complete env manifest: grep `process.env\.` across `apps/api/src`, document all ~90 missing vars in `.env.example`; expand `validateEnv()` (`index.ts:126`) to hard-fail in production on security-critical vars (ENCRYPTION_KEY, BANK_ENCRYPTION_KEY, JWT_SECRET, DB) and warn on optional ones.
+- Complete env manifest: grep `process.env\.` across `apps/api/src`, document all ~90 missing vars in `.env.example`; expand `validateEnv()` (now `lib/validateEnv.ts`, which main extended for the gam_demo instance) to hard-fail in production on security-critical vars (ENCRYPTION_KEY, BANK_ENCRYPTION_KEY, JWT_SECRET, DB) and warn on optional ones.
 - `trust proxy` → `Number(process.env.TRUST_PROXY_HOPS ?? 1)` (`index.ts:257`); tune during cutover verification.
 - Pin Node 22: root `engines` + `.nvmrc`; bump CI from Node 20.
 
@@ -74,10 +89,10 @@ express-rate-limit MemoryStore, agent caches, turnGate, endpointPool, metrics ri
 ## Phase B — Containerize + CI/CD
 
 ### B1. Dockerfile (repo root, multi-stage)
-- Base `node:22-bookworm-slim` (glibc required for `@napi-rs/canvas` prebuilts — never alpine). Stage 1: workspace-aware `npm ci` with `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`, build shared then api (`tsc -b`). Stage 2: `npm ci --omit=dev`, copy `apps/api/dist`, `packages/shared/dist`+package.json, **and `apps/api/src/db/migrations/`** (runner reads files from disk). No bundling/pruning tools — `pdfjs-dist` needs intact `node_modules` (`lib/pdfText.ts:71-80`).
+- Base `node:22-bookworm-slim` (glibc required for `@napi-rs/canvas` prebuilts — never alpine). Stage 1: workspace-aware `npm ci` with `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`, build shared then api (`tsc -b`). Stage 2: `npm ci --omit=dev`, copy `apps/api/dist`, `packages/shared/dist`+package.json, **`apps/api/src/db/migrations/`** (runner reads files from disk) **and repo-root `legal/`** (FlexPay/FlexDeposit terms read at runtime). No bundling/pruning tools — `pdfjs-dist` needs intact `node_modules` (`lib/pdfText.ts:71-80`).
 - Move `playwright` deps→devDeps in `apps/api/package.json` (only db/ingest scrapers use it; verify with grep).
 - Migrations: keep `ts-node` + `typescript` as prod deps, run job as `node -r ts-node/register src/db/migrate.ts` (ship `src/` + tsconfig in image). The `dump-schema.sh` post-migration hook is warn-only — let it warn, or gate with `SKIP_SCHEMA_DUMP=1`.
-- Verification: build + run against local docker-compose Postgres; hit `/health/ready`; exercise a PDF-generation route (canvas + pdfjs in-container); apply all 564 migrations to a scratch DB from the image.
+- Verification: build + run against local docker-compose Postgres; hit `/health/ready`; exercise a PDF-generation route (canvas + pdfjs in-container); apply every migration to a scratch DB from the image.
 
 ### B2. Migration-at-deploy
 Cloud Run **Job** `gam-migrate` executed by CD before rollout (clean logs, retries; runner is already transactional + checksummed). Order: build → push → migrate job (fail = abort) → deploy api → deploy scheduler.
@@ -150,6 +165,42 @@ Work items (branch `money-flow-visibility`):
 2. Landlord portal: show "Held by GAM" + next-payout date on the Finances/Disbursements surfaces.
 3. Verification runbook for prod (Nic's Mac): job liveness, held totals vs platform balance, Connect readiness per landlord, stuck `platform_transfer_intents`, missed webhooks — shipped as a read-only SQL script under `scripts/`.
 4. Follow-ups from the audit (separate): legacy `routes/terminal.ts` creates platform card_present PIs with no disbursement path (verify unreachable, then delete); business payouts unrecorded in `connect_payouts`; missing `application_fee_amount` on public-customer-portal and recurring off-session invoice charges; stale money-flow comments in `lib/stripe.ts`, `routes/bankAccounts.ts`, `services/connectPayouts.ts`.
+
+## Needed from the Mac (Nic) — 2026-10-11
+
+Send secrets through a password manager / encrypted share, never chat or email.
+
+**1. The production `apps/api/.env`, whole file** — the simplest way to get every value below. The ones that must carry over *exactly*:
+- `ENCRYPTION_KEY`, `BANK_ENCRYPTION_KEY` — encrypted columns (bank details, PII) are unreadable forever without the same keys.
+- `JWT_SECRET` — a new value logs everyone out.
+- `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_SUBJECT` — new keys break every existing push subscription.
+- Stripe: `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CONNECT_WEBHOOK_SECRET`.
+- `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET`; `CHECKR_API_KEY`, `CHECKR_WEBHOOK_SECRET`; `SENTRY_DSN`.
+- If set: `COLUMN_API_KEY`, `CREDIT_LENDING_SERVICE_TOKEN`, `NY_OPENLEG_KEY`, `CLOUDFLARE_API_TOKEN`, `VERCEL_TOKEN`, `GEOCODER_URL`/`OSRM_URL` (if they point at local services).
+
+**2. Data**
+- `pg_dump -Fc gam` now (for the staging rehearsal); final dump at cutover.
+- `pg_dump -Fc gam_properties` (one-shot, read-only corpus).
+- Is `gam_demo` / the demo API instance (S650) served publicly? If yes, it migrates too; if not, it stays on the Mac.
+- `uploads/`: `du -sh uploads/*` and `find uploads -type f | wc -l` first (sizing), then an rsync/tarball path for the bulk copy.
+- Output of `SELECT version();`, `\dx` and `\du` (Postgres version, extensions, roles incl. the read-only `gam_properties` role).
+
+**3. What is actually running**
+- `git -C ~/gam rev-parse HEAD` and `git -C ~/gam status` — prod must be running committed code, or we'll migrate the wrong thing.
+- `launchctl list | grep com.gam`, `ls ~/Library/LaunchAgents/com.gam.*`, `crontab -l`, `node -v`.
+- `~/.cloudflared/config.yml` (or the tunnel's ingress rules in the Cloudflare dashboard) — the full list of hostnames the tunnel serves.
+- The model actually served for chat (`LLM_MODEL`, MLX model directory) and embeddings (`EMBEDDINGS_MODEL`), to match on DeepInfra.
+- Is `apps/property-api` (:4001) running or used anywhere? (A6: delete if not.)
+
+**4. Access**
+- Cloudflare account (DNS for `goldassetmanagement.com` and `gam.biz`, tunnel).
+- Stripe (platform + Connect webhook endpoints), Resend and Checkr dashboards — to verify webhook URLs and send test events at cutover.
+- Vercel team (projects + their env vars, e.g. `VITE_API_URL`).
+- GCP: billing account and project owner.
+
+**5. Decisions**
+- Re-confirm the AI-privacy override and the DeepInfra DPA (Decisions above).
+- A cutover evening, and who notifies landlords.
 
 ## Critical files
 
