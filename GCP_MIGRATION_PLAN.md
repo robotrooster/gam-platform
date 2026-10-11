@@ -170,6 +170,8 @@ Work items (branch `money-flow-visibility`):
 
 Send secrets through a password manager / encrypted share, never chat or email.
 
+**Shortcut:** `bash scripts/gcp-handoff-bundle.sh` on the Mac collects items 1–3 into one AES-256 encrypted `.dmg` on the Desktop (read-only on prod; add `--with-uploads` to include the files themselves). Items 4–5 still need Nic.
+
 **1. The production `apps/api/.env`, whole file** — the simplest way to get every value below. The ones that must carry over *exactly*:
 - `ENCRYPTION_KEY`, `BANK_ENCRYPTION_KEY` — encrypted columns (bank details, PII) are unreadable forever without the same keys.
 - `JWT_SECRET` — a new value logs everyone out.
