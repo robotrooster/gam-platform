@@ -202,6 +202,12 @@ async function billRunOn(day: string) {
   await generateInvoices(DateTime.fromISO(day, { zone: TZ }).set({ hour: 8 }).toJSDate())
 }
 
+// 10/11: these checks mean "the household is never moved out". A space with a
+// bill past its grace reads 'delinquent' — still occupied — and the bills these
+// tests run carry real due dates, so 'active' alone passed only in the first
+// days of a month (it failed from the 7th on). Occupied is what is being tested.
+const OCCUPIED = ['active', 'delinquent']
+
 describe('a month-to-month household can be sent a new lease', () => {
   it('drafts as a "New Lease", sends without an overlap refusal, and the landlord\'s signature issues it — the old lease untouched', async () => {
     const park = await seedPark()
@@ -384,7 +390,7 @@ describe('a signed fixed term and its new lease — never a stretch with no leas
     await processLeaseEnds()
     expect(await leaseRow(h.leaseId)).toMatchObject({ status: 'expired', end_date: plusDays(-1) })
     expect(await leaseRow(nlId)).toMatchObject({ status: 'active', signed_by_tenant: false })
-    expect(await unitStatus(h)).toBe('active')
+    expect(OCCUPIED).toContain(await unitStatus(h))
     expect(await depositReturns([h.leaseId, nlId])).toBe(0)
 
     // The old lease billed everything up to its last day; the new rent from there.
@@ -410,7 +416,7 @@ describe('a signed fixed term and its new lease — never a stretch with no leas
     await processLeaseEnds()
     expect(await leaseRow(h.leaseId)).toMatchObject({ status: 'active', end_date: plusDays(29), rent: 1000 })
     expect(await leaseRow(nlId)).toMatchObject({ status: 'pending' })
-    expect(await unitStatus(h)).toBe('active')
+    expect(OCCUPIED).toContain(await unitStatus(h))
     expect(await depositReturns([h.leaseId, nlId])).toBe(0)
     const tenants = await db.query<{ status: string }>(`SELECT status FROM lease_tenants WHERE lease_id=$1`, [h.leaseId])
     expect(tenants.rows.map(r => r.status)).toEqual(['active'])
@@ -492,7 +498,7 @@ describe('a signed fixed term and its new lease — never a stretch with no leas
     await activatePendingLeases()
     await processLeaseEnds()
     expect(await leaseRow(h.leaseId)).toMatchObject({ status: 'active', end_date: plusDays(29) })
-    expect(await unitStatus(h)).toBe('active')
+    expect(OCCUPIED).toContain(await unitStatus(h))
     expect(await depositReturns([h.leaseId])).toBe(0)
   })
   it('canceled during a holdover and sent again: the SIGNED end is named, never the held-over day — and the next term is as long as the signed one', async () => {
@@ -631,7 +637,7 @@ describe('canceling a new lease', () => {
     expect((await leaseRow(h.leaseId)).status).toBe('active')
     const unit = async () => (await db.query<{ status: string }>(`SELECT status FROM units WHERE id=$1`, [h.unitId])).rows[0].status
     const returns = async () => (await db.query(`SELECT 1 FROM deposit_returns WHERE lease_id = ANY($1)`, [[h.leaseId, nlId]])).rows.length
-    expect(await unit()).toBe('active')
+    expect(OCCUPIED).toContain(await unit())
     expect(await returns()).toBe(0)
 
     // The bill is made; that night the household is handed over.
@@ -640,7 +646,7 @@ describe('canceling a new lease', () => {
     await processLeaseEnds()
     expect((await leaseRow(h.leaseId)).status).toBe('expired')
     expect((await leaseRow(nlId)).status).toBe('active')
-    expect(await unit()).toBe('active')
+    expect(OCCUPIED).toContain(await unit())
     expect(await returns()).toBe(0)
   })
 
@@ -957,7 +963,7 @@ describe('the lease a new lease follows is ended EARLY while the new lease waits
     expect(res.body.error).toMatch(/^There is a new lease for .* starting .*\. To end your lease early instead, ask the office to cancel that new lease first, then come back here\.$/)
     expect((await leaseRow(h.leaseId)).status).toBe('active')
     expect((await leaseRow(nlId)).status).toBe('pending')
-    expect(await unitStatus(h)).toBe('active')
+    expect(OCCUPIED).toContain(await unitStatus(h))
     expect(await terminationRequests(h)).toHaveLength(0)
   })
 
@@ -977,7 +983,7 @@ describe('the lease a new lease follows is ended EARLY while the new lease waits
     expect(own.status).toBe(409)
     expect(own.body.error).toMatch(/^This new lease starts .*, so it can't be ended before it starts\. If you are moving out, tell the office the day you are leaving\.$/)
     expect((await leaseRow(nlId)).status).toBe('pending')
-    expect(await unitStatus(h)).toBe('active')
+    expect(OCCUPIED).toContain(await unitStatus(h))
     expect(await terminationRequests(h)).toHaveLength(0)
   })
 
@@ -1002,7 +1008,7 @@ describe('the lease a new lease follows is ended EARLY while the new lease waits
     expect(waived.status).toBe(409)
     expect(waived.body.error).toMatch(/ has a new lease starting .*\. If they are leaving instead, cancel it first: Leases → Change → New lease — view or cancel → Cancel the new lease\. Then end this lease\.$/)
     expect((await leaseRow(h.leaseId)).status).toBe('active')
-    expect(await unitStatus(h)).toBe('active')
+    expect(OCCUPIED).toContain(await unitStatus(h))
     expect((await terminationRequests(h)).map((r: any) => r.status)).toEqual(['failed'])
   })
 
